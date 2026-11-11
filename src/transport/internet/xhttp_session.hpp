@@ -422,6 +422,7 @@ enum class XHttpSessionAccess : uint8_t {
 // Limits: 1024 live entries per Worker, 65536 live directory records per group,
 // and the most recent 1024 ended ids in each bounded FIFO replay window.
 [[nodiscard]] net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
+    GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::string_view session_namespace,
     std::string_view session_id,
@@ -444,6 +445,7 @@ enum class XHttpSessionAccess : uint8_t {
                                                XHttpClientRequestKind kind);
 
 [[nodiscard]] net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
+    GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> stream,
     const HttpConfig& cfg,

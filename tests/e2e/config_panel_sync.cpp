@@ -63,6 +63,22 @@ private:
             try { Reply(socket, 200, R"({"users":[]})", "invalid-timeout"); } catch (const std::exception&) {}
             return;
         }
+        if (phase == "user-http-malformed") {
+            socket.Write("HTTP/1.1 200 OK\r\nETag: invalid-framing\r\n"
+                         "Transfer-Encoding: chunked\r\nContent-Length: 12\r\n\r\n"
+                         "c\r\n{\"users\":[]}\r\n0\r\n\r\n");
+            return;
+        }
+        if (phase == "user-http-oversized") {
+            socket.Write("HTTP/1.1 200 OK\r\nETag: invalid-budget\r\n"
+                         "Content-Length: 67108865\r\n\r\n");
+            return;
+        }
+        if (phase == "user-http-truncated") {
+            socket.Write("HTTP/1.1 200 OK\r\nETag: invalid-truncated\r\n"
+                         "Content-Length: 100\r\n\r\n{\"users\":[]}");
+            return;
+        }
         if (phase == "user-json") { Reply(socket, 200, R"({"users":)", "invalid-json"); return; }
         if (phase == "user-schema") { Reply(socket, 200, R"({"message":"not a user list"})", "invalid-schema"); return; }
         if (phase == "user-credentials") {
@@ -112,6 +128,7 @@ TEST(PanelUserSync, FailuresPreserveCommittedUsersAndValidatorsThenRevokeAndReco
     EXPECT_TRUE(ready[0].empty());
     EXPECT_EQ(ready[1], "users-v1");
     for (const auto phase : {"config404", "config503", "config-invalid", "user404", "user500", "user-timeout",
+             "user-http-malformed", "user-http-oversized", "user-http-truncated",
              "user-json", "user-schema", "user-credentials", "unchanged", "invalid-candidate", "rejected-update"}) {
         SCOPED_TRACE(phase);
         panel.Enter(phase);

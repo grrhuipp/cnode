@@ -32,6 +32,8 @@
 #include <utility>
 #include <variant>
 
+class GroupCoordinator;
+
 namespace vmess {
 
 // 通过 AuthID 查找用户，限定 tag（优化：O(N_tag) 而非 O(N_total)）
@@ -41,8 +43,10 @@ FindByAuthIDForTag(std::string_view tag,
                    int64_t* out_timestamp = nullptr);
 
 // Records AEAD request body key/IV for replay protection.
-// Returns false if the same user/key/IV tuple is still inside the replay window.
+// Returns false for replay or full tracking capacity; unexpired tuples are never
+// evicted to accept a new one.
 [[nodiscard]] net::awaitable<bool> RegisterSessionIfNew(
+    GroupCoordinator& coordinator,
     const proxyman::inbound::UserStore::VmessCredential& user,
     const std::array<uint8_t, 16>& body_key,
     const std::array<uint8_t, 16>& body_iv);

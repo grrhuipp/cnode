@@ -6,17 +6,16 @@
 #include "app/dns/dns.hpp"
 #include "infra/json.hpp"
 #include "infra/log.hpp"
-#include "api/v2board/http_response.hpp"
+#include "api/v2board/panel_data.hpp"
+#include "api/v2board/request_task.hpp"
+#include "transport/internet/http1_handshake.hpp"
 
 #include <asio/ip/tcp.hpp>
 #include <asio/ssl.hpp>
-#include <asio/connect.hpp>
-#include <asio/read.hpp>
-#include <asio/read_until.hpp>
 #include <asio/redirect_error.hpp>
-#include <asio/write.hpp>
 #include <asio/cancel_after.hpp>
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <format>
@@ -115,26 +114,123 @@ std::string MethodName(HttpMethod method) {
     return "GET";
 }
 
+// Adapts the existing Asio owner to byte I/O; HTTP parsing stays in transport.
 template <typename Stream>
-net::awaitable<HttpResponse>
-WriteRequestAndReadResponse(Stream& stream, std::string_view request) {
-    const auto cancellation = co_await net::this_coro::cancellation_state;
-    IoErrorCode write_ec;
-    co_await net::async_write(
-        stream, net::buffer(request),
-        net::redirect_error(net::use_awaitable, write_ec));
-    if (cancellation.cancelled() != net::cancellation_type::none) {
-        throw IoSystemError(
-            write_ec ? write_ec : net::error::operation_aborted,
-            "HTTP write cancelled");
+class PanelStream final : public AsyncStream {
+public:
+    template <typename... Args>
+    explicit PanelStream(Args&&... args) : stream(std::forward<Args>(args)...) {}
+    ~PanelStream() override { Close(); }
+
+    net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
+        IoErrorCode ec;
+        const auto n = co_await stream.async_read_some(
+            buffer, net::redirect_error(net::use_awaitable, ec));
+        if (ec && ec != net::error::eof) throw IoSystemError(ec);
+        co_return n;
     }
-    if (write_ec) {
-        HttpResponse result;
-        result.status = -1;
-        result.body = write_ec.message();
-        co_return result;
+    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+        buf::BufferGuard buffer{buf::Buffer::New()};
+        if (!buffer) throw std::bad_alloc();
+        const auto n = co_await AsyncRead(
+            net::buffer(buffer->Tail().data(), buffer->Available()));
+        if (n == 0) co_return buf::MultiBuffer{};
+        buffer->Produce(static_cast<uint32_t>(n));
+        co_return buf::MultiBuffer{std::move(buffer)};
     }
-    co_return co_await http::ReadResponse(stream);
+    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
+        co_return co_await stream.async_write_some(buffer, net::use_awaitable);
+    }
+    void ShutdownRead() override {
+        IoErrorCode ec;
+        Socket().shutdown(tcp::socket::shutdown_receive, ec);
+    }
+    void ShutdownWrite() override {
+        IoErrorCode ec;
+        Socket().shutdown(tcp::socket::shutdown_send, ec);
+    }
+    net::awaitable<void> AsyncShutdownWrite() override {
+        if constexpr (!std::is_same_v<Stream, tcp::socket>) {
+            IoErrorCode ec;
+            co_await stream.async_shutdown(net::cancel_after(std::chrono::seconds(1),
+                net::redirect_error(net::use_awaitable, ec)));
+        } else {
+            ShutdownWrite();
+        }
+    }
+    void Close() override {
+        NotifyClosed();
+        IoErrorCode ec;
+        stream.lowest_layer().close(ec);
+    }
+    void Cancel() noexcept override {
+        NotifyCancellation();
+        IoErrorCode ec;
+        stream.lowest_layer().cancel(ec);
+    }
+    int NativeHandle() const override {
+        return const_cast<Stream&>(stream).lowest_layer().native_handle();
+    }
+    bool IsOpen() const override { return stream.lowest_layer().is_open(); }
+
+    Stream stream;
+private:
+    tcp::socket& Socket() noexcept {
+        if constexpr (std::is_same_v<Stream, tcp::socket>) return stream;
+        else return stream.next_layer();
+    }
+};
+
+net::awaitable<HttpResponse> WriteRequestAndReadResponse(
+    std::unique_ptr<AsyncStream> stream, std::string_view request) {
+    using namespace transport::internet;
+    constexpr size_t kMaxBodySize = 64 * 1024 * 1024;
+    constexpr size_t kMaxLineSize = 64 * 1024;
+    constexpr size_t kMaxHeaderSize = 256 * 1024;
+    if (!co_await WriteFullToStream(*stream, request))
+        co_return HttpResponse{.status = -1, .body = "HTTP request write failed"};
+    auto response = co_await ReadHttp1ResponseHead(*stream,
+        {.max_head_bytes = kMaxHeaderSize, .max_line_bytes = kMaxLineSize});
+    if (!response)
+        co_return HttpResponse{.status = -1, .body = "invalid HTTP response headers"};
+
+    HttpResponse result{.status = response->status};
+    result.not_modified = result.status == 304;
+    const auto head = response->head.Text();
+    if (CountHeadersCI(head, "ETag") > 1)
+        co_return HttpResponse{.status = -1, .body = "duplicate ETag"};
+    auto etag = ExtractHeaderValueCI(head, "ETag");
+    if (etag.size() >= 2 && etag.front() == '"' && etag.back() == '"')
+        etag = etag.substr(1, etag.size() - 2);
+    if (!std::ranges::all_of(etag, [](unsigned char ch) {
+            return ch > 0x20 && ch != 0x7f;
+        }))
+        co_return HttpResponse{.status = -1, .body = "invalid ETag"};
+    result.etag.assign(etag);
+    if (const auto* length = std::get_if<Http1BodyContentLength>(&response->framing);
+        length && length->bytes > kMaxBodySize)
+        co_return HttpResponse{.status = -1, .body = "HTTP body too large"};
+
+    auto body = MakeHttp1BodyStream(std::move(stream), response->framing, false,
+        response->head.TakeReadAheadMultiBuffer(),
+        {.max_body_bytes = kMaxBodySize,
+         .max_line_bytes = kMaxLineSize,
+         .max_trailer_lines = std::numeric_limits<size_t>::max(),
+         .max_trailer_bytes = kMaxHeaderSize - response->header_bytes,
+         .count_trailer_terminator = true,
+         .reject_trailing_read_ahead = result.status != 204 && result.status != 304});
+    std::array<char, 8192> block;
+    for (;;) {
+        const auto n = co_await body->AsyncRead(net::buffer(block));
+        if (n == 0) break;
+        if (n > kMaxBodySize - result.body.size())
+            co_return HttpResponse{.status = -1, .body = "HTTP body too large"};
+        // Grow for bytes actually received, never for a declared length.
+        result.body.append(block.data(), n);
+    }
+    // A completed response survives cancellation of best-effort TLS cleanup.
+    try { co_await body->AsyncShutdownWrite(); } catch (const std::exception&) {}
+    co_return result;
 }
 
 // 同进程的 HTTPS 面板客户端共享一份只读客户端 SSL_CTX（一份系统 CA store）。
@@ -164,7 +260,7 @@ std::shared_ptr<ssl::context> AcquireHttpsClientContext() {
 class APIClient final : public ::api::API {
 public:
     APIClient(net::io_context& io_context,
-              const ::api::Config& config,
+              ::api::Config config,
               ::app::dns::DNS& dns_service);
     ~APIClient() override = default;
 
@@ -227,10 +323,10 @@ private:
 };
 
 APIClient::APIClient(net::io_context& io_context,
-                     const ::api::Config& config,
+                     ::api::Config config,
                      ::app::dns::DNS& dns_service)
     : io_context_(io_context)
-    , config_(config)
+    , config_(std::move(config))
     , log_context_{config_.Name, config_.APIHost, config_.NodeID, config_.NodeType}
     , dns_service_(dns_service) {
     if (config_.RequestTimeout <= std::chrono::seconds::zero() ||
@@ -244,7 +340,7 @@ APIClient::APIClient(net::io_context& io_context,
         throw std::invalid_argument("Invalid panel API key");
     }
 
-    auto parts = ParsePanelApiUrl(config.APIHost);
+    auto parts = ParsePanelApiUrl(config_.APIHost);
     if (!parts) {
         throw std::invalid_argument("Invalid panel API host");
     }
@@ -343,29 +439,31 @@ APIClient::ConnectAndExchange(std::span<const tcp::endpoint> endpoints,
     std::string last_error;
     for (const auto& endpoint : endpoints) {
         auto stream = [this] {
-            if constexpr (kTls) return Stream(io_context_, *https_context_);
-            else return Stream(io_context_);
+            if constexpr (kTls)
+                return std::make_unique<PanelStream<Stream>>(io_context_, *https_context_);
+            else
+                return std::make_unique<PanelStream<Stream>>(io_context_);
         }();
         try {
             if constexpr (kTls) {
                 if (literal_address_) {
-                    auto* verify_param = SSL_get0_param(stream.native_handle());
+                    auto* verify_param = SSL_get0_param(stream->stream.native_handle());
                     if (!verify_param ||
                         X509_VERIFY_PARAM_set1_ip_asc(verify_param, url_parts_.host.c_str()) != 1) {
                         co_return HttpResponse{.status = -1, .body = "SSL IP verify param error",
                                                .etag = {}, .not_modified = false};
                     }
                 } else {
-                    stream.set_verify_callback(ssl::host_name_verification(url_parts_.host));
-                    if (!SSL_set_tlsext_host_name(stream.native_handle(), url_parts_.host.c_str())) {
+                    stream->stream.set_verify_callback(ssl::host_name_verification(url_parts_.host));
+                    if (!SSL_set_tlsext_host_name(stream->stream.native_handle(), url_parts_.host.c_str())) {
                         co_return HttpResponse{.status = -1, .body = "SSL SNI error",
                                                .etag = {}, .not_modified = false};
                     }
                 }
             }
-            co_await stream.lowest_layer().async_connect(endpoint, net::use_awaitable);
+            co_await stream->stream.lowest_layer().async_connect(endpoint, net::use_awaitable);
             if constexpr (kTls) {
-                co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
+                co_await stream->stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
             }
         } catch (const std::exception& e) {
             if (cancellation.cancelled() != net::cancellation_type::none) {
@@ -379,25 +477,7 @@ APIClient::ConnectAndExchange(std::span<const tcp::endpoint> endpoints,
             continue;
         }
 
-        auto result = co_await WriteRequestAndReadResponse(stream, request);
-
-        IoErrorCode close_ec;
-        if constexpr (kTls) {
-            // The HTTP response is complete. TLS close_notify is best effort
-            // and must neither stall indefinitely nor invalidate that response.
-            if (result.status > 0 && cancellation.cancelled() == net::cancellation_type::none) {
-                try {
-                    IoErrorCode ec;
-                    co_await stream.async_shutdown(net::cancel_after(std::chrono::seconds(1),
-                        net::redirect_error(net::use_awaitable, ec)));
-                } catch (const std::exception&) {
-                }
-            }
-        } else if (result.status > 0) {
-            stream.shutdown(tcp::socket::shutdown_both, close_ec);
-        }
-        stream.lowest_layer().close(close_ec);
-        co_return result;
+        co_return co_await WriteRequestAndReadResponse(std::move(stream), request);
     }
     co_return HttpResponse{
         .status = -1,
@@ -591,9 +671,9 @@ namespace api {
 
 std::unique_ptr<API> CreatePanelClient(
     net::io_context& io_context,
-    const Config& config,
+    Config config,
     app::dns::DNS& dns_service) {
-    return std::make_unique<v2board::APIClient>(io_context, config, dns_service);
+    return std::make_unique<v2board::APIClient>(io_context, std::move(config), dns_service);
 }
 
 }  // namespace api

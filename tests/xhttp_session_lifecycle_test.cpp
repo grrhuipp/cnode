@@ -1,3 +1,4 @@
+#include "transport_coordinator_fixture.hpp"
 #include <gtest/gtest.h>
 
 #include "transport/internet/xhttp_session.hpp"
@@ -5,6 +6,8 @@
 #include "app/session_group_executor.hpp"
 
 #include <asio/co_spawn.hpp>
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/cancellation_signal.hpp>
 #include <asio/post.hpp>
 #include <asio/write.hpp>
 #include <asio/executor_work_guard.hpp>
@@ -25,18 +28,15 @@ namespace net = ::net;
 using namespace ::transport::internet;
 using namespace std::chrono_literals;
 
-void Require(bool value, const char* message) {
-    if (!value) throw std::runtime_error(message);
-}
 
 template<class Predicate>
-void RunUntil(net::io_context& io, Predicate predicate, const char* message) {
+bool RunUntil(net::io_context& io, Predicate predicate) {
     const auto deadline = std::chrono::steady_clock::now() + 3s;
     while (!predicate() && std::chrono::steady_clock::now() < deadline) {
         io.restart();
         io.run_for(5ms);
     }
-    Require(predicate(), message);
+    return predicate();
 }
 
 template<class Scenario>
@@ -44,118 +44,110 @@ void RunTableScenario(Scenario scenario) {
     net::io_context io;
     bool done = false;
     std::exception_ptr failure;
-    net::co_spawn(io, scenario(io), [&](std::exception_ptr error) {
-        failure = error;
-        done = true;
-    });
-    RunUntil(io, [&] { return done; }, "session table scenario did not finish");
+    net::cancellation_signal cancel;
+    TransportCoordinatorFixture transport_coordinator{io};
+    net::co_spawn(io, scenario(transport_coordinator.Coordinator(), io), net::bind_cancellation_slot(cancel.slot(),
+        [&](std::exception_ptr error) {
+            failure = error;
+            done = true;
+        }));
+    const bool completed_before_cleanup = RunUntil(io, [&] { return done; });
+    if (!done) cancel.emit(net::cancellation_type::terminal);
+    io.restart();
+    io.run();
+    EXPECT_TRUE(completed_before_cleanup);
+    EXPECT_TRUE(done);
     if (failure) std::rethrow_exception(failure);
 }
 
-net::awaitable<void> NamespaceAndRetirement(net::io_context& io) {
-    auto first = co_await GetXHttpPacketSession(io, "inbound-a:g1", "same-id", XHttpSessionAccess::Open);
-    auto other = co_await GetXHttpPacketSession(io, "inbound-b:g1", "same-id", XHttpSessionAccess::Open);
-    auto replacement = co_await GetXHttpPacketSession(io, "inbound-a:g2", "same-id", XHttpSessionAccess::Open);
-    Require(first && other && replacement && first != other && first != replacement,
-            "configuration namespaces shared a session");
-    Require((co_await GetXHttpPacketSession(io, "inbound-a:g1", "same-id", XHttpSessionAccess::Join)) == first,
-            "same namespace failed to join");
+net::awaitable<void> NamespaceAndRetirement(GroupCoordinator& coordinator, net::io_context& io) {
+    auto first = co_await GetXHttpPacketSession(coordinator, io, "inbound-a:g1", "same-id", XHttpSessionAccess::Open);
+    auto other = co_await GetXHttpPacketSession(coordinator, io, "inbound-b:g1", "same-id", XHttpSessionAccess::Open);
+    auto replacement = co_await GetXHttpPacketSession(coordinator, io, "inbound-a:g2", "same-id", XHttpSessionAccess::Open);
+    EXPECT_TRUE(first);
+    EXPECT_TRUE(other);
+    EXPECT_TRUE(replacement);
+    EXPECT_NE(first, other);
+    EXPECT_NE(first, replacement);
+    if (!first || !other || !replacement) co_return;
+    EXPECT_EQ((co_await GetXHttpPacketSession(coordinator, io, "inbound-a:g1", "same-id", XHttpSessionAccess::Join)), first) << "same namespace failed to join";
     first->Close(); // still held by this test: retirement must not wait for weak expiration.
-    Require(!(co_await GetXHttpPacketSession(io, "inbound-a:g1", "same-id", XHttpSessionAccess::Upload)),
-            "ended session accepted a replay");
-    auto reopened = co_await GetXHttpPacketSession(io, "inbound-a:g1", "same-id", XHttpSessionAccess::Open);
-    Require(reopened && reopened != first, "explicit reopen did not replace tombstone");
+    EXPECT_FALSE((co_await GetXHttpPacketSession(coordinator, io, "inbound-a:g1", "same-id", XHttpSessionAccess::Upload))) << "ended session accepted a replay";
+    auto reopened = co_await GetXHttpPacketSession(coordinator, io, "inbound-a:g1", "same-id", XHttpSessionAccess::Open);
+    EXPECT_TRUE(reopened);
+    EXPECT_NE(reopened, first);
     first.reset(); // must not retire the replacement generation.
-    Require((co_await GetXHttpPacketSession(io, "inbound-a:g1", "same-id", XHttpSessionAccess::Join)) == reopened,
-            "old generation destructor retired new session");
+    EXPECT_EQ((co_await GetXHttpPacketSession(coordinator, io, "inbound-a:g1", "same-id", XHttpSessionAccess::Join)), reopened) << "old generation destructor retired new session";
     other->CloseInput();
-    Require(!(co_await GetXHttpPacketSession(io, "inbound-b:g1", "same-id", XHttpSessionAccess::Join)),
-            "input EOF was not retired");
+    EXPECT_FALSE((co_await GetXHttpPacketSession(coordinator, io, "inbound-b:g1", "same-id", XHttpSessionAccess::Join))) << "input EOF was not retired";
 }
 
-net::awaitable<void> StandaloneContextsDoNotShare(net::io_context& io) {
-    net::io_context second_io;
-    auto first = co_await GetXHttpPacketSession(io, "standalone", "same-id", XHttpSessionAccess::Open);
-    auto second = co_await GetXHttpPacketSession(
-        second_io, "standalone", "same-id", XHttpSessionAccess::Open);
-    Require(first && second && first != second, "standalone io_context services shared a table");
-    first->Close();
-    Require((co_await GetXHttpPacketSession(
-                second_io, "standalone", "same-id", XHttpSessionAccess::Upload)) == second,
-            "one standalone context retired another context's session");
-}
-
-net::awaitable<void> FullTableReclaimsOnEvents(net::io_context& io) {
+net::awaitable<void> FullTableReclaimsOnEvents(GroupCoordinator& coordinator, net::io_context& io) {
     std::vector<std::shared_ptr<XHttpPacketUpSession>> active;
     active.reserve(1024);
     for (int n = 0; n != 1024; ++n) {
-        auto session = co_await GetXHttpPacketSession(io, "capacity", std::to_string(n), XHttpSessionAccess::Open);
-        Require(bool(session), "table exhausted before active limit");
+        auto session = co_await GetXHttpPacketSession(coordinator, io, "capacity", std::to_string(n), XHttpSessionAccess::Open);
+        EXPECT_TRUE(bool(session)) << "table exhausted before active limit";
+        if (!session) co_return;
         active.push_back(std::move(session));
     }
     for (int n = 0; n != 64; ++n)
-        Require(!(co_await GetXHttpPacketSession(io, "capacity", "overflow", XHttpSessionAccess::Open)),
-                "full table admitted an extra live session");
+        EXPECT_FALSE((co_await GetXHttpPacketSession(coordinator, io, "capacity", "overflow", XHttpSessionAccess::Open))) << "full table admitted an extra live session";
     active.front()->Close();
-    auto next = co_await GetXHttpPacketSession(io, "capacity", "replacement", XHttpSessionAccess::Open);
-    Require(bool(next), "close did not free active capacity while session remained referenced");
-    Require(!(co_await GetXHttpPacketSession(io, "capacity", "0", XHttpSessionAccess::Upload)),
-            "capacity pressure discarded a recent tombstone");
+    auto next = co_await GetXHttpPacketSession(coordinator, io, "capacity", "replacement", XHttpSessionAccess::Open);
+    EXPECT_TRUE(bool(next)) << "close did not free active capacity while session remained referenced";
+    EXPECT_FALSE((co_await GetXHttpPacketSession(coordinator, io, "capacity", "0", XHttpSessionAccess::Upload))) << "capacity pressure discarded a recent tombstone";
     active.back().reset();
-    auto after_destroy = co_await GetXHttpPacketSession(io, "capacity", "after-destroy", XHttpSessionAccess::Upload);
-    Require(bool(after_destroy), "destruction did not free active capacity");
+    auto after_destroy = co_await GetXHttpPacketSession(coordinator, io, "capacity", "after-destroy", XHttpSessionAccess::Upload);
+    EXPECT_TRUE(bool(after_destroy)) << "destruction did not free active capacity";
     active[1]->CloseInput();
-    auto after_eof = co_await GetXHttpPacketSession(io, "capacity", "after-eof", XHttpSessionAccess::Open);
-    Require(bool(after_eof), "input EOF did not free active capacity");
+    auto after_eof = co_await GetXHttpPacketSession(coordinator, io, "capacity", "after-eof", XHttpSessionAccess::Open);
+    EXPECT_TRUE(bool(after_eof)) << "input EOF did not free active capacity";
 }
 
-net::awaitable<void> BoundedReplayWindow(net::io_context& io) {
+net::awaitable<void> BoundedReplayWindow(GroupCoordinator& coordinator, net::io_context& io) {
     for (int n = 0; n != 1025; ++n) {
-        auto session = co_await GetXHttpPacketSession(io, "replay", std::to_string(n), XHttpSessionAccess::Open);
-        Require(bool(session), "tombstones consumed live capacity");
+        auto session = co_await GetXHttpPacketSession(coordinator, io, "replay", std::to_string(n), XHttpSessionAccess::Open);
+        EXPECT_TRUE(bool(session)) << "tombstones consumed live capacity";
+        if (!session) co_return;
         session->Close();
     }
-    Require(!(co_await GetXHttpPacketSession(io, "replay", "1", XHttpSessionAccess::Upload)),
-            "recent tombstone was evicted too early");
-    Require(!(co_await GetXHttpPacketSession(io, "replay", "1024", XHttpSessionAccess::Upload)),
-            "newest tombstone was evicted");
-    auto oldest = co_await GetXHttpPacketSession(io, "replay", "0", XHttpSessionAccess::Upload);
-    Require(bool(oldest), "oldest tombstone was not bounded by FIFO eviction");
+    EXPECT_FALSE((co_await GetXHttpPacketSession(coordinator, io, "replay", "1", XHttpSessionAccess::Upload))) << "recent tombstone was evicted too early";
+    EXPECT_FALSE((co_await GetXHttpPacketSession(coordinator, io, "replay", "1024", XHttpSessionAccess::Upload))) << "newest tombstone was evicted";
+    auto oldest = co_await GetXHttpPacketSession(coordinator, io, "replay", "0", XHttpSessionAccess::Upload);
+    EXPECT_TRUE(bool(oldest)) << "oldest tombstone was not bounded by FIFO eviction";
 }
 
-net::awaitable<void> DomainsJoinBySession(net::io_context& io) {
-    auto coordinator = std::make_shared<::GroupCoordinator>(io);
-    coordinator->RegisterWorker(io);
+net::awaitable<void> DomainsJoinBySession(GroupCoordinator& coordinator, net::io_context& io) {
     auto scenario = [&]() -> net::awaitable<void> {
-        auto first = co_await GetXHttpPacketSession(
+        auto first = co_await GetXHttpPacketSession(coordinator, 
             io, "group", "session-a", XHttpSessionAccess::Open);
-        auto other = co_await GetXHttpPacketSession(
+        auto other = co_await GetXHttpPacketSession(coordinator, 
             io, "group", "session-b", XHttpSessionAccess::Open);
-        Require(first && other && first != other,
-                "unrelated sessions of one inbound were not independent");
-        auto upload = co_await GetXHttpPacketSession(
+        EXPECT_TRUE(first);
+        EXPECT_TRUE(other);
+        EXPECT_NE(first, other);
+        if (!first || !other) co_return;
+        auto upload = co_await GetXHttpPacketSession(coordinator, 
             io, "group", "session-a", XHttpSessionAccess::Upload);
-        Require(upload == first,
-                "upload did not resolve to the existing logical session");
+        EXPECT_EQ(upload, first) << "upload did not resolve to the existing logical session";
         first->Close();
-        auto replay = co_await GetXHttpPacketSession(
+        auto replay = co_await GetXHttpPacketSession(coordinator, 
             io, "group", "session-a", XHttpSessionAccess::Upload);
-        Require(!replay,
-                "retired upload recreated a session inside the replay window");
-        auto reopened = co_await GetXHttpPacketSession(
+        EXPECT_FALSE(replay) << "retired upload recreated a session inside the replay window";
+        auto reopened = co_await GetXHttpPacketSession(coordinator, 
             io, "group", "session-a", XHttpSessionAccess::Open);
-        Require(reopened && reopened != first,
-                "explicit reopen did not claim a new session generation");
+        EXPECT_TRUE(reopened);
+        EXPECT_NE(reopened, first);
         upload.reset();
         first.reset();
-        auto joined = co_await GetXHttpPacketSession(
+        auto joined = co_await GetXHttpPacketSession(coordinator, 
             io, "group", "session-a", XHttpSessionAccess::Join);
-        Require(joined == reopened,
-                "old session destruction retired the replacement generation");
+        EXPECT_EQ(joined, reopened) << "old session destruction retired the replacement generation";
         joined.reset();
         reopened.reset();
         other.reset();
-        co_await BoundedReplayWindow(io);
+        co_await BoundedReplayWindow(coordinator, io);
     };
     std::exception_ptr failure;
     try {
@@ -163,11 +155,9 @@ net::awaitable<void> DomainsJoinBySession(net::io_context& io) {
     } catch (...) {
         failure = std::current_exception();
     }
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    co_await net::this_coro::throw_if_cancelled(false);
     co_await net::post(io, net::use_awaitable);
-    coordinator->CloseAdmission();
-    co_await coordinator->AsyncJoin();
-    coordinator->ReleaseServices();
-    co_await coordinator->Finalize();
     if (failure) std::rethrow_exception(failure);
 }
 
@@ -186,7 +176,7 @@ std::string Receive(::tcp::socket& socket) {
 // Exercise the actual H1 client and TCP transport, including no response yet,
 // forced close despite a configured keep-alive, response padding beyond the
 // peer send buffer, and cancellation of a reader still waiting for padding.
-void UploadResponseIsDrained() {
+TEST(XhttpSessionLifecycle, UploadResponseDrainPreservesWritesAndJoinsReaderOnClose) {
     net::io_context io;
     ::tcp::acceptor listener(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket client(io), peer(io);
@@ -210,47 +200,58 @@ void UploadResponseIsDrained() {
             if (!error && result) upload = std::move(*result);
             built = true;
         });
-    RunUntil(io, [&] { return built; }, "upload waited for response before becoming writable");
-    if (failure) std::rethrow_exception(failure);
-    Require(bool(upload), "upload handshake failed");
-    const auto request = Receive(peer);
-    Require(request.find("Connection: close\r\n") != std::string::npos &&
-            request.find("keep-alive") == std::string::npos,
-            "H1 stream-up did not force Xray-compatible Connection: close");
-    Require(request.ends_with("5\r\nfirst\r\n"), "initial upload chunk missing");
-
     bool drained = false;
-    net::co_spawn(io, [&]() -> net::awaitable<void> {
-        const std::string head = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
-        co_await net::async_write(peer, net::buffer(head), net::use_awaitable);
-        const std::string padding(4096, 'X');
-        for (int n = 0; n != 512; ++n)
-            co_await net::async_write(peer, net::buffer(padding), net::use_awaitable);
-    }, [&](std::exception_ptr error) { failure = error; drained = true; });
-    RunUntil(io, [&] { return drained; }, "upload response padding blocked on unread receive window");
-    if (failure) std::rethrow_exception(failure);
-    Require(upload->IsOpen(), "padding closed upload prematurely");
     bool wrote = false;
     const std::string later = "second";
-    net::co_spawn(io, upload->AsyncWrite(net::buffer(later)),
-        [&](std::exception_ptr error, size_t n) {
-            failure = error;
-            wrote = n == later.size();
-        });
-    RunUntil(io, [&] { return wrote || failure; }, "upload stalled after draining response padding");
-    if (failure) std::rethrow_exception(failure);
-    Require(Receive(peer) == "6\r\nsecond\r\n", "later upload chunk was damaged");
+    auto scenario = [&] {
+        ASSERT_TRUE(RunUntil(io, [&] { return built; }));
+        if (failure) std::rethrow_exception(failure);
+        ASSERT_TRUE(upload);
+        const auto request = Receive(peer);
+        EXPECT_NE(request.find("Connection: close\r\n"), std::string::npos);
+        EXPECT_EQ(request.find("keep-alive"), std::string::npos);
+        EXPECT_TRUE(request.ends_with("5\r\nfirst\r\n"));
+
+        net::co_spawn(io, [&]() -> net::awaitable<void> {
+            const std::string head = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+            co_await net::async_write(peer, net::buffer(head), net::use_awaitable);
+            const std::string padding(4096, 'X');
+            for (int n = 0; n != 512; ++n)
+                co_await net::async_write(peer, net::buffer(padding), net::use_awaitable);
+        }, [&](std::exception_ptr error) { failure = error; drained = true; });
+        ASSERT_TRUE(RunUntil(io, [&] { return drained; }));
+        if (failure) std::rethrow_exception(failure);
+        EXPECT_TRUE(upload->IsOpen());
+        net::co_spawn(io, upload->AsyncWrite(net::buffer(later)),
+            [&](std::exception_ptr error, size_t n) {
+                failure = error;
+                wrote = n == later.size();
+            });
+        ASSERT_TRUE(RunUntil(io, [&] { return wrote || failure; }));
+        if (failure) std::rethrow_exception(failure);
+        EXPECT_EQ(Receive(peer), "6\r\nsecond\r\n");
+    };
+    std::exception_ptr scenario_failure;
+    try {
+        scenario();
+    } catch (...) {
+        scenario_failure = std::current_exception();
+    }
     upload.reset();
+    peer.close();
     bool joined = false;
     net::co_spawn(io, JoinXHttpClientTasks(io), [&](std::exception_ptr error) {
         failure = error;
         joined = true;
     });
-    RunUntil(io, [&] { return joined; }, "upload response reader was not joined at teardown");
+    io.restart();
+    io.run();
+    EXPECT_TRUE(joined);
+    if (scenario_failure) std::rethrow_exception(scenario_failure);
     if (failure) std::rethrow_exception(failure);
 }
 
-void CrossWorkerUploadHandoffDoesNotEscapeOriginSink() {
+TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetirement) {
     net::io_context control;
     auto worker0 = std::make_unique<net::io_context>();
     auto worker1 = std::make_unique<net::io_context>();
@@ -275,7 +276,7 @@ void CrossWorkerUploadHandoffDoesNotEscapeOriginSink() {
         explicit OriginBoundSink(std::thread::id owner)
             : owner_thread(owner), local_tag(128, 'x') {}
         ~OriginBoundSink() noexcept override {
-            if (std::this_thread::get_id() != owner_thread) std::terminate();
+            EXPECT_EQ(std::this_thread::get_id(), owner_thread);
         }
         net::awaitable<void> OnInboundTransportStream(
             std::unique_ptr<::AsyncStream> s, ::InboundTransportMetadata) override {
@@ -300,6 +301,8 @@ void CrossWorkerUploadHandoffDoesNotEscapeOriginSink() {
     ::tcp::acceptor acceptor(control, {net::ip::address_v4::loopback(), 0});
     const auto endpoint = acceptor.local_endpoint();
 
+    std::exception_ptr scenario_failure;
+    try {
     for (int round = 0; round < 16; ++round) {
         const std::string session_id = "s-" + std::to_string(round);
         ::tcp::socket client_up(control), server_up(*worker1);
@@ -315,9 +318,9 @@ void CrossWorkerUploadHandoffDoesNotEscapeOriginSink() {
             [&, sock = std::move(server_up)]() mutable -> net::awaitable<void> {
                 auto sink = std::make_shared<OriginBoundSink>(std::this_thread::get_id());
                 auto res = co_await DoXHttp1ServerHandshake(
-                    *worker1, std::make_unique<::TcpStream>(std::move(sock)),
+                    *coordinator,                     *worker1, std::make_unique<::TcpStream>(std::move(sock)),
                     http_cfg, xhttp_cfg, 1, nullptr, {}, sink);
-                Require(res.has_value() && !*res, "packet-up handoff failed");
+                EXPECT_TRUE(res.has_value() && !*res) << "packet-up handoff failed";
             }, net::use_future);
 
         const std::string post_req =
@@ -332,13 +335,13 @@ void CrossWorkerUploadHandoffDoesNotEscapeOriginSink() {
             [&, sock = std::move(server_down)]() mutable -> net::awaitable<std::string> {
                 auto sink = std::make_shared<OriginBoundSink>(std::this_thread::get_id());
                 auto res = co_await DoXHttp1ServerHandshake(
-                    *worker0, std::make_unique<::TcpStream>(std::move(sock)),
+                    *coordinator,                     *worker0, std::make_unique<::TcpStream>(std::move(sock)),
                     http_cfg, xhttp_cfg, 2, nullptr, {}, sink);
-                Require(res.has_value() && !*res && sink->logical != nullptr,
-                        "packet-down did not produce logical stream");
+                EXPECT_TRUE(res.has_value() && !*res && sink->logical != nullptr) << "packet-down did not produce logical stream";
+                if (!sink->logical) co_return std::string{};
                 std::array<char, 5> buf{};
                 const size_t n = co_await sink->logical->AsyncRead(net::buffer(buf));
-                Require(n == 5, "short read on logical stream");
+                EXPECT_EQ(n, 5) << "short read on logical stream";
                 sink->logical->Close();
                 co_return std::string(buf.data(), n);
             }, net::use_future);
@@ -348,8 +351,16 @@ void CrossWorkerUploadHandoffDoesNotEscapeOriginSink() {
             "Host: localhost\r\n\r\n";
         net::write(client_down, net::buffer(get_req));
 
-        up_future.get();
-        Require(down_future.get() == "hello", "mismatched payload after cross-worker handoff");
+        std::exception_ptr up_error, down_error;
+        std::string received;
+        try { up_future.get(); } catch (...) { up_error = std::current_exception(); }
+        try { received = down_future.get(); } catch (...) { down_error = std::current_exception(); }
+        EXPECT_FALSE(up_error);
+        EXPECT_FALSE(down_error);
+        EXPECT_EQ(received, "hello");
+    }
+    } catch (...) {
+        scenario_failure = std::current_exception();
     }
 
     auto stop_future = net::co_spawn(control, [&]() -> net::awaitable<void> {
@@ -366,20 +377,22 @@ void CrossWorkerUploadHandoffDoesNotEscapeOriginSink() {
     thread_0.join();
     thread_1.join();
     thread_c.join();
+    if (scenario_failure) std::rethrow_exception(scenario_failure);
 }
 } // namespace
 
-TEST(XhttpSessionLifecycle, Contract) {
-    try {
-        RunTableScenario(NamespaceAndRetirement);
-        RunTableScenario(StandaloneContextsDoNotShare);
-        RunTableScenario(FullTableReclaimsOnEvents);
-        RunTableScenario(BoundedReplayWindow);
-        RunTableScenario(DomainsJoinBySession);
-        UploadResponseIsDrained();
-        CrossWorkerUploadHandoffDoesNotEscapeOriginSink();
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "%s\n", error.what());
-        FAIL() << error.what();
-    }
+TEST(XhttpSessionLifecycle, NamespaceIsolationAndRetirementProtectReplacementGeneration) {
+    RunTableScenario(NamespaceAndRetirement);
+}
+
+TEST(XhttpSessionLifecycle, CloseDestructionAndEofReturnFullTableCapacity) {
+    RunTableScenario(FullTableReclaimsOnEvents);
+}
+
+TEST(XhttpSessionLifecycle, ReplayTombstonesHaveBoundedFifoLifetime) {
+    RunTableScenario(BoundedReplayWindow);
+}
+
+TEST(XhttpSessionLifecycle, CoordinatorJoinsBySessionAndRetiresOnlyCurrentGeneration) {
+    RunTableScenario(DomainsJoinBySession);
 }

@@ -10,6 +10,15 @@ namespace {
 thread_local std::ptrdiff_t fail_after = -1;
 using namespace ::proxyman::inbound;
 
+template <typename Users>
+concept BorrowableUserUpdate = requires(Users&& users) {
+    UserStore::UserUpdate{"borrowed", std::forward<Users>(users)};
+};
+static_assert(BorrowableUserUpdate<UserSet&>);
+static_assert(BorrowableUserUpdate<const UserSet&>);
+static_assert(!BorrowableUserUpdate<UserSet>);
+static_assert(!BorrowableUserUpdate<const UserSet>);
+
 void Commit(UserStore::PublishedSnapshot snapshot) {
     auto view = UserStore::PrepareWorkerView(snapshot);
     UserStore::CommitSnapshot(std::move(snapshot));

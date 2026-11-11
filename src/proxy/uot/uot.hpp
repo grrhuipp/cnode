@@ -1,4 +1,5 @@
 #pragma once
+#include "proxy/uot/version.hpp"
 
 #include "common/asio_types.hpp"
 #include "app/relay.hpp"
@@ -26,10 +27,6 @@ inline constexpr std::string_view kV1MagicAddress = "sp.udp-over-tcp.arpa";
 inline constexpr size_t kMaxAddressSize = kMaxEncodedAddressSize;
 inline constexpr size_t kMaxRequestSize = 1 + kMaxAddressSize;
 
-enum class Version : uint8_t {
-    V1 = 1,
-    V2 = 2,
-};
 
 [[nodiscard]] constexpr std::string_view MagicAddress(Version version) noexcept {
     return version == Version::V1 ? kV1MagicAddress : kMagicAddress;

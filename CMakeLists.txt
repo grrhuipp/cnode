@@ -78,6 +78,7 @@ set(CNODE_CORE_SOURCES
     src/infra/log.cpp
     src/infra/json.cpp
     src/infra/config.cpp
+    src/infra/outbound_config.cpp
 
     # App - DNS
     src/app/dns/dns.cpp
@@ -172,6 +173,7 @@ set(CNODE_CORE_SOURCES
     src/proxy/shadowsocks/shadowsocks_protocol.cpp
     src/proxy/shadowsocks/ss_udp.cpp
     src/proxy/shadowsocks/ss_stream.cpp
+    src/proxy/shadowsocks/ss_salt_pool.cpp
     src/proxy/shadowsocks/inbound/ss_inbound.cpp
     src/proxy/shadowsocks/outbound/ss_outbound.cpp
 
@@ -273,10 +275,11 @@ foreach(name IN ITEMS
         xhttp_upload_stream_slot)
     cnode_unit(${name} LIBRARY cnode_test_core)
 endforeach()
-foreach(name IN ITEMS protocol_registration runtime_sampling worker_udp_retirement_runtime)
+foreach(name IN ITEMS protocol_registration inbound_tls_policy runtime_sampling worker_udp_retirement_runtime)
     cnode_unit(${name} LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core>")
 endforeach()
 cnode_unit(awaitable_batch LIBRARY cnode_build_options)
+cnode_unit(ss2022_salt_pool LIBRARY cnode_test_core)
 cnode_unit(awaitable_task_group LIBRARY cnode_build_options)
 cnode_unit(shadowsocks_stream_crypto LIBRARY cnode_build_options SOURCES src/proxy/shadowsocks/shadowsocks_protocol.cpp)
 cnode_unit(timeout_scheduler LIBRARY cnode_build_options SOURCES src/transport/internet/timeout_scheduler.cpp src/app/session_group_executor.cpp src/infra/log.cpp)

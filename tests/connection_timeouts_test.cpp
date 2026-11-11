@@ -1,22 +1,18 @@
 #include <gtest/gtest.h>
-
 #include "transport/internet/connection_timeouts.hpp"
-
 #include <chrono>
-#include <cstdio>
 #include <memory>
 
 namespace {
 using namespace std::chrono_literals;
-using Timeouts = ::transport::internet::detail::ConnectionTimeouts<struct Owner>;
-
 struct Owner {
     int calls = 0;
     ::ErrorCode reason = ::ErrorCode::OK;
     void OnTimeout(::ErrorCode error) noexcept { ++calls; reason = error; }
 };
+using Timeouts = ::transport::internet::detail::ConnectionTimeouts<Owner>;
 
-bool TestIdleAndOperations() {
+TEST(ConnectionTimeouts, ActivityArmsIdleTimeoutAfterCompletedWrite) {
     ::net::io_context io;
     Owner owner;
     Timeouts timeouts(io, owner);
@@ -25,76 +21,78 @@ bool TestIdleAndOperations() {
     timeouts.EndWrite();
     timeouts.TouchActivity();
     io.run_for(1100ms);
-    return owner.calls == 1 && owner.reason == ::ErrorCode::CANCELLED &&
-           timeouts.ConsumeIdleTimeout() && !timeouts.ConsumeWriteTimeout();
+    EXPECT_EQ(owner.calls, 1);
+    EXPECT_EQ(owner.reason, ::ErrorCode::CANCELLED);
+    EXPECT_TRUE(timeouts.ConsumeIdleTimeout());
+    EXPECT_FALSE(timeouts.ConsumeWriteTimeout());
 }
 
-bool TestPhaseReplacementAndClear() {
+TEST(ConnectionTimeouts, ReadTimeoutSurvivesPhaseReplacementAndClear) {
     ::net::io_context io;
     Owner owner;
     Timeouts timeouts(io, owner);
     auto old = timeouts.StartPhaseDeadline(1s);
     auto current = timeouts.StartPhaseDeadline(2s);
-    if (!old || !current || old.Expired() || current.Expired()) return false;
+    EXPECT_TRUE(old);
+    EXPECT_TRUE(current);
+    EXPECT_FALSE(old.Expired());
+    EXPECT_FALSE(current.Expired());
     timeouts.ClearPhaseDeadline();
-    if (current.Expired() || timeouts.ConsumePhaseDeadline()) return false;
+    EXPECT_FALSE(current.Expired());
+    EXPECT_FALSE(timeouts.ConsumePhaseDeadline());
     timeouts.SetReadTimeout(1s);
     timeouts.BeginRead();
     auto later_phase = timeouts.StartPhaseDeadline(2s);
     io.run_for(1100ms);
-    return owner.calls == 1 && later_phase && !later_phase.Expired() &&
-           timeouts.ConsumeReadTimeout() && !timeouts.ConsumePhaseDeadline();
+    EXPECT_EQ(owner.calls, 1);
+    EXPECT_TRUE(later_phase);
+    EXPECT_FALSE(later_phase.Expired());
+    EXPECT_TRUE(timeouts.ConsumeReadTimeout());
+    EXPECT_FALSE(timeouts.ConsumePhaseDeadline());
 }
 
-bool TestExpiredPhaseAndStopFlag() {
+TEST(ConnectionTimeouts, StopAndClearInvalidateExpiredPhase) {
     ::net::io_context io;
     Owner owner;
     Timeouts timeouts(io, owner);
     auto phase = timeouts.StartPhaseDeadline(1s);
     io.run_for(1100ms);
-    if (owner.calls != 1 || !timeouts.ConsumePhaseDeadline()) return false;
+    EXPECT_EQ(owner.calls, 1);
+    EXPECT_TRUE(timeouts.ConsumePhaseDeadline());
     timeouts.Stop();
     timeouts.ClearPhaseDeadline();
-    return !phase.Expired() && !timeouts.ConsumePhaseDeadline();
+    EXPECT_FALSE(phase.Expired());
+    EXPECT_FALSE(timeouts.ConsumePhaseDeadline());
 }
 
-bool TestDestroyOwnerAndMaximumTimeout() {
+TEST(ConnectionTimeouts, DestructionCancelsMaximumDeadlineBeforeOwnerDestruction) {
     ::net::io_context io;
     auto owner = std::make_unique<Owner>();
-    {
-        auto timeouts = std::make_unique<Timeouts>(io, *owner);
-        timeouts->SetIdleTimeout(std::chrono::seconds::max());
-        timeouts->BeginRead();
-        timeouts.reset();
-    }
-    owner.reset();
+    auto timeouts = std::make_unique<Timeouts>(io, *owner);
+    timeouts->SetIdleTimeout(std::chrono::seconds::max());
+    timeouts->BeginRead();
+    timeouts.reset();
     io.run_for(10ms);
-    return true;
+    EXPECT_EQ(owner->calls, 0);
+    owner.reset();
+    io.restart();
+    io.run_for(10ms);
 }
 
-bool TestActivityDoesNotExtendPhase() {
+TEST(ConnectionTimeouts, ActivityDoesNotExtendPhaseDeadline) {
     ::net::io_context io;
     Owner owner;
     Timeouts timeouts(io, owner);
     timeouts.SetIdleTimeout(1s);
     auto phase = timeouts.StartPhaseDeadline(1s);
     io.run_for(600ms);
-    if (owner.calls) return false;
+    EXPECT_EQ(owner.calls, 0);
     timeouts.TouchActivity();
     io.restart();
     io.run_for(600ms);
-    return owner.calls == 1 && phase.Expired() && timeouts.ConsumePhaseDeadline() &&
-        !timeouts.ConsumeIdleTimeout();
+    EXPECT_EQ(owner.calls, 1);
+    EXPECT_TRUE(phase.Expired());
+    EXPECT_TRUE(timeouts.ConsumePhaseDeadline());
+    EXPECT_FALSE(timeouts.ConsumeIdleTimeout());
 }
-}  // namespace
-
-TEST(ConnectionTimeouts, Contract) {
-    const bool idle = TestIdleAndOperations();
-    const bool phase = TestPhaseReplacementAndClear();
-    const bool expired = TestExpiredPhaseAndStopFlag();
-    const bool destruction = TestDestroyOwnerAndMaximumTimeout();
-    const bool dual = TestActivityDoesNotExtendPhase();
-    std::printf("connection timeouts: idle=%d phase=%d expired=%d destruction=%d dual=%d\n",
-                idle, phase, expired, destruction, dual);
-    { ASSERT_TRUE(idle && phase && expired && destruction && dual); return; }
-}
+} // namespace

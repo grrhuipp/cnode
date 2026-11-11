@@ -41,7 +41,7 @@ struct TrojanHandshakeResult {
 net::awaitable<tl::expected<TrojanHandshakeResult, ErrorCode>>
 ParseTrojanRequest(AsyncStream& stream,
                    session::Context& ctx,
-                   ConnectionLimiter* limiter) {
+                   proxy::InboundAuthentication& authentication) {
     std::array<uint8_t, kMaxTrojanHandshakeBytes> handshake_buf{};
     size_t total_read = 0;
     size_t required = ::trojan::kRequestPrefixSize;
@@ -67,11 +67,11 @@ ParseTrojanRequest(AsyncStream& stream,
             break;
         }
         if (decoded.status == ::trojan::RequestDecodeStatus::InvalidAddress) {
-            proxy::LogInboundRequestRejected(ctx, "invalid target address");
+            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid target address"));
             co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
         if (decoded.status == ::trojan::RequestDecodeStatus::InvalidHeader) {
-            proxy::LogInboundRequestRejected(ctx, "invalid request header");
+            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid request header"));
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         required = decoded.required;
@@ -79,17 +79,14 @@ ParseTrojanRequest(AsyncStream& stream,
 
     auto& request = decoded.request;
     OPENSSL_cleanse(handshake_buf.data(), handshake_buf.size());
-    const auto credential = co_await proxy::VerifyInboundCredential(
-        limiter, ctx, proxyman::inbound::UserProtocol::Trojan,
-        {reinterpret_cast<const uint8_t*>(request.password_hash.data()),
-         request.password_hash.size()});
-    if (credential.error != ErrorCode::OK) co_return tl::unexpected(credential.error);
+    const auto credential = co_await authentication.VerifyCredential({
+        proxy::KeyedInboundProtocol::Trojan,
+        {reinterpret_cast<const uint8_t*>(request.password_hash.data()), request.password_hash.size()}});
+    if (credential != ErrorCode::OK) co_return tl::unexpected(credential);
     auto user_info = proxyman::inbound::UserStore::FindTrojanUser(
         ctx.inbound.tag, request.PasswordHashView());
     if (!user_info) {
-        co_await proxy::RecordInboundAuthFailure(
-            limiter, ctx, "no matching credential", credential.key);
-        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+        co_return tl::unexpected(co_await authentication.RejectCredential("no matching credential"));
     }
 
     co_return TrojanHandshakeResult{
@@ -106,9 +103,7 @@ namespace proxy::trojan::inbound {
 
 class Handler final : public ::Inbound {
 public:
-    Handler(::UserOnlineTracker& tracker,
-            ::StatsShard& stats,
-            ::ConnectionLimiter* limiter);
+    explicit Handler(const ::proxyman::inbound::AdmissionEnvironment& environment);
 
     ::net::awaitable<::RelayResult> Process(
         std::unique_ptr<::AsyncStream> stream,
@@ -120,9 +115,7 @@ public:
         uint32_t pressure_idle_timeout) override;
 
 private:
-    ::UserOnlineTracker& tracker_;
-    ::StatsShard& stats_;
-    ::ConnectionLimiter* limiter_;
+    const ::proxyman::inbound::AdmissionEnvironment& environment_;
 };
 
 }  // namespace proxy::trojan::inbound
@@ -132,12 +125,8 @@ private:
 // ============================================================================
 
 proxy::trojan::inbound::Handler::Handler(
-    ::UserOnlineTracker& tracker,
-    StatsShard& stats,
-    ConnectionLimiter* limiter)
-    : tracker_(tracker)
-    , stats_(stats)
-    , limiter_(limiter)
+    const ::proxyman::inbound::AdmissionEnvironment& environment)
+    : environment_(environment)
 {}
 
 net::awaitable<RelayResult>
@@ -153,31 +142,22 @@ proxy::trojan::inbound::Handler::Process(
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}",
                    ctx.inbound.source_ip, ctx.inbound.source_port);
 
-    if (proxy::BeginInboundAuthentication(limiter_, ctx) &&
-        co_await proxy::CheckInboundIpBanned(*limiter_, ctx)) {
-        co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::BLOCKED);
-    }
+    auto authentication = co_await proxy::BeginInboundAuthentication(environment_, ctx);
+    if (!authentication) co_return proxy::RejectInbound(environment_.stats, stream.get(), authentication.error());
     std::optional<UserOnlineSessionGuard> user_session;
     Network net = Network::TCP;
     {
-        auto handshake = co_await ParseTrojanRequest(*stream, ctx, limiter_);
+        auto handshake = co_await ParseTrojanRequest(*stream, ctx, *authentication);
         if (!handshake) {
-            co_return proxy::RejectInbound(stats_, stream.get(), handshake.error());
+            co_return proxy::RejectInbound(environment_.stats, stream.get(), handshake.error());
         }
         net = (handshake->command == ::trojan::TrojanCommand::UDP_ASSOCIATE)
               ? Network::UDP : Network::TCP;
-        proxy::BindAuthenticatedInbound(
-            ctx, handshake->user->profile,
-            proxy::InboundRequestTarget{
-                net,
-                std::move(handshake->target),
-                std::move(handshake->forwarded)});
-        user_session = co_await proxy::AdmitAuthenticatedInbound(
-            tracker_, ctx, handshake->user->profile);
-        if (!user_session) {
-            co_return proxy::RejectInbound(
-                stats_, stream.get(), ErrorCode::PERMISSION_DENIED);
-        }
+        auto admitted = co_await proxy::AuthenticateAndAdmit(
+            std::move(*authentication), &handshake->user->profile, "no matching credential",
+            proxy::InboundRequestTarget{net, std::move(handshake->target), std::move(handshake->forwarded)});
+        if (!admitted) co_return proxy::RejectInbound(environment_.stats, stream.get(), admitted.error());
+        user_session.emplace(std::move(*admitted));
         // Session metadata is owned; release the authentication snapshot before I/O.
         handshake->user.reset();
     }
@@ -191,7 +171,7 @@ proxy::trojan::inbound::Handler::Process(
             transport::Link{&udp_endpoint, &udp_endpoint},
             InitialPayload{},
             ctx,
-            stats_,
+            environment_.stats,
             timeouts);
     }
 
@@ -203,7 +183,7 @@ proxy::trojan::inbound::Handler::Process(
         transport::Link{tcp_stream, tcp_stream},
         InitialPayload{},
         ctx,
-        stats_,
+        environment_.stats,
         timeouts);
 }
 
@@ -215,22 +195,13 @@ namespace {
 const bool kTrojanInboundRegistered = [] {
     ::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = ::proxyman::inbound::UserProtocol::Trojan;
+    reg.traits.requires_tls = true;
 
-    reg.create_runtime = &::proxy::CreateUserOnlineProtocolRuntime;
 
     reg.create_tcp_handler =
-        [](::proxyman::inbound::ProtocolRuntime& runtime,
-           ::StatsShard& stats,
-           ::ConnectionLimiter* limiter,
+        [](const ::proxyman::inbound::AdmissionEnvironment& environment,
            const ::proxyman::inbound::BuildRequest&) -> std::unique_ptr<::Inbound> {
-            auto* tracker = runtime.OnlineTracker();
-            if (!tracker) {
-                return nullptr;
-            }
-            return std::make_unique<::proxy::trojan::inbound::Handler>(
-                *tracker,
-                stats,
-                limiter);
+            return std::make_unique<::proxy::trojan::inbound::Handler>(environment);
         };
 
     reg.build_users =

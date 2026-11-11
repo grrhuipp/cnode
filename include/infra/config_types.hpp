@@ -7,6 +7,7 @@
 #include "features/routing/router.hpp"
 #include "infra/json.hpp"
 #include "infra/log.hpp"
+#include "infra/outbound_types.hpp"
 #include "transport/internet/inbound_listen.hpp"
 #include "transport/internet/proxy_protocol.hpp"
 #include "transport/internet/stream_settings.hpp"
@@ -242,7 +243,7 @@ namespace infra {
 struct OutboundSourceConfig {
     std::string tag;
     std::string protocol;
-    json::object settings;
+    OutboundSettings settings;
     StreamSettings stream_settings;
     std::optional<OutboundBind> send_through;
     bool passthrough = false;

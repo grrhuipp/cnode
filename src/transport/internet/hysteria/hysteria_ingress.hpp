@@ -1,6 +1,6 @@
 #pragma once
 
-#include "app/proxyman/inbound/handler.hpp"
+#include "transport/internet/quic_listener.hpp"
 #include "app/datagram_session_environment.hpp"
 #include "app/rate_limiter.hpp"
 #include "common/allocator.hpp"
@@ -36,6 +36,7 @@ class InboundTransportStreamHandler;
 class AwaitableTaskGroup;
 class SslContext;
 struct ngtcp2_cid;
+namespace proxyman::inbound { struct ReceiverSettings; }
 
 namespace transport::internet::hysteria {
 
@@ -222,11 +223,11 @@ private:
 // stays on its accepting Worker, shared by all its TCP streams and UDP
 // sessions; listeners never transfer received payloads or move their shared
 // sockets.
-class HysteriaIngress final {
+class HysteriaIngress final : public transport::internet::QuicListener {
 public:
     using SocketPtr = std::shared_ptr<udp::socket>;
 
-    HysteriaIngress(uint32_t worker_id, net::io_context& io_context,
+    HysteriaIngress(uint32_t worker_id, uint32_t worker_count, net::io_context& io_context,
                    app::DatagramSessionEnvironment environment);
     ~HysteriaIngress() noexcept;
 
@@ -261,6 +262,7 @@ private:
     app::DatagramSessionEnvironment environment;
     memory::UnorderedMap<Connection*, std::shared_ptr<Connection>> sessions;
     uint32_t worker_id;
+    uint32_t worker_count;
     net::io_context& io;
     Version version = Version::V2;
     uint64_t upload_bytes_per_second = 0;

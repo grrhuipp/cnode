@@ -107,9 +107,7 @@ InboundSpec StaticInboundSpec(StaticInboundConfig source) {
                 std::string(constants::protocol::kDirect))}
             : routing::OutboundSelectionPolicy{routing::ForceOutbound(
                 std::string(constants::protocol::kDirect))});
-    if (source.protocol == constants::protocol::kAnyTLS ||
-        source.protocol == constants::protocol::kHysteria ||
-        source.protocol == constants::protocol::kHysteria2) {
+    if (proxyman::inbound::RegisteredProtocolTraits(source.protocol).mailbox_email_defaults_to_tag) {
         for (auto& user : source.users) {
             if (user.email.empty()) user.email = tag;
         }

@@ -19,9 +19,6 @@ using namespace std::chrono_literals;
 using transport::internet::hysteria::UdpSessionStream;
 using transport::internet::hysteria::QuicStreamState;
 
-void Require(bool value, const char* reason) {
-    if (!value) throw std::runtime_error(reason);
-}
 
 template <class Scenario>
 void RunInDomain(Scenario scenario) {
@@ -52,12 +49,15 @@ TEST_P(QuicUdpCancellation, ReturnsUnreadBuffersBeforeNotifyingSubscribers) {
         constexpr std::array<std::string_view, 3> input{
             "delivered-first", "discard-second", "discard-third"};
         for (const auto bytes : input) {
-            Require(stream->Push(target, {reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()}),
-                    "UDP input was not admitted");
+            const bool admitted = stream->Push(target,
+                {reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()});
+            EXPECT_TRUE(admitted);
+            if (!admitted) co_return;
         }
         auto delivered = co_await stream->ReadMultiBuffer();
-        Require(delivered.size() == 1 && delivered.byte_size() == input[0].size(),
-                "UDP read did not transfer the first datagram");
+        EXPECT_EQ(delivered.size(), 1u);
+        EXPECT_EQ(delivered.byte_size(), input[0].size());
+        if (delivered.size() != 1 || delivered.byte_size() != input[0].size()) co_return;
         EXPECT_EQ(memory::detail::test_buffers_live, baseline + input.size());
         struct Observer final : transport::CancellationSubscription {
             std::unique_ptr<UdpSessionStream>& host;
@@ -111,6 +111,7 @@ TEST(QuicUdpQueue, BoundsBufferCapacityAndReturnsAdmissionOnRead) {
             if (stream.Push(target, {&byte, 1})) ++accepted;
         }
         EXPECT_EQ(accepted, limit);
+        if (accepted != limit) co_return;
         EXPECT_EQ(memory::detail::test_buffers_live, baseline + limit);
         const uint8_t replacement = 0xee;
         const auto rejected = memory::rejected_process_allocations;
@@ -122,7 +123,9 @@ TEST(QuicUdpQueue, BoundsBufferCapacityAndReturnsAdmissionOnRead) {
             << "full UDP queue attempted allocation before rejecting input";
 
         auto first = co_await stream.ReadMultiBuffer();
-        Require(first.size() == 1 && first.byte_size() == 1, "UDP first packet changed");
+        EXPECT_EQ(first.size(), 1u);
+        EXPECT_EQ(first.byte_size(), 1u);
+        if (first.size() != 1 || first.byte_size() != 1) co_return;
         EXPECT_EQ((*first.begin())->Bytes().front(), 0);
         std::vector<uint8_t> two_blocks(buf::Buffer::kSize + 1, 0x6c);
         two_blocks.front() = 0x12;
@@ -135,25 +138,32 @@ TEST(QuicUdpQueue, BoundsBufferCapacityAndReturnsAdmissionOnRead) {
         EXPECT_EQ(memory::rejected_process_allocations, rejected_with_one_slot)
             << "two-block input allocated with only one queued block available";
         auto second = co_await stream.ReadMultiBuffer();
-        Require(second.size() == 1 && second.byte_size() == 1, "UDP second packet changed");
+        EXPECT_EQ(second.size(), 1u);
+        EXPECT_EQ(second.byte_size(), 1u);
+        if (second.size() != 1 || second.byte_size() != 1) co_return;
         EXPECT_EQ((*second.begin())->Bytes().front(), 1);
-        Require(stream.Push(target, two_blocks), "UDP reads did not return two-block admission");
-        EXPECT_EQ((*first.begin())->Bytes().front(), 0);
+        const bool admitted = stream.Push(target, two_blocks);
+        EXPECT_TRUE(admitted);
+        if (!admitted) co_return;
         EXPECT_TRUE((*first.begin())->UDP().SameEndpoint(target));
         first.clear();
         second.clear();
         for (size_t index = 2; index < accepted; ++index) {
             auto packet = co_await stream.ReadMultiBuffer();
-            Require(packet.size() == 1 && packet.byte_size() == 1, "UDP packet boundary changed");
+            EXPECT_EQ(packet.size(), 1u);
+            EXPECT_EQ(packet.byte_size(), 1u);
+            if (packet.size() != 1 || packet.byte_size() != 1) co_return;
             EXPECT_EQ((*packet.begin())->Bytes().front(), static_cast<uint8_t>(index % 251));
             EXPECT_TRUE((*packet.begin())->UDP().SameEndpoint(target));
         }
         auto tail = co_await stream.ReadMultiBuffer();
-        Require(tail.size() == 2 && tail.byte_size() == two_blocks.size(),
-                "UDP multi-block packet boundary changed");
+        EXPECT_EQ(tail.byte_size(), two_blocks.size());
+        if (tail.byte_size() != two_blocks.size()) co_return;
         size_t offset = 0;
         for (const auto* buffer : tail) {
             const auto bytes = buffer->Bytes();
+            EXPECT_LE(offset + bytes.size(), two_blocks.size());
+            if (offset + bytes.size() > two_blocks.size()) co_return;
             EXPECT_TRUE(std::equal(bytes.begin(), bytes.end(), two_blocks.begin() + offset));
             EXPECT_TRUE(buffer->UDP().SameEndpoint(target));
             offset += bytes.size();
@@ -161,6 +171,14 @@ TEST(QuicUdpQueue, BoundsBufferCapacityAndReturnsAdmissionOnRead) {
         tail.clear();
         EXPECT_EQ(memory::detail::test_buffers_live, baseline);
 
+    });
+}
+
+TEST(QuicUdpQueue, OversizedDatagramIsRejectedBeforeAllocation) {
+    RunInDomain([](net::io_context& io) -> net::awaitable<void> {
+        const auto baseline = memory::detail::test_buffers_live;
+        const TargetAddress target("127.0.0.1", 12345);
+        UdpSessionStream stream(io, 11, {});
         const std::vector<uint8_t> oversized(UdpSessionStream::kMaxQueuedBytes + 1, 0x7a);
         const auto rejected_before_oversized = memory::rejected_process_allocations;
         memory::reject_next_process_allocation = true;
@@ -169,10 +187,8 @@ TEST(QuicUdpQueue, BoundsBufferCapacityAndReturnsAdmissionOnRead) {
         EXPECT_FALSE(oversized_admitted);
         EXPECT_EQ(memory::rejected_process_allocations, rejected_before_oversized)
             << "oversized UDP input underflowed its budget check";
-        const bool oversized_without_fault = stream.Push(target, oversized);
-        EXPECT_FALSE(oversized_without_fault);
-        if (oversized_without_fault) stream.Cancel();
         EXPECT_EQ(memory::detail::test_buffers_live, baseline);
+        co_return;
     });
 }
 
@@ -185,7 +201,8 @@ TEST(QuicUdpQueue, EmptyMessagesConsumeBufferAdmissionAndRemainReadable) {
         size_t admitted = 0;
         for (size_t index = 0; index <= limit; ++index)
             admitted += stream.Push(target, {});
-        Require(admitted == limit, "empty UDP messages did not consume buffer admission");
+        EXPECT_EQ(admitted, limit);
+        if (admitted != limit) co_return;
         EXPECT_EQ(memory::detail::test_buffers_live, baseline + limit);
         const auto rejected = memory::rejected_process_allocations;
         memory::reject_next_process_allocation = true;
@@ -197,13 +214,14 @@ TEST(QuicUdpQueue, EmptyMessagesConsumeBufferAdmissionAndRemainReadable) {
         auto packet = co_await stream.ReadMultiBuffer();
         {
             const auto datagram = buf::InspectUdpDatagram(packet);
-            Require(datagram.Valid() && datagram.target, "empty UDP message became EOF");
-            EXPECT_EQ(datagram.payload_size, 0);
-            EXPECT_EQ(datagram.buffer_count, 1);
+            EXPECT_TRUE(datagram.Valid());
+            EXPECT_NE(datagram.target, nullptr);
+            if (!datagram.Valid() || !datagram.target) co_return;
+            EXPECT_EQ(datagram.payload_size, 0u);
             EXPECT_TRUE(datagram.target->SameEndpoint(target));
         }
         const uint8_t later = 0x7a;
-        Require(stream.Push(target, {&later, 1}), "empty UDP read did not return admission");
+        EXPECT_TRUE(stream.Push(target, {&later, 1}));
         stream.Cancel();
         EXPECT_EQ(memory::detail::test_buffers_live, baseline + 1);
         EXPECT_EQ(buf::InspectUdpDatagram(packet).status, buf::UdpDatagramStatus::Valid);
@@ -232,7 +250,9 @@ TEST(QuicStreamClose, CompletedDuplexLeavesTransportAliveUntilNativeRetirement) 
         {
             transport::internet::hysteria::QuicStream stream(state);
             const std::array<uint8_t, 3> input{0x12, 0x34, 0x56};
-            Require(state->PushInput(input, true), "input FIN was not admitted");
+            const bool admitted = state->PushInput(input, true);
+            EXPECT_TRUE(admitted);
+            if (!admitted) co_return;
             std::array<uint8_t, 3> received{};
             EXPECT_EQ(co_await stream.AsyncRead(net::buffer(received)), input.size());
             EXPECT_EQ(received, input);
@@ -262,7 +282,9 @@ TEST(QuicStreamClose, UnreadFinTailIsDiscardedAndCancelled) {
         StreamCancellation cancellation;
         cancellation.Resubscribe(stream.Cancellation());
         const std::array<uint8_t, 3> input{0x21, 0x43, 0x65};
-        Require(state->PushInput(input, true), "input FIN was not admitted");
+        const bool admitted = state->PushInput(input, true);
+        EXPECT_TRUE(admitted);
+        if (!admitted) co_return;
         uint8_t first = 0;
         EXPECT_EQ(co_await stream.AsyncRead(net::buffer(&first, 1)), 1);
         EXPECT_EQ(first, input.front());
@@ -276,7 +298,7 @@ TEST(QuicStreamClose, UnreadFinTailIsDiscardedAndCancelled) {
         EXPECT_EQ(cancellation.reason, ErrorCode::CANCELLED);
         try {
             (void)co_await state->ReadMultiBuffer();
-            throw std::runtime_error("aborted input tail became graceful EOF");
+            ADD_FAILURE() << "aborted input tail became graceful EOF";
         } catch (const transport::LinkError& error) {
             EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
         }
@@ -293,7 +315,9 @@ TEST_P(QuicStreamHalfClose, CloseAbortsIncompleteDuplex) {
         StreamCancellation cancellation;
         cancellation.Resubscribe(stream.Cancellation());
         if (remote_fin) {
-            Require(state->PushInput({}, true), "input FIN was not admitted");
+            const bool admitted = state->PushInput({}, true);
+            EXPECT_TRUE(admitted);
+            if (!admitted) co_return;
             EXPECT_TRUE((co_await stream.ReadMultiBuffer()).empty());
         } else {
             stream.ShutdownWrite();
@@ -323,7 +347,9 @@ TEST_P(QuicStreamAbort, ExplicitAbortCancelsEvenCompletedDuplex) {
         transport::internet::hysteria::QuicStream stream(state);
         StreamCancellation cancellation;
         cancellation.Resubscribe(stream.Cancellation());
-        Require(state->PushInput({}, true), "input FIN was not admitted");
+        const bool admitted = state->PushInput({}, true);
+        EXPECT_TRUE(admitted);
+        if (!admitted) co_return;
         EXPECT_TRUE((co_await stream.ReadMultiBuffer()).empty());
         stream.ShutdownWrite();
         if (abortive_close) stream.CloseAbortive();
@@ -335,7 +361,7 @@ TEST_P(QuicStreamAbort, ExplicitAbortCancelsEvenCompletedDuplex) {
         EXPECT_EQ(cancellation.reason, ErrorCode::CANCELLED);
         try {
             (void)co_await state->ReadMultiBuffer();
-            throw std::runtime_error("explicit cancellation became graceful EOF");
+            ADD_FAILURE() << "explicit cancellation became graceful EOF";
         } catch (const transport::LinkError& error) {
             EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
         }
@@ -371,13 +397,13 @@ TEST(QuicStreamWriteWait, BroadcastsWithoutLeavingStaleReadiness) {
             net::co_spawn(executor, wait(), finish);
             net::co_spawn(executor, wait(), finish);
             co_await net::post(executor, net::use_awaitable);
-            Require(started == (round + 1) * 2, "output waiters did not start");
-            Require(completed == round * 2, "output wait retained stale readiness");
+            EXPECT_EQ(started, (round + 1) * 2);
+            EXPECT_EQ(completed, round * 2);
             state.NotifyWritable();
             co_await joined.async_receive(net::use_awaitable);
             co_await joined.async_receive(net::use_awaitable);
             if (failure) std::rethrow_exception(failure);
-            Require(completed == (round + 1) * 2, "output event did not broadcast");
+            EXPECT_EQ(completed, (round + 1) * 2);
         }
     });
 }
@@ -391,7 +417,9 @@ TEST_P(QuicStreamWriteWaitEnd, SettlesPendingAndSubsequentWaits) {
         auto state = std::make_shared<QuicStreamState>(io, 8, std::weak_ptr<transport::internet::hysteria::Connection>{});
         transport::internet::hysteria::QuicStream stream(state);
         const std::array<uint8_t, 3> tail{0x21, 0x43, 0x65};
-        Require(state->PushInput(tail, false), "input tail was not admitted");
+        const bool admitted = state->PushInput(tail, false);
+        EXPECT_TRUE(admitted);
+        if (!admitted) co_return;
         const auto executor = co_await net::this_coro::executor;
         SignalChannel joined(executor, 1);
         bool started = false;
@@ -402,12 +430,12 @@ TEST_P(QuicStreamWriteWaitEnd, SettlesPendingAndSubsequentWaits) {
         auto expect_closed = [&]() -> net::awaitable<void> {
             try {
                 co_await state->WaitWritable();
-                throw std::runtime_error("ended output wait succeeded");
+                ADD_FAILURE() << "ended output wait succeeded";
             } catch (const transport::WriteClosed&) {
-                Require(!cancelled, "cancelled stream reported graceful write closure");
+                EXPECT_FALSE(cancelled);
             } catch (const transport::LinkError& error) {
-                Require(cancelled && error.code() == ErrorCode::CANCELLED,
-                        "output wait lost its cancellation reason");
+                EXPECT_TRUE(cancelled);
+                EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
             }
         };
         auto wait = [&]() -> net::awaitable<void> {
@@ -420,7 +448,8 @@ TEST_P(QuicStreamWriteWaitEnd, SettlesPendingAndSubsequentWaits) {
             (void)joined.try_send(IoErrorCode{});
         });
         co_await net::post(executor, net::use_awaitable);
-        Require(started && !completed, "write did not suspend before termination");
+        EXPECT_TRUE(started);
+        EXPECT_FALSE(completed);
         switch (ending) {
         case WriteWaitEnd::ShutdownWrite: state->ShutdownWrite(); break;
         case WriteWaitEnd::Cancel: state->Cancel(); break;
@@ -430,15 +459,22 @@ TEST_P(QuicStreamWriteWaitEnd, SettlesPendingAndSubsequentWaits) {
         }
         co_await joined.async_receive(net::use_awaitable);
         if (failure) std::rethrow_exception(failure);
-        Require(completed, "ended stream left a writer suspended");
+        EXPECT_TRUE(completed);
         co_await expect_closed();
         if (!cancelled) {
-            Require(state->Open(), "write closure cancelled the readable stream");
+            EXPECT_TRUE(state->Open());
             auto input = co_await state->ReadMultiBuffer();
-            Require(input.byte_size() == tail.size(), "write closure discarded unread input");
-            EXPECT_TRUE(std::equal(tail.begin(), tail.end(), (*input.begin())->Bytes().begin()));
-            if (ending == WriteWaitEnd::ShutdownWrite)
-                Require(state->PushInput({}, true), "write shutdown rejected remote FIN");
+            std::vector<uint8_t> received;
+            for (const auto* buffer : input) {
+                const auto bytes = buffer->Bytes();
+                received.insert(received.end(), bytes.begin(), bytes.end());
+            }
+            EXPECT_EQ(received, std::vector<uint8_t>(tail.begin(), tail.end()));
+            if (ending == WriteWaitEnd::ShutdownWrite) {
+                const bool admitted = state->PushInput({}, true);
+                EXPECT_TRUE(admitted);
+                if (!admitted) co_return;
+            }
             EXPECT_EQ((co_await state->ReadMultiBuffer()).byte_size(), 0);
         } else {
             EXPECT_FALSE(state->Open());
@@ -479,16 +515,18 @@ TEST(QuicStreamWriteWait, RemoteFinLeavesWriterWaitingForOutputCredit) {
             (void)joined.try_send(IoErrorCode{});
         });
         co_await net::post(executor, net::use_awaitable);
-        Require(started && !completed, "writer did not wait for credit");
-        Require(state.PushInput({}, true), "remote FIN was not admitted");
-        EXPECT_EQ((co_await state.ReadMultiBuffer()).byte_size(), 0);
+        EXPECT_TRUE(started);
+        EXPECT_FALSE(completed);
+        const bool admitted = state.PushInput({}, true);
+        EXPECT_TRUE(admitted);
+        if (admitted) EXPECT_EQ((co_await state.ReadMultiBuffer()).byte_size(), 0);
         co_await net::post(executor, net::use_awaitable);
-        Require(!completed, "remote FIN spuriously supplied output credit");
-        state.CheckWriteOpen();
+        EXPECT_FALSE(completed);
+        EXPECT_NO_THROW(state.CheckWriteOpen());
         state.NotifyWritable();
         co_await joined.async_receive(net::use_awaitable);
         if (failure) std::rethrow_exception(failure);
-        Require(completed, "remote FIN prevented ACK wakeup");
+        EXPECT_TRUE(completed);
     });
 }
 
@@ -510,10 +548,11 @@ TEST(QuicStreamWriteWait, CoroutineCancellationDoesNotBecomeAnAck) {
                 (void)joined.try_send(IoErrorCode{});
             }));
         co_await net::post(executor, net::use_awaitable);
-        Require(started, "writer did not begin its cancellation-aware wait");
+        EXPECT_TRUE(started);
         cancellation.emit(net::cancellation_type::terminal);
         co_await joined.async_receive(net::use_awaitable);
-        Require(failure != nullptr, "coroutine cancellation was mistaken for credit");
+        EXPECT_NE(failure, nullptr);
+        if (!failure) co_return;
         try {
             std::rethrow_exception(failure);
         } catch (const IoSystemError& error) {

@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -22,10 +23,11 @@
 
 namespace transport::internet {
 
-// HTTP/1 message head read into one Buffer. Bytes past the blank line
-// are read-ahead that the caller must hand to the next reader in order.
+// HTTP/1 message head starts in one Buffer; explicit larger budgets may grow
+// owned storage only for bytes received. Bytes past the blank line are read-ahead.
 struct Http1MessageHead {
     buf::BufferGuard storage;
+    memory::String extended_storage;
     const uint8_t* bytes = nullptr;
     size_t header_end = 0;
     size_t size = 0;
@@ -49,7 +51,7 @@ struct Http1MessageHead {
             storage->Advance(static_cast<uint32_t>(header_end));
             return buf::MultiBuffer{std::move(storage)};
         }
-        // Read-ahead bytes always live in `storage`; copy them before releasing it.
+        // Expanded heads retain their own storage; copy only the read-ahead.
         buf::MultiBuffer mb;
         const auto read_ahead = ReadAhead();
         size = header_end;
@@ -60,15 +62,22 @@ struct Http1MessageHead {
     }
 };
 
-// `initial` holds bytes already consumed while sniffing the protocol. Fails
-// with SOCKET_EOF on peer close and PROTOCOL_DECODE_FAILED when the head does
-// not fit one Buffer.
+struct Http1HeadReadLimits {
+    // Zero keeps the ordinary transport's single-Buffer limit.
+    size_t max_head_bytes = 0;
+    // Content bytes, excluding CRLF; zero adds no separate line limit.
+    size_t max_line_bytes = 0;
+};
+
+// `initial` holds bytes already consumed while sniffing the protocol.
 [[nodiscard]] net::awaitable<tl::expected<void, ErrorCode>>
 ReadHttp1MessageHead(AsyncStream& stream,
                      Http1MessageHead& head,
-                     std::span<const uint8_t> initial = {});
+                     std::span<const uint8_t> initial = {},
+                     Http1HeadReadLimits limits = {});
 [[nodiscard]] net::awaitable<tl::expected<Http1MessageHead, ErrorCode>>
-ReadHttp1MessageHead(AsyncStream& stream, std::span<const uint8_t> initial = {});
+ReadHttp1MessageHead(AsyncStream& stream, std::span<const uint8_t> initial = {},
+                     Http1HeadReadLimits limits = {});
 
 [[nodiscard]] std::string_view ExtractStartLine(std::string_view head);
 struct Http1RequestLine {
@@ -189,14 +198,38 @@ struct Http1BodyContentLength {
 using Http1ReadFraming =
     std::variant<Http1BodyUntilClose, Http1BodyChunked, Http1BodyContentLength>;
 
+struct Http1ResponseHead {
+    Http1MessageHead head;
+    int status = 0;
+    Http1ReadFraming framing = Http1BodyUntilClose{};
+    size_t header_bytes = 0; // Includes all interim heads and the final head.
+};
+
+// Reads the final response, consuming bounded interim heads. Applies RFC 9112
+// message-length precedence and rejects unsupported transfer codings.
+[[nodiscard]] net::awaitable<tl::expected<Http1ResponseHead, ErrorCode>>
+ReadHttp1ResponseHead(AsyncStream& stream, Http1HeadReadLimits limits = {});
+
+struct Http1BodyReadOptions {
+    uint64_t max_body_bytes = std::numeric_limits<uint64_t>::max();
+    size_t max_line_bytes = 8192 - 2; // Chunk/trailer line content, excluding CRLF.
+    size_t max_trailer_lines = 128;
+    size_t max_trailer_bytes = 64 * 1024;
+    bool count_trailer_terminator = false;
+    bool reject_trailing_read_ahead = false;
+};
+
 // HTTP/1 message body over an established connection; `read_ahead` is body
 // data already read with the message head. Bytes past a chunked or
 // Content-Length body never reach the reader.
+// One-shot consumers may reject already-buffered bytes beyond that boundary;
+// no extra socket read is performed to look for a following message.
 [[nodiscard]] std::unique_ptr<AsyncStream> MakeHttp1BodyStream(
     std::unique_ptr<AsyncStream> inner,
     Http1ReadFraming read_framing,
     bool write_chunked,
-    buf::MultiBuffer&& read_ahead = {});
+    buf::MultiBuffer&& read_ahead = {},
+    Http1BodyReadOptions read_options = {});
 
 [[nodiscard]] net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     std::unique_ptr<AsyncStream> stream,

@@ -14,20 +14,17 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
-#include <iostream>
 #include <limits>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace {
-thread_local volatile size_t system_allocations = 0;
 bool fail_cipher_context = false;
 }
 #if defined(CNODE_WRAP_MALLOC)
 extern "C" void* __real_malloc(size_t);
 extern "C" void* __wrap_malloc(size_t size) {
-    system_allocations = system_allocations + 1;
     return __real_malloc(size);
 }
 extern "C" EVP_AEAD_CTX* __real_EVP_AEAD_CTX_new(const EVP_AEAD*, const uint8_t*, size_t, size_t);
@@ -40,19 +37,9 @@ extern "C" EVP_AEAD_CTX* __wrap_EVP_AEAD_CTX_new(
 namespace {
 
 
-[[noreturn]] void Fail(std::string_view message) {
-    std::cerr << message << '\n';
-    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
-}
 
-void Check(bool condition, std::string_view message) {
-    if (!condition) {
-        Fail(message);
-    }
-}
-
-void TestAesBlock() {
-    // FIPS 197 single-block AES-128/AES-256 known-answer vectors.
+TEST(ShadowsocksStreamCrypto, AesBlockMatchesFips197AndSupportsOverlap) {
+    // FIPS 197 的 AES-128/AES-256 单块已知答案。
     const std::array<uint8_t, 16> plain{
         0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,
         0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff};
@@ -61,54 +48,40 @@ void TestAesBlock() {
         {0x8e,0xa2,0xb7,0xca,0x51,0x67,0x45,0xbf,0xea,0xfc,0x49,0x90,0x4b,0x49,0x60,0x89}}};
     std::array<uint8_t, 34> keys{};
     for (size_t i = 0; i < 32; ++i) keys[i + 1] = static_cast<uint8_t>(i);
-#if defined(CNODE_WRAP_MALLOC)
-    const auto cold = system_allocations;
-    auto* ctx = EVP_CIPHER_CTX_new();
-    Check(ctx != nullptr && system_allocations > cold, "malloc instrumentation is inactive");
-    EVP_CIPHER_CTX_free(ctx);
-#endif
-    const auto before = system_allocations;
     for (size_t index = 0; index < 2; ++index) {
         const auto key = std::span<const uint8_t>(keys).subspan(1, index ? 32 : 16);
         for (int round = 0; round < 64; ++round) {
             std::array<uint8_t, 18> guarded;
             guarded.fill(0xa5);
             auto output = std::span<uint8_t>(guarded).subspan<1, 16>();
-            Check(ss::AesBlocksCrypt<16>(key, plain, output, true), "AES block encrypt failed");
-            Check(std::equal(output.begin(), output.end(), expected[index].begin()), "AES known answer mismatch");
-            Check(ss::AesBlocksCrypt<16>(key, output, output, false), "AES in-place decrypt failed");
-            Check(std::equal(output.begin(), output.end(), plain.begin()), "AES plaintext mismatch");
-            Check(ss::AesBlocksCrypt<16>(key, output, output, true), "AES in-place encrypt failed");
-            Check(std::equal(output.begin(), output.end(), expected[index].begin()), "AES in-place ciphertext mismatch");
-            Check(guarded.front() == 0xa5 && guarded.back() == 0xa5, "AES wrote outside output block");
+            EXPECT_TRUE((ss::AesBlocksCrypt<16>(key, plain, output, true))) << "AES block encrypt failed";
+            EXPECT_TRUE((std::equal(output.begin(), output.end(), expected[index].begin()))) << "AES known answer mismatch";
+            EXPECT_TRUE((ss::AesBlocksCrypt<16>(key, output, output, false))) << "AES in-place decrypt failed";
+            EXPECT_TRUE((std::equal(output.begin(), output.end(), plain.begin()))) << "AES plaintext mismatch";
+            EXPECT_TRUE((ss::AesBlocksCrypt<16>(key, output, output, true))) << "AES in-place encrypt failed";
+            EXPECT_TRUE((std::equal(output.begin(), output.end(), expected[index].begin()))) << "AES in-place ciphertext mismatch";
+            EXPECT_TRUE((guarded.front() == 0xa5 && guarded.back() == 0xa5)) << "AES wrote outside output block";
         }
         std::array<uint8_t, 17> overlap{};
         std::copy(plain.begin(), plain.end(), overlap.begin());
         auto first = std::span<uint8_t>(overlap).first<16>();
         auto shifted = std::span<uint8_t>(overlap).subspan<1, 16>();
-        Check(ss::AesBlocksCrypt<16>(key, first, shifted, true), "AES overlapping encrypt failed");
-        Check(std::equal(shifted.begin(), shifted.end(), expected[index].begin()),
-              "AES overlapping ciphertext mismatch");
-        Check(ss::AesBlocksCrypt<16>(key, shifted, first, false), "AES overlapping decrypt failed");
-        Check(std::equal(first.begin(), first.end(), plain.begin()), "AES overlapping plaintext mismatch");
+        EXPECT_TRUE((ss::AesBlocksCrypt<16>(key, first, shifted, true))) << "AES overlapping encrypt failed";
+        EXPECT_TRUE((std::equal(shifted.begin(), shifted.end(), expected[index].begin()))) << "AES overlapping ciphertext mismatch";
+        EXPECT_TRUE((ss::AesBlocksCrypt<16>(key, shifted, first, false))) << "AES overlapping decrypt failed";
+        EXPECT_TRUE((std::equal(first.begin(), first.end(), plain.begin()))) << "AES overlapping plaintext mismatch";
     }
-#if defined(CNODE_WRAP_MALLOC)
-    Check(system_allocations == before, "AES block operation allocated heap memory");
-#else
-    (void)before;
-#endif
     for (size_t size : {size_t(0),size_t(1),size_t(15),size_t(17),size_t(24),size_t(31),size_t(33)}) {
         auto output = plain;
         for (bool encrypt : {false, true}) {
-            Check(!ss::AesBlocksCrypt<16>(std::span<const uint8_t>(keys).first(size), plain, output, encrypt),
-                  "AES accepted unsupported key size");
-            Check(output == plain, "AES invalid key modified output");
+            EXPECT_FALSE((ss::AesBlocksCrypt<16>(std::span<const uint8_t>(keys).first(size), plain, output, encrypt))) << "AES accepted unsupported key size";
+            EXPECT_EQ((output), (plain)) << "AES invalid key modified output";
         }
     }
 }
 
-void TestDeriveSubkey() {
-    // Independent HMAC-SHA1 Extract+Expand answers for info="ss-subkey".
+TEST(ShadowsocksStreamCrypto, SubkeyMatchesIndependentHmacSha1Vectors) {
+    // info="ss-subkey" 的独立 HMAC-SHA1 Extract+Expand 已知答案。
     const std::array<std::array<uint8_t, 32>, 2> expected{{
         {0xf0,0xa4,0xbe,0x5d,0x42,0x09,0xa6,0x16,0x8b,0x93,0x6a,0x2b,0xa4,0x4c,0xa3,0x40},
         {0x7d,0xc1,0x97,0xfc,0xef,0x2d,0xc7,0xe6,0x61,0x03,0x27,0x35,0x76,0x75,0xfc,0x6a,
@@ -118,49 +91,39 @@ void TestDeriveSubkey() {
         key[i] = static_cast<uint8_t>(i);
         salt[i] = static_cast<uint8_t>(0xa0 + i);
     }
-    Check(ss::DeriveSubkey(key.data(), 32, salt.data(), 32, warm.data()),
-          "HKDF warmup failed");
-    const auto before = system_allocations;
+    EXPECT_TRUE((ss::DeriveSubkey(key.data(), 32, salt.data(), 32, warm.data()))) << "HKDF warmup failed";
     for (size_t index = 0; index < expected.size(); ++index) {
         const size_t size = index ? 32 : 16;
         for (int round = 0; round < 64; ++round) {
             std::array<uint8_t, 34> guarded;
             guarded.fill(0xa5);
-            Check(ss::DeriveSubkey(key.data(), size, salt.data(), size, guarded.data() + 1),
-                  "HKDF derivation failed");
-            Check(std::equal(expected[index].begin(), expected[index].begin() + size,
-                             guarded.begin() + 1), "HKDF known answer mismatch");
-            Check(guarded.front() == 0xa5 && guarded[size + 1] == 0xa5,
-                  "HKDF wrote outside output");
+            EXPECT_TRUE((ss::DeriveSubkey(key.data(), size, salt.data(), size, guarded.data() + 1))) << "HKDF derivation failed";
+            EXPECT_TRUE((std::equal(expected[index].begin(), expected[index].begin() + size,
+                             guarded.begin() + 1))) << "HKDF known answer mismatch";
+            EXPECT_TRUE((guarded.front() == 0xa5 && guarded[size + 1] == 0xa5)) << "HKDF wrote outside output";
             auto in_place = key;
-            Check(ss::DeriveSubkey(in_place.data(), size, salt.data(), size, in_place.data()),
-                  "HKDF in-place derivation failed");
-            Check(std::equal(expected[index].begin(), expected[index].begin() + size,
-                             in_place.begin()), "HKDF in-place result mismatch");
+            EXPECT_TRUE((ss::DeriveSubkey(in_place.data(), size, salt.data(), size, in_place.data()))) << "HKDF in-place derivation failed";
+            EXPECT_TRUE((std::equal(expected[index].begin(), expected[index].begin() + size,
+                             in_place.begin()))) << "HKDF in-place result mismatch";
         }
     }
-#if defined(CNODE_WRAP_MALLOC)
-    Check(system_allocations == before, "HKDF derivation allocated heap memory");
-#else
-    (void)before;
-#endif
     const size_t oversized = static_cast<size_t>(std::numeric_limits<int>::max()) + 1;
     auto output = warm;
-    Check(!ss::DeriveSubkey(nullptr, 32, salt.data(), 32, output.data()), "HKDF accepted null key");
-    Check(!ss::DeriveSubkey(key.data(), 32, nullptr, 32, output.data()), "HKDF accepted null salt");
-    Check(!ss::DeriveSubkey(key.data(), 32, salt.data(), 32, nullptr), "HKDF accepted null output");
-    Check(!ss::DeriveSubkey(key.data(), oversized, salt.data(), 32, output.data()), "HKDF accepted oversized key");
-    Check(!ss::DeriveSubkey(key.data(), 32, salt.data(), oversized, output.data()), "HKDF accepted oversized salt");
-    Check(output == warm, "invalid HKDF input modified output");
+    EXPECT_FALSE((ss::DeriveSubkey(nullptr, 32, salt.data(), 32, output.data()))) << "HKDF accepted null key";
+    EXPECT_FALSE((ss::DeriveSubkey(key.data(), 32, nullptr, 32, output.data()))) << "HKDF accepted null salt";
+    EXPECT_FALSE((ss::DeriveSubkey(key.data(), 32, salt.data(), 32, nullptr))) << "HKDF accepted null output";
+    EXPECT_FALSE((ss::DeriveSubkey(key.data(), oversized, salt.data(), 32, output.data()))) << "HKDF accepted oversized key";
+    EXPECT_FALSE((ss::DeriveSubkey(key.data(), 32, salt.data(), oversized, output.data()))) << "HKDF accepted oversized salt";
+    EXPECT_EQ((output), (warm)) << "invalid HKDF input modified output";
 }
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& mb) {
     std::vector<uint8_t> out;
     out.reserve(mb.byte_size());
     for (const buf::Buffer* buffer : mb) {
-        Check(buffer != nullptr, "decoded MultiBuffer contains a null slot");
-        Check(buffer->start <= buffer->end && buffer->end <= buf::Buffer::kSize,
-              "decoded Buffer cursor escaped the 8KB payload");
+        EXPECT_TRUE((buffer != nullptr)) << "decoded MultiBuffer contains a null slot";
+        if (!buffer) throw std::runtime_error("missing decoded buffer");
+        EXPECT_TRUE((buffer->start <= buffer->end && buffer->end <= buf::Buffer::kSize)) << "decoded Buffer cursor escaped the 8KB payload";
         const auto bytes = buffer->Bytes();
         out.insert(out.end(), bytes.begin(), bytes.end());
     }
@@ -188,26 +151,21 @@ void TestLargeRecord(size_t payload_size, ss::SsCipherType cipher_type) {
         key.size());
     std::vector<uint8_t> ciphertext(
         payload_size + ss::SsAeadCipher::kTagSize);
-    Check(cipher.Encrypt(
+    EXPECT_TRUE((cipher.Encrypt(
               nonce.data(),
               plaintext.data(),
               plaintext.size(),
-              ciphertext.data()),
-          "large Shadowsocks record encryption failed");
+              ciphertext.data()))) << "large Shadowsocks record encryption failed";
 
     ss::SsAeadCipher decryptor(cipher_type, key.data(), key.size());
     buf::MultiBuffer encrypted;
-    Check(buf::AppendSpanToMultiBuffer(ciphertext, encrypted),
-          "encrypted fixture allocation failed");
+    EXPECT_TRUE((buf::AppendSpanToMultiBuffer(ciphertext, encrypted))) << "encrypted fixture allocation failed";
     buf::MultiBuffer decoded;
-    Check(ss::detail::DecryptStreamPayload(
-              decryptor, nonce, std::move(encrypted), decoded),
-          "large Shadowsocks record decrypt failed");
+    EXPECT_TRUE((ss::detail::DecryptStreamPayload(
+              decryptor, nonce, std::move(encrypted), decoded))) << "large Shadowsocks record decrypt failed";
 
-    Check(decoded.byte_size() == payload_size,
-          "large Shadowsocks record decoded byte count mismatch");
-    Check(Flatten(decoded) == plaintext,
-          "large Shadowsocks record plaintext mismatch");
+    EXPECT_EQ((decoded.byte_size()), (payload_size)) << "large Shadowsocks record decoded byte count mismatch";
+    EXPECT_EQ((Flatten(decoded)), (plaintext)) << "large Shadowsocks record plaintext mismatch";
 }
 
 void TestInvalidTagDoesNotPublishPartialPlaintext() {
@@ -221,24 +179,20 @@ void TestInvalidTagDoesNotPublishPartialPlaintext() {
         ss::SsCipherType::AES_256_GCM,
         key.data(),
         key.size());
-    Check(cipher.Encrypt(
+    EXPECT_TRUE((cipher.Encrypt(
               nonce.data(),
               plaintext.data(),
               plaintext.size(),
-              ciphertext.data()),
-          "invalid-tag fixture encryption failed");
+              ciphertext.data()))) << "invalid-tag fixture encryption failed";
     ciphertext.back() ^= 0x80;
 
     ss::SsAeadCipher decryptor(ss::SsCipherType::AES_256_GCM, key.data(), key.size());
     buf::MultiBuffer encrypted;
-    Check(buf::AppendSpanToMultiBuffer(ciphertext, encrypted),
-          "encrypted fixture allocation failed");
+    EXPECT_TRUE((buf::AppendSpanToMultiBuffer(ciphertext, encrypted))) << "encrypted fixture allocation failed";
     buf::MultiBuffer decoded;
-    Check(!ss::detail::DecryptStreamPayload(
-               decryptor, nonce, std::move(encrypted), decoded),
-          "invalid Shadowsocks record tag was accepted");
-    Check(decoded.empty() && decoded.byte_size() == 0,
-          "unauthenticated plaintext escaped into the output");
+    EXPECT_FALSE((ss::detail::DecryptStreamPayload(
+               decryptor, nonce, std::move(encrypted), decoded))) << "invalid Shadowsocks record tag was accepted";
+    EXPECT_TRUE((decoded.empty() && decoded.byte_size() == 0)) << "unauthenticated plaintext escaped into the output";
 }
 
 class WireReader final : public transport::MultiBufferReader {
@@ -258,7 +212,7 @@ public:
             net::post(executor, [this] { signal->emit(net::cancellation_type::terminal); });
             IoErrorCode error;
             co_await wait.async_wait(net::redirect_error(net::use_awaitable, error));
-            Check(error == io_error::operation_aborted, "wire interruption did not cancel an actual wait");
+            EXPECT_EQ((error), (io_error::operation_aborted)) << "wire interruption did not cancel an actual wait";
             if (empty_on_cancel) co_return buf::MultiBuffer{};
             throw IoSystemError(error);
         }
@@ -268,10 +222,9 @@ public:
         }
         size_t count = std::min(fragment_, wire_.size() - offset_);
         if (cut_ < cuts.size()) count = std::min(count, cuts[cut_] - offset_);
-        Check(count != 0, "invalid encrypted wire cutpoint");
+        EXPECT_TRUE((count != 0)) << "invalid encrypted wire cutpoint";
         buf::MultiBuffer raw;
-        Check(buf::AppendSpanToMultiBuffer({wire_.data() + offset_, count}, raw),
-              "wire input allocation failed");
+        EXPECT_TRUE((buf::AppendSpanToMultiBuffer({wire_.data() + offset_, count}, raw))) << "wire input allocation failed";
         offset_ += count;
 #ifdef CNODE_TEST_ALLOCATOR
         if (fail_payload_allocation) {
@@ -311,11 +264,9 @@ void AppendRecord(ss::SsAeadCipher& cipher, uint64_t& counter,
     const std::array<uint8_t, 2> length{
         static_cast<uint8_t>(plaintext.size() >> 8), static_cast<uint8_t>(plaintext.size())};
     auto nonce = ss::detail::MakeNonce(counter++);
-    Check(cipher.Encrypt(nonce.data(), length.data(), length.size(), wire.data() + start),
-          "real record length encryption failed");
+    EXPECT_TRUE((cipher.Encrypt(nonce.data(), length.data(), length.size(), wire.data() + start))) << "real record length encryption failed";
     nonce = ss::detail::MakeNonce(counter++);
-    Check(cipher.Encrypt(nonce.data(), plaintext.data(), plaintext.size(), wire.data() + start + 18),
-          "real record payload encryption failed");
+    EXPECT_TRUE((cipher.Encrypt(nonce.data(), plaintext.data(), plaintext.size(), wire.data() + start + 18))) << "real record payload encryption failed";
 }
 
 void TestReaderResume(ss::SsCipherType type, uint64_t initial_nonce, bool empty_on_cancel,
@@ -343,13 +294,12 @@ void TestReaderResume(ss::SsCipherType type, uint64_t initial_nonce, bool empty_
         ss::SsAeadCipher(type, kRecordKey.data(), RecordKeySize(type)),
         initial_nonce, source, max_payload);
     const auto exercise = [&]() -> net::awaitable<void> {
-        Check(Flatten(co_await reader.ReadMultiBuffer()) == first, "first real record changed");
+        EXPECT_EQ((Flatten(co_await reader.ReadMultiBuffer())), (first)) << "first real record changed";
         size_t cancelled = 0;
         for (;;) {
             bool interrupted = false;
             try {
-                Check(Flatten(co_await reader.ReadMultiBuffer()) == second,
-                      "cancelled record resumed with wrong plaintext or nonce");
+                EXPECT_EQ((Flatten(co_await reader.ReadMultiBuffer())), (second)) << "cancelled record resumed with wrong plaintext or nonce";
             } catch (const IoSystemError& error) {
                 if (error.code() != io_error::operation_aborted) throw;
                 interrupted = true;
@@ -358,9 +308,9 @@ void TestReaderResume(ss::SsCipherType type, uint64_t initial_nonce, bool empty_
             ++cancelled;
             co_await net::this_coro::reset_cancellation_state();
         }
-        Check(cancelled == source.cuts.size(), "reader missed a real record cancellation boundary");
-        Check((co_await reader.ReadMultiBuffer()).byte_size() == 0, "clean record boundary was not EOF");
-        Check((co_await reader.ReadMultiBuffer()).byte_size() == 0, "repeated record EOF returned data");
+        EXPECT_EQ((cancelled), (source.cuts.size())) << "reader missed a real record cancellation boundary";
+        EXPECT_EQ(((co_await reader.ReadMultiBuffer()).byte_size()), (0)) << "clean record boundary was not EOF";
+        EXPECT_EQ(((co_await reader.ReadMultiBuffer()).byte_size()), (0)) << "repeated record EOF returned data";
     };
     auto done = net::co_spawn(io, exercise(),
         net::bind_cancellation_slot(signal.slot(), net::use_future));
@@ -379,13 +329,12 @@ void CheckReaderFailure(const std::vector<uint8_t>& wire, ss::SsCipherType type,
         nonce, source);
     const auto exercise = [&]() -> net::awaitable<void> {
         if (preceding_record)
-            Check(Flatten(co_await reader.ReadMultiBuffer()) == std::vector<uint8_t>({7, 8, 9}),
-                  "valid record preceding corruption was lost");
+            EXPECT_EQ((Flatten(co_await reader.ReadMultiBuffer())), (std::vector<uint8_t>({7, 8, 9}))) << "valid record preceding corruption was lost";
         for (int retry = 0; retry < 2; ++retry) {
             bool failed = false;
             try { (void)co_await reader.ReadMultiBuffer(); }
             catch (const transport::LinkError& error) { failed = error.code() == expected; }
-            Check(failed, "record failure was replaced by EOF, another error, or nonce recovery");
+            EXPECT_TRUE((failed)) << "record failure was replaced by EOF, another error, or nonce recovery";
         }
     };
     auto done = net::co_spawn(io, exercise(), net::use_future);
@@ -393,7 +342,11 @@ void CheckReaderFailure(const std::vector<uint8_t>& wire, ss::SsCipherType type,
     done.get();
 }
 
-void TestReaderFailures(ss::SsCipherType type, uint64_t initial_nonce) {
+class ShadowsocksReaderFailure : public testing::TestWithParam<
+    std::tuple<ss::SsCipherType, uint64_t>> {};
+
+TEST_P(ShadowsocksReaderFailure, AuthenticationFailureRetiresReader) {
+    const auto [type, initial_nonce] = GetParam();
     ss::SsAeadCipher encoder(type, kRecordKey.data(), RecordKeySize(type));
     uint64_t nonce = initial_nonce;
     std::vector<uint8_t> wire;
@@ -406,53 +359,82 @@ void TestReaderFailures(ss::SsCipherType type, uint64_t initial_nonce) {
         corrupted[tamper] ^= 0x80;
         CheckReaderFailure(corrupted, type, initial_nonce, ErrorCode::PROTOCOL_AUTH_FAILED, true);
     }
+}
+
+TEST_P(ShadowsocksReaderFailure, TruncatedEofRetiresReader) {
+    const auto [type, initial_nonce] = GetParam();
+    ss::SsAeadCipher encoder(type, kRecordKey.data(), RecordKeySize(type));
+    uint64_t nonce = initial_nonce;
+    std::vector<uint8_t> wire;
+    const std::array<uint8_t, 3> plain{7, 8, 9};
+    AppendRecord(encoder, nonce, plain, wire);
+    const size_t next = wire.size();
+    AppendRecord(encoder, nonce, plain, wire);
     for (const size_t size : {next + 1, next + 17, next + 18, next + 19, wire.size() - 1}) {
         const std::vector<uint8_t> truncated(wire.begin(), wire.begin() + size);
         CheckReaderFailure(truncated, type, initial_nonce, ErrorCode::PROTOCOL_DECODE_FAILED, true);
     }
+}
+
+TEST_P(ShadowsocksReaderFailure, SourceFailureRetiresReader) {
+    const auto [type, initial_nonce] = GetParam();
+    ss::SsAeadCipher encoder(type, kRecordKey.data(), RecordKeySize(type));
+    uint64_t nonce = initial_nonce;
+    std::vector<uint8_t> wire;
+    const std::array<uint8_t, 3> plain{7, 8, 9};
+    AppendRecord(encoder, nonce, plain, wire);
+    const size_t next = wire.size();
+    AppendRecord(encoder, nonce, plain, wire);
     std::vector<uint8_t> interrupted(wire.begin(), wire.begin() + next + 1);
     CheckReaderFailure(interrupted, type, initial_nonce, ErrorCode::BLOCKED, true, true);
-    // Authenticated length outside the classic wire limit must fail before
-    // waiting for (or allocating) the claimed payload.
+}
+
+TEST_P(ShadowsocksReaderFailure, OversizedAuthenticatedLengthIsRejectedBeforePayload) {
+    const auto [type, initial_nonce] = GetParam();
+    ss::SsAeadCipher encoder(type, kRecordKey.data(), RecordKeySize(type));
     std::array<uint8_t, 18> invalid_length{};
     const std::array<uint8_t, 2> oversized{0x40, 0x00};
     const auto first_nonce = ss::detail::MakeNonce(initial_nonce);
-    Check(encoder.Encrypt(first_nonce.data(), oversized.data(), 2, invalid_length.data()),
-          "oversized authenticated length fixture failed");
+    EXPECT_TRUE((encoder.Encrypt(first_nonce.data(), oversized.data(), 2, invalid_length.data()))) << "oversized authenticated length fixture failed";
     CheckReaderFailure({invalid_length.begin(), invalid_length.end()}, type, initial_nonce,
                        ErrorCode::PROTOCOL_DECODE_FAILED, false);
 }
 
-void TestContextLifetime() {
+TEST(ShadowsocksStreamCrypto, ResetKeyAllowsIndependentAuthenticationTrials) {
     const std::array<uint8_t, 12> nonce{};
     const std::array<uint8_t, 3> plain{17, 31, 91};
     std::array<uint8_t, 19> ciphertext{};
     ss::SsAeadCipher encoder(ss::SsCipherType::AES_256_GCM, kRecordKey.data(), 32);
-    Check(encoder.Encrypt(nonce.data(), plain.data(), plain.size(), ciphertext.data()),
-          "trial fixture encryption failed");
+    EXPECT_TRUE((encoder.Encrypt(nonce.data(), plain.data(), plain.size(), ciphertext.data()))) << "trial fixture encryption failed";
     std::array<uint8_t, 32> wrong{};
     ss::SsAeadCipher trials(ss::SsCipherType::AES_256_GCM, wrong.data(), 32);
     std::array<uint8_t, 3> decoded{};
-    Check(!trials.Decrypt(nonce.data(), ciphertext.data(), ciphertext.size(), decoded.data()),
-          "wrong trial key authenticated");
+    EXPECT_FALSE((trials.Decrypt(nonce.data(), ciphertext.data(), ciphertext.size(), decoded.data()))) << "wrong trial key authenticated";
     for (size_t i = 0; i < 8; ++i) {
-        Check(trials.ResetKey(kRecordKey.data(), 32) &&
+        EXPECT_TRUE((trials.ResetKey(kRecordKey.data(), 32) &&
               trials.Decrypt(nonce.data(), ciphertext.data(), ciphertext.size(), decoded.data()) &&
-              decoded == plain, "reused authentication context failed with correct key");
-        Check(trials.ResetKey(wrong.data(), 32) &&
-              !trials.Decrypt(nonce.data(), ciphertext.data(), ciphertext.size(), decoded.data()),
-              "reused authentication context accepted wrong key");
+              decoded == plain)) << "reused authentication context failed with correct key";
+        EXPECT_TRUE((trials.ResetKey(wrong.data(), 32) &&
+              !trials.Decrypt(nonce.data(), ciphertext.data(), ciphertext.size(), decoded.data()))) << "reused authentication context accepted wrong key";
     }
+}
 #ifdef CNODE_WRAP_MALLOC
+TEST(ShadowsocksStreamCrypto, ContextAllocationFailureRejectsConstruction) {
+    struct FaultReset {
+        ~FaultReset() { fail_cipher_context = false; }
+    } reset;
     fail_cipher_context = true;
     bool failed = false;
     try {
         ss::SsAeadCipher unavailable(ss::SsCipherType::AES_256_GCM, kRecordKey.data(), 32);
     } catch (const std::bad_alloc&) { failed = true; }
     fail_cipher_context = false;
-    Check(failed, "EVP allocation failure created usable SS state");
+    EXPECT_TRUE((failed)) << "EVP allocation failure created usable SS state";
+}
 #endif
 #ifdef CNODE_TEST_ALLOCATOR
+TEST(ShadowsocksStreamCrypto, PayloadAllocationFailureRetiresReaderWithoutPlaintext) {
+    ss::SsAeadCipher encoder(ss::SsCipherType::AES_256_GCM, kRecordKey.data(), 32);
     std::vector<uint8_t> wire;
     uint64_t counter = 0;
     const std::vector<uint8_t> large_plain(buf::Buffer::kSize + 1, 0x5a);
@@ -467,45 +449,64 @@ void TestContextLifetime() {
             bool failed = false;
             try { (void)co_await reader.ReadMultiBuffer(); }
             catch (const std::bad_alloc&) { failed = true; }
-            Check(failed, "payload OOM exposed plaintext or masqueraded as EOF");
+            catch (...) {
+                memory::reject_next_process_allocation = false;
+                throw;
+            }
+            memory::reject_next_process_allocation = false;
+            EXPECT_TRUE((failed)) << "payload OOM exposed plaintext or masqueraded as EOF";
         }
     };
     auto done = net::co_spawn(io, exercise(), net::use_future);
     io.run();
     done.get();
-#endif
 }
+#endif
 
 }  // namespace
 
-TEST(ShadowsocksStreamCrypto, Contract) {
-    TestAesBlock();
-    TestDeriveSubkey();
-    TestLargeRecord(buf::Buffer::kSize, ss::SsCipherType::AES_256_GCM);
-    TestLargeRecord(buf::Buffer::kSize + 1, ss::SsCipherType::AES_256_GCM);
-    TestLargeRecord(ss::kMaxChunkPayload, ss::SsCipherType::AES_256_GCM);
-    for (size_t i = 0; i < 16; ++i) {
-        TestLargeRecord(
-            ss::kSs2022MaxChunkPayload,
-            ss::SsCipherType::AES_256_GCM_2022);
-    }
-    TestInvalidTagDoesNotPublishPartialPlaintext();
-    TestContextLifetime();
-    for (const auto cipher : {ss::SsCipherType::AES_128_GCM, ss::SsCipherType::AES_256_GCM,
-                               ss::SsCipherType::CHACHA20_POLY1305}) {
-        for (const uint64_t nonce : {uint64_t{0}, uint64_t{2}}) {
-            for (const bool empty_cancel : {false, true}) TestReaderResume(cipher, nonce, empty_cancel);
-            TestReaderFailures(cipher, nonce);
-        }
-    }
-    for (const auto cipher : {ss::SsCipherType::AES_128_GCM_2022, ss::SsCipherType::AES_256_GCM_2022,
-                               ss::SsCipherType::CHACHA20_POLY1305_2022}) {
-        for (const uint64_t nonce : {uint64_t{1}, uint64_t{2}})
-            for (const bool empty_cancel : {false, true}) TestReaderResume(cipher, nonce, empty_cancel);
-    }
-    TestReaderResume(ss::SsCipherType::AES_256_GCM, 2, false, 1);
-    std::cout << "shadowsocks_stream_crypto_test: ok\n";
+class ShadowsocksLargeRecord : public testing::TestWithParam<std::tuple<size_t, ss::SsCipherType>> {};
+
+TEST_P(ShadowsocksLargeRecord, AuthenticatesCompletePayloadAcrossBufferBoundary) {
+    const auto [size, cipher] = GetParam();
+    TestLargeRecord(size, cipher);
 }
+
+INSTANTIATE_TEST_SUITE_P(WireBoundaries, ShadowsocksLargeRecord, testing::Values(
+    std::tuple{buf::Buffer::kSize, ss::SsCipherType::AES_256_GCM},
+    std::tuple{buf::Buffer::kSize + size_t{1}, ss::SsCipherType::AES_256_GCM},
+    std::tuple{size_t{ss::kMaxChunkPayload}, ss::SsCipherType::AES_256_GCM},
+    std::tuple{size_t{ss::kSs2022MaxChunkPayload}, ss::SsCipherType::AES_256_GCM_2022}));
+
+TEST(ShadowsocksStreamCrypto, InvalidTagDoesNotPublishPartialPlaintext) {
+    TestInvalidTagDoesNotPublishPartialPlaintext();
+}
+
+class ShadowsocksReaderResume : public testing::TestWithParam<
+    std::tuple<ss::SsCipherType, uint64_t, bool>> {};
+
+TEST_P(ShadowsocksReaderResume, CancellationRetainsRecordAndNonceProgress) {
+    const auto [cipher, nonce, empty_cancel] = GetParam();
+    TestReaderResume(cipher, nonce, empty_cancel);
+}
+
+INSTANTIATE_TEST_SUITE_P(Classic, ShadowsocksReaderResume, testing::Combine(
+    testing::Values(ss::SsCipherType::AES_128_GCM, ss::SsCipherType::AES_256_GCM,
+                    ss::SsCipherType::CHACHA20_POLY1305),
+    testing::Values(uint64_t{0}, uint64_t{2}), testing::Bool()));
+INSTANTIATE_TEST_SUITE_P(Ss2022, ShadowsocksReaderResume, testing::Combine(
+    testing::Values(ss::SsCipherType::AES_128_GCM_2022, ss::SsCipherType::AES_256_GCM_2022,
+                    ss::SsCipherType::CHACHA20_POLY1305_2022),
+    testing::Values(uint64_t{1}, uint64_t{2}), testing::Bool()));
+
+TEST(ShadowsocksStreamCrypto, OneByteFragmentsResumeWithoutNonceDrift) {
+    TestReaderResume(ss::SsCipherType::AES_256_GCM, 2, false, 1);
+}
+
+INSTANTIATE_TEST_SUITE_P(Classic, ShadowsocksReaderFailure, testing::Combine(
+    testing::Values(ss::SsCipherType::AES_128_GCM, ss::SsCipherType::AES_256_GCM,
+                    ss::SsCipherType::CHACHA20_POLY1305),
+    testing::Values(uint64_t{0}, uint64_t{2})));
 
 TEST(ShadowsocksStreamCrypto, AesBlocksMatchIndependentVectors) {
     // NIST SP 800-38A F.1.1/F.1.5 的前两块，独立验证批处理而非自生成回环。

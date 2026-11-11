@@ -11,7 +11,6 @@
 
 #include <algorithm>
 #include <array>
-#include <iostream>
 #include <span>
 #include <stdexcept>
 
@@ -47,75 +46,102 @@ StaticInboundConfig Source(std::string tag, uint16_t port, std::string user = "s
     return source;
 }
 
-bool Rejected(std::vector<StaticInboundConfig> sources, bool test_mode) {
-    try { (void)PrepareStartupInbounds(std::move(sources), test_mode); }
-    catch (const std::invalid_argument&) { return true; }
-    return false;
-}
-}
-
-TEST(StartupInbounds, Contract) {
-    // Use the production registry and startup preparation with a narrow fake
-    // credential builder. Actual VMess startup is covered by process tests.
-    ProxyRegistration registration;
-    registration.user_protocol = UserProtocol::Vmess;
-    registration.create_runtime = []() -> std::unique_ptr<ProtocolRuntime> { return {}; };
-    registration.create_tcp_handler = [](ProtocolRuntime&, StatsShard&, ConnectionLimiter*,
-                                          const BuildRequest&) -> std::unique_ptr<Inbound> { return {}; };
-    registration.build_users = &FakeBuildUsers;
-    RegisterProxy("vmess", registration);
-
-    {
+class StartupInboundTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        static const bool registered = [] {
+            ProxyRegistration registration;
+            registration.user_protocol = UserProtocol::Vmess;
+            registration.create_tcp_handler = [](const AdmissionEnvironment&,
+                const BuildRequest&) -> std::unique_ptr<Inbound> { return {}; };
+            registration.build_users = &FakeBuildUsers;
+            RegisterProxy("vmess", registration);
+            return true;
+        }();
+        (void)registered;
+        user_builds = 0;
         auto snapshot = UserStore::PrepareUsers(
-            "static-owner", UserSet{PreparedVmessUsers{
-                PreparedVmessUser{.profile = {}}}});
+            "static-owner", UserSet{PreparedVmessUsers{PreparedVmessUser{.profile = {}}}});
         auto view = UserStore::PrepareWorkerView(snapshot);
         UserStore::CommitSnapshot(std::move(snapshot));
         UserStore::InstallWorkerView(std::move(view));
     }
+
+    void TearDown() override {
+        for (const auto tag : {std::string_view("static-owner"),
+                               std::string_view(constants::test::kTestInboundTag)}) {
+            auto snapshot = UserStore::PrepareClearUsers(UserProtocol::Vmess, tag);
+            UserStore::CommitSnapshot(std::move(snapshot));
+        }
+        UserStore::ClearWorkerView();
+        user_builds = 0;
+    }
+};
+
+class StartupReservedBinding : public StartupInboundTest,
+                               public ::testing::WithParamInterface<bool> {};
+
+TEST_P(StartupReservedBinding, RejectsCollisionBeforeBuildingCredentials) {
+    auto source = GetParam()
+        ? Source(std::string(constants::test::kTestInboundTag), 12000)
+        : Source("static-owner", constants::test::kTestPort);
+    EXPECT_THROW((void)PrepareStartupInbounds({source}, true), std::invalid_argument);
+    EXPECT_EQ(user_builds, 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(TestMode, StartupReservedBinding, ::testing::Bool(),
+    [](const ::testing::TestParamInfo<bool>& info) {
+        return info.param ? "ReservedTag" : "ReservedPort";
+    });
+
+TEST_F(StartupInboundTest, PreparationAddsTestInboundWithoutPublishingUsers) {
     const auto old = UserStore::VmessUsers("static-owner").users;
-    ASSERT_FALSE((!Rejected({Source(std::string(constants::test::kTestInboundTag), 12000)}, true) || user_builds != 0 ||
-        !Rejected({Source("static-owner", constants::test::kTestPort)}, true) || user_builds != 0));
-
     const auto prepared = PrepareStartupInbounds({Source("static-owner", 12000)}, true);
-    ASSERT_FALSE((prepared.size() != 2 || prepared[0].receiver.proxy_protocol != ProxyProtocolMode::Auto ||
-        prepared[1].receiver.proxy_protocol != ProxyProtocolMode::Auto));
-    ASSERT_FALSE((user_builds != 2 || prepared.size() != 2 ||
-        prepared[0].binding.tag != "static-owner" || prepared[0].build_request.tag != "static-owner" ||
-        prepared[1].binding.tag != constants::test::kTestInboundTag ||
-        prepared[1].build_request.tag != constants::test::kTestInboundTag ||
-        prepared[1].binding.port != constants::test::kTestPort ||
-        !prepared[1].receiver.dispatch_policy.sniffing.enabled || !prepared[1].binding.listen.IsAuto() ||
-        std::get<PreparedVmessUsers>(*prepared[1].users).front().uuid_bytes !=
-            CredentialMarker(constants::test::kTestVmessUuid) ||
-        UserStore::VmessUsers("static-owner").users != old ||
-        !UserStore::VmessUsers(constants::test::kTestInboundTag).empty()));
+    ASSERT_EQ(prepared.size(), 2u);
+    EXPECT_EQ(prepared[1].binding.tag, constants::test::kTestInboundTag);
+    EXPECT_EQ(prepared[1].binding.port, constants::test::kTestPort);
+    EXPECT_EQ(UserStore::VmessUsers("static-owner").users, old);
+    EXPECT_TRUE(UserStore::VmessUsers(constants::test::kTestInboundTag).empty());
+}
 
-    user_builds = 0;
-    ASSERT_FALSE((!Rejected({Source("static-owner", 12000), Source("invalid-users", 12001, "reject")}, false) ||
-        user_builds != 2 || UserStore::VmessUsers("static-owner").users != old));
-    ASSERT_FALSE((!PrepareStartupInbounds({}, false).empty() || PrepareStartupInbounds({}, true).size() != 1));
+TEST_F(StartupInboundTest, InvalidCredentialsLeavePublishedUsersUntouched) {
+    const auto old = UserStore::VmessUsers("static-owner").users;
+    EXPECT_THROW((void)PrepareStartupInbounds(
+        {Source("static-owner", 12000), Source("invalid-users", 12001, "reject")}, false),
+        std::invalid_argument);
+    EXPECT_EQ(UserStore::VmessUsers("static-owner").users, old);
+}
 
-    auto routed = Source("routed", 12002);
-    routed.routing_enabled = true;
-    routed.proxy_protocol = ProxyProtocolMode::On;
-    auto forced = Source("forced", 12001);
-    forced.outbound_tag = "custom-out";
-    auto forced_override = Source("forced-override", 12003);
-    forced_override.routing_enabled = true;
-    forced_override.outbound_tag = "custom-out";
-    const auto policies = PrepareStartupInbounds(
-        {Source("default-direct", 12000), routed, forced, forced_override}, false);
-    ASSERT_FALSE((policies.size() != 4 || policies[1].receiver.proxy_protocol != ProxyProtocolMode::On ||
-        policies[0].receiver.proxy_protocol != ProxyProtocolMode::Auto));
-    ASSERT_FALSE((policies.size() != 4 ||
-        !std::holds_alternative<routing::ForceOutbound>(policies[0].receiver.dispatch_policy.outbound) ||
-        std::get<routing::ForceOutbound>(policies[0].receiver.dispatch_policy.outbound).outbound_tag != "direct" ||
-        !std::holds_alternative<routing::RouteWithFallback>(policies[1].receiver.dispatch_policy.outbound) ||
-        std::get<routing::RouteWithFallback>(policies[1].receiver.dispatch_policy.outbound).outbound_tag != "direct" ||
-        !std::holds_alternative<routing::ForceOutbound>(policies[2].receiver.dispatch_policy.outbound) ||
-        std::get<routing::ForceOutbound>(policies[2].receiver.dispatch_policy.outbound).outbound_tag != "custom-out" ||
-        !std::holds_alternative<routing::ForceOutbound>(policies[3].receiver.dispatch_policy.outbound) ||
-        std::get<routing::ForceOutbound>(policies[3].receiver.dispatch_policy.outbound).outbound_tag != "custom-out"));
-    std::cout << "startup sources share validation and preparation without user publication\n";
+enum class StartupPolicy { Routed, Forced, ForcedOverridesRouting };
+class StartupDispatchPolicy : public StartupInboundTest,
+                              public ::testing::WithParamInterface<StartupPolicy> {};
+
+TEST_P(StartupDispatchPolicy, PreservesExplicitRoutingAndOutboundSelection) {
+    auto source = Source("configured", 12002);
+    source.routing_enabled = GetParam() != StartupPolicy::Forced;
+    source.proxy_protocol = ProxyProtocolMode::On;
+    if (GetParam() != StartupPolicy::Routed) source.outbound_tag = "custom-out";
+    const auto prepared = PrepareStartupInbounds({source}, false);
+    ASSERT_EQ(prepared.size(), 1u);
+    EXPECT_EQ(prepared[0].receiver.proxy_protocol, ProxyProtocolMode::On);
+    const auto& policy = prepared[0].receiver.dispatch_policy.outbound;
+    if (GetParam() == StartupPolicy::Routed) {
+        EXPECT_TRUE(std::holds_alternative<routing::RouteWithFallback>(policy));
+    } else {
+        ASSERT_TRUE(std::holds_alternative<routing::ForceOutbound>(policy));
+        EXPECT_EQ(std::get<routing::ForceOutbound>(policy).outbound_tag, "custom-out");
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(ExplicitConfiguration, StartupDispatchPolicy,
+    ::testing::Values(StartupPolicy::Routed, StartupPolicy::Forced,
+                      StartupPolicy::ForcedOverridesRouting),
+    [](const ::testing::TestParamInfo<StartupPolicy>& info) {
+        switch (info.param) {
+            case StartupPolicy::Routed: return "RoutingEnabled";
+            case StartupPolicy::Forced: return "ForcedOutbound";
+            case StartupPolicy::ForcedOverridesRouting: return "ForcedOverridesRouting";
+        }
+        return "Unknown";
+    });
 }

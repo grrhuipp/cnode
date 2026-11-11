@@ -1,72 +1,53 @@
-#include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "proxy/anytls/anytls_codec.hpp"
+#include "infra/config.hpp"
 
-#include <cstdlib>
-#include <iostream>
+#include <string>
 #include <string_view>
 
 namespace {
 
-[[noreturn]] void Fail(std::string_view message) {
-    std::cerr << message << '\n';
-    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
+infra::AnyTlsSettings Parse(std::string_view body) {
+    const auto source = json::parse(body, json::KeyComparison::AsciiCaseInsensitive);
+    return std::get<infra::AnyTlsSettings>(infra::ParseOutboundSettings("anytls", source.as_object()));
 }
 
-void Check(bool condition, std::string_view message) {
-    if (!condition) Fail(message);
-}
-
-auto Parse(std::string_view body) {
-    const auto parsed = ::json::parse(body);
-    return ::proxy::anytls::outbound::ParseSettings(parsed.as_object());
-}
-
-void CheckInvalid(std::string_view body) {
-    auto result = Parse(body);
-    Check(!result, "invalid AnyTLS settings were accepted");
-}
-
-TEST(AnytlsOutboundSettings, ValidSettingsAreNormalized) {
-    auto explicit_values = Parse(
+TEST(AnytlsOutboundSettings, SessionPolicyIsNormalized) {
+    const auto settings = Parse(
         R"({"address":"example.com","port":8443,"password":"secret","idleSessionCheckInterval":10,"idleSessionTimeout":20,"minIdleSession":2})");
-    Check(explicit_values.has_value(), "valid explicit AnyTLS settings were rejected");
-    Check(explicit_values->idle_session_check_interval.count() == 10,
-          "explicit check interval mismatch");
-    Check(explicit_values->idle_session_timeout.count() == 20,
-          "explicit idle timeout mismatch");
-    Check(explicit_values->min_idle_sessions == 2,
-          "explicit minimum idle mismatch");
+    EXPECT_EQ(settings.idle_session_check_interval, std::chrono::seconds(10));
+    EXPECT_EQ(settings.idle_session_timeout, std::chrono::seconds(20));
+    EXPECT_EQ(settings.min_idle_sessions, 2u);
 }
 
-TEST(AnytlsOutboundSettings, PreparedPasswordHashes) {
-    auto check_hash = [](std::string_view body, std::string_view expected) {
-        const auto settings = Parse(body);
-        Check(settings.has_value(), "valid AnyTLS credentials rejected");
+TEST(AnytlsOutboundSettings, PasswordHashPreservesEmbeddedNull) {
+    struct Case { std::string_view password; std::string_view hash; };
+    for (const auto& test : {
+        Case{"secret", "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"},
+        Case{R"(abc\u0000def)", "516a5e926ce20c5f4d80f00e1a01abdf14986def6588d6abeed9fce090bc660c"}}) {
+        const auto settings = Parse(std::string(R"({"address":"127.0.0.1","port":443,"password":")") +
+                                    std::string(test.password) + R"("})");
         constexpr std::string_view hex = "0123456789abcdef";
         std::string actual;
-        for (const auto byte : settings->password_hash) {
+        for (const auto byte : settings.password_hash) {
             actual += hex[byte >> 4];
-            actual += hex[byte & 0x0f];
+            actual += hex[byte & 15];
         }
-        Check(actual == expected, "prepared AnyTLS SHA256 vector mismatch");
-    };
-    check_hash(R"({"address":"127.0.0.1","port":443,"password":"secret"})",
-               "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b");
-    check_hash(R"({"address":"127.0.0.1","port":443,"password":"abc\u0000def"})",
-               "516a5e926ce20c5f4d80f00e1a01abdf14986def6588d6abeed9fce090bc660c");
+        EXPECT_EQ(actual, test.hash);
+    }
 }
 
-TEST(AnytlsOutboundSettings, InvalidSessionSettingsAreRejected) {
-    CheckInvalid(R"({"address":"example.com","port":443,"password":"secret","idleSessionCheckInterval":9223372036854775807})");
-    CheckInvalid(R"({"address":"example.com","port":443,"password":"secret","idleSessionTimeout":9223372036854775807})");
-    CheckInvalid(R"({"address":"example.com","port":443,"password":"secret","idleSessionCheckInterval":"30"})");
-    CheckInvalid(R"({"address":"example.com","port":443,"password":"secret","idleSessionTimeout":0})");
-    CheckInvalid(R"({"address":"example.com","port":443,"password":"secret","idleSessionTimeout":18446744073709551615})");
-    CheckInvalid(R"({"address":"example.com","port":443,"password":"secret","minIdleSession":-1})");
-    CheckInvalid(R"({"address":"example.com","port":443,"password":"secret","minIdleSession":"1"})");
+TEST(AnytlsOutboundSettings, InvalidSessionPoliciesAreRejected) {
+    for (const auto field : {
+        R"("idleSessionCheckInterval":9223372036854775807)",
+        R"("idleSessionTimeout":9223372036854775807)",
+        R"("idleSessionCheckInterval":"30")", R"("idleSessionTimeout":0)",
+        R"("idleSessionTimeout":18446744073709551615)",
+        R"("minIdleSession":-1)", R"("minIdleSession":"1")", R"("minIdleSessions":1)"}) {
+        SCOPED_TRACE(field);
+        EXPECT_THROW(Parse(std::string(R"({"address":"example.com","port":443,"password":"secret",)") + field + '}'),
+                     std::invalid_argument);
+    }
 }
 
 }  // namespace
-

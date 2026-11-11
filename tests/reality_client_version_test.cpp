@@ -2,32 +2,33 @@
 
 #include "transport/internet/stream_settings.hpp"
 
-#include <array>
+namespace {
+using ::transport::internet::ParseRealityClientVersion;
+using ::transport::internet::RealityClientVersion;
+using ::transport::internet::RealityClientVersionValue;
 
-TEST(RealityClientVersion, Contract) {
-    using ::transport::internet::ParseRealityClientVersion;
-    using ::transport::internet::RealityClientVersion;
-    using ::transport::internet::RealityClientVersionValue;
-
-    const auto unset = ParseRealityClientVersion("");
-    ASSERT_TRUE(unset && !*unset)
-        << "empty version policy must remain unset";
-
-    const auto semantic = ParseRealityClientVersion("1.8.0");
-    const RealityClientVersion expected_semantic{1, 8, 0, 0};
-    ASSERT_TRUE(semantic && *semantic == expected_semantic)
-        << "three-part REALITY version must parse";
-
-    const auto short_version = ParseRealityClientVersion("1.8");
-    const RealityClientVersion expected_short{1, 8, 0, 0};
-    ASSERT_TRUE(short_version && *short_version == expected_short)
-        << "two-part REALITY version must zero-fill";
-
-    ASSERT_TRUE(RealityClientVersionValue(expected_semantic) == 0x01080000u)
-        << "REALITY version ordering value must preserve components";
-
-    for (const char* invalid : {"1.8.0.1", "1..0", "1.256.0", "v1.8.0"}) {
-        ASSERT_FALSE(ParseRealityClientVersion(invalid))
-            << "invalid REALITY version must be rejected";
-    }
+TEST(RealityClientVersion, EmptyPolicyDisablesVersionRestriction) {
+    const auto parsed = ParseRealityClientVersion("");
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_FALSE(*parsed);
 }
+
+class RealityVersionSyntax : public testing::TestWithParam<const char*> {};
+TEST_P(RealityVersionSyntax, ParsesSemanticVersion) {
+    const auto parsed = ParseRealityClientVersion(GetParam());
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(*parsed, (RealityClientVersion{1, 8, 0, 0}));
+}
+INSTANTIATE_TEST_SUITE_P(Components, RealityVersionSyntax, testing::Values("1.8.0", "1.8"));
+
+TEST(RealityClientVersion, OrderingPreservesVersionComponents) {
+    EXPECT_EQ(RealityClientVersionValue(RealityClientVersion{1, 8, 0, 0}), 0x01080000u);
+}
+
+class RealityInvalidVersion : public testing::TestWithParam<const char*> {};
+TEST_P(RealityInvalidVersion, RejectsMalformedOrOverflowingVersion) {
+    EXPECT_FALSE(ParseRealityClientVersion(GetParam()));
+}
+INSTANTIATE_TEST_SUITE_P(Syntax, RealityInvalidVersion,
+                        testing::Values("1.8.0.1", "1..0", "1.256.0", "v1.8.0"));
+}  // namespace

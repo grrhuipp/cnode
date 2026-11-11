@@ -1,67 +1,42 @@
-#include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "proxy/shadowsocks/ss_outbound.hpp"
+#include "infra/config.hpp"
+#include "proxy/uot/uot.hpp"
 
-#include <cstdlib>
-#include <iostream>
 #include <string_view>
 
 namespace {
 
-using UotVersion = ::proxy::uot::Version;
-
-[[noreturn]] void Fail(std::string_view message) {
-    std::cerr << message << '\n';
-    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
+std::optional<proxy::uot::Version> Parse(std::string_view fields) {
+    auto source = json::parse(fields, json::KeyComparison::AsciiCaseInsensitive);
+    source.as_object()["address"] = "example.com";
+    source.as_object()["password"] = "secret";
+    return std::get<infra::ShadowsocksSettings>(
+        infra::ParseOutboundSettings("shadowsocks", source.as_object())).uot_version;
 }
 
-void Check(bool condition, std::string_view message) {
-    if (!condition) Fail(message);
+TEST(SsOutboundUot, ExplicitVersionsAreNormalized) {
+    using proxy::uot::Version;
+    EXPECT_EQ(Parse(R"({"uot":true,"uotVersion":1})"), Version::V1);
+    EXPECT_EQ(Parse(R"({"uot":true,"uotVersion":2})"), Version::V2);
+    EXPECT_EQ(Parse(R"({"uot":{"enabled":true,"version":2}})"), Version::V2);
+    EXPECT_EQ(Parse(R"({"uot":{"version":1}})"), Version::V1);
+    EXPECT_FALSE(Parse(R"({"uot":false})"));
+    EXPECT_FALSE(Parse(R"({"uot":{"enabled":false}})"));
 }
 
-auto Parse(std::string_view body) {
-    const auto parsed = ::json::parse(body);
-    return ::proxy::shadowsocks::outbound::ParseUotVersion(
-        parsed.as_object());
-}
-
-void CheckInvalid(std::string_view body) {
-    auto result = Parse(body);
-    Check(!result, "invalid UoT settings were accepted");
-}
-
-TEST(SsOutboundUot, ValidFormsAreNormalized) {
-    auto absent = Parse(R"({})");
-    Check(absent.has_value() && !*absent, "absent UoT was enabled");
-
-    auto disabled = Parse(R"({"uot":false})");
-    Check(disabled.has_value() && !*disabled, "disabled UoT was enabled");
-
-    auto default_version = Parse(R"({"uot":true})");
-    Check(default_version.has_value() &&
-              *default_version == UotVersion::V2,
-          "boolean UoT did not default to v2");
-
-    auto v1 = Parse(R"({"uot":true,"uotVersion":1})");
-    Check(v1.has_value() && *v1 == UotVersion::V1,
-          "boolean UoT v1 mismatch");
-
-    auto object = Parse(
-        R"({"uot":{"enabled":true,"version":2}})");
-    Check(object.has_value() && *object == UotVersion::V2,
-          "object UoT v2 mismatch");
-}
-
-TEST(SsOutboundUot, InvalidFormsAreRejected) {
-    CheckInvalid(R"({"uot":true,"uotVersion":3})");
-    CheckInvalid(R"({"uot":"true"})");
-    CheckInvalid(R"({"uot":{"enabled":true,"version":3}})");
-    CheckInvalid(R"({"uot":{"enabled":1,"version":2}})");
-    CheckInvalid(R"({"uotVersion":2})");
-    CheckInvalid(R"({"uot":1})");
-    CheckInvalid(R"({"uot":false,"uotVersion":2})");
+TEST(SsOutboundUot, InvalidOrAmbiguousPoliciesAreRejected) {
+    for (const auto body : {
+        R"({"uot":true,"uotVersion":3})", R"({"uot":"true"})",
+        R"({"uot":{"enabled":true,"version":3}})",
+        R"({"uot":{"enabled":1,"version":2}})", R"({"uotVersion":2})",
+        R"({"uot":1})", R"({"uot":false,"uotVersion":2})",
+        R"({"uot":{"enabled":false,"version":2}})",
+        R"({"uot":{"version":1},"uotVersion":1})",
+        R"({"uot":{"enabled":true,"unknown":2}})"}) {
+        SCOPED_TRACE(body);
+        EXPECT_THROW(Parse(body), std::invalid_argument);
+    }
 }
 
 }  // namespace
-

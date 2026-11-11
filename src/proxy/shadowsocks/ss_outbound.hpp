@@ -11,7 +11,6 @@
 #include "common/sharded_user_stats.hpp"
 #include "common/target_address.hpp"
 #include <openssl/mem.h>
-#include "infra/json.hpp"
 #include "proxy/inbound.hpp"
 #include "proxy/outbound.hpp"
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
@@ -148,7 +147,7 @@ private:
 class Credentials {
 public:
     [[nodiscard]] static std::optional<Credentials> Prepare(
-        std::string_view method, std::string_view password);
+        const ss::SsCipherInfo& cipher, std::string_view password);
 
     [[nodiscard]] const ss::SsCipherInfo& Cipher() const noexcept { return cipher_; }
     [[nodiscard]] const ss::KeyBytes& MasterKey() const noexcept { return master_key_; }
@@ -166,8 +165,6 @@ private:
     std::vector<ss::KeyBytes> psk_chain_;
 };
 
-[[nodiscard]] tl::expected<std::optional<proxy::uot::Version>, std::string>
-ParseUotVersion(const json::object& source);
 
 struct PreparedSettings {
     SsOutboundConfig config;

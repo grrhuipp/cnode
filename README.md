@@ -185,7 +185,7 @@ geosite.dat
 - 所有本地配置键（含侧车、`panels` 和嵌套 `settings`）不区分 ASCII 大小写，示例采用 camelCase：`APIHost`、`apiHost`、`apihost` 等价。大小写归一化后重复的键直接报错。`api_host` 等下划线别名不被识别。
 - 语义上大小写无关的值统一按小写处理：协议、`nodeType`、面板 `type`、`network`、`security`、日志级别、加密方法、`flow`、`decryption`/`encryption`、`packetEncoding`、`auto`、`sendThroughStrategy`、`domainStrategy`、`dnsType`、Blackhole 响应类型、Host/SNI/`serverName`/gRPC `authority`。路径、gRPC `serviceName`、Header 值、标签、邮箱、UUID、密码、密钥与 padding 方案区分大小写。
 - 未知枚举、空值、错误类型拒绝加载；路由引用不存在的 outbound 直接报错。
-- 主配置、日志、DNS、限额、超时、面板、入站和路由对象中的未知键拒绝加载。例如连接空闲超时必须写 `timeouts.connIdle`，`timeouts.idle` 不再被静默忽略。
+- 主配置、日志、DNS、限额、超时、面板、入站、出站和路由对象中的未知键拒绝加载。例如连接空闲超时必须写 `timeouts.connIdle`，`timeouts.idle` 不再被静默忽略。
 - IP 字段必须是完整地址：IPv4 四段无前导零，IPv6 可带数字 scope ID（如 `fe80::1%3`），不接受接口名 scope。单独的 host、listen、sendThrough 字段不接受端口、方括号或尾随内容；方括号只用于 endpoint/URL 中的 IPv6。出站服务器字段可使用 DNS 主机名。
 
 ### config.json
@@ -248,6 +248,7 @@ geosite.dat
 样例见 [`config/inbounds.json.example`](config/inbounds.json.example)、[`config/outbounds.json.example`](config/outbounds.json.example)、[`config/routing.json.example`](config/routing.json.example)。
 
 - 静态入站默认 `"routingEnabled": false`，直接走内置 `direct`（源进源出）；`"routingEnabled": true` 且未指定 `outboundTag` 时参与路由，未命中回落内置 `direct`；指定 `"outboundTag"` 时全部走该出口。标签不存在或为空拒绝启动。
+- 静态入站的 `settings.clients` 中，VMess/VLESS 使用 `id`，其他协议使用 `password`；`flow` 仅用于 VLESS，不将另一种凭据键当作回退来源。
 - 面板创建的 direct 出站是路由未命中时的回退；命中规则始终优先。出口列表顺序不表达默认出口，明确的出口不存在时请求失败。
 - 未写 `inboundTag` 的路由规则匹配所有入站。`network`、`inboundTag`、`user`、`source`、`protocol` 写成空字符串或空数组时拒绝启动。
 - 启动时只加载路由实际引用的 geoip/geosite 分类；数据文件缺失、损坏或引用的分类不存在时拒绝启动；geosite 的 regexp 条目不加载。
@@ -255,15 +256,17 @@ geosite.dat
 - 传输名称保留 [Xray 的公开拼写](https://github.com/XTLS/Xray-core/blob/main/infra/conf/transport_internet.go)：`raw`/`tcp`、`ws`/`websocket`、`xhttp`/`splithttp` 分别表示同一种传输；本实现另支持用 `h2` 强制 HTTP/2。
 - WebSocket 入站默认取 `X-Forwarded-For` 首个 IP 作为客户端地址；`wsSettings.realIpHeader` 可改用其他头，设为 `""` 关闭。该头可被伪造，仅应经可信代理访问，源端口记为 `:0`。
 - WebSocket 与 HTTPUpgrade 入站按 URL 路径精确匹配配置（包括 `/`），查询字符串不参与路径匹配；Host 比较前去除首尾空白。
-- `tlsSettings` 的 `certificateFile`/`certFile`、`keyFile`、`caFile` 与面板 `tlsCert`/`tlsKey` 在加载配置时读入，文件缺失、为空或超过 1 MiB 时拒绝加载；证书更新需重新加载配置。autosign 只为配置的名称签发证书并在到期前自动更新。
+- TLS 证书可写 `tlsSettings.certificates[].certificateFile`/`keyFile`，或 `tlsSettings.certFile`/`keyFile`；这些文件、`tlsSettings.caFile` 与面板 `tlsCert`/`tlsKey` 在加载配置时读入，文件缺失、为空或超过 1 MiB 时拒绝加载；证书更新需重新加载配置。autosign 只为配置的名称签发证书并在到期前自动更新。
 - XHTTP `mode` 只接受 `auto`（或省略）、`packet-up`、`stream-up`、`stream-one`。
 - REALITY 服务端支持 `dest`、`xver`（0/1/2）、`serverNames`、`shortIds`、`privateKey`、`minClientVer`、`maxClientVer`、`maxTimeDiff`、`mldsa65Seed`；客户端支持 `serverName`、`publicKey`、`shortId`、`fingerprint`（`chrome`/`firefox`/`safari`/`ios`/`android`/`edge`/`360`/`qq`/`random`）、`spiderX`、`mldsa65Verify`。`show`、`type`、`masterKeyLog` 会被拒绝。未认证连接透明回落到 `dest`，使用 `timeouts.dial`、`connIdle`、`write`、`uplinkOnly`、`downlinkOnly`。V2Board `tls=2` 节点自动同步为 REALITY。
-- VLESS 出站 Vision flow 要求 TCP 搭配 TLS 或 REALITY；1–30 字节自定义 ID 按 UUIDv5 映射。
+- 出站 `settings` 的每层对象均拒绝未知键。Trojan/Shadowsocks 可用扁平服务器字段或单元素 `servers` 数组；VLESS/VMess 可用扁平字段或单元素 `vnext` 数组及其中的单元素 `users` 数组，不能混用两种结构。
+- VLESS 出站身份字段为 `id`，支持 UUID 或 1–30 字节自定义 ID，并按 [Xray 的 UUIDv5 映射](https://xtls.github.io/config/outbounds/vless.html#outboundconfigurationobject)处理。Vision flow 要求 TCP 搭配 TLS、REALITY 或 VLESS Encryption。`packetEncoding` 接受 `none`、`packetaddr`、`xudp`（默认）；[PacketAddr 与 XUDP](https://sing-box.sagernet.org/configuration/outbound/vless/#packet_encoding)分别对应 V2Ray 5+ 与 Xray 的 UDP 封装。
+- VMess 出站 `security` 接受 `auto`、`aes-128-gcm`、`chacha20-poly1305`、`none`、`zero`；`alterId` 仅接受 `0`。Shadowsocks 与 Trojan 的凭据字段为 `password`。
 - Shadowsocks 出站省略 `method` 时使用 `aes-256-gcm`；SS2022 每段 PSK 必须符合方法密钥长度，身份链只支持 AES 方法。`"uot": true` 开启 UoT（默认 v2），`"uotVersion": 1` 选择 v1，也可写 `"uot": {"enabled": true, "version": 2}`。Shadowsocks 与 AnyTLS 入站自动识别 UoT v1/v2。
 - AnyTLS 出站：`idleSessionCheckInterval` 默认 30 秒，`idleSessionTimeout` 默认 60 秒，`minIdleSession` 默认 0。AnyTLS 入站通过 `settings.clients` 与 `settings.paddingScheme` 配置，padding 方案归一化后最多 65,535 字节，无效方案拒绝加载。
 - 出站顶层 `sendThrough` 可填单个源 IP、`auto`，或按优先级排列的 IP/CIDR 数组：按目标地址族选第一个同族条目，CIDR 地址由 `sendThroughStrategy` 选择——`random`（默认）、`ip_hash`（按最初入站客户端 IP）或 `user_hash`（按入站标签与用户标识，无用户时回退 IP）。绑定失败不换源 IP，也不回退系统默认；没有同族条目时由系统选择。
 - 代理出站顶层 `"passthrough": true`（默认 `false`）向下一跳 cnode 透传最初入站的标签、用户身份与客户端 IP，供下游 `ip_hash`/`user_hash` 与访问日志使用。
-- Freedom `settings.domainStrategy: "UseIPv6v4"` 等策略按顺序尝试地址族。
+- Freedom `settings.domainStrategy` 接受 `AsIs`、`UseIP`、`UseIPv4`、`UseIPv6`、`UseIPv4v6`、`UseIPv6v4` 及对应 `Force*` 策略；TCP 与 UDP 的地址族选择均由拨号器执行。`settings.redirect` 为 TCP 目标的 `host:port`；源地址统一由出站顶层 `sendThrough` 配置。
 
 ### 认证失败限制
 
@@ -295,12 +298,14 @@ geosite.dat
 - TCP keepalive：空闲 60 秒后开始探测，间隔 10 秒，共 6 次。
 - 嗅探：TCP 复制至多 4 KiB 前缀；UDP QUIC 嗅探总窗口 200 ms、最多 64 个数据报、累计 64 KiB。
 - HTTP/2（gRPC、h2、XHTTP 服务端）：每连接最多 256 个并发流，超额 REFUSED_STREAM；流窗口 4 MiB、连接窗口 8 MiB。gRPC 单条消息正文最多 4 MiB。
+- 面板 HTTP：每行最多 64 KiB，响应头（含临时响应及 trailer）累计最多 256 KiB，解码后响应体最多 64 MiB；这些预算不扩大普通代理传输的限制。
 - XHTTP：每个 session 排队数据与并发上传共用 4 MiB 预算，最多 1024 个排队包、64 个在途上传。
 - Mux：每连接最多 1,024 个子会话；未转发客户端数据共享 4 MiB 预算，降至 2 MiB 后恢复读取（与 Xray 相同的队头阻塞语义）。
 - AnyTLS 入站：每个 Session 最多 128 条未结束子流，子流从 SYN 起受 `timeouts.handshake` 绝对期限约束；每条子流接收队列最多 65,535 字节有效数据。
 - 原生 UDP：每 Worker 最多 4096 个出站 UDP socket、4096 个存活入站 association、8192 份排队数据报、64 MiB 排队缓冲；满额拒绝新请求，不驱逐已有请求。每个逻辑 UDP 请求独占一个出站 socket，源端口在请求期间不变。上行半关闭后在 `downlinkOnly` 窗口内继续收包。
 - Hysteria UDP 分片重组：5 秒无新片或 15 秒整体期限即丢弃该轮分片，不关闭会话。Hysteria v1 服务端使用 BBR v2 拥塞控制，与官方 v1 客户端线协议互通，但带宽控制行为不是 Brutal。
 - VMess 重放窗口 180 秒，最多 65,536 项，满时拒绝新记录。
+- SS2022 TCP 按 [SIP022 §3.1.5](https://shadowsocks.org/doc/sip022.html#_3-1-5-replay-protection) 记录已认证请求的 salt：进程级去重，保留 65 秒，最多 262,144 项；满时拒绝新记录，不提前淘汰未过期项。重放或跟踪容量拒绝不计入认证失败封禁。
 - TLS 读取以 `close_notify` 为正常结束，未收到关闭通知的断开按截断错误处理。
 
 ### 流量上报

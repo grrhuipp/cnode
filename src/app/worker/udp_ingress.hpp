@@ -350,7 +350,7 @@ public:
     // 回包只借用本入口，并持有地址稳定的 socket 状态直到会话结束。
     struct ReplyRoute {
         SocketStatePtr socket;
-        std::shared_ptr<::InboundDatagramResponse> response;
+        std::shared_ptr<InboundDatagramResponse> response;
         UdpIngress* owner = nullptr;
         uint32_t worker_id = 0;
 
@@ -544,13 +544,11 @@ private:
         routing::DispatchPolicy policy;
         routing::Dispatcher* dispatcher = nullptr;
         net::io_context* io_context = nullptr;
-        StatsShard* stats = nullptr;
+        const proxyman::inbound::AdmissionEnvironment* admission = nullptr;
+        app::RequestLoadState* request_load = nullptr;
         TimeoutsConfig timeouts;
         // Owned copy of the authenticating credential's profile.
         UserProfile profile;
-        UserOnlineTracker* tracker = nullptr;
-        ConnectionLimiter* limiter = nullptr;
-        uint32_t* active_sessions = nullptr;
     };
 
     struct QueuedInput {

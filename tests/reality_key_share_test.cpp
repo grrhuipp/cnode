@@ -35,46 +35,43 @@ std::vector<uint8_t> BuildExtension(
 
 }  // namespace
 
-TEST(RealityKeyShare, Contract) {
-    using ::transport::internet::ParseRealityClientKeyShareExtension;
-    constexpr uint16_t kX25519 = 29;
-    constexpr uint16_t kX25519MlKem768 = 0x11ec;
+TEST(RealityKeyShare, ParsesStandaloneX25519Share) {
+    const std::vector<Entry> entries{{29, std::vector<uint8_t>(32, 0x2a)}};
+    const auto parsed = ::transport::internet::ParseRealityClientKeyShareExtension(BuildExtension(entries));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_TRUE(std::ranges::all_of(*parsed, [](uint8_t byte) { return byte == 0x2a; }));
+}
 
-    const std::vector<uint8_t> x25519_key(32, 0x2a);
-    const std::vector<Entry> valid_entries{{kX25519, x25519_key}};
-    const auto valid =
-        ParseRealityClientKeyShareExtension(BuildExtension(valid_entries));
-    ASSERT_TRUE(valid && valid->front() == 0x2a)
-        << "a canonical X25519 key share must parse";
-
+TEST(RealityKeyShare, RejectsTrailingBytesAfterShare) {
+    const std::vector<Entry> entries{{29, std::vector<uint8_t>(32, 0x2a)}};
     const std::vector<uint8_t> trailing{0xff};
-    ASSERT_FALSE(ParseRealityClientKeyShareExtension(
-        BuildExtension(valid_entries, trailing)))
-        << "bytes after an X25519 key share must not be ignored";
+    EXPECT_FALSE(::transport::internet::ParseRealityClientKeyShareExtension(BuildExtension(entries, trailing)));
+}
 
-    const std::vector<Entry> duplicate_entries{
-        {kX25519, x25519_key}, {kX25519, x25519_key}};
-    ASSERT_FALSE(ParseRealityClientKeyShareExtension(
-        BuildExtension(duplicate_entries)))
-        << "duplicate X25519 groups must be rejected";
+TEST(RealityKeyShare, RejectsDuplicateX25519Group) {
+    const std::vector<uint8_t> key(32, 0x2a);
+    const std::vector<Entry> entries{{29, key}, {29, key}};
+    EXPECT_FALSE(::transport::internet::ParseRealityClientKeyShareExtension(BuildExtension(entries)));
+}
 
-    const std::vector<Entry> short_hybrid{{kX25519MlKem768, x25519_key}};
-    ASSERT_FALSE(ParseRealityClientKeyShareExtension(
-        BuildExtension(short_hybrid)))
-        << "a truncated X25519MLKEM768 share must be rejected";
+TEST(RealityKeyShare, RejectsTruncatedHybridShare) {
+    const std::vector<Entry> entries{{0x11ec, std::vector<uint8_t>(32, 0x2a)}};
+    EXPECT_FALSE(::transport::internet::ParseRealityClientKeyShareExtension(BuildExtension(entries)));
+}
 
-    std::vector<uint8_t> hybrid_key(1216, 0x11);
-    std::fill_n(hybrid_key.end() - 32, 32, uint8_t{0x3b});
-    const std::vector<Entry> valid_hybrid{{kX25519MlKem768, hybrid_key}};
-    const auto parsed_hybrid =
-        ParseRealityClientKeyShareExtension(BuildExtension(valid_hybrid));
-    ASSERT_TRUE(parsed_hybrid && parsed_hybrid->front() == 0x3b)
-        << "a canonical hybrid share must expose its X25519 suffix";
+TEST(RealityKeyShare, ExtractsX25519SuffixFromHybridShare) {
+    std::vector<uint8_t> key(1216, 0x11);
+    std::fill_n(key.end() - 32, 32, uint8_t{0x3b});
+    const std::vector<Entry> entries{{0x11ec, key}};
+    const auto parsed = ::transport::internet::ParseRealityClientKeyShareExtension(BuildExtension(entries));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_TRUE(std::ranges::all_of(*parsed, [](uint8_t byte) { return byte == 0x3b; }));
+}
 
-    const std::vector<Entry> hybrid_then_x25519{
-        {kX25519MlKem768, hybrid_key}, {kX25519, x25519_key}};
-    const auto preferred_x25519 = ParseRealityClientKeyShareExtension(
-        BuildExtension(hybrid_then_x25519));
-    ASSERT_TRUE(preferred_x25519 && preferred_x25519->front() == 0x2a)
-        << "a standalone X25519 share must remain preferred";
+TEST(RealityKeyShare, PrefersStandaloneX25519OverEarlierHybridShare) {
+    const std::vector<Entry> entries{
+        {0x11ec, std::vector<uint8_t>(1216, 0x11)}, {29, std::vector<uint8_t>(32, 0x2a)}};
+    const auto parsed = ::transport::internet::ParseRealityClientKeyShareExtension(BuildExtension(entries));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_TRUE(std::ranges::all_of(*parsed, [](uint8_t byte) { return byte == 0x2a; }));
 }

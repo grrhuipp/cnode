@@ -10,6 +10,7 @@ namespace transport::internet {
 using namespace h2;
 
 net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
+    GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
     const GrpcConfig& cfg,
     net::io_context& io_context,
@@ -23,7 +24,7 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    co_return co_await StartHttp2ServerSession(
+    co_return co_await StartHttp2ServerSession(coordinator, 
         std::move(stream),
         cfg.initial_window_size.value_or(kDefaultInitialWindow),
         H2PayloadCodec::GrpcHunk,
@@ -36,13 +37,14 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
 }
 
 net::awaitable<TransportBuildResult> RunHttp2ServerSession(
+    GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
     const HttpConfig& cfg,
     const XHttpConfig* xhttp_cfg,
     net::io_context& io_context,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
     uint64_t conn_id) {
-    return StartHttp2ServerSession(
+    return StartHttp2ServerSession(coordinator, 
         std::move(stream),
         cfg.initial_window_size.value_or(kDefaultInitialWindow),
         H2PayloadCodec::RawData,

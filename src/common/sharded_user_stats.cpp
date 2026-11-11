@@ -135,21 +135,17 @@ net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConn
     if (user_id <= 0 || client_ip.empty()) {
         co_return std::optional<UserOnlineSessionGuard>(std::in_place);
     }
-    auto executor = co_await net::this_coro::executor;
-    auto* coordinator = GroupCoordinator::ForContext(
-        net::query(executor, net::execution::context));
-    if (!coordinator) throw std::logic_error("user admission requires a registered coordinator");
     const auto uid = static_cast<uint64_t>(user_id);
     std::optional<UserOnlineSessionGuard> guard(std::in_place);
     auto reservation = std::make_shared<DeviceReservation>();
     reservation->node = std::make_unique<DeviceReturn>();
     auto& node = *reservation->node;
-    node.coordinator = coordinator;
+    node.coordinator = &coordinator_;
     node.tag.assign(tag);
     node.ip.assign(client_ip);
     node.user = uid;
     guard->quota_reservation_ = reservation;
-    const bool admitted = co_await coordinator->PostCall(
+    const bool admitted = co_await coordinator_.PostCall(
         [reservation, device_limit] {
             auto& node = *reservation->node;
             node.quota = net::use_service<DeviceQuotaService>(

@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <unordered_map>
 
-TEST(XhttpPacketSessionKey, Contract) {
+TEST(XhttpPacketSessionKey, IsolatesSessionIdsAndInboundNamespaces) {
     using Key = ::detail::XHttpPacketSessionKey;
     using Map = std::unordered_map<
         Key,
@@ -27,10 +27,11 @@ TEST(XhttpPacketSessionKey, Contract) {
         "second-session", "inbound-a"});
     const auto other_it = sessions.find(::detail::XHttpPacketSessionKeyRef{
         "shared-session", "inbound-b"});
-    if (sessions.size() != 3 || first_it == sessions.end() ||
-        second_it == sessions.end() || other_it == sessions.end() ||
-        first_it->second != 1 || second_it->second != 2 || other_it->second != 3) {
-        { ASSERT_EQ((EXIT_FAILURE), 0); return; }
-    }
-    { ASSERT_EQ((EXIT_SUCCESS), 0); return; }
+    ASSERT_EQ(sessions.size(), 3u);
+    ASSERT_NE(first_it, sessions.end());
+    ASSERT_NE(second_it, sessions.end());
+    ASSERT_NE(other_it, sessions.end());
+    EXPECT_EQ(first_it->second, 1);
+    EXPECT_EQ(second_it->second, 2);
+    EXPECT_EQ(other_it->second, 3);
 }

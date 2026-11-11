@@ -1,36 +1,23 @@
 #include <gtest/gtest.h>
-
 #include "features/routing/dispatcher.hpp"
 
-#include <cstdio>
-
 namespace {
-
-bool Require(bool condition, const char* message) {
-    if (!condition) std::fprintf(stderr, "%s\n", message);
-    return condition;
-}
-
-}  // namespace
-
-TEST(SniffConfig, Contract) {
+class ExcludedDomain : public testing::TestWithParam<const char*> {};
+TEST_P(ExcludedDomain, MatchesCaseInsensitivelyAndIgnoresRootDot) {
     ::SniffConfig config;
     config.domains_excluded = {"Blocked.Example", "safe.example"};
+    EXPECT_TRUE(config.IsDomainExcluded(GetParam()));
+    EXPECT_FALSE(config.IsDomainExcluded("not-safe.example"));
+}
+INSTANTIATE_TEST_SUITE_P(Names, ExcludedDomain,
+    testing::Values("blocked.example", "SAFE.EXAMPLE", "blocked.example."));
+}
 
-    ASSERT_FALSE((!Require(config.IsDomainExcluded("blocked.example"),
-                 "domain exclusions must be ASCII case-insensitive")));
-    ASSERT_FALSE((!Require(config.IsDomainExcluded("SAFE.EXAMPLE"),
-                 "uppercase sniffed domains must remain excluded")));
-    ASSERT_FALSE((!Require(!config.IsDomainExcluded("not-safe.example"),
-                 "domain exclusions must remain exact names")));
-    ASSERT_FALSE((!Require(config.IsDomainExcluded("blocked.example."),
-                 "an absolute DNS name must not bypass domain exclusions")));
+TEST(SniffConfig, OverridesOnlySupportedSelectedProtocols) {
+    ::SniffConfig config;
     config.dest_override = ::routing::SniffedProtocolBit("quic");
-    ASSERT_FALSE((!Require(config.MatchesDestOverride("quic"),
-                 "quic destOverride must be recognized")));
-    ASSERT_FALSE((!Require(!config.MatchesDestOverride("tls"),
-                 "unlisted destOverride protocols must not match")));
-    ASSERT_FALSE((!Require(::routing::SniffedProtocolBit("fakedns") == 0 &&
-                 !config.MatchesDestOverride("fakedns"),
-                 "unsupported protocol names must not map to a destOverride bit")));
+    EXPECT_TRUE(config.MatchesDestOverride("quic"));
+    EXPECT_FALSE(config.MatchesDestOverride("tls"));
+    EXPECT_EQ(::routing::SniffedProtocolBit("fakedns"), 0);
+    EXPECT_FALSE(config.MatchesDestOverride("fakedns"));
 }

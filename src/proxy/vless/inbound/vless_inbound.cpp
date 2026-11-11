@@ -184,8 +184,8 @@ CompleteVlessInboundHandshake(
     proxy::BufferedStreamReader& protocol_reader,
     transport::MultiBufferWriter& protocol_writer,
     std::optional<::vless::VlessEncryptedIo>& encrypted_io,
-    ::UserOnlineTracker& tracker,
-    ConnectionLimiter* limiter,
+    const proxyman::inbound::AdmissionEnvironment& environment,
+    proxy::InboundAuthentication authentication,
     const proxyman::inbound::ReceiverSettings& receiver,
     session::Context& ctx) {
     const auto tag = ctx.inbound.tag;
@@ -198,6 +198,7 @@ CompleteVlessInboundHandshake(
         try {
             auto runtime =
                 co_await ::vless::RunVlessEncryptionServerHandshake(
+                    environment.coordinator,
                     protocol_reader,
                     protocol_writer,
                     decryption,
@@ -254,20 +255,11 @@ CompleteVlessInboundHandshake(
         co_return tl::unexpected(parsed_request.error());
     }
     auto& request = *parsed_request;
-    const auto credential = co_await proxy::VerifyInboundCredential(
-        limiter, ctx, proxyman::inbound::UserProtocol::Vless, request.uuid);
-    if (credential.error != ErrorCode::OK) co_return tl::unexpected(credential.error);
-    if (resumed_identity &&
-        CRYPTO_memcmp(resumed_identity->data(), request.uuid.data(), request.uuid.size()) != 0) {
-        co_await proxy::RecordInboundAuthFailure(
-            limiter, ctx, "resumed identity mismatch", credential.key);
-        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
-    }
+    const auto credential = co_await authentication.VerifyCredential({proxy::KeyedInboundProtocol::Vless, request.uuid});
+    if (credential != ErrorCode::OK) co_return tl::unexpected(credential);
     auto user_info = proxyman::inbound::UserStore::FindVlessUser(tag, request.uuid);
     if (!user_info) {
-        co_await proxy::RecordInboundAuthFailure(
-            limiter, ctx, "no matching user", credential.key);
-        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+        co_return tl::unexpected(co_await authentication.RejectCredential("no matching user"));
     }
     Network net = Network::TCP;
     if (request.command == ::vless::Command::UDP) {
@@ -280,47 +272,41 @@ CompleteVlessInboundHandshake(
         ::vless::IsPacketAddrMagic(request.target);
     // Published before flow/transport validation so those rejections log the
     // authenticated user and the requested target.
-    proxy::BindAuthenticatedInbound(
-        ctx, user_info->profile,
+    auto bound = std::move(authentication).Bind(user_info->profile,
         proxy::InboundRequestTarget{
             net,
             std::move(request.target),
             std::move(request.forwarded)});
+    if (resumed_identity &&
+        CRYPTO_memcmp(resumed_identity->data(), request.uuid.data(), request.uuid.size()) != 0) {
+        co_return tl::unexpected(std::move(bound).Reject("resumed identity mismatch", ErrorCode::PROTOCOL_AUTH_FAILED));
+    }
     const bool use_vision = ::vless::IsVisionFlow(request.flow);
     if (!request.flow.empty()) {
         if (std::string_view(request.flow) != user_info->flow) {
-            proxy::LogInboundRequestRejected(ctx, "request flow not allowed");
-            co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+            co_return tl::unexpected(std::move(bound).Reject("request flow not allowed", ErrorCode::PROTOCOL_UNSUPPORTED));
         }
         if (!use_vision) {
-            proxy::LogInboundRequestRejected(ctx, "unknown request flow");
-            co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+            co_return tl::unexpected(std::move(bound).Reject("unknown request flow", ErrorCode::PROTOCOL_UNSUPPORTED));
         }
     }
     if (!user_info->flow.empty() && !::vless::IsVisionFlow(user_info->flow)) {
-        proxy::LogInboundRequestRejected(ctx, "unsupported configured flow");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        co_return tl::unexpected(std::move(bound).Reject("unsupported configured flow", ErrorCode::PROTOCOL_UNSUPPORTED));
     }
     if (request.flow.empty() && ::vless::IsVisionFlow(user_info->flow)) {
-        proxy::LogInboundRequestRejected(ctx, "missing required flow");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        co_return tl::unexpected(std::move(bound).Reject("missing required flow", ErrorCode::PROTOCOL_UNSUPPORTED));
     }
     if (use_vision && request.command != ::vless::Command::TCP) {
-        proxy::LogInboundRequestRejected(ctx, "flow only supports TCP");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        co_return tl::unexpected(std::move(bound).Reject("flow only supports TCP", ErrorCode::PROTOCOL_UNSUPPORTED));
     }
     if (use_vision &&
         (!(receiver.stream_settings.IsTlsLike() || decryption != nullptr) ||
          receiver.stream_settings.network_mode != NetworkMode::Tcp)) {
-        proxy::LogInboundRequestRejected(ctx, "flow requires raw TCP TLS-like transport");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        co_return tl::unexpected(std::move(bound).Reject("flow requires raw TCP TLS-like transport", ErrorCode::PROTOCOL_UNSUPPORTED));
     }
 
-    auto user_session = co_await proxy::AdmitAuthenticatedInbound(
-        tracker, ctx, user_info->profile);
-    if (!user_session) {
-        co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
-    }
+    auto user_session = co_await std::move(bound).Admit();
+    if (!user_session) co_return tl::unexpected(user_session.error());
 
     // Flow validation and metadata copy are complete; no credential is needed
     // by the request body or Vision's per-session UUID state.
@@ -329,7 +315,7 @@ CompleteVlessInboundHandshake(
     if (issued_ticket) {
         try {
             (void)co_await ::vless::AuthenticateVlessTicket(
-                decryption, tag, std::move(*issued_ticket), request.uuid);
+                environment.coordinator, decryption, tag, std::move(*issued_ticket), request.uuid);
         } catch (const WorkerMailboxFull&) {
             co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         } catch (const IoSystemError&) {
@@ -352,9 +338,7 @@ namespace proxy::vless::inbound {
 
 class Handler final : public ::Inbound {
 public:
-    Handler(::UserOnlineTracker& tracker,
-            ::StatsShard& stats,
-            ::ConnectionLimiter* limiter,
+    Handler(const ::proxyman::inbound::AdmissionEnvironment& environment,
             std::shared_ptr<
                 const ::vless::VlessEncryptionConfig> decryption = {});
     ~Handler() override;
@@ -369,22 +353,16 @@ public:
         uint32_t pressure_idle_timeout) override;
 
 private:
-    ::UserOnlineTracker& tracker_;
-    ::StatsShard& stats_;
-    ::ConnectionLimiter* limiter_;
+    const ::proxyman::inbound::AdmissionEnvironment& environment_;
     std::shared_ptr<const ::vless::VlessEncryptionConfig> decryption_;
 };
 
 }  // namespace proxy::vless::inbound
 
 proxy::vless::inbound::Handler::Handler(
-    ::UserOnlineTracker& tracker,
-    StatsShard& stats,
-    ConnectionLimiter* limiter,
+    const ::proxyman::inbound::AdmissionEnvironment& environment,
     std::shared_ptr<const ::vless::VlessEncryptionConfig> decryption)
-    : tracker_(tracker)
-    , stats_(stats)
-    , limiter_(limiter)
+    : environment_(environment)
     , decryption_(std::move(decryption)) {}
 
 proxy::vless::inbound::Handler::~Handler() = default;
@@ -401,13 +379,11 @@ proxy::vless::inbound::Handler::Process(
 
 
     auto fail_abortive = [&](ErrorCode error) {
-        return proxy::RejectInbound(stats_, stream.get(), error);
+        return proxy::RejectInbound(environment_.stats, stream.get(), error);
     };
 
-    if (proxy::BeginInboundAuthentication(limiter_, ctx) &&
-        co_await proxy::CheckInboundIpBanned(*limiter_, ctx)) {
-        co_return fail_abortive(ErrorCode::BLOCKED);
-    }
+    auto authentication = co_await proxy::BeginInboundAuthentication(environment_, ctx);
+    if (!authentication) co_return fail_abortive(authentication.error());
 
     proxy::BufferedStreamReader protocol_reader(*stream);
     transport::MultiBufferWriter& protocol_writer = *stream;
@@ -427,8 +403,8 @@ proxy::vless::inbound::Handler::Process(
             protocol_reader,
             protocol_writer,
             encrypted_io,
-            tracker_,
-            limiter_,
+            environment_,
+            std::move(*authentication),
             receiver,
             ctx);
         if (!handshake) {
@@ -455,9 +431,9 @@ proxy::vless::inbound::Handler::Process(
             *stream,
             dispatcher,
             receiver.dispatch_policy,
-            limiter_,
+            environment_,
             ctx,
-            stats_,
+            environment_.stats,
             timeouts,
             pressure_idle_timeout);
     }
@@ -484,7 +460,7 @@ proxy::vless::inbound::Handler::Process(
             transport::Link{&udp_endpoint, &udp_endpoint},
             std::move(first_datagram),
             ctx,
-            stats_,
+            environment_.stats,
             timeouts);
     }
 
@@ -503,7 +479,7 @@ proxy::vless::inbound::Handler::Process(
             transport::Link{&vision_reader, &vision_writer},
             InitialPayload{},
             ctx,
-            stats_,
+            environment_.stats,
             timeouts);
     }
 
@@ -514,7 +490,7 @@ proxy::vless::inbound::Handler::Process(
         transport::Link{active_reader, active_writer},
         InitialPayload{},
         ctx,
-        stats_,
+        environment_.stats,
         timeouts);
 }
 
@@ -548,23 +524,17 @@ const bool kVlessInboundRegistered = [] {
     ::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = ::proxyman::inbound::UserProtocol::Vless;
 
-    reg.create_runtime = &::proxy::CreateUserOnlineProtocolRuntime;
 
     reg.create_tcp_handler =
-        [](::proxyman::inbound::ProtocolRuntime& runtime,
-           ::StatsShard& stats,
-           ::ConnectionLimiter* limiter,
+        [](const ::proxyman::inbound::AdmissionEnvironment& environment,
            const ::proxyman::inbound::BuildRequest& req)
             -> std::unique_ptr<::Inbound> {
-            auto* tracker = runtime.OnlineTracker();
             const auto* settings = GetVlessSettings(req);
-            if (!tracker || !settings) {
+            if (!settings) {
                 return nullptr;
             }
             return std::make_unique<::proxy::vless::inbound::Handler>(
-                *tracker,
-                stats,
-                limiter,
+                environment,
                 settings->decryption);
         };
 

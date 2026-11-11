@@ -1,325 +1,196 @@
-#include <stdexcept>
 #include <gtest/gtest.h>
-
 #include "common/mux/mux_codec.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
-
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <cstdlib>
-#include <iostream>
 #include <limits>
-#include <optional>
 #include <span>
-#include <string_view>
+#include <new>
+#include <optional>
 #include <vector>
 
 namespace {
-
-[[noreturn]] void Fail(std::string_view message) {
-    std::cerr << message << '\n';
-    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
+std::optional<::mux::FrameHeader> Decode(std::span<const uint8_t> frame, size_t split) {
+    ::buf::MultiBuffer input, suffix;
+    split = std::min(split, frame.size());
+    if (!::buf::AppendSpanToMultiBuffer(frame.first(split), input) ||
+        !::buf::AppendSpanToMultiBuffer(frame.subspan(split), suffix)) {
+        throw std::bad_alloc();
+    }
+    suffix.MoveTo(input);
+    return ::mux::DecodeFrame(input);
 }
 
-void Check(bool condition, std::string_view message) {
-    if (!condition) {
-        Fail(message);
+class TruncatedXudp : public testing::TestWithParam<std::vector<uint8_t>> {};
+TEST_P(TruncatedXudp, EofRejectsPartialLengthOrPayload) {
+    buf::MultiBuffer input, packet;
+    ASSERT_TRUE(buf::AppendSpanToMultiBuffer(GetParam(), input));
+    buf::LengthPrefixedPacketBuffer decoder;
+    ASSERT_TRUE(decoder.Append(std::move(input)));
+    EXPECT_EQ(decoder.Pop(packet), buf::LengthPrefixedPacketBuffer::PopResult::NeedMore);
+    EXPECT_FALSE(decoder.Finish());
+}
+INSTANTIATE_TEST_SUITE_P(Boundaries, TruncatedXudp,
+    testing::Values(std::vector<uint8_t>{0}, std::vector<uint8_t>{0, 2, 0x41}));
+
+struct PayloadCase { size_t size; bool udp; };
+class MuxPayload : public testing::TestWithParam<PayloadCase> {};
+TEST_P(MuxPayload, PreservesPayloadLengthAcrossBufferLayouts) {
+    const auto item = GetParam();
+    std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
+    const size_t count = item.udp
+        ? mux::EncodeNewHeaderTo(header, 9, mux::NetworkType::UDP,
+              TargetAddress("example.com", 53), item.size, true)
+        : mux::EncodeKeepDataHeaderTo(header, 7, item.size);
+    ASSERT_NE(count, 0u);
+    std::vector<uint8_t> wire(header.begin(), header.begin() + count);
+    wire.insert(wire.end(), item.size, 0x5a);
+    for (size_t split : {size_t(0), size_t(3), count, wire.size()}) {
+        SCOPED_TRACE(split);
+        const auto decoded = Decode(wire, split);
+        ASSERT_TRUE(decoded);
+        EXPECT_EQ(decoded->frame_size, wire.size());
+        EXPECT_TRUE(decoded->has_data);
+        EXPECT_EQ(decoded->data_len, item.size);
     }
 }
+INSTANTIATE_TEST_SUITE_P(Boundaries, MuxPayload, testing::Values(
+    PayloadCase{0, false}, PayloadCase{std::numeric_limits<uint16_t>::max(), false},
+    PayloadCase{buf::Buffer::kSize + 257, true}));
 
-std::optional<::mux::FrameHeader> DecodeSplit(
-    std::span<const uint8_t> frame,
-    size_t split) {
-    ::buf::MultiBuffer buffers;
-    ::buf::MultiBuffer suffix;
-    split = std::min(split, frame.size());
-    Check(::buf::AppendSpanToMultiBuffer(frame.first(split), buffers) &&
-              ::buf::AppendSpanToMultiBuffer(frame.subspan(split), suffix),
-          "failed to allocate Mux test input");
-    // A separate suffix keeps the split as a real Buffer boundary.
-    suffix.MoveTo(buffers);
-    return ::mux::DecodeFrame(buffers);
+class MuxUdpNew : public testing::TestWithParam<bool> {};
+TEST_P(MuxUdpNew, DistinguishesControlFromEmptyDataAtEveryHeaderSplit) {
+    std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
+    const size_t count = mux::EncodeNewHeaderTo(header, 7, mux::NetworkType::UDP,
+        TargetAddress("example.com", 53), 0, GetParam());
+    ASSERT_NE(count, 0u);
+    const auto wire = std::span(header).first(count);
+    for (size_t split = 0; split <= count; ++split) {
+        SCOPED_TRACE(split);
+        const auto decoded = Decode(wire, split);
+        ASSERT_TRUE(decoded);
+        EXPECT_EQ(decoded->has_data, GetParam());
+        EXPECT_EQ(decoded->data_len, 0u);
+        EXPECT_EQ(decoded->frame_size, count);
+    }
 }
+INSTANTIATE_TEST_SUITE_P(DataPresence, MuxUdpNew, testing::Bool());
 
-std::optional<::mux::FrameHeader> Decode(std::span<const uint8_t> frame) {
-    return DecodeSplit(frame, frame.size());
+class OversizedMuxPayload : public testing::TestWithParam<int> {};
+TEST_P(OversizedMuxPayload, RejectsLengthRatherThanTruncating) {
+    std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
+    const size_t size = size_t(std::numeric_limits<uint16_t>::max()) + 1;
+    const TargetAddress target("example.com", 53);
+    switch (GetParam()) {
+    case 0: EXPECT_EQ(mux::EncodeKeepDataHeaderTo(header, 7, size), 0u); break;
+    case 1: EXPECT_EQ(mux::EncodeNewHeaderTo(header, 7, mux::NetworkType::UDP, target, size, true), 0u); break;
+    case 2: EXPECT_EQ(mux::EncodeKeepUDPHeaderTo(header, 7, target, size), 0u); break;
+    }
 }
+INSTANTIATE_TEST_SUITE_P(FrameKinds, OversizedMuxPayload, testing::Values(0, 1, 2));
 
-bool EncodeKeepDataHeader(
-    ::memory::ByteVector& out,
-    uint16_t session_id,
-    size_t payload_len) {
-    std::array<uint8_t, ::mux::kMaxFrameHeaderBytes> header{};
-    const size_t n = ::mux::EncodeKeepDataHeaderTo(header, session_id, payload_len);
-    out.assign(header.data(), header.data() + n);
-    return n != 0;
+class InvalidMuxTarget : public testing::TestWithParam<int> {};
+TEST_P(InvalidMuxTarget, RejectsInvalidTargetOrNetworkBeforeEncoding) {
+    std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
+    TargetAddress target("example.com", GetParam() < 2 ? 0 : 53);
+    auto network = mux::NetworkType::TCP;
+    if (GetParam() == 2) {
+        target.type = AddressType::Domain;
+        target.host.assign(256, 'a');
+    }
+    if (GetParam() == 3) network = static_cast<mux::NetworkType>(0xff);
+    if (GetParam() == 1) {
+        EXPECT_EQ(mux::EncodeKeepUDPHeaderTo(header, 7, target, 0), 0u);
+    } else {
+        EXPECT_EQ(mux::EncodeNewHeaderTo(header, 7, network, target, 0, false), 0u);
+    }
 }
+INSTANTIATE_TEST_SUITE_P(Faults, InvalidMuxTarget, testing::Values(0, 1, 2, 3));
 
-bool EncodeNewHeaderTo(
-    ::memory::ByteVector& out,
-    uint16_t session_id,
-    ::mux::NetworkType network,
-    const ::TargetAddress& target,
-    size_t payload_len,
-    bool has_data) {
-    std::array<uint8_t, ::mux::kMaxFrameHeaderBytes> header{};
-    const size_t n = ::mux::EncodeNewHeaderTo(
-        header, session_id, network, target, payload_len, has_data);
-    out.assign(header.data(), header.data() + n);
-    return n != 0;
+class InvalidMuxFrame : public testing::TestWithParam<std::vector<uint8_t>> {};
+TEST_P(InvalidMuxFrame, RejectsMalformedMetadataInContiguousAndFragmentedInput) {
+    for (size_t split : {GetParam().size(), size_t(3)}) {
+        const auto decoded = Decode(GetParam(), split);
+        ASSERT_TRUE(decoded);
+        EXPECT_EQ(decoded->frame_size, 0u);
+    }
 }
+INSTANTIATE_TEST_SUITE_P(Faults, InvalidMuxFrame, testing::Values(
+    std::vector<uint8_t>{0, 4, 0, 7, static_cast<uint8_t>(mux::SessionStatus::NEW), 0},
+    std::vector<uint8_t>{0, 0x13, 0, 7, static_cast<uint8_t>(mux::SessionStatus::NEW), 0,
+        static_cast<uint8_t>(mux::NetworkType::TCP), 0, 0, 2, 11,
+        'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm'},
+    std::vector<uint8_t>{0, 11, 0, 7, static_cast<uint8_t>(mux::SessionStatus::NEW), 0,
+        static_cast<uint8_t>(mux::NetworkType::TCP), 0, 80, 2, 3, 'a', ' ', 'b'},
+    std::vector<uint8_t>{0, 5, 0, 0, static_cast<uint8_t>(mux::SessionStatus::KEEPALIVE), 0, 0xaa},
+    std::vector<uint8_t>{2, 0, 0}));
 
-bool EncodeKeepUDPHeaderTo(
-    ::memory::ByteVector& out,
-    uint16_t session_id,
-    const ::TargetAddress& src,
-    size_t payload_len) {
-    std::array<uint8_t, ::mux::kMaxFrameHeaderBytes> header{};
-    const size_t n = ::mux::EncodeKeepUDPHeaderTo(
-        header, session_id, src, payload_len);
-    out.assign(header.data(), header.data() + n);
-    return n != 0;
+class MuxGlobalId : public testing::TestWithParam<size_t> {};
+TEST_P(MuxGlobalId, AcceptsExactlyEightBytesOfGlobalIdMetadata) {
+    std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
+    const auto count = mux::EncodeNewHeaderTo(header, 7, mux::NetworkType::UDP,
+        TargetAddress("example.com", 53), 0, false);
+    ASSERT_GE(count, 2u);
+    std::vector<uint8_t> wire(header.begin(), header.begin() + count);
+    const auto meta = (size_t(wire[0]) << 8 | wire[1]) + GetParam();
+    wire.insert(wire.end(), GetParam(), 0x42);
+    wire[0] = static_cast<uint8_t>(meta >> 8);
+    wire[1] = static_cast<uint8_t>(meta);
+    for (size_t split : {wire.size(), size_t(5)}) {
+        const auto decoded = Decode(wire, split);
+        ASSERT_TRUE(decoded);
+        EXPECT_EQ(decoded->frame_size, GetParam() == 8 ? wire.size() : 0u);
+    }
 }
-
-void CheckInvalidAcrossLayouts(
-    std::span<const uint8_t> frame,
-    std::string_view message) {
-    const auto contiguous = Decode(frame);
-    const auto fragmented = DecodeSplit(frame, 3);
-
-    Check(contiguous.has_value() && contiguous->frame_size == 0 &&
-              fragmented.has_value() && fragmented->frame_size == 0,
-          message);
-}
-
+INSTANTIATE_TEST_SUITE_P(Lengths, MuxGlobalId, testing::Values(size_t(8), size_t(9)));
 }  // namespace
 
-TEST(MuxCodec, Contract) {
-    constexpr size_t kMaxPayload = std::numeric_limits<uint16_t>::max();
-    std::vector<uint8_t> maximum(kMaxPayload, 0x5a);
-    std::vector<uint8_t> oversized(kMaxPayload + 1, 0x6b);
-    memory::ByteVector encoded;
+TEST(XudpCodec, RecoversDatagramLargerThanSingleBuffer) {
+    const std::vector<uint8_t> packet(buf::Buffer::kSize + 257, 0x39);
+    std::vector<uint8_t> wire{static_cast<uint8_t>(packet.size() >> 8), static_cast<uint8_t>(packet.size())};
+    wire.insert(wire.end(), packet.begin(), packet.end());
+    buf::MultiBuffer input, output;
+    ASSERT_TRUE(buf::AppendSpanToMultiBuffer(wire, input));
+    buf::LengthPrefixedPacketBuffer decoder;
+    ASSERT_TRUE(decoder.Append(std::move(input)));
+    EXPECT_EQ(decoder.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
+    std::vector<uint8_t> recovered(packet.size());
+    EXPECT_EQ(output.CopyPrefixTo(recovered), packet.size());
+    EXPECT_EQ(recovered, packet);
+    EXPECT_EQ(decoder.PendingBytes(), 0u);
+    EXPECT_TRUE(decoder.Finish());
+}
 
-    std::vector<uint8_t> large_xudp_packet(buf::Buffer::kSize + 257, 0x39);
-    std::vector<uint8_t> xudp_wire(large_xudp_packet.size() + 2);
-    xudp_wire[0] = static_cast<uint8_t>(large_xudp_packet.size() >> 8);
-    xudp_wire[1] = static_cast<uint8_t>(large_xudp_packet.size());
-    std::copy(
-        large_xudp_packet.begin(), large_xudp_packet.end(), xudp_wire.begin() + 2);
-    buf::MultiBuffer xudp_input;
-    Check(buf::AppendSpanToMultiBuffer(xudp_wire, xudp_input),
-          "failed to allocate large XUDP fixture");
-    buf::LengthPrefixedPacketBuffer xudp_decoder;
-    Check(xudp_decoder.Append(std::move(xudp_input)), "XUDP input rejected");
-    buf::MultiBuffer decoded_xudp_packet;
-    const auto xudp_result = xudp_decoder.Pop(decoded_xudp_packet);
-    std::vector<uint8_t> recovered_xudp_packet(large_xudp_packet.size());
-    const size_t recovered_xudp_bytes =
-        decoded_xudp_packet.CopyPrefixTo(recovered_xudp_packet);
-    Check(xudp_result == buf::LengthPrefixedPacketBuffer::PopResult::Packet &&
-              recovered_xudp_bytes == large_xudp_packet.size() &&
-              recovered_xudp_packet == large_xudp_packet &&
-              xudp_decoder.PendingBytes() == 0,
-          "XUDP packet larger than one Buffer was rejected or truncated");
-    Check(xudp_decoder.Finish(), "XUDP EOF rejected at frame boundary");
-    xudp_decoder.Reset();
-    const std::array<uint8_t, 5> empty_then_packet{0, 0, 0, 1, 0x4f};
-    buf::MultiBuffer empty_input;
-    Check(buf::AppendSpanToMultiBuffer(empty_then_packet, empty_input),
-          "failed to allocate empty XUDP fixture");
-    Check(xudp_decoder.Append(std::move(empty_input)), "empty XUDP input rejected");
-    Check(xudp_decoder.Pop(decoded_xudp_packet) ==
-              buf::LengthPrefixedPacketBuffer::PopResult::Packet &&
-          decoded_xudp_packet.empty() && xudp_decoder.PendingBytes() == 3,
-          "zero-length XUDP frame failed to consume exactly its header");
-    Check(xudp_decoder.Pop(decoded_xudp_packet) ==
-              buf::LengthPrefixedPacketBuffer::PopResult::Packet &&
-          decoded_xudp_packet.byte_size() == 1,
-          "zero-length XUDP frame corrupted its successor");
-    Check(xudp_decoder.Finish(), "XUDP EOF rejected after empty frame");
-    for (const auto& truncated : {std::vector<uint8_t>{0},
-                                  std::vector<uint8_t>{0, 2, 0x41}}) {
-        xudp_decoder.Reset();
-        buf::MultiBuffer input;
-        Check(buf::AppendSpanToMultiBuffer(truncated, input),
-              "failed to allocate truncated XUDP fixture");
-        Check(xudp_decoder.Append(std::move(input)), "partial XUDP input rejected");
-        Check(xudp_decoder.Pop(decoded_xudp_packet) ==
-                  buf::LengthPrefixedPacketBuffer::PopResult::NeedMore,
-              "truncated XUDP frame was emitted");
-        Check(!xudp_decoder.Finish(), "XUDP EOF accepted a partial length or payload");
+TEST(XudpCodec, EmptyPacketConsumesItsHeaderWithoutCorruptingSuccessor) {
+    const std::array<uint8_t, 5> wire{0, 0, 0, 1, 0x4f};
+    buf::MultiBuffer input, output;
+    ASSERT_TRUE(buf::AppendSpanToMultiBuffer(wire, input));
+    buf::LengthPrefixedPacketBuffer decoder;
+    ASSERT_TRUE(decoder.Append(std::move(input)));
+    EXPECT_EQ(decoder.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
+    EXPECT_TRUE(output.empty());
+    EXPECT_EQ(decoder.PendingBytes(), 3u);
+    EXPECT_EQ(decoder.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
+    EXPECT_EQ(output.byte_size(), 1u);
+    EXPECT_TRUE(decoder.Finish());
+}
+
+TEST(MuxCodec, RejectsPayloadLengthWithoutDataOption) {
+    std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
+    EXPECT_EQ(mux::EncodeNewHeaderTo(header, 7, mux::NetworkType::UDP,
+        TargetAddress("example.com", 53), 1, false), 0u);
+}
+
+TEST(MuxCodec, RejectsUnknownOptionBitsAcrossLayouts) {
+    std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
+    const auto count = mux::EncodeKeepDataHeaderTo(header, 7, 0);
+    ASSERT_GT(count, 5u);
+    header[5] |= 0x80;
+    for (size_t split : {count, size_t(3)}) {
+        const auto decoded = Decode(std::span(header).first(count), split);
+        ASSERT_TRUE(decoded);
+        EXPECT_EQ(decoded->frame_size, 0u);
     }
-
-    Check(EncodeNewHeaderTo(
-              encoded,
-              9,
-              mux::NetworkType::UDP,
-              TargetAddress("example.com", 53),
-              large_xudp_packet.size(), true),
-          "large Mux NEW header was rejected");
-    encoded.insert(
-        encoded.end(), large_xudp_packet.begin(), large_xudp_packet.end());
-    const auto large_new_frame = Decode(encoded);
-    Check(large_new_frame.has_value() && large_new_frame->frame_size == encoded.size() &&
-              large_new_frame->data_len == large_xudp_packet.size(),
-          "Mux NEW header did not preserve a multi-buffer datagram length");
-
-    Check(EncodeKeepDataHeader(
-              encoded, 7, maximum.size()),
-          "maximum Mux payload was rejected");
-    encoded.insert(encoded.end(), maximum.begin(), maximum.end());
-    const auto decoded = Decode(encoded);
-    Check(decoded.has_value() && decoded->frame_size == encoded.size() &&
-              decoded->data_len == kMaxPayload,
-          "maximum Mux payload did not round-trip");
-
-    Check(EncodeKeepDataHeader(encoded, 7, 0),
-          "zero-length Mux DATA frame was rejected");
-    const auto empty_decoded = Decode(encoded);
-    Check(empty_decoded.has_value() &&
-              empty_decoded->frame_size == encoded.size() &&
-              empty_decoded->has_data && empty_decoded->data_len == 0,
-          "zero-length Mux DATA frame omitted its wire length");
-    Check(EncodeNewHeaderTo(encoded, 7, mux::NetworkType::UDP,
-                            TargetAddress("example.com", 53), 0, false),
-          "pure Mux UDP NEW control frame was rejected");
-    const auto control_new = Decode(encoded);
-    const size_t control_size = encoded.size();
-    Check(control_new && !control_new->has_data && control_new->data_len == 0 &&
-          control_new->frame_size == control_size,
-          "Mux UDP NEW control frame manufactured Data");
-    Check(EncodeNewHeaderTo(encoded, 7, mux::NetworkType::UDP,
-                            TargetAddress("example.com", 53), 0, true),
-          "Mux UDP NEW with empty Data was rejected");
-    for (size_t split = 0; split <= encoded.size(); ++split) {
-        const auto data_new = DecodeSplit(encoded, split);
-        Check(data_new && data_new->has_data && data_new->data_len == 0 &&
-              data_new->frame_size == encoded.size() && encoded.size() == control_size + 2,
-              "Mux UDP NEW lost empty Data or its length across Buffer layouts");
-    }
-    Check(!EncodeNewHeaderTo(encoded, 7, mux::NetworkType::UDP,
-                             TargetAddress("example.com", 53), 1, false),
-          "Mux NEW without Data silently encoded a nonzero payload length");
-    Check(!EncodeKeepDataHeader(encoded, 7, oversized.size()) &&
-              encoded.empty(),
-          "oversized Mux TCP header was truncated instead of rejected");
-
-    const TargetAddress target("example.com", 53);
-    const TargetAddress zero_port_target("example.com", 0);
-    TargetAddress oversized_domain_target;
-    oversized_domain_target.type = AddressType::Domain;
-    oversized_domain_target.host.assign(256, 'a');
-    oversized_domain_target.port = 53;
-    Check(!EncodeNewHeaderTo(
-              encoded,
-              7,
-              mux::NetworkType::TCP,
-              zero_port_target,
-              0, false) &&
-              encoded.empty(),
-          "Mux NEW encoded a zero-port target");
-    Check(!EncodeKeepUDPHeaderTo(
-              encoded, 7, zero_port_target, 0) && encoded.empty(),
-          "Mux UDP encoded a zero-port target");
-    Check(!EncodeNewHeaderTo(
-              encoded,
-              7,
-              mux::NetworkType::TCP,
-              oversized_domain_target,
-              0, false) &&
-              encoded.empty(),
-          "Mux NEW truncated an oversized domain target");
-    Check(!EncodeNewHeaderTo(
-              encoded,
-              7,
-              static_cast<mux::NetworkType>(0xff),
-              target,
-              0, false) &&
-              encoded.empty(),
-          "Mux NEW encoded an unknown network type");
-
-    Check(!EncodeNewHeaderTo(
-              encoded,
-              7,
-              mux::NetworkType::UDP,
-              target,
-              oversized.size(), true) &&
-              encoded.empty(),
-          "oversized Mux NEW payload was truncated instead of rejected");
-    Check(!EncodeKeepUDPHeaderTo(
-              encoded, 7, target, oversized.size()) &&
-              encoded.empty(),
-          "oversized Mux UDP header was truncated instead of rejected");
-
-    Check(EncodeKeepDataHeader(encoded, 7, 0),
-          "failed to encode option validation fixture");
-    encoded[5] |= 0x80;
-    CheckInvalidAcrossLayouts(
-        encoded, "unknown Mux option bits were layout-dependent or accepted");
-
-    const std::vector<uint8_t> missing_new_target{
-        0x00, 0x04, 0x00, 0x07,
-        static_cast<uint8_t>(mux::SessionStatus::NEW), 0x00};
-    CheckInvalidAcrossLayouts(
-        missing_new_target, "Mux NEW without a target was accepted");
-
-    const std::vector<uint8_t> zero_port_new_target{
-        0x00, 0x13, 0x00, 0x07,
-        static_cast<uint8_t>(mux::SessionStatus::NEW), 0x00,
-        static_cast<uint8_t>(mux::NetworkType::TCP),
-        0x00, 0x00, 0x02, 0x0b,
-        'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm'};
-    CheckInvalidAcrossLayouts(
-        zero_port_new_target, "Mux NEW accepted a zero-port target");
-
-    const std::vector<uint8_t> invalid_domain_new_target{
-        0x00, 0x0b, 0x00, 0x07,
-        static_cast<uint8_t>(mux::SessionStatus::NEW), 0x00,
-        static_cast<uint8_t>(mux::NetworkType::TCP),
-        0x00, 0x50, 0x02, 0x03, 'a', ' ', 'b'};
-    CheckInvalidAcrossLayouts(
-        invalid_domain_new_target, "Mux NEW accepted an invalid domain target");
-
-    const std::vector<uint8_t> trailing_keepalive_metadata{
-        0x00, 0x05, 0x00, 0x00,
-        static_cast<uint8_t>(mux::SessionStatus::KEEPALIVE), 0x00, 0xaa};
-    CheckInvalidAcrossLayouts(
-        trailing_keepalive_metadata,
-        "Mux KEEPALIVE trailing metadata was accepted");
-
-    const std::vector<uint8_t> oversized_metadata_prefix{0x02, 0x00, 0x00};
-    CheckInvalidAcrossLayouts(
-        oversized_metadata_prefix,
-        "Mux MetaLen beyond the largest valid metadata waited for more data");
-
-    Check(EncodeNewHeaderTo(
-              encoded,
-              7,
-              mux::NetworkType::UDP,
-              target,
-              0, false),
-          "failed to encode GlobalID fixture");
-    const uint16_t base_meta_len = static_cast<uint16_t>(
-        (static_cast<uint16_t>(encoded[0]) << 8) | encoded[1]);
-    encoded.insert(encoded.end(), 8, 0x42);
-    const uint16_t global_meta_len = static_cast<uint16_t>(base_meta_len + 8);
-    encoded[0] = static_cast<uint8_t>(global_meta_len >> 8);
-    encoded[1] = static_cast<uint8_t>(global_meta_len);
-    const auto global_id_frame = Decode(encoded);
-    const auto fragmented_global_id_frame = DecodeSplit(encoded, 5);
-    Check(global_id_frame.has_value() && global_id_frame->frame_size != 0 &&
-              fragmented_global_id_frame.has_value() &&
-              fragmented_global_id_frame->frame_size == global_id_frame->frame_size,
-          "exact eight-byte Mux GlobalID was rejected");
-
-    encoded.push_back(0x43);
-    const uint16_t oversized_global_meta_len = static_cast<uint16_t>(base_meta_len + 9);
-    encoded[0] = static_cast<uint8_t>(oversized_global_meta_len >> 8);
-    encoded[1] = static_cast<uint8_t>(oversized_global_meta_len);
-    CheckInvalidAcrossLayouts(
-        encoded, "oversized Mux GlobalID metadata was accepted");
-
-    std::cout << "mux_codec_test: ok\n";
 }

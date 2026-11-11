@@ -73,14 +73,24 @@ ConnectionLimiter::ConnectionLimiter(
 
 ConnectionLimiter::~ConnectionLimiter() = default;
 
+std::optional<net::awaitable<ConnectionLimiter::Admission>> ConnectionLimiter::TryReserve(
+    ReservationRequest request) {
+    const bool tracks_ban = request.check_ban && core_->TracksAuthBan() && !request.ip.empty();
+    if (request.scope == ReservationScope::Physical) {
+        if (!core_->TracksGlobalConnections() && !tracks_ban) return std::nullopt;
+        return ReservePhysical(request.tag, request.ip, request.check_ban);
+    }
+    const bool tracks_family = request.scope == ReservationScope::Logical &&
+        request.family && core_->TracksGlobalConnections();
+    if (!tracks_family && !core_->TracksIpConnections() && !tracks_ban)
+        return std::nullopt;
+    return Reserve(request.scope == ReservationScope::Logical ? std::move(request.family) : nullptr,
+                   request.tag, request.ip, request.check_ban);
+}
+
 net::awaitable<ConnectionLimiter::Admission> ConnectionLimiter::ReservePhysical(
     std::string_view tag, std::string_view ip, bool check_ban) {
     const auto ban_key = check_ban ? core_->ComputeIpBanKey(tag, ip) : std::nullopt;
-    if (!core_->TracksGlobalConnections() && !ban_key) {
-        return []() -> net::awaitable<Admission> {
-            co_return Admission{RejectReason::NONE, {}};
-        }();
-    }
     auto node = std::make_unique<Return>();
     node->owner = shared_from_this();
     if (core_->TracksGlobalConnections()) {
@@ -103,16 +113,6 @@ net::awaitable<ConnectionLimiter::Admission> ConnectionLimiter::ReservePhysical(
         });
 }
 
-net::awaitable<ConnectionLimiter::Admission> ConnectionLimiter::ReserveIP(
-    std::string_view tag, std::string_view ip, bool check_ban) {
-    return Reserve({}, tag, ip, check_ban);
-}
-
-net::awaitable<ConnectionLimiter::Admission> ConnectionLimiter::ReserveLogical(
-    std::shared_ptr<Family> family, std::string_view tag, std::string_view ip,
-    bool check_ban) {
-    return Reserve(std::move(family), tag, ip, check_ban);
-}
 
 AuthCredentialKey ConnectionLimiter::FingerprintCredential(
     std::string_view tag, std::span<const uint8_t> credential,
@@ -154,11 +154,6 @@ net::awaitable<ConnectionLimiter::Admission> ConnectionLimiter::Reserve(
     const auto ban_key = check_ban ? core_->ComputeIpBanKey(tag, ip) : std::nullopt;
     if (!core_->TracksGlobalConnections()) {
         family.reset();
-    }
-    if (!core_->TracksGlobalConnections() && !core_->TracksIpConnections() && !ban_key) {
-        return []() -> net::awaitable<Admission> {
-            co_return Admission{RejectReason::NONE, {}};
-        }();
     }
     const uint64_t ip_hash = core_->TracksIpConnections()
         ? ConnectionLimiterCore::IpHash(ip) : 0;

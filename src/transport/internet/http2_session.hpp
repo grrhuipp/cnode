@@ -50,6 +50,7 @@ inline constexpr std::string_view kHttp2ClientPreface =
 // gRPC server: reads the client preface, then serves the connection until it
 // ends. Logical streams are delivered to `stream_handler`.
 [[nodiscard]] net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
+    GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
     const GrpcConfig& cfg,
     net::io_context& io_context,
@@ -59,6 +60,7 @@ inline constexpr std::string_view kHttp2ClientPreface =
 // h2 / XHTTP server after the caller consumed the client preface. `cfg` and
 // `xhttp_cfg` are borrowed for the whole call; the session never outlives it.
 [[nodiscard]] net::awaitable<TransportBuildResult> RunHttp2ServerSession(
+    GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
     const HttpConfig& cfg,
     const XHttpConfig* xhttp_cfg,

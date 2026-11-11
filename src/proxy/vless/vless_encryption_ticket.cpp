@@ -2,7 +2,6 @@
 #include "app/session_group_executor.hpp"
 #include "infra/log.hpp"
 
-#include <asio/this_coro.hpp>
 #include <blake3.h>
 
 #include <algorithm>
@@ -189,41 +188,35 @@ private:
 } // namespace
 
 net::awaitable<bool> AuthenticateVlessTicket(
+    GroupCoordinator& coordinator,
     std::shared_ptr<const VlessEncryptionConfig> config, std::string_view tag,
     VlessEncryptionIssuedTicket ticket, std::array<uint8_t, 16> identity) {
     if (!config) co_return false;
-    auto executor = co_await net::this_coro::executor;
-    auto* coordinator = GroupCoordinator::ForContext(
-        net::query(executor, net::execution::context));
-    if (!coordinator) co_return false;
     std::string owned_tag(tag);
-    co_return co_await coordinator->PostCall(
-        [coordinator, config = std::move(config), tag = std::move(owned_tag),
+    co_return co_await coordinator.PostCall(
+        [&coordinator, config = std::move(config), tag = std::move(owned_tag),
          ticket = std::move(ticket), identity]() mutable -> bool {
             const auto now = Clock::now();
             const auto expires = ticket.issued_at + std::chrono::seconds(ticket.seconds);
             if (ticket.seconds == 0 || expires <= now) return false;
             auto& store = net::use_service<TicketDirectoryService>(
-                coordinator->Services()).GetOrCreate(std::move(config), tag);
+                coordinator.Services()).GetOrCreate(std::move(config), tag);
             store.Store(ticket.ticket, ticket.pfs_key, ticket.seconds, ticket.issued_at);
             return store.BindIdentity(ticket.ticket, identity, now);
         });
 }
 
 net::awaitable<std::optional<Resumed>> LookupVlessTicket(
+    GroupCoordinator& coordinator,
     std::shared_ptr<const VlessEncryptionConfig> config, std::string_view tag,
     Ticket ticket, VlessEncryptionNfsKey nfs) {
     if (!config) co_return std::nullopt;
-    auto executor = co_await net::this_coro::executor;
-    auto* coordinator = GroupCoordinator::ForContext(
-        net::query(executor, net::execution::context));
-    if (!coordinator) co_return std::nullopt;
     std::string owned_tag(tag);
-    co_return co_await coordinator->PostCall(
-        [coordinator, config = std::move(config), tag = std::move(owned_tag),
+    co_return co_await coordinator.PostCall(
+        [&coordinator, config = std::move(config), tag = std::move(owned_tag),
          ticket, nfs = std::move(nfs)]() -> std::optional<Resumed> {
             auto* store = net::use_service<TicketDirectoryService>(
-                coordinator->Services()).Find(config.get(), tag);
+                coordinator.Services()).Find(config.get(), tag);
             auto result = store ? store->Lookup(ticket, nfs, Clock::now()) : std::nullopt;
             LOG_NET_DEBUG("inbound '{}' ticket lookup accepted={}",
                           tag, result.has_value());

@@ -20,8 +20,8 @@
 #include <asio/this_coro.hpp>
 #include <chrono>
 #include <cstring>
-#include <iostream>
 #include <optional>
+#include <utility>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -32,9 +32,14 @@ using namespace std::chrono_literals;
 size_t BufferCount() noexcept { return memory::detail::test_buffers_live; }
 size_t BufferPeak() noexcept { return memory::detail::test_buffers_peak; }
 
-void Check(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
-}
+template <typename Cleanup>
+class CleanupGuard {
+public:
+    explicit CleanupGuard(Cleanup cleanup) : cleanup_(std::move(cleanup)) {}
+    ~CleanupGuard() { cleanup_(); }
+private:
+    Cleanup cleanup_;
+};
 
 // Setup and teardown use the same allocation lease as protocol callbacks.
 // The coordinator stays alive until domain services and reserved returns drain.
@@ -47,6 +52,7 @@ public:
           coordinator_(std::make_shared<GroupCoordinator>(io)) {
         UserStore::ClearWorkerView();
         coordinator_->RegisterWorker(io);
+        limiter_ = ConnectionLimiter::Acquire({}, coordinator_);
     }
     ~DomainFixture() {
         Shutdown();
@@ -54,6 +60,8 @@ public:
         UserStore::ClearWorkerView();
     }
     net::any_io_executor Executor() { return io_.get_executor(); }
+    GroupCoordinator& Coordinator() noexcept { return *coordinator_; }
+    ConnectionLimiter& Limiter() noexcept { return *limiter_; }
 
     void InstallUsers(std::span<const UserStore::UserUpdate> updates) {
         auto snapshot = UserStore::PrepareUsers(updates);
@@ -74,16 +82,19 @@ public:
             co_await coordinator_->Finalize();
         }, [&](std::exception_ptr error) { failure = error; joined = true; });
         io_.restart();
-        io_.poll();
+        io_.run();
+        EXPECT_TRUE(joined);
+        EXPECT_FALSE(failure);
+        EXPECT_TRUE(io_.stopped());
+        limiter_.reset();
         coordinator_.reset();
-        Check(joined && !failure && io_.stopped(),
-              "coordinator must join controls and finalize returns without pending work");
     }
 
 private:
     net::io_context& io_;
     UserStore::WorkerView users_;
     std::shared_ptr<GroupCoordinator> coordinator_;
+    std::shared_ptr<ConnectionLimiter> limiter_;
 };
 
 void Frame(std::vector<uint8_t>& out, uint8_t command, uint32_t sid,
@@ -105,12 +116,12 @@ struct StreamState {
     int pending_reads = 0;
     int pending_writes = 0;
     bool block_writes = false;
+    IoErrorCode write_failure;
     bool partial_synack = false;
     int synack_fault = 0;
+    int synack_faults = 0;
     bool delayed_write_cleanup = false;
     bool stall_payload = false;
-    bool record_payload_buffers = false;
-    std::vector<const void*> payload_buffers;
     bool fail_syn_read = false;
     void FeedInvalidFrame(bool mux) {
         if (mux) input.insert(input.end(), {0, 3, 0, 1, 2, 0});
@@ -135,7 +146,6 @@ public:
         if (state_.closed) co_return 0;
         const size_t count = std::min(output.size(), state_.input.size() - state_.offset);
         std::memcpy(output.data(), state_.input.data() + state_.offset, count);
-        if (state_.record_payload_buffers && count >= 4096) state_.payload_buffers.push_back(output.data());
         state_.offset += count;
         if (state_.stall_payload && count == 7 && static_cast<const uint8_t*>(output.data())[0] == 2) {
             state_.stall_payload = false;
@@ -152,6 +162,7 @@ public:
     net::awaitable<size_t> AsyncWrite(net::const_buffer data) override {
         const auto* bytes = static_cast<const uint8_t*>(data.data());
         if (state_.synack_fault != 0 && data.size() == 7 && bytes[0] == 7) {
+            ++state_.synack_faults;
             state_.output.insert(state_.output.end(), bytes, bytes + 3);
             if (state_.synack_fault == 1) throw std::bad_alloc();
             if (state_.synack_fault == 2) throw transport::LinkError(ErrorCode::BLOCKED);
@@ -164,6 +175,7 @@ public:
             ++state_.pending_writes;
             auto [error] = co_await state_.write_wake.async_wait(net::as_tuple(net::use_awaitable));
             --state_.pending_writes;
+            if (state_.write_failure) throw IoSystemError(state_.write_failure);
             if (error && (state_.block_writes || partial_synack)) {
                 if (state_.delayed_write_cleanup) {
                     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
@@ -237,7 +249,7 @@ public:
                 --owner.active; ++owner.finished;
             }
         } scope(*this, ctx);
-        Check(ctx.content.network == Network::TCP, "child must enter the ordinary dispatcher");
+        EXPECT_EQ(ctx.content.network, Network::TCP);
         // Model DNS/dial work before relay subscribes to the logical source.
         (void)co_await gate.async_wait(net::as_tuple(net::use_awaitable));
         if (write_payload) {
@@ -257,12 +269,13 @@ public:
 
 net::awaitable<RelayResult> RunMux(std::unique_ptr<AsyncStream> stream,
     routing::Dispatcher& dispatcher, const proxyman::inbound::ReceiverSettings& receiver,
-    net::io_context& io, session::Context& context, StatsShard& stats, const TimeoutsConfig& timeouts) {
+    net::io_context& io, const proxyman::inbound::AdmissionEnvironment& environment,
+    session::Context& context, StatsShard& stats, const TimeoutsConfig& timeouts) {
     co_return co_await proxy::ServeMuxInbound(io, {stream.get(), stream.get(), stream.get()},
-        *stream, dispatcher, receiver.dispatch_policy, nullptr, context, stats, timeouts, 0);
+        *stream, dispatcher, receiver.dispatch_policy, environment, context, stats, timeouts, 0);
 }
 
-bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = false) {
+void RunCase(int mode, bool blocked_writes, bool mux) {
     net::io_context io;
     DomainFixture domain(io);
     StreamState stream(io);
@@ -292,9 +305,11 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
     domain.InstallUsers(updates);
     std::weak_ptr<const UserStore::AnyTlsCredential> old_table =
         UserStore::FindAnyTlsUser("lifecycle", hash);
-    UserOnlineTracker tracker;
+    UserOnlineTracker tracker(domain.Coordinator());
     StatsShard stats;
-    proxy::anytls::inbound::Handler handler(tracker, stats, {});
+    const AdmissionEnvironment environment{
+        domain.Coordinator(), domain.Limiter(), tracker, stats};
+    proxy::anytls::inbound::Handler handler(environment, {});
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
@@ -309,8 +324,20 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
     std::exception_ptr failure;
     ErrorCode returned_error = ErrorCode::INTERNAL;
     auto request = mux
-        ? RunMux(std::make_unique<Stream>(stream), dispatcher, receiver, io, context, stats, timeouts)
+        ? RunMux(std::make_unique<Stream>(stream), dispatcher, receiver, io, environment, context, stats, timeouts)
         : handler.Process(std::make_unique<Stream>(stream), dispatcher, receiver, io, context, timeouts, 0);
+    CleanupGuard cleanup([&] {
+        cancellation.emit(net::cancellation_type::all);
+        stream.closed = true;
+        stream.wake.cancel();
+        stream.write_wake.cancel();
+        dispatcher.gate.cancel();
+        io.restart();
+        // A device reservation starts the coordinator's persistent return pump.
+        // Join the request before shutting that pump down; io.run() alone cannot drain it.
+        while (!returned) io.run_one();
+        domain.Shutdown();
+    });
     net::co_spawn(domain.Executor(), std::move(request),
         net::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr error, RelayResult result) {
             returned = true;
@@ -320,58 +347,77 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
             returned_error = result.error;
         }));
     io.poll();
-    Check(dispatcher.active == 2 && stream.pending_reads == 1, "both logical requests must be pending");
-    if (!mux && !baseline) {
-        Check(!old_table.expired(), "published snapshot must still own its users");
+    {
+        EXPECT_EQ(dispatcher.active, 2);
+        EXPECT_EQ(stream.pending_reads, 1);
+    }
+    if (!mux) {
+        EXPECT_FALSE(old_table.expired());
         domain.InstallUsers(updates);
-        Check(old_table.expired(), "authenticated control transport must not retain the old user table");
-        Check(context.inbound.user_id == 1 && context.inbound.user_email == "lifecycle@test",
-              "session metadata must survive destruction of its authentication snapshot");
+        EXPECT_TRUE(old_table.expired());
+        {
+            EXPECT_EQ(context.inbound.user_id, 1);
+            EXPECT_EQ(context.inbound.user_email, "lifecycle@test");
+        }
     }
     if (blocked_writes) {
         stream.block_writes = true;
         dispatcher.write_payload = true;
         dispatcher.gate.cancel();
         io.poll();
-        Check(dispatcher.attempting_writes == 2 && stream.pending_writes == 1,
-              "one child must hold the physical writer while another waits for its gate");
+        {
+            EXPECT_EQ(dispatcher.attempting_writes, 2);
+            EXPECT_EQ(stream.pending_writes, 1);
+        }
     }
     if (mode == 0) cancellation.emit(net::cancellation_type::terminal);
     else if (mode == 1) stream.FeedInvalidFrame(mux);
     else if (mode == 2) { stream.closed = true; stream.wake.cancel(); }
-    else {
+    else if (mode == 4) {
+        // Fail the already-started physical write before session retirement.
+        stream.write_failure = io_error::connection_reset;
+        stream.write_wake.cancel();
+    } else {
         Frame(stream.input, 1, 3);
         stream.fail_syn_read = true;
         stream.wake.cancel();
     }
     io.run_for(500ms);
-    const bool joined = returned && dispatcher.active == 0 && finished_at_return == 2 &&
-                        stream.destroyed && stream.pending_reads == 0 && stream.pending_writes == 0;
-    constexpr std::array names{"parent-cancel", "session-failure", "physical-eof", "physical-read-allocation-failure"};
-    std::cout << (mux ? "mux-" : "anytls-") << names[mode] << (blocked_writes ? "-blocked-writes" : "")
-              << " returned=" << returned << " active-at-return=" << active_at_return
-              << " finished-at-return=" << finished_at_return << " joined=" << joined << '\n';
-    // Keep all borrowed fixtures alive even when observing the old unsafe path.
+    EXPECT_TRUE(returned);
+    EXPECT_EQ(active_at_return, 0);
+    EXPECT_EQ(finished_at_return, 2);
+    EXPECT_TRUE(stream.destroyed);
+    EXPECT_EQ(stream.pending_reads, 0);
+    EXPECT_EQ(stream.pending_writes, 0);
+    // Drain fixture work while every borrowed request object remains alive.
     dispatcher.gate.cancel();
     io.restart();
     io.run_for(1s);
-    Check(dispatcher.active == 0, "fixture must join remaining old children");
-    if (!baseline) {
-        Check(joined, "container parent must cancel and join every dynamic request");
-        Check(tracker.OnlineDeviceCount("lifecycle", 1) == 0, "online lease must be released after join");
+    EXPECT_EQ(dispatcher.active, 0);
+    {
+        EXPECT_EQ(tracker.OnlineDeviceCount("lifecycle", 1), 0);
         if (mode == 0) {
-            Check(!failure && returned_error == ErrorCode::CANCELLED, "parent cancellation must be classified");
+            {
+                EXPECT_FALSE(failure);
+                EXPECT_EQ(returned_error, ErrorCode::CANCELLED);
+            }
         } else if (mode == 3) {
-            Check(!failure && returned_error == ErrorCode::RESOURCE_EXHAUSTED,
-                  "physical read allocation failure must retain its classification");
+            {
+                EXPECT_FALSE(failure);
+                EXPECT_EQ(returned_error, ErrorCode::RESOURCE_EXHAUSTED);
+            }
+        } else if (mode == 4) {
+            EXPECT_FALSE(failure);
+            EXPECT_EQ(returned_error, ErrorCode::SOCKET_CLOSED);
         } else {
             const auto expected = mode == 1
                 ? (mux ? ErrorCode::PROTOCOL_DECODE_FAILED : ErrorCode::PROTOCOL_INVALID_COMMAND) : ErrorCode::OK;
-            Check(!failure && returned_error == expected,
-                  "session result must survive companion cancellation");
+            {
+                EXPECT_FALSE(failure);
+                EXPECT_EQ(returned_error, expected);
+            }
         }
     }
-    return joined;
 }
 bool HasAlert(const std::vector<uint8_t>& bytes) {
     for (size_t offset = 0; offset + 7 <= bytes.size();) {
@@ -395,10 +441,7 @@ bool HasFrame(const std::vector<uint8_t>& bytes, uint8_t command, uint32_t sid) 
     return false;
 }
 
-void RunHandshakeCase(int mode, bool baseline = false) {
-    constexpr std::array names{"partial-synack-timeout", "partial-synack-parent-cancel",
-        "write-gate-timeout-isolation", "capacity-rejected-id-retired", "overdue-ready-header",
-        "synack-memory-error", "synack-link-error", "synack-unexpected-error"};
+void RunHandshakeCase(int mode) {
     net::io_context io;
     DomainFixture domain(io);
     StreamState stream(io);
@@ -418,9 +461,11 @@ void RunHandshakeCase(int mode, bool baseline = false) {
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"handshake", users}};
     domain.InstallUsers(updates);
-    UserOnlineTracker tracker;
+    UserOnlineTracker tracker(domain.Coordinator());
     StatsShard stats;
-    proxy::anytls::inbound::Handler handler(tracker, stats, {});
+    const AdmissionEnvironment environment{
+        domain.Coordinator(), domain.Limiter(), tracker, stats};
+    proxy::anytls::inbound::Handler handler(environment, {});
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
@@ -435,79 +480,127 @@ void RunHandshakeCase(int mode, bool baseline = false) {
     net::cancellation_signal cancellation;
     bool returned = false;
     int active_at_return = -1;
+    std::exception_ptr failure;
+    ErrorCode returned_error = ErrorCode::OK;
+    CleanupGuard cleanup([&] {
+        cancellation.emit(net::cancellation_type::all);
+        stream.closed = true;
+        stream.wake.cancel();
+        stream.write_wake.cancel();
+        dispatcher.gate.cancel();
+        io.restart();
+        while (!returned) io.run_one();
+        domain.Shutdown();
+    });
     net::co_spawn(domain.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
         receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
-        [&](std::exception_ptr, RelayResult) {
-            returned = true; active_at_return = dispatcher.active;
+        [&](std::exception_ptr error, RelayResult result) {
+            failure = error;
+            returned_error = result.error;
+            returned = true;
+            active_at_return = dispatcher.active;
         }));
     io.poll();
     if (mode >= 5) {
-        const bool passed = returned && stream.closed && stream.destroyed && active_at_return == 0 &&
-            stream.pending_reads == 0 && stream.pending_writes == 0;
-        std::cout << "handshake-" << names[mode]
-                  << " joined=" << (returned && stream.destroyed) << " passed=" << passed << '\n';
-        Check(baseline || passed, "physical frame failure must retain the owned logical context and original exception code");
+        EXPECT_EQ(stream.synack_faults, 1);
+        EXPECT_FALSE(failure);
+        EXPECT_EQ(returned_error, mode == 5 ? ErrorCode::RESOURCE_EXHAUSTED :
+            mode == 6 ? ErrorCode::BLOCKED : ErrorCode::INTERNAL);
+        EXPECT_TRUE(returned);
+        EXPECT_TRUE(stream.closed);
+        EXPECT_TRUE(stream.destroyed);
+        EXPECT_EQ(active_at_return, 0);
+        EXPECT_EQ(stream.pending_reads, 0);
+        EXPECT_EQ(stream.pending_writes, 0);
         return;
     }
-    Check(!returned && stream.pending_reads == 1, "session reader must remain live during stream preparation");
+    {
+        EXPECT_FALSE(returned);
+        EXPECT_EQ(stream.pending_reads, 1);
+    }
     if (mode < 2) {
-        Check(stream.pending_writes == 1 && dispatcher.active == 0 && !HasFrame(stream.output, 7, 1),
-              "SYNACK must be incomplete and still belong to handshake preparation");
+        {
+            EXPECT_EQ(stream.pending_writes, 1);
+            EXPECT_EQ(dispatcher.active, 0);
+            EXPECT_FALSE(HasFrame(stream.output, 7, 1));
+        }
         if (mode == 1) {
             cancellation.emit(net::cancellation_type::terminal);
             io.poll();
-            Check(!returned && !stream.destroyed, "parent must wait for cancelled physical write cleanup");
+            {
+                EXPECT_FALSE(returned);
+                EXPECT_FALSE(stream.destroyed);
+            }
         }
         io.run_for(mode == 0 ? 1200ms : 100ms);
-        Check(returned && stream.closed && !HasFrame(stream.output, 3, 1),
-              "an interrupted physical frame must abort the session before another frame is written");
+        {
+            EXPECT_TRUE(returned);
+            EXPECT_TRUE(stream.closed);
+            EXPECT_FALSE(HasFrame(stream.output, 3, 1));
+        }
     } else if (mode == 2) {
-        Check(dispatcher.active == 1, "prepared stream must enter dispatcher");
+        EXPECT_EQ(dispatcher.active, 1);
         stream.block_writes = true;
         dispatcher.write_payload = true;
         dispatcher.gate.cancel();
         io.poll();
-        Check(stream.pending_writes == 1, "established stream must own the physical write gate");
+        EXPECT_EQ(stream.pending_writes, 1);
         Frame(stream.input, 1, 2);
         Frame(stream.input, 2, 2, target);
         stream.wake.cancel();
         io.run_for(1150ms);
-        Check(!returned && !stream.closed && dispatcher.active == 1 && stream.pending_writes == 1,
-              "a handshake waiting for the write gate must not cancel its established sibling");
+        {
+            EXPECT_FALSE(returned);
+            EXPECT_FALSE(stream.closed);
+            EXPECT_EQ(dispatcher.active, 1);
+            EXPECT_EQ(stream.pending_writes, 1);
+        }
         stream.block_writes = false;
         stream.write_wake.cancel();
         io.run_for(100ms);
-        Check(!stream.closed && dispatcher.finished == 1 && HasFrame(stream.output, 3, 2) &&
-              !HasFrame(stream.output, 7, 2), "only the expired logical stream must receive FIN after the gate releases");
+        {
+            EXPECT_FALSE(stream.closed);
+            EXPECT_EQ(dispatcher.finished, 1);
+            EXPECT_TRUE(HasFrame(stream.output, 3, 2));
+            EXPECT_FALSE(HasFrame(stream.output, 7, 2));
+        }
         stream.FeedInvalidFrame(false);
         io.run_for(100ms);
     } else if (mode == 3) {
-        Check(dispatcher.active == 0 && HasFrame(stream.output, 7, 129) && HasFrame(stream.output, 3, 129),
-              "full session must reject the new stream before address dispatch");
+        {
+            EXPECT_EQ(dispatcher.active, 0);
+            EXPECT_TRUE(HasFrame(stream.output, 7, 129));
+            EXPECT_TRUE(HasFrame(stream.output, 3, 129));
+        }
         Frame(stream.input, 1, 129);
         stream.wake.cancel();
         io.run_for(100ms);
-        Check(returned && HasAlert(stream.output), "a capacity-rejected ID must never be admitted on reuse");
+        {
+            EXPECT_TRUE(returned);
+            EXPECT_TRUE(HasAlert(stream.output));
+        }
     } else {
         io.run_for(100ms);
-        Check(dispatcher.active == 0 && dispatcher.finished == 0 && HasFrame(stream.output, 3, 1),
-              "a header ready after its absolute deadline must not dispatch before the timer callback");
+        {
+            EXPECT_EQ(dispatcher.active, 0);
+            EXPECT_EQ(dispatcher.finished, 0);
+            EXPECT_TRUE(HasFrame(stream.output, 3, 1));
+        }
         stream.FeedInvalidFrame(false);
         io.run_for(100ms);
     }
-    Check(returned && active_at_return == 0 && stream.destroyed &&
-          stream.pending_reads == 0 && stream.pending_writes == 0,
-          "handshake children and physical writes must join before transport destruction");
+    {
+        EXPECT_TRUE(returned);
+        EXPECT_EQ(active_at_return, 0);
+        EXPECT_TRUE(stream.destroyed);
+        EXPECT_EQ(stream.pending_reads, 0);
+        EXPECT_EQ(stream.pending_writes, 0);
+    }
     io.restart();
     io.run_for(1100ms); // A removed deadline must not retain pending work or touch dead stream state.
-    domain.Shutdown();
-    Check(io.stopped(), "joined handshakes must leave no live deadline work");
-    std::cout << "handshake-" << names[mode] << " joined=1 passed=1\n";
 }
 
-void RunIdentityCase(int mode, bool baseline) {
-    constexpr std::array names{"duplicate-active", "duplicate-pending", "reuse-completed",
-        "descending", "zero", "syn-payload", "wraparound", "valid-gap", "fin-before-target", "payload-after-retirement"};
+void RunIdentityCase(int mode) {
     net::io_context io;
     DomainFixture domain(io);
     StreamState stream(io);
@@ -528,9 +621,11 @@ void RunIdentityCase(int mode, bool baseline) {
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"identity", users}};
     domain.InstallUsers(updates);
-    UserOnlineTracker tracker;
+    UserOnlineTracker tracker(domain.Coordinator());
     StatsShard stats;
-    proxy::anytls::inbound::Handler handler(tracker, stats, {});
+    const AdmissionEnvironment environment{
+        domain.Coordinator(), domain.Limiter(), tracker, stats};
+    proxy::anytls::inbound::Handler handler(environment, {});
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
@@ -538,22 +633,38 @@ void RunIdentityCase(int mode, bool baseline) {
     context.inbound.tag = "identity";
     context.inbound.source_ip = "127.0.0.1";
     TimeoutsConfig timeouts;
+    net::cancellation_signal cancellation;
     bool returned = false;
     ErrorCode result_error = ErrorCode::INTERNAL;
     std::exception_ptr failure;
+    CleanupGuard cleanup([&] {
+        cancellation.emit(net::cancellation_type::all);
+        stream.closed = true;
+        stream.wake.cancel();
+        stream.write_wake.cancel();
+        dispatcher.gate.cancel();
+        io.restart();
+        while (!returned) io.run_one();
+        domain.Shutdown();
+    });
     net::co_spawn(domain.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
-        receiver, io, context, timeouts, 0), [&](std::exception_ptr error, RelayResult result) {
+        receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr error, RelayResult result) {
             returned = true;
             failure = error;
             result_error = result.error;
-        });
+        }));
     io.poll();
-    Check(dispatcher.active == (pending ? 0 : 1) && stream.pending_reads == 1,
-          "initial identity state must be established");
+    {
+        EXPECT_EQ(dispatcher.active, (pending ? 0 : 1));
+        EXPECT_EQ(stream.pending_reads, 1);
+    }
     if (mode == 2) {
         dispatcher.gate.cancel();
         io.run_for(50ms);
-        Check(dispatcher.finished == 1 && !returned, "first request must retire while session stays open");
+        {
+            EXPECT_EQ(dispatcher.finished, 1);
+            EXPECT_FALSE(returned);
+        }
     }
     if (mode == 9) {
         constexpr std::array<uint8_t, 32> payload{};
@@ -563,11 +674,16 @@ void RunIdentityCase(int mode, bool baseline) {
                            stream.input.end());
         stream.wake.cancel();
         io.poll();
-        Check(stream.pending_reads == 1 && dispatcher.active == 1,
-              "payload read must suspend while the original dispatch is alive");
+        {
+            EXPECT_EQ(stream.pending_reads, 1);
+            EXPECT_EQ(dispatcher.active, 1);
+        }
         dispatcher.gate.cancel();
         io.run_for(50ms);
-        Check(dispatcher.finished == 1 && !returned, "dispatch must retire while payload read stays pending");
+        {
+            EXPECT_EQ(dispatcher.finished, 1);
+            EXPECT_FALSE(returned);
+        }
         stream.input.insert(stream.input.end(), payload.begin(), payload.end());
         Frame(stream.input, 1, 19);
         Frame(stream.input, 2, 19, changed_target);
@@ -586,15 +702,18 @@ void RunIdentityCase(int mode, bool baseline) {
     const bool rejected = returned && !failure && result_error == ErrorCode::PROTOCOL_INVALID_COMMAND && HasAlert(stream.output);
     if (!returned) stream.FeedInvalidFrame(false);
     io.run_for(500ms);
-    Check(returned && dispatcher.active == 0 && stream.destroyed, "identity fixture must join all requests");
-    std::cout << "identity-" << names[mode] << " started=" << started
-              << " overlapping=" << dispatcher.overlapping_contexts
-              << " changed=" << dispatcher.changed_contexts << " rejected=" << rejected << '\n';
-    if (baseline) return;
+    {
+        EXPECT_TRUE(returned);
+        EXPECT_EQ(dispatcher.active, 0);
+        EXPECT_TRUE(stream.destroyed);
+    }
     const size_t expected = (mode == 7 || mode == 9) ? 2 : pending ? 0 : 1;
-    Check(started == expected && dispatcher.overlapping_contexts == 0 && dispatcher.changed_contexts == 0,
-          "each SYN must create one independent request context exactly once");
-    Check(mode >= 7 || rejected, "invalid SYN must alert and reject the session");
+    {
+        EXPECT_EQ(started, expected);
+        EXPECT_EQ(dispatcher.overlapping_contexts, 0);
+        EXPECT_EQ(dispatcher.changed_contexts, 0);
+    }
+    if (mode < 7) EXPECT_TRUE(rejected);
 }
 class ParsingDispatcher final : public routing::Dispatcher {
 public:
@@ -620,8 +739,6 @@ public:
 };
 
 void RunParsingCase(int mode) {
-    constexpr std::array names{"coalesced", "ipv4-fragmented", "ipv6-fragmented", "max-domain",
-        "invalid-type", "empty-domain", "zero-port", "truncated", "cancel-pending", "oversized-domain", "invalid-uot-request"};
     net::io_context io;
     DomainFixture execution(io);
     StreamState stream(io);
@@ -668,9 +785,11 @@ void RunParsingCase(int mode) {
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"parsing", users}};
     execution.InstallUsers(updates);
-    UserOnlineTracker tracker;
+    UserOnlineTracker tracker(execution.Coordinator());
     StatsShard stats;
-    proxy::anytls::inbound::Handler handler(tracker, stats, {});
+    const AdmissionEnvironment environment{
+        execution.Coordinator(), execution.Limiter(), tracker, stats};
+    proxy::anytls::inbound::Handler handler(environment, {});
     ParsingDispatcher dispatcher;
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
@@ -681,6 +800,15 @@ void RunParsingCase(int mode) {
     bool returned = false;
     std::exception_ptr failure;
     ErrorCode result_error = ErrorCode::INTERNAL;
+    CleanupGuard cleanup([&] {
+        cancellation.emit(net::cancellation_type::all);
+        stream.closed = true;
+        stream.wake.cancel();
+        stream.write_wake.cancel();
+        io.restart();
+        while (!returned) io.run_one();
+        execution.Shutdown();
+    });
     net::co_spawn(execution.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
         receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
         [&](std::exception_ptr error, RelayResult result) {
@@ -689,22 +817,32 @@ void RunParsingCase(int mode) {
             result_error = result.error;
         }));
     io.poll();
-    Check(!returned && stream.pending_reads == 1, "logical parsing must leave the session reader alive");
+    {
+        EXPECT_FALSE(returned);
+        EXPECT_EQ(stream.pending_reads, 1);
+    }
     if (mode < 4) {
-        Check(dispatcher.calls == 1 && dispatcher.bytes == expected, "target prefix and frame boundaries must preserve every data byte");
-        if (mode == 3) Check(dispatcher.host == domain, "maximum domain length must survive fragmented decoding");
+        {
+            EXPECT_EQ(dispatcher.calls, 1);
+            EXPECT_EQ(dispatcher.bytes, expected);
+        }
+        if (mode == 3) EXPECT_EQ(dispatcher.host, domain);
     } else {
-        Check(dispatcher.calls == 0, "invalid or incomplete address must not enter dispatcher");
+        EXPECT_EQ(dispatcher.calls, 0);
     }
     if (mode == 8) cancellation.emit(net::cancellation_type::terminal);
     else stream.FeedInvalidFrame(false);
     io.run_for(500ms);
-    Check(returned && stream.destroyed && stream.pending_reads == 0 && stream.pending_writes == 0,
-          "parsing tasks must join before transport destruction");
-    Check(mode != 8 || (!failure && result_error == ErrorCode::CANCELLED),
-          "pending parser must report parent cancellation through the session result");
-    std::cout << "parsing-" << names[mode] << " calls=" << dispatcher.calls
-              << " bytes=" << dispatcher.bytes.size() << " joined=1\n";
+    {
+        EXPECT_TRUE(returned);
+        EXPECT_TRUE(stream.destroyed);
+        EXPECT_EQ(stream.pending_reads, 0);
+        EXPECT_EQ(stream.pending_writes, 0);
+    }
+    if (mode == 8) {
+        EXPECT_FALSE(failure);
+        EXPECT_EQ(result_error, ErrorCode::CANCELLED);
+    }
 }
 class QueueDispatcher final : public routing::Dispatcher {
 public:
@@ -715,7 +853,6 @@ public:
     bool consume = false;
     int active = 0;
     std::vector<uint8_t> received;
-    std::vector<const void*> received_buffers;
     net::awaitable<RelayResult> Dispatch(net::io_context& io,
         const routing::DispatchPolicy&, std::unique_ptr<AsyncStream>, transport::Link link,
         InitialPayload first, session::Context&, StatsShard&, const TimeoutsConfig&) override {
@@ -727,7 +864,6 @@ public:
                 while (true) {
                     for (const auto* buffer : data) {
                         if (!buffer) continue;
-                        received_buffers.push_back(buffer->Bytes().data());
                         received.insert(received.end(), buffer->Bytes().begin(), buffer->Bytes().end());
                     }
                     data.clear();
@@ -745,9 +881,7 @@ public:
     }
 };
 
-void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
-    constexpr std::array names{"tiny-fragments", "whole-frame", "sparse-mixed", "boundary-fragments",
-        "byte-budget-backpressure", "cancel-full-queue", "maximum-tiny-fragments", "random-fragments"};
+void RunQueueCase(int mode, uint32_t seed = 0) {
     net::io_context io;
     DomainFixture domain(io);
     StreamState stream(io);
@@ -765,9 +899,11 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"queue", users}};
     domain.InstallUsers(updates);
-    UserOnlineTracker tracker;
+    UserOnlineTracker tracker(domain.Coordinator());
     StatsShard stats;
-    proxy::anytls::inbound::Handler handler(tracker, stats, {});
+    const AdmissionEnvironment environment{
+        domain.Coordinator(), domain.Limiter(), tracker, stats};
+    proxy::anytls::inbound::Handler handler(environment, {});
     QueueDispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
@@ -777,15 +913,30 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     net::cancellation_signal cancellation;
     bool returned = false;
     int active_at_return = -1;
-    Check(BufferCount() == 0, "buffer accounting must start empty");
+    EXPECT_EQ(BufferCount(), 0);
+    const auto previous_peak = memory::detail::test_buffers_peak;
+    CleanupGuard restore_peak([&] { memory::detail::test_buffers_peak = previous_peak; });
     memory::detail::test_buffers_peak = 0;
+    CleanupGuard cleanup([&] {
+        cancellation.emit(net::cancellation_type::all);
+        stream.closed = true;
+        stream.wake.cancel();
+        stream.write_wake.cancel();
+        dispatcher.gate.cancel();
+        io.restart();
+        while (!returned) io.run_one();
+        domain.Shutdown();
+    });
     net::co_spawn(domain.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
         receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
         [&](std::exception_ptr, RelayResult) {
             returned = true; active_at_return = dispatcher.active;
         }));
     io.poll();
-    Check(dispatcher.active == 1 && stream.pending_reads == 1, "request must pause before consuming its logical input");
+    {
+        EXPECT_EQ(dispatcher.active, 1);
+        EXPECT_EQ(stream.pending_reads, 1);
+    }
     std::vector<uint8_t> expected(mode == 0 ? 2048 : 65535);
     for (size_t i = 0; i < expected.size(); ++i) expected[i] = uint8_t(i % 251);
     size_t offset = 0;
@@ -802,78 +953,58 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
         offset += count;
         ++fragments;
     }
-    stream.record_payload_buffers = mode == 1;
     stream.wake.cancel();
     io.poll();
     const size_t queued_blocks = BufferCount();
     const bool bounded = queued_blocks <= (expected.size() + 4095) / 4096;
-    Check(stream.offset == stream.input.size() && stream.pending_reads == 1,
-          "queue must accept the full payload budget independent of frame fragmentation");
+    {
+        EXPECT_EQ(stream.offset, stream.input.size());
+        EXPECT_EQ(stream.pending_reads, 1);
+    }
     if (mode == 4 || mode == 5) {
         Frame(stream.input, 2, 1, std::span(expected).first(1));
         stream.wake.cancel();
         io.poll();
-        Check(stream.pending_reads == 0 && dispatcher.active == 1,
-              "the next payload must wait for capacity without entering the queue");
+        {
+            EXPECT_EQ(stream.pending_reads, 0);
+            EXPECT_EQ(dispatcher.active, 1);
+        }
         expected.push_back(expected[0]);
     }
     if (mode == 5) {
         cancellation.emit(net::cancellation_type::terminal);
         io.poll();
-        Check(!returned && !stream.destroyed, "queue cancellation must join delayed request cleanup");
+        {
+            EXPECT_FALSE(returned);
+            EXPECT_FALSE(stream.destroyed);
+        }
     } else {
         Frame(stream.input, 3, 1);
         dispatcher.consume = true;
         dispatcher.gate.cancel();
         stream.wake.cancel();
         io.run_for(100ms);
-        Check(dispatcher.received == expected && dispatcher.active == 0,
-              "queue drain and backpressure must preserve every byte through logical FIN");
-        if (mode == 1) Check(dispatcher.received_buffers == stream.payload_buffers,
-            "whole payload buffers must transfer through the queue without copying");
+        {
+            EXPECT_EQ(dispatcher.received, expected);
+            EXPECT_EQ(dispatcher.active, 0);
+        }
         stream.FeedInvalidFrame(false);
     }
     io.run_for(100ms);
-    Check(returned && active_at_return == 0 && stream.destroyed &&
-          stream.pending_reads == 0 && stream.pending_writes == 0,
-          "queue storage must not outlive its joined session");
-    Check(BufferCount() == 0, "all queued and in-flight Buffer allocations must be released");
-    std::cout << "queue-" << names[mode] << " seed=" << seed << " fragments=" << fragments << " queued-blocks=" << queued_blocks
-              << " capacity-bytes=" << queued_blocks * buf::Buffer::kSize << " bounded=" << bounded
-              << " peak-blocks=" << BufferPeak() << " released=1\n";
-    if (!baseline) Check(bounded && BufferPeak() <= 24,
-        "queue and current physical frame must stay within their combined Buffer capacity budget");
+    {
+        EXPECT_TRUE(returned);
+        EXPECT_EQ(active_at_return, 0);
+        EXPECT_TRUE(stream.destroyed);
+        EXPECT_EQ(stream.pending_reads, 0);
+        EXPECT_EQ(stream.pending_writes, 0);
+    }
+    EXPECT_EQ(BufferCount(), 0);
+    {
+        EXPECT_TRUE(bounded);
+        EXPECT_LE(BufferPeak(), 24);
+    }
 }
 
-void TestPeerSettings() {
-    struct Valid { std::string_view text; uint32_t version; };
-    constexpr std::array valid{
-        Valid{"", 1}, Valid{"v=1", 1}, Valid{"v=2", 2}, Valid{"v=3", 3},
-        Valid{"v=20", 20}, Valid{"v=256", 256}, Valid{"v=4294967295", UINT32_MAX},
-        Valid{"v=02", 2}, Valid{"v=2\r\nclient=test\r\n", 2},
-        Valid{"client=has-v=2\nnot-v=2", 1}, Valid{"\n\r\nv=2\n", 2},
-        Valid{"padding-md5=v=2", 1}, Valid{"client=x\nclient=y\nv=1", 1}};
-    constexpr std::array invalid{"v=", "v=0", "v=-1", "v=+2", "v= 2", "v=2 ",
-        "v=2x", "v=1\nv=2", "v=2\nv=2", "v=4294967296", "v=9999999999999999999999",
-        "v", "=2", "padding-md5=a\npadding-md5=b", "v=2\rx"};
-    for (const auto& item : valid) {
-        const auto parsed = anytls::ParsePeerSettings(item.text);
-        Check(parsed && parsed->version == (item.version >= 2 ? anytls::SessionVersion::V2 : anytls::SessionVersion::V1),
-              "peer settings must parse the exact version key without narrowing or substring inference");
-    }
-    for (const auto text : invalid) {
-        const auto parsed = anytls::ParsePeerSettings(text);
-        Check(!parsed && parsed.error() == ErrorCode::PROTOCOL_DECODE_FAILED, "malformed peer settings must fail atomically");
-    }
-    Check(!anytls::ParsePeerSettings(std::string_view("v=2\0junk", 8)), "embedded NUL is not a version terminator");
-    const auto defaults = anytls::ClientSettings(*anytls::DefaultPaddingScheme());
-    const auto parsed = anytls::ParsePeerSettings(defaults);
-    Check(parsed && parsed->version == anytls::SessionVersion::V2 &&
-          parsed->padding_md5 == anytls::DefaultPaddingScheme()->Digest() &&
-          defaults.find("\nclient=cnode\n") != std::string::npos,
-          "advertised settings must identify this implementation and its supported version");
-    std::cout << "peer-settings cases=" << valid.size() + invalid.size() + 2 << " passed=1\n";
-}
 class MuxUdpDispatcher final : public routing::Dispatcher {
 public:
     explicit MuxUdpDispatcher(net::io_context& io) : gate(io) {
@@ -900,7 +1031,7 @@ public:
             ~Scope() { --owner.active; ++owner.finished; }
         } scope(*this);
         try {
-            Check(ctx.content.network == Network::UDP, "Mux UDP must use the ordinary UDP dispatcher");
+            EXPECT_EQ(ctx.content.network, Network::UDP);
             if (pause) (void)co_await gate.async_wait(net::as_tuple(net::use_awaitable));
             for (;;) {
                 auto packet = co_await link.reader->ReadMultiBuffer();
@@ -909,7 +1040,8 @@ public:
                     break;
                 }
                 const auto datagram = buf::InspectUdpDatagram(packet);
-                Check(datagram.Valid(), "Mux UDP input must retain a complete message and target");
+                EXPECT_TRUE(datagram.Valid());
+                if (!datagram.Valid()) co_return RelayResult{};
                 Packet observation{*datagram.target, {}};
                 for (const auto* buffer : packet) {
                     const auto bytes = buffer->Bytes();
@@ -933,6 +1065,9 @@ void RunMuxUdpCase(int mode) {
     MuxUdpDispatcher dispatcher(io);
     dispatcher.pause = mode >= 2;
     StatsShard stats;
+    UserOnlineTracker tracker(domain.Coordinator());
+    const proxyman::inbound::AdmissionEnvironment environment{
+        domain.Coordinator(), domain.Limiter(), tracker, stats};
     proxyman::inbound::ReceiverSettings receiver{
         .inbound_tag = {}, .inbound_tags = {}, .protocol = {}, .stream_settings = {},
         .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
@@ -943,7 +1078,7 @@ void RunMuxUdpCase(int mode) {
     const TargetAddress changed("127.0.0.2", 5353);
     std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
     auto append = [&](size_t size) {
-        Check(size != 0, "Mux UDP fixture header encoding failed");
+        EXPECT_NE(size, 0);
         stream.input.insert(stream.input.end(), header.begin(), header.begin() + size);
     };
     const size_t open_size = mux::EncodeNewHeaderTo(
@@ -954,14 +1089,26 @@ void RunMuxUdpCase(int mode) {
     bool returned = false;
     std::exception_ptr failure;
     net::cancellation_signal cancellation;
-    Check(BufferCount() == 0, "Mux UDP fixture must start without live buffers");
+    EXPECT_EQ(BufferCount(), 0);
+    CleanupGuard cleanup([&] {
+        cancellation.emit(net::cancellation_type::all);
+        stream.closed = true;
+        stream.wake.cancel();
+        stream.write_wake.cancel();
+        dispatcher.gate.cancel();
+        io.restart();
+        while (!returned) io.run_one();
+        domain.Shutdown();
+    });
     net::co_spawn(domain.Executor(),
-        RunMux(std::make_unique<Stream>(stream), dispatcher, receiver, io, context, stats, timeouts),
+        RunMux(std::make_unique<Stream>(stream), dispatcher, receiver, io, environment, context, stats, timeouts),
         net::bind_cancellation_slot(cancellation.slot(),
             [&](std::exception_ptr error, RelayResult) { failure = error; returned = true; }));
     io.poll();
-    Check(dispatcher.active == 1 && dispatcher.received.size() == (mode == 1 ? 1u : 0u),
-          "Mux NEW without Data must not manufacture an empty datagram");
+    {
+        EXPECT_EQ(dispatcher.active, 1);
+        EXPECT_EQ(dispatcher.received.size(), (mode == 1 ? 1u : 0u));
+    }
     // Neither a no-Data KEEP nor a KEEPALIVE with Data is a UDP packet.
     stream.input.insert(stream.input.end(), {0, 4, 0, 1, 2, 0, 0, 4, 0, 1, 4, 1, 0, 0});
     const size_t count = mode >= 2 ? 1500 : 1;
@@ -988,10 +1135,11 @@ void RunMuxUdpCase(int mode) {
     stream.wake.cancel();
     io.poll();
     if (mode >= 2) {
-        Check(dispatcher.received.empty() && dispatcher.active == 1,
-              "paused Mux dispatcher must retain queued empty datagrams");
-        Check(BufferCount() <= 4 * 1024 * 1024 / buf::Buffer::kSize + 32,
-              "empty Mux UDP queue must charge a Buffer capacity floor");
+        {
+            EXPECT_TRUE(dispatcher.received.empty());
+            EXPECT_EQ(dispatcher.active, 1);
+        }
+        EXPECT_LE(BufferCount(), 4 * 1024 * 1024 / buf::Buffer::kSize + 32);
         if (mode == 3) {
             cancellation.emit(net::cancellation_type::terminal);
         } else {
@@ -1000,84 +1148,161 @@ void RunMuxUdpCase(int mode) {
         io.run_for(100ms);
     }
     if (mode != 3) {
-        if (dispatcher.failure) std::rethrow_exception(dispatcher.failure);
+        EXPECT_FALSE(dispatcher.failure);
         const size_t expected = expected_packets.size();
-        Check(dispatcher.received.size() == expected && dispatcher.finished == 1 &&
-              dispatcher.input_eof,
-              "Mux must deliver every datagram, including END Data, before input EOF");
-        for (size_t i = 0; i < expected; ++i) {
+        {
+            EXPECT_EQ(dispatcher.received.size(), expected);
+            EXPECT_EQ(dispatcher.finished, 1);
+            EXPECT_TRUE(dispatcher.input_eof);
+        }
+        for (size_t i = 0; i < std::min(expected, dispatcher.received.size()); ++i) {
             const auto& packet = dispatcher.received[i];
-            Check(packet.target.SameEndpoint(expected_packets[i].target) &&
-                  packet.bytes == expected_packets[i].bytes,
-                  "Mux UDP target, final END payload or zero/nonzero boundary changed");
+            {
+                EXPECT_TRUE(packet.target.SameEndpoint(expected_packets[i].target));
+                EXPECT_EQ(packet.bytes, expected_packets[i].bytes);
+            }
         }
         buf::MultiBuffer output;
-        Check(buf::AppendSpanToMultiBuffer(stream.output, output), "Mux reply fixture allocation failed");
+        EXPECT_TRUE(buf::AppendSpanToMultiBuffer(stream.output, output));
         size_t replies = 0;
         while (!output.empty()) {
             const auto frame = mux::DecodeFrame(output);
-            Check(frame && frame->frame_size != 0, "Mux UDP reply must have a real wire header");
+            {
+                EXPECT_TRUE(frame);
+                if (!frame) break;
+                EXPECT_NE(frame->frame_size, 0);
+            }
+            if (!frame || frame->frame_size == 0) break;
             if (frame->status == mux::SessionStatus::KEEP) {
-                Check(frame->has_data && frame->has_target &&
-                      replies < dispatcher.received.size(), "Mux UDP reply lost Data or endpoint");
+                {
+                    EXPECT_TRUE(frame->has_data);
+                    EXPECT_TRUE(frame->has_target);
+                    EXPECT_LT(replies, dispatcher.received.size());
+                }
+                if (replies >= dispatcher.received.size()) break;
                 const auto& packet = dispatcher.received[replies++];
-                Check(frame->target.SameEndpoint(packet.target) && frame->data_len == packet.bytes.size(),
-                      "Mux UDP zero reply was dropped or misframed");
+                {
+                    EXPECT_TRUE(frame->target.SameEndpoint(packet.target));
+                    EXPECT_EQ(frame->data_len, packet.bytes.size());
+                }
                 output.DropPrefixBytes(frame->data_offset);
                 std::vector<uint8_t> bytes(frame->data_len);
-                Check(output.CopyPrefixTo(bytes) == bytes.size() && bytes == packet.bytes,
-                      "Mux UDP reply changed or truncated payload bytes");
+                {
+                    EXPECT_EQ(output.CopyPrefixTo(bytes), bytes.size());
+                    EXPECT_EQ(bytes, packet.bytes);
+                }
                 output.DropPrefixBytes(frame->data_len);
             } else {
                 output.DropPrefixBytes(frame->frame_size);
             }
         }
-        Check(replies == expected, "Mux UDP must encode every empty reply exactly once");
+        EXPECT_EQ(replies, expected);
         stream.FeedInvalidFrame(true);
         io.run_for(100ms);
     }
     if (mode == 3) {
-        Check(dispatcher.received.empty() && !dispatcher.input_eof,
-              "cancelling queued Mux UDP input must not report normal EOF or deliver discarded packets");
+        {
+            EXPECT_TRUE(dispatcher.received.empty());
+            EXPECT_FALSE(dispatcher.input_eof);
+        }
     }
-    Check(returned && !failure && dispatcher.active == 0 &&
-          stream.pending_reads == 0 && stream.pending_writes == 0 && stream.destroyed,
-          "Mux UDP cancellation and close must join all logical and physical work");
-    Check(BufferCount() == 0, "Mux UDP must release every queued and in-flight Buffer");
+    {
+        EXPECT_TRUE(returned);
+        EXPECT_FALSE(failure);
+        EXPECT_EQ(dispatcher.active, 0);
+        EXPECT_EQ(stream.pending_reads, 0);
+        EXPECT_EQ(stream.pending_writes, 0);
+        EXPECT_TRUE(stream.destroyed);
+    }
+    EXPECT_EQ(BufferCount(), 0);
     domain.Shutdown();
 }
 
 }  // namespace
 
-TEST(SubstreamInboundLifecycle, Contract) {
-    try {
-        constexpr bool baseline = false;
-        RunCase(0, baseline);
-        RunCase(1, baseline);
-        if (!baseline) {
-            RunCase(2, false);
-            RunCase(3, false);
-            RunCase(0, false, true);
-            RunCase(1, false, true);
-            RunCase(0, false, false, true);
-            RunCase(1, false, false, true);
-            RunCase(0, false, true, true);
-            for (int mode = 0; mode < 10; ++mode) RunIdentityCase(mode, false);
-            for (int mode = 0; mode < 11; ++mode) RunParsingCase(mode);
-            for (int mode = 0; mode < 8; ++mode) RunHandshakeCase(mode);
-            for (int mode = 0; mode < 7; ++mode) RunQueueCase(mode);
-            for (uint32_t seed = 0; seed < 16; ++seed) RunQueueCase(7, false, seed);
-            TestPeerSettings();
-        }
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        FAIL() << error.what();
-    }
+namespace {
+struct ParentStopCase { int mode; bool blocked_writes; bool mux; const char* name; };
+class SubstreamParentStop : public testing::TestWithParam<ParentStopCase> {};
+TEST_P(SubstreamParentStop, JoinsChildrenAndReleasesAuthenticationLease) {
+    const auto& value = GetParam();
+    RunCase(value.mode, value.blocked_writes, value.mux);
 }
-
-TEST(SubstreamInboundLifecycle, MuxUdpEmptyDatagramsAndControlFrames) {
-    for (int mode = 0; mode < 6; ++mode) {
-        SCOPED_TRACE(mode);
-        RunMuxUdpCase(mode);
-    }
+INSTANTIATE_TEST_SUITE_P(TransportAndFailure, SubstreamParentStop, testing::Values(
+    ParentStopCase{0, false, false, "AnyTlsCancellation"},
+    ParentStopCase{1, false, false, "AnyTlsInvalidFrame"},
+    ParentStopCase{2, false, false, "AnyTlsPhysicalEof"},
+    ParentStopCase{3, false, false, "AnyTlsReadAllocationFailure"},
+    ParentStopCase{0, true, false, "AnyTlsCancellationWithBlockedWrites"},
+    ParentStopCase{1, true, false, "AnyTlsInvalidFrameWithBlockedWrites"},
+    ParentStopCase{2, true, false, "AnyTlsPhysicalEofWithBlockedWrites"},
+    ParentStopCase{3, true, false, "AnyTlsReadAllocationFailureWithBlockedWrites"},
+    ParentStopCase{4, true, false, "AnyTlsPhysicalWriteFailureWithBlockedWrites"},
+    ParentStopCase{0, false, true, "MuxCancellation"},
+    ParentStopCase{1, false, true, "MuxInvalidFrame"},
+    ParentStopCase{0, true, true, "MuxCancellationWithBlockedWrites"}),
+    [](const auto& info) { return info.param.name; });
+class AnyTlsHandshakeLifecycle : public testing::TestWithParam<int> {};
+TEST_P(AnyTlsHandshakeLifecycle, JoinsPreparationWithoutCancellingEstablishedSiblings) { RunHandshakeCase(GetParam()); }
+INSTANTIATE_TEST_SUITE_P(Behaviors, AnyTlsHandshakeLifecycle, testing::Range(0, 8),
+    ([](const auto& info) {
+        constexpr std::array names{"PartialSynackTimeout", "PartialSynackCancellation", "WriteGateTimeoutIsolation", "CapacityRejectedIdRetired", "OverdueReadyHeader", "SynackAllocationFailure", "SynackLinkFailure", "SynackUnexpectedFailure"};
+        return names[info.param];
+    }));
+class AnyTlsStreamIdentity : public testing::TestWithParam<int> {};
+TEST_P(AnyTlsStreamIdentity, PreservesIndependentContextsAndRejectsInvalidReuse) { RunIdentityCase(GetParam()); }
+INSTANTIATE_TEST_SUITE_P(Behaviors, AnyTlsStreamIdentity, testing::Range(0, 10),
+    ([](const auto& info) {
+        constexpr std::array names{"DuplicateActive", "DuplicatePending", "ReuseCompleted", "Descending", "Zero", "SynPayload", "Wraparound", "ValidGap", "FinBeforeTarget", "PayloadAfterRetirement"};
+        return names[info.param];
+    }));
+class AnyTlsTargetParsing : public testing::TestWithParam<int> {};
+TEST_P(AnyTlsTargetParsing, DispatchesOnlyCompleteValidTargetsAndJoinsOnStop) { RunParsingCase(GetParam()); }
+INSTANTIATE_TEST_SUITE_P(Behaviors, AnyTlsTargetParsing, testing::Range(0, 11),
+    ([](const auto& info) {
+        constexpr std::array names{"Coalesced", "FragmentedIpv4", "FragmentedIpv6", "MaximumDomain", "InvalidType", "EmptyDomain", "ZeroPort", "Truncated", "CancelPending", "OversizedDomain", "InvalidUotRequest"};
+        return names[info.param];
+    }));
+class AnyTlsInboundQueue : public testing::TestWithParam<int> {};
+TEST_P(AnyTlsInboundQueue, PreservesPayloadWithinCapacityAndReclaimsOnStop) { RunQueueCase(GetParam(), 0); }
+INSTANTIATE_TEST_SUITE_P(Behaviors, AnyTlsInboundQueue, testing::Range(0, 7),
+    ([](const auto& info) {
+        constexpr std::array names{"TinyFragments", "WholeFrame", "SparseMixed", "BoundaryFragments", "ByteBudgetBackpressure", "CancelFullQueue", "MaximumTinyFragments"};
+        return names[info.param];
+    }));
+class AnyTlsInboundQueueFragments : public testing::TestWithParam<uint32_t> {};
+TEST_P(AnyTlsInboundQueueFragments, PreservesPayloadAcrossRandomFrameBoundaries) {
+    RunQueueCase(7, GetParam());
 }
+INSTANTIATE_TEST_SUITE_P(Seeds, AnyTlsInboundQueueFragments, testing::Range(uint32_t{0}, uint32_t{16}));
+class MuxUdpLifecycle : public testing::TestWithParam<int> {};
+TEST_P(MuxUdpLifecycle, PreservesDatagramAndControlBoundariesAndReclaimsStorage) { RunMuxUdpCase(GetParam()); }
+INSTANTIATE_TEST_SUITE_P(Behaviors, MuxUdpLifecycle, testing::Range(0, 6),
+    ([](const auto& info) {
+        constexpr std::array names{"EndPayload", "EmptyNewAndEndData", "DrainQueuedEmptyDatagrams", "CancelQueuedEmptyDatagrams", "EmptyEndData", "NonemptyEndData"};
+        return names[info.param];
+    }));
+struct PeerVersion { std::string_view text; uint32_t version; };
+class AnyTlsPeerVersion : public testing::TestWithParam<PeerVersion> {};
+TEST_P(AnyTlsPeerVersion, ParsesExactVersionKeyWithoutNarrowing) {
+    const auto& value = GetParam();
+    const auto parsed = anytls::ParsePeerSettings(value.text);
+    ASSERT_TRUE(parsed);
+    EXPECT_EQ(parsed->version, value.version >= 2 ? anytls::SessionVersion::V2 : anytls::SessionVersion::V1);
+}
+INSTANTIATE_TEST_SUITE_P(ValidSettings, AnyTlsPeerVersion, testing::Values(
+PeerVersion{"", 1}, PeerVersion{"v=1", 1}, PeerVersion{"v=2", 2}, PeerVersion{"v=3", 3},
+        PeerVersion{"v=20", 20}, PeerVersion{"v=256", 256}, PeerVersion{"v=4294967295", UINT32_MAX},
+        PeerVersion{"v=02", 2}, PeerVersion{"v=2\r\nclient=test\r\n", 2},
+        PeerVersion{"client=has-v=2\nnot-v=2", 1}, PeerVersion{"\n\r\nv=2\n", 2},
+        PeerVersion{"padding-md5=v=2", 1}, PeerVersion{"client=x\nclient=y\nv=1", 1}));
+class AnyTlsMalformedPeerSettings : public testing::TestWithParam<std::string_view> {};
+TEST_P(AnyTlsMalformedPeerSettings, RejectsMalformedSettingsAtomically) {
+    const auto parsed = anytls::ParsePeerSettings(GetParam());
+    ASSERT_FALSE(parsed);
+    EXPECT_EQ(parsed.error(), ErrorCode::PROTOCOL_DECODE_FAILED);
+}
+INSTANTIATE_TEST_SUITE_P(InvalidSettings, AnyTlsMalformedPeerSettings, testing::Values(
+"v=", "v=0", "v=-1", "v=+2", "v= 2", "v=2 ",
+        "v=2x", "v=1\nv=2", "v=2\nv=2", "v=4294967296", "v=9999999999999999999999",
+        "v", "=2", "padding-md5=a\npadding-md5=b", "v=2\rx", std::string_view("v=2\0junk", 8)));
+}  // namespace

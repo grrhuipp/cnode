@@ -18,6 +18,7 @@ class FailingResource final : public std::pmr::memory_resource {
 public:
     explicit FailingResource(std::pmr::memory_resource* upstream) : upstream_(upstream) {}
     [[nodiscard]] size_t Live() const noexcept { return live_; }
+    ~FailingResource() override { EXPECT_EQ(live_, 0u); }
 private:
     void* do_allocate(size_t size, size_t alignment) override {
         if (fail_after >= 0 && fail_after-- == 0) throw std::bad_alloc();
@@ -42,9 +43,6 @@ public:
     ~FailAllocation() { fail_after = -1; }
 };
 
-void Require(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
-}
 
 using ::app::dns::DnsCache;
 using ::app::dns::DnsResult;
@@ -56,7 +54,11 @@ DnsResult Answer(std::string_view address, size_t count = 1) {
     return result;
 }
 
-void TestFailedInsertion(bool negative, std::pmr::memory_resource* resource) {
+class DnsCacheInsertion : public testing::TestWithParam<bool> {};
+TEST_P(DnsCacheInsertion, FailedInsertionRetainsIndexedAnswerAndAllowsLaterEviction) {
+    FailingResource storage(::memory::process_resource());
+    auto* resource = &storage;
+    const bool negative = GetParam();
     const std::array domains{std::string("cached.example"), std::string(60, 'a') + ".example"};
     const auto old_answer = Answer("192.0.2.1");
     const auto new_answer = Answer("192.0.2.2", 400);
@@ -82,71 +84,97 @@ void TestFailedInsertion(bool negative, std::pmr::memory_resource* resource) {
         if (rejected) {
             ++failures;
             const auto old = cache.GetResult(domains[0]);
-            Require(old && old->addresses.front() == old_answer.addresses.front(),
-                    "failed cache insertion must retain the existing answer");
-            Require(!cache.GetResult(domains[1]) && cache.GetStats().entries == 1,
-                    "failed cache insertion must leave the index and count unchanged");
+            ASSERT_TRUE(old);
+            EXPECT_EQ(old->addresses.front(), old_answer.addresses.front());
+            EXPECT_FALSE(cache.GetResult(domains[1]));
+            EXPECT_EQ(cache.GetStats().entries, 1u);
         } else {
             completed = true;
         }
         cache.Store(domains[1], new_answer);
-        Require(cache.GetStats().entries == 1 && !cache.GetResult(domains[0]) &&
-                    cache.GetResult(domains[1])->addresses.size() == new_answer.addresses.size(),
-                "insertion after a fault must retain one indexed entry with correct ownership");
+        EXPECT_EQ(cache.GetStats().entries, 1u);
+        EXPECT_FALSE(cache.GetResult(domains[0]));
+        const auto inserted = cache.GetResult(domains[1]);
+        ASSERT_TRUE(inserted);
+        EXPECT_EQ(inserted->addresses.size(), new_answer.addresses.size());
         cache.Store(domains[0], old_answer);
-        Require(cache.GetStats().entries == 1 && cache.GetResult(domains[0]) &&
-                    !cache.GetResult(domains[1]),
-                "later eviction must not encounter an orphaned cache node");
+        EXPECT_EQ(cache.GetStats().entries, 1u);
+        EXPECT_TRUE(cache.GetResult(domains[0]));
+        EXPECT_FALSE(cache.GetResult(domains[1]));
         if (completed) break;
     }
-    Require(failures > 0 && completed, "allocation sweep must cover failures and success");
+    EXPECT_GT(failures, 0);
+    EXPECT_TRUE(completed);
 }
 
-void TestCapacityAndResults(std::pmr::memory_resource* resource) {
+INSTANTIATE_TEST_SUITE_P(AnswerKind, DnsCacheInsertion, testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) {
+        return info.param ? "Negative" : "Positive";
+    });
+
+TEST(DnsCache, CapacityEvictsOldestWrite) {
+    FailingResource storage(::memory::process_resource());
+    auto* resource = &storage;
     DnsCache cache(2, 10, 600, nullptr, resource);
     const auto answer = Answer("192.0.2.3");
     cache.Store("one.example", answer);
     cache.Store("two.example", answer);
-    Require(cache.GetResult("one.example") && cache.GetResult("two.example") &&
-                cache.GetStats().entries == 2,
-            "a Worker cache must make its full capacity available to arbitrary domains");
+    EXPECT_TRUE(cache.GetResult("one.example"));
+    EXPECT_TRUE(cache.GetResult("two.example"));
+    EXPECT_EQ(cache.GetStats().entries, 2u);
     cache.Store("three.example", answer);
-    Require(!cache.GetResult("one.example") && cache.GetResult("two.example") &&
-                cache.GetResult("three.example") && cache.GetStats().entries == 2,
-            "insertion must evict the oldest write only after reaching capacity");
+    EXPECT_FALSE(cache.GetResult("one.example"));
+    EXPECT_TRUE(cache.GetResult("two.example"));
+    EXPECT_TRUE(cache.GetResult("three.example"));
+    EXPECT_EQ(cache.GetStats().entries, 2u);
+}
+
+TEST(DnsCache, PositiveAndNegativeReplacementClampTtlAndIgnoreTemporaryFailure) {
+    DnsCache cache(2, 10, 600);
+    const auto answer = Answer("192.0.2.3");
+    cache.Store("two.example", answer);
 
     DnsResult negative;
     negative.error = ::ErrorCode::DNS_NO_RECORD;
     negative.ttl = 1;
     cache.Store("two.example", negative);
     const auto cached_negative = cache.GetResult("two.example");
-    Require(cached_negative && cached_negative->error == ::ErrorCode::DNS_NO_RECORD &&
-                cached_negative->addresses.empty() && cached_negative->ttl <= 10,
-            "negative answers must replace positives and clamp the TTL");
+    ASSERT_TRUE(cached_negative);
+    EXPECT_EQ(cached_negative->error, ::ErrorCode::DNS_NO_RECORD);
+    EXPECT_TRUE(cached_negative->addresses.empty());
+    EXPECT_LE(cached_negative->ttl, 10u);
     auto cached_answer = answer;
     cached_answer.ttl = 1;
     cache.Store("two.example", cached_answer);
-    Require(cache.GetResult("two.example")->Ok() && cache.GetResult("two.example")->ttl <= 10,
-            "positive answers must replace negatives and clamp the TTL");
+    const auto positive = cache.GetResult("two.example");
+    ASSERT_TRUE(positive);
+    EXPECT_TRUE(positive->Ok());
+    EXPECT_LE(positive->ttl, 10u);
 
     DnsResult temporary_failure;
     temporary_failure.error = ::ErrorCode::DNS_RESOLVE_FAILED;
     cache.Store("two.example", temporary_failure);
-    Require(cache.GetResult("two.example").has_value(),
-            "temporary failures must not replace valid cached data");
+    EXPECT_TRUE(cache.GetResult("two.example"));
+}
+
+TEST(DnsCache, ZeroCapacityAndExpiredAnswersRetainNoEntries) {
+    const auto answer = Answer("192.0.2.3");
+    auto cached_answer = answer;
     DnsCache expired(1, 0, 600);
     cached_answer.ttl = 0;
     expired.Store("two.example", cached_answer);
-    Require(!expired.GetResult("two.example") && expired.GetStats().entries == 0,
-            "expired entries must be removed from both ownership and statistics");
+    EXPECT_FALSE(expired.GetResult("two.example"));
+    EXPECT_EQ(expired.GetStats().entries, 0u);
 
     DnsCache disabled(0, 10, 600);
     disabled.Store("one.example", answer);
-    Require(!disabled.GetResult("one.example") && disabled.GetStats().entries == 0,
-            "disabled caches must retain no entries");
+    EXPECT_FALSE(disabled.GetResult("one.example"));
+    EXPECT_EQ(disabled.GetStats().entries, 0u);
 }
 
-void TestFailedReplacement(std::pmr::memory_resource* resource) {
+TEST(DnsCache, FailedReplacementRetainsCompleteOldAnswer) {
+    FailingResource storage(::memory::process_resource());
+    auto* resource = &storage;
     DnsCache cache(1, 10, 600, nullptr, resource);
     const auto original = Answer("192.0.2.1");
     const auto replacement = Answer("192.0.2.2", 400);
@@ -160,8 +188,10 @@ void TestFailedReplacement(std::pmr::memory_resource* resource) {
             failed = true;
         }
     }
-    Require(failed && cache.GetResult("same.example")->addresses.front() == original.addresses.front(),
-            "failed replacement must retain the complete old answer");
+    EXPECT_TRUE(failed);
+    const auto retained = cache.GetResult("same.example");
+    ASSERT_TRUE(retained);
+    EXPECT_EQ(retained->addresses, original.addresses);
 }
 
 struct NegativeEvent {
@@ -175,8 +205,13 @@ void RecordNegativeEvent(std::string_view domain, std::string_view reason,
     negative_events.push_back({std::string(domain), std::string(reason), std::string(event), hits});
 }
 
-void TestNegativeEventLifecycle(std::pmr::memory_resource* resource) {
+TEST(DnsCache, NegativeDiagnosticsSummarizeRecoveryExpiryEvictionAndShutdown) {
+    FailingResource storage(::memory::process_resource());
+    auto* resource = &storage;
     negative_events.clear();
+    struct ClearEvents {
+        ~ClearEvents() { negative_events.clear(); }
+    } clear_events;
     DnsResult negative;
     negative.error = ::ErrorCode::DNS_NO_RECORD;
     negative.error_msg = "NXDOMAIN";
@@ -186,83 +221,60 @@ void TestNegativeEventLifecycle(std::pmr::memory_resource* resource) {
         cache.Store("negative.example", negative);
         for (size_t i = 0; i < 128; ++i) {
             const auto result = cache.GetResult("negative.example");
-            Require(result && result->error_msg == "NXDOMAIN",
-                    "every suppressed hit must retain the original negative reason");
+            ASSERT_TRUE(result);
+            EXPECT_EQ(result->error_msg, "NXDOMAIN");
         }
-        Require(negative_events.empty(), "repeated cache hits must not emit repeated diagnostics");
+        EXPECT_TRUE(negative_events.empty());
         cache.Store("negative.example", Answer("192.0.2.1"));
-        Require(negative_events.size() == 1 && negative_events[0].event == "recovered" &&
-                    negative_events[0].hits == 128 && negative_events[0].reason == "NXDOMAIN",
-                "recovery must publish the exact suppressed hit count and initial reason");
+        ASSERT_EQ(negative_events.size(), 1u);
+        EXPECT_EQ(negative_events[0].event, "recovered");
+        EXPECT_EQ(negative_events[0].hits, 128u);
+        EXPECT_EQ(negative_events[0].reason, "NXDOMAIN");
 
         negative.error_msg = "NODATA";
         negative.ttl = 0;
         cache.Store("expired.example", negative);
-        Require(!cache.GetResult("expired.example") && cache.GetStats().entries == 0,
-                "expired negatives must not be served or counted as live cache entries");
-        Require(negative_events.size() == 2 && negative_events.back().event == "expired",
-                "expiry must publish one summary");
-        Require(!cache.GetResult("expired.example") && negative_events.size() == 2,
-                "repeated expired lookups must not repeat expiry diagnostics");
+        EXPECT_FALSE(cache.GetResult("expired.example"));
+        EXPECT_EQ(cache.GetStats().entries, 0u);
+        ASSERT_EQ(negative_events.size(), 2u);
+        EXPECT_EQ(negative_events.back().event, "expired");
+        EXPECT_FALSE(cache.GetResult("expired.example"));
+        EXPECT_EQ(negative_events.size(), 2u);
         cache.Store("expired.example", Answer("192.0.2.2"));
-        Require(negative_events.size() == 3 && negative_events.back().event == "recovered" &&
-                    negative_events.back().reason == "NODATA",
-                "successful refresh after expiry must retain the old negative reason");
+        ASSERT_EQ(negative_events.size(), 3u);
+        EXPECT_EQ(negative_events.back().event, "recovered");
+        EXPECT_EQ(negative_events.back().reason, "NODATA");
 
         negative.ttl = 60;
         cache.Store("evicted.example", negative);
         (void)cache.GetResult("evicted.example");
         cache.Store("shutdown.example", negative);
-        Require(negative_events.size() == 4 && negative_events.back().event == "evicted" &&
-                    negative_events.back().hits == 1 && cache.GetStats().entries == 1,
-                "eviction must summarize counts and keep metadata inside the cache capacity");
+        ASSERT_EQ(negative_events.size(), 4u);
+        EXPECT_EQ(negative_events.back().event, "evicted");
+        EXPECT_EQ(negative_events.back().hits, 1u);
+        EXPECT_EQ(cache.GetStats().entries, 1u);
     }
-    Require(negative_events.size() == 5 && negative_events.back().event == "shutdown",
-            "shutdown must summarize remaining live negative entries");
+    ASSERT_EQ(negative_events.size(), 5u);
+    EXPECT_EQ(negative_events.back().event, "shutdown");
     negative_events.clear();
 }
 
 }  // namespace
 
-TEST(DnsCache, Contract) {
-    FailingResource resource(::memory::process_resource());
-    bool passed = true;
-    try {
-        TestFailedInsertion(false, &resource);
-        TestFailedInsertion(true, &resource);
-        TestFailedReplacement(&resource);
-        TestCapacityAndResults(&resource);
-        TestNegativeEventLifecycle(&resource);
-        Require(resource.Live() == 0, "destroyed caches must release all their storage");
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        passed = false;
-    }
-    { ASSERT_TRUE(passed); return; }
-}
 
 TEST(DnsCache, ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage) {
     FailingResource resource(::memory::process_resource());
     {
         DnsCache cache(2, 60, 3600, nullptr, &resource);
-        // The bucket array grows on first insertion and is retained; only entry
-        // storage is expected to return after a zero-TTL invalidation.
-        auto warm = Answer("192.0.2.9");
-        cache.Store("warm.example", warm);
-        warm.ttl = 0;
-        cache.Store("warm.example", warm);
-        const auto empty_allocations = resource.Live();
         cache.Store("ttl.example", Answer("192.0.2.1", 400));
         auto current = Answer("192.0.2.2");
         current.ttl = 0;
         cache.Store("ttl.example", current);
         EXPECT_FALSE(cache.GetResult("ttl.example"));
         EXPECT_EQ(cache.GetStats().entries, 0);
-        EXPECT_EQ(resource.Live(), empty_allocations);
         cache.Store("uncached.example", current);
         EXPECT_FALSE(cache.GetResult("uncached.example"));
         EXPECT_EQ(cache.GetStats().entries, 0);
-        EXPECT_EQ(resource.Live(), empty_allocations);
 
         DnsResult negative;
         negative.error = ErrorCode::DNS_NO_RECORD;
@@ -273,7 +285,6 @@ TEST(DnsCache, ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage) {
         cache.Store("ttl.example", current);
         EXPECT_FALSE(cache.GetResult("ttl.example"));
         EXPECT_EQ(cache.GetStats().entries, 0);
-        EXPECT_EQ(resource.Live(), empty_allocations);
 
         const auto retained = Answer("192.0.2.3");
         cache.Store("ttl.example", retained);

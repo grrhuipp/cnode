@@ -1,3 +1,4 @@
+#include "transport_coordinator_fixture.hpp"
 #include <gtest/gtest.h>
 
 #include "transport/internet/tcp_stream.hpp"
@@ -12,7 +13,6 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -28,9 +28,19 @@ using namespace std::chrono_literals;
 constexpr uint32_t kDefaultWindow = 65535;
 constexpr size_t kMaxFramePayload = 16384;
 
-void Require(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
-}
+struct SessionJoin {
+    net::io_context& io;
+    ::tcp::socket& peer;
+    net::experimental::channel<void(::IoErrorCode)>* release = nullptr;
+    ~SessionJoin() {
+        ::IoErrorCode ignored;
+        peer.close(ignored);
+        if (release) release->close();
+        io.restart();
+        io.run();
+    }
+};
+
 
 std::string U32(uint32_t value) {
     std::string out;
@@ -90,7 +100,7 @@ void RunUntil(net::io_context& io, Predicate predicate, const char* message) {
         io.restart();
         io.run_for(5ms);
     }
-    Require(predicate(), message);
+    EXPECT_TRUE(predicate()) << message;
 }
 
 void Settle(net::io_context& io) {
@@ -206,7 +216,7 @@ private:
 // RFC 9113 6.9.1: the client never sends more DATA than the connection and
 // stream windows allow; 6.9.2: SETTINGS_INITIAL_WINDOW_SIZE credits the open
 // stream by the difference while the connection window stays independent.
-void ClientWaitsForPeerWindows() {
+TEST(Http2FlowControl, ClientWaitsForPeerWindows) {
     net::io_context io;
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket dialed(io), server(io);
@@ -221,7 +231,7 @@ void ClientWaitsForPeerWindows() {
     std::exception_ptr failure;
     auto client = [&]() -> net::awaitable<void> {
         auto result = co_await ::BuildOutboundTransport(std::move(raw), settings, nullptr);
-        Require(result.has_value() && *result, "gRPC client handshake failed");
+        if (!result || !*result) throw std::runtime_error("gRPC client handshake failed");
         stream = std::move(*result);
         (void)co_await stream->AsyncWrite(net::buffer(payload));
         written = true;
@@ -230,6 +240,7 @@ void ClientWaitsForPeerWindows() {
         failure = error;
         finished = true;
     });
+    SessionJoin join{io, server};
 
     RawPeer peer(server, 24);
     RunUntil(io, [&] { peer.Poll(); return peer.HasHeaders(1) || finished; },
@@ -241,16 +252,16 @@ void ClientWaitsForPeerWindows() {
     Settle(io);
     peer.Poll();
     if (failure) std::rethrow_exception(failure);
-    Require(!written && peer.DataBytes(1) == kDefaultWindow,
-            "client sent DATA beyond the peer's flow-control window");
-    Require(peer.SettingsAcks() == 1, "client did not acknowledge SETTINGS");
+    EXPECT_FALSE(written);
+    EXPECT_EQ(peer.DataBytes(1), kDefaultWindow);
+    EXPECT_EQ(peer.SettingsAcks(), 1u);
 
     peer.Write(Frame(4, 0, 0, InitialWindowSetting(1u << 20)));
     Settle(io);
     peer.Poll();
-    Require(peer.SettingsAcks() == 2, "client did not acknowledge the window SETTINGS");
-    Require(!written && peer.DataBytes(1) == kDefaultWindow,
-            "stream credit alone let the client exceed the connection window");
+    EXPECT_EQ(peer.SettingsAcks(), 2u);
+    EXPECT_FALSE(written);
+    EXPECT_EQ(peer.DataBytes(1), kDefaultWindow);
 
     peer.Write(Frame(8, 0, 0, U32(1u << 20)));
     // One Hunk message: 5-octet gRPC prefix, field key and 3-octet length.
@@ -258,8 +269,8 @@ void ClientWaitsForPeerWindows() {
     RunUntil(io, [&] { peer.Poll(); return (written && peer.DataBytes(1) == expected) || finished; },
              "client did not resume after WINDOW_UPDATE");
     if (failure) std::rethrow_exception(failure);
-    Require(peer.LargestData() <= kMaxFramePayload, "client exceeded SETTINGS_MAX_FRAME_SIZE");
-    stream->CloseAbortive();
+    EXPECT_LE(peer.LargestData(), kMaxFramePayload);
+    if (stream) stream->CloseAbortive();
     RunUntil(io, [&] { return finished; }, "client task did not finish");
 }
 
@@ -267,13 +278,13 @@ void ClientWaitsForPeerWindows() {
 // what consumes the peer's frames while no reader runs.
 struct ParkedWriterClient {
     explicit ParkedWriterClient(net::io_context& io)
-        : acceptor(io, {net::ip::address_v4::loopback(), 0}), dialed(io), server(io) {
+        : io_(io), acceptor(io, {net::ip::address_v4::loopback(), 0}), dialed(io), server(io) {
         dialed.connect(acceptor.local_endpoint());
         acceptor.accept(server);
         auto client = [this, raw = std::make_unique<::TcpStream>(std::move(dialed))]()
             mutable -> net::awaitable<void> {
             auto result = co_await ::BuildOutboundTransport(std::move(raw), settings, nullptr);
-            Require(result.has_value() && *result, "gRPC client handshake failed");
+            if (!result || !*result) throw std::runtime_error("gRPC client handshake failed");
             stream = std::move(*result);
             (void)co_await stream->AsyncWrite(net::buffer(payload));
         };
@@ -281,6 +292,14 @@ struct ParkedWriterClient {
             writer_failure = error;
             writer_finished = true;
         });
+    }
+
+    ~ParkedWriterClient() {
+        if (stream) stream->CloseAbortive();
+        ::IoErrorCode ignored;
+        server.close(ignored);
+        io_.restart();
+        io_.run();
     }
 
     // Opens the response and waits until the writer used its send window.
@@ -293,9 +312,12 @@ struct ParkedWriterClient {
                  "client did not use its send window");
         Settle(io);
         peer.Poll();
-        Require(!writer_finished, "client writer stopped waiting for send credit");
+        if (writer_failure) std::rethrow_exception(writer_failure);
+        if (!stream) throw std::runtime_error("gRPC response did not establish a stream");
+        EXPECT_FALSE(writer_finished);
     }
 
+    net::io_context& io_;
     ::tcp::acceptor acceptor;
     ::tcp::socket dialed;
     ::tcp::socket server;
@@ -309,7 +331,7 @@ struct ParkedWriterClient {
 // RFC 9113 6.9.1: DATA, padding included, is charged against the windows the
 // client advertised even while only a writer short of send credit pumps
 // frames; DATA beyond the connection window is a FLOW_CONTROL_ERROR.
-void ClientEnforcesReceiveWindow() {
+TEST(Http2FlowControl, ClientEnforcesReceiveWindow) {
     net::io_context io;
     ParkedWriterClient client(io);
     RawPeer peer(client.server, 24);
@@ -324,21 +346,21 @@ void ClientEnforcesReceiveWindow() {
                Frame(0, 8, 1, padded));
     Settle(io);
     peer.Poll();
-    Require(!client.writer_finished && !peer.GoAwayError(),
-            "DATA within the advertised window was refused");
-    Require(peer.WindowCredit(0) == 0, "credit returned before the reader took any DATA");
+    EXPECT_FALSE(client.writer_finished);
+    EXPECT_FALSE(peer.GoAwayError());
+    EXPECT_EQ(peer.WindowCredit(0), 0u);
 
     peer.Write(Frame(0, 0, 1, "z"));
     RunUntil(io, [&] { peer.Poll(); return client.writer_finished && peer.GoAwayError(); },
              "DATA beyond the receive window was accepted");
-    Require(client.writer_failure != nullptr, "flow-control violation did not fail the stream");
-    Require(*peer.GoAwayError() == 3, "violation not reported as FLOW_CONTROL_ERROR");
-    client.stream->CloseAbortive();
+    EXPECT_NE(client.writer_failure, nullptr);
+    EXPECT_EQ(peer.GoAwayError(), 3u);
+    if (client.stream) client.stream->CloseAbortive();
 }
 
 // Credit for received DATA returns when the reader takes it, so a reader
 // that keeps up receives far more than one window.
-void ClientReturnsCreditAsReaderTakesData() {
+TEST(Http2FlowControl, ClientReturnsCreditAsReaderTakesData) {
     net::io_context io;
     ParkedWriterClient client(io);
     RawPeer peer(client.server, 24);
@@ -356,8 +378,8 @@ void ClientReturnsCreditAsReaderTakesData() {
     peer.Write(std::string_view(messages).substr(0, messages.size() / 2));
     Settle(io);
     peer.Poll();
-    Require(!client.writer_finished && peer.WindowCredit(0) == 0,
-            "credit returned before the reader took any DATA");
+    EXPECT_FALSE(client.writer_finished);
+    EXPECT_EQ(peer.WindowCredit(0), 0u);
 
     std::string received;
     bool reader_finished = false;
@@ -374,17 +396,19 @@ void ClientReturnsCreditAsReaderTakesData() {
         reader_failure = error;
         reader_finished = true;
     });
+    SessionJoin reader_join{io, client.server};
     RunUntil(io, [&] { peer.Poll(); return peer.WindowCredit(0) == 4 * frame_size; },
              "reader did not return the credit of the DATA it took");
     peer.Write(std::string_view(messages).substr(messages.size() / 2));
     RunUntil(io, [&] { return reader_finished; }, "reader did not receive every message");
     if (reader_failure) std::rethrow_exception(reader_failure);
-    Require(received == expected, "reader received corrupted data");
+    EXPECT_EQ(received, expected);
     RunUntil(io, [&] {
         peer.Poll();
         return peer.WindowCredit(0) == 8 * frame_size && peer.WindowCredit(1) == 8 * frame_size;
     }, "credit returned does not match the DATA taken");
-    Require(!peer.GoAwayError() && !client.writer_finished, "in-window DATA failed the client");
+    EXPECT_FALSE(peer.GoAwayError());
+    EXPECT_FALSE(client.writer_finished);
 
     client.stream->CloseAbortive();
     RunUntil(io, [&] { return client.writer_finished; }, "client writer did not finish");
@@ -414,8 +438,9 @@ public:
 
 // The server honours the client's SETTINGS_INITIAL_WINDOW_SIZE per stream and
 // the 65535-octet connection window until WINDOW_UPDATE grants more.
-void ServerWaitsForPeerWindows() {
+TEST(Http2FlowControl, ServerWaitsForPeerWindows) {
     net::io_context io;
+    TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket client(io), accepted(io);
     client.connect(acceptor.local_endpoint());
@@ -426,12 +451,13 @@ void ServerWaitsForPeerWindows() {
     bool returned = false;
     std::exception_ptr failure;
     auto build = [&]() -> net::awaitable<void> {
-        (void)co_await ::BuildInboundTransport(io, std::move(raw), settings, nullptr, 0, sink);
+        (void)co_await ::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr, 0, sink);
     };
     net::co_spawn(io, build(), [&](std::exception_ptr error) {
         failure = error;
         returned = true;
     });
+    SessionJoin join{io, client, &sink->release};
 
     RawPeer peer(client, 0);
     peer.Write(std::string("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") +
@@ -441,43 +467,30 @@ void ServerWaitsForPeerWindows() {
              "server did not use the stream window");
     Settle(io);
     peer.Poll();
-    Require(!sink->written && peer.DataBytes(1) == 16384,
-            "server exceeded the peer's SETTINGS_INITIAL_WINDOW_SIZE");
-    Require(peer.SettingsAcks() == 1, "server did not acknowledge SETTINGS");
+    EXPECT_FALSE(sink->written);
+    EXPECT_EQ(peer.DataBytes(1), 16384u);
+    EXPECT_EQ(peer.SettingsAcks(), 1u);
 
     peer.Write(Frame(8, 0, 1, U32(1u << 20)));
     RunUntil(io, [&] { peer.Poll(); return peer.DataBytes(1) >= kDefaultWindow || returned; },
              "server did not use the stream WINDOW_UPDATE");
     Settle(io);
     peer.Poll();
-    Require(!sink->written && peer.DataBytes(1) == kDefaultWindow,
-            "server exceeded the connection window");
+    EXPECT_FALSE(sink->written);
+    EXPECT_EQ(peer.DataBytes(1), kDefaultWindow);
 
     peer.Write(Frame(8, 0, 0, U32(1u << 20)));
     const size_t expected = sink->payload.size() + 9;
     RunUntil(io, [&] { peer.Poll(); return (sink->written && peer.DataBytes(1) == expected) || returned; },
              "server did not resume after the connection WINDOW_UPDATE");
-    Require(peer.LargestData() <= kMaxFramePayload, "server exceeded SETTINGS_MAX_FRAME_SIZE");
+    EXPECT_LE(peer.LargestData(), kMaxFramePayload);
 
     ::IoErrorCode ignored;
     client.close(ignored);
-    Require(sink->release.try_send(::IoErrorCode{}), "sink release failed");
+    EXPECT_TRUE(sink->release.try_send(::IoErrorCode{}));
     RunUntil(io, [&] { return returned; }, "server session did not finish");
     if (failure) std::rethrow_exception(failure);
 }
 
 }  // namespace
 
-TEST(Http2FlowControl, Contract) {
-    try {
-        ClientWaitsForPeerWindows();
-        ClientEnforcesReceiveWindow();
-        ClientReturnsCreditAsReaderTakesData();
-        ServerWaitsForPeerWindows();
-        std::puts("HTTP/2 flow control: client and server honour peer windows");
-        return;
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "HTTP/2 flow control: %s\n", error.what());
-        FAIL() << error.what();
-    }
-}

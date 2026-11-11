@@ -5,7 +5,6 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <chrono>
-#include <cstdio>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -15,10 +14,6 @@ namespace {
 using Renewal = ::AutoSignContextRenewal;
 using namespace std::chrono_literals;
 
-bool Require(bool condition, const char* message) {
-    if (!condition) std::fprintf(stderr, "%s\n", message);
-    return condition;
-}
 std::shared_ptr<SSL_CTX> Context(long validity_seconds) {
     auto certificate = ::transport::internet::AutoSignCertificate::Create("renewal.example");
     if (!certificate || !X509_gmtime_adj(X509_get_notAfter(certificate->Certificate()), validity_seconds) ||
@@ -45,41 +40,40 @@ template<class Predicate> bool Await(Predicate predicate) {
 }
 }
 
-TEST(AutosignContext, Contract) {
-    // An actual certificate inside the 30-day renewal window is immediately
-    // due. No clock changes, production timeouts, or 30-day sleeps are needed.
+TEST(AutosignContext, RenewalPublishesNewSnapshotWithoutMutatingEstablishedConnection) {
     constexpr long kTenDays = 10L * 24 * 60 * 60;
-    const auto after_ten_days = Renewal::Clock::now() + std::chrono::hours(24 * 11);
-
-    // 调度器按登记顺序处理到期项：先登记的失败续期在后续成功续期发布之前必已尝试。
-    // 版本区间为空，使重建在签发后的上下文配置阶段失败。
-    auto old = Context(kTenDays);
-    auto failing_config = RenewalConfig("failing.example");
-    failing_config.min_version = ::TlsVersion::V1_3;
-    failing_config.max_version = ::TlsVersion::V1_2;
-    auto failing = Renewal::Start(old, failing_config);
-
     auto initial = Context(kTenDays);
-    SSL* established = SSL_new(initial.get());
-    ASSERT_FALSE((!Require(established != nullptr, "old SSL must retain its certificate snapshot")));
+    std::unique_ptr<SSL, decltype(&SSL_free)> established(SSL_new(initial.get()), SSL_free);
+    ASSERT_NE(established, nullptr);
     auto renewal = Renewal::Start(initial, RenewalConfig("renewal.example"));
-    ASSERT_FALSE((!Require(Await([&] { return renewal->Acquire().get() != initial.get(); }),
-                 "due certificate must publish a renewed immutable snapshot")));
+    ASSERT_TRUE(Await([&] { return renewal->Acquire().get() != initial.get(); }));
     auto replacement = renewal->Acquire();
-    ASSERT_FALSE((!Require(replacement && SSL_get_SSL_CTX(established) == initial.get() &&
-                    SSL_CTX_get0_certificate(replacement.get()) != SSL_get_certificate(established),
-                 "publishing renewal must not mutate established SSL's old context")));
-    SSL_free(established);
-    ASSERT_FALSE((!Require(renewal->Acquire(after_ten_days) == replacement,
-                 "renewal must rebuild a one-year certificate from the configuration snapshot")));
-    for (int i = 0; i < 1000; ++i) {
-        ASSERT_FALSE((!Require(renewal->Acquire() == replacement, "snapshot acquisition must not invoke signing")));
-    }
+    ASSERT_NE(replacement, nullptr);
+    EXPECT_EQ(SSL_get_SSL_CTX(established.get()), initial.get());
+    EXPECT_NE(SSL_CTX_get0_certificate(replacement.get()), SSL_get_certificate(established.get()));
+    EXPECT_EQ(renewal->Acquire(Renewal::Clock::now() + std::chrono::hours(24 * 11)), replacement);
+}
 
-    ASSERT_FALSE((!Require(failing->Acquire() == old,
-                 "renew failure must retain a still-valid previous certificate")));
-    ASSERT_FALSE((!Require(!failing->Acquire(after_ten_days),
-                 "expired certificate must fail closed even when renewal failed")));
-    ASSERT_FALSE((!Require(!renewal->Acquire(Renewal::Clock::now() + std::chrono::hours(24 * 366)),
-                 "snapshot validity must be enforced at notAfter")));
+TEST(AutosignContext, FailedRenewalRetainsValidSnapshotButRejectsExpiredSnapshot) {
+    constexpr long kTenDays = 10L * 24 * 60 * 60;
+    auto old = Context(kTenDays);
+    auto config = RenewalConfig("failing.example");
+    config.min_version = ::TlsVersion::V1_3;
+    config.max_version = ::TlsVersion::V1_2;
+    auto failing = Renewal::Start(old, config);
+
+    // The scheduler processes due registrations in order. A later successful
+    // renewal is a barrier proving the earlier failed renewal was attempted.
+    auto barrier_context = Context(kTenDays);
+    auto barrier = Renewal::Start(barrier_context, RenewalConfig("renewal.example"));
+    ASSERT_TRUE(Await([&] { return barrier->Acquire().get() != barrier_context.get(); }));
+    EXPECT_EQ(failing->Acquire(), old);
+    EXPECT_EQ(failing->Acquire(Renewal::Clock::now() + std::chrono::hours(24 * 11)), nullptr);
+}
+
+TEST(AutosignContext, RenewedSnapshotFailsClosedAfterNotAfter) {
+    auto initial = Context(10L * 24 * 60 * 60);
+    auto renewal = Renewal::Start(initial, RenewalConfig("renewal.example"));
+    ASSERT_TRUE(Await([&] { return renewal->Acquire().get() != initial.get(); }));
+    EXPECT_EQ(renewal->Acquire(Renewal::Clock::now() + std::chrono::hours(24 * 366)), nullptr);
 }

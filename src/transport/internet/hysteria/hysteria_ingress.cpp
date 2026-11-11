@@ -66,7 +66,8 @@ void EncodeWorkerServerCid(ngtcp2_cid& cid, size_t length, uint32_t worker_id) n
 }
 
 bool AttachQuicReuseportBpf(int fd, uint32_t worker_count) noexcept {
-    const uint32_t count = std::max<uint32_t>(1, worker_count);
+    if (worker_count == 0) return false;
+    const uint32_t count = worker_count;
     // 长短头均识别签发的 DCID；其他 Initial 按随机 DCID 前缀散列。
     std::array<sock_filter, 15> instructions{{
         {BPF_LD | BPF_B | BPF_ABS, 0, 0, 0},
@@ -229,7 +230,7 @@ std::shared_ptr<Connection> Connection::Create(
         listener.Associate(header.dcid, connection);
         listener.Associate(connection->core_->server_cid, connection);
         listener.sessions.emplace(connection.get(), connection);
-        listener.environment.stats->OnConnectionAccepted();
+        listener.environment.admission->stats.OnConnectionAccepted();
         connection->stats_open_ = true;
         ++listener.tasks;
         tracked = true;
@@ -420,7 +421,7 @@ void Connection::SpawnOwned(net::awaitable<void> task) {
 
 net::awaitable<void> Connection::Run() {
     std::exception_ptr failure;
-    if (listener_->environment.active_sessions) ++*listener_->environment.active_sessions;
+    app::RequestLoadState::PhysicalConnectionScope physical(*listener_->environment.request_load);
     try {
         co_await RunAwaitableTaskGroup(Reactor().get_executor(), [&](AwaitableTaskGroup& tasks) {
             tasks_ = &tasks;
@@ -431,7 +432,6 @@ net::awaitable<void> Connection::Run() {
     Close();
     tasks_ = nullptr;
     core_.reset();
-    if (listener_->environment.active_sessions) --*listener_->environment.active_sessions;
     if (failure) std::rethrow_exception(failure);
 }
 
@@ -480,7 +480,7 @@ void Connection::OnTimeout() {
         const auto reason = transport::ClassifyFailure(
             std::current_exception(), ErrorCode::INTERNAL);
         Close();
-        listener_->environment.stats->OnError();
+        listener_->environment.admission->stats.OnError();
         try {
             LOG_ERROR("Hysteria expiry failed worker={} > {}",
                       listener_->worker_id, ErrorCodeToString(reason));
@@ -528,7 +528,7 @@ void Connection::Feed(SocketState& socket, const udp::endpoint& remote,
     in_ngtcp2_callback_ = false;
     if (result != 0) {
         if (result != NGTCP2_ERR_DRAINING && result != NGTCP2_ERR_IDLE_CLOSE)
-            listener_->environment.stats->OnError();
+            listener_->environment.admission->stats.OnError();
         Close();
         return;
     }
@@ -988,7 +988,7 @@ void Connection::Close() noexcept {
     }
     if (physical_ == PhysicalAdmission::Pending) (void)physical_ready_.try_send(IoErrorCode{});
     if (stats_open_) {
-        listener_->environment.stats->OnConnectionClosed();
+        listener_->environment.admission->stats.OnConnectionClosed();
         stats_open_ = false;
     }
     stream_sink_.reset();
@@ -999,20 +999,14 @@ void Connection::Close() noexcept {
 
 net::awaitable<void> Connection::ReservePhysicalAdmission() {
     ConnectionLimiter::Admission admission;
-    if (auto& limiter = *listener_->environment.limiter; limiter.TracksAdmission()) {
-        admission = co_await limiter.ReservePhysical(
-            base_context_.inbound.tag, base_context_.inbound.source_ip,
-            base_context_.inbound.HasProxyProtocolClientIP());
+    if (auto pending = proxy::ReserveInboundConnection(
+            *listener_->environment.admission, ConnectionLimiter::ReservationScope::Physical, base_context_)) {
+        admission = co_await std::move(*pending);
     }
     const auto reject = admission.reason;
     if (closed_) co_return;
     if (reject != ConnectionLimiter::RejectReason::NONE) {
-        LOG_CONN_DEBUG(base_context_, "connection rejected from {}:{} > {}",
-                       base_context_.inbound.source_ip, base_context_.inbound.source_port,
-                       ConnectionLimiter::RejectReasonToString(reject));
-        LOG_ACCESS(FormatAccessLog(base_context_, AccessStatus::Rejected,
-                                  ConnectionLimiter::RejectReasonToString(reject)));
-        listener_->environment.stats->OnError();
+        proxy::RejectInboundAdmission(base_context_, listener_->environment.admission->stats, reject);
         physical_ = PhysicalAdmission::Rejected;
         (void)physical_ready_.try_send(IoErrorCode{});
         Refuse();
@@ -1062,7 +1056,6 @@ net::awaitable<Connection::AdmitResult> Connection::AdmitConnection(
     std::string_view credential) {
     auto auth_hash = HashCredential(credential);
     ScopedCleanse cleanse_auth_hash{auth_hash};
-    auto* limiter = listener_->environment.limiter;
     while (physical_ == PhysicalAdmission::Pending && !closed_) {
         auto [error] = co_await physical_ready_.async_receive(
             net::as_tuple(net::use_awaitable));
@@ -1070,32 +1063,37 @@ net::awaitable<Connection::AdmitResult> Connection::AdmitConnection(
     }
     if (closed_ || physical_ != PhysicalAdmission::Admitted)
         co_return AdmitResult::Limited;
-    const auto credential_check = co_await proxy::VerifyInboundCredential(
-        limiter, base_context_, proxyman::inbound::UserProtocol::Hysteria, auth_hash);
-    if (credential_check.error != ErrorCode::OK) {
-        listener_->environment.stats->OnError();
+    auto authentication = co_await proxy::BeginInboundAuthentication(*listener_->environment.admission, base_context_);
+    if (!authentication) {
+        if (authentication.error() != ErrorCode::CANCELLED && authentication.error() != ErrorCode::SOCKET_EOF)
+            listener_->environment.admission->stats.OnError();
+        co_return AdmitResult::Limited;
+    }
+    const auto credential_check = co_await authentication->VerifyCredential({proxy::KeyedInboundProtocol::Hysteria, auth_hash});
+    if (credential_check != ErrorCode::OK) {
+        if (credential_check != ErrorCode::CANCELLED && credential_check != ErrorCode::SOCKET_EOF)
+            listener_->environment.admission->stats.OnError();
         co_return AdmitResult::Limited;
     }
     if (closed_) co_return AdmitResult::Limited;
     const auto& receiver = listener_->Receiver();
     auto user = proxyman::inbound::UserStore::FindHysteriaUser(
         receiver.inbound_tag, auth_hash);
-    if (!user) {
-        co_await proxy::RecordInboundAuthFailure(
-            limiter, base_context_, "no matching credential", credential_check.key);
-        listener_->environment.stats->OnError();
-        co_return AdmitResult::AuthFailed;
-    }
-    const auto profile = user->profile;
+    const auto profile = user ? std::optional<UserProfile>(user->profile) : std::nullopt;
     user.reset();
-    proxy::BindAuthenticatedInbound(base_context_, profile, std::nullopt);
-    auto session = co_await proxy::AdmitAuthenticatedInbound(
-        *listener_->environment.tracker, base_context_, profile);
-    if (!session) co_return AdmitResult::DeviceLimited;
+    auto session = co_await proxy::AuthenticateAndAdmit(
+        std::move(*authentication), profile ? &*profile : nullptr, "no matching credential", std::nullopt);
+    if (!session) {
+        if (session.error() != ErrorCode::CANCELLED && session.error() != ErrorCode::SOCKET_EOF)
+            listener_->environment.admission->stats.OnError();
+        if (session.error() == ErrorCode::PROTOCOL_AUTH_FAILED) co_return AdmitResult::AuthFailed;
+        co_return session.error() == ErrorCode::PERMISSION_DENIED
+            ? AdmitResult::DeviceLimited : AdmitResult::Limited;
+    }
     if (closed_) co_return AdmitResult::Limited;
     online_session_.emplace(std::move(*session));
     stream_sink_ = listener_->environment.handler->NewAuthenticatedStreamSink(
-        Reactor(), *listener_->environment.dispatcher, *listener_->environment.stats,
+        Reactor(), *listener_->environment.dispatcher, listener_->environment.admission->stats,
         *listener_->environment.request_load, listener_->environment.timeouts,
         base_context_, physical_reservation_.FamilyLease());
     authenticated_ = true;
@@ -1515,11 +1513,15 @@ void Connection::CloseUdpSession(uint32_t session_id) noexcept {
 }
 
 HysteriaIngress::HysteriaIngress(
-    uint32_t worker_id_value, net::io_context& io_value,
+    uint32_t worker_id_value, uint32_t worker_count_value, net::io_context& io_value,
     app::DatagramSessionEnvironment environment_value)
     : environment(std::move(environment_value)),
-      worker_id(worker_id_value), io(io_value),
+      worker_id(worker_id_value), worker_count(worker_count_value), io(io_value),
       changed(io, std::chrono::steady_clock::time_point::max()) {
+    if (!environment.admission || !environment.prepared || !environment.handler ||
+        !environment.dispatcher || !environment.request_load ||
+        worker_count == 0 || worker_id >= worker_count)
+        throw std::invalid_argument("incomplete Hysteria listener environment");
     const auto* settings = GetSettings(*environment.prepared);
     if (!settings) throw std::invalid_argument("missing Hysteria settings");
     version = settings->version;
@@ -1626,7 +1628,7 @@ net::awaitable<void> HysteriaIngress::ReceiveLoop(std::shared_ptr<SocketState> s
         [this, socket](const udp::endpoint& remote, std::span<const uint8_t> packet) {
             ProcessPacket(*socket, remote, packet);
         },
-        [this]() noexcept { environment.stats->OnError(); });
+        [this]() noexcept { environment.admission->stats.OnError(); });
 }
 
 void HysteriaIngress::ProcessPacket(
@@ -1684,8 +1686,6 @@ HysteriaIngress::SocketPtr HysteriaIngress::AttachSocket(
     std::string_view socket_key, SocketPtr socket) {
     if (!socket || !socket->is_open() || started || stopping)
         return {};
-    const auto* coordinator = GroupCoordinator::ForContext(io);
-    const uint32_t worker_count = coordinator ? coordinator->WorkerCount() : 1;
     (void)AttachQuicReuseportBpf(socket->native_handle(), worker_count);
     auto state = std::make_shared<SocketState>(io);
     state->socket = std::move(socket);

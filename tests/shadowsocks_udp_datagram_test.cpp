@@ -15,25 +15,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cstdlib>
-#include <iostream>
 #include <memory>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace {
 
 
-[[noreturn]] void Fail(std::string_view message) {
-    std::cerr << message << '\n';
-    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
-}
-
-void Check(bool condition, std::string_view message) {
-    if (!condition) {
-        Fail(message);
-    }
-}
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
     std::vector<uint8_t> out;
@@ -51,10 +40,8 @@ std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
 buf::MultiBuffer MakePayload(const std::vector<uint8_t>& source,
                              const TargetAddress& target) {
     buf::MultiBuffer payload;
-    Check(buf::AppendSpanToMultiBuffer(source, payload),
-          "failed to allocate Shadowsocks UDP test payload");
-    Check(buf::SetUdpTarget(payload, target),
-          "failed to mark Shadowsocks UDP test datagram");
+    EXPECT_TRUE((buf::AppendSpanToMultiBuffer(source, payload))) << "failed to allocate Shadowsocks UDP test payload";
+    EXPECT_TRUE((buf::SetUdpTarget(payload, target))) << "failed to mark Shadowsocks UDP test datagram";
     return payload;
 }
 
@@ -67,81 +54,71 @@ void CheckClassic(const TargetAddress& target,
         target, payload.data(), payload.size(), key.span(),
         cipher.type, cipher.key_size, cipher.salt_size, nullptr, 0);
     std::vector<uint8_t> encoded(encoded_size);
-    Check(ss::EncodeUdpPacketTo(
+    EXPECT_EQ((ss::EncodeUdpPacketTo(
               target, payload.data(), payload.size(), key.span(),
               cipher.type, cipher.key_size - 1, cipher.salt_size,
-              encoded.data(), encoded.size()) == 0,
-          "datagram AEAD accepted an incompatible encryption key length");
-    Check(ss::EncodeUdpPacketTo(
+              encoded.data(), encoded.size())), (0)) << "datagram AEAD accepted an incompatible encryption key length";
+    EXPECT_EQ((ss::EncodeUdpPacketTo(
               target, payload.data(), payload.size(), key.span(),
               cipher.type, cipher.key_size, cipher.salt_size,
-              encoded.data(), encoded.size()) == encoded.size(),
-          "classic Shadowsocks UDP encoding failed");
-    Check(!ss::DecodeUdpPacketWithKey(
+              encoded.data(), encoded.size())), (encoded.size())) << "classic Shadowsocks UDP encoding failed";
+    EXPECT_FALSE((ss::DecodeUdpPacketWithKey(
               encoded.data(), encoded.size(), key.span(),
-              cipher.type, cipher.key_size - 1, cipher.salt_size),
-          "datagram AEAD accepted an incompatible decryption key length");
+              cipher.type, cipher.key_size - 1, cipher.salt_size))) << "datagram AEAD accepted an incompatible decryption key length";
 
     auto decoded = ss::DecodeUdpPacketWithKey(
         encoded.data(), encoded.size(), key.span(),
         cipher.type, cipher.key_size, cipher.salt_size);
-    Check(decoded && decoded->target.SameEndpoint(target) &&
-          Flatten(decoded->payload) == source,
-          "classic Shadowsocks split one MultiBuffer datagram");
-    Check(!decoded->session_id, "classic UDP unexpectedly supplied a protocol session ID");
-    Check(!decoded->packet_id, "classic UDP unexpectedly supplied an authenticated packet ID");
+    ASSERT_TRUE(decoded);
+    EXPECT_TRUE((decoded && decoded->target.SameEndpoint(target) &&
+          Flatten(decoded->payload) == source)) << "classic Shadowsocks split one MultiBuffer datagram";
+    EXPECT_FALSE((decoded->session_id)) << "classic UDP unexpectedly supplied a protocol session ID";
+    EXPECT_FALSE((decoded->packet_id)) << "classic UDP unexpectedly supplied an authenticated packet ID";
     const auto reply_datagram = buf::InspectUdpDatagram(decoded->payload);
-    Check(reply_datagram.Valid() && reply_datagram.target->SameEndpoint(target) &&
-          reply_datagram.payload_size == source.size(),
-          "classic Shadowsocks reply lost its UDP message boundary");
+    EXPECT_TRUE((reply_datagram.Valid() && reply_datagram.target->SameEndpoint(target) &&
+          reply_datagram.payload_size == source.size())) << "classic Shadowsocks reply lost its UDP message boundary";
 
     auto user_list = std::make_shared<
         proxyman::inbound::UserStore::ShadowsocksUserList>();
     proxyman::inbound::UserStore::ShadowsocksCredential user;
-    Check(user.derived_key.assign(key.span()), "failed to prepare classic UDP user");
+    EXPECT_TRUE((user.derived_key.assign(key.span()))) << "failed to prepare classic UDP user";
     user_list->push_back(std::move(user));
     ss::Ss2022UdpReplayCache replay_cache;
     for (bool deferred_replay : {false, true}) {
         auto inbound = ss::DecodeUdpPacket(
             encoded.data(), encoded.size(), {user_list},
             cipher.type, cipher.key_size, cipher.salt_size, replay_cache, deferred_replay);
-        Check(inbound && !inbound->session_id && !inbound->packet_id &&
+        ASSERT_TRUE(inbound);
+        EXPECT_TRUE((inbound && !inbound->session_id && !inbound->packet_id &&
               inbound->target.SameEndpoint(target) && Flatten(inbound->payload) == source &&
-              replay_cache.Size() == 0,
-              "deferred replay changed classic UDP decoding");
+              replay_cache.Size() == 0)) << "deferred replay changed classic UDP decoding";
         const auto request_datagram = buf::InspectUdpDatagram(inbound->payload);
-        Check(request_datagram.Valid() && request_datagram.target->SameEndpoint(target) &&
-              request_datagram.payload_size == source.size(),
-              "classic authenticated request lost its UDP message boundary");
+        EXPECT_TRUE((request_datagram.Valid() && request_datagram.target->SameEndpoint(target) &&
+              request_datagram.payload_size == source.size())) << "classic authenticated request lost its UDP message boundary";
     }
 
-    Check(!ss::DecodeUdpPacket(nullptr, 0, {user_list}, cipher.type,
+    EXPECT_TRUE((!ss::DecodeUdpPacket(nullptr, 0, {user_list}, cipher.type,
                               cipher.key_size, cipher.salt_size, replay_cache, false) &&
           !ss::DecodeUdpPacketWithKey(nullptr, 0, key.span(), cipher.type,
-                                     cipher.key_size, cipher.salt_size),
-          "raw empty Shadowsocks wire bypassed authentication");
+                                     cipher.key_size, cipher.salt_size))) << "raw empty Shadowsocks wire bypassed authentication";
     // Cross-check the one-shot AEAD API against the existing streaming EVP
     // implementation, rather than only round-tripping through the new path.
     std::array<uint8_t, 32> subkey{};
     std::array<uint8_t, 12> nonce{};
-    Check(ss::DeriveSubkey(key.data(), key.size, encoded.data(), cipher.salt_size,
-                          subkey.data()), "reference subkey derivation failed");
+    EXPECT_TRUE((ss::DeriveSubkey(key.data(), key.size, encoded.data(), cipher.salt_size,
+                          subkey.data()))) << "reference subkey derivation failed";
     ss::SsAeadCipher reference(cipher.type, subkey.data(), cipher.key_size);
     const auto body = std::span<const uint8_t>(encoded).subspan(cipher.salt_size);
     std::vector<uint8_t> plaintext(body.size() - ss::SsAeadCipher::kTagSize);
-    Check(reference.Decrypt(nonce.data(), body.data(), body.size(), plaintext.data()),
-          "EVP could not decrypt one-shot AEAD ciphertext");
-    Check(std::equal(source.begin(), source.end(), plaintext.end() - source.size()),
-          "reference AEAD plaintext mismatch");
+    EXPECT_TRUE((reference.Decrypt(nonce.data(), body.data(), body.size(), plaintext.data()))) << "EVP could not decrypt one-shot AEAD ciphertext";
+    EXPECT_TRUE((std::equal(source.begin(), source.end(), plaintext.end() - source.size()))) << "reference AEAD plaintext mismatch";
     std::vector<uint8_t> reference_ciphertext(body.size());
     ss::SsAeadCipher encoder(cipher.type, subkey.data(), cipher.key_size);
-    Check(encoder.Encrypt(nonce.data(), plaintext.data(), plaintext.size(), reference_ciphertext.data()) &&
-          std::equal(body.begin(), body.end(), reference_ciphertext.begin()),
-          "AEAD ciphertext/tag differ from streaming EVP");
+    EXPECT_TRUE((encoder.Encrypt(nonce.data(), plaintext.data(), plaintext.size(), reference_ciphertext.data()) &&
+          std::equal(body.begin(), body.end(), reference_ciphertext.begin()))) << "AEAD ciphertext/tag differ from streaming EVP";
     encoded.back() ^= 1;
-    Check(!ss::DecodeUdpPacketWithKey(encoded.data(), encoded.size(), key.span(),
-                                    cipher.type, cipher.key_size, cipher.salt_size),
-          "datagram AEAD accepted a modified tag");
+    EXPECT_FALSE((ss::DecodeUdpPacketWithKey(encoded.data(), encoded.size(), key.span(),
+                                    cipher.type, cipher.key_size, cipher.salt_size))) << "datagram AEAD accepted a modified tag";
 }
 
 void Check2022(const TargetAddress& target,
@@ -156,54 +133,44 @@ void Check2022(const TargetAddress& target,
     for (size_t i = 0; i < key_size; ++i) {
         key_bytes[i] = static_cast<uint8_t>(i + 1);
     }
-    Check(key.assign(std::span<const uint8_t>(key_bytes).first(key_size)),
-          "failed to initialize Shadowsocks 2022 key");
+    EXPECT_TRUE((key.assign(std::span<const uint8_t>(key_bytes).first(key_size)))) << "failed to initialize Shadowsocks 2022 key";
 
     std::array<ss::KeyBytes, 2> chain{};
     std::span<const ss::KeyBytes> psk_chain;
     if (identity) {
         auto identity_bytes = key_bytes;
         for (auto& byte : identity_bytes) byte ^= 0xa5;
-        Check(chain[0].assign(std::span<const uint8_t>(identity_bytes).first(key_size)),
-              "failed to initialize identity key");
+        EXPECT_TRUE((chain[0].assign(std::span<const uint8_t>(identity_bytes).first(key_size)))) << "failed to initialize identity key";
         chain[1] = key;
         psk_chain = chain;
     }
     ss::Ss2022UdpSessionState encoder;
-    Check(ss::Init2022UdpSessionState(encoder, cipher, key),
-          "failed to initialize Shadowsocks 2022 UDP state");
+    EXPECT_TRUE((ss::Init2022UdpSessionState(encoder, cipher, key))) << "failed to initialize Shadowsocks 2022 UDP state";
     encoder.client_session_id = {0x00, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde};
     const size_t encoded_size = ss::Encode2022UdpRequestPacketTo(
         target, payload.data(), payload.size(), encoder, psk_chain, nullptr, 0);
-    Check(encoder.next_packet_id == 0,
-          "Shadowsocks 2022 size calculation advanced packet state");
+    EXPECT_EQ((encoder.next_packet_id), (0)) << "Shadowsocks 2022 size calculation advanced packet state";
     std::vector<uint8_t> encoded(encoded_size);
-    Check(ss::Encode2022UdpRequestPacketTo(
+    EXPECT_EQ((ss::Encode2022UdpRequestPacketTo(
               target, payload.data(), payload.size(), encoder, psk_chain,
-              encoded.data(), encoded.size()) == encoded.size(),
-          "Shadowsocks 2022 UDP encoding failed");
-    Check(encoder.next_packet_id == 1,
-          "Shadowsocks 2022 request did not advance packet state once");
+              encoded.data(), encoded.size())), (encoded.size())) << "Shadowsocks 2022 UDP encoding failed";
+    EXPECT_EQ((encoder.next_packet_id), (1)) << "Shadowsocks 2022 request did not advance packet state once";
 
     proxyman::inbound::PreparedShadowsocksUsers prepared_users;
     proxyman::inbound::PreparedShadowsocksUser user;
-    Check(user.derived_key.assign(key.span()),
-          "failed to initialize Shadowsocks 2022 decode user");
+    EXPECT_TRUE((user.derived_key.assign(key.span()))) << "failed to initialize Shadowsocks 2022 decode user";
     if (identity) {
-        Check(user.identity_key.assign(chain[0].span()) &&
-              ss::Hash2022Psk(key.span(), user.psk_hash),
-              "failed to prepare identity credential");
+        EXPECT_TRUE((user.identity_key.assign(chain[0].span()) &&
+              ss::Hash2022Psk(key.span(), user.psk_hash))) << "failed to prepare identity credential";
     }
     if (identity) {
         auto decoy = user;
         decoy.derived_key.bytes[0] ^= 0x5a;
-        Check(ss::Hash2022Psk(decoy.derived_key.span(), decoy.psk_hash),
-              "failed to prepare decoy credential");
+        EXPECT_TRUE((ss::Hash2022Psk(decoy.derived_key.span(), decoy.psk_hash))) << "failed to prepare decoy credential";
         auto other_identity = decoy;
         other_identity.identity_key.bytes[0] ^= 0x33;
         other_identity.derived_key.bytes[1] ^= 0x33;
-        Check(ss::Hash2022Psk(other_identity.derived_key.span(), other_identity.psk_hash),
-              "failed to prepare other identity credential");
+        EXPECT_TRUE((ss::Hash2022Psk(other_identity.derived_key.span(), other_identity.psk_hash))) << "failed to prepare other identity credential";
         prepared_users.push_back(std::move(other_identity));
         prepared_users.push_back(std::move(decoy));
     }
@@ -223,271 +190,243 @@ void Check2022(const TargetAddress& target,
         bad_prepared.back().psk_hash[0] ^= 1;
         const auto bad_users = prepare_view(bad_prepared);
         ss::Ss2022UdpReplayCache bad_cache;
-        Check(!ss::DecodeUdpPacket(encoded.data(), encoded.size(), bad_users,
-                                  cipher.type, cipher.key_size, cipher.salt_size, bad_cache, false),
-              "identity authentication ignored prepared PSK hash");
-        Check(!ss::DecodeUdpPacket(encoded.data(), encoded.size(), bad_users,
+        EXPECT_FALSE((ss::DecodeUdpPacket(encoded.data(), encoded.size(), bad_users,
+                                  cipher.type, cipher.key_size, cipher.salt_size, bad_cache, false))) << "identity authentication ignored prepared PSK hash";
+        EXPECT_TRUE((!ss::DecodeUdpPacket(encoded.data(), encoded.size(), bad_users,
                                   cipher.type, cipher.key_size, cipher.salt_size, bad_cache, true) &&
-              bad_cache.Size() == 0,
-              "deferred identity authentication accepted an invalid PSK hash or mutated replay");
+              bad_cache.Size() == 0)) << "deferred identity authentication accepted an invalid PSK hash or mutated replay";
     }
     std::vector<uint8_t> corrupted = encoded;
     corrupted.back() ^= 0x01;
     ss::Ss2022UdpReplayCache validation_cache;
-    Check(!ss::DecodeUdpPacket(
+    EXPECT_FALSE((ss::DecodeUdpPacket(
               corrupted.data(), corrupted.size(), users,
               cipher.type, cipher.key_size, cipher.salt_size,
-              validation_cache, false),
-          "invalid Shadowsocks 2022 request unexpectedly decoded");
-    Check(validation_cache.Size() == 0,
-          "invalid Shadowsocks 2022 authentication created replay state");
-    Check(!ss::DecodeUdpPacket(
+              validation_cache, false))) << "invalid Shadowsocks 2022 request unexpectedly decoded";
+    EXPECT_EQ((validation_cache.Size()), (0)) << "invalid Shadowsocks 2022 authentication created replay state";
+    EXPECT_TRUE((!ss::DecodeUdpPacket(
               corrupted.data(), corrupted.size(), users,
               cipher.type, cipher.key_size, cipher.salt_size, validation_cache, true) &&
-          validation_cache.Size() == 0,
-          "deferred invalid authentication accepted ciphertext or mutated replay");
-    Check(!ss::DecodeUdpPacket(nullptr, 0, users, cipher.type, cipher.key_size,
+          validation_cache.Size() == 0)) << "deferred invalid authentication accepted ciphertext or mutated replay";
+    EXPECT_TRUE((!ss::DecodeUdpPacket(nullptr, 0, users, cipher.type, cipher.key_size,
                               cipher.salt_size, validation_cache, false) &&
-          validation_cache.Size() == 0,
-          "raw empty SS2022 wire bypassed authentication or created replay state");
-    Check(ss::DecodeUdpPacket(
+          validation_cache.Size() == 0)) << "raw empty SS2022 wire bypassed authentication or created replay state";
+    EXPECT_TRUE((ss::DecodeUdpPacket(
               encoded.data(), encoded.size(), users,
               cipher.type, cipher.key_size, cipher.salt_size,
-              validation_cache, false).has_value(),
-          "invalid Shadowsocks 2022 request poisoned the replay window");
+              validation_cache, false).has_value())) << "invalid Shadowsocks 2022 request poisoned the replay window";
 
     ss::Ss2022UdpReplayCache replay_cache;
     for (size_t attempt = 0; attempt < 2; ++attempt) {
         auto authenticated = ss::DecodeUdpPacket(
             encoded.data(), encoded.size(), users,
             cipher.type, cipher.key_size, cipher.salt_size, replay_cache, true);
-        Check(authenticated && authenticated->session_id == 0x00123456789abcdeULL &&
+        EXPECT_TRUE((authenticated && authenticated->session_id == 0x00123456789abcdeULL &&
               authenticated->packet_id == 0 &&
               authenticated->session_owner.size == key.size &&
               std::equal(key.span().begin(), key.span().end(),
                          authenticated->session_owner.span().begin()) &&
               authenticated->target.SameEndpoint(target) &&
-              Flatten(authenticated->payload) == source && replay_cache.Size() == 0,
-              "SS2022 authentication lost metadata or committed replay");
+              Flatten(authenticated->payload) == source && replay_cache.Size() == 0)) << "SS2022 authentication lost metadata or committed replay";
     }
     auto decoded = ss::DecodeUdpPacket(
         encoded.data(), encoded.size(), users,
         cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false);
-    Check(decoded && decoded->target.SameEndpoint(target) &&
-          Flatten(decoded->payload) == source,
-          "Shadowsocks 2022 split one MultiBuffer datagram");
+    ASSERT_TRUE(decoded);
+    EXPECT_TRUE((decoded && decoded->target.SameEndpoint(target) &&
+          Flatten(decoded->payload) == source)) << "Shadowsocks 2022 split one MultiBuffer datagram";
     const auto request_datagram = buf::InspectUdpDatagram(decoded->payload);
-    Check(request_datagram.Valid() && request_datagram.target->SameEndpoint(target) &&
-          request_datagram.payload_size == source.size(),
-          "SS2022 authenticated request lost its UDP message boundary");
-    Check(decoded->session_id == 0x00123456789abcdeULL,
-          "Shadowsocks 2022 session ID lost byte order or leading zeros");
-    Check(decoded->packet_id == 0 && decoded->session_owner.size == key.size &&
-          std::equal(key.span().begin(), key.span().end(), decoded->session_owner.span().begin()),
-          "SS2022 decode lost authenticated packet ID or full credential");
-    Check(!ss::DecodeUdpPacket(
+    EXPECT_TRUE((request_datagram.Valid() && request_datagram.target->SameEndpoint(target) &&
+          request_datagram.payload_size == source.size())) << "SS2022 authenticated request lost its UDP message boundary";
+    EXPECT_EQ((decoded->session_id), (0x00123456789abcdeULL)) << "Shadowsocks 2022 session ID lost byte order or leading zeros";
+    EXPECT_TRUE((decoded->packet_id == 0 && decoded->session_owner.size == key.size &&
+          std::equal(key.span().begin(), key.span().end(), decoded->session_owner.span().begin()))) << "SS2022 decode lost authenticated packet ID or full credential";
+    EXPECT_FALSE((ss::DecodeUdpPacket(
               encoded.data(), encoded.size(), users,
-              cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false),
-          "Shadowsocks 2022 accepted a replayed request packet");
+              cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false))) << "Shadowsocks 2022 accepted a replayed request packet";
     auto authenticated_replay = ss::DecodeUdpPacket(
         encoded.data(), encoded.size(), users,
         cipher.type, cipher.key_size, cipher.salt_size, replay_cache, true);
-    Check(authenticated_replay && replay_cache.Size() == 1,
-          "deferred authentication consulted already committed replay state");
+    ASSERT_TRUE(authenticated_replay);
+    ASSERT_TRUE(authenticated_replay->session_id);
+    ASSERT_TRUE(authenticated_replay->packet_id);
+    EXPECT_TRUE((authenticated_replay && replay_cache.Size() == 1)) << "deferred authentication consulted already committed replay state";
     std::array<uint8_t, 8> authenticated_session{};
     for (size_t i = 0; i < authenticated_session.size(); ++i) {
         authenticated_session[i] = static_cast<uint8_t>(
             *authenticated_replay->session_id >> ((authenticated_session.size() - 1 - i) * 8));
     }
     ss::Ss2022UdpReplayCache ingress_replay;
-    Check(ingress_replay.Accept(authenticated_replay->session_owner.span(),
+    EXPECT_TRUE((ingress_replay.Accept(authenticated_replay->session_owner.span(),
                                authenticated_session, *authenticated_replay->packet_id) &&
           !ingress_replay.Accept(authenticated_replay->session_owner.span(),
-                                authenticated_session, *authenticated_replay->packet_id),
-          "authenticated metadata did not support a unique external replay commit");
+                                authenticated_session, *authenticated_replay->packet_id))) << "authenticated metadata did not support a unique external replay commit";
 
     // A forged high packet ID must not advance an already initialized window.
     constexpr uint64_t kHighPacketId = 0x0102030405060708ULL;
     encoder.next_packet_id = kHighPacketId;
     std::vector<uint8_t> high_packet(encoded_size);
-    Check(ss::Encode2022UdpRequestPacketTo(
+    EXPECT_EQ((ss::Encode2022UdpRequestPacketTo(
               target, payload.data(), payload.size(), encoder, psk_chain,
-              high_packet.data(), high_packet.size()) == high_packet.size(),
-          "failed to encode high packet ID");
+              high_packet.data(), high_packet.size())), (high_packet.size())) << "failed to encode high packet ID";
     high_packet.back() ^= 1;
     for (bool deferred_replay : {false, true}) {
-        Check(!ss::DecodeUdpPacket(
+        EXPECT_TRUE((!ss::DecodeUdpPacket(
                   high_packet.data(), high_packet.size(), users,
                   cipher.type, cipher.key_size, cipher.salt_size, replay_cache, deferred_replay) &&
-              replay_cache.Size() == 1,
-              "invalid authentication changed an existing replay namespace");
+              replay_cache.Size() == 1)) << "invalid authentication changed an existing replay namespace";
     }
     encoder.next_packet_id = 1;
     std::vector<uint8_t> next_packet(encoded_size);
-    Check(ss::Encode2022UdpRequestPacketTo(
+    EXPECT_EQ((ss::Encode2022UdpRequestPacketTo(
               target, payload.data(), payload.size(), encoder, psk_chain,
-              next_packet.data(), next_packet.size()) == next_packet.size(),
-          "failed to encode next packet ID");
+              next_packet.data(), next_packet.size())), (next_packet.size())) << "failed to encode next packet ID";
     auto next_decoded = ss::DecodeUdpPacket(
         next_packet.data(), next_packet.size(), users,
         cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false);
-    Check(next_decoded && next_decoded->packet_id == 1,
-          "invalid authentication advanced the replay window");
+    EXPECT_TRUE((next_decoded && next_decoded->packet_id == 1)) << "invalid authentication advanced the replay window";
     high_packet.back() ^= 1;
     auto high_authenticated = ss::DecodeUdpPacket(
         high_packet.data(), high_packet.size(), users,
         cipher.type, cipher.key_size, cipher.salt_size, replay_cache, true);
-    Check(high_authenticated && high_authenticated->packet_id == kHighPacketId,
-          "SS2022 authenticated packet ID lost width or byte order");
-    Check(!ss::DecodeUdpPacket(
+    EXPECT_TRUE((high_authenticated && high_authenticated->packet_id == kHighPacketId)) << "SS2022 authenticated packet ID lost width or byte order";
+    EXPECT_FALSE((ss::DecodeUdpPacket(
               next_packet.data(), next_packet.size(), users,
-              cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false),
-          "deferred authentication cleared existing replay history");
+              cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false))) << "deferred authentication cleared existing replay history";
     // Distinct authenticated users may independently choose identical session
     // and packet IDs. Authentication must scope the replay window too.
     ss::KeyBytes second_key = key;
     second_key.bytes[second_key.size - 1] ^= 0x5a;
     auto second_user = prepared_users.back();
-    Check(second_user.derived_key.assign(second_key.span()), "failed to prepare second user's key");
+    EXPECT_TRUE((second_user.derived_key.assign(second_key.span()))) << "failed to prepare second user's key";
     if (identity)
-        Check(ss::Hash2022Psk(second_key.span(), second_user.psk_hash),
-              "failed to prepare second identity credential");
+        EXPECT_TRUE((ss::Hash2022Psk(second_key.span(), second_user.psk_hash))) << "failed to prepare second identity credential";
     prepared_users.push_back(std::move(second_user));
     const auto second_users = prepare_view(prepared_users);
     ss::Ss2022UdpSessionState second_encoder;
-    Check(ss::Init2022UdpSessionState(second_encoder, cipher, second_key),
-          "failed to prepare second user's UDP session");
+    EXPECT_TRUE((ss::Init2022UdpSessionState(second_encoder, cipher, second_key))) << "failed to prepare second user's UDP session";
     second_encoder.client_session_id = encoder.client_session_id;
     if (identity) chain[1] = second_key;
     const size_t second_size = ss::Encode2022UdpRequestPacketTo(
         target, payload.data(), payload.size(), second_encoder, psk_chain, nullptr, 0);
     std::vector<uint8_t> second_packet(second_size);
-    Check(second_size != 0 && ss::Encode2022UdpRequestPacketTo(
+    EXPECT_TRUE((second_size != 0 && ss::Encode2022UdpRequestPacketTo(
               target, payload.data(), payload.size(), second_encoder, psk_chain,
-              second_packet.data(), second_packet.size()) == second_size,
-          "failed to encode second user's UDP packet");
+              second_packet.data(), second_packet.size()) == second_size)) << "failed to encode second user's UDP packet";
     auto second_decoded = ss::DecodeUdpPacket(
         second_packet.data(), second_packet.size(), second_users,
         cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false);
-    Check(second_decoded && second_decoded->session_id == decoded->session_id &&
+    EXPECT_TRUE((second_decoded && second_decoded->session_id == decoded->session_id &&
           !std::equal(decoded->session_owner.span().begin(), decoded->session_owner.span().end(),
                       second_decoded->session_owner.span().begin()) &&
-          Flatten(second_decoded->payload) == source,
-          "SS2022 replay state crossed authenticated users with identical session and packet IDs");
-    Check(second_decoded->packet_id == decoded->packet_id &&
+          Flatten(second_decoded->payload) == source)) << "SS2022 replay state crossed authenticated users with identical session and packet IDs";
+    ASSERT_TRUE(second_decoded);
+    EXPECT_TRUE((second_decoded->packet_id == decoded->packet_id &&
           second_decoded->session_owner.size == second_key.size &&
           std::equal(second_key.span().begin(), second_key.span().end(),
                      second_decoded->session_owner.span().begin()) &&
           ingress_replay.Accept(second_decoded->session_owner.span(),
-                                authenticated_session, *second_decoded->packet_id),
-          "SS2022 external replay namespace truncated the authenticated credential");
-    Check(!ss::DecodeUdpPacket(
+                                authenticated_session, *second_decoded->packet_id))) << "SS2022 external replay namespace truncated the authenticated credential";
+    EXPECT_FALSE((ss::DecodeUdpPacket(
               second_packet.data(), second_packet.size(), second_users,
-              cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false),
-          "SS2022 second user accepted its own repeated packet");
+              cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false))) << "SS2022 second user accepted its own repeated packet";
 
-    auto make_response_state = [&]() {
-        ss::Ss2022UdpSessionState state;
-        state.cipher_info = encoder.cipher_info;
-        state.key = encoder.key;
-        state.client_session_id = encoder.client_session_id;
-        state.server_session_id = encoder.server_session_id;
-        return state;
-    };
-    ss::Ss2022UdpSessionState response_encoder = make_response_state();
-    ss::Ss2022UdpSessionState response_decoder = make_response_state();
+}
+
+void Expect2022Response(const TargetAddress& target, const std::vector<uint8_t>& source,
+                        ss::SsCipherType type, size_t key_size) {
+    ss::KeyBytes key;
+    std::array<uint8_t, 32> key_bytes{};
+    for (size_t i = 0; i < key_size; ++i) key_bytes[i] = static_cast<uint8_t>(i + 1);
+    ASSERT_TRUE(key.assign(std::span<const uint8_t>(key_bytes).first(key_size)));
+    ss::Ss2022UdpSessionState response_encoder;
+    ASSERT_TRUE(ss::Init2022UdpSessionState(response_encoder, {type, key_size, key_size}, key));
+    response_encoder.client_session_id = {0x00, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde};
+    ss::Ss2022UdpSessionState response_decoder;
+    response_decoder.cipher_info = response_encoder.cipher_info;
+    response_decoder.key = response_encoder.key;
+    response_decoder.client_session_id = response_encoder.client_session_id;
+    response_decoder.server_session_id = response_encoder.server_session_id;
+    const std::span<const uint8_t> payload(source);
     const size_t response_size = ss::Encode2022UdpResponsePacketTo(
         target, payload.data(), payload.size(), response_encoder, nullptr, 0);
     std::vector<uint8_t> response(response_size);
-    Check(ss::Encode2022UdpResponsePacketTo(
+    EXPECT_EQ((ss::Encode2022UdpResponsePacketTo(
               target, payload.data(), payload.size(), response_encoder,
-              response.data(), response.size()) == response.size(),
-          "Shadowsocks 2022 UDP response encoding failed");
+              response.data(), response.size())), (response.size())) << "Shadowsocks 2022 UDP response encoding failed";
     auto response_decoded = ss::Decode2022UdpResponsePacket(
         response.data(), response.size(), response_decoder);
-    Check(response_decoded &&
+    ASSERT_TRUE(response_decoded);
+    EXPECT_TRUE((response_decoded &&
           response_decoded->target.SameEndpoint(target) &&
-          Flatten(response_decoded->payload) == source,
-          "Shadowsocks 2022 UDP response decoding failed");
+          Flatten(response_decoded->payload) == source)) << "Shadowsocks 2022 UDP response decoding failed";
     const auto reply_datagram = buf::InspectUdpDatagram(response_decoded->payload);
-    Check(reply_datagram.Valid() && reply_datagram.target->SameEndpoint(target) &&
-          reply_datagram.payload_size == source.size(),
-          "SS2022 authenticated response lost its UDP message boundary");
-    Check(!ss::Decode2022UdpResponsePacket(
-              response.data(), response.size(), response_decoder),
-          "Shadowsocks 2022 accepted a replayed response packet");
+    EXPECT_TRUE((reply_datagram.Valid() && reply_datagram.target->SameEndpoint(target) &&
+          reply_datagram.payload_size == source.size())) << "SS2022 authenticated response lost its UDP message boundary";
+    EXPECT_FALSE((ss::Decode2022UdpResponsePacket(
+              response.data(), response.size(), response_decoder))) << "Shadowsocks 2022 accepted a replayed response packet";
 }
 
-void Check2022AssociationPaths() {
+TEST(ShadowsocksUdpDatagram, AssociationInspectionAndPathChangesPreserveReplayHistory) {
     using enum InboundDatagramCheck;
     const udp::endpoint first{net::ip::address_v4::loopback(), 48234};
     const udp::endpoint second{net::ip::address_v4::loopback(), 48235};
     ss::Ss2022UdpAssociation record;
     const auto now = std::chrono::steady_clock::now();
-    Check(record.Check(10, 0, first, Commit, now), "failed to seed protocol association");
+    EXPECT_TRUE((record.Check(10, 0, first, Commit, now))) << "failed to seed protocol association";
     const auto deadline = record.ProtectedUntil();
-    Check(record.Check(12, 0, second, Inspect, now + std::chrono::seconds(1)) &&
+    EXPECT_TRUE((record.Check(12, 0, second, Inspect, now + std::chrono::seconds(1)) &&
           record.Check(12, 0, second, Inspect, now + std::chrono::seconds(2)) &&
           record.ProtectedUntil() == deadline &&
-          record.Check(11, 0, first, Commit, now),
-          "inspection committed a packet, changed the path, or extended retention");
-    Check(record.Check(12, 0, second, Commit) &&
+          record.Check(11, 0, first, Commit, now))) << "inspection committed a packet, changed the path, or extended retention";
+    EXPECT_TRUE((record.Check(12, 0, second, Commit) &&
           !record.Check(9, 0, first, Inspect) && !record.Check(9, 0, first, Commit) &&
-          record.Check(9, 0, second, Commit) && !record.Check(9, 0, second, Commit),
-          "same-Worker path freshness rejected reordering or admitted a stale endpoint");
-    Check(record.Check(14, 1, first, Commit) &&
+          record.Check(9, 0, second, Commit) && !record.Check(9, 0, second, Commit))) << "same-Worker path freshness rejected reordering or admitted a stale endpoint";
+    EXPECT_TRUE((record.Check(14, 1, first, Commit) &&
           !record.Check(13, 0, second, Inspect) && !record.Check(13, 0, second, Commit) &&
-          record.Check(13, 1, first, Commit) && !record.Check(13, 1, first, Commit),
-          "cross-Worker path freshness lost replay history or allowed rollback");
+          record.Check(13, 1, first, Commit) && !record.Check(13, 1, first, Commit))) << "cross-Worker path freshness lost replay history or allowed rollback";
     // Reordering on the current path must not lower the path watermark.
-    Check(record.Check(17, 1, first, Commit) && record.Check(15, 1, first, Commit) &&
+    EXPECT_TRUE((record.Check(17, 1, first, Commit) && record.Check(15, 1, first, Commit) &&
           !record.Check(16, 1, second, Inspect) && !record.Check(16, 1, second, Commit) &&
           !record.Check(16, 0, first, Inspect) && !record.Check(16, 0, first, Commit) &&
           record.Check(16, 1, first, Commit) && record.Check(18, 0, second, Commit) &&
           record.Check(20, 2, first, Commit) && !record.Check(19, 0, second, Commit) &&
-          record.Check(19, 2, first, Commit),
-          "repeated path changes regressed the freshness watermark");
+          record.Check(19, 2, first, Commit))) << "repeated path changes regressed the freshness watermark";
     ss::Ss2022UdpAssociation zero;
-    Check(zero.Check(0, 0, first, Commit) && !zero.Check(0, 1, second, Commit) &&
-          zero.Check(1, 1, second, Commit),
-          "zero packet ID bypassed path freshness or replay protection");
+    EXPECT_TRUE((zero.Check(0, 0, first, Commit) && !zero.Check(0, 1, second, Commit) &&
+          zero.Check(1, 1, second, Commit))) << "zero packet ID bypassed path freshness or replay protection";
 }
 
-void Check2022ReplayWindow() {
+TEST(ShadowsocksUdpDatagram, ReplayWindowAcceptsReorderingAndRetainsBitsAcrossWords) {
     ss::Ss2022UdpReplayWindow window;
-    Check(window.Accept(100) && window.Accept(98) && window.Accept(99),
-          "Shadowsocks 2022 replay window rejected valid reordering");
-    Check(!window.Accept(100) && !window.Accept(98),
-          "Shadowsocks 2022 replay window accepted duplicate packet IDs");
-    Check(window.Accept(100 + ss::Ss2022UdpReplayWindow::kWindowBits),
-          "Shadowsocks 2022 replay window rejected a new high packet ID");
-    Check(!window.Accept(100),
-          "Shadowsocks 2022 replay window accepted an out-of-window packet ID");
+    EXPECT_TRUE((window.Accept(100) && window.Accept(98) && window.Accept(99))) << "Shadowsocks 2022 replay window rejected valid reordering";
+    EXPECT_TRUE((!window.Accept(100) && !window.Accept(98))) << "Shadowsocks 2022 replay window accepted duplicate packet IDs";
+    EXPECT_TRUE((window.Accept(100 + ss::Ss2022UdpReplayWindow::kWindowBits))) << "Shadowsocks 2022 replay window rejected a new high packet ID";
+    EXPECT_FALSE((window.Accept(100))) << "Shadowsocks 2022 replay window accepted an out-of-window packet ID";
 
     ss::Ss2022UdpReplayWindow cross_word_window;
-    Check(cross_word_window.Accept(0) && cross_word_window.Accept(65) &&
+    EXPECT_TRUE((cross_word_window.Accept(0) && cross_word_window.Accept(65) &&
           !cross_word_window.Accept(0) && cross_word_window.Accept(64) &&
-          !cross_word_window.Accept(64),
-          "Shadowsocks 2022 replay window lost bits across word boundaries");
+          !cross_word_window.Accept(64))) << "Shadowsocks 2022 replay window lost bits across word boundaries";
 
+}
+
+TEST(ShadowsocksUdpDatagram, ReplayCacheRetentionAndMovePreserveCommittedPackets) {
     ss::Ss2022UdpReplayCache cache;
     const std::array<uint8_t, 8> session_id{1, 2, 3, 4, 5, 6, 7, 8};
     const auto started = std::chrono::steady_clock::time_point{};
     ss::KeyBytes owner;
     const std::array<uint8_t, 16> owner_bytes{1};
-    Check(owner.assign(owner_bytes), "failed to prepare replay test credential");
-    Check(cache.Accept(owner.span(), session_id, 7, started) &&
+    EXPECT_TRUE((owner.assign(owner_bytes))) << "failed to prepare replay test credential";
+    EXPECT_TRUE((cache.Accept(owner.span(), session_id, 7, started) &&
           !cache.Accept(owner.span(), session_id, 7, started + std::chrono::seconds(64)) &&
-          cache.Accept(owner.span(), session_id, 7, started + std::chrono::seconds(66)),
-          "Shadowsocks 2022 replay cache retention is incorrect");
+          cache.Accept(owner.span(), session_id, 7, started + std::chrono::seconds(66)))) << "Shadowsocks 2022 replay cache retention is incorrect";
 
     ss::Ss2022UdpReplayCache previous_cache;
-    Check(previous_cache.Accept(owner.span(), session_id, 9, started),
-          "failed to seed Shadowsocks 2022 replay cache");
+    EXPECT_TRUE((previous_cache.Accept(owner.span(), session_id, 9, started))) << "failed to seed Shadowsocks 2022 replay cache";
     ss::Ss2022UdpReplayCache adopted_cache = std::move(previous_cache);
-    Check(!adopted_cache.Accept(
-              owner.span(), session_id, 9, started + std::chrono::seconds(1)),
-          "Shadowsocks 2022 replay cache lost state during handler adoption");
+    EXPECT_FALSE((adopted_cache.Accept(
+              owner.span(), session_id, 9, started + std::chrono::seconds(1)))) << "Shadowsocks 2022 replay cache lost state during handler adoption";
 }
 
 enum class WriteFault { None, PartialIo, PartialCancel, Allocation, ClosedBeforeStart };
@@ -523,7 +462,7 @@ public:
             net::post(executor, [this] { signal->emit(net::cancellation_type::terminal); });
             IoErrorCode error;
             co_await wait.async_wait(net::redirect_error(net::use_awaitable, error));
-            Check(error == io_error::operation_aborted, "write cancellation did not interrupt a wait");
+            EXPECT_EQ((error), (io_error::operation_aborted)) << "write cancellation did not interrupt a wait";
             throw IoSystemError(error);
         }
     }
@@ -549,7 +488,7 @@ net::awaitable<void> WriteTcpPayload(transport::MultiBufferWriter& writer, bool 
         co_await writer.WriteBuffers(buffers);
     } else {
         buf::MultiBuffer mb;
-        Check(buf::AppendSpanToMultiBuffer(payload, mb), "TCP write fixture allocation failed");
+        EXPECT_TRUE((buf::AppendSpanToMultiBuffer(payload, mb))) << "TCP write fixture allocation failed";
         co_await writer.WriteMultiBuffer(std::move(mb));
     }
 }
@@ -560,16 +499,18 @@ net::awaitable<std::unique_ptr<transport::MultiBufferWriter>> CreateTcpWriter(
     FailingWriteStream& stream) {
     if (response) {
         proxyman::inbound::UserStore::ShadowsocksCredential user;
-        Check(user.derived_key.assign(key.span()), "TCP response credential fixture failed");
+        EXPECT_TRUE((user.derived_key.assign(key.span()))) << "TCP response credential fixture failed";
         ss::KeyBytes request_salt;
-        Check(request_salt.assign(key.span()), "TCP request salt fixture failed");
+        EXPECT_TRUE((request_salt.assign(key.span()))) << "TCP request salt fixture failed";
         auto result = ss::WriteTCPResponse(user, cipher, request_salt, stream);
-        Check(bool(result), "public TCP response writer creation failed");
+        EXPECT_TRUE((bool(result))) << "public TCP response writer creation failed";
+        if (!result) throw std::runtime_error("TCP response writer creation failed");
         co_return std::make_unique<ss::SsStreamWriter>(std::move(*result));
     }
     auto result = co_await ss::WriteTCPRequest(
         TargetAddress("1.1.1.1", 443), cipher, key, {}, stream);
-    Check(bool(result), "public TCP request writer creation failed");
+    EXPECT_TRUE((bool(result))) << "public TCP request writer creation failed";
+    if (!result) throw std::runtime_error("TCP request writer creation failed");
     co_return std::make_unique<ss::SsStreamWriter>(std::move(result->request_writer));
 }
 
@@ -581,8 +522,7 @@ void CheckTcpWriterFailure(const ss::SsCipherInfo& cipher, bool response, bool s
     stream.signal = &signal;
     ss::KeyBytes key;
     std::array<uint8_t, 32> key_bytes{0x17, 0x29, 0x41};
-    Check(key.assign(std::span<const uint8_t>(key_bytes).first(cipher.key_size)),
-          "TCP writer key fixture failed");
+    EXPECT_TRUE((key.assign(std::span<const uint8_t>(key_bytes).first(cipher.key_size)))) << "TCP writer key fixture failed";
     const auto exercise = [&]() -> net::awaitable<void> {
         auto writer = co_await CreateTcpWriter(cipher, key, response, stream);
         if (initialized) co_await WriteTcpPayload(*writer, scatter);
@@ -598,7 +538,7 @@ void CheckTcpWriterFailure(const ss::SsCipherInfo& cipher, bool response, bool s
             failed = error.code() == (fault == WriteFault::PartialCancel
                 ? io_error::operation_aborted : io_error::connection_reset);
         }
-        Check(failed, "TCP frame write did not preserve its original failure");
+        EXPECT_TRUE((failed)) << "TCP frame write did not preserve its original failure";
         co_await net::this_coro::reset_cancellation_state();
         EXPECT_FALSE(stream.IsOpen()) << "failed encrypted write left its transport reusable";
         const auto wire = stream.wire;
@@ -640,27 +580,24 @@ void CheckTcpCancellationBeforeEncryption(const ss::SsCipherInfo& cipher, bool r
             }
             co_await net::this_coro::reset_cancellation_state();
             co_await net::this_coro::throw_if_cancelled(true);
-            Check(cancelled && stream.IsOpen() && stream.wire == wire,
-                  "cancelled-before-start write progressed or retired a healthy stream");
+            EXPECT_TRUE((cancelled && stream.IsOpen() && stream.wire == wire)) << "cancelled-before-start write progressed or retired a healthy stream";
         }
         co_await WriteTcpPayload(*writer, true);
         std::array<uint8_t, 32> subkey{};
         const auto derive = ss::Is2022Cipher(cipher.type) ? ss::Derive2022Subkey : ss::DeriveSubkey;
-        Check(derive(key.data(), key.size, stream.wire.data(), cipher.salt_size, subkey.data()),
-              "retry decryption subkey derivation failed");
+        EXPECT_TRUE((derive(key.data(), key.size, stream.wire.data(), cipher.salt_size, subkey.data()))) << "retry decryption subkey derivation failed";
         ss::SsAeadCipher decryptor(cipher.type, subkey.data(), cipher.key_size);
         std::array<uint8_t, 12> nonce{};
         nonce[0] = response ? 2 : 4;
-        Check(stream.wire.size() - wire.size() == 37, "retry did not publish one complete encrypted frame");
+        EXPECT_EQ((stream.wire.size() - wire.size()), (37)) << "retry did not publish one complete encrypted frame";
         std::array<uint8_t, 2> length{};
         const auto* retry = stream.wire.data() + wire.size();
-        Check(decryptor.Decrypt(nonce.data(), retry, 18, length.data()) &&
-              length == std::array<uint8_t, 2>{0, 3}, "rejected write advanced the next record nonce");
+        EXPECT_TRUE((decryptor.Decrypt(nonce.data(), retry, 18, length.data()) &&
+              length == std::array<uint8_t, 2>{0, 3})) << "rejected write advanced the next record nonce";
         ++nonce[0];
         std::array<uint8_t, 3> payload{};
-        Check(decryptor.Decrypt(nonce.data(), retry + 18, 19, payload.data()) &&
-              payload == std::array<uint8_t, 3>{0x31, 0x52, 0x73},
-              "retry after pre-encryption cancellation changed plaintext");
+        EXPECT_TRUE((decryptor.Decrypt(nonce.data(), retry + 18, 19, payload.data()) &&
+              payload == std::array<uint8_t, 3>{0x31, 0x52, 0x73})) << "retry after pre-encryption cancellation changed plaintext";
     };
     auto done = net::co_spawn(io, exercise(),
         net::bind_cancellation_slot(signal.slot(), net::use_future));
@@ -682,8 +619,7 @@ void CheckTcpFinishedWriter(const ss::SsCipherInfo& cipher, bool response, bool 
             bool closed = false;
             try { co_await WriteTcpPayload(*writer, scatter); }
             catch (const transport::WriteClosed&) { closed = true; }
-            Check(closed && stream.IsOpen() && stream.wire == wire,
-                  "definite write-side closure aborted the reverse direction or emitted data");
+            EXPECT_TRUE((closed && stream.IsOpen() && stream.wire == wire)) << "definite write-side closure aborted the reverse direction or emitted data";
             stream.fault = WriteFault::None;
         } else {
             co_await writer->AsyncShutdownWrite();
@@ -693,13 +629,12 @@ void CheckTcpFinishedWriter(const ss::SsCipherInfo& cipher, bool response, bool 
             bool closed = false;
             try { co_await WriteTcpPayload(*writer, retry_scatter); }
             catch (const transport::WriteClosed&) { closed = true; }
-            Check(closed, "finished writer did not reject before encryption with WriteClosed");
+            EXPECT_TRUE((closed)) << "finished writer did not reject before encryption with WriteClosed";
         }
         co_await writer->AsyncShutdownWrite();
-        Check(stream.IsOpen() && stream.wire == wire, "finished writer altered its transport on reuse");
+        EXPECT_TRUE((stream.IsOpen() && stream.wire == wire)) << "finished writer altered its transport on reuse";
         std::array<uint8_t, 3> reply{};
-        Check(co_await stream.AsyncRead(net::buffer(reply)) == reply.size() && reply == stream.reverse,
-              "write-side completion discarded reverse-direction data");
+        EXPECT_TRUE((co_await stream.AsyncRead(net::buffer(reply)) == reply.size() && reply == stream.reverse)) << "write-side completion discarded reverse-direction data";
     };
     auto done = net::co_spawn(io, exercise(), net::use_future);
     io.run();
@@ -708,47 +643,37 @@ void CheckTcpFinishedWriter(const ss::SsCipherInfo& cipher, bool response, bool 
 
 }  // namespace
 
-TEST(ShadowsocksUdpDatagram, Contract) {
+class ShadowsocksUdpWire : public testing::TestWithParam<const char*> {};
+
+TEST_P(ShadowsocksUdpWire, LargeDatagramPreservesAuthenticationAndReplayBoundaries) {
     const TargetAddress target("1.1.1.1", 53);
     const std::vector<uint8_t> source(buf::Buffer::kSize + 257, 0x6d);
-    const buf::MultiBuffer fragmented = MakePayload(source, target);
-    const buf::ContiguousBufferView payload(fragmented);
-    Check(payload.Bytes().size() == source.size() &&
-          std::equal(payload.Bytes().begin(), payload.Bytes().end(), source.begin()),
-          "Shadowsocks UDP payload coalescing mismatch");
-
-    for (std::string_view method : {"aes-128-gcm", "aes-256-gcm", "chacha20-poly1305"}) {
-        const auto cipher = ss::ParseCipherMethod(method);
-        Check(cipher.has_value(), "test cipher unavailable");
+    const auto packet = MakePayload(source, target);
+    const buf::ContiguousBufferView payload(packet);
+    const auto cipher = ss::ParseCipherMethod(GetParam());
+    ASSERT_TRUE(cipher);
+    if (ss::Is2022Cipher(cipher->type))
+        Check2022(target, source, payload.Bytes(), cipher->type, cipher->key_size, false);
+    else
         CheckClassic(target, source, payload.Bytes(), *cipher);
-    }
-    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32, false);
-    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16, false);
-    Check2022(target, source, payload.Bytes(), ss::SsCipherType::CHACHA20_POLY1305_2022, 32, false);
-    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16, true);
-    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32, true);
-    Check2022ReplayWindow();
-    Check2022AssociationPaths();
 }
 
-TEST(ShadowsocksUdpDatagram, AuthenticatedEmptyDatagrams) {
+TEST_P(ShadowsocksUdpWire, AuthenticatedEmptyDatagramIsNotRawEmptyWire) {
     const TargetAddress target("1.1.1.1", 53);
     const std::vector<uint8_t> source;
     const auto packet = MakePayload(source, target);
     const buf::ContiguousBufferView payload(packet);
-    for (std::string_view method : {"aes-128-gcm", "aes-256-gcm", "chacha20-poly1305"}) {
-        const auto cipher = ss::ParseCipherMethod(method);
-        Check(cipher.has_value(), "test cipher unavailable");
+    const auto cipher = ss::ParseCipherMethod(GetParam());
+    ASSERT_TRUE(cipher);
+    if (ss::Is2022Cipher(cipher->type))
+        Check2022(target, source, payload.Bytes(), cipher->type, cipher->key_size, false);
+    else
         CheckClassic(target, source, payload.Bytes(), *cipher);
-    }
-    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16, false);
-    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32, false);
-    Check2022(target, source, payload.Bytes(), ss::SsCipherType::CHACHA20_POLY1305_2022, 32, false);
-    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16, true);
-    Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32, true);
 }
 
-TEST(ShadowsocksUdpDatagram, AuthenticatedShortDomainDatagrams) {
+TEST_P(ShadowsocksUdpWire, ShortDomainsPreserveEmptyAndSingleByteDatagrams) {
+    const auto cipher = ss::ParseCipherMethod(GetParam());
+    ASSERT_TRUE(cipher);
     for (std::string_view host : {"a", "ab"}) {
         SCOPED_TRACE(host);
         const TargetAddress target(host, 54321);
@@ -757,64 +682,98 @@ TEST(ShadowsocksUdpDatagram, AuthenticatedShortDomainDatagrams) {
             const std::vector<uint8_t> source(length, 0x7b);
             const auto packet = MakePayload(source, target);
             const buf::ContiguousBufferView payload(packet);
-            for (std::string_view method : {"aes-128-gcm", "aes-256-gcm", "chacha20-poly1305"}) {
-                const auto cipher = ss::ParseCipherMethod(method);
-                Check(cipher.has_value(), "test cipher unavailable");
+            if (ss::Is2022Cipher(cipher->type))
+                Check2022(target, source, payload.Bytes(), cipher->type, cipher->key_size, false);
+            else
                 CheckClassic(target, source, payload.Bytes(), *cipher);
-            }
-            Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16, false);
-            Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32, false);
-            Check2022(target, source, payload.Bytes(), ss::SsCipherType::CHACHA20_POLY1305_2022, 32, false);
-            Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_128_GCM_2022, 16, true);
-            Check2022(target, source, payload.Bytes(), ss::SsCipherType::AES_256_GCM_2022, 32, true);
         }
     }
 }
 
-TEST(ShadowsocksTcpWriter, FailedFrameRetiresWriterAndTransport) {
-    for (std::string_view method : {"aes-128-gcm", "aes-256-gcm", "chacha20-poly1305",
-                                    "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
-                                    "2022-blake3-chacha20-poly1305"}) {
-        SCOPED_TRACE(method);
-        const auto cipher = ss::ParseCipherMethod(method);
-        ASSERT_TRUE(cipher);
-        for (const bool response : {false, true}) {
-            SCOPED_TRACE(response);
-            CheckTcpCancellationBeforeEncryption(*cipher, response);
-            for (const bool scatter : {false, true}) {
-                SCOPED_TRACE(scatter);
-                for (const bool initialized : {false, true}) {
-                    SCOPED_TRACE(initialized);
-                    for (const auto fault : {WriteFault::PartialIo, WriteFault::PartialCancel,
-                                             WriteFault::Allocation}) {
-                        SCOPED_TRACE(static_cast<int>(fault));
-                        CheckTcpWriterFailure(*cipher, response, scatter, initialized, fault);
-                    }
-                }
-            }
+INSTANTIATE_TEST_SUITE_P(CipherMethods, ShadowsocksUdpWire, testing::Values(
+    "aes-128-gcm", "aes-256-gcm", "chacha20-poly1305", "2022-blake3-aes-128-gcm",
+    "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305"));
+
+class Shadowsocks2022UdpWire : public testing::TestWithParam<const char*> {};
+
+TEST_P(Shadowsocks2022UdpWire, IdentityAuthenticationScopesReplayToFullUserCredential) {
+    const auto cipher = ss::ParseCipherMethod(GetParam());
+    ASSERT_TRUE(cipher);
+    for (const size_t size : {size_t{0}, size_t{1}, buf::Buffer::kSize + size_t{257}}) {
+        SCOPED_TRACE(size);
+        for (std::string_view host : {"1.1.1.1", "a", "ab"}) {
+            SCOPED_TRACE(host);
+            const TargetAddress target(host, 54321);
+            const std::vector<uint8_t> source(size, 0x7b);
+            const auto packet = MakePayload(source, target);
+            const buf::ContiguousBufferView payload(packet);
+            Check2022(target, source, payload.Bytes(), cipher->type, cipher->key_size, true);
         }
     }
 }
 
-TEST(ShadowsocksTcpWriter, FinishedWriterPreservesReverseRead) {
-    for (std::string_view method : {"aes-128-gcm", "aes-256-gcm", "chacha20-poly1305",
-                                    "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
-                                    "2022-blake3-chacha20-poly1305"}) {
-        SCOPED_TRACE(method);
-        const auto cipher = ss::ParseCipherMethod(method);
-        ASSERT_TRUE(cipher);
-        for (const bool response : {false, true}) {
-            SCOPED_TRACE(response);
-            for (const bool initialized : {false, true}) {
-                SCOPED_TRACE(initialized);
-                for (const bool closed_before_start : {false, true}) {
-                    SCOPED_TRACE(closed_before_start);
-                    for (const bool scatter : {false, true}) {
-                        SCOPED_TRACE(scatter);
-                        CheckTcpFinishedWriter(*cipher, response, initialized, closed_before_start, scatter);
-                    }
-                }
-            }
+INSTANTIATE_TEST_SUITE_P(IdentityMethods, Shadowsocks2022UdpWire,
+    testing::Values("2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"));
+
+class Shadowsocks2022UdpReply : public testing::TestWithParam<const char*> {};
+
+TEST_P(Shadowsocks2022UdpReply, ResponsePreservesPayloadBoundaryAndRejectsReplay) {
+    const auto cipher = ss::ParseCipherMethod(GetParam());
+    ASSERT_TRUE(cipher);
+    for (const size_t size : {size_t{0}, size_t{1}, buf::Buffer::kSize + size_t{257}}) {
+        SCOPED_TRACE(size);
+        for (std::string_view host : {"1.1.1.1", "a", "ab"}) {
+            SCOPED_TRACE(host);
+            Expect2022Response(TargetAddress(host, 54321),
+                std::vector<uint8_t>(size, 0x7b), cipher->type, cipher->key_size);
         }
     }
 }
+
+INSTANTIATE_TEST_SUITE_P(ResponseMethods, Shadowsocks2022UdpReply,
+    testing::Values("2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
+                    "2022-blake3-chacha20-poly1305"));
+
+constexpr std::array writer_methods{
+    "aes-128-gcm", "aes-256-gcm", "chacha20-poly1305",
+    "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
+    "2022-blake3-chacha20-poly1305"};
+
+class ShadowsocksTcpWriteFailure : public testing::TestWithParam<
+    std::tuple<const char*, bool, bool, bool, WriteFault>> {};
+
+TEST_P(ShadowsocksTcpWriteFailure, FailedFrameRetiresWriterAndTransport) {
+    const auto [method, response, scatter, initialized, fault] = GetParam();
+    const auto cipher = ss::ParseCipherMethod(method);
+    ASSERT_TRUE(cipher);
+    CheckTcpWriterFailure(*cipher, response, scatter, initialized, fault);
+}
+
+INSTANTIATE_TEST_SUITE_P(WritePaths, ShadowsocksTcpWriteFailure, testing::Combine(
+    testing::ValuesIn(writer_methods), testing::Bool(), testing::Bool(), testing::Bool(),
+    testing::Values(WriteFault::PartialIo, WriteFault::PartialCancel, WriteFault::Allocation)));
+
+class ShadowsocksTcpAdmission : public testing::TestWithParam<std::tuple<const char*, bool>> {};
+
+TEST_P(ShadowsocksTcpAdmission, PreEncryptionCancellationPreservesNextRecordNonce) {
+    const auto [method, response] = GetParam();
+    const auto cipher = ss::ParseCipherMethod(method);
+    ASSERT_TRUE(cipher);
+    CheckTcpCancellationBeforeEncryption(*cipher, response);
+}
+
+INSTANTIATE_TEST_SUITE_P(Directions, ShadowsocksTcpAdmission, testing::Combine(
+    testing::ValuesIn(writer_methods), testing::Bool()));
+
+class ShadowsocksTcpWriteEnd : public testing::TestWithParam<
+    std::tuple<const char*, bool, bool, bool, bool>> {};
+
+TEST_P(ShadowsocksTcpWriteEnd, FinishedWriterPreservesReverseRead) {
+    const auto [method, response, initialized, closed_before_start, scatter] = GetParam();
+    const auto cipher = ss::ParseCipherMethod(method);
+    ASSERT_TRUE(cipher);
+    CheckTcpFinishedWriter(*cipher, response, initialized, closed_before_start, scatter);
+}
+
+INSTANTIATE_TEST_SUITE_P(WritePaths, ShadowsocksTcpWriteEnd, testing::Combine(
+    testing::ValuesIn(writer_methods), testing::Bool(), testing::Bool(), testing::Bool(), testing::Bool()));

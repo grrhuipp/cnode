@@ -12,9 +12,11 @@
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/internet/proxy_protocol.hpp"
+#include "transport/internet/quic_listener.hpp"
 #include "transport/internet/stream_settings.hpp"
 #include "transport/internet/transport_security.hpp"
 
+#include "app/datagram_session_environment.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <memory>
@@ -101,17 +103,19 @@ struct DatagramHandlerBuildResult {
     std::unique_ptr<::Inbound> handler;
 };
 
-// ============================================================================
-// ProtocolRuntime - 每个 Worker 的协议私有可变状态
-// ============================================================================
-class ProtocolRuntime {
-public:
-    virtual ~ProtocolRuntime() noexcept = default;
-
-    [[nodiscard]] virtual ::UserOnlineTracker* OnlineTracker() noexcept {
-        return nullptr;
-    }
+// Worker-owned capabilities, borrowed by every inbound entry point.
+struct AdmissionEnvironment final {
+    GroupCoordinator& coordinator;
+    ConnectionLimiter& limiter;
+    UserOnlineTracker& online_users;
+    StatsShard& stats;
 };
+
+struct InboundProtocolTraits final {
+    bool mailbox_email_defaults_to_tag = false;
+    bool requires_tls = false;
+};
+
 
 // ============================================================================
 // ProxyRegistration - 入站协议注册项
@@ -122,22 +126,20 @@ struct ProxyRegistration {
     std::optional<UserProtocol> user_protocol;
     DatagramTransport datagram_transport = DatagramTransport::None;
 
-    // 创建当前 Worker 独占的协议运行态（必须）。
-    std::unique_ptr<ProtocolRuntime> (*create_runtime)() = nullptr;
+    InboundProtocolTraits traits{};
 
     // 创建 TCP 入站处理器（必须）
     std::unique_ptr<::Inbound> (*create_tcp_handler)(
-        ProtocolRuntime& runtime,
-        ::StatsShard& stats,
-        ::ConnectionLimiter* limiter,
+        const AdmissionEnvironment& environment,
         const BuildRequest& req) = nullptr;
 
     // 创建 UDP 入站处理器（可选）
     std::unique_ptr<::Inbound> (*create_datagram_handler)(
-        ProtocolRuntime& runtime,
-        ::StatsShard& stats,
-        ::ConnectionLimiter* limiter,
+        const AdmissionEnvironment& environment,
         const BuildRequest& req) = nullptr;
+    std::unique_ptr<transport::internet::QuicListener> (*create_quic_listener)(
+        uint32_t worker_id, uint32_t worker_count, net::io_context& io,
+        app::DatagramSessionEnvironment environment) = nullptr;
 
     // Parse protocol-specific source fields on the cold path. The returned
     // immutable type remains private to the protocol implementation.
@@ -165,6 +167,11 @@ void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
 [[nodiscard]] DatagramTransport RegisteredDatagramTransport(
     std::string_view protocol);
 
+[[nodiscard]] InboundProtocolTraits RegisteredProtocolTraits(std::string_view protocol);
+[[nodiscard]] std::unique_ptr<transport::internet::QuicListener> NewQuicListener(
+    std::string_view protocol, uint32_t worker_id, uint32_t worker_count,
+    net::io_context& io, app::DatagramSessionEnvironment environment);
+
 [[nodiscard]] std::optional<BuildRequest> PrepareBuildRequest(
     std::string_view protocol,
     std::string_view tag,
@@ -185,7 +192,7 @@ public:
     // Prepared TransportSecurity is shared; SSL contexts are never rebuilt for
     // each short HTTP packet upload.
     Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy,
-            ConnectionLimiter& limiter);
+            const AdmissionEnvironment& environment);
 
     Handler(const Handler&) = delete;
     Handler& operator=(const Handler&) = delete;
@@ -233,7 +240,7 @@ private:
     const inbound::ReceiverSettings receiver_;
     TransportSecurity security_;
     std::unique_ptr<Inbound> proxy_;
-    ConnectionLimiter& limiter_;
+    const AdmissionEnvironment& environment_;
 };
 
 // ============================================================================
@@ -244,7 +251,7 @@ private:
 // ============================================================================
 class HandlerRegistry final {
 public:
-    explicit HandlerRegistry(StatsShard& stats);
+    explicit HandlerRegistry(const AdmissionEnvironment& environment);
     ~HandlerRegistry() noexcept;
 
     HandlerRegistry(const HandlerRegistry&) = delete;
@@ -255,14 +262,10 @@ public:
     [[nodiscard]] HandlerPtr GetHandler(std::string_view tag) noexcept;
 
     [[nodiscard]] std::unique_ptr<::Inbound> NewHandler(
-        ::ConnectionLimiter* limiter,
         const BuildRequest& req);
 
     [[nodiscard]] DatagramHandlerBuildResult NewDatagramHandler(
-        ::ConnectionLimiter* limiter,
         const BuildRequest& req);
-    [[nodiscard]] ProtocolRuntime* GetOrCreateRuntime(
-        std::string_view protocol);
 
     // ReplaceHandler 在所属 Worker 上替换同 tag handler。调用方持有的
     // shared_ptr 让在途物理连接及其任务组持有的逻辑子任务继续使用原 handler。
@@ -272,7 +275,7 @@ public:
     void RemoveHandler(std::string_view tag);
 
     [[nodiscard]] std::vector<::OnlineDevice>
-    GetOnlineDevices(std::string_view protocol, std::string_view tag) const;
+    GetOnlineDevices(std::string_view tag) const;
 
 private:
     using HandlerMap = memory::UnorderedMap<
@@ -280,14 +283,8 @@ private:
         std::shared_ptr<Handler>,
         TransparentStringHash,
         TransparentStringEq>;
-    using RuntimeMap = memory::UnorderedMap<
-        memory::String,
-        std::unique_ptr<ProtocolRuntime>,
-        TransparentStringHash,
-        TransparentStringEq>;
 
-    StatsShard& stats_;
-    RuntimeMap runtimes_;
+    const AdmissionEnvironment& environment_;
     HandlerMap handlers_;
 };
 

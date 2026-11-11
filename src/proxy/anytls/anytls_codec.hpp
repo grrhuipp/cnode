@@ -10,7 +10,7 @@
 #include "common/sharded_user_stats.hpp"
 #include "common/target_address.hpp"
 #include <openssl/mem.h>
-#include "infra/json.hpp"
+#include "infra/outbound_types.hpp"
 #include "proxy/anytls_padding.hpp"
 #include "proxy/inbound.hpp"
 #include "proxy/outbound.hpp"
@@ -27,6 +27,7 @@
 class AsyncStream;
 class AwaitableTaskGroup;
 struct StatsShard;
+namespace proxyman::inbound { struct AdmissionEnvironment; }
 namespace anytls {
 
 [[nodiscard]] inline std::array<uint8_t, 32> PasswordHash(std::string_view password) noexcept {
@@ -176,9 +177,7 @@ namespace proxy::anytls::inbound {
 // ============================================================================
 class Handler final : public Inbound {
 public:
-    Handler(UserOnlineTracker& tracker,
-            StatsShard& stats,
-            ConnectionLimiter* limiter,
+    Handler(const proxyman::inbound::AdmissionEnvironment& environment,
             std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme = {});
 
     net::awaitable<RelayResult> Process(
@@ -191,9 +190,7 @@ public:
         uint32_t pressure_idle_timeout) override;
 
 private:
-    UserOnlineTracker& tracker_;
-    StatsShard& stats_;
-    ConnectionLimiter* limiter_;
+    const proxyman::inbound::AdmissionEnvironment& environment_;
     std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme_;
 };
 
@@ -203,26 +200,6 @@ private:
 // proxy::<name>::outbound（对应 vmess core=vmess, handler=proxy::vmess::*）。
 namespace proxy::anytls::outbound {
 
-// 传输层与 sendThrough 属于 Handler 的 sender settings。
-struct Settings {
-    OutboundServer server;
-    std::array<uint8_t, 32> password_hash{};
-    std::chrono::seconds idle_session_check_interval{30};
-    std::chrono::seconds idle_session_timeout{60};
-    size_t min_idle_sessions = 0;
-
-    Settings() = default;
-    Settings(const Settings&) = default;
-    Settings& operator=(const Settings&) = default;
-    Settings(Settings&&) noexcept = default;
-    Settings& operator=(Settings&&) noexcept = default;
-    ~Settings() noexcept {
-        OPENSSL_cleanse(password_hash.data(), password_hash.size());
-    }
-};
-
-[[nodiscard]] tl::expected<Settings, std::string> ParseSettings(
-    const json::object& source);
 
 // ============================================================================
 // Handler - AnyTLS outbound proxy
@@ -239,7 +216,7 @@ public:
     // PaddingState and captured for each new handshake.
     Handler(std::string_view tag,
             net::io_context& io_context,
-            std::shared_ptr<const Settings> settings,
+            std::shared_ptr<const infra::AnyTlsSettings> settings,
             AwaitableTaskGroup& tasks);
     ~Handler() noexcept override;
 
@@ -250,9 +227,7 @@ public:
         const TimeoutsConfig& timeouts,
         StatsShard& stats,
         const RelayConfig& relay_config,
-        buf::MultiBufferBatch first_payload,
-        std::chrono::seconds relay_idle_timeout,
-        std::chrono::seconds relay_write_timeout) override;
+        buf::MultiBufferBatch first_payload) override;
 
 private:
     struct PaddingState;
@@ -263,11 +238,10 @@ private:
     net::awaitable<OutboundProcessResult> ProcessSession(
         session::Context& ctx, transport::Link inbound, OutboundDialer& dialer,
         const TimeoutsConfig& timeouts, StatsShard& stats, const RelayConfig& relay_config,
-        buf::MultiBufferBatch first_payload, std::chrono::seconds relay_idle_timeout,
-        std::chrono::seconds relay_write_timeout,
+        buf::MultiBufferBatch first_payload,
         std::shared_ptr<ClientSession> session, bool& reusable);
     memory::String tag_;
-    std::shared_ptr<const Settings> settings_;
+    std::shared_ptr<const infra::AnyTlsSettings> settings_;
     std::shared_ptr<PaddingState> padding_;
     std::shared_ptr<SessionPool> pool_;
 };

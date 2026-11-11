@@ -65,6 +65,12 @@ struct OutboundSelection {
     return OutboundSelection{routed->outbound_tag, SelectionSource::Fallback};
 }
 
+// The result borrows an owning policy tag; reject temporaries and implicit
+// ForceOutbound/RouteWithFallback-to-variant conversions at the call boundary.
+OutboundSelection SelectOutbound(
+    const routing::OutboundSelectionPolicy&&,
+    const routing::RouteDecision& = {}) noexcept = delete;
+
 }  // namespace detail
 
 // ============================================================================

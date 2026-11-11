@@ -12,6 +12,7 @@ namespace routing { class Dispatcher; }
 namespace proxyman::inbound {
 class Handler;
 struct BuildRequest;
+struct AdmissionEnvironment;
 }
 
 namespace app {
@@ -21,11 +22,8 @@ class RequestLoadState;
 struct DatagramSessionEnvironment final {
     TimeoutsConfig timeouts;
     routing::Dispatcher* dispatcher = nullptr;
-    StatsShard* stats = nullptr;
-    ConnectionLimiter* limiter = nullptr;
+    const proxyman::inbound::AdmissionEnvironment* admission = nullptr;
     RequestLoadState* request_load = nullptr;
-    UserOnlineTracker* tracker = nullptr;
-    uint32_t* active_sessions = nullptr;
     std::shared_ptr<proxyman::inbound::Handler> handler{};
     std::shared_ptr<const proxyman::inbound::BuildRequest> prepared{};
 };

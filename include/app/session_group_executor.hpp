@@ -21,7 +21,6 @@ public:
     // Register fixed Worker routes before their request admission starts.
     void RegisterWorker(net::io_context& reactor);
     [[nodiscard]] uint32_t WorkerCount() const noexcept;
-    [[nodiscard]] static GroupCoordinator* ForContext(net::execution_context& context) noexcept;
 
     struct ReservedOperation {
         ReservedOperation* next = nullptr;

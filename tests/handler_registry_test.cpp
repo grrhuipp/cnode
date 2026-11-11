@@ -11,7 +11,6 @@
 #include "common/awaitable_task_group.hpp"
 
 #include <asio/co_spawn.hpp>
-#include <cstdio>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -38,7 +37,7 @@ public:
     ::net::awaitable<::OutboundProcessResult> Process(
         ::session::Context&, ::transport::Link, ::OutboundDialer& dialer,
         const ::TimeoutsConfig&, ::StatsShard&, const ::RelayConfig&,
-        ::buf::MultiBufferBatch, std::chrono::seconds, std::chrono::seconds) override {
+        ::buf::MultiBufferBatch) override {
         ++probe_.processed;
         probe_.last_dialer = &dialer;
         co_return ::RelayResult{};
@@ -63,97 +62,101 @@ PreparedOutboundConfig MakeConfig(std::string tag, Probe& probe) {
     };
 }
 
-int Run() {
+class HandlerRegistryTest : public ::testing::Test {
+protected:
     ::net::io_context io;
-    // Lookup tests never resolve names; one inert endpoint satisfies DNSWorker.
-    ::app::dns::Config dns_config{
-        .servers = {{::net::ip::address_v4::loopback(), 9}}};
-    ::app::dns::DNSWorker dns_worker(io, dns_config, 8);
-    ::app::dns::DNS dns(dns_worker);
-    ::ResidentTaskGroup tasks(io.get_executor());
+    ::app::dns::DNSWorker dns_worker{
+        io, ::app::dns::Config{
+            .servers = {{::net::ip::address_v4::loopback(), 9}}}, 8};
+    ::app::dns::DNS dns{dns_worker};
+    ::ResidentTaskGroup tasks{io.get_executor()};
     Probe first_probe;
     Probe second_probe;
-    HandlerRegistry registry({MakeConfig("direct", first_probe)}, io, dns,
-                             std::chrono::seconds(1), tasks.Tasks());
+    HandlerRegistry registry{{MakeConfig("direct", first_probe)}, io, dns,
+                             std::chrono::seconds(1), tasks.Tasks()};
 
-    // Publication instantiates on the owning Worker; lookups never construct.
-    if (first_probe.created != 1) return 1;
+    void TearDown() override {
+        bool joined = false;
+        auto cleanup = [&]() -> ::net::awaitable<void> {
+            co_await tasks.AsyncJoin();
+            co_await dns_worker.AsyncJoin();
+        };
+        ::net::co_spawn(io, cleanup(), [&](std::exception_ptr error) {
+            EXPECT_FALSE(error);
+            joined = true;
+        });
+        io.restart();
+        io.run();
+        EXPECT_TRUE(joined);
+    }
+};
+
+TEST_F(HandlerRegistryTest, LookupReturnsPublishedHandlerAndRejectsUnknownTags) {
     auto first = registry.GetHandler("direct");
-    if (!first || first->Tag() != "direct") return 2;
-    if (registry.GetHandler("direct") != first || first_probe.created != 1) return 3;
-    if (registry.GetHandler("") || registry.GetHandler("missing")) return 4;
+    ASSERT_TRUE(first);
+    EXPECT_EQ(registry.GetHandler("direct"), first);
+    EXPECT_FALSE(registry.GetHandler(""));
+    EXPECT_FALSE(registry.GetHandler("missing"));
+}
 
-    // Dispatch reaches the protocol exactly once, with the handler's dialer.
+TEST_F(HandlerRegistryTest, DispatchReachesPublishedProtocol) {
+    auto first = registry.GetHandler("direct");
+    ASSERT_TRUE(first);
     ::session::Context ctx;
     ::TimeoutsConfig timeouts;
     ::StatsShard stats;
     ::RelayConfig relay;
-    bool dispatched = false;
+    bool completed = false;
     ::net::co_spawn(io,
-        first->Dispatch(ctx, ::transport::Link{}, timeouts, stats, relay, {},
-                        std::chrono::seconds(1), std::chrono::seconds(1)),
+        first->Dispatch(ctx, ::transport::Link{}, timeouts, stats, relay, {}),
         [&](std::exception_ptr error, ::OutboundProcessResult result) {
-            dispatched = !error && result.has_value();
+            EXPECT_FALSE(error);
+            EXPECT_TRUE(result.has_value());
+            completed = true;
         });
-    for (int round = 0; round < 100 && !dispatched; ++round) {
-        io.run_for(std::chrono::milliseconds(10));
-        io.restart();
-    }
-    if (!dispatched || first_probe.processed != 1 || !first_probe.last_dialer) return 5;
+    io.run();
+    EXPECT_TRUE(completed);
+    EXPECT_EQ(first_probe.processed, 1);
+    EXPECT_NE(first_probe.last_dialer, nullptr);
+}
 
-    // A failed publication leaves the published handler untouched.
+TEST_F(HandlerRegistryTest, RejectedReplacementPreservesPublishedHandler) {
+    auto first = registry.GetHandler("direct");
     PreparedOutboundConfig missing_creator;
     missing_creator.tag = "direct";
-    bool rejected = false;
-    try {
-        registry.Replace(missing_creator);
-    } catch (const std::logic_error&) {
-        rejected = true;
-    }
-    if (!rejected) return 6;
-    if (registry.GetHandler("direct") != first) return 7;
+    EXPECT_THROW(registry.Replace(missing_creator), std::logic_error);
+    EXPECT_EQ(registry.GetHandler("direct"), first);
+}
 
-    // Replacement: new handler for new requests; in-flight handles survive.
+TEST_F(HandlerRegistryTest, ReplacementKeepsExistingRequestAliveUntilReleased) {
+    auto first = registry.GetHandler("direct");
+    ASSERT_TRUE(first);
     registry.Replace(MakeConfig("direct", second_probe));
     auto second = registry.GetHandler("direct");
-    if (!second || second == first || second_probe.created != 1) return 8;
-    if (first_probe.destroyed != 0) return 9;
+    ASSERT_TRUE(second);
+    EXPECT_NE(second, first);
+    EXPECT_EQ(first_probe.destroyed, 0);
     first.reset();
-    if (first_probe.destroyed != 1) return 10;
+    EXPECT_EQ(first_probe.destroyed, 1);
+}
 
-    // Removal releases the registry's handle; the request handle survives.
+TEST_F(HandlerRegistryTest, RemovalKeepsExistingRequestAliveUntilReleased) {
+    auto request = registry.GetHandler("direct");
+    ASSERT_TRUE(request);
     registry.Remove("direct");
-    if (second_probe.destroyed != 0) return 11;
-    second.reset();
-    if (second_probe.destroyed != 1) return 12;
-    if (registry.GetHandler("direct")) return 13;
+    EXPECT_FALSE(registry.GetHandler("direct"));
+    EXPECT_EQ(first_probe.destroyed, 0);
+    request.reset();
+    EXPECT_EQ(first_probe.destroyed, 1);
+}
 
-    // Duplicate tags never publish a partial registry.
-    Probe duplicate_probe;
-    bool duplicate_rejected = false;
-    try {
-        HandlerRegistry duplicate({MakeConfig("same", duplicate_probe),
-                                   MakeConfig("same", duplicate_probe)},
-                                  io, dns, std::chrono::seconds(1), tasks.Tasks());
-    } catch (const std::logic_error&) {
-        duplicate_rejected = true;
-    }
-    if (!duplicate_rejected || duplicate_probe.created != 2 ||
-        duplicate_probe.destroyed != 2) {
-        return 14;
-    }
-    return 0;
+TEST_F(HandlerRegistryTest, DuplicateTagsReleaseAllUnpublishedHandlers) {
+    Probe probe;
+    EXPECT_THROW(
+        (HandlerRegistry({MakeConfig("same", probe), MakeConfig("same", probe)},
+                         io, dns, std::chrono::seconds(1), tasks.Tasks())),
+        std::logic_error);
+    EXPECT_EQ(probe.destroyed, probe.created);
 }
 
 }  // namespace
-
-TEST(HandlerRegistry, Contract) {
-    try {
-        const int result = ::Run();
-        std::printf("outbound handler lookup: %s (%d)\n", result == 0 ? "PASS" : "FAIL", result);
-        { ASSERT_EQ((result), 0); return; }
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "fixture failure: %s\n", error.what());
-        FAIL() << error.what();
-    }
-}

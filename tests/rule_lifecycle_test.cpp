@@ -16,66 +16,64 @@ namespace {
 }
 
 }  // namespace
-TEST(RuleLifecycle, Contract) {
-    ::rule::DetectRulePolicy detect_rule_policy;
-    constexpr std::string_view tag = "panel|vmess|443";
-
-    detect_rule_policy.UpdateRule(tag, MakeRules({
-        ::rule::DetectRule{
+class RuleLifecycle : public testing::Test {
+protected:
+    void SetUp() override {
+        context.inbound.tag = tag;
+        context.inbound.user_id = 42;
+        context.inbound.user_email = "alice@example.com";
+        context.outbound.target = ::TargetAddress("blocked.example", 443);
+        policy.UpdateRule(tag, MakeRules({::rule::DetectRule{
             .Pattern = std::regex("blocked\\.example"),
-        },
-    }));
-    ::session::Context ctx;
-    ctx.inbound.tag = tag;
-    ctx.inbound.user_id = 42;
-    ctx.inbound.user_email = "alice@example.com";
-    ctx.outbound.target = ::TargetAddress("blocked.example", 443);
-    ::rule::DetectRulePolicy& policy = detect_rule_policy;
-    ASSERT_FALSE((!policy.Blocked(ctx)));
+        }}));
+    }
+    static constexpr std::string_view tag = "panel|vmess|443";
+    ::rule::DetectRulePolicy policy;
+    ::session::Context context;
+};
 
-    ASSERT_FALSE((!policy.Blocked(ctx)));
-    ctx.outbound.target = ::TargetAddress("allowed.example", 443);
-    ASSERT_FALSE((policy.Blocked(ctx)));
-    ctx.outbound.target = ::TargetAddress("blocked.example", 443);
-    ctx.inbound.user_id = 0;
-    ASSERT_FALSE((policy.Blocked(ctx)));
-    ctx.inbound.user_id = 42;
-    ctx.inbound.tag = "another-node";
-    ASSERT_FALSE((policy.Blocked(ctx)));
-    ctx.inbound.tag = tag;
+TEST_F(RuleLifecycle, MatchesTargetOnlyForAuthenticatedInboundIdentity) {
+    EXPECT_TRUE(policy.Blocked(context));
+    context.outbound.target = ::TargetAddress("allowed.example", 443);
+    EXPECT_FALSE(policy.Blocked(context));
+    context.outbound.target = ::TargetAddress("blocked.example", 443);
+    context.inbound.user_id = 0;
+    EXPECT_FALSE(policy.Blocked(context));
+    context.inbound.user_id = 42;
+    context.inbound.tag = "another-node";
+    EXPECT_FALSE(policy.Blocked(context));
+}
 
-    detect_rule_policy.UpdateRule(tag, MakeRules({
-        ::rule::DetectRule{
-            .Pattern = std::regex("replacement\\.example"),
-        },
-    }));
-    ASSERT_FALSE((policy.Blocked(ctx)));
-    ctx.outbound.target = ::TargetAddress("replacement.example", 443);
-    ASSERT_FALSE((!policy.Blocked(ctx)));
-    detect_rule_policy.UpdateRule(tag, {});
-    // Verify route_only (route_target) and original_target cannot bypass block rules.
-    detect_rule_policy.UpdateRule(tag, MakeRules({
-        ::rule::DetectRule{
-            .Pattern = std::regex("sniffed\\.blocked\\.example"),
-        },
-    }));
-    ctx.outbound.target = ::TargetAddress("1.1.1.1", 443);
-    ctx.outbound.route_target = ::TargetAddress("sniffed.blocked.example", 443);
-    ASSERT_FALSE((!policy.Blocked(ctx)));
-    ctx.outbound.route_target = ::TargetAddress("allowed.example", 443);
-    ctx.outbound.original_target = ::TargetAddress("sniffed.blocked.example", 443);
-    ASSERT_FALSE((!policy.Blocked(ctx)));
-    ctx.outbound.original_target = {};
-    // A domain target whose resolved_addr matches an IP block rule must also be blocked.
-    detect_rule_policy.UpdateRule(tag, MakeRules({
-        ::rule::DetectRule{
-            .Pattern = std::regex("192\\.0\\.2\\.99"),
-        },
-    }));
-    ctx.outbound.target = ::TargetAddress("allowed.example", 443);
-    ctx.outbound.target.resolved_addr = ::net::ip::make_address("192.0.2.99");
-    ASSERT_FALSE((!policy.Blocked(ctx)));
-    ctx.outbound.target.resolved_addr = std::nullopt;
-    detect_rule_policy.UpdateRule(tag, {});
-    ASSERT_FALSE((policy.Blocked(ctx)));
+TEST_F(RuleLifecycle, ReplacementAndRemovalTakeEffectWithoutRetainingOldRules) {
+    EXPECT_TRUE(policy.Blocked(context));
+    policy.UpdateRule(tag, MakeRules({::rule::DetectRule{
+        .Pattern = std::regex("replacement\\.example"),
+    }}));
+    EXPECT_FALSE(policy.Blocked(context));
+    context.outbound.target = ::TargetAddress("replacement.example", 443);
+    EXPECT_TRUE(policy.Blocked(context));
+    policy.UpdateRule(tag, {});
+    EXPECT_FALSE(policy.Blocked(context));
+}
+
+TEST_F(RuleLifecycle, RouteOnlyAndOriginalTargetsCannotBypassBlocking) {
+    context.outbound.target = ::TargetAddress("1.1.1.1", 443);
+    context.outbound.route_target = ::TargetAddress("blocked.example", 443);
+    EXPECT_TRUE(policy.Blocked(context));
+    context.outbound.route_target = ::TargetAddress("allowed.example", 443);
+    context.outbound.original_target = ::TargetAddress("blocked.example", 443);
+    EXPECT_TRUE(policy.Blocked(context));
+    context.outbound.original_target = {};
+    EXPECT_FALSE(policy.Blocked(context));
+}
+
+TEST_F(RuleLifecycle, ResolvedAddressCannotBypassIpBlocking) {
+    policy.UpdateRule(tag, MakeRules({::rule::DetectRule{
+        .Pattern = std::regex("192\\.0\\.2\\.99"),
+    }}));
+    context.outbound.target = ::TargetAddress("allowed.example", 443);
+    context.outbound.target.resolved_addr = ::net::ip::make_address("192.0.2.99");
+    EXPECT_TRUE(policy.Blocked(context));
+    context.outbound.target.resolved_addr = std::nullopt;
+    EXPECT_FALSE(policy.Blocked(context));
 }

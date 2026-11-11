@@ -40,8 +40,6 @@ public:
         const TimeoutsConfig& timeouts,
         StatsShard& stats,
         const RelayConfig& relay_config,
-        buf::MultiBufferBatch first_payload,
-        std::chrono::seconds relay_idle_timeout,
-        std::chrono::seconds relay_write_timeout) = 0;
+        buf::MultiBufferBatch first_payload) = 0;
 };
 

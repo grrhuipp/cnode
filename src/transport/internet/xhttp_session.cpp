@@ -1391,6 +1391,7 @@ struct XHttpSessionOwnerResolution {
 };
 
 net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
+    GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::string_view session_namespace,
     std::string_view session_id,
@@ -1407,23 +1408,15 @@ net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
             };
         }
     }
-    auto* coordinator = GroupCoordinator::ForContext(io_context);
-    if (!coordinator) {
-        co_return XHttpSessionOwnerResolution{
-            .owner = &io_context,
-            .session = table.Get(
-                io_context, session_namespace, session_id, access),
-        };
-    }
     for (;;) {
-        auto claim = co_await coordinator->PostCall(
-            [coordinator,
+        auto claim = co_await coordinator.PostCall(
+            [&coordinator,
              session_namespace,
              session_id,
              access,
              &io_context,
              bind_owner] {
-                return net::use_service<XHttpSessionDirectory>(coordinator->Services()).Acquire(
+                return net::use_service<XHttpSessionDirectory>(coordinator.Services()).Acquire(
                     session_namespace, session_id, access, &io_context, bind_owner);
             });
         if (claim.retry) continue;
@@ -1441,7 +1434,15 @@ net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
                 .session = std::move(session),
             };
         }
-        if (!claim.wait_owner) co_return XHttpSessionOwnerResolution{};
+        if (!claim.wait_owner) {
+            // A rejected packet upload has no live owner to route to. Keep
+            // it on this Worker so HTTP/1 can drain its body and send 404
+            // without closing a persistent connection or creating a session.
+            co_return XHttpSessionOwnerResolution{
+                .owner = access == XHttpSessionAccess::Upload ? &io_context : nullptr,
+                .session = {},
+            };
+        }
         struct CancelWait final : transport::CancellationSubscription {
             std::shared_ptr<XHttpSessionDirectory::OwnerWaiter> waiter;
             bool cancelled = false;
@@ -1472,11 +1473,12 @@ net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
 }  // namespace
 
 net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
+    GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::string_view session_namespace,
     std::string_view session_id,
     XHttpSessionAccess access) {
-    co_return (co_await ResolveXHttpSessionOwner(
+    co_return (co_await ResolveXHttpSessionOwner(coordinator, 
         io_context, session_namespace, session_id, access, true)).session;
 }
 
@@ -1707,6 +1709,7 @@ net::awaitable<tl::expected<bool, ErrorCode>> ExecuteXHttp1UploadRequest(
 }
 
 net::awaitable<tl::expected<void, ErrorCode>> HandOffXHttpUpload(
+    GroupCoordinator& coordinator,
     net::io_context* owner, DetachedXHttpStream detached,
     const HttpConfig& cfg, const XHttpConfig& xhttp_cfg, uint64_t conn_id,
     XHttpUploadTimeouts timeouts, XHttpRequestMeta::Kind kind,
@@ -1714,6 +1717,7 @@ net::awaitable<tl::expected<void, ErrorCode>> HandOffXHttpUpload(
     bool expect_100_continue, bool keep_alive);
 
 net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
+    GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> stream,
     const HttpConfig& cfg,
@@ -1769,7 +1773,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
             if (!stream_handler) {
                 co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
             }
-            auto session = co_await GetXHttpPacketSession(
+            auto session = co_await GetXHttpPacketSession(coordinator, 
                 io_context, xhttp_cfg.session_namespace, meta.session_id, XHttpSessionAccess::Open);
             if (!session) {
                 co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
@@ -1818,7 +1822,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
                 ? XHttpSessionAccess::Open
                 : XHttpSessionAccess::Upload;
             const bool bind_immediately = !timeouts.active;
-            auto resolution = co_await ResolveXHttpSessionOwner(
+            auto resolution = co_await ResolveXHttpSessionOwner(coordinator, 
                 io_context, xhttp_cfg.session_namespace, meta.session_id,
                 access, bind_immediately, &stream->Cancellation());
             auto* owner_reactor = resolution.owner;
@@ -1833,7 +1837,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
                     co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
                 }
                 auto handed = co_await net::co_spawn(*owner_reactor,
-                    HandOffXHttpUpload(owner_reactor, std::move(*detached),
+                    HandOffXHttpUpload(coordinator, owner_reactor, std::move(*detached),
                         cfg, xhttp_cfg, conn_id,
                         XHttpUploadTimeouts{
                             .handshake_timeout = timeouts.handshake_timeout,
@@ -1885,6 +1889,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
 }
 
 net::awaitable<tl::expected<void, ErrorCode>> HandOffXHttpUpload(
+    GroupCoordinator& coordinator,
     net::io_context* owner, DetachedXHttpStream detached,
     const HttpConfig& cfg, const XHttpConfig& xhttp_cfg, uint64_t conn_id,
     XHttpUploadTimeouts timeouts, XHttpRequestMeta::Kind kind,
@@ -1895,7 +1900,7 @@ net::awaitable<tl::expected<void, ErrorCode>> HandOffXHttpUpload(
     timeouts.OnRequest(*restored);
     const auto access = kind == XHttpRequestMeta::Kind::StreamUp
         ? XHttpSessionAccess::Open : XHttpSessionAccess::Upload;
-    auto resolution = co_await ResolveXHttpSessionOwner(
+    auto resolution = co_await ResolveXHttpSessionOwner(coordinator, 
         *owner, xhttp_cfg.session_namespace, session_id, access,
         !timeouts.active, &restored->Cancellation());
     if (!resolution.owner) co_return tl::unexpected(OwnerMissError(*restored, kind));
@@ -1905,7 +1910,7 @@ net::awaitable<tl::expected<void, ErrorCode>> HandOffXHttpUpload(
     if (!first) co_return tl::unexpected(first.error());
     if (!*first) co_return tl::expected<void, ErrorCode>{};
     const std::shared_ptr<InboundTransportStreamHandler> no_handler;
-    auto result = co_await RunXHttp1ServerHandshake(
+    auto result = co_await RunXHttp1ServerHandshake(coordinator, 
         *owner, std::move(restored), cfg, xhttp_cfg, conn_id, nullptr,
         {}, no_handler, timeouts, true);
     if (!result) co_return tl::unexpected(result.error());
@@ -1916,6 +1921,7 @@ net::awaitable<tl::expected<void, ErrorCode>> HandOffXHttpUpload(
 }  // namespace
 
 net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
+    GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> stream,
     const HttpConfig& cfg,
@@ -1934,7 +1940,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
             : std::chrono::seconds{0},
         .active = (stream_handler != nullptr),
     };
-    co_return co_await RunXHttp1ServerHandshake(
+    co_return co_await RunXHttp1ServerHandshake(coordinator, 
         io_context, std::move(stream), cfg, xhttp_cfg, conn_id,
         transport_metadata, initial, stream_handler, timeouts, false);
 }

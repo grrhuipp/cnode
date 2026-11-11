@@ -122,12 +122,6 @@ private:
 };
 
 struct Settings final : ::proxyman::inbound::ProtocolSettings {};
-struct Runtime final : ::proxyman::inbound::ProtocolRuntime {
-    ::UserOnlineTracker* OnlineTracker() noexcept override {
-        return &tracker;
-    }
-    ::UserOnlineTracker tracker;
-};
 
 class NativeDecoder final : public ::Inbound {
 public:
@@ -178,12 +172,8 @@ private:
 };
 
 thread_local FixtureState* g_state = nullptr;
-std::unique_ptr<::proxyman::inbound::ProtocolRuntime> MakeRuntime() {
-    return std::make_unique<Runtime>();
-}
 std::unique_ptr<::Inbound> MakeHandler(
-    ::proxyman::inbound::ProtocolRuntime&, ::StatsShard&,
-    ::ConnectionLimiter*,
+    const ::proxyman::inbound::AdmissionEnvironment&,
     const ::proxyman::inbound::BuildRequest&) {
     if (!g_state) throw std::logic_error("fixture state not installed on Worker thread");
     return std::make_unique<NativeDecoder>(*g_state);
@@ -194,7 +184,6 @@ void RegisterProtocol() {
             .user_protocol = std::nullopt,
             .datagram_transport =
                 ::proxyman::inbound::DatagramTransport::Packet,
-            .create_runtime = MakeRuntime,
             .create_tcp_handler = MakeHandler,
             .create_datagram_handler = MakeHandler,
         });
@@ -220,8 +209,7 @@ public:
     ::net::awaitable<::OutboundProcessResult> Process(
         ::session::Context& ctx, ::transport::Link inbound,
         ::OutboundDialer&, const ::TimeoutsConfig&, ::StatsShard&,
-        const ::RelayConfig&, ::buf::MultiBufferBatch first_payload,
-        std::chrono::seconds, std::chrono::seconds) override {
+        const ::RelayConfig&, ::buf::MultiBufferBatch first_payload) override {
         if (!inbound.reader || !state_.cleanup_gate)
             throw std::logic_error("delayed outbound missing owner-local link/gate");
         std::array<uint8_t, 2> bytes{};
@@ -369,7 +357,7 @@ void SendLateDnsReply(::udp::socket& socket, DnsPacket& query) {
         auto outbound_source = ::infra::OutboundSourceConfig{};
         outbound_source.tag = "native-test";
         outbound_source.protocol = "freedom";
-        outbound_source.settings["domainStrategy"] = "UseIP";
+        outbound_source.settings = infra::FreedomSettings{.domain_strategy = proxy::freedom::outbound::DomainStrategy::UseIP};
         auto prepared = ::proxyman::outbound::PrepareOutboundConfig(outbound_source);
         if (!prepared) Fail("production Freedom outbound preparation failed");
         worker.AddOutbound(std::move(*prepared));
@@ -381,7 +369,7 @@ void SendLateDnsReply(::udp::socket& socket, DnsPacket& query) {
     ::proxyman::inbound::ReceiverSettings receiver{
         .inbound_tag = std::string(kTag), .inbound_tags = {}, .protocol = std::string(kProtocol),
         .stream_settings = {},
-        .dispatch_policy = {.sniffing = {.enabled = false}, .outbound = ::routing::ForceOutbound{"native-test"}}};
+        .dispatch_policy = {.sniffing = {.enabled = false, .domains_excluded = {}}, .outbound = ::routing::ForceOutbound{"native-test"}}};
     if (!worker.RegisterInbound(request, receiver))
         Fail("real native inbound registration failed");
     const auto listen = ::InboundListen::Parse("127.0.0.1");
@@ -438,7 +426,7 @@ template <typename Predicate>
     return {.inbound_tag = std::move(tag), .inbound_tags = {}, .protocol = std::string(kProtocol),
             .stream_settings = {},
             .dispatch_policy = {
-                .sniffing = {.enabled = false},
+                .sniffing = {.enabled = false, .domains_excluded = {}},
                 .outbound = ::routing::ForceOutbound(std::move(outbound_tag))}};
 }
 

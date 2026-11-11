@@ -13,7 +13,6 @@
 #include <chrono>
 #include <functional>
 #include <future>
-#include <iostream>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -24,10 +23,6 @@ namespace net = ::net;
 using namespace ::controller;
 using ::api::NodeInfo;
 using ::proxyman::inbound::UserSet;
-
-void Require(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
-}
 
 std::string Tag(const NodeInfo& config) {
     return config.NodeType + ':' + std::to_string(config.Port);
@@ -187,7 +182,7 @@ struct Runtime {
     }
 };
 
-std::exception_ptr Run(net::awaitable<void> task) {
+std::exception_ptr RunNodeRuntimeOperation(net::awaitable<void> task) {
     net::io_context io;
     auto result = net::co_spawn(io, std::move(task), net::use_future);
     io.run();
@@ -203,79 +198,121 @@ void Seed(Runtime& runtime, NodeState& state, std::shared_ptr<const NodeSnapshot
         true, true, snapshot->users ? snapshot->users->size() : 0, snapshot->rules ? snapshot->rules->size() : 0, snapshot->config.Path};
 }
 
-bool Matches(const Runtime& runtime, const NodeSnapshot& snapshot) {
-    const auto& actual = runtime.resources.at(snapshot.tag);
-    return actual.inbound && actual.outbound && actual.users == (snapshot.users ? snapshot.users->size() : 0) &&
-        actual.rules == (snapshot.rules ? snapshot.rules->size() : 0) && actual.version == snapshot.config.Path;
+void ExpectMatches(const Runtime& runtime, const NodeSnapshot& snapshot) {
+    const auto it = runtime.resources.find(snapshot.tag);
+    ASSERT_NE(it, runtime.resources.end()) << snapshot.tag;
+    const auto& actual = it->second;
+    EXPECT_TRUE(actual.inbound);
+    EXPECT_TRUE(actual.outbound);
+    EXPECT_EQ(actual.users, snapshot.users ? snapshot.users->size() : 0);
+    EXPECT_EQ(actual.rules, snapshot.rules ? snapshot.rules->size() : 0);
+    EXPECT_EQ(actual.version, snapshot.config.Path);
 }
 
-bool Empty(const Runtime& runtime, const std::string& tag) {
+void ExpectEmpty(const Runtime& runtime, const std::string& tag) {
     const auto it = runtime.resources.find(tag);
-    return it == runtime.resources.end() ||
-        (!it->second.inbound && !it->second.outbound && it->second.users == 0 && it->second.rules == 0);
+    if (it == runtime.resources.end()) return;
+    EXPECT_FALSE(it->second.inbound) << tag;
+    EXPECT_FALSE(it->second.outbound) << tag;
+    EXPECT_EQ(it->second.users, 0u) << tag;
+    EXPECT_EQ(it->second.rules, 0u) << tag;
 }
 
-void TestSuccessAndRefresh() {
+TEST(NodeTransaction, CreatesCompleteRuntime) {
     Runtime runtime;
     NodeState state;
-    auto first = Snapshot(1000);
-    Require(!Run(ApplyNodeChange(runtime, state, Change(first, state))), "create failed");
+    const auto first = Snapshot(1000);
+    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(first, state))));
+    EXPECT_EQ(state.committed, first);
+    EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
+    EXPECT_FALSE(state.HasPendingCleanup());
+    ExpectMatches(runtime, *first);
+}
+
+TEST(NodeTransaction, RefreshPublishesUsersAndRulesWithoutReplacingListener) {
+    Runtime runtime;
+    NodeState state;
+    const auto first = Snapshot(1000);
+    Seed(runtime, state, first);
     auto refresh = std::make_shared<NodeSnapshot>(*first);
     refresh->users = std::make_shared<const std::vector<::api::UserInfo>>(2);
     ReplaceUsers(*refresh, 2);
     refresh->users_etag = "users-2";
     refresh->rules = std::make_shared<const std::vector<::rule::DetectRule>>(2);
-    Require(!Run(ApplyNodeChange(runtime, state, Change(refresh, state))), "refresh failed");
-    Require(state.committed == refresh && state.phase == NodeRuntimePhase::Ready &&
-        !state.HasPendingCleanup() && Matches(runtime, *refresh), "refresh must publish the complete new snapshot");
-    Require(runtime.counts["add-in:" + first->tag] == 1, "refresh must preserve the existing listener");
-    Require(first->users && first->users->size() == 1 && first->rules && first->rules->size() == 1, "published old snapshots must remain immutable");
-    Require(state.committed->users_etag == "users-2" && first->users_etag == "users-1",
-        "user validators must be published with their immutable snapshot");
+    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(refresh, state))));
+    EXPECT_EQ(state.committed, refresh);
+    EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
+    EXPECT_FALSE(state.HasPendingCleanup());
+    ExpectMatches(runtime, *refresh);
+    EXPECT_EQ(runtime.counts["add-in:" + first->tag], 0);
+    EXPECT_EQ(first->users->size(), 1u);
+    EXPECT_EQ(first->rules->size(), 1u);
+    EXPECT_EQ(state.committed->users_etag, "users-2");
+    EXPECT_EQ(first->users_etag, "users-1");
 }
 
-void TestFailureMatrix() {
+struct TransitionFault {
+    const char* name;
+    const char* operation;
+    bool candidate;
+    bool after_mutation;
+    bool return_false;
+};
+
+class NodeTransitionFailure : public ::testing::TestWithParam<TransitionFault> {};
+
+TEST_P(NodeTransitionFailure, RestoresCommittedRuntimeAndValidators) {
+    Runtime runtime;
+    NodeState state;
     const auto old = Snapshot(1000);
     const auto next = Snapshot(2000, 2);
-    const std::vector<std::string> operations{
-        "users:" + next->tag, "add-out:" + next->tag, "add-in:" + next->tag,
-        "remove-in:" + old->tag, "remove-out:" + old->tag,
-        "clear-users:" + old->tag, "rules:" + old->tag, "rules:" + next->tag};
-    for (const auto& operation : operations) {
-        for (const bool after : {false, true}) {
-            Runtime runtime;
-            NodeState state;
-            Seed(runtime, state, old);
-            runtime.faults.push_back({operation, 1, after, false});
-            const auto failure = Run(ApplyNodeChange(runtime, state, Change(next, state)));
-            Require(static_cast<bool>(failure), "injected mutation must fail the change");
-            try { std::rethrow_exception(failure); }
-            catch (const MutationFailure& error) {
-                Require(error.operation == operation, "rollback must preserve the original failure");
-            }
-            Require(state.committed == old && state.phase == NodeRuntimePhase::Ready &&
-                !state.HasPendingCleanup() && Matches(runtime, *old) && Empty(runtime, next->tag),
-                "every single transition failure must restore the old runtime and remove the candidate");
-            Require(state.committed->users_etag == "users-1" &&
-                state.committed->config_etag == "config-1",
-                "a failed update must not acknowledge fetched user or config validators");
+    Seed(runtime, state, old);
+    const auto& fault = GetParam();
+    const auto operation = std::string(fault.operation) + (fault.candidate ? next->tag : old->tag);
+    runtime.faults.push_back({operation, 1, fault.after_mutation, fault.return_false});
+    const auto failure = RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(next, state)));
+    EXPECT_TRUE(failure);
+    if (failure && !fault.return_false) {
+        try {
+            std::rethrow_exception(failure);
+        } catch (const MutationFailure& error) {
+            EXPECT_EQ(error.operation, operation);
+        } catch (...) {
+            ADD_FAILURE() << "change did not preserve the original mutation failure";
         }
     }
-    for (const auto& operation : {"add-in:" + next->tag}) {
-        for (const bool after : {false, true}) {
-            Runtime runtime;
-            NodeState state;
-            Seed(runtime, state, old);
-            runtime.faults.push_back({operation, 1, after, true});
-            Require(static_cast<bool>(Run(ApplyNodeChange(runtime, state, Change(next, state)))) &&
-                state.committed == old && state.phase == NodeRuntimePhase::Ready &&
-                Matches(runtime, *old) && Empty(runtime, next->tag),
-                "a false mutation result must roll back partial effects like an exception");
-        }
-    }
+    EXPECT_EQ(state.committed, old);
+    EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
+    EXPECT_FALSE(state.HasPendingCleanup());
+    ExpectMatches(runtime, *old);
+    ExpectEmpty(runtime, next->tag);
+    ASSERT_TRUE(state.committed);
+    EXPECT_EQ(state.committed->users_etag, "users-1");
+    EXPECT_EQ(state.committed->config_etag, "config-1");
 }
 
-void TestRefreshRollbackFailure() {
+INSTANTIATE_TEST_SUITE_P(MutationFaults, NodeTransitionFailure, ::testing::Values(
+    TransitionFault{"UsersBefore", "users:", true, false, false},
+    TransitionFault{"UsersAfter", "users:", true, true, false},
+    TransitionFault{"AddOutboundBefore", "add-out:", true, false, false},
+    TransitionFault{"AddOutboundAfter", "add-out:", true, true, false},
+    TransitionFault{"AddInboundBefore", "add-in:", true, false, false},
+    TransitionFault{"AddInboundAfter", "add-in:", true, true, false},
+    TransitionFault{"RemoveInboundBefore", "remove-in:", false, false, false},
+    TransitionFault{"RemoveInboundAfter", "remove-in:", false, true, false},
+    TransitionFault{"RemoveOutboundBefore", "remove-out:", false, false, false},
+    TransitionFault{"RemoveOutboundAfter", "remove-out:", false, true, false},
+    TransitionFault{"ClearUsersBefore", "clear-users:", false, false, false},
+    TransitionFault{"ClearUsersAfter", "clear-users:", false, true, false},
+    TransitionFault{"ClearRulesBefore", "rules:", false, false, false},
+    TransitionFault{"ClearRulesAfter", "rules:", false, true, false},
+    TransitionFault{"PublishRulesBefore", "rules:", true, false, false},
+    TransitionFault{"PublishRulesAfter", "rules:", true, true, false},
+    TransitionFault{"AddInboundFalseBefore", "add-in:", true, false, true},
+    TransitionFault{"AddInboundFalseAfter", "add-in:", true, true, true}),
+    [](const ::testing::TestParamInfo<TransitionFault>& info) { return info.param.name; });
+
+TEST(NodeTransaction, FailedRefreshCompensationForcesRebuild) {
     Runtime runtime;
     NodeState state;
     const auto old = Snapshot(1000);
@@ -285,34 +322,38 @@ void TestRefreshRollbackFailure() {
     next->rules = std::make_shared<const std::vector<::rule::DetectRule>>(2);
     Seed(runtime, state, old);
     runtime.faults = {{"users:" + old->tag, 1, true}, {"rules:" + old->tag, 2, false}};
-    Require(static_cast<bool>(Run(ApplyNodeChange(runtime, state, Change(next, state)))) &&
-        state.committed == old && state.phase == NodeRuntimePhase::RecoveryRequired &&
-        runtime.resources.at(old->tag).rules == 2, "failed refresh compensation must invalidate partially updated rules");
+    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(next, state))));
+    EXPECT_EQ(state.committed, old);
+    EXPECT_EQ(state.phase, NodeRuntimePhase::RecoveryRequired);
+    EXPECT_EQ(runtime.resources.at(old->tag).rules, 2u);
     runtime.faults.clear();
-    Require(!Run(ApplyNodeChange(runtime, state, Change(old, state))) && Matches(runtime, *old) &&
-        runtime.counts["add-in:" + old->tag] == 1, "recovery must rebuild after a partial refresh even when the old listener survived");
+    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(old, state))));
+    ExpectMatches(runtime, *old);
+    EXPECT_EQ(runtime.counts["add-in:" + old->tag], 1);
 }
 
-void TestFailedRollbackForcesRebuild() {
+TEST(NodeTransaction, FailedRollbackRebuildsEvenIdenticalConfig) {
     Runtime runtime;
     NodeState state;
     const auto old = Snapshot(1000);
     const auto next = Snapshot(1000, 2);
     Seed(runtime, state, old);
     runtime.faults = {{"rules:" + old->tag, 1, true}, {"add-in:" + old->tag, 2, false}};
-    Require(static_cast<bool>(Run(ApplyNodeChange(runtime, state, Change(next, state)))), "double fault must fail");
-    Require(state.committed == old && state.phase == NodeRuntimePhase::RecoveryRequired && state.HasPendingCleanup(),
-        "failed rollback must invalidate runtime readiness without losing the last committed snapshot");
-    Require(!runtime.resources.at(old->tag).inbound, "the injected rollback failure must actually leave the listener absent");
+    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(next, state))));
+    EXPECT_EQ(state.committed, old);
+    EXPECT_EQ(state.phase, NodeRuntimePhase::RecoveryRequired);
+    EXPECT_TRUE(state.HasPendingCleanup());
+    EXPECT_FALSE(runtime.resources.at(old->tag).inbound);
     const auto installs = runtime.counts["add-in:" + old->tag];
     runtime.faults.clear();
-    Require(!Run(ApplyNodeChange(runtime, state, Change(old, state))), "recovery of identical config failed");
-    Require(runtime.counts["add-in:" + old->tag] > installs && Matches(runtime, *old) &&
-        state.phase == NodeRuntimePhase::Ready && !state.HasPendingCleanup(),
-        "identical config after failed rollback must rebuild instead of only refreshing users and rules");
+    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(old, state))));
+    EXPECT_GT(runtime.counts["add-in:" + old->tag], installs);
+    ExpectMatches(runtime, *old);
+    EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
+    EXPECT_FALSE(state.HasPendingCleanup());
 }
 
-void TestOrphanCleanupAndBlockedRetry() {
+TEST(NodeTransaction, OrphanCleanupBlocksCandidatesUntilRecovery) {
     Runtime runtime;
     NodeState state;
     const auto old = Snapshot(1000);
@@ -320,48 +361,57 @@ void TestOrphanCleanupAndBlockedRetry() {
     const auto later = Snapshot(3000, 3);
     Seed(runtime, state, old);
     runtime.faults = {{"add-in:" + next->tag, 1, true}, {"remove-in:" + next->tag, 1, false}};
-    Require(static_cast<bool>(Run(ApplyNodeChange(runtime, state, Change(next, state)))), "orphan fixture must fail");
-    Require(runtime.resources.at(next->tag).inbound && state.HasPendingCleanup(), "failed candidate cleanup must be retained");
+    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(next, state))));
+    EXPECT_TRUE(runtime.resources.at(next->tag).inbound);
+    EXPECT_TRUE(state.HasPendingCleanup());
     runtime.faults = {{"remove-out:" + old->tag, runtime.counts["remove-out:" + old->tag] + 1, true}};
-    Require(static_cast<bool>(Run(ApplyNodeChange(runtime, state, Change(later, state)))), "blocked cleanup must fail the retry");
-    Require(Empty(runtime, later->tag) && state.committed == old && state.HasPendingCleanup(),
-        "a new candidate must not start while earlier resources still need cleanup");
+    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(later, state))));
+    ExpectEmpty(runtime, later->tag);
+    EXPECT_EQ(state.committed, old);
+    EXPECT_TRUE(state.HasPendingCleanup());
     runtime.faults.clear();
-    Require(!Run(ApplyNodeChange(runtime, state, Change(later, state))), "retry after cleanup failure must recover");
-    Require(Empty(runtime, old->tag) && Empty(runtime, next->tag) && Matches(runtime, *later) &&
-        state.committed == later && !state.HasPendingCleanup(), "recovery must remove both old and orphan candidate resources");
+    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(later, state))));
+    ExpectEmpty(runtime, old->tag);
+    ExpectEmpty(runtime, next->tag);
+    ExpectMatches(runtime, *later);
+    EXPECT_EQ(state.committed, later);
+    EXPECT_FALSE(state.HasPendingCleanup());
 }
 
-void TestCleanupFailureRecovery() {
+TEST(NodeTransaction, PartialCleanupRetainsSnapshotForRecovery) {
     Runtime runtime;
     NodeState state;
     const auto old = Snapshot(1000);
     Seed(runtime, state, old);
     state.pending_cleanup = {old, {}};
     runtime.faults = {{"remove-out:" + old->tag, 1, true}};
-    Require(static_cast<bool>(Run(CleanPendingNodeRuntime(runtime, state))), "partial cleanup must fail");
-    Require(state.committed == old && state.phase == NodeRuntimePhase::RecoveryRequired &&
-        state.HasPendingCleanup() && !runtime.resources.at(old->tag).inbound, "partial removal must preserve recovery data");
+    EXPECT_TRUE(RunNodeRuntimeOperation(CleanPendingNodeRuntime(runtime, state)));
+    EXPECT_EQ(state.committed, old);
+    EXPECT_EQ(state.phase, NodeRuntimePhase::RecoveryRequired);
+    EXPECT_TRUE(state.HasPendingCleanup());
+    EXPECT_FALSE(runtime.resources.at(old->tag).inbound);
     runtime.faults.clear();
-    Require(!Run(ApplyNodeChange(runtime, state, Change(old, state))) && Matches(runtime, *old),
-        "a node must be rebuilt after partial cleanup");
-    Require(state.committed->users_etag == "users-1",
-        "cleanup and recovery must retain the last committed user validator");
+    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(old, state))));
+    ExpectMatches(runtime, *old);
+    ASSERT_TRUE(state.committed);
+    EXPECT_EQ(state.committed->users_etag, "users-1");
 }
 
-void TestUncommittedCandidateCleanup() {
+TEST(NodeTransaction, CleansUncommittedOrphanCandidate) {
     Runtime runtime;
     NodeState state;
     const auto next = Snapshot(2000);
     runtime.faults = {{"add-in:" + next->tag, 1, true}, {"remove-in:" + next->tag, 1, false}};
-    Require(static_cast<bool>(Run(ApplyNodeChange(runtime, state, Change(next, state)))) &&
-        !state.committed && state.HasPendingCleanup(), "failed initial creation must retain cleanup without a committed node");
+    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(next, state))));
+    EXPECT_FALSE(state.committed);
+    EXPECT_TRUE(state.HasPendingCleanup());
     runtime.faults.clear();
-    Require(!Run(CleanPendingNodeRuntime(runtime, state)) && !state.HasPendingCleanup() && Empty(runtime, next->tag),
-        "local cleanup must remove an uncommitted orphan candidate");
+    EXPECT_FALSE(RunNodeRuntimeOperation(CleanPendingNodeRuntime(runtime, state)));
+    EXPECT_FALSE(state.HasPendingCleanup());
+    ExpectEmpty(runtime, next->tag);
 }
 
-void TestReservationBeforeFirstSuspend() {
+TEST(NodeTransaction, ReservesEndpointsBeforeFirstSuspend) {
     Runtime runtime;
     NodeState state;
     const auto old = Snapshot(1000);
@@ -369,19 +419,23 @@ void TestReservationBeforeFirstSuspend() {
     Seed(runtime, state, old);
     net::io_context io;
     auto completed = net::co_spawn(io, ApplyNodeChange(runtime, state, Change(next, state)), net::use_future);
-    Require(io.poll_one() == 1 && state.phase == NodeRuntimePhase::Updating &&
-        state.ReservesPort(1000) && state.ReservesPort(2000),
-        "clean transaction entry must reserve both endpoints before its first suspension");
+    EXPECT_EQ(io.poll_one(), 1u);
+    EXPECT_EQ(state.phase, NodeRuntimePhase::Updating);
+    EXPECT_TRUE(state.ReservesPort(1000));
+    EXPECT_TRUE(state.ReservesPort(2000));
     io.run();
-    completed.get();
-    Require(!state.ReservesPort(1000) && state.ReservesPort(2000),
-        "successful transition must release the old endpoint");
-    Require(!Run(CleanPendingNodeRuntime(runtime, state)), "empty cleanup must succeed");
+    EXPECT_NO_THROW(completed.get());
+    EXPECT_FALSE(state.ReservesPort(1000));
+    EXPECT_TRUE(state.ReservesPort(2000));
+    EXPECT_FALSE(RunNodeRuntimeOperation(CleanPendingNodeRuntime(runtime, state)));
     state.phase = NodeRuntimePhase::Stopped;
-    Require(!state.ReservesPort(2000), "stopped historical data must not reserve a cleaned endpoint");
+    EXPECT_FALSE(state.ReservesPort(2000));
 }
 
-void TestCancellationRollback(bool close_runtime) {
+class NodeCancellation : public ::testing::TestWithParam<bool> {};
+
+TEST_P(NodeCancellation, JoinsMutationAndRecoversCommittedRuntime) {
+    const bool close_runtime = GetParam();
     Runtime runtime;
     NodeState state;
     const auto old = Snapshot(1000);
@@ -399,40 +453,60 @@ void TestCancellationRollback(bool close_runtime) {
             failure = error;
         }));
     io.poll();
-    Require(runtime.gate_entered && !completed, "cancellation fixture must suspend after earlier mutations");
-    Require(state.ReservesPort(1000) && state.ReservesPort(2000),
-        "an in-flight transaction must reserve old and candidate endpoints");
+    EXPECT_TRUE(runtime.gate_entered);
+    EXPECT_FALSE(completed);
+    EXPECT_TRUE(state.ReservesPort(1000));
+    EXPECT_TRUE(state.ReservesPort(2000));
     const auto started_before_stop = runtime.operations_started;
     cancellation.emit(net::cancellation_type::terminal);
     runtime.closed = close_runtime;
-    io.run();
-    Require(completed && failure && runtime.gate_released && state.committed == old,
-        "cancelled mutation must release the active operation and preserve the committed snapshot");
-    if (close_runtime) {
-        Require(state.phase == NodeRuntimePhase::RecoveryRequired && state.HasPendingCleanup() &&
-            state.ReservesPort(1000) && state.ReservesPort(2000),
-            "closed mutation admission must retain unfinished cleanup and reservations");
-        Require(runtime.operations_started == started_before_stop,
-            "shutdown must join the started operation without starting compensation");
-    } else {
-        Require(state.phase == NodeRuntimePhase::Ready && !state.HasPendingCleanup() &&
-            Matches(runtime, *old) && Empty(runtime, next->tag) && !state.ReservesPort(2000),
-            "rollback must ignore pull cancellation and restore the last committed runtime");
+    io.poll();
+    const bool cancellation_joined = completed;
+    if (!completed) {
+        gate.cancel();
+        io.restart();
+        io.run();
     }
-    try { std::rethrow_exception(failure); }
-    catch (const std::system_error& error) {
-        Require(error.code() == net::error::operation_aborted, "cancellation must preserve its original cause");
+    EXPECT_TRUE(cancellation_joined);
+    EXPECT_TRUE(completed);
+    EXPECT_TRUE(runtime.gate_released);
+    EXPECT_EQ(state.committed, old);
+    if (close_runtime) {
+        EXPECT_EQ(state.phase, NodeRuntimePhase::RecoveryRequired);
+        EXPECT_TRUE(state.HasPendingCleanup());
+        EXPECT_TRUE(state.ReservesPort(1000));
+        EXPECT_TRUE(state.ReservesPort(2000));
+        EXPECT_EQ(runtime.operations_started, started_before_stop);
+    } else {
+        EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
+        EXPECT_FALSE(state.HasPendingCleanup());
+        ExpectMatches(runtime, *old);
+        ExpectEmpty(runtime, next->tag);
+        EXPECT_FALSE(state.ReservesPort(2000));
+    }
+    EXPECT_TRUE(failure);
+    if (failure) {
+        try { std::rethrow_exception(failure); }
+        catch (const std::system_error& error) {
+            EXPECT_EQ(error.code(), net::error::operation_aborted);
+        } catch (...) { ADD_FAILURE() << "cancellation lost its original cause"; }
     }
     runtime.inbound_gate = nullptr;
     runtime.closed = false;
-    Require(!Run(ApplyNodeChange(runtime, state, Change(old, state))) && Matches(runtime, *old) &&
-        Empty(runtime, next->tag), "a fresh attempt must repair the state left by a cancelled transaction");
-    Require(state.ReservesPort(1000) && !state.ReservesPort(2000),
-        "completed recovery must release the abandoned candidate endpoint");
+    EXPECT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(old, state))));
+    ExpectMatches(runtime, *old);
+    ExpectEmpty(runtime, next->tag);
+    EXPECT_TRUE(state.ReservesPort(1000));
+    EXPECT_FALSE(state.ReservesPort(2000));
     state.pending_cleanup = {old, {}};
-    Require(!Run(CleanPendingNodeRuntime(runtime, state)) && !state.ReservesPort(1000),
-        "completed cleanup must release the original endpoint");
+    EXPECT_FALSE(RunNodeRuntimeOperation(CleanPendingNodeRuntime(runtime, state)));
+    EXPECT_FALSE(state.ReservesPort(1000));
 }
+
+INSTANTIATE_TEST_SUITE_P(RuntimeAdmission, NodeCancellation, ::testing::Bool(),
+    [](const ::testing::TestParamInfo<bool>& info) {
+        return info.param ? "Closed" : "Open";
+    });
 
 net::awaitable<void> RecoverThenWait(Runtime& runtime, NodeState& state,
                                    PreparedNodeChange change, net::steady_timer& wait,
@@ -443,13 +517,13 @@ net::awaitable<void> RecoverThenWait(Runtime& runtime, NodeState& state,
     } catch (const MutationFailure&) {
         failed = true;
     }
-    Require(failed && state.phase == NodeRuntimePhase::Ready,
-            "ordinary failure must finish rollback before the next pull");
+    EXPECT_TRUE(failed);
+    EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
     recovered = true;
     co_await wait.async_wait(net::use_awaitable);
 }
 
-void TestRollbackDoesNotDisableFutureStop() {
+TEST(NodeTransaction, RollbackDoesNotDisableFutureStop) {
     Runtime runtime;
     NodeState state;
     const auto old = Snapshot(1000);
@@ -468,33 +542,36 @@ void TestRollbackDoesNotDisableFutureStop() {
             failure = error;
         }));
     io.poll();
-    Require(recovered && !completed, "the next pull must wait after rollback");
+    EXPECT_TRUE(recovered);
+    EXPECT_FALSE(completed);
     stop.emit(net::cancellation_type::terminal);
     io.poll();
     const bool stopped = completed;
     if (!stopped) {
         wait.cancel();
+        io.restart();
         io.run();
     }
-    Require(stopped && failure, "rollback shielding must not suppress a later stop");
+    EXPECT_TRUE(stopped);
+    ASSERT_TRUE(failure);
     try { std::rethrow_exception(failure); }
     catch (const std::system_error& error) {
-        Require(error.code() == net::error::operation_aborted,
-                "later stop must retain cancellation semantics");
-    }
+        EXPECT_EQ(error.code(), net::error::operation_aborted);
+    } catch (...) { ADD_FAILURE() << "later stop lost cancellation semantics"; }
 }
-void TestIncompleteCandidatePreservesLiveService() {
+
+TEST(NodeTransaction, IncompleteCandidatePreservesLiveService) {
     Runtime runtime;
     NodeState state;
     const auto old = Snapshot(1000);
     Seed(runtime, state, old);
     auto next = std::make_shared<NodeSnapshot>(*Snapshot(1000, 2));
     next->inbound.reset();
-    Require(static_cast<bool>(Run(ApplyNodeChange(runtime, state, Change(next, state)))),
-        "an unprepared candidate must be rejected");
-    Require(runtime.calls.empty() && state.committed == old &&
-        state.phase == NodeRuntimePhase::Ready && Matches(runtime, *old),
-        "candidate rejection must not retire the listener, users, outbound or rules");
+    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(next, state))));
+    EXPECT_TRUE(runtime.calls.empty());
+    EXPECT_EQ(state.committed, old);
+    EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
+    ExpectMatches(runtime, *old);
 }
 
 net::awaitable<void> GatedChange(
@@ -524,19 +601,26 @@ net::awaitable<void> GatedCleanup(
     co_await CleanPendingNodeRuntime(runtime, state);
 }
 
-void RequireCancelled(std::future<void>& result) {
-    Require(result.wait_for(std::chrono::seconds::zero()) == std::future_status::ready,
-        "cancelled admission must complete without waiting for the active panel");
-    try {
-        result.get();
-        Require(false, "waiting panel must report cancellation");
-    } catch (const std::system_error& error) {
-        Require(error.code() == net::error::operation_aborted,
-            "waiting panel cancellation must retain operation_aborted");
-    }
+void ExpectCancelled(std::future<void>& result) {
+    EXPECT_THROW({
+        try { result.get(); }
+        catch (const std::system_error& error) {
+            EXPECT_EQ(error.code(), net::error::operation_aborted);
+            throw;
+        }
+    }, std::system_error);
 }
 
-void TestFairMultiPanelTransactions() {
+void JoinGatedChanges(net::io_context& io, NodeMutationGate& gate) {
+    io.restart();
+    io.poll();
+    // Drain normally first, then join any admission stranded by a failed change.
+    gate.Close();
+    io.restart();
+    io.run();
+}
+
+TEST(NodeTransaction, WaitingPanelsCommitInFairOrder) {
     net::io_context io;
     NodeMutationGate gate;
     NodeState first, second, third;
@@ -555,30 +639,52 @@ void TestFairMultiPanelTransactions() {
     auto third_done = net::co_spawn(io,
         GatedChange(gate, three, runtime, third, Snapshot(3000), committed, 3), net::use_future);
     io.poll();
-    Require(runtime.calls.empty() && !first.committed && !second.committed && !third.committed,
-        "waiting transactions must not mutate runtime or acknowledge fetched validators");
+    EXPECT_TRUE(runtime.calls.empty());
+    EXPECT_FALSE(first.committed);
+    EXPECT_FALSE(second.committed);
+    EXPECT_FALSE(third.committed);
+    hold.cancel();
+    JoinGatedChanges(io, gate);
+    EXPECT_NO_THROW(first_done.get());
+    EXPECT_NO_THROW(second_done.get());
+    EXPECT_NO_THROW(third_done.get());
+    EXPECT_EQ(committed, std::vector<int>({1, 2, 3, 1}));
+    ASSERT_TRUE(first.committed);
+    ASSERT_TRUE(second.committed);
+    ASSERT_TRUE(third.committed);
+    ExpectMatches(runtime, *first.committed);
+    ExpectMatches(runtime, *second.committed);
+    ExpectMatches(runtime, *third.committed);
+    EXPECT_EQ(first.committed->config_etag, "config-2");
+}
+
+TEST(NodeTransaction, RejectsDuplicatePendingAdmission) {
+    net::io_context io;
+    NodeMutationGate gate;
+    NodeState first, second;
+    NodeMutationGate::Participant one(gate, io.get_executor(), first);
+    NodeMutationGate::Participant two(gate, io.get_executor(), second);
+    gate.Seal();
+    Runtime runtime;
+    std::vector<int> committed;
+    net::steady_timer hold(io, net::steady_timer::time_point::max());
+    auto first_done = net::co_spawn(io,
+        GatedChange(gate, one, runtime, first, Snapshot(1000), committed, 1, &hold), net::use_future);
+    io.poll();
+    auto second_done = net::co_spawn(io,
+        GatedChange(gate, two, runtime, second, Snapshot(2000), committed, 2), net::use_future);
     auto duplicate = net::co_spawn(io,
         GatedChange(gate, two, runtime, second, Snapshot(4000), committed, 4), net::use_future);
     io.poll();
-    Require(duplicate.wait_for(std::chrono::seconds::zero()) == std::future_status::ready,
-        "duplicate admission must be rejected without adding another wait slot");
-    bool rejected = false;
-    try { duplicate.get(); }
-    catch (const std::logic_error&) { rejected = true; }
-    Require(rejected, "each fixed panel may own at most one pending admission");
+    EXPECT_EQ(duplicate.wait_for(std::chrono::seconds::zero()), std::future_status::ready);
     hold.cancel();
-    io.run();
-    first_done.get();
-    second_done.get();
-    third_done.get();
-    Require(committed == std::vector<int>({1, 2, 3, 1}),
-        "a fast polling panel must not overtake already waiting panels");
-    Require(Matches(runtime, *first.committed) && Matches(runtime, *second.committed) &&
-        Matches(runtime, *third.committed) && first.committed->config_etag == "config-2",
-        "serialized publications must preserve every companion and commit validators with runtime");
+    JoinGatedChanges(io, gate);
+    EXPECT_THROW(duplicate.get(), std::logic_error);
+    EXPECT_NO_THROW(first_done.get());
+    EXPECT_NO_THROW(second_done.get());
 }
 
-void TestCancelledPanelRetainsQueueFairness() {
+TEST(NodeTransaction, CancelledPanelRejoinsBehindExistingWaiters) {
     net::io_context io;
     NodeMutationGate gate;
     NodeState first, second, third;
@@ -601,20 +707,23 @@ void TestCancelledPanelRetainsQueueFairness() {
     io.poll();
     cancellation.emit(net::cancellation_type::terminal);
     io.poll();
-    RequireCancelled(cancelled);
+    EXPECT_EQ(cancelled.wait_for(std::chrono::seconds::zero()), std::future_status::ready);
     auto retried = net::co_spawn(io,
         GatedChange(gate, two, runtime, second, Snapshot(2000), committed, 2), net::use_future);
     io.poll();
     hold.cancel();
-    io.run();
-    first_done.get();
-    third_done.get();
-    retried.get();
-    Require(committed == std::vector<int>({1, 3, 2}),
-        "a cancelled slot must detach and rejoin behind existing waiters");
+    JoinGatedChanges(io, gate);
+    ExpectCancelled(cancelled);
+    EXPECT_NO_THROW(first_done.get());
+    EXPECT_NO_THROW(third_done.get());
+    EXPECT_NO_THROW(retried.get());
+    EXPECT_EQ(committed, std::vector<int>({1, 3, 2}));
 }
 
-void TestRecoveryOwnershipBlocksCompanions(bool close_gate) {
+class NodeRecoveryOwnership : public ::testing::TestWithParam<bool> {};
+
+TEST_P(NodeRecoveryOwnership, BlocksCompanionsUntilCleanupOrShutdown) {
+    const bool close_gate = GetParam();
     net::io_context io;
     NodeMutationGate gate;
     NodeState owner, companion;
@@ -637,69 +746,66 @@ void TestRecoveryOwnershipBlocksCompanions(bool close_gate) {
     io.poll();
     hold.cancel();
     io.poll();
-    Require(failed.wait_for(std::chrono::seconds::zero()) == std::future_status::ready,
-        "the failed transaction must complete while its companion remains blocked");
-    bool mutation_failed = false;
-    try { failed.get(); }
-    catch (const MutationFailure&) { mutation_failed = true; }
-    Require(mutation_failed && owner.HasPendingCleanup() && !companion.committed &&
-        runtime.resources.find(companion_snapshot->tag) == runtime.resources.end() &&
-        owner.committed == old && owner.committed->config_etag == "config-1",
-        "failed compensation must retain credentials and block all companion mutations");
+    const bool failure_ready = failed.wait_for(std::chrono::seconds::zero()) == std::future_status::ready;
+    EXPECT_TRUE(failure_ready);
+    if (!failure_ready) {
+        gate.Close();
+        io.restart();
+        io.run();
+        EXPECT_THROW(failed.get(), std::exception);
+        EXPECT_THROW(waiting.get(), std::exception);
+        return;
+    }
+    EXPECT_THROW(failed.get(), MutationFailure);
+    EXPECT_TRUE(owner.HasPendingCleanup());
+    EXPECT_FALSE(companion.committed);
+    EXPECT_EQ(runtime.resources.find(companion_snapshot->tag), runtime.resources.end());
+    EXPECT_EQ(owner.committed, old);
+    if (owner.committed) EXPECT_EQ(owner.committed->config_etag, "config-1");
     runtime.faults = {{"remove-out:" + old->tag, runtime.counts["remove-out:" + old->tag] + 1}};
     auto retry_failed = net::co_spawn(io, GatedCleanup(gate, one, runtime, owner), net::use_future);
     io.poll();
-    Require(retry_failed.wait_for(std::chrono::seconds::zero()) == std::future_status::ready,
-        "recovery owner must be admitted ahead of the blocked companion");
-    bool cleanup_failed = false;
-    try { retry_failed.get(); }
-    catch (const MutationFailure&) { cleanup_failed = true; }
-    Require(cleanup_failed && owner.HasPendingCleanup() && !companion.committed,
-        "a failed recovery attempt must not pass admission to another panel");
+    const bool retry_ready = retry_failed.wait_for(std::chrono::seconds::zero()) == std::future_status::ready;
+    EXPECT_TRUE(retry_ready);
+    if (!retry_ready) {
+        gate.Close();
+        io.restart();
+        io.run();
+        EXPECT_THROW(retry_failed.get(), std::exception);
+        EXPECT_THROW(waiting.get(), std::exception);
+        return;
+    }
+    EXPECT_THROW(retry_failed.get(), MutationFailure);
+    EXPECT_TRUE(owner.HasPendingCleanup());
+    EXPECT_FALSE(companion.committed);
     if (close_gate) {
         const auto started = runtime.operations_started;
         gate.Close();
         io.run();
-        RequireCancelled(waiting);
-        Require(runtime.operations_started == started && owner.HasPendingCleanup() &&
-            owner.committed == old && committed.empty(),
-            "shutdown must wake blocked panels without starting recovery or dropping retained snapshots");
+        ExpectCancelled(waiting);
+        EXPECT_EQ(runtime.operations_started, started);
+        EXPECT_TRUE(owner.HasPendingCleanup());
+        EXPECT_EQ(owner.committed, old);
+        EXPECT_TRUE(committed.empty());
     } else {
         runtime.faults.clear();
         auto recovered = net::co_spawn(io, GatedCleanup(gate, one, runtime, owner), net::use_future);
-        io.run();
-        recovered.get();
-        waiting.get();
-        Require(!owner.HasPendingCleanup() && Empty(runtime, old->tag) &&
-            Empty(runtime, next->tag) && Matches(runtime, *companion.committed) &&
-            committed == std::vector<int>({2}),
-            "only successful owner cleanup may release a waiting companion transaction");
+        JoinGatedChanges(io, gate);
+        EXPECT_NO_THROW(recovered.get());
+        EXPECT_NO_THROW(waiting.get());
+        EXPECT_FALSE(owner.HasPendingCleanup());
+        ExpectEmpty(runtime, old->tag);
+        ExpectEmpty(runtime, next->tag);
+        ASSERT_TRUE(companion.committed);
+        ExpectMatches(runtime, *companion.committed);
+        EXPECT_EQ(committed, std::vector<int>({2}));
     }
 }
+
+INSTANTIATE_TEST_SUITE_P(RecoveryCompletion, NodeRecoveryOwnership, ::testing::Bool(),
+    [](const ::testing::TestParamInfo<bool>& info) {
+        return info.param ? "Shutdown" : "Cleanup";
+    });
 
 }  // namespace
 
-TEST(NodeTransaction, Contract) {
-    try {
-        TestSuccessAndRefresh();
-        TestIncompleteCandidatePreservesLiveService();
-        TestFailureMatrix();
-        TestRefreshRollbackFailure();
-        TestFailedRollbackForcesRebuild();
-        TestOrphanCleanupAndBlockedRetry();
-        TestCleanupFailureRecovery();
-        TestUncommittedCandidateCleanup();
-        TestReservationBeforeFirstSuspend();
-        TestCancellationRollback(false);
-        TestCancellationRollback(true);
-        TestRollbackDoesNotDisableFutureStop();
-        TestFairMultiPanelTransactions();
-        TestCancelledPanelRetainsQueueFairness();
-        TestRecoveryOwnershipBlocksCompanions(false);
-        TestRecoveryOwnershipBlocksCompanions(true);
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        FAIL() << error.what();
-    }
-    std::cout << "node transaction fault matrix and recovery passed\n";
-}

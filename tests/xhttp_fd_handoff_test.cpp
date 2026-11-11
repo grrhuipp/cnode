@@ -15,10 +15,6 @@
 
 namespace {
 
-void Require(bool condition, const char* what) {
-    if (!condition) throw std::runtime_error(what);
-}
-
 TEST(XhttpFdHandoff, TcpStaticBoundaryDetachAndRestorePreservesPrefixAndStream) {
     // io_b runs on this thread, io_a on thread_a; only detached native state crosses.
     net::io_context io_b, io_a;
@@ -36,10 +32,10 @@ TEST(XhttpFdHandoff, TcpStaticBoundaryDetachAndRestorePreservesPrefixAndStream) 
         io_b, server_stream->AsyncRead(net::buffer(head_buf)), net::use_future);
     io_b.run();
     const size_t n = read_fut.get();
-    Require(n == head_buf.size(), "initial head read incomplete");
+    ASSERT_EQ(n, head_buf.size());
 
     auto detached = server_stream->DetachForHandoff({head_buf.data(), n});
-    Require(detached.has_value(), "TCP DetachForHandoff failed");
+    ASSERT_TRUE(detached.has_value());
     server_stream.reset();
 
     std::string received;
@@ -47,18 +43,20 @@ TEST(XhttpFdHandoff, TcpStaticBoundaryDetachAndRestorePreservesPrefixAndStream) 
         io_a,
         [&, state = std::move(*detached)]() mutable -> net::awaitable<void> {
             auto restored = TcpStream::RestoreFromHandoff(io_a, std::move(state));
-            Require(restored != nullptr, "TCP RestoreFromHandoff failed");
+            EXPECT_TRUE(restored != nullptr) << "TCP RestoreFromHandoff failed";
+                if (!(restored != nullptr)) co_return;
             std::array<uint8_t, 128> buf{};
             while (received.size() < payload.size()) {
                 const size_t r = co_await restored->AsyncRead(net::buffer(buf));
-                Require(r > 0, "unexpected EOF on restored TCP stream");
+                EXPECT_TRUE(r > 0) << "unexpected EOF on restored TCP stream";
+                if (!(r > 0)) co_return;
                 received.append(reinterpret_cast<const char*>(buf.data()), r);
             }
             const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
             co_await restored->AsyncWrite(net::buffer(reply));
         },
         net::use_future);
-    std::thread thread_a([&] { io_a.run(); });
+    std::jthread thread_a([&] { io_a.run(); });
     restore_fut.get();
     thread_a.join();
 
@@ -76,7 +74,7 @@ TEST(XhttpFdHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPlainte
     auto server_ctx = SslContext::CreateServerAutoSign(tls_cfg);
     tls_cfg.allow_insecure = true;
     auto client_ctx = SslContext::CreateClient(tls_cfg);
-    Require(server_ctx && client_ctx, "failed to create TLS contexts");
+    ASSERT_TRUE(server_ctx && client_ctx);
 
     net::io_context io_b, io_a;
     tcp::acceptor acceptor(io_b, {net::ip::address_v4::loopback(), 0});
@@ -95,7 +93,8 @@ TEST(XhttpFdHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPlainte
         [&]() -> net::awaitable<void> {
             client_tls = co_await WrapTlsClient(
                 std::make_unique<TcpStream>(std::move(raw_client)), *client_ctx, "localhost");
-            Require(client_tls != nullptr, "client TLS handshake failed");
+            EXPECT_TRUE(client_tls != nullptr) << "client TLS handshake failed";
+                if (!(client_tls != nullptr)) co_return;
             co_await client_tls->AsyncWrite(net::buffer(payload));
         },
         net::use_future);
@@ -105,7 +104,8 @@ TEST(XhttpFdHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPlainte
         [&]() -> net::awaitable<void> {
             server_tls = co_await WrapTlsServer(
                 std::make_unique<TcpStream>(std::move(raw_server)), *server_ctx);
-            Require(server_tls != nullptr, "server TLS handshake failed");
+            EXPECT_TRUE(server_tls != nullptr) << "server TLS handshake failed";
+                if (!(server_tls != nullptr)) co_return;
             prefix_n = co_await server_tls->AsyncRead(net::buffer(prefix));
         },
         net::use_future);
@@ -113,10 +113,10 @@ TEST(XhttpFdHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPlainte
     io_b.run();
     client_fut.get();
     server_fut.get();
-    Require(prefix_n == prefix.size(), "initial TLS read incomplete");
+    ASSERT_EQ(prefix_n, prefix.size());
 
     auto detached = server_tls->DetachForHandoff({prefix.data(), prefix_n});
-    Require(detached.has_value(), "TLS DetachForHandoff failed");
+    ASSERT_TRUE(detached.has_value());
     server_tls.reset();
 
     std::string received;
@@ -124,16 +124,18 @@ TEST(XhttpFdHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPlainte
         io_a,
         [&, state = std::move(*detached)]() mutable -> net::awaitable<void> {
             auto restored = TlsStream::RestoreFromHandoff(io_a, std::move(state));
-            Require(restored != nullptr, "TLS RestoreFromHandoff failed");
+            EXPECT_TRUE(restored != nullptr) << "TLS RestoreFromHandoff failed";
+                if (!(restored != nullptr)) co_return;
             std::array<uint8_t, 128> buf{};
             while (received.size() < payload.size()) {
                 const size_t r = co_await restored->AsyncRead(net::buffer(buf));
-                Require(r > 0, "unexpected EOF on restored TLS stream");
+                EXPECT_TRUE(r > 0) << "unexpected EOF on restored TLS stream";
+                if (!(r > 0)) co_return;
                 received.append(reinterpret_cast<const char*>(buf.data()), r);
             }
         },
         net::use_future);
-    std::thread thread_a([&] { io_a.run(); });
+    std::jthread thread_a([&] { io_a.run(); });
     restore_fut.get();
     thread_a.join();
 

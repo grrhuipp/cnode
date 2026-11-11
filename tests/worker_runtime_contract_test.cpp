@@ -1,26 +1,31 @@
 #include <gtest/gtest.h>
-
 #include "app/proxyman/inbound/handler.hpp"
 
-TEST(WorkerRuntimeContract, Contract) {
+TEST(WorkerRequestLoad, NestedDispatchesReleasePressureWhenTheyComplete) {
     ::app::RequestLoadState load(3, 7);
-    ASSERT_FALSE((load.ActiveConnections() != 0 || load.PressureIdleTimeout() != 0));
     {
         ::app::RequestLoadState::PhysicalConnectionScope physical(load);
         ::app::RequestLoadState::DispatchScope first(load);
-        ASSERT_FALSE((load.ActiveConnections() != 1 || load.PressureIdleTimeout() != 0));
+        EXPECT_EQ(load.ActiveConnections(), 1u);
+        EXPECT_EQ(load.PressureIdleTimeout(), 0u);
         {
             ::app::RequestLoadState::DispatchScope second(load);
             ::app::RequestLoadState::DispatchScope third(load);
-            ASSERT_FALSE((load.ActiveConnections() != 3 || load.PressureIdleTimeout() != 7));
+            EXPECT_EQ(load.ActiveConnections(), 3u);
+            EXPECT_EQ(load.PressureIdleTimeout(), 7u);
         }
-        ASSERT_FALSE((load.ActiveConnections() != 1 || load.PressureIdleTimeout() != 0));
+        EXPECT_EQ(load.ActiveConnections(), 1u);
+        EXPECT_EQ(load.PressureIdleTimeout(), 0u);
     }
-    ASSERT_FALSE((load.ActiveConnections() != 0));
-    ::app::RequestLoadState one_connection(1, 9);
+    EXPECT_EQ(load.ActiveConnections(), 0u);
+}
+
+TEST(WorkerRequestLoad, PhysicalConnectionReachesPressureThreshold) {
+    ::app::RequestLoadState load(1, 9);
     {
-        ::app::RequestLoadState::PhysicalConnectionScope physical(one_connection);
-        ASSERT_FALSE((one_connection.ActiveConnections() != 1 ||
-            one_connection.PressureIdleTimeout() != 9));
+        ::app::RequestLoadState::PhysicalConnectionScope physical(load);
+        EXPECT_EQ(load.ActiveConnections(), 1u);
+        EXPECT_EQ(load.PressureIdleTimeout(), 9u);
     }
+    EXPECT_EQ(load.ActiveConnections(), 0u);
 }

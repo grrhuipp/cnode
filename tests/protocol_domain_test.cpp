@@ -7,6 +7,7 @@
 #include "proxy/vless/vless_codec.hpp"
 #include "proxy/vmess/encoding/body.hpp"
 #include "proxy/vmess/vmess_crypto.hpp"
+#include "transport/link.hpp"
 
 #include <algorithm>
 #include <array>
@@ -152,7 +153,12 @@ TEST_P(ProtocolDomainTest, TrojanUdpFrame) {
         buf::MultiBuffer input;
         ASSERT_TRUE(buf::AppendSpanToMultiBuffer(wire, input));
         framer.Feed(std::move(input));
-        EXPECT_THROW((void)framer.Next(packet), IoSystemError);
+        try {
+            (void)framer.Next(packet);
+            ADD_FAILURE() << "invalid domain was accepted";
+        } catch (const transport::LinkError& error) {
+            EXPECT_EQ(error.code(), ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
         return;
     }
 
@@ -174,7 +180,7 @@ TEST_P(ProtocolDomainTest, TrojanUdpFrame) {
     EXPECT_TRUE(packet.target.SameEndpoint(TargetAddress("127.0.0.1", 53)));
     EXPECT_EQ(Flatten(packet.payload), std::vector<uint8_t>({0x42}));
     EXPECT_FALSE(framer.Next(packet));
-    EXPECT_NO_THROW(framer.Finish());
+    framer.Finish();
 }
 
 // 与 vmess_udp_datagram_test 的认证失败fixture相同：公开AuthID/AEAD codec

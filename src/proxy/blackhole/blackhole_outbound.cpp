@@ -3,7 +3,6 @@
 #include "common/buf/multi_buffer.hpp"
 #include "common/session.hpp"
 #include "core/constants.hpp"
-#include "infra/json.hpp"
 #include "infra/log.hpp"
 #include "proxy/outbound.hpp"
 
@@ -25,13 +24,10 @@ constexpr std::string_view kHttp403Response =
 
 }  // namespace
 
-struct BlackholeSettings {
-    bool http_response = false;  // response.type == "http"
-};
 
 class Handler final : public Outbound {
 public:
-    explicit Handler(const BlackholeSettings& settings);
+    explicit Handler(const infra::BlackholeSettings& settings);
 
     net::awaitable<OutboundProcessResult> Process(
         session::Context& ctx,
@@ -40,9 +36,7 @@ public:
         const TimeoutsConfig& timeouts,
         StatsShard& stats,
         const RelayConfig& relay_config,
-        buf::MultiBufferBatch first_payload,
-        std::chrono::seconds relay_idle_timeout,
-        std::chrono::seconds relay_write_timeout) override;
+        buf::MultiBufferBatch first_payload) override;
 
 private:
     bool http_response_;
@@ -52,7 +46,7 @@ private:
 // Handler 实现
 // ============================================================================
 
-Handler::Handler(const BlackholeSettings& settings)
+Handler::Handler(const infra::BlackholeSettings& settings)
     : http_response_(settings.http_response) {
 }
 
@@ -63,9 +57,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     const TimeoutsConfig& /*timeouts*/,
     StatsShard& /*stats*/,
     const RelayConfig& /*relay_config*/,
-    buf::MultiBufferBatch first_payload,
-    std::chrono::seconds /*relay_idle_timeout*/,
-    std::chrono::seconds /*relay_write_timeout*/) {
+    buf::MultiBufferBatch first_payload) {
     first_payload.clear();
     const bool send_http =
         http_response_ && ctx.content.network == Network::TCP && inbound.writer;
@@ -93,37 +85,17 @@ const bool kBlackholeRegistered = (::proxyman::outbound::RegisterProxy(
     ::constants::protocol::kBlackhole,
     [](const ::infra::OutboundSourceConfig& cfg)
         -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
-        ::proxy::blackhole::outbound::BlackholeSettings settings;
-        if (const auto* p = cfg.settings.if_contains("response")) {
-            // Xray 格式: {"response": {"type": "http"}}；未知类型或错误类型拒绝加载。
-            if (!p->is_object()) {
-                LOG_ERROR("blackhole outbound '{}': response must be an object", cfg.tag);
-                return std::nullopt;
-            }
-            const auto type = ::ParseJsonString(p->as_object(), "type");
-            if (!type) {
-                LOG_ERROR("blackhole outbound '{}': response {}", cfg.tag, type.error());
-                return std::nullopt;
-            }
-            if (*type) {
-                const std::string value = LowerAscii(**type);
-                if (value == ::constants::protocol::kHttp) {
-                    settings.http_response = true;
-                } else if (value != ::constants::protocol::kNone) {
-                    LOG_ERROR("blackhole outbound '{}': response type must be http or none", cfg.tag);
-                    return std::nullopt;
-                }
-            }
-        }
+        const auto* settings = std::get_if<::infra::BlackholeSettings>(&cfg.settings);
+        if (!settings) return std::nullopt;
         return ::proxyman::outbound::PreparedOutboundProxy{
             .create = ::proxyman::outbound::MakePreparedOutboundCreator<
-                ::proxy::blackhole::outbound::BlackholeSettings,
+                ::infra::BlackholeSettings,
                 +[](std::string_view /*tag*/,
-                    std::shared_ptr<const ::proxy::blackhole::outbound::BlackholeSettings> s,
+                    std::shared_ptr<const ::infra::BlackholeSettings> s,
                     ::net::io_context& /*io_context*/,
                     ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
                     return std::make_unique<::proxy::blackhole::outbound::Handler>(*s);
-                }>(std::move(settings)),
+                }>(*settings),
             .sender = {},
         };
     }), true);

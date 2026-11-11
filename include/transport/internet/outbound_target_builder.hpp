@@ -10,6 +10,7 @@
 #include "common/target_address.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/internet/outbound_bind.hpp"
+#include "transport/internet/outbound_server.hpp"
 #include "transport/internet/stream_settings.hpp"
 #include "transport/internet/transport_security.hpp"
 
@@ -38,13 +39,6 @@ struct OutboundSenderSettings {
     bool passthrough = false;
 };
 
-// A proxy protocol's next hop. The literal form is parsed once on the cold
-// path; a hostname is resolved by the dialer per connection.
-struct OutboundServer {
-    std::string address;
-    std::optional<net::ip::address> literal_address;
-    uint16_t port = 0;
-};
 
 // The one validator for a configured next hop: a non-empty IP literal or DNS
 // hostname and a non-zero port.
@@ -148,15 +142,21 @@ public:
         OutboundBind::Selection v6;
     };
 
+    struct AddressFamilyPolicy {
+        bool accepts_v4 = true;
+        bool accepts_v6 = true;
+        bool prefers_v6 = false;
+        bool preserves_dns_order = true;
+        bool restricts_literals = false;
+    };
+
     // Remote side of a native (transport-less) UDP association.
     struct DatagramRemote {
         // Known remote address; fixes the socket family.
         std::optional<net::ip::address> address;
         // Family hint when the remote is a hostname (e.g. a routing lookup).
         std::optional<net::ip::address> family_hint;
-        bool accepts_v4 = true;
-        bool accepts_v6 = true;
-        bool prefers_v6 = false;
+        AddressFamilyPolicy family_policy;
     };
 
     OutboundDialer(net::io_context& io_context,
@@ -167,7 +167,6 @@ public:
     OutboundDialer& operator=(const OutboundDialer&) = delete;
 
     [[nodiscard]] net::io_context& IoContext() const noexcept { return io_context_; }
-    [[nodiscard]] app::dns::DNS& Dns() const noexcept { return dns_; }
 
     [[nodiscard]] bool Passthrough() const noexcept { return sender_.passthrough; }
     [[nodiscard]] ForwardedMetadataView ForwardedMetadata(
@@ -185,10 +184,9 @@ public:
     Dial(session::Context& ctx, const OutboundServer& server,
          const OrderedBind* ordered = nullptr);
 
-    // Destination already resolved by protocol policy (Freedom domainStrategy);
-    // candidates are tried in the given order.
+    // 直连目标的解析、地址族筛选与尝试顺序由拨号器统一执行。
     [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
-    Dial(session::Context& ctx, std::span<const net::ip::address> addresses, uint16_t port);
+    Dial(session::Context& ctx, const TargetAddress& target, AddressFamilyPolicy policy);
 
     // Native UDP association: selects the sendThrough bind address, constructs
     // Endpoint(io_context, dns, bind_address, args...) and records the egress.
@@ -216,6 +214,9 @@ public:
     void RecordConnected(session::Context& ctx, const AsyncStream& stream) const;
 
 private:
+    [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+    DialAddresses(session::Context& ctx, std::span<const net::ip::address> addresses,
+                  uint16_t port, AddressFamilyPolicy policy);
     [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
     DialTarget(session::Context& ctx, const OutboundTransportTarget& target);
     [[nodiscard]] tl::expected<net::ip::address, ErrorCode> SelectDatagramBind(

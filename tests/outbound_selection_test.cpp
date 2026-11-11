@@ -1,54 +1,50 @@
 #include <gtest/gtest.h>
-
 #include "app/dispatcher/default_dispatcher.hpp"
-
-#include <concepts>
 #include <stdexcept>
+#include <utility>
 
+namespace {
+template <typename Policy>
+concept SelectablePolicy = requires(Policy&& policy) {
+    ::app::dispatcher::detail::SelectOutbound(std::forward<Policy>(policy));
+};
+static_assert(SelectablePolicy<::routing::OutboundSelectionPolicy&>);
+static_assert(SelectablePolicy<const ::routing::OutboundSelectionPolicy&>);
+static_assert(!SelectablePolicy<::routing::OutboundSelectionPolicy>);
+static_assert(!SelectablePolicy<const ::routing::OutboundSelectionPolicy>);
+static_assert(!SelectablePolicy<::routing::ForceOutbound>);
+static_assert(!SelectablePolicy<::routing::ForceOutbound&>);
+static_assert(!SelectablePolicy<::routing::RouteWithFallback>);
+static_assert(!SelectablePolicy<::routing::RouteWithFallback&>);
+}  // namespace
 
-TEST(OutboundSelection, Contract) {
-    using ::app::dispatcher::detail::RequiresRouting;
-    using ::routing::RouteDecision;
-    using ::app::dispatcher::detail::SelectionSource;
-    using ::app::dispatcher::detail::SelectOutbound;
+TEST(OutboundSelection, RejectsEmptyForcedAndFallbackTags) {
+    EXPECT_THROW((void)::routing::ForceOutbound(""), std::invalid_argument);
+    EXPECT_THROW((void)::routing::RouteWithFallback(""), std::invalid_argument);
+}
 
-    try {
-        (void)::routing::ForceOutbound("");
-        FAIL() << "empty forced outbound tag must be rejected";
-    } catch (const std::invalid_argument&) {
-    }
-    try {
-        (void)::routing::RouteWithFallback("");
-        FAIL() << "empty route fallback tag must be rejected";
-    } catch (const std::invalid_argument&) {
-    }
+TEST(OutboundSelection, ForcedTagOverridesMatchedRoute) {
+    // Selection borrows the variant's tag, not the converting policy temporary.
+    const ::routing::OutboundSelectionPolicy policy = ::routing::ForceOutbound("direct");
+    EXPECT_FALSE(::app::dispatcher::detail::RequiresRouting(policy));
+    const auto selected = ::app::dispatcher::detail::SelectOutbound(
+        policy, ::routing::RouteDecision{.outbound_tag = "blocked", .matched = true});
+    EXPECT_EQ(selected.outbound_tag, "direct");
+    EXPECT_EQ(selected.source, ::app::dispatcher::detail::SelectionSource::Forced);
+}
 
-    const ::routing::OutboundSelectionPolicy forced =
-        ::routing::ForceOutbound("direct");
-    ASSERT_FALSE((RequiresRouting(forced)));
-    const auto forced_selection = SelectOutbound(
-        forced,
-        RouteDecision{
-            .outbound_tag = "blocked",
-            .matched = true,
-        });
-    ASSERT_FALSE((forced_selection.outbound_tag != "direct" ||
-        forced_selection.source != SelectionSource::Forced));
+TEST(OutboundSelection, MatchedRuleOverridesFallback) {
+    const ::routing::OutboundSelectionPolicy policy = ::routing::RouteWithFallback("panel-direct");
+    EXPECT_TRUE(::app::dispatcher::detail::RequiresRouting(policy));
+    const auto selected = ::app::dispatcher::detail::SelectOutbound(
+        policy, ::routing::RouteDecision{.outbound_tag = "proxy", .matched = true});
+    EXPECT_EQ(selected.outbound_tag, "proxy");
+    EXPECT_EQ(selected.source, ::app::dispatcher::detail::SelectionSource::Rule);
+}
 
-    const ::routing::OutboundSelectionPolicy routed =
-        ::routing::RouteWithFallback("panel-direct");
-    ASSERT_FALSE((!RequiresRouting(routed)));
-    const auto rule_selection = SelectOutbound(
-        routed,
-        RouteDecision{
-            .outbound_tag = "proxy",
-            .matched = true,
-        });
-    ASSERT_FALSE((rule_selection.outbound_tag != "proxy" ||
-        rule_selection.source != SelectionSource::Rule));
-
-    const auto fallback_selection = SelectOutbound(routed);
-    ASSERT_FALSE((fallback_selection.outbound_tag != "panel-direct" ||
-        fallback_selection.source != SelectionSource::Fallback));
-
+TEST(OutboundSelection, MissingRuleUsesFallback) {
+    const ::routing::OutboundSelectionPolicy policy = ::routing::RouteWithFallback("panel-direct");
+    const auto selected = ::app::dispatcher::detail::SelectOutbound(policy);
+    EXPECT_EQ(selected.outbound_tag, "panel-direct");
+    EXPECT_EQ(selected.source, ::app::dispatcher::detail::SelectionSource::Fallback);
 }

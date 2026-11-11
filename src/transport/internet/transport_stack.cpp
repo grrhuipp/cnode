@@ -295,6 +295,7 @@ net::awaitable<TransportBuildResult> ConnectOutboundSecurity(
 // HTTP/2 prior knowledge is recognized by the full client preface; anything
 // else is served as HTTP/1 with the sniffed bytes as the start of the request.
 net::awaitable<TransportBuildResult> DoHttpServerHandshake(
+    GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
     const HttpConfig& cfg,
     net::io_context& io_context,
@@ -320,7 +321,7 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
 
     if (std::string_view(unsafe::ptr_cast<const char>(first.data()), total) ==
         kHttp2ClientPreface) {
-        co_return co_await transport::internet::RunHttp2ServerSession(
+        co_return co_await transport::internet::RunHttp2ServerSession(coordinator, 
             std::move(stream),
             cfg,
             xhttp_config,
@@ -331,7 +332,7 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
 
     const std::span<const uint8_t> initial(first.data(), total);
     if (xhttp_config) {
-        co_return co_await transport::internet::DoXHttp1ServerHandshake(
+        co_return co_await transport::internet::DoXHttp1ServerHandshake(coordinator, 
             io_context,
             std::move(stream),
             cfg,
@@ -379,6 +380,7 @@ void LogLayerFailure(uint64_t conn_id, std::string_view layer, ErrorCode error) 
 }  // namespace
 
 net::awaitable<TransportBuildResult> BuildInboundTransport(
+    GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> raw,
     const StreamSettings& s,
@@ -410,7 +412,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
 
     // 2. gRPC 层（服务端）
     if (s.IsGrpc()) {
-        auto grpc_result = co_await transport::internet::DoGrpcServerHandshake(
+        auto grpc_result = co_await transport::internet::DoGrpcServerHandshake(coordinator, 
             std::move(stream),
             s.grpc,
             io_context,
@@ -425,7 +427,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
 
     // 3. HTTP / h2 层（服务端）
     if (s.IsHttp()) {
-        auto http_result = co_await DoHttpServerHandshake(
+        auto http_result = co_await DoHttpServerHandshake(coordinator, 
             std::move(stream),
             s.http,
             io_context,
@@ -444,7 +446,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
     if (s.IsXHttp()) {
         // Outlives the HTTP/2 session, which borrows it until the call returns.
         const HttpConfig http = transport::internet::XHttpStreamOneHttpConfig(s.xhttp, false);
-        auto xhttp_result = co_await DoHttpServerHandshake(
+        auto xhttp_result = co_await DoHttpServerHandshake(coordinator, 
             std::move(stream),
             http,
             io_context,

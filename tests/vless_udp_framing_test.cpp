@@ -16,9 +16,7 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <future>
-#include <iostream>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -27,16 +25,6 @@
 namespace {
 
 
-[[noreturn]] void Fail(std::string_view message) {
-    std::cerr << message << '\n';
-    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
-}
-
-void Check(bool condition, std::string_view message) {
-    if (!condition) {
-        Fail(message);
-    }
-}
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
     std::vector<uint8_t> out;
@@ -88,29 +76,28 @@ void Run(Factory&& factory) {
 buf::MultiBuffer MakeDatagram(const std::vector<uint8_t>& source,
                               const TargetAddress& target) {
     buf::MultiBuffer payload;
-    Check(buf::AppendSpanToMultiBuffer(source, payload),
-          "failed to allocate VLESS UDP test payload");
-    Check(buf::SetUdpTarget(payload, target),
-          "failed to tag VLESS UDP test payload");
+    EXPECT_TRUE((buf::AppendSpanToMultiBuffer(source, payload))) << "failed to allocate VLESS UDP test payload";
+    EXPECT_TRUE((buf::SetUdpTarget(payload, target))) << "failed to tag VLESS UDP test payload";
     return payload;
 }
 buf::MultiBuffer MakeInput(std::span<const uint8_t> bytes) {
     buf::MultiBuffer input;
-    Check(buf::AppendSpanToMultiBuffer(bytes, input), "input allocation failed");
+    EXPECT_TRUE((buf::AppendSpanToMultiBuffer(bytes, input))) << "input allocation failed";
     return input;
 }
 
 template <typename Fn>
-void CheckRejected(Fn&& fn, std::string_view message,
-                   ErrorCode expected = ErrorCode::PROTOCOL_DECODE_FAILED) {
-    bool rejected = false;
-    try { fn(); } catch (const transport::LinkError& error) {
-        rejected = error.code() == expected;
+void ExpectLinkError(Fn&& fn, std::string_view message,
+                     ErrorCode expected = ErrorCode::PROTOCOL_DECODE_FAILED) {
+    try {
+        fn();
+        ADD_FAILURE() << message;
+    } catch (const transport::LinkError& error) {
+        EXPECT_EQ(error.code(), expected) << message;
     }
-    Check(rejected, message);
 }
 
-void CheckFrameBoundaries() {
+TEST(VlessUdpFraming, FragmentedEmptyAndDataFramesPreserveBoundaries) {
     const std::array<uint8_t, 9> wire{0, 0, 0, 2, 0x11, 0x22, 0, 1, 0x33};
     for (size_t split = 0; split <= wire.size(); ++split) {
         vless::UdpFramer framer(false);
@@ -130,37 +117,39 @@ void CheckFrameBoundaries() {
             decoded.insert(decoded.end(), bytes.begin(), bytes.end());
         }
         framer.Finish();
-        Check(decoded == std::vector<uint8_t>({0x11, 0x22, 0x33}),
-              "zero length frame damaged a following frame");
-        Check(sizes == std::vector<size_t>({0, 2, 1}),
-              "VLESS UDP lost an empty datagram boundary");
+        EXPECT_EQ((decoded), (std::vector<uint8_t>({0x11, 0x22, 0x33}))) << "zero length frame damaged a following frame";
+        EXPECT_EQ((sizes), (std::vector<size_t>({0, 2, 1}))) << "VLESS UDP lost an empty datagram boundary";
     }
-    for (size_t cut : {size_t{1}, size_t{2}, size_t{3}}) {
-        vless::UdpFramer framer(false);
-        framer.Feed(MakeInput(std::span(wire).subspan(2, cut)));
-        vless::FramedUdpPacket packet;
-        (void)framer.Next(packet);
-        CheckRejected([&] { framer.Finish(); }, "truncated frame accepted as EOF");
-    }
+}
+
+TEST(VlessUdpFraming, MalformedPacketAddressCannotResynchronize) {
     vless::UdpFramer invalid(true);
     const std::array<uint8_t, 6> malformed{0, 1, 0xff, 0, 1, 0x42};
     invalid.Feed(MakeInput(malformed));
     vless::FramedUdpPacket packet;
-    CheckRejected([&] { (void)invalid.Next(packet); }, "invalid address accepted");
-    CheckRejected([&] { (void)invalid.Next(packet); }, "invalid stream resynchronized");
+    ExpectLinkError([&] { (void)invalid.Next(packet); }, "invalid address accepted");
+    ExpectLinkError([&] { (void)invalid.Next(packet); }, "invalid stream resynchronized");
     vless::UdpFramer missing_address(true);
     const std::array<uint8_t, 2> no_address{0, 0};
     missing_address.Feed(MakeInput(no_address));
-    CheckRejected([&] { (void)missing_address.Next(packet); },
+    ExpectLinkError([&] { (void)missing_address.Next(packet); },
                   "packet-address segment without an address became a UDP message");
 
+}
+
+TEST(VlessUdpFraming, PendingInputOverflowPermanentlyRetiresFramer) {
+    vless::FramedUdpPacket packet;
     vless::UdpFramer bounded(false);
     const std::vector<uint8_t> excess(buf::kPacketStreamPendingLimit + 1, 0);
-    CheckRejected([&] { bounded.Feed(MakeInput(excess)); }, "unbounded retained input");
-    CheckRejected([&] { (void)bounded.Next(packet); }, "overflow stream recovered");
-    CheckRejected([&] { bounded.Feed({}); }, "overflow stream accepted more input");
-    CheckRejected([&] { bounded.Finish(); }, "overflow stream accepted clean EOF");
+    ExpectLinkError([&] { bounded.Feed(MakeInput(excess)); }, "unbounded retained input");
+    ExpectLinkError([&] { (void)bounded.Next(packet); }, "overflow stream recovered");
+    ExpectLinkError([&] { bounded.Feed({}); }, "overflow stream accepted more input");
+    ExpectLinkError([&] { bounded.Finish(); }, "overflow stream accepted clean EOF");
 
+}
+
+TEST(VlessUdpFraming, MaximumPayloadDecodesFromOneByteFragments) {
+    vless::FramedUdpPacket packet;
     const std::vector<uint8_t> maximum(65535, 0x71);
     std::vector<uint8_t> large{0xff, 0xff};
     large.insert(large.end(), maximum.begin(), maximum.end());
@@ -168,12 +157,11 @@ void CheckFrameBoundaries() {
     for (const auto byte : large) {
         fragmented.Feed(MakeInput(std::span<const uint8_t>(&byte, 1)));
     }
-    Check(fragmented.Next(packet) && Flatten(packet.payload) == maximum,
-          "one-byte fragments failed at maximum wire length");
+    EXPECT_TRUE((fragmented.Next(packet) && Flatten(packet.payload) == maximum)) << "one-byte fragments failed at maximum wire length";
     fragmented.Finish();
 }
 
-void CheckCancelledReadPreservesFrame() {
+TEST(VlessUdpFraming, CancelledReadPreservesPartialFrame) {
     net::io_context io;
     tcp::acceptor listener(io, tcp::endpoint(net::ip::address_v4::loopback(), 0));
     tcp::socket sender(io);
@@ -187,19 +175,18 @@ void CheckCancelledReadPreservesFrame() {
         co_await net::async_read(receiver, net::buffer(bytes.data(), 1), net::use_awaitable);
         framer.Feed(MakeInput(std::span(bytes).first(1)));
         vless::FramedUdpPacket packet;
-        Check(!framer.Next(packet), "partial frame delivered before cancellation");
+        EXPECT_FALSE((framer.Next(packet))) << "partial frame delivered before cancellation";
         net::post(io, [&] { receiver.cancel(); });
         IoErrorCode ec;
         (void)co_await receiver.async_read_some(
             net::buffer(bytes), net::redirect_error(net::use_awaitable, ec));
-        Check(ec == net::error::operation_aborted, "socket read was not cancelled");
+        EXPECT_EQ((ec), (net::error::operation_aborted)) << "socket read was not cancelled";
         net::write(sender, net::buffer(wire.data() + 1, wire.size() - 1));
         co_await net::async_read(receiver, net::buffer(bytes.data(), 4), net::use_awaitable);
         framer.Feed(MakeInput(std::span(bytes).first(4)));
-        Check(framer.Next(packet) &&
-                  Flatten(packet.payload) == std::vector<uint8_t>({0x11, 0x22, 0x33}),
-              "cancelled read lost retained VLESS bytes");
-        Check(!framer.Next(packet), "cancelled read duplicated VLESS bytes");
+        EXPECT_TRUE((framer.Next(packet) &&
+                  Flatten(packet.payload) == std::vector<uint8_t>({0x11, 0x22, 0x33}))) << "cancelled read lost retained VLESS bytes";
+        EXPECT_FALSE((framer.Next(packet))) << "cancelled read duplicated VLESS bytes";
         framer.Finish();
     }, net::use_future);
     io.run();
@@ -226,17 +213,13 @@ void CheckDecoded(const std::vector<uint8_t>& wire,
     }
 
     vless::FramedUdpPacket decoded;
-    Check(framer.Next(decoded), "fragmented VLESS UDP datagram was not decoded");
-    Check(decoded.target.has_value() == packet_addr,
-          "VLESS packet-address target presence mismatch");
+    ASSERT_TRUE(framer.Next(decoded));
+    ASSERT_EQ(decoded.target.has_value(), packet_addr);
     if (packet_addr) {
-        Check(decoded.target->SameEndpoint(target),
-              "VLESS packet-address target mismatch");
+        EXPECT_TRUE((decoded.target->SameEndpoint(target))) << "VLESS packet-address target mismatch";
     }
-    Check(decoded.payload.size() > 1 && Flatten(decoded.payload) == source,
-          "VLESS UDP framer truncated multi-buffer payload");
-    Check(!framer.Next(decoded),
-          "one VLESS UDP datagram produced multiple logical packets");
+    EXPECT_TRUE((decoded.payload.size() > 1 && Flatten(decoded.payload) == source)) << "VLESS UDP framer truncated multi-buffer payload";
+    EXPECT_FALSE((framer.Next(decoded))) << "one VLESS UDP datagram produced multiple logical packets";
     framer.Finish();
 }
 
@@ -270,30 +253,23 @@ void CheckEmptyDatagramRoundTrip(bool packet_addr) {
         co_await vless::WriteUdpDatagram(
             capture, target, packet_addr, std::span<const net::const_buffer>{});
     });
-    Check(capture.bytes.size() == (packet_addr ? 28 : 7),
-          "VLESS UDP empty datagrams did not write real frame headers");
+    EXPECT_EQ((capture.bytes.size()), ((packet_addr ? 28 : 7))) << "VLESS UDP empty datagrams did not write real frame headers";
     FragmentReader source(capture.bytes);
     vless::UdpFramer framer(packet_addr);
     ::Run([&]() -> net::awaitable<void> {
         for (const size_t size : {size_t{0}, size_t{1}, size_t{0}}) {
             auto packet = co_await framer.ReadDatagram(source, target);
             const auto datagram = buf::InspectUdpDatagram(packet);
-            Check(datagram.Valid() && datagram.payload_size == size &&
-                      datagram.target->SameEndpoint(target),
-                  "VLESS UDP empty/data sequence became EOF or lost its target");
-            if (size != 0) Check(Flatten(packet) == data, "VLESS UDP payload changed");
+            EXPECT_TRUE((datagram.Valid() && datagram.payload_size == size &&
+                      datagram.target->SameEndpoint(target))) << "VLESS UDP empty/data sequence became EOF or lost its target";
+            if (size != 0) EXPECT_EQ((Flatten(packet)), (data)) << "VLESS UDP payload changed";
         }
-        Check((co_await framer.ReadDatagram(source, target)).empty(),
-              "VLESS UDP clean stream EOF became an empty datagram");
+        EXPECT_TRUE(((co_await framer.ReadDatagram(source, target)).empty())) << "VLESS UDP clean stream EOF became an empty datagram";
     });
 }
 }  // namespace
 
-TEST(VlessUdpFraming, Contract) {
-    CheckFrameBoundaries();
-    CheckCancelledReadPreservesFrame();
-    CheckEmptyDatagramRoundTrip(false);
-    CheckEmptyDatagramRoundTrip(true);
+TEST(VlessUdpFraming, LargeDatagramAndScatterWritePreserveMessageBoundary) {
     const TargetAddress target("1.1.1.1", 53);
     const std::vector<uint8_t> source(buf::Buffer::kSize + 257, 0x6d);
 
@@ -303,11 +279,10 @@ TEST(VlessUdpFraming, Contract) {
         co_await vless::WriteUdpDatagram(
             fixed_capture, std::move(fixed_payload), false);
     });
-    Check(fixed_capture.bytes.size() == source.size() + 2 &&
+    EXPECT_TRUE((fixed_capture.bytes.size() == source.size() + 2 &&
               fixed_capture.bytes[0] == static_cast<uint8_t>(source.size() >> 8) &&
               fixed_capture.bytes[1] == static_cast<uint8_t>(source.size()) &&
-              std::equal(source.begin(), source.end(), fixed_capture.bytes.begin() + 2),
-          "large VLESS UDP datagram was split or malformed");
+              std::equal(source.begin(), source.end(), fixed_capture.bytes.begin() + 2))) << "large VLESS UDP datagram was split or malformed";
     CheckDecoded(fixed_capture.bytes, false, target, source);
 
     CaptureWriter packet_addr_capture;
@@ -329,20 +304,31 @@ TEST(VlessUdpFraming, Contract) {
         co_await vless::WriteUdpDatagram(
             scatter_capture, target, false, scatter);
     });
-    Check(scatter_capture.bytes == fixed_capture.bytes,
-          "scatter VLESS UDP payload was split into multiple frames");
+    EXPECT_EQ((scatter_capture.bytes), (fixed_capture.bytes)) << "scatter VLESS UDP payload was split into multiple frames";
 
+}
+
+TEST(VlessUdpFraming, OversizedDatagramDoesNotWritePartialFrame) {
+    const TargetAddress target("1.1.1.1", 53);
     const std::vector<uint8_t> oversized(65536, 0x42);
     const std::array<net::const_buffer, 1> oversized_buffers{net::buffer(oversized)};
     CaptureWriter rejected_capture;
-    CheckRejected([&] {
+    ExpectLinkError([&] {
         ::Run([&]() -> net::awaitable<void> {
             co_await vless::WriteUdpDatagram(
                 rejected_capture, target, false, oversized_buffers);
         });
     }, "oversized VLESS datagram accepted", ErrorCode::PROTOCOL_ENCODE_FAILED);
-    Check(rejected_capture.bytes.empty(), "oversized VLESS datagram partially written");
+    EXPECT_TRUE((rejected_capture.bytes.empty())) << "oversized VLESS datagram partially written";
 
+}
+
+TEST(VlessUdpFraming, FixedAddressEmptyDatagramsAreNotEof) {
+    CheckEmptyDatagramRoundTrip(false);
+}
+
+TEST(VlessUdpFraming, PacketAddressEmptyDatagramsAreNotEof) {
+    CheckEmptyDatagramRoundTrip(true);
 }
 
 TEST(VlessUdpFraming, TruncatedEofCannotResume) {
@@ -391,9 +377,8 @@ TEST(VlessUdpFraming, ReadEofDoesNotConsumeAnotherTransport) {
     fresh_peer.shutdown(tcp::socket::shutdown_send);
     vless::UdpFramer framer(false);
     auto result = net::co_spawn(io, [&]() -> net::awaitable<void> {
-        Check((co_await framer.ReadDatagram(ended, target)).empty(), "clean EOF produced a datagram");
-        Check((co_await framer.ReadDatagram(fresh, target)).empty(),
-              "finished VLESS framer consumed another transport");
+        EXPECT_TRUE(((co_await framer.ReadDatagram(ended, target)).empty())) << "clean EOF produced a datagram";
+        EXPECT_TRUE(((co_await framer.ReadDatagram(fresh, target)).empty())) << "finished VLESS framer consumed another transport";
         std::vector<uint8_t> retained;
         for (;;) {
             auto input = co_await fresh.ReadMultiBuffer();
@@ -401,8 +386,7 @@ TEST(VlessUdpFraming, ReadEofDoesNotConsumeAnotherTransport) {
             const auto bytes = Flatten(input);
             retained.insert(retained.end(), bytes.begin(), bytes.end());
         }
-        Check(retained == std::vector<uint8_t>(wire.begin(), wire.end()),
-              "finished VLESS framer changed another transport's bytes");
+        EXPECT_EQ((retained), (std::vector<uint8_t>(wire.begin(), wire.end()))) << "finished VLESS framer changed another transport's bytes";
     }, net::use_future);
     io.run();
     result.get();
@@ -428,7 +412,7 @@ TEST(VlessUdpFraming, EmptyDatagramAllocationFailureRetiresFramer) {
             throw;
         }
         memory::reject_next_process_allocation = false;
-        Check(failed, "empty VLESS datagram allocation failure was hidden");
+        EXPECT_TRUE((failed)) << "empty VLESS datagram allocation failure was hidden";
     });
     EXPECT_THROW(framer.Feed(MakeInput(next_wire)), transport::LinkError);
     vless::FramedUdpPacket packet;

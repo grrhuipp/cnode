@@ -23,10 +23,10 @@
 #include <asio/this_coro.hpp>
 #include <array>
 #include <chrono>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <tuple>
+#include <utility>
 
 namespace {
 // Armed together with memory::reject_next_process_allocation; whichever
@@ -35,7 +35,6 @@ namespace {
 thread_local bool fail_next_allocation = false;
 thread_local size_t operator_new_failures = 0;
 thread_local size_t armed_process_rejections = 0;
-thread_local size_t failed_allocation_size = 0;
 
 void ArmNextAllocationFailure() {
     fail_next_allocation = true;
@@ -59,7 +58,8 @@ void FailArmedAllocation(std::size_t size) {
     }
     if (fail_next_allocation) {
         DisarmAllocationFailure();
-        ++operator_new_failures; failed_allocation_size = size; throw std::bad_alloc();
+        ++operator_new_failures;
+        throw std::bad_alloc();
     }
 }
 }
@@ -78,8 +78,6 @@ struct QueueScenario {
     std::vector<uint8_t> wire_payload;
     std::vector<uint8_t> received;
     std::vector<size_t> datagram_sizes;
-    std::vector<const void*> read_addresses;
-    std::vector<const void*> delivered_addresses;
     size_t queued_blocks = 0;
     bool snapshot = false;
     std::unique_ptr<net::steady_timer> consumer_gate;
@@ -301,9 +299,6 @@ public:
             wire_->RaiseIoFault();
         }
         const auto count = std::min(output.size(), wire_->input.size() - wire_->offset);
-        if (wire_->queue && wire_->queue->mode == 1 && count >= 4096) {
-            wire_->queue->read_addresses.push_back(output.data());
-        }
         std::memcpy(output.data(), wire_->input.data() + wire_->offset, count);
         wire_->offset += count;
         if (wire_->fail_on_header && count == 7) {
@@ -447,7 +442,6 @@ public:
             }
             for (const auto* block : bytes) {
                 queue_scenario->received.insert(queue_scenario->received.end(), block->Bytes().begin(), block->Bytes().end());
-                queue_scenario->delivered_addresses.push_back(block->Bytes().data());
             }
             if (queue_scenario->mode == 9 && queue_scenario->received.size() == 65535) {
                 auto& wire = *dialed[0];
@@ -482,8 +476,40 @@ net::awaitable<DialResult> DialOutboundTransport(net::io_context& io, session::C
 }
 
 namespace {
+template <typename Cleanup>
+class CleanupGuard {
+public:
+    explicit CleanupGuard(Cleanup cleanup) : cleanup_(std::move(cleanup)) {}
+    ~CleanupGuard() { cleanup_(); }
+private:
+    Cleanup cleanup_;
+};
+
+class AnyTlsLifecycleTest : public testing::Test {
+protected:
+    void SetUp() override {
+        peak_ = memory::detail::test_buffers_peak;
+        ResetHooks();
+    }
+    void TearDown() override {
+        ResetHooks();
+        memory::detail::test_buffers_peak = peak_;
+    }
+private:
+    static void ResetHooks() {
+        DisarmAllocationFailure();
+        queue_scenario = nullptr;
+        open_order_scenario = nullptr;
+        client_padding_probe = false;
+        fail_first_session = respond_on_auth = false;
+        io_fault_mode = io_fault_kind = 0;
+        dialed.clear();
+    }
+    size_t peak_ = 0;
+};
+
 // The Worker joins resident physical tasks after its request owners finish.
-// Returns whether AsyncJoin completed without failure before the deadline.
+// Do not abandon completion callbacks borrowing the caller's stack.
 bool JoinResidentTasks(net::io_context& io, ResidentTaskGroup& tasks) {
     bool done = false;
     std::exception_ptr failure;
@@ -492,8 +518,7 @@ bool JoinResidentTasks(net::io_context& io, ResidentTaskGroup& tasks) {
         done = true;
     });
     io.restart();
-    const auto deadline = std::chrono::steady_clock::now() + 2s;
-    while (!done && io.run_one_until(deadline) != 0) {}
+    io.run();
     return done && !failure;
 }
 
@@ -513,7 +538,7 @@ OutboundServer LoopbackServer() {
     };
 }
 
-bool RunClientPadding() {
+void RunClientPadding() {
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
@@ -521,7 +546,7 @@ bool RunClientPadding() {
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
     ResidentTaskGroup tasks(io.get_executor());
-    proxy::anytls::outbound::Settings settings;
+    infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 60s;
     settings.idle_session_timeout = 60s;
@@ -529,7 +554,7 @@ bool RunClientPadding() {
     auto make_handler = [&] {
         return std::make_unique<proxy::anytls::outbound::Handler>(
             "same-client-tag", io,
-            std::make_shared<const proxy::anytls::outbound::Settings>(settings),
+            std::make_shared<const infra::AnyTlsSettings>(settings),
             tasks.Tasks());
     };
     auto handler = make_handler();
@@ -549,10 +574,11 @@ bool RunClientPadding() {
         StatsShard stats;
         TimeoutsConfig timeouts;
         RelayConfig config;
+        config.idle_timeout = config.write_timeout = 10s;
         config.uplink_only = config.downlink_only = 5s;
         co_return co_await active.Process(ctx,
             {&clients[index], &clients[index], nullptr}, outbound.dialer, timeouts,
-            stats, config, {}, 10s, 10s);
+            stats, config, {});
     };
     auto start = [&](proxy::anytls::outbound::Handler& active, size_t index) {
         net::co_spawn(io, request(active, index), net::bind_cancellation_slot(cancellations[index].slot(),
@@ -564,56 +590,83 @@ bool RunClientPadding() {
         io.restart();
         io.poll();
     };
+    std::unique_ptr<proxy::anytls::outbound::Handler> replacement;
+    CleanupGuard cleanup([&] {
+        DisarmAllocationFailure();
+        for (auto& cancellation : cancellations) cancellation.emit(net::cancellation_type::all);
+        replacement.reset();
+        handler.reset();
+        for (const auto& wire : dialed) {
+            wire->closed = true;
+            wire->wake.cancel();
+            wire->open_gate.cancel();
+        }
+        (void)JoinResidentTasks(io, tasks);
+        io.restart();
+        io.run();
+    });
     start(*handler, 0);
-    bool passed = dialed.size() == 1 && !done[0] && clients[0].received == 5;
+    EXPECT_EQ(dialed.size(), 1);
+    EXPECT_FALSE(done[0]);
+    EXPECT_EQ(clients[0].received, 5);
     start(*handler, 1);
-    passed &= dialed.size() == 2 && done[1] && !failed[1] && errors[1] == ErrorCode::OK;
-    const auto matches = [](const Wire& wire, uint16_t auth, std::string_view digest) {
-        return wire.auth_padding == auth && wire.client_settings ==
-            "v=2\nclient=cnode\npadding-md5=" + std::string(digest);
-    };
+    EXPECT_EQ(dialed.size(), 2);
+    EXPECT_TRUE(done[1]);
+    EXPECT_FALSE(failed[1]);
+    EXPECT_EQ(errors[1], ErrorCode::OK);
     if (dialed.size() == 2) {
-        passed &= matches(*dialed[0], 30, "75cff2ad89aadf5e257059ee571ebe11");
-        passed &= dialed[1]->auth_update_seen && matches(*dialed[1], 45, "52a2071298e4ff6f3bad08249a70a53c");
-        passed &= dialed[1]->padding_lengths == std::vector<size_t>{160};
+        {
+            EXPECT_TRUE(dialed[1]->auth_update_seen);
+            EXPECT_EQ(dialed[1]->auth_padding, 45);
+        }
+        EXPECT_EQ(dialed[1]->padding_lengths, (std::vector<size_t>{160}));
         dialed[1]->Frame(anytls::kCmdAlert, 0, "fresh session required");
         dialed[1]->wake.cancel();
         io.restart();
         io.run_for(40ms);
     }
     start(*handler, 2);
-    passed &= dialed.size() == 3 && done[2] && !failed[2] && errors[2] == ErrorCode::OK;
+    EXPECT_EQ(dialed.size(), 3);
+    EXPECT_TRUE(done[2]);
+    EXPECT_FALSE(failed[2]);
+    EXPECT_EQ(errors[2], ErrorCode::OK);
     if (dialed.size() == 3) {
-        passed &= matches(*dialed[2], 91, "75051a2e7a47cba8affd2d07cbe8d0c8");
-        passed &= dialed[2]->padding_lengths == std::vector<size_t>{224};
+        {
+            EXPECT_EQ(dialed[2]->auth_padding, 91);
+        }
+        EXPECT_EQ(dialed[2]->padding_lengths, (std::vector<size_t>{224}));
     }
     cancellations[0].emit(net::cancellation_type::all);
     io.restart();
     io.poll();
-    passed &= done[0] && !failed[0] && errors[0] == ErrorCode::CANCELLED;
+    EXPECT_TRUE(done[0]);
+    EXPECT_FALSE(failed[0]);
+    EXPECT_EQ(errors[0], ErrorCode::CANCELLED);
     handler.reset();
     const bool retired_during_cleanup = std::any_of(dialed.begin(), dialed.end(),
         [](const auto& wire) { return wire->closed && !wire->destroyed; });
-    auto replacement = make_handler();
+    replacement = make_handler();
     start(*replacement, 3);
-    passed &= dialed.size() == 4 && done[3] && !failed[3] && errors[3] == ErrorCode::OK;
+    EXPECT_EQ(dialed.size(), 4);
+    EXPECT_TRUE(done[3]);
+    EXPECT_FALSE(failed[3]);
+    EXPECT_EQ(errors[3], ErrorCode::OK);
     if (dialed.size() == 4)
-        passed &= matches(*dialed[3], 30, "75cff2ad89aadf5e257059ee571ebe11");
+        {
+            EXPECT_EQ(dialed[3]->auth_padding, dialed[0]->auth_padding);
+        }
     replacement.reset();
     const bool join_completed = JoinResidentTasks(io, tasks);
     const bool joined = join_completed && std::all_of(dialed.begin(), dialed.end(),
         [](const auto& wire) { return wire->closed && wire->destroyed && wire->active_reads == 0; });
-    passed &= retired_during_cleanup && joined && std::all_of(done.begin(), done.end(), [](bool value) { return value; });
-    std::printf("client-padding connections=%zu during-auth=%d retired-cleanup=%d joined=%d auth=",
-        dialed.size(), dialed.size() > 1 && dialed[1]->auth_update_seen, retired_during_cleanup, joined);
-    for (const auto& wire : dialed) std::printf("%u,", unsigned(wire->auth_padding));
-    std::printf(" %s\n", passed ? "PASS" : "FAIL");
+    EXPECT_TRUE(retired_during_cleanup);
+    EXPECT_TRUE(joined);
+    EXPECT_TRUE(std::all_of(done.begin(), done.end(), [](bool value) { return value; }));
     dialed.clear();
     client_padding_probe = false;
-    return passed;
 }
 
-bool RunOpenOrder(int mode, bool before) {
+void RunOpenOrder(int mode, bool before) {
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
@@ -621,7 +674,7 @@ bool RunOpenOrder(int mode, bool before) {
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
     ResidentTaskGroup tasks(io.get_executor());
-    proxy::anytls::outbound::Settings settings;
+    infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 60s;
     settings.idle_session_timeout = 60s;
@@ -630,7 +683,7 @@ bool RunOpenOrder(int mode, bool before) {
     open_order_scenario = &scenario;
     dialed.clear();
     auto handler = std::make_unique<proxy::anytls::outbound::Handler>("open-order", io,
-        std::make_shared<const proxy::anytls::outbound::Settings>(settings),
+        std::make_shared<const infra::AnyTlsSettings>(settings),
         tasks.Tasks());
     auto request = [&](Client& client, session::Context& ctx) -> net::awaitable<OutboundProcessResult> {
         ctx.outbound.target = TargetAddress("192.0.2.1", 443);
@@ -638,9 +691,10 @@ bool RunOpenOrder(int mode, bool before) {
         StatsShard stats;
         TimeoutsConfig timeouts;
         RelayConfig config;
+        config.idle_timeout = config.write_timeout = 10s;
         config.uplink_only = config.downlink_only = 5s;
         co_return co_await handler->Process(ctx,
-            {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {}, 10s, 10s);
+            {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {});
     };
     Client warm, tested, recovery;
     session::Context warm_ctx, tested_ctx, recovery_ctx;
@@ -648,11 +702,29 @@ bool RunOpenOrder(int mode, bool before) {
     ErrorCode observed = ErrorCode::OK;
     std::exception_ptr failure;
     net::cancellation_signal cancel;
+    CleanupGuard cleanup([&] {
+        DisarmAllocationFailure();
+        cancel.emit(net::cancellation_type::all);
+        handler.reset();
+        for (const auto& wire : dialed) {
+            wire->closed = true;
+            wire->wake.cancel();
+            wire->open_gate.cancel();
+        }
+        (void)JoinResidentTasks(io, tasks);
+        io.restart();
+        io.run();
+    });
     net::co_spawn(io, request(warm, warm_ctx), [&](std::exception_ptr error, OutboundProcessResult result) {
-        warm_done = !error && result && result->error == ErrorCode::OK && warm.received == 5;
+        EXPECT_FALSE(error);
+        EXPECT_TRUE(result);
+        if (result) EXPECT_EQ(result->error, ErrorCode::OK);
+        EXPECT_EQ(warm.received, 5);
+        warm_done = true;
     });
     io.run_for(100ms);
-    if (!warm_done || dialed.size() != 1) throw std::runtime_error("open-order warmup did not establish one reusable v2 session");
+    ASSERT_TRUE(warm_done);
+    ASSERT_EQ(dialed.size(), 1);
     net::co_spawn(io, request(tested, tested_ctx), net::bind_cancellation_slot(cancel.slot(),
         [&](std::exception_ptr error, OutboundProcessResult result) {
             done = true; failure = error;
@@ -660,8 +732,8 @@ bool RunOpenOrder(int mode, bool before) {
         }));
     io.restart();
     io.run_for(80ms);
-    if (!scenario.target_sent || (before && !scenario.write_released))
-        throw std::runtime_error("open-order fixture did not establish the requested write/read ordering");
+    EXPECT_TRUE(scenario.target_sent);
+    if (before) EXPECT_TRUE(scenario.write_released);
     const bool waited_without_signal = !done;
     if (!before) {
         if (mode == 7) cancel.emit(net::cancellation_type::terminal);
@@ -672,9 +744,13 @@ bool RunOpenOrder(int mode, bool before) {
     const bool timely = done;
     const auto expected = mode <= 2 ? ErrorCode::OK : mode == 6 ? ErrorCode::TIMEOUT :
         mode == 7 ? ErrorCode::CANCELLED : ErrorCode::PROTOCOL_DECODE_FAILED;
-    bool passed = timely && !failure && observed == expected &&
-        tested.received == (mode == 0 || mode == 2 ? 5u : 0u) &&
-        (before || waited_without_signal) && scenario.fin_replies == 0 && scenario.payload_after_close == 0;
+    EXPECT_TRUE(timely);
+    EXPECT_FALSE(failure);
+    EXPECT_EQ(observed, expected);
+    EXPECT_EQ(tested.received, (mode == 0 || mode == 2 ? 5u : 0u));
+    EXPECT_TRUE((before || waited_without_signal));
+    EXPECT_EQ(scenario.fin_replies, 0);
+    EXPECT_EQ(scenario.payload_after_close, 0);
     if (!done) {
         // Record the actual incorrect deadline result before cleaning up.
         io.restart();
@@ -685,24 +761,29 @@ bool RunOpenOrder(int mode, bool before) {
         io.restart(); io.run_for(200ms);
     }
     net::co_spawn(io, request(recovery, recovery_ctx), [&](std::exception_ptr error, OutboundProcessResult result) {
-        recovery_done = !error && result && result->error == ErrorCode::OK && recovery.received == 5;
+        EXPECT_FALSE(error);
+        EXPECT_TRUE(result);
+        if (result) EXPECT_EQ(result->error, ErrorCode::OK);
+        EXPECT_EQ(recovery.received, 5);
+        recovery_done = true;
     });
     io.restart(); io.run_for(100ms);
     const size_t expected_connections = mode <= 2 ? 1 : 2;
-    passed &= done && recovery_done && dialed.size() == expected_connections;
+    EXPECT_TRUE(done);
+    EXPECT_TRUE(recovery_done);
+    EXPECT_EQ(dialed.size(), expected_connections);
     handler.reset();
     io.restart(); io.run_for(200ms);
-    bool joined = JoinResidentTasks(io, tasks);
-    for (const auto& wire : dialed) joined &= wire->closed && wire->destroyed && wire->active_reads == 0;
-    passed &= joined;
-    std::printf("open-order mode=%d before=%d held=%d released=%d timely=%d code=%s bytes=%zu connections=%zu recovered=%d joined=%d: %s\n",
-        mode, before, scenario.write_held, scenario.write_released, timely,
-        ErrorCodeToString(observed).data(), tested.received, dialed.size(), recovery_done, joined, passed ? "PASS" : "FAIL");
+    EXPECT_TRUE(JoinResidentTasks(io, tasks));
+    for (const auto& wire : dialed) {
+        EXPECT_TRUE(wire->closed);
+        EXPECT_TRUE(wire->destroyed);
+        EXPECT_EQ(wire->active_reads, 0);
+    }
     dialed.clear(); open_order_scenario = nullptr;
-    return passed;
 }
 
-bool RunQueue(int mode, unsigned seed = 1) {
+void RunQueue(int mode, unsigned seed = 1) {
     net::io_context io;
     QueueScenario queue;
     queue.mode = mode;
@@ -746,20 +827,19 @@ bool RunQueue(int mode, unsigned seed = 1) {
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
     ResidentTaskGroup tasks(io.get_executor());
-    proxy::anytls::outbound::Settings settings;
+    infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
     auto handler = std::make_unique<proxy::anytls::outbound::Handler>("queue", io,
-        std::make_shared<const proxy::anytls::outbound::Settings>(settings),
+        std::make_shared<const infra::AnyTlsSettings>(settings),
         tasks.Tasks());
     queue_scenario = &queue;
     dialed.clear();
     fail_first_session = respond_on_auth = false;
     io_fault_mode = io_fault_kind = 0;
     memory::detail::test_buffers_peak = BufferCount();
-    failed_allocation_size = 0;
     Client client;
     auto control_wire = std::make_shared<Wire>(io);
     Stream control(control_wire);
@@ -776,6 +856,7 @@ bool RunQueue(int mode, unsigned seed = 1) {
     StatsShard stats;
     TimeoutsConfig timeouts;
     RelayConfig config;
+    config.idle_timeout = config.write_timeout = 10s;
     config.uplink_only = config.downlink_only = 5s;
     bool done = false;
     const auto started = std::chrono::steady_clock::now();
@@ -783,9 +864,23 @@ bool RunQueue(int mode, unsigned seed = 1) {
     ErrorCode observed = ErrorCode::OK;
     std::exception_ptr exception;
     net::cancellation_signal cancellation;
+    CleanupGuard cleanup([&] {
+        DisarmAllocationFailure();
+        cancellation.emit(net::cancellation_type::all);
+        handler.reset();
+        for (const auto& wire : dialed) {
+            wire->closed = true;
+            wire->wake.cancel();
+            wire->open_gate.cancel();
+        }
+        if (queue.consumer_gate) queue.consumer_gate->cancel();
+        (void)JoinResidentTasks(io, tasks);
+        io.restart();
+        io.run();
+    });
     net::co_spawn(io, handler->Process(ctx,
         {&client, &client, use_control ? &control : nullptr}, outbound.dialer, timeouts,
-        stats, config, {}, 10s, 10s),
+        stats, config, {}),
         net::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr failure, OutboundProcessResult result) {
             done = true; exception = failure;
             completed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -793,9 +888,14 @@ bool RunQueue(int mode, unsigned seed = 1) {
             observed = result ? result->error : result.error();
         }));
     io.poll();
-    bool passed = !exception && (mode == 6 || mode >= 13 ? !done : done);
+    ASSERT_FALSE(dialed.empty());
+    EXPECT_FALSE(exception);
+    EXPECT_TRUE((mode == 6 || mode >= 13 ? !done : done));
     if (mode >= 13) {
-        passed &= queue.consumer_started && queue.pending_consumer == 1 && BufferCount() == 24;
+        {
+            EXPECT_TRUE(queue.consumer_started);
+            EXPECT_EQ(queue.pending_consumer, 1);
+        }
         // Eight consumer blocks, eight queued blocks, eight in the waiting frame.
         queue.queued_blocks = BufferCount() >= 16 ? BufferCount() - 16 : 0;
         queue.snapshot = true;
@@ -805,42 +905,61 @@ bool RunQueue(int mode, unsigned seed = 1) {
         } else if (mode == 14) cancellation.emit(net::cancellation_type::terminal);
     }
     if (mode == 6) {
-        passed &= queue.snapshot && !dialed[0]->closed && dialed[0]->active_reads == 1;
+        {
+            EXPECT_TRUE(queue.snapshot);
+            EXPECT_FALSE(dialed[0]->closed);
+            EXPECT_EQ(dialed[0]->active_reads, 1);
+        }
         cancellation.emit(net::cancellation_type::terminal);
     }
     io.restart();
     io.run_for(mode == 15 ? 1300ms : 80ms);
     const ErrorCode expected = mode == 6 || mode == 14 ? ErrorCode::CANCELLED : mode == 15 ? ErrorCode::RELAY_TIMEOUT
         : mode == 12 ? ErrorCode::PROTOCOL_DECODE_FAILED : ErrorCode::OK;
-    passed &= done && !exception && observed == expected;
-    if (mode != 6 && mode != 12 && mode != 14 && mode != 15) passed &= queue.received == queue.expected;
-    else passed &= queue.received.empty();
-    if (mode == 1) passed &= queue.read_addresses.size() == 8 && queue.delivered_addresses == queue.read_addresses;
-    if (mode == 14 || mode == 15) passed &= queue.consumer_cleaned && queue.pending_consumer == 0;
-    if (mode == 15) passed &= completed_ms >= 900 && completed_ms < 1500;
-    if (mode == 13) passed &= dialed[0]->heart_responses == 1;
-    if (mode == 10 || mode == 11) passed &= queue.datagram_sizes == std::vector<size_t>{9000, 19999};
-    const bool bounded = queue.queued_blocks <= 16 && BufferPeak() <= 24;
-    if (mode != 12) passed &= queue.snapshot;
-    if (mode == 0) passed &= queue.queued_blocks == 1;
-    passed &= bounded;
+    EXPECT_TRUE(done);
+    EXPECT_FALSE(exception);
+    EXPECT_EQ(observed, expected);
+    if (mode != 6 && mode != 12 && mode != 14 && mode != 15) {
+        EXPECT_EQ(queue.received, queue.expected);
+    }
+    else {
+        EXPECT_TRUE(queue.received.empty());
+    }
+    if (mode == 14 || mode == 15) {
+        EXPECT_TRUE(queue.consumer_cleaned);
+        EXPECT_EQ(queue.pending_consumer, 0);
+    }
+    if (mode == 15) {
+        EXPECT_GE(completed_ms, 900);
+        EXPECT_LT(completed_ms, 1500);
+    }
+    if (mode == 13) {
+        EXPECT_EQ(dialed[0]->heart_responses, 1);
+    }
+    if (mode == 10 || mode == 11) {
+        EXPECT_EQ(queue.datagram_sizes, (std::vector<size_t>{9000, 19999}));
+    }
+
+    if (mode != 12) {
+        EXPECT_TRUE(queue.snapshot);
+    }
+    EXPECT_LE(queue.queued_blocks, 16);
+    EXPECT_LE(BufferPeak(), 24);
     handler.reset();
     io.restart();
     io.run_for(100ms);
-    passed &= JoinResidentTasks(io, tasks);
-    for (const auto& wire : dialed) passed &= wire->closed && wire->destroyed && wire->active_reads == 0;
-    passed &= BufferCount() == 0;
-    std::printf("outbound-queue mode=%d seed=%u fragments=%zu bytes=%zu queued-blocks=%zu capacity-bytes=%zu peak-blocks=%zu bounded=%d received=%zu datagrams=%zu code=%s allocation-size=%zu completed-ms=%lld heart-responses=%zu pending-consumer=%d released=%d: %s\n",
-        mode, seed, queue.fragments.size(), bytes, queue.queued_blocks, queue.queued_blocks * buf::Buffer::kSize,
-        BufferPeak(), bounded, queue.received.size(), queue.datagram_sizes.size(), ErrorCodeToString(observed).data(), failed_allocation_size,
-        static_cast<long long>(completed_ms), dialed[0]->heart_responses, queue.pending_consumer,
-        BufferCount() == 0, passed ? "PASS" : "FAIL");
+    EXPECT_TRUE(JoinResidentTasks(io, tasks));
+    for (const auto& wire : dialed) {
+        EXPECT_TRUE(wire->closed);
+        EXPECT_TRUE(wire->destroyed);
+        EXPECT_EQ(wire->active_reads, 0);
+    }
+    EXPECT_EQ(BufferCount(), 0);
     dialed.clear();
     queue_scenario = nullptr;
-    return passed;
 }
 
-bool RunIoFault(int mode, int kind) {
+void RunIoFault(int mode, int kind) {
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
@@ -848,13 +967,13 @@ bool RunIoFault(int mode, int kind) {
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
     ResidentTaskGroup tasks(io.get_executor());
-    proxy::anytls::outbound::Settings settings;
+    infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
     auto handler = std::make_unique<proxy::anytls::outbound::Handler>("io-fault", io,
-        std::make_shared<const proxy::anytls::outbound::Settings>(settings),
+        std::make_shared<const infra::AnyTlsSettings>(settings),
         tasks.Tasks());
     dialed.clear();
     fail_first_session = false;
@@ -869,6 +988,7 @@ bool RunIoFault(int mode, int kind) {
         StatsShard stats;
         TimeoutsConfig timeouts;
         RelayConfig config;
+        config.idle_timeout = config.write_timeout = 10s;
         config.uplink_only = config.downlink_only = 5s;
         buf::MultiBuffer payload;
         if (first && (mode == 3 || mode == 4)) {
@@ -881,7 +1001,7 @@ bool RunIoFault(int mode, int kind) {
         }
         co_return co_await handler->Process(ctx,
             {&client, &client, first && mode == 4 ? &control : nullptr}, outbound.dialer,
-            timeouts, stats, config, buf::MultiBufferBatch(std::move(payload)), 10s, 10s);
+            timeouts, stats, config, buf::MultiBufferBatch(std::move(payload)));
     };
     // Relay payload and FIN failures retain the write-phase category. An open
     // exception escapes Process unchanged; unknown physical reads are INTERNAL.
@@ -894,6 +1014,19 @@ bool RunIoFault(int mode, int kind) {
     bool request_joined = false;
     ErrorCode observed = ErrorCode::OK;
     net::cancellation_signal cancel;
+    CleanupGuard cleanup([&] {
+        DisarmAllocationFailure();
+        cancel.emit(net::cancellation_type::all);
+        handler.reset();
+        for (const auto& wire : dialed) {
+            wire->closed = true;
+            wire->wake.cancel();
+            wire->open_gate.cancel();
+        }
+        (void)JoinResidentTasks(io, tasks);
+        io.restart();
+        io.run();
+    });
     net::co_spawn(io, request(first, first_ctx, true), net::bind_cancellation_slot(cancel.slot(),
         [&](std::exception_ptr failure, OutboundProcessResult result) {
             first_done = true;
@@ -909,34 +1042,46 @@ bool RunIoFault(int mode, int kind) {
             catch (...) { observed = ErrorCode::INTERNAL; }
         }));
     io.run_for(180ms);
-    bool passed = first_done && request_joined && observed == expected && dialed.size() == 1 &&
-        dialed[0]->io_faults == 1 && dialed[0]->closed && dialed[0]->destroyed &&
-        dialed[0]->writes_after_close == 0 && (mode == 1 || dialed[0]->partial_write == 3);
+    ASSERT_FALSE(dialed.empty());
+    EXPECT_TRUE(first_done);
+    EXPECT_TRUE(request_joined);
+    EXPECT_EQ(observed, expected);
+    EXPECT_EQ(dialed.size(), 1);
+    EXPECT_EQ(dialed[0]->io_faults, 1);
+    EXPECT_TRUE(dialed[0]->closed);
+    EXPECT_TRUE(dialed[0]->destroyed);
+    EXPECT_EQ(dialed[0]->writes_after_close, 0);
+    EXPECT_TRUE((mode == 1 || dialed[0]->partial_write == 3));
     if (!first_done) {
         cancel.emit(net::cancellation_type::terminal);
         io.restart();
         io.run_for(200ms);
     }
     net::co_spawn(io, request(second, second_ctx, false), [&](std::exception_ptr failure, OutboundProcessResult result) {
-        second_done = !failure && result && result->error == ErrorCode::OK && second.received == 5;
+        EXPECT_FALSE(failure);
+        EXPECT_TRUE(result);
+        if (result) EXPECT_EQ(result->error, ErrorCode::OK);
+        EXPECT_EQ(second.received, 5);
+        second_done = true;
     });
     io.restart();
     io.run_for(180ms);
-    passed &= second_done && dialed.size() == 2;
+    EXPECT_TRUE(second_done);
+    EXPECT_EQ(dialed.size(), 2);
     handler.reset();
     io.restart();
     io.run_for(200ms);
-    passed &= JoinResidentTasks(io, tasks);
-    for (const auto& wire : dialed) passed &= wire->closed && wire->destroyed && wire->active_reads == 0;
-    std::printf("outbound-io mode=%d kind=%d observed=%s expected=%s faults=%d partial=%zu recovered=%d joined=%d: %s\n",
-        mode, kind, ErrorCodeToString(observed).data(), ErrorCodeToString(expected).data(),
-        dialed[0]->io_faults, dialed[0]->partial_write, second_done, dialed[0]->destroyed, passed ? "PASS" : "FAIL");
+    EXPECT_TRUE(JoinResidentTasks(io, tasks));
+    for (const auto& wire : dialed) {
+        EXPECT_TRUE(wire->closed);
+        EXPECT_TRUE(wire->destroyed);
+        EXPECT_EQ(wire->active_reads, 0);
+    }
     dialed.clear();
     io_fault_mode = io_fault_kind = 0;
-    return passed;
 }
 
-bool Run(int mode) {
+void RunSessionRetirement(int mode) {
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
@@ -944,14 +1089,14 @@ bool Run(int mode) {
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
     ResidentTaskGroup tasks(io.get_executor());
-    proxy::anytls::outbound::Settings settings;
+    infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
     auto handler = std::make_unique<proxy::anytls::outbound::Handler>(
         "test", io,
-        std::make_shared<const proxy::anytls::outbound::Settings>(settings),
+        std::make_shared<const infra::AnyTlsSettings>(settings),
         tasks.Tasks());
     dialed.clear();
     fail_first_session = mode == 0 || mode == 3;
@@ -963,9 +1108,10 @@ bool Run(int mode) {
         StatsShard stats;
         TimeoutsConfig timeouts;
         RelayConfig config;
+        config.idle_timeout = config.write_timeout = 10s;
         config.uplink_only = config.downlink_only = 5s;
         co_return co_await handler->Process(ctx,
-            {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {}, 10s, 10s);
+            {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {});
     };
     Client first, second;
     session::Context ctx_first, ctx_second;
@@ -973,33 +1119,66 @@ bool Run(int mode) {
     OutboundProcessResult first_result, second_result;
     std::exception_ptr failure;
     net::cancellation_signal cancel;
+    CleanupGuard cleanup([&] {
+        DisarmAllocationFailure();
+        cancel.emit(net::cancellation_type::all);
+        handler.reset();
+        for (const auto& wire : dialed) {
+            wire->closed = true;
+            wire->wake.cancel();
+            wire->open_gate.cancel();
+        }
+        (void)JoinResidentTasks(io, tasks);
+        io.restart();
+        io.run();
+    });
     net::co_spawn(io, request(first, ctx_first), net::bind_cancellation_slot(cancel.slot(),
         [&](std::exception_ptr error, OutboundProcessResult result) {
             failure = error; first_result = result; first_done = true;
         }));
     io.run_for(180ms);
+    ASSERT_FALSE(dialed.empty());
     const bool timely = first_done;
-    bool passed = timely && !failure && !dialed.empty();
-    if (mode == 0) passed &= first_result && first_result->error == ErrorCode::RESOURCE_EXHAUSTED && dialed[0]->closed;
+    EXPECT_TRUE(timely);
+    EXPECT_FALSE(failure);
+    EXPECT_FALSE(dialed.empty());
+    if (mode == 0) {
+        ASSERT_TRUE(first_result);
+        EXPECT_EQ(first_result->error, ErrorCode::RESOURCE_EXHAUSTED);
+        EXPECT_TRUE(dialed[0]->closed);
+    }
     // The reply is already buffered when Adopt starts the physical loop, which
     // fails and closes the session inline: the request's open reports the
     // session's terminal cause before any relay begins.
-    else if (mode == 3) passed &= !first_result && first_result.error() == ErrorCode::RESOURCE_EXHAUSTED && dialed[0]->closed;
-    else passed &= first_result && first_result->error == ErrorCode::OK && first.received == 5;
+    else if (mode == 3) {
+        ASSERT_FALSE(first_result);
+        EXPECT_EQ(first_result.error(), ErrorCode::RESOURCE_EXHAUSTED);
+        EXPECT_TRUE(dialed[0]->closed);
+    }
+    else {
+        ASSERT_TRUE(first_result);
+        EXPECT_EQ(first_result->error, ErrorCode::OK);
+        EXPECT_EQ(first.received, 5);
+    }
     bool retired_while_cleaning = false;
     if (mode == 1 && first_done) {
         dialed[0]->Fault();
         io.restart();
         io.run_for(60ms);
-        passed &= dialed[0]->closed && dialed[0]->destroyed;
+        EXPECT_TRUE(dialed[0]->closed);
+        EXPECT_TRUE(dialed[0]->destroyed);
         net::co_spawn(io, request(second, ctx_second), net::bind_cancellation_slot(cancel.slot(),
             [&](std::exception_ptr error, OutboundProcessResult result) {
                 failure = error; second_result = result; second_done = true;
             }));
         io.restart();
         io.run_for(180ms);
-        passed &= second_done && !failure && second_result && second_result->error == ErrorCode::OK &&
-            second.received == 5 && dialed.size() == 2;
+        EXPECT_TRUE(second_done);
+        EXPECT_FALSE(failure);
+        ASSERT_TRUE(second_result);
+        EXPECT_EQ(second_result->error, ErrorCode::OK);
+        EXPECT_EQ(second.received, 5);
+        EXPECT_EQ(dialed.size(), 2);
     }
     if (!first_done || (mode == 1 && !second_done)) {
         cancel.emit(net::cancellation_type::terminal);
@@ -1009,20 +1188,26 @@ bool Run(int mode) {
     handler.reset();
     if (mode == 2) retired_while_cleaning = dialed[0]->closed && !dialed[0]->destroyed;
     // The join itself must wait for the retired session's asynchronous cleanup.
-    passed &= JoinResidentTasks(io, tasks);
-    if (mode == 2) passed &= dialed[0]->cleanup_completed && dialed[0]->destroyed;
+    EXPECT_TRUE(JoinResidentTasks(io, tasks));
+    if (mode == 2) {
+        EXPECT_TRUE(dialed[0]->cleanup_completed);
+        EXPECT_TRUE(dialed[0]->destroyed);
+    }
     io.restart();
     io.run_for(200ms);
-    passed &= first_done && (mode != 1 || second_done);
-    for (const auto& wire : dialed) passed &= wire->closed && wire->destroyed && wire->active_reads == 0;
-    passed &= AllocationFailures() - failures_before == (mode == 2 ? 0 : 1);
-    if (mode == 2) passed &= retired_while_cleaning && dialed[0]->cleanup_completed;
-    std::printf("mode=%d timely=%d allocations=%zu connections=%zu first=%s second-done=%d closed=%d destroyed=%d cleanup=%d: %s\n",
-        mode, timely, AllocationFailures() - failures_before, dialed.size(),
-        ErrorCodeToString(first_result ? first_result->error : first_result.error()).data(), second_done,
-        dialed[0]->closed, dialed[0]->destroyed, dialed[0]->cleanup_completed, passed ? "PASS" : "FAIL");
+    EXPECT_TRUE(first_done);
+    EXPECT_TRUE((mode != 1 || second_done));
+    for (const auto& wire : dialed) {
+        EXPECT_TRUE(wire->closed);
+        EXPECT_TRUE(wire->destroyed);
+        EXPECT_EQ(wire->active_reads, 0);
+    }
+    EXPECT_EQ(AllocationFailures() - failures_before, (mode == 2 ? 0 : 1));
+    if (mode == 2) {
+        EXPECT_TRUE(retired_while_cleaning);
+        EXPECT_TRUE(dialed[0]->cleanup_completed);
+    }
     dialed.clear();
-    return passed;
 }
 
 // Pool policy and ownership through the public Handler contract. Two busy
@@ -1030,7 +1215,7 @@ bool Run(int mode) {
 // them. Handler retirement only cancels the physical loops and the Worker join
 // waits for their cleanup; a Worker join with a live Handler cancels its idle
 // loops and later admissions fail instead of starting unowned work.
-bool RunPoolLifecycle(bool join_before_retirement) {
+void RunPoolLifecycle(bool join_before_retirement) {
     net::io_context io;
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
@@ -1038,13 +1223,13 @@ bool RunPoolLifecycle(bool join_before_retirement) {
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
     ResidentTaskGroup tasks(io.get_executor());
-    proxy::anytls::outbound::Settings settings;
+    infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 1s;
     settings.min_idle_sessions = 1;
     auto handler = std::make_unique<proxy::anytls::outbound::Handler>("pool", io,
-        std::make_shared<const proxy::anytls::outbound::Settings>(settings),
+        std::make_shared<const infra::AnyTlsSettings>(settings),
         tasks.Tasks());
     dialed.clear();
     fail_first_session = respond_on_auth = false;
@@ -1055,9 +1240,10 @@ bool RunPoolLifecycle(bool join_before_retirement) {
         StatsShard stats;
         TimeoutsConfig timeouts;
         RelayConfig config;
+        config.idle_timeout = config.write_timeout = 10s;
         config.uplink_only = config.downlink_only = 5s;
         co_return co_await handler->Process(ctx,
-            {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {}, 10s, 10s);
+            {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {});
     };
     std::array<Client, 3> clients;
     std::array<session::Context, 3> contexts;
@@ -1067,15 +1253,37 @@ bool RunPoolLifecycle(bool join_before_retirement) {
         net::co_spawn(io, request(clients[index], contexts[index]),
             [&, index](std::exception_ptr error, OutboundProcessResult result) {
                 threw[index] = bool(error);
+                if (index < 2) {
+                    EXPECT_FALSE(error);
+                    EXPECT_TRUE(result);
+                    if (result) EXPECT_EQ(result->error, ErrorCode::OK);
+                    EXPECT_EQ(clients[index].received, 5);
+                }
                 succeeded[index] = !error && result && result->error == ErrorCode::OK &&
                     clients[index].received == 5;
             });
     };
+    CleanupGuard cleanup([&] {
+        DisarmAllocationFailure();
+        handler.reset();
+        for (const auto& wire : dialed) {
+            wire->closed = true;
+            wire->wake.cancel();
+            wire->open_gate.cancel();
+        }
+        (void)JoinResidentTasks(io, tasks);
+        io.restart();
+        io.run();
+    });
     start(0);
     start(1);
     io.run_for(180ms);
-    bool passed = succeeded[0] && succeeded[1] && dialed.size() == 2 &&
-        !dialed[0]->closed && !dialed[1]->closed;
+    ASSERT_GE(dialed.size(), 2);
+    EXPECT_TRUE(succeeded[0]);
+    EXPECT_TRUE(succeeded[1]);
+    EXPECT_EQ(dialed.size(), 2);
+    EXPECT_FALSE(dialed[0]->closed);
+    EXPECT_FALSE(dialed[1]->closed);
 
     size_t expired = 0;
     bool retired_during_cleanup = false;
@@ -1086,14 +1294,14 @@ bool RunPoolLifecycle(bool join_before_retirement) {
         io.run_for(2300ms);
         for (size_t i = 0; i < 2 && i < dialed.size(); ++i)
             expired += dialed[i]->closed && dialed[i]->destroyed;
-        passed &= expired == 1;
+        EXPECT_EQ(expired, 1);
         handler.reset();
         retired_during_cleanup = std::any_of(dialed.begin(), dialed.end(),
             [](const auto& wire) { return wire->closed && !wire->destroyed; });
         // The join resumes only after the retired loop finished its cleanup.
         joined = JoinResidentTasks(io, tasks) && std::all_of(dialed.begin(), dialed.end(),
             [](const auto& wire) { return wire->destroyed && wire->cleanup_completed; });
-        passed &= retired_during_cleanup;
+        EXPECT_TRUE(retired_during_cleanup);
     } else {
         // A Worker join cancels idle loops even while their Handler is alive.
         joined = JoinResidentTasks(io, tasks) && std::all_of(dialed.begin(), dialed.end(),
@@ -1102,24 +1310,23 @@ bool RunPoolLifecycle(bool join_before_retirement) {
         io.restart();
         io.run_for(180ms);
         rejected_after_join = threw[2] && dialed.size() == 3 && dialed[2]->closed;
-        passed &= rejected_after_join;
+        EXPECT_TRUE(rejected_after_join);
         handler.reset();
     }
     io.restart();
     io.run_for(100ms);
-    passed &= joined;
+    EXPECT_TRUE(joined);
     for (const auto& wire : dialed) {
-        passed &= wire->closed && wire->destroyed && wire->active_reads == 0;
+        {
+            EXPECT_TRUE(wire->closed);
+            EXPECT_TRUE(wire->destroyed);
+            EXPECT_EQ(wire->active_reads, 0);
+        }
     }
-    std::printf("pool-lifecycle join-first=%d connections=%zu expired=%zu retired-cleanup=%d "
-        "rejected-after-join=%d joined=%d: %s\n",
-        join_before_retirement, dialed.size(), expired, retired_during_cleanup,
-        rejected_after_join, joined, passed ? "PASS" : "FAIL");
     dialed.clear();
-    return passed;
 }
 
-bool RunDomainPoolIsolation() {
+void RunDomainPoolIsolation() {
     net::io_context io;
     auto coordinator = std::make_shared<GroupCoordinator>(io, 2);
     coordinator->RegisterWorker(io);
@@ -1129,12 +1336,12 @@ bool RunDomainPoolIsolation() {
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
     auto tasks = std::make_unique<ResidentTaskGroup>(io.get_executor());
-    proxy::anytls::outbound::Settings settings;
+    infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 60s;
     settings.idle_session_timeout = 60s;
     auto handler = std::make_unique<proxy::anytls::outbound::Handler>("isolation", io,
-        std::make_shared<const proxy::anytls::outbound::Settings>(settings), tasks->Tasks());
+        std::make_shared<const infra::AnyTlsSettings>(settings), tasks->Tasks());
     OpenOrderScenario scenario{.mode = 0, .before_write_completion = false};
     open_order_scenario = &scenario;
     fail_first_session = respond_on_auth = client_padding_probe = false;
@@ -1149,51 +1356,86 @@ bool RunDomainPoolIsolation() {
         StatsShard stats;
         TimeoutsConfig timeouts;
         RelayConfig relay;
+        relay.idle_timeout = relay.write_timeout = 10s;
         relay.uplink_only = relay.downlink_only = 5s;
         co_return co_await handler->Process(contexts[index],
             {&clients[index], &clients[index], nullptr}, outbound.dialer,
-            timeouts, stats, relay, {}, 10s, 10s);
+            timeouts, stats, relay, {});
     };
     auto start = [&](size_t index) {
         net::co_spawn(io, request(index),
             [&, index](std::exception_ptr error, OutboundProcessResult result) {
-                done[index] = !error && result && result->error == ErrorCode::OK &&
-                    clients[index].received == 5;
+                EXPECT_FALSE(error);
+                EXPECT_TRUE(result);
+                if (result) EXPECT_EQ(result->error, ErrorCode::OK);
+                EXPECT_EQ(clients[index].received, 5);
+                done[index] = true;
             });
         io.restart();
         io.run_for(100ms);
     };
+    bool joined = false;
+    bool finalized = false;
+    CleanupGuard cleanup([&] {
+        DisarmAllocationFailure();
+        handler.reset();
+        for (const auto& wire : dialed) {
+            wire->closed = true;
+            wire->wake.cancel();
+            wire->open_gate.cancel();
+        }
+        if (tasks) (void)JoinResidentTasks(io, *tasks);
+        io.restart();
+        io.run();
+        tasks.reset();
+        if (!finalized) {
+            coordinator->CloseAdmission();
+            net::co_spawn(io, [&]() -> net::awaitable<void> {
+                co_await coordinator->AsyncJoin();
+                coordinator->ReleaseServices();
+                co_await coordinator->Finalize();
+            }, [&](std::exception_ptr error) { finalized = !error; });
+            io.restart();
+            io.run();
+        }
+    });
     start(0);
-    if (!done[0] || dialed.size() != 1)
-        throw std::runtime_error("pool warmup did not create one session");
-    bool passed = done[0] && dialed.size() == 1;
+    ASSERT_TRUE(done[0]);
+    ASSERT_EQ(dialed.size(), 1);
+    EXPECT_TRUE(done[0]);
+    EXPECT_EQ(dialed.size(), 1);
     start(1);
-    passed &= !done[1] && dialed.size() == 1;
+    EXPECT_FALSE(done[1]);
+    EXPECT_EQ(dialed.size(), 1);
     start(2);
-    passed &= done[2] && dialed.size() == 2;
+    EXPECT_TRUE(done[2]);
+    EXPECT_EQ(dialed.size(), 2);
     if (!dialed.empty()) {
         dialed.front()->DeliverOpenResult();
     }
     io.restart();
     io.run_for(100ms);
-    passed &= done[1];
+    EXPECT_TRUE(done[1]);
     start(3);
-    passed &= done[3] && dialed.size() == 2;
-    bool joined = false;
+    EXPECT_TRUE(done[3]);
+    EXPECT_EQ(dialed.size(), 2);
     net::co_spawn(io, [&]() -> net::awaitable<void> {
         handler.reset();
         co_await tasks->AsyncJoin();
     }, [&](std::exception_ptr error) { joined = !error; });
     io.restart();
     io.run_for(250ms);
-    passed &= joined;
+    EXPECT_TRUE(joined);
     for (const auto& wire : dialed)
-        passed &= wire->closed && wire->destroyed && wire->active_reads == 0;
+        {
+            EXPECT_TRUE(wire->closed);
+            EXPECT_TRUE(wire->destroyed);
+            EXPECT_EQ(wire->active_reads, 0);
+        }
     dialed.clear();
     open_order_scenario = nullptr;
     tasks.reset();
     coordinator->CloseAdmission();
-    bool finalized = false;
     net::co_spawn(io, [&]() -> net::awaitable<void> {
         co_await coordinator->AsyncJoin();
         coordinator->ReleaseServices();
@@ -1201,37 +1443,68 @@ bool RunDomainPoolIsolation() {
     }, [&](std::exception_ptr error) { finalized = !error; });
     io.restart();
     io.run_for(250ms);
-    passed &= finalized;
-    std::printf("domain-pool-isolation reusable=%d finalized=%d: %s\n",
-        done[3], finalized, passed ? "PASS" : "FAIL");
-    return passed;
+    EXPECT_TRUE(finalized);
 }
 
 }
 
-TEST(AnytlsOutboundLifecycle, Contract) {
-    struct Disarm {
-        ~Disarm() { DisarmAllocationFailure(); }
-    } disarm;
-    try {
-        bool passed = RunClientPadding();
-        for (int mode = 0; mode < 9; ++mode)
-            for (bool before : {false, true})
-                if (!before || (mode != 6 && mode != 7)) passed &= RunOpenOrder(mode, before);
-        for (int mode = 0; mode < 4; ++mode) passed &= ::Run(mode);
-        passed &= RunPoolLifecycle(false);
-        passed &= RunPoolLifecycle(true);
-        passed &= RunDomainPoolIsolation();
-        for (int mode = 1; mode <= 5; ++mode)
-            for (int kind = 1; kind <= 3; ++kind) passed &= RunIoFault(mode, kind);
-        for (int mode = 0; mode <= 6; ++mode) passed &= RunQueue(mode);
-        for (unsigned seed = 1; seed <= 16; ++seed) passed &= RunQueue(8, seed);
-        for (int mode = 9; mode <= 12; ++mode) passed &= RunQueue(mode);
-        for (int mode = 13; mode <= 15; ++mode) passed &= RunQueue(mode);
-        { ASSERT_TRUE(passed); return; }
-    } catch (const std::exception& error) {
-        DisarmAllocationFailure();
-        std::fprintf(stderr, "fixture failure: %s\n", error.what());
-        FAIL() << error.what();
-    }
+namespace {
+TEST_F(AnyTlsLifecycleTest, PaddingUpdatesStayWithClientAndAuthenticationSnapshot) { RunClientPadding(); }
+TEST_F(AnyTlsLifecycleTest, IndependentRequestsDoNotShareAnOpeningPoolLease) { RunDomainPoolIsolation(); }
+class AnyTlsOpenOrder : public AnyTlsLifecycleTest,
+    public testing::WithParamInterface<std::tuple<int, bool>> {};
+TEST_P(AnyTlsOpenOrder, PreservesTerminalResultAndRecoversAfterOpening) {
+    const auto [mode, before] = GetParam();
+    RunOpenOrder(mode, before);
 }
+INSTANTIATE_TEST_SUITE_P(FrameAndWriteOrdering, AnyTlsOpenOrder, testing::Values(
+    std::tuple{0, false}, std::tuple{0, true}, std::tuple{1, false}, std::tuple{1, true},
+    std::tuple{2, false}, std::tuple{2, true}, std::tuple{3, false}, std::tuple{3, true},
+    std::tuple{4, false}, std::tuple{4, true}, std::tuple{5, false}, std::tuple{5, true},
+    std::tuple{6, false}, std::tuple{7, false}, std::tuple{8, false}, std::tuple{8, true}),
+    ([](const auto& info) {
+        constexpr std::array names{"SynackPayloadFin", "FinOnly", "PayloadFin", "RejectedSynack",
+            "Alert", "SynackThenAlert", "Timeout", "Cancellation", "TruncatedPhysicalFrame"};
+        return std::string(names[std::get<0>(info.param)]) +
+            (std::get<1>(info.param) ? "BeforeWriteCompletion" : "AfterWriteCompletion");
+    }));
+class AnyTlsSessionRetirement : public AnyTlsLifecycleTest, public testing::WithParamInterface<int> {};
+TEST_P(AnyTlsSessionRetirement, PreservesFailureAndJoinsPhysicalCleanup) { RunSessionRetirement(GetParam()); }
+INSTANTIATE_TEST_SUITE_P(Behaviors, AnyTlsSessionRetirement, testing::Range(0, 4),
+    ([](const auto& info) {
+        constexpr std::array names{"SettingsAllocationFailure", "IdleFailureEvictionAndRecovery",
+            "RetiredReaderCleanup", "InlineOpenAllocationFailure"};
+        return names[info.param];
+    }));
+class AnyTlsPoolRetirement : public AnyTlsLifecycleTest, public testing::WithParamInterface<bool> {};
+TEST_P(AnyTlsPoolRetirement, JoinsIdleLoopsAndRejectsUnownedAdmissions) { RunPoolLifecycle(GetParam()); }
+INSTANTIATE_TEST_SUITE_P(OwnerOrdering, AnyTlsPoolRetirement, testing::Bool(),
+    [](const auto& info) { return info.param ? "JoinBeforeHandlerRetirement" : "IdleExpiryBeforeRetirement"; });
+class AnyTlsPhysicalIoFailure : public AnyTlsLifecycleTest,
+    public testing::WithParamInterface<std::tuple<int, int>> {};
+TEST_P(AnyTlsPhysicalIoFailure, PreservesErrorCategoryAndEvictsFailedSessionBeforeReuse) {
+    const auto [mode, kind] = GetParam();
+    RunIoFault(mode, kind);
+}
+INSTANTIATE_TEST_SUITE_P(PhaseAndFault, AnyTlsPhysicalIoFailure,
+    testing::Combine(testing::Range(1, 6), testing::Range(1, 4)),
+    ([](const auto& info) {
+        constexpr std::array phases{"", "Read", "OpenWrite", "TcpPayloadWrite", "UdpPayloadWrite", "FinWrite"};
+        constexpr std::array faults{"", "AllocationFailure", "LinkFailure", "UnexpectedException"};
+        return std::string(phases[std::get<0>(info.param)]) + faults[std::get<1>(info.param)];
+    }));
+class AnyTlsOutboundQueue : public AnyTlsLifecycleTest, public testing::WithParamInterface<int> {};
+TEST_P(AnyTlsOutboundQueue, PreservesBoundariesAndReclaimsBoundedStorageOnCompletionOrStop) { RunQueue(GetParam()); }
+INSTANTIATE_TEST_SUITE_P(Behaviors, AnyTlsOutboundQueue,
+    testing::Values(0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15),
+    ([](const auto& info) {
+        constexpr std::array names{"TinyFragments", "WholeFrame", "SparseFragments", "BoundaryFragments",
+            "MaximumTinyFragments", "FullQueueBackpressure", "CancelFullQueue", "Unused", "RandomFragments",
+            "RefillAfterDrain", "CoalescedUdpDatagrams", "FragmentedUdpDatagrams", "AlertDiscardsQueue",
+            "SlowConsumerAndHeartResponse", "CancelSlowConsumer", "TimeoutSlowConsumer"};
+        return names[info.param];
+    }));
+class AnyTlsOutboundQueueFragments : public AnyTlsLifecycleTest, public testing::WithParamInterface<unsigned> {};
+TEST_P(AnyTlsOutboundQueueFragments, PreservesPayloadAcrossRandomFrameBoundaries) { RunQueue(8, GetParam()); }
+INSTANTIATE_TEST_SUITE_P(Seeds, AnyTlsOutboundQueueFragments, testing::Range(1u, 17u));
+}  // namespace

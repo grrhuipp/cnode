@@ -48,8 +48,8 @@ namespace {
     stream.network_mode = ParseNetworkMode(node_config.TransportProtocol);
     stream.http.force_http2 = EqualsAsciiCI(node_config.TransportProtocol, "h2");
 
-    // TLSEnable only declares that this cnode instance can terminate TLS.
-    // The panel node still decides whether this particular inbound uses TLS.
+    // The panel permits local TLS termination; the protocol's registered
+    // requirement and node setting decide whether this inbound uses it.
     if (node_config.EnableReality) {
         stream.security_mode = SecurityMode::Reality;
         stream.reality = node_config.Reality;
@@ -219,24 +219,6 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
 };
 namespace {
 
-[[nodiscard]] std::string_view DomainStrategyName(
-    proxy::freedom::outbound::DomainStrategy strategy) noexcept {
-    using proxy::freedom::outbound::DomainStrategy;
-    switch (strategy) {
-        case DomainStrategy::AsIs: return "AsIs";
-        case DomainStrategy::UseIP: return "UseIP";
-        case DomainStrategy::UseIPv6v4: return "UseIPv6v4";
-        case DomainStrategy::UseIPv4: return "UseIPv4";
-        case DomainStrategy::UseIPv4v6: return "UseIPv4v6";
-        case DomainStrategy::UseIPv6: return "UseIPv6";
-        case DomainStrategy::ForceIP: return "ForceIP";
-        case DomainStrategy::ForceIPv6v4: return "ForceIPv6v4";
-        case DomainStrategy::ForceIPv6: return "ForceIPv6";
-        case DomainStrategy::ForceIPv4v6: return "ForceIPv4v6";
-        case DomainStrategy::ForceIPv4: return "ForceIPv4";
-    }
-    return "AsIs";
-}
 
 [[nodiscard]] proxyman::outbound::PreparedOutboundConfig BuildPanelAutoOutbound(
     const std::string& tag,
@@ -247,7 +229,7 @@ namespace {
     infra::OutboundSourceConfig source{
         .tag = tag,
         .protocol = std::string(constants::protocol::kFreedom),
-        .settings = json::object{{"domainStrategy", DomainStrategyName(strategy)}},
+        .settings = infra::FreedomSettings{.domain_strategy = strategy},
         .stream_settings = {},
         // The panel sendIP is the auto outbound Handler's sendThrough.
         .send_through = panel_config.SendIP,

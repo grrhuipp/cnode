@@ -10,12 +10,12 @@
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>
 #include <asio/steady_timer.hpp>
+#include <asio/use_future.hpp>
 
 #include <array>
 #include <chrono>
 #include <cstdlib>
 #include <exception>
-#include <iostream>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -32,12 +32,17 @@ using namespace std::chrono_literals;
 thread_local size_t fail_size = 0;
 thread_local size_t injected_failures = 0;
 
-void Require(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
-}
 
 
 enum class Failure { None, Query, IoQuery, CancelledQuery, ResultCopy };
+template<class Service>
+void JoinService(net::io_context& io, Service& service) {
+    io.restart();
+    auto joined = net::co_spawn(io, service.AsyncJoin(), net::use_future);
+    io.run();
+    joined.get();
+}
+
 
 net::awaitable<DnsResult> Query(net::io_context& io, size_t& calls, Failure failure) {
     ++calls;
@@ -53,7 +58,9 @@ net::awaitable<DnsResult> Query(net::io_context& io, size_t& calls, Failure fail
     co_return result;
 }
 
-void TestCompletion(Failure failure) {
+class DnsInflightCompletion : public testing::TestWithParam<Failure> {};
+TEST_P(DnsInflightCompletion, SharesQueryOutcomeAndReleasesGenerationForRetry) {
+    const auto failure = GetParam();
     net::io_context io;
     InflightResolves inflight(io, 1);
     size_t calls = 0;
@@ -64,7 +71,7 @@ void TestCompletion(Failure failure) {
     net::steady_timer watchdog(io, 2s);
     bool timed_out = false;
     watchdog.async_wait([&](const ::IoErrorCode& error) {
-        if (!error) { timed_out = true; io.stop(); }
+        if (!error) { timed_out = true; inflight.RequestStop(); }
     });
     const auto failures_before = injected_failures;
     for (size_t i = 0; i < clients; ++i) {
@@ -78,44 +85,41 @@ void TestCompletion(Failure failure) {
     }
     io.run();
     fail_size = 0;
-    Require(!timed_out && completed == clients && calls == 1,
-            "one query must complete every subscriber even when the owner fails");
+    EXPECT_FALSE(timed_out);
+    EXPECT_EQ(completed, clients);
+    EXPECT_EQ(calls, 1u);
     if (failure == Failure::ResultCopy) {
-        Require(injected_failures == failures_before + 1,
-                "the result-copy allocation failure must actually be injected");
+        EXPECT_GT(injected_failures, failures_before);
     }
     size_t copy_failures = 0;
     for (size_t i = 0; i < clients; ++i) {
         if (failure == Failure::Query || failure == Failure::IoQuery) {
-            Require(static_cast<bool>(errors[i]),
-                    "every uncancelled subscriber must receive the actual query exception");
+            EXPECT_TRUE(errors[i]);
+            if (!errors[i]) continue;
             try {
                 std::rethrow_exception(errors[i]);
             } catch (const ::IoSystemError& error) {
-                Require(failure == Failure::IoQuery && error.code() == ::io_error::connection_reset,
-                        "non-cancellation I/O failures must preserve their concrete error code");
+                EXPECT_EQ(failure, Failure::IoQuery);
+                EXPECT_EQ(error.code(), ::io_error::connection_reset);
             } catch (const std::runtime_error& error) {
-                Require(failure == Failure::Query && std::string_view(error.what()) == "query failed",
-                        "query exceptions must preserve their original type and reason");
+                EXPECT_EQ(failure, Failure::Query);
+                EXPECT_STREQ(error.what(), "query failed");
             }
         } else if (errors[i]) {
-            Require(failure == Failure::ResultCopy,
-                    "successful or cancelled queries must not manufacture exceptions");
+            EXPECT_EQ(failure, Failure::ResultCopy);
             try {
                 std::rethrow_exception(errors[i]);
             } catch (const std::bad_alloc&) {
                 ++copy_failures;
             }
         } else if (failure == Failure::CancelledQuery) {
-            Require(results[i].error == ::ErrorCode::CANCELLED,
-                    "operation_aborted must remain an explicit cancellation result");
+            EXPECT_EQ(results[i].error, ::ErrorCode::CANCELLED);
         } else {
-            Require(results[i].Ok() && results[i].addresses.size() == 400,
-                    "successful answers must survive another waiter's copy failure");
+            EXPECT_TRUE(results[i].Ok());
+            EXPECT_EQ(results[i].addresses.size(), 400u);
         }
     }
-    Require(copy_failures == (failure == Failure::ResultCopy ? 1u : 0u),
-            "only the waiter with a failed result copy may fail");
+    EXPECT_EQ(copy_failures, failure == Failure::ResultCopy ? 1u : 0u);
 
     io.restart();
     bool retried = false;
@@ -125,8 +129,7 @@ void TestCompletion(Failure failure) {
         retried = !error && result.Ok();
     });
     io.run_for(1s);
-    Require(retried && calls == 2,
-            "completion must erase the failed generation and return its only active quota slot");
+    EXPECT_TRUE(retried && calls == 2) << "completion must erase the failed generation and return its only active quota slot";
     io.restart();
     bool joined = false;
     std::exception_ptr join_error;
@@ -136,7 +139,7 @@ void TestCompletion(Failure failure) {
     });
     io.run();
     if (join_error) std::rethrow_exception(join_error);
-    Require(joined, "subscriber exceptions must not prevent service task-group join");
+    EXPECT_TRUE(joined) << "subscriber exceptions must not prevent service task-group join";
 }
 
 net::awaitable<DnsResult> GatedQuery(
@@ -148,7 +151,7 @@ net::awaitable<DnsResult> GatedQuery(
     co_return result;
 }
 
-void TestSubscriberCancellation() {
+TEST(DnsInflight, CancellingSubscriberPreservesOwnerAndOtherSubscribers) {
     net::io_context io;
     InflightResolves inflight(io, 8);
     net::experimental::channel<void(::IoErrorCode)> gate(io);
@@ -174,11 +177,14 @@ void TestSubscriberCancellation() {
         net::post(io, [&] { gate.close(); });
     });
     io.run_for(1s);
-    Require(completed == 3 && calls == 1 && !errors[0] && !errors[2] &&
-                results[0].Ok() && results[2].Ok(),
-            "cancelling one subscriber must not cancel the owner or another subscriber");
-    Require(errors[1] || results[1].error == ::ErrorCode::CANCELLED,
-            "the cancelled subscriber must observe cancellation");
+    JoinService(io, inflight);
+    EXPECT_EQ(completed, 3u);
+    EXPECT_EQ(calls, 1u);
+    EXPECT_FALSE(errors[0]);
+    EXPECT_FALSE(errors[2]);
+    EXPECT_TRUE(results[0].Ok());
+    EXPECT_TRUE(results[2].Ok());
+    EXPECT_TRUE(errors[1] || results[1].error == ::ErrorCode::CANCELLED) << "the cancelled subscriber must observe cancellation";
 }
 
 net::awaitable<DnsResult> DelayedCancellationQuery(
@@ -188,7 +194,7 @@ net::awaitable<DnsResult> DelayedCancellationQuery(
     co_return co_await GatedQuery(gate, calls);
 }
 
-void TestRetiredGenerationCapacity() {
+TEST(DnsInflight, RetiredGenerationKeepsCapacityUntilCompletionWithoutRetiringReplacement) {
     net::io_context io;
     InflightResolves inflight(io, 2);
     net::experimental::channel<void(::IoErrorCode)> old_gate(io), new_gate(io);
@@ -206,40 +212,42 @@ void TestRetiredGenerationCapacity() {
     io.poll();
     cancel.emit(net::cancellation_type::terminal);
     io.poll();
-    Require(cancelled && calls == 1, "last waiter cancellation must retire its generation");
+    EXPECT_TRUE(cancelled);
+    EXPECT_EQ(calls, 1u);
     auto survivor = [&](std::exception_ptr error, DnsResult result) {
         if (error) failure = error;
         else if (result.Ok()) ++survivors;
     };
     net::co_spawn(io, inflight.Run("generation.example", new_query), survivor);
     io.poll();
-    Require(calls == 2, "a new waiter must not attach to a cancelled generation");
+    EXPECT_EQ(calls, 2) << "a new waiter must not attach to a cancelled generation";
     net::co_spawn(io, inflight.Run("capacity.example", new_query),
         [&](std::exception_ptr error, DnsResult result) {
             rejected = !error && result.error == ::ErrorCode::RESOURCE_EXHAUSTED;
         });
     io.poll();
-    Require(rejected && calls == 2, "retired but unfinished queries must still consume capacity");
+    EXPECT_TRUE(rejected);
+    EXPECT_EQ(calls, 2u);
     old_gate.close();
     io.poll();
     net::co_spawn(io, inflight.Run("generation.example", new_query), survivor);
     io.poll();
-    Require(calls == 2, "old completion must not remove the new generation's registry entry");
+    EXPECT_EQ(calls, 2) << "old completion must not remove the new generation's registry entry";
     new_gate.close();
     io.run();
-    if (failure) std::rethrow_exception(failure);
-    Require(survivors == 2, "both new-generation waiters must receive the healthy answer");
+    EXPECT_EQ(survivors, 2) << "both new-generation waiters must receive the healthy answer";
     io.restart();
     bool joined = false;
     net::co_spawn(io, inflight.AsyncJoin(), [&](std::exception_ptr error) {
-        failure = error; joined = true;
+        if (error) failure = error;
+        joined = true;
     });
     io.run();
     if (failure) std::rethrow_exception(failure);
-    Require(joined, "join must settle cancelled generations as well as active subscribers");
+    EXPECT_TRUE(joined) << "join must settle cancelled generations as well as active subscribers";
 }
 
-void TestDNSWorker() {
+TEST(DnsWorker, ReturnsOwnedAnswersToIndependentCallerExecutors) {
     ::app::dns::Config config;
     config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
     net::io_context main_context;
@@ -274,13 +282,18 @@ void TestDNSWorker() {
     main_context.run();
     first_thread.join();
     second_thread.join();
-    Require(!failures[0] && !failures[1] && answers[0].Ok() && answers[1].Ok() &&
-                answers[0].addresses[0] == net::ip::make_address("192.0.2.1") &&
-                answers[1].addresses[0] == net::ip::make_address("192.0.2.2"),
-            "multiple caller executors must receive owned answers from one DNS Worker");
+    JoinService(main_context, worker);
+    EXPECT_FALSE(failures[0]);
+    EXPECT_FALSE(failures[1]);
+    EXPECT_TRUE(answers[0].Ok());
+    EXPECT_TRUE(answers[1].Ok());
+    ASSERT_EQ(answers[0].addresses.size(), 1u);
+    ASSERT_EQ(answers[1].addresses.size(), 1u);
+    EXPECT_EQ(answers[0].addresses[0], net::ip::make_address("192.0.2.1"));
+    EXPECT_EQ(answers[1].addresses[0], net::ip::make_address("192.0.2.2"));
 }
 
-void TestDNSRemoteInputOwnership() {
+TEST(DnsWorker, OwnsDomainBeforeDeferredTaskStarts) {
     net::io_context main_context;
     net::ip::udp::socket sink(main_context, {net::ip::address_v4::loopback(), 0});
     ::app::dns::Config config;
@@ -302,12 +315,15 @@ void TestDNSRemoteInputOwnership() {
             completed = true;
         });
     main_context.run();
-    Require(completed && !failure && answer.Ok() && answer.addresses.size() == 1 &&
-                answer.addresses.front() == net::ip::make_address("192.0.2.1"),
-            "remote DNS facade must own its input at task creation");
+    JoinService(main_context, worker);
+    EXPECT_TRUE(completed);
+    EXPECT_FALSE(failure);
+    EXPECT_TRUE(answer.Ok());
+    ASSERT_EQ(answer.addresses.size(), 1u);
+    EXPECT_EQ(answer.addresses.front(), net::ip::make_address("192.0.2.1"));
 }
 
-void TestDNSClientLifetime() {
+TEST(DnsWorker, DeferredTaskOutlivesClientFacade) {
     net::io_context main_context;
     net::ip::udp::socket sink(main_context, {net::ip::address_v4::loopback(), 0});
     ::app::dns::Config config;
@@ -316,17 +332,25 @@ void TestDNSClientLifetime() {
     // The facade must not be captured in a deferred coroutine: the task only
     // needs its input and the DNSWorker, not this already-destroyed client.
     auto task = ::app::dns::DNS(worker).Resolve("192.0.2.3");
-    bool resolved = false;
+    bool completed = false;
+    std::exception_ptr failure;
+    DnsResult answer;
     net::co_spawn(main_context, std::move(task),
         [&](std::exception_ptr error, DnsResult result) {
-            resolved = !error && result.Ok() && result.addresses.size() == 1 &&
-                result.addresses.front() == net::ip::make_address("192.0.2.3");
+            failure = error;
+            answer = std::move(result);
+            completed = true;
         });
     main_context.run();
-    Require(resolved, "DNS tasks must not borrow the lightweight client facade");
+    JoinService(main_context, worker);
+    EXPECT_TRUE(completed);
+    EXPECT_FALSE(failure);
+    EXPECT_TRUE(answer.Ok());
+    ASSERT_EQ(answer.addresses.size(), 1u);
+    EXPECT_EQ(answer.addresses.front(), net::ip::make_address("192.0.2.3"));
 }
 
-void TestDNSWorkerCancellation() {
+TEST(DnsWorker, CancellingCallerStopsWaitingForService) {
     net::io_context caller;
     net::ip::udp::socket sink(caller, {net::ip::address_v4::loopback(), 0});
     ::app::dns::Config config;
@@ -344,10 +368,15 @@ void TestDNSWorkerCancellation() {
         if (!ec) signal.emit(net::cancellation_type::terminal);
     });
     caller.run_for(1s);
-    Require(completed, "cancellation must stop waiting for the main control Worker's DNS service");
+    const bool completed_before_cleanup = completed;
+    JoinService(caller, worker);
+    EXPECT_TRUE(completed_before_cleanup);
+    EXPECT_TRUE(completed) << "cancellation must stop waiting for the main control Worker's DNS service";
 }
 
-void TestDNSWorkerCapacity(bool stats_request) {
+class DnsWorkerCapacity : public testing::TestWithParam<bool> {};
+TEST_P(DnsWorkerCapacity, FullMailboxRejectsRequestsAndCancellationReturnsSlot) {
+    const bool stats_request = GetParam();
     net::io_context main_context;
     net::ip::udp::socket sink(main_context, {net::ip::address_v4::loopback(), 0});
     ::app::dns::Config config;
@@ -399,8 +428,9 @@ void TestDNSWorkerCapacity(bool stats_request) {
             }
         });
     main_context.run();
-    Require(owner_done && !failure && rejected,
-            "a full DNS mailbox must reject rather than queue a lookup or stats request");
+    EXPECT_TRUE(owner_done);
+    EXPECT_FALSE(failure);
+    EXPECT_TRUE(rejected);
 
     main_context.restart();
     bool recovered = false;
@@ -416,10 +446,11 @@ void TestDNSWorkerCapacity(bool stats_request) {
             });
     }
     main_context.run();
-    Require(recovered, "cancellation must release the DNS mailbox slot");
+    JoinService(main_context, worker);
+    EXPECT_TRUE(recovered) << "cancellation must release the DNS mailbox slot";
 }
 
-void TestInflightStopBeforeLeaderCompletion() {
+TEST(DnsInflight, StopJoinsLeaderAndSubscribersBeforeDestruction) {
     net::io_context io;
     auto inflight = std::make_unique<InflightResolves>(io, 8);
     net::experimental::channel<void(::IoErrorCode)> gate(io);
@@ -453,15 +484,17 @@ void TestInflightStopBeforeLeaderCompletion() {
     io.run();
     inflight.reset();
     if (join_error) std::rethrow_exception(join_error);
-    Require(!expired && joined && completed == results.size() && calls == 1,
-            "join must finish the service query and every subscriber before destruction");
+    EXPECT_FALSE(expired);
+    EXPECT_TRUE(joined);
+    EXPECT_EQ(completed, results.size());
+    EXPECT_EQ(calls, 1u);
     for (size_t i = 0; i < results.size(); ++i) {
-        Require(!errors[i] && results[i].error == ::ErrorCode::CANCELLED,
-                "late successful leader completion must not replace service cancellation");
+        EXPECT_FALSE(errors[i]) << i;
+        EXPECT_EQ(results[i].error, ::ErrorCode::CANCELLED) << i;
     }
 }
 
-void TestDNSWorkerStoppedWithoutQueries() {
+TEST(DnsWorker, StopBeforeFirstQueryRejectsAdmissionAndJoinsIdempotently) {
     net::io_context io;
     ::app::dns::Config config;
     config.servers = {{net::ip::address_v4::loopback(), 53}};
@@ -472,8 +505,7 @@ void TestDNSWorkerStoppedWithoutQueries() {
     std::exception_ptr failure;
     auto stop = [&]() -> net::awaitable<void> {
         const auto result = co_await worker->Resolve("192.0.2.1");
-        Require(result.error == ::ErrorCode::CANCELLED,
-                "an unused stopped service must reject queries without starting I/O");
+        EXPECT_EQ(result.error, ::ErrorCode::CANCELLED) << "an unused stopped service must reject queries without starting I/O";
         co_await worker->AsyncJoin();
         co_await worker->AsyncJoin();
         worker.reset();
@@ -484,10 +516,10 @@ void TestDNSWorkerStoppedWithoutQueries() {
     });
     io.run();
     if (failure) std::rethrow_exception(failure);
-    Require(done, "joining a never-started service must complete");
+    EXPECT_TRUE(done) << "joining a never-started service must complete";
 }
 
-void TestDNSWorkerCrossExecutorStop() {
+TEST(DnsWorker, CrossExecutorStopJoinsUdpQueriesAndCallerCompletions) {
     net::io_context main_context, first_io, second_io;
     net::ip::udp::socket sink(main_context, {net::ip::address_v4::loopback(), 0});
     ::app::dns::Config config;
@@ -523,13 +555,18 @@ void TestDNSWorkerCrossExecutorStop() {
     auto stop = [&]() -> net::awaitable<void> {
         std::array<uint8_t, 512> packet{};
         net::ip::udp::endpoint sender;
-        for (; packets < 8; ++packets) {
-            co_await sink.async_receive_from(net::buffer(packet), sender, net::use_awaitable);
+        std::exception_ptr receive_error;
+        try {
+            for (; packets < 8; ++packets)
+                co_await sink.async_receive_from(net::buffer(packet), sender, net::use_awaitable);
+        } catch (...) {
+            receive_error = std::current_exception();
         }
         worker->RequestStop();
         worker->RequestStop();
         co_await worker->AsyncJoin();
         sink.close();
+        if (receive_error) std::rethrow_exception(receive_error);
     };
     net::co_spawn(main_context, stop(), [&](std::exception_ptr error) {
         join_error = error;
@@ -549,12 +586,14 @@ void TestDNSWorkerCrossExecutorStop() {
     second_thread.join();
     // Caller executor callbacks, not just DNS registry removal, have finished.
     worker.reset();
-    Require(!expired && joined && packets == 8 && completed == results.size(),
-            "service stop must join real UDP leaders and cross-executor subscribers");
+    EXPECT_FALSE(expired);
+    EXPECT_TRUE(joined);
+    EXPECT_EQ(packets, 8u);
+    EXPECT_EQ(completed, results.size());
     if (join_error) std::rethrow_exception(join_error);
     for (size_t i = 0; i < results.size(); ++i) {
-        Require(!errors[i] && results[i].error == ::ErrorCode::CANCELLED,
-                "cross-executor shutdown must return owned cancellation results");
+        EXPECT_FALSE(errors[i]) << i;
+        EXPECT_EQ(results[i].error, ::ErrorCode::CANCELLED) << i;
     }
 }
 
@@ -570,29 +609,21 @@ void FailSize(std::size_t size) {
 
 constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = FailSize};
 
-TEST(DnsInflight, Contract) {
-    bool passed = true;
-    try {
-        TestCompletion(Failure::None);
-        TestCompletion(Failure::Query);
-        TestCompletion(Failure::IoQuery);
-        TestCompletion(Failure::CancelledQuery);
-        TestCompletion(Failure::ResultCopy);
-        TestSubscriberCancellation();
-        TestRetiredGenerationCapacity();
-        TestDNSWorker();
-        TestDNSRemoteInputOwnership();
-        TestDNSClientLifetime();
-        TestDNSWorkerCancellation();
-        TestDNSWorkerCapacity(false);
-        TestDNSWorkerCapacity(true);
-        TestInflightStopBeforeLeaderCompletion();
-        TestDNSWorkerStoppedWithoutQueries();
-        TestDNSWorkerCrossExecutorStop();
-    } catch (const std::exception& error) {
-        fail_size = 0;
-        std::cerr << error.what() << '\n';
-        passed = false;
-    }
-    { ASSERT_TRUE(passed); return; }
-}
+INSTANTIATE_TEST_SUITE_P(QueryOutcome, DnsInflightCompletion,
+    testing::Values(Failure::None, Failure::Query, Failure::IoQuery,
+                    Failure::CancelledQuery, Failure::ResultCopy),
+    [](const testing::TestParamInfo<Failure>& info) {
+        switch (info.param) {
+        case Failure::None: return "Success";
+        case Failure::Query: return "QueryException";
+        case Failure::IoQuery: return "IoFailure";
+        case Failure::CancelledQuery: return "Cancelled";
+        case Failure::ResultCopy: return "WaiterCopyFailure";
+        }
+        return "Invalid";
+    });
+
+INSTANTIATE_TEST_SUITE_P(RequestKind, DnsWorkerCapacity, testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) {
+        return info.param ? "CacheStats" : "Resolve";
+    });

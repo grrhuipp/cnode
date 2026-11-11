@@ -252,7 +252,7 @@ public:
 
     // `http_config` (required for RawData) and `xhttp_config` are borrowed
     // from the handshake caller, which awaits Run() to completion.
-    Http2ServerSession(net::io_context& io_context,
+    Http2ServerSession(GroupCoordinator& coordinator, net::io_context& io_context,
                        std::unique_ptr<AsyncStream> stream,
                        std::shared_ptr<InboundTransportStreamHandler> stream_handler,
                        H2PayloadCodec payload_codec,
@@ -261,7 +261,8 @@ public:
                        const XHttpConfig* xhttp_config,
                        const GrpcConfig* grpc_config,
                        uint32_t initial_receive_window)
-        : io_context_(io_context)
+        : coordinator_(coordinator)
+        , io_context_(io_context)
         , stream_(std::move(stream))
         , stream_handler_(std::move(stream_handler))
         , payload_codec_(payload_codec)
@@ -979,6 +980,7 @@ private:
         CancelAll();
     }
 
+    GroupCoordinator& coordinator_;
     net::io_context& io_context_;
     std::unique_ptr<AsyncStream> stream_;
     std::shared_ptr<InboundTransportStreamHandler> stream_handler_;

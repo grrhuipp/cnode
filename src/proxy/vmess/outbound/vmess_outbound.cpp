@@ -10,7 +10,6 @@
 #include "app/relay.hpp"
 #include "app/dns/dns.hpp"
 #include "app/proxyman/outbound/handler.hpp"
-#include "infra/json.hpp"
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"
 #include "core/constants.hpp"
@@ -57,9 +56,7 @@ public:
         const ::TimeoutsConfig& timeouts,
         ::StatsShard& stats,
         const ::RelayConfig& relay_config,
-        ::buf::MultiBufferBatch first_payload,
-        std::chrono::seconds relay_idle_timeout,
-        std::chrono::seconds relay_write_timeout) override;
+        ::buf::MultiBufferBatch first_payload) override;
 
 private:
     std::shared_ptr<const PreparedSettings> prepared_;
@@ -171,9 +168,7 @@ proxy::vmess::outbound::Handler::Process(
     const TimeoutsConfig& timeouts,
     StatsShard& stats,
     const RelayConfig& relay_config,
-    buf::MultiBufferBatch first_payload,
-    std::chrono::seconds relay_idle_timeout,
-    std::chrono::seconds relay_write_timeout) {
+    buf::MultiBufferBatch first_payload) {
     if (!inbound.Valid()) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
@@ -197,9 +192,9 @@ proxy::vmess::outbound::Handler::Process(
         stream->CloseAbortive();
         co_return tl::unexpected(ok.error());
     }
-    stream->SetIdleTimeout(relay_idle_timeout);
+    stream->SetIdleTimeout(relay_config.idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
-    stream->SetWriteTimeout(relay_write_timeout);
+    stream->SetWriteTimeout(relay_config.write_timeout);
     stream->ClearPhaseDeadline();
 
     VMessOutboundEndpoint target_endpoint(vmess_session, *stream, is_udp, target);
@@ -218,97 +213,10 @@ const bool kVMessRegistered = (::proxyman::outbound::RegisterProxy(
     ::constants::protocol::kVmess,
     [](const ::infra::OutboundSourceConfig& cfg)
         -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
-        const auto& s = cfg.settings;
-
-        // A present field of the wrong type is a configuration error, never
-        // an implicit default.
-        bool invalid_field = false;
-        auto json_string = [&](const ::json::object& obj,
-                               std::string_view key) -> std::string {
-            auto parsed = ::ParseJsonString(obj, key);
-            if (!parsed) {
-                LOG_ERROR("VMess outbound '{}': {}", cfg.tag, parsed.error());
-                invalid_field = true;
-                return {};
-            }
-            return std::move(*parsed).value_or(std::string{});
-        };
-        auto has_supported_alter_id = [](const ::json::object& obj) {
-            const auto* value = obj.if_contains("alterId");
-            if (!value) return true;
-            const auto alter_id = ::JsonUnsignedInteger(*value);
-            return alter_id && *alter_id == 0;
-        };
-        auto parse_security = [&](std::string security)
-            -> std::optional<::vmess::Security> {
-            security = LowerAscii(std::move(security));
-            if (security.empty() ||
-                security == ::constants::protocol::kAes128Gcm ||
-                security == ::constants::binding::kAuto) {
-                return ::vmess::Security::AES_128_GCM;
-            }
-            if (security == ::constants::protocol::kChacha20IetfPoly1305 ||
-                security == "chacha20-poly1305") {
-                return ::vmess::Security::CHACHA20_POLY1305;
-            }
-            if (security == ::constants::protocol::kNone) {
-                return ::vmess::Security::NONE;
-            }
-            if (security == "zero") {
-                return ::vmess::Security::ZERO;
-            }
-            return std::nullopt;
-        };
-
-        const auto vnext_server = ::proxy::ParseOptionalSingleObjectArray(
-            s, "vnext", "VMess", cfg.tag);
-        if (!vnext_server) {
-            return std::nullopt;
-        }
-        const ::json::object& server_obj = *vnext_server ? **vnext_server : s;
-        const ::json::object* user_obj = &s;
-        if (*vnext_server) {
-            user_obj = ::proxy::ParseRequiredSingleObjectArray(
-                server_obj, "users", "VMess", cfg.tag);
-            if (!user_obj) {
-                return std::nullopt;
-            }
-        } else if (s.if_contains("users")) {
-            LOG_ERROR("VMess outbound '{}': users requires vnext", cfg.tag);
-            return std::nullopt;
-        }
-        std::string address = json_string(server_obj, "address");
-        uint16_t port = 443;
-        const auto source_port = ::ReadJsonPort(server_obj, "port");
-        if (source_port.Invalid()) {
-            return std::nullopt;
-        }
-        if (source_port.Valid()) {
-            port = source_port.value;
-        }
-        std::string uuid = json_string(*user_obj, "id");
-        if (!has_supported_alter_id(*user_obj)) {
-            return std::nullopt;
-        }
-        auto parsed_security = parse_security(json_string(*user_obj, "security"));
-        if (!parsed_security) {
-            return std::nullopt;
-        }
-        const auto security = *parsed_security;
-        if (invalid_field) {
-            return std::nullopt;
-        }
-
-        auto user = ::vmess::MemoryAccount::FromUUID(uuid);
-        if (!user) {
-            LOG_ERROR("VMess outbound '{}': invalid UUID", cfg.tag);
-            return std::nullopt;
-        }
-        auto next_hop = ::proxy::PrepareNextHop(
-            cfg, std::move(address), port, ::OutboundStreamDefaults{});
-        if (!next_hop) {
-            return std::nullopt;
-        }
+        const auto* settings = std::get_if<::infra::VmessSettings>(&cfg.settings);
+        if (!settings) return std::nullopt;
+        auto user = ::vmess::MemoryAccount::FromUuidBytes(settings->id);
+        auto next_hop = ::proxy::PrepareNextHop(cfg, settings->server, ::OutboundStreamDefaults{});
 
         using PreparedSettings = ::proxy::vmess::outbound::PreparedSettings;
         return ::proxyman::outbound::PreparedOutboundProxy{
@@ -322,12 +230,12 @@ const bool kVMessRegistered = (::proxyman::outbound::RegisterProxy(
                         std::move(state));
                 }>(PreparedSettings{
                     ::VMessOutboundConfig{
-                        .server = std::move(next_hop->server),
-                        .security = security,
+                        .server = std::move(next_hop.server),
+                        .security = settings->security,
                     },
-                    *user,
-                    ::vmess::ExpandAuthIDEncryptKey(user->auth_key)}),
-            .sender = std::move(next_hop->sender),
+                    user,
+                    ::vmess::ExpandAuthIDEncryptKey(user.auth_key)}),
+            .sender = std::move(next_hop.sender),
         };
     }), true);
 }  // namespace

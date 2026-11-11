@@ -1,5 +1,6 @@
 #include "proxy/shadowsocks/ss_inbound.hpp"
 #include "proxy/shadowsocks/ss_stream.hpp"
+#include "proxy/shadowsocks/ss_salt_pool.hpp"
 #include "proxy/handshake_errors.hpp"
 #include "common/scoped_cleanse.hpp"
 #include "proxy/inbound_admission.hpp"
@@ -26,7 +27,6 @@
 #include <optional>
 #include <span>
 #include <utility>
-#include <variant>
 
 namespace ss {
 
@@ -413,30 +413,6 @@ namespace {
 
 
 
-class ShadowsocksUdpResponseContext final : public InboundDatagramResponse {
-public:
-    ShadowsocksUdpResponseContext(ss::KeyBytes reply_key, ss::SsCipherInfo cipher_info)
-        : state_(ClassicState{std::move(reply_key), cipher_info}) {}
-
-    explicit ShadowsocksUdpResponseContext(ss::Ss2022UdpTxState session)
-        : state_(std::move(session)) {}
-
-    [[nodiscard]] buf::MultiBuffer Encode(UDPPacketView packet) override;
-
-private:
-    struct ClassicState {
-        ss::KeyBytes reply_key;
-        ss::SsCipherInfo cipher_info{};
-    };
-
-    [[nodiscard]] size_t EncodePacketTo(
-        const TargetAddress& target,
-        std::span<const uint8_t> payload,
-        uint8_t* out,
-        size_t out_capacity);
-
-    std::variant<ClassicState, ss::Ss2022UdpTxState> state_;
-};
 
 struct PreparedSsTcpSession {
     ss::detail::BodyReader request_reader;
@@ -451,8 +427,8 @@ PrepareSsTcpSession(
     AsyncStream& stream,
     const ss::SsCipherInfo& cipher_info,
     size_t& last_matched_index,
-    UserOnlineTracker& tracker,
-    ConnectionLimiter* limiter,
+    const proxyman::inbound::AdmissionEnvironment& environment,
+    proxy::InboundAuthentication authentication,
     session::Context& ctx) {
     const auto tag = ctx.inbound.tag;
     const auto& client_ip = ctx.inbound.source_ip;
@@ -464,7 +440,7 @@ PrepareSsTcpSession(
     if (!session_result) {
         const ErrorCode error = session_result.error();
         if (error == ErrorCode::PROTOCOL_AUTH_FAILED) {
-            co_await proxy::RecordInboundAuthFailure(limiter, ctx, "no matching credential");
+            (void)co_await authentication.RejectCredential("no matching credential");
         } else if (error == ErrorCode::SOCKET_EOF) {
             LOG_CONN_DEBUG(ctx, "TCP peer closed before its handshake");
         } else if (error != ErrorCode::SOCKET_EOF && error != ErrorCode::CONNECTION_CLOSED &&
@@ -478,24 +454,32 @@ PrepareSsTcpSession(
     auto request_reader = std::move(session_result->body_reader);
     const auto* matched = session_result->user.get();
     if (!matched) {
-        co_await proxy::RecordInboundAuthFailure(limiter, ctx, "no authenticated user");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
+        co_return tl::unexpected(co_await authentication.RejectCredential("no authenticated user"));
     }
 
     // UoT resolves its UDP destination only after admission; the magic address
     // is admitted as the TCP request target, as before.
     const auto uot_version = proxy::uot::VersionFromMagicAddress(session_result->target);
-    proxy::BindAuthenticatedInbound(
-        ctx, matched->profile,
+    auto bound = std::move(authentication).Bind(matched->profile,
         proxy::InboundRequestTarget{
             Network::TCP,
             std::move(session_result->target),
             std::move(session_result->forwarded)});
-    auto user_session = co_await proxy::AdmitAuthenticatedInbound(
-        tracker, ctx, matched->profile);
-    if (!user_session) {
-        co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
+    if (ss::Is2022Cipher(cipher_info.type)) {
+        try {
+            const auto salt = co_await ss::AdmitSs2022RequestSalt(environment.coordinator, session_result->request_salt);
+            if (salt != ss::Ss2022SaltAdmission::Accepted) {
+                co_return tl::unexpected(std::move(bound).Reject(
+                    salt == ss::Ss2022SaltAdmission::Replayed ? "request salt replay" : "request salt tracking capacity",
+                    salt == ss::Ss2022SaltAdmission::Replayed ? ErrorCode::PERMISSION_DENIED : ErrorCode::RESOURCE_EXHAUSTED));
+            }
+        } catch (const IoSystemError& error) {
+            co_return tl::unexpected(error.code() == net::error::operation_aborted
+                ? ErrorCode::CANCELLED : MapAsioError(error.code()));
+        }
     }
+    auto user_session = co_await std::move(bound).Admit();
+    if (!user_session) co_return tl::unexpected(user_session.error());
 
     auto response_writer_result = ss::WriteTCPResponse(
         *matched, cipher_info, session_result->request_salt, stream);
@@ -564,13 +548,9 @@ net::awaitable<RelayResult> DispatchSsUotSession(
 // ============================================================================
 
 proxy::shadowsocks::inbound::Handler::Handler(
-    UserOnlineTracker& tracker,
-    StatsShard& stats,
-    ConnectionLimiter* limiter,
+    const proxyman::inbound::AdmissionEnvironment& environment,
     ss::SsCipherInfo cipher_info)
-    : tracker_(tracker)
-    , stats_(stats)
-    , limiter_(limiter)
+    : environment_(environment)
     , cipher_info_(cipher_info) {}
 
 // ----------------------------------------------------------------------------
@@ -601,19 +581,17 @@ proxy::shadowsocks::inbound::Handler::Process(
 
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
-    if (proxy::BeginInboundAuthentication(limiter_, ctx) &&
-        co_await proxy::CheckInboundIpBanned(*limiter_, ctx)) {
-        co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::BLOCKED);
-    }
+    auto authentication = co_await proxy::BeginInboundAuthentication(environment_, ctx);
+    if (!authentication) co_return proxy::RejectInbound(environment_.stats, stream.get(), authentication.error());
     auto prepared = co_await PrepareSsTcpSession(
         *stream,
         cipher_info_,
         last_matched_index_,
-        tracker_,
-        limiter_,
+        environment_,
+        std::move(*authentication),
         ctx);
     if (!prepared) {
-        co_return proxy::RejectInbound(stats_, stream.get(), prepared.error());
+        co_return proxy::RejectInbound(environment_.stats, stream.get(), prepared.error());
     }
 
     if (prepared->uot_version) {
@@ -627,7 +605,7 @@ proxy::shadowsocks::inbound::Handler::Process(
             receiver.dispatch_policy,
             io_context,
             ctx,
-            stats_,
+            environment_.stats,
             timeouts);
     }
 
@@ -638,7 +616,7 @@ proxy::shadowsocks::inbound::Handler::Process(
         transport::Link{&prepared->request_reader, &prepared->response_writer},
         std::move(prepared->initial_payload),
         ctx,
-        stats_,
+        environment_.stats,
         timeouts);
 }
 
@@ -677,8 +655,6 @@ proxy::shadowsocks::inbound::Handler::Process(
             result.session_owner, *decoded->session_id, request.configuration});
         if (found != request.associations->end() && found->second) {
             auto* association = found->second;
-            // The configuration/credential/session lookup and immutable policy
-            // identity together establish the concrete protocol state type.
             if (&association->Policy() != result.association_policy)
                 return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
             if (!association->claimed) {
@@ -702,7 +678,7 @@ proxy::shadowsocks::inbound::Handler::CreateDatagramResponse(
         return tl::unexpected(ErrorCode::INTERNAL);
     }
     if (!ss::Is2022Cipher(cipher_info_.type)) {
-        return std::make_shared<ShadowsocksUdpResponseContext>(key, cipher_info_);
+        return std::make_shared<ss::UdpResponse>(key, cipher_info_);
     }
     if (!decoded.session_id) return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     ss::Ss2022UdpTxState state;
@@ -712,63 +688,9 @@ proxy::shadowsocks::inbound::Handler::CreateDatagramResponse(
     if (RAND_bytes(state.server_session_id.data(), state.server_session_id.size()) != 1) {
         return tl::unexpected(ErrorCode::INTERNAL);
     }
-    return std::make_shared<ShadowsocksUdpResponseContext>(std::move(state));
+    return std::make_shared<ss::UdpResponse>(std::move(state));
 }
 
-size_t ShadowsocksUdpResponseContext::EncodePacketTo(
-    const TargetAddress& target,
-    std::span<const uint8_t> payload,
-    uint8_t* out,
-    size_t out_capacity) {
-    if (auto* ss2022 = std::get_if<ss::Ss2022UdpTxState>(&state_)) {
-        return ss::Encode2022UdpResponsePacketTo(
-            target,
-            payload.data(),
-            payload.size(),
-            *ss2022,
-            out,
-            out_capacity);
-    }
-    const auto& classic = std::get<ClassicState>(state_);
-    return ss::EncodeUdpPacketTo(
-        target,
-        payload.data(),
-        payload.size(),
-        classic.reply_key.span(),
-        classic.cipher_info.type,
-        classic.cipher_info.key_size,
-        classic.cipher_info.salt_size,
-        out,
-        out_capacity);
-}
-
-buf::MultiBuffer ShadowsocksUdpResponseContext::Encode(UDPPacketView packet) {
-    const size_t encoded_len = EncodePacketTo(
-        packet.target, packet.data, nullptr, 0);
-    if (encoded_len == 0) {
-        return {};
-    }
-
-    buf::ContiguousWriteBuffer encoded;
-    uint8_t* dst = encoded.TryPrepare(encoded_len);
-    if (!dst) {
-        return {};
-    }
-    const size_t written = EncodePacketTo(
-        packet.target,
-        packet.data,
-        dst,
-        encoded_len);
-    if (written != encoded_len) {
-        return {};
-    }
-
-    buf::MultiBuffer payload;
-    if (!encoded.TryAppendTo(written, payload)) {
-        return {};
-    }
-    return payload;
-}
 
 
 // ============================================================================
@@ -795,22 +717,16 @@ const bool kSsInboundRegistered = [] {
     reg.datagram_transport =
         ::proxyman::inbound::DatagramTransport::Packet;
 
-    reg.create_runtime = &::proxy::CreateUserOnlineProtocolRuntime;
 
     const auto create_handler =
-        [](::proxyman::inbound::ProtocolRuntime& runtime,
-           ::StatsShard& stats,
-           ::ConnectionLimiter* limiter,
+        [](const ::proxyman::inbound::AdmissionEnvironment& environment,
            const ::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<::Inbound> {
-            auto* tracker = runtime.OnlineTracker();
             const auto* settings = GetSettings(req);
-            if (!tracker || !settings) {
+            if (!settings) {
                 return nullptr;
             }
             return std::make_unique<::proxy::shadowsocks::inbound::Handler>(
-                *tracker,
-                stats,
-                limiter,
+                environment,
                 settings->cipher);
         };
     reg.create_tcp_handler = create_handler;

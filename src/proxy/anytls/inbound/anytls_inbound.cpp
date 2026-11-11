@@ -50,13 +50,9 @@ constexpr size_t kMaxConcurrentSubstreams = 128;
 
 }  // namespace
 
-Handler::Handler(UserOnlineTracker& tracker,
-                 StatsShard& stats,
-                 ConnectionLimiter* limiter,
+Handler::Handler(const proxyman::inbound::AdmissionEnvironment& environment,
                  std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme)
-    : tracker_(tracker)
-    , stats_(stats)
-    , limiter_(limiter)
+    : environment_(environment)
     , padding_scheme_(std::move(padding_scheme)) {}
 
 namespace {
@@ -202,20 +198,18 @@ public:
     AnyTLSDemuxSession(std::unique_ptr<AsyncStream> stream,
                        routing::Dispatcher& dispatcher,
                        const routing::DispatchPolicy& policy,
-                       ConnectionLimiter* limiter,
+                       const proxyman::inbound::AdmissionEnvironment& environment,
                        net::io_context& io_context,
                        const session::Context& session_ctx,
-                       StatsShard& stats,
                        const TimeoutsConfig& timeouts,
                        std::chrono::seconds control_idle_timeout,
                        const PaddingScheme* padding_scheme)
         : stream_(std::move(stream))
         , dispatcher_(dispatcher)
         , policy_(policy)
-        , limiter_(limiter)
+        , environment_(environment)
         , io_context_(io_context)
         , session_ctx_(session_ctx)
-        , stats_(stats)
         , timeouts_(timeouts)
         , control_idle_timeout_(control_idle_timeout)
         , padding_scheme_(padding_scheme) {}
@@ -271,10 +265,10 @@ public:
 
         try {
             auto result = co_await anytls::WriteFrame(*stream_, cmd, sid, payload);
-            if (!result) CancelAll();
+            if (!result) FailPhysicalWrite(result.error());
             co_return result;
         } catch (...) {
-            CancelAll();
+            FailPhysicalWrite(transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL));
             throw;
         }
     }
@@ -292,10 +286,10 @@ public:
         try {
             auto result = co_await anytls::WriteMultiBufferAsFrameBatch(
                 *stream_, cmd, sid, std::move(mb));
-            if (!result) CancelAll();
+            if (!result) FailPhysicalWrite(result.error());
             co_return result;
         } catch (...) {
-            CancelAll();
+            FailPhysicalWrite(transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL));
             throw;
         }
     }
@@ -324,10 +318,10 @@ public:
         CheckStreamWrite(sid);
         try {
             auto result = co_await anytls::WriteBuffersAsFrameBatch(*stream_, cmd, sid, buffers);
-            if (!result) CancelAll();
+            if (!result) FailPhysicalWrite(result.error());
             co_return result;
         } catch (...) {
-            CancelAll();
+            FailPhysicalWrite(transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL));
             throw;
         }
     }
@@ -346,6 +340,13 @@ public:
     }
 
 private:
+    void FailPhysicalWrite(ErrorCode error) noexcept {
+        // A write completing after retirement only reports its consequences.
+        // Preserve the frame loop's error (or clean EOF), not that drain error.
+        if (cancelled_) return;
+        physical_write_error_ = error;
+        CancelAll();
+    }
     std::shared_ptr<AnyTLSSubStream> FindStream(uint32_t sid) const {
         const auto it = streams_.find(sid);
         return it == streams_.end() ? nullptr : it->second;
@@ -443,10 +444,9 @@ private:
     std::unique_ptr<AsyncStream> stream_;
     routing::Dispatcher& dispatcher_;
     const routing::DispatchPolicy& policy_;
-    ConnectionLimiter* limiter_;
+    const proxyman::inbound::AdmissionEnvironment& environment_;
     net::io_context& io_context_;
     const session::Context& session_ctx_;
-    StatsShard& stats_;
     TimeoutsConfig timeouts_;
     std::chrono::seconds control_idle_timeout_{};
     const PaddingScheme* padding_scheme_ = nullptr;
@@ -454,6 +454,7 @@ private:
     memory::UnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>> streams_;
     uint32_t last_stream_id_ = 0;
     bool cancelled_ = false;
+    std::optional<ErrorCode> physical_write_error_;
     std::optional<anytls::SessionVersion> session_version_;
 };
 
@@ -501,7 +502,7 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
 
     (void)co_await proxy::uot::DispatchPreparedUotRequest(
         std::move(*prepared), nullptr, sub, sub,
-        dispatcher_, policy_, io_context_, sub.ctx, stats_, timeouts_);
+        dispatcher_, policy_, io_context_, sub.ctx, environment_.stats, timeouts_);
     co_return ErrorCode::OK;
 }
 
@@ -509,8 +510,10 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
     AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at) {
     session::Context& ctx = sub.ctx;
     // Held for the stream's lifetime; a refusal ends only this stream.
-    auto admission = co_await proxy::AdmitInboundSubstream(limiter_, stats_, ctx);
-    if (!admission) {
+    proxy::InboundSubstreamAdmission admission(environment_.stats);
+    auto pending_admission = proxy::AdmitInboundSubstream(environment_, ctx);
+    if (pending_admission &&
+        !admission.Hold(co_await std::move(*pending_admission), ctx, environment_.stats)) {
         if (session_version_ == anytls::SessionVersion::V2) {
             constexpr std::string_view message = "connection rejected";
             (void)co_await WriteFrameSerialized(anytls::kCmdSYNACK, sub.Sid(),
@@ -556,7 +559,7 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
     }
     (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
         transport::Link{&sub, &sub}, InitialPayload{std::move(pending)},
-        ctx, stats_, timeouts_);
+        ctx, environment_.stats, timeouts_);
     co_return ErrorCode::OK;
 }
 
@@ -594,9 +597,14 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
         // cleanup, even when the frame loop returns normally.
         tasks.Cancel();
     };
-    co_await RunAwaitableTaskGroup(co_await net::this_coro::executor,
-        [&](AwaitableTaskGroup& tasks) { tasks.Spawn(read_frames(tasks)); });
+    try {
+        co_await RunAwaitableTaskGroup(co_await net::this_coro::executor,
+            [&](AwaitableTaskGroup& tasks) { tasks.Spawn(read_frames(tasks)); });
+    } catch (...) {
+        if (!physical_write_error_) throw;
+    }
     if (result.error == ErrorCode::SOCKET_EOF) result.error = ErrorCode::OK;
+    if (physical_write_error_) result.error = *physical_write_error_;
     co_return result;
 }
 
@@ -657,7 +665,7 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::OpenClientStream(const anytls::F
             if (streams_.size() >= kMaxConcurrentSubstreams) {
                 proxy::LogInboundRequestRejected(session_ctx_, "concurrent stream limit");
                 last_stream_id_ = sid; // A refused ID is retired, never reusable.
-                stats_.OnError();
+                environment_.stats.OnError();
                 if (session_version_ == anytls::SessionVersion::V2) {
                     constexpr std::string_view message = "concurrent stream limit";
                     auto ok = co_await WriteFrameSerialized(anytls::kCmdSYNACK, sid,
@@ -786,8 +794,7 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadAuth(
 net::awaitable<tl::expected<UserOnlineSessionGuard, ErrorCode>>
 AuthenticateSession(
     AsyncStream& stream,
-    UserOnlineTracker& tracker,
-    ConnectionLimiter* limiter,
+    proxy::InboundAuthentication authentication,
     session::Context& ctx,
     const TimeoutsConfig& timeouts,
     std::chrono::seconds control_idle_timeout) {
@@ -796,27 +803,19 @@ AuthenticateSession(
     if (auto ok = co_await ReadAuth(stream, auth_hash); !ok) {
         co_return tl::unexpected(ok.error());
     }
-    const auto credential = co_await proxy::VerifyInboundCredential(
-        limiter, ctx, proxyman::inbound::UserProtocol::AnyTls, auth_hash);
-    if (credential.error != ErrorCode::OK) co_return tl::unexpected(credential.error);
+    const auto credential = co_await authentication.VerifyCredential({proxy::KeyedInboundProtocol::AnyTls, auth_hash});
+    if (credential != ErrorCode::OK) co_return tl::unexpected(credential);
     auto user = proxyman::inbound::UserStore::FindAnyTlsUser(ctx.inbound.tag, auth_hash);
     OPENSSL_cleanse(auth_hash.data(), auth_hash.size());
-    if (!user) {
-        co_await proxy::RecordInboundAuthFailure(
-            limiter, ctx, "no matching credential", credential.key);
-        co_return tl::unexpected(ErrorCode::PROTOCOL_AUTH_FAILED);
-    }
+    if (!user) co_return tl::unexpected(co_await authentication.RejectCredential("no matching credential"));
     stream.SetReadTimeout(std::chrono::seconds(0));
     stream.SetWriteTimeout(
         std::min(timeouts.WriteTimeout(), control_idle_timeout));
 
     // Session-level authentication: no target exists until streams open.
-    proxy::BindAuthenticatedInbound(ctx, user->profile, std::nullopt);
-    auto user_session = co_await proxy::AdmitAuthenticatedInbound(
-        tracker, ctx, user->profile);
-    if (!user_session) {
-        co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
-    }
+    auto user_session = co_await proxy::AuthenticateAndAdmit(
+        std::move(authentication), &user->profile, "no matching credential", std::nullopt);
+    if (!user_session) co_return tl::unexpected(user_session.error());
 
     // Metadata is owned by ctx; authentication must not pin an old user table
     // for the lifetime of this control transport and all its logical streams.
@@ -836,8 +835,6 @@ Handler::Process(
     session::Context& ctx,
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
-    ctx.inbound.user_id = 0;
-    ctx.inbound.user_email.clear();
     if (!stream) {
         RelayResult result;
         result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
@@ -845,10 +842,8 @@ Handler::Process(
     }
 
     try {
-        if (proxy::BeginInboundAuthentication(limiter_, ctx) &&
-            co_await proxy::CheckInboundIpBanned(*limiter_, ctx)) {
-            co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::BLOCKED);
-        }
+        auto authentication = co_await proxy::BeginInboundAuthentication(environment_, ctx);
+        if (!authentication) co_return proxy::RejectInbound(environment_.stats, stream.get(), authentication.error());
 
         auto control_idle_timeout = timeouts.IdleTimeout();
         if (pressure_idle_timeout > 0) {
@@ -860,9 +855,9 @@ Handler::Process(
         UserOnlineSessionGuard user_session;
         {
             auto auth = co_await AuthenticateSession(
-                *stream, tracker_, limiter_, ctx, timeouts, control_idle_timeout);
+                *stream, std::move(*authentication), ctx, timeouts, control_idle_timeout);
             if (!auth) {
-                co_return proxy::RejectInbound(stats_, stream.get(), auth.error());
+                co_return proxy::RejectInbound(environment_.stats, stream.get(), auth.error());
             }
             user_session = std::move(*auth);
         }
@@ -870,17 +865,16 @@ Handler::Process(
             std::move(stream),
             dispatcher,
             receiver.dispatch_policy,
-            limiter_,
+            environment_,
             io_context,
             ctx,
-            stats_,
             timeouts,
             control_idle_timeout,
             padding_scheme_.get());
         co_return co_await demux.Run();
     } catch (...) {
         co_return proxy::RejectInbound(
-            stats_, stream.get(),
+            environment_.stats, stream.get(),
             transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL));
     }
 }
@@ -902,23 +896,18 @@ public:
 const bool kInboundRegistered = [] {
     ::proxyman::inbound::ProxyRegistration reg;
     reg.user_protocol = ::proxyman::inbound::UserProtocol::AnyTls;
+    reg.traits = {.mailbox_email_defaults_to_tag = true, .requires_tls = true};
 
-    reg.create_runtime = &::proxy::CreateUserOnlineProtocolRuntime;
 
     reg.create_tcp_handler =
-        [](::proxyman::inbound::ProtocolRuntime& runtime,
-           ::StatsShard& stats,
-           ::ConnectionLimiter* limiter,
+        [](const ::proxyman::inbound::AdmissionEnvironment& environment,
            const ::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<::Inbound> {
-            auto* tracker = runtime.OnlineTracker();
             const auto* settings = GetAnyTlsSettings(req);
-            if (!tracker || !settings) {
+            if (!settings) {
                 return nullptr;
             }
             return std::make_unique<::proxy::anytls::inbound::Handler>(
-                *tracker,
-                stats,
-                limiter,
+                environment,
                 settings->padding_scheme);
         };
 

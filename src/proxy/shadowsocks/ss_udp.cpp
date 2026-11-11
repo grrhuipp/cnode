@@ -821,8 +821,7 @@ void Ss2022UdpReplayCache::PruneExpired(
 
 const InboundDatagramAssociationPolicy& Ss2022UdpAssociation::Policy() noexcept {
     static const InboundDatagramAssociationPolicy policy{
-        Ss2022UdpReplayCache::kMaxSessions,
-        Ss2022UdpReplayCache::kRetention,
+        Ss2022UdpReplayCache::kMaxSessions, Ss2022UdpReplayCache::kRetention,
         []() -> std::unique_ptr<InboundDatagramAssociation> {
             return std::make_unique<Ss2022UdpAssociation>();
         }};
@@ -1195,4 +1194,58 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     return result;
 }
 
+size_t ss::UdpResponse::EncodePacketTo(
+    const TargetAddress& target,
+    std::span<const uint8_t> payload,
+    uint8_t* out,
+    size_t out_capacity) {
+    if (auto* ss2022 = std::get_if<ss::Ss2022UdpTxState>(&state_)) {
+        return ss::Encode2022UdpResponsePacketTo(
+            target,
+            payload.data(),
+            payload.size(),
+            *ss2022,
+            out,
+            out_capacity);
+    }
+    const auto& classic = std::get<ClassicState>(state_);
+    return ss::EncodeUdpPacketTo(
+        target,
+        payload.data(),
+        payload.size(),
+        classic.reply_key.span(),
+        classic.cipher_info.type,
+        classic.cipher_info.key_size,
+        classic.cipher_info.salt_size,
+        out,
+        out_capacity);
+}
+
+buf::MultiBuffer ss::UdpResponse::Encode(UDPPacketView packet) {
+    const size_t encoded_len = EncodePacketTo(
+        packet.target, packet.data, nullptr, 0);
+    if (encoded_len == 0) {
+        return {};
+    }
+
+    buf::ContiguousWriteBuffer encoded;
+    uint8_t* dst = encoded.TryPrepare(encoded_len);
+    if (!dst) {
+        return {};
+    }
+    const size_t written = EncodePacketTo(
+        packet.target,
+        packet.data,
+        dst,
+        encoded_len);
+    if (written != encoded_len) {
+        return {};
+    }
+
+    buf::MultiBuffer payload;
+    if (!encoded.TryAppendTo(written, payload)) {
+        return {};
+    }
+    return payload;
+}
 }  // namespace ss

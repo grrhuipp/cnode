@@ -773,7 +773,7 @@ net::awaitable<void> RunSubDispatch(
     net::io_context& io_context,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& policy,
-    ConnectionLimiter* limiter,
+    const proxyman::inbound::AdmissionEnvironment& environment,
     MuxSubSession* sub,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
@@ -787,8 +787,9 @@ net::awaitable<void> RunSubDispatch(
 
     try {
         // Held for the child's lifetime; a refusal ends only this child.
-        auto admission = co_await proxy::AdmitInboundSubstream(limiter, stats, sub->ctx);
-        if (!admission) {
+        proxy::InboundSubstreamAdmission admission(stats);
+        auto pending = proxy::AdmitInboundSubstream(environment, sub->ctx);
+        if (pending && !admission.Hold(co_await std::move(*pending), sub->ctx, stats)) {
             sub->Reject();
         } else {
             (void)co_await dispatcher.Dispatch(
@@ -815,11 +816,11 @@ class MuxServerSession final {
 public:
     MuxServerSession(net::io_context& io_context, transport::Link client_link,
         AsyncStream& client_control, routing::Dispatcher& dispatcher,
-        const routing::DispatchPolicy& policy, ConnectionLimiter* limiter,
+        const routing::DispatchPolicy& policy, const proxyman::inbound::AdmissionEnvironment& environment,
         session::Context& parent_ctx, StatsShard& stats, const TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout)
         : io_context(io_context), client_link(client_link), client_control(client_control),
-          dispatcher(dispatcher), policy(policy), limiter(limiter), parent_ctx(parent_ctx),
+          dispatcher(dispatcher), policy(policy), environment(environment), parent_ctx(parent_ctx),
           stats(stats), timeouts(timeouts), pressure_idle_timeout(pressure_idle_timeout),
           main_signal(net::any_io_executor(io_context.get_executor()), 1),
           reply_queue(main_signal), client_reads(io_context, main_signal),
@@ -1203,7 +1204,7 @@ private:
                                 io_context,
                                 dispatcher,
                                 policy,
-                                limiter,
+                                environment,
                                 sub_ptr,
                                 stats,
                                 timeouts,
@@ -1340,7 +1341,7 @@ private:
     AsyncStream& client_control;
     routing::Dispatcher& dispatcher;
     const routing::DispatchPolicy& policy;
-    ConnectionLimiter* limiter;
+    const proxyman::inbound::AdmissionEnvironment& environment;
     session::Context& parent_ctx;
     StatsShard& stats;
     const TimeoutsConfig& timeouts;
@@ -1364,7 +1365,7 @@ net::awaitable<RelayResult> ServeMuxInbound(
     AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& policy,
-    ConnectionLimiter* limiter,
+    const proxyman::inbound::AdmissionEnvironment& environment,
     session::Context& parent_ctx,
     StatsShard& stats,
     const TimeoutsConfig& timeouts,
@@ -1372,7 +1373,7 @@ net::awaitable<RelayResult> ServeMuxInbound(
 {
     try {
         MuxServerSession session(io_context, client_link, client_control, dispatcher, policy,
-            limiter, parent_ctx, stats, timeouts, pressure_idle_timeout);
+            environment, parent_ctx, stats, timeouts, pressure_idle_timeout);
         co_return co_await session.Run();
     } catch (...) {
         stats.OnError();

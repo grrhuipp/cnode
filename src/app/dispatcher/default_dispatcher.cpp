@@ -494,6 +494,8 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     }
 
     RelayConfig relay_cfg;
+    relay_cfg.idle_timeout  = relay_idle_timeout;
+    relay_cfg.write_timeout = relay_write_timeout;
     relay_cfg.uplink_only   = timeouts.UplinkOnlyTimeout();
     relay_cfg.downlink_only = timeouts.DownlinkOnlyTimeout();
     relay_cfg.speed_limit   = ctx.content.speed_limit;
@@ -515,9 +517,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
         timeouts,
         stats,
         relay_cfg,
-        std::move(outbound_first_payload),
-        relay_idle_timeout,
-        relay_write_timeout);
+        std::move(outbound_first_payload));
     if (!outbound_process) {
         ErrorCode process_error = outbound_process.error();
         if (process_error == ErrorCode::OK) {

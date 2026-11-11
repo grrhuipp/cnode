@@ -17,40 +17,16 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <cstdlib>
 #include <exception>
 #include <future>
-#include <iostream>
 #include <optional>
 #include <span>
 #include <string_view>
-#include <type_traits>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 namespace {
-static_assert(!std::is_copy_constructible_v<vless::VlessEncryptionTicketRejection>);
-static_assert(!std::is_copy_assignable_v<vless::VlessEncryptionTicketRejection>);
-static_assert(!std::is_move_constructible_v<vless::VlessEncryptionTicketRejection>);
-static_assert(!std::is_move_assignable_v<vless::VlessEncryptionTicketRejection>);
-static_assert(!std::is_copy_constructible_v<vless::VlessEncryptionWriter>);
-static_assert(!std::is_copy_assignable_v<vless::VlessEncryptionWriter>);
-static_assert(!std::is_move_constructible_v<vless::VlessEncryptionWriter>);
-static_assert(!std::is_move_assignable_v<vless::VlessEncryptionWriter>);
-
-
-
-
-[[noreturn]] void Fail(std::string_view message) {
-    std::cerr << message << '\n';
-    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
-}
-
-void Check(bool condition, std::string_view message) {
-    if (!condition) {
-        Fail(message);
-    }
-}
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
     std::vector<uint8_t> out;
@@ -119,8 +95,7 @@ public:
             IoErrorCode error;
             co_await pending.async_wait(
                 net::redirect_error(net::use_awaitable, error));
-            Check(error == io_error::operation_aborted,
-                  "controlled read was not cancelled by Asio");
+            EXPECT_EQ(error, io_error::operation_aborted) << "controlled read was not cancelled by Asio";
             if (empty_on_cancel_) {
                 // TcpStream may report cancellation as an empty MultiBuffer.
                 co_return buf::MultiBuffer{};
@@ -133,13 +108,14 @@ public:
         }
         const size_t end = cutpoint_index_ < cutpoints_.size()
             ? cutpoints_[cutpoint_index_] : bytes_.size();
-        Check(end > offset_ && end <= bytes_.size(),
-              "invalid encrypted stream interruption boundary");
+        if (end <= offset_ || end > bytes_.size()) {
+            throw std::runtime_error("invalid encrypted stream interruption boundary");
+        }
         buf::MultiBuffer out;
-        Check(buf::AppendSpanToMultiBuffer(
-                  std::span<const uint8_t>(bytes_.data() + offset_, end - offset_),
-                  out),
-              "failed to allocate encrypted input fragment");
+        if (!buf::AppendSpanToMultiBuffer(
+                std::span<const uint8_t>(bytes_.data() + offset_, end - offset_), out)) {
+            throw std::bad_alloc();
+        }
         offset_ = end;
         co_return out;
     }
@@ -162,11 +138,11 @@ std::optional<vless::VlessEncryptionHeaderXor> MakeHeaderXor(
         return std::nullopt;
     }
     auto result = vless::VlessEncryptionHeaderXor::Create(key, context);
-    Check(result.has_value(), "failed to create encryption header XOR state");
+    if (!result) throw std::runtime_error("header XOR fixture unavailable");
     return result;
 }
 
-void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
+void ResumeInterruptedRecords(vless::VlessEncryptionAeadCipher cipher,
                    bool header_xor,
                    bool empty_on_cancel,
                    bool lazy_context) {
@@ -183,7 +159,7 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
         }
         const auto create_aead = [&] {
             auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
-            Check(aead.has_value(), "failed to create VLESS encryption AEAD");
+            if (!aead) throw std::runtime_error("AEAD fixture unavailable");
             return std::move(*aead);
         };
 
@@ -207,10 +183,8 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
             const net::const_buffer buffer(data.data(), data.size());
             co_await writer->WriteBuffers(
                 std::span<const net::const_buffer>(&buffer, 1));
-            Check(capture.bytes.size() - boundaries[record] ==
-                      vless::kVlessEncryptionRecordHeaderSize + data.size() +
-                          vless::kVlessEncryptionTagSize,
-                  "writer did not produce one encrypted record per plaintext");
+            EXPECT_EQ(capture.bytes.size() - boundaries[record], vless::kVlessEncryptionRecordHeaderSize + data.size() +
+                vless::kVlessEncryptionTagSize) << "writer did not produce one encrypted record per plaintext";
         }
         boundaries.back() = capture.bytes.size();
 
@@ -250,8 +224,7 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
             bool interrupted = false;
             try {
                 auto output = co_await reader->ReadMultiBuffer();
-                Check(Flatten(output) == plaintext[decoded],
-                      "resumed encryption reader lost or changed plaintext");
+                EXPECT_EQ(Flatten(output), plaintext[decoded]) << "resumed encryption reader lost or changed plaintext";
                 ++decoded;
             } catch (const IoSystemError& error) {
                 if (error.code() != io_error::operation_aborted) {
@@ -260,48 +233,31 @@ void RunResumeCase(vless::VlessEncryptionAeadCipher cipher,
                 interrupted = true;
             }
             if (interrupted) {
-                Check(!rejection.rejected,
-                      "cancelled deferred read invalidated a reusable ticket");
-                Check(cancelled < cutpoints.size() &&
+                EXPECT_FALSE(rejection.rejected) << "cancelled deferred read invalidated a reusable ticket";
+                EXPECT_TRUE((cancelled < cutpoints.size() &&
                           source.Interruptions() == cancelled + 1 &&
-                          source.Offset() == cutpoints[cancelled],
-                      "cancellation did not occur at the requested byte boundary");
-                Check(decoded == (source.Offset() < boundaries[0] ? 0u : 1u),
-                      "cancellation occurred before the preceding record decoded");
+                          source.Offset() == cutpoints[cancelled])) << "cancellation did not occur at the requested byte boundary";
+                EXPECT_EQ(decoded, (source.Offset() < boundaries[0] ? 0u : 1u)) << "cancellation occurred before the preceding record decoded";
                 const auto state = co_await net::this_coro::cancellation_state;
-                Check(state.cancelled() != net::cancellation_type::none,
-                      "read interruption lost its coroutine cancellation state");
+                EXPECT_NE(state.cancelled(), net::cancellation_type::none) << "read interruption lost its coroutine cancellation state";
                 ++cancelled;
                 co_await net::this_coro::reset_cancellation_state();
             }
         }
-        Check(cancelled == cutpoints.size(),
-              "encrypted reader did not exercise every cancellation cutpoint");
-        Check(source.Offset() == capture.bytes.size(),
-              "encrypted reader left wire bytes unconsumed");
-        Check((co_await reader->ReadMultiBuffer()).byte_size() == 0,
-              "real encrypted stream EOF returned plaintext");
-        Check((co_await reader->ReadMultiBuffer()).byte_size() == 0,
-              "repeated encrypted stream EOF returned plaintext");
+        EXPECT_EQ(cancelled, cutpoints.size()) << "encrypted reader did not exercise every cancellation cutpoint";
+        EXPECT_EQ(source.Offset(), capture.bytes.size()) << "encrypted reader left wire bytes unconsumed";
+        EXPECT_EQ((co_await reader->ReadMultiBuffer()).byte_size(), 0) << "real encrypted stream EOF returned plaintext";
+        EXPECT_EQ((co_await reader->ReadMultiBuffer()).byte_size(), 0) << "repeated encrypted stream EOF returned plaintext";
         reader->RejectDeferredTicket();
-        Check(!rejection.rejected,
-              "authenticated response or later EOF invalidated the ticket");
+        EXPECT_FALSE(rejection.rejected) << "authenticated response or later EOF invalidated the ticket";
     };
     auto future = net::co_spawn(io, exercise(),
         net::bind_cancellation_slot(signal.slot(), net::use_future));
     io.run();
-    try {
-        future.get();
-    } catch (const std::exception& error) {
-        std::cerr << "cipher=" << static_cast<int>(cipher)
-                  << " xor=" << header_xor
-                  << " empty-on-cancel=" << empty_on_cancel
-                  << " lazy-context=" << lazy_context << '\n';
-        Fail(error.what());
-    }
+    future.get();
 }
 
-void RunDeferredRejectionCase(vless::VlessEncryptionAeadCipher cipher,
+void AuthenticateDeferredResponse(vless::VlessEncryptionAeadCipher cipher,
                               bool header_xor,
                               unsigned boundary) {
     net::io_context io;
@@ -310,7 +266,7 @@ void RunDeferredRejectionCase(vless::VlessEncryptionAeadCipher cipher,
         std::array<uint8_t, vless::kVlessEncryptionCtrIvSize> context{};
         vless::VlessEncryptionUnitedKey key;
         auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
-        Check(aead.has_value(), "failed to create deferred response AEAD");
+        if (!aead) throw std::runtime_error("AEAD fixture unavailable");
         CaptureWriter capture;
         capture.bytes.insert(capture.bytes.end(), context.begin(), context.end());
         vless::VlessEncryptionWriter writer(
@@ -343,25 +299,19 @@ void RunDeferredRejectionCase(vless::VlessEncryptionAeadCipher cipher,
             auto result = co_await reader.ReadMultiBuffer();
             if (boundary == 6) {
                 const auto bytes = Flatten(result);
-                Check(std::string_view(reinterpret_cast<const char*>(bytes.data()),
-                                       bytes.size()) == payload,
-                      "deferred authenticated response changed payload");
+                EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(bytes.data()),
+                                       bytes.size()), payload) << "deferred authenticated response changed payload";
             } else {
-                Check(boundary == 2 && result.empty(),
-                      "incomplete deferred response produced plaintext");
+                EXPECT_TRUE((boundary == 2 && result.empty())) << "incomplete deferred response produced plaintext";
             }
         } catch (const IoSystemError& error) {
-            Check(error.code() != io_error::operation_aborted,
-                  "deferred rejection unexpectedly reported cancellation");
+            EXPECT_NE(error.code(), io_error::operation_aborted) << "deferred rejection unexpectedly reported cancellation";
             failed = true;
         }
-        Check(failed == (boundary != 2 && boundary != 6),
-              "deferred response failure category changed");
-        Check(rejection.rejected == (boundary != 6),
-              "ticket rejection did not match first-response authentication");
+        EXPECT_EQ(failed, (boundary != 2 && boundary != 6)) << "deferred response failure category changed";
+        EXPECT_EQ(rejection.rejected, (boundary != 6)) << "ticket rejection did not match first-response authentication";
         reader.RejectDeferredTicket();
-        Check(rejection.rejected == (boundary != 6),
-              "late failure invalidated an authenticated ticket");
+        EXPECT_EQ(rejection.rejected, (boundary != 6)) << "late failure invalidated an authenticated ticket";
     };
     auto future = net::co_spawn(io, exercise(), net::use_future);
     io.run();
@@ -409,8 +359,7 @@ public:
         IoErrorCode error;
         co_await pending.async_wait(
             net::redirect_error(net::use_awaitable, error));
-        Check(error == io_error::operation_aborted,
-              "controlled encrypted write was not cancelled");
+        EXPECT_EQ(error, io_error::operation_aborted) << "controlled encrypted write was not cancelled";
         throw IoSystemError(error);
     }
 
@@ -422,7 +371,7 @@ private:
     bool armed_ = true;
 };
 
-void RunWriterFailureCase(vless::VlessEncryptionAeadCipher cipher,
+void RejectWritesAfterFailure(vless::VlessEncryptionAeadCipher cipher,
                           bool header_xor, WriteFault fault) {
     net::io_context io;
     net::cancellation_signal signal;
@@ -430,7 +379,7 @@ void RunWriterFailureCase(vless::VlessEncryptionAeadCipher cipher,
         const std::array<uint8_t, vless::kVlessEncryptionCtrIvSize> context{};
         const vless::VlessEncryptionUnitedKey key;
         auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
-        Check(aead.has_value(), "failed to create faulting writer AEAD");
+        if (!aead) throw std::runtime_error("AEAD fixture unavailable");
         InterruptedWriter destination(fault, signal);
         vless::VlessEncryptionWriter writer(
             destination, std::move(*aead), key,
@@ -448,7 +397,7 @@ void RunWriterFailureCase(vless::VlessEncryptionAeadCipher cipher,
                 (fault == WriteFault::PartialFailure
                      ? io_error::connection_refused : io_error::operation_aborted);
         }
-        Check(original_error, "encrypted write did not preserve its original error");
+        EXPECT_TRUE((original_error)) << "encrypted write did not preserve its original error";
         co_await net::this_coro::reset_cancellation_state();
         const auto published = destination.capture.bytes;
         bool rejected = false;
@@ -461,9 +410,8 @@ void RunWriterFailureCase(vless::VlessEncryptionAeadCipher cipher,
             rejected = fault != WriteFault::Closed &&
                        error.code() == io_error::connection_reset;
         }
-        Check(destination.capture.bytes == published,
-              "terminal encrypted writer published another record");
-        Check(rejected, "terminal encrypted writer accepted another write");
+        EXPECT_EQ(destination.capture.bytes, published) << "terminal encrypted writer published another record";
+        EXPECT_TRUE((rejected)) << "terminal encrypted writer accepted another write";
     };
     auto future = net::co_spawn(io, exercise(),
         net::bind_cancellation_slot(signal.slot(), net::use_future));
@@ -471,14 +419,14 @@ void RunWriterFailureCase(vless::VlessEncryptionAeadCipher cipher,
     future.get();
 }
 
-void RunWriterShutdownCase(vless::VlessEncryptionAeadCipher cipher,
+void RejectWritesAfterShutdown(vless::VlessEncryptionAeadCipher cipher,
                            bool header_xor) {
     net::io_context io;
     const auto exercise = [&]() -> net::awaitable<void> {
         const std::array<uint8_t, vless::kVlessEncryptionCtrIvSize> context{};
         const vless::VlessEncryptionUnitedKey key;
         auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
-        Check(aead.has_value(), "failed to create shutdown writer AEAD");
+        if (!aead) throw std::runtime_error("AEAD fixture unavailable");
         CaptureWriter destination;
         vless::VlessEncryptionWriter writer(
             destination, std::move(*aead), key,
@@ -497,16 +445,15 @@ void RunWriterShutdownCase(vless::VlessEncryptionAeadCipher cipher,
         } catch (const transport::WriteClosed&) {
             rejected = true;
         }
-        Check(destination.bytes == published,
-              "finished encrypted writer published another record");
-        Check(rejected, "finished encrypted writer accepted another write");
+        EXPECT_EQ(destination.bytes, published) << "finished encrypted writer published another record";
+        EXPECT_TRUE((rejected)) << "finished encrypted writer accepted another write";
     };
     auto future = net::co_spawn(io, exercise(), net::use_future);
     io.run();
     future.get();
 }
 
-void RunWriterPrecancelCase(vless::VlessEncryptionAeadCipher cipher,
+void ResumePrecancelledWriter(vless::VlessEncryptionAeadCipher cipher,
                             bool header_xor) {
     net::io_context io;
     net::cancellation_signal signal;
@@ -515,8 +462,7 @@ void RunWriterPrecancelCase(vless::VlessEncryptionAeadCipher cipher,
         const vless::VlessEncryptionUnitedKey key;
         auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
         auto read_aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
-        Check(aead.has_value() && read_aead.has_value(),
-              "failed to create pre-cancel writer AEAD");
+        if (!aead || !read_aead) throw std::runtime_error("AEAD fixture unavailable");
         CaptureWriter destination;
         vless::VlessEncryptionWriter writer(
             destination, std::move(*aead), key,
@@ -532,9 +478,8 @@ void RunWriterPrecancelCase(vless::VlessEncryptionAeadCipher cipher,
         } catch (const IoSystemError& error) {
             cancelled = error.code() == io_error::operation_aborted;
         }
-        Check(destination.bytes.empty(),
-              "pre-cancelled encrypted writer published a record");
-        Check(cancelled, "pre-cancelled encrypted write did not report cancellation");
+        EXPECT_TRUE((destination.bytes.empty())) << "pre-cancelled encrypted writer published a record";
+        EXPECT_TRUE((cancelled)) << "pre-cancelled encrypted write did not report cancellation";
         co_await net::this_coro::reset_cancellation_state();
         co_await writer.WriteBuffers(
             std::span<const net::const_buffer>(&buffer, 1));
@@ -543,11 +488,9 @@ void RunWriterPrecancelCase(vless::VlessEncryptionAeadCipher cipher,
             source, std::move(*read_aead), key,
             MakeHeaderXor(header_xor, key.bytes, context));
         const auto decoded = Flatten(co_await reader.ReadMultiBuffer());
-        Check(std::string_view(reinterpret_cast<const char*>(decoded.data()),
-                               decoded.size()) == payload,
-              "pre-cancelled writer could not resume a consumable stream");
-        Check((co_await reader.ReadMultiBuffer()).empty(),
-              "pre-cancelled writer emitted extra plaintext");
+        EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(decoded.data()),
+                               decoded.size()), payload) << "pre-cancelled writer could not resume a consumable stream";
+        EXPECT_TRUE(((co_await reader.ReadMultiBuffer()).empty())) << "pre-cancelled writer emitted extra plaintext";
     };
     auto future = net::co_spawn(io, exercise(),
         net::bind_cancellation_slot(signal.slot(), net::use_future));
@@ -557,72 +500,49 @@ void RunWriterPrecancelCase(vless::VlessEncryptionAeadCipher cipher,
 
 }  // namespace
 
-TEST(VlessEncryptionIo, Contract) {
-    for (const auto cipher : {vless::VlessEncryptionAeadCipher::Aes256Gcm,
-                              vless::VlessEncryptionAeadCipher::Chacha20Poly1305}) {
-        for (const bool header_xor : {false, true}) {
-            for (const bool empty_on_cancel : {false, true}) {
-                for (const bool lazy_context : {false, true}) {
-                    RunResumeCase(cipher, header_xor, empty_on_cancel, lazy_context);
-                }
-            }
-        }
-    }
-}
+namespace {
+using Cipher = vless::VlessEncryptionAeadCipher;
+const auto ciphers = testing::Values(Cipher::Aes256Gcm, Cipher::Chacha20Poly1305);
 
-TEST(VlessEncryptionIo, DeferredTicketAuthenticationAndCloseBoundaries) {
-    for (const auto cipher : {vless::VlessEncryptionAeadCipher::Aes256Gcm,
-                              vless::VlessEncryptionAeadCipher::Chacha20Poly1305}) {
-        for (const bool header_xor : {false, true}) {
-            for (unsigned boundary = 0; boundary != 7; ++boundary) {
-                SCOPED_TRACE(testing::Message() << "cipher=" << static_cast<int>(cipher)
-                    << " xor=" << header_xor << " boundary=" << boundary);
-                RunDeferredRejectionCase(cipher, header_xor, boundary);
-            }
-        }
-    }
+class InterruptedEncryptedRead
+    : public testing::TestWithParam<std::tuple<Cipher, bool, bool, bool>> {};
+TEST_P(InterruptedEncryptedRead, CancellationResumesWithoutLosingRecordsOrRejectingTicket) {
+    const auto [cipher, header_xor, empty_on_cancel, lazy_context] = GetParam();
+    ResumeInterruptedRecords(cipher, header_xor, empty_on_cancel, lazy_context);
 }
+INSTANTIATE_TEST_SUITE_P(Modes, InterruptedEncryptedRead,
+    testing::Combine(ciphers, testing::Bool(), testing::Bool(), testing::Bool()));
 
-TEST(VlessEncryptionIo, WriterPartialFailureIsTerminal) {
-    for (const auto cipher : {vless::VlessEncryptionAeadCipher::Aes256Gcm,
-                              vless::VlessEncryptionAeadCipher::Chacha20Poly1305}) {
-        for (const bool header_xor : {false, true}) {
-            RunWriterFailureCase(cipher, header_xor, WriteFault::PartialFailure);
-        }
-    }
+class DeferredEncryptedResponse
+    : public testing::TestWithParam<std::tuple<Cipher, bool, unsigned>> {};
+TEST_P(DeferredEncryptedResponse, RejectsTicketUnlessFirstResponseAuthenticates) {
+    const auto [cipher, header_xor, boundary] = GetParam();
+    AuthenticateDeferredResponse(cipher, header_xor, boundary);
 }
+INSTANTIATE_TEST_SUITE_P(Boundaries, DeferredEncryptedResponse,
+    testing::Combine(ciphers, testing::Bool(), testing::Values(0u, 1u, 2u, 3u, 4u, 5u, 6u)));
 
-TEST(VlessEncryptionIo, WriterSuspendedCancellationIsTerminal) {
-    for (const auto cipher : {vless::VlessEncryptionAeadCipher::Aes256Gcm,
-                              vless::VlessEncryptionAeadCipher::Chacha20Poly1305}) {
-        for (const bool header_xor : {false, true}) {
-            RunWriterFailureCase(cipher, header_xor, WriteFault::SuspendedCancellation);
-        }
-    }
+class FailedEncryptedWrite
+    : public testing::TestWithParam<std::tuple<Cipher, bool, WriteFault>> {};
+TEST_P(FailedEncryptedWrite, PreservesOriginalErrorAndRejectsFurtherPublication) {
+    const auto [cipher, header_xor, fault] = GetParam();
+    RejectWritesAfterFailure(cipher, header_xor, fault);
 }
+INSTANTIATE_TEST_SUITE_P(Faults, FailedEncryptedWrite,
+    testing::Combine(ciphers, testing::Bool(), testing::Values(
+        WriteFault::PartialFailure, WriteFault::SuspendedCancellation, WriteFault::Closed)));
 
-TEST(VlessEncryptionIo, WriterClosedRejectionIsTerminal) {
-    RunWriterFailureCase(vless::VlessEncryptionAeadCipher::Aes256Gcm,
-                         true, WriteFault::Closed);
+class EncryptedWriter : public testing::TestWithParam<std::tuple<Cipher, bool>> {};
+TEST_P(EncryptedWriter, ShutdownPreventsFurtherPublication) {
+    const auto [cipher, header_xor] = GetParam();
+    RejectWritesAfterShutdown(cipher, header_xor);
 }
-
-TEST(VlessEncryptionIo, WriterShutdownIsTerminal) {
-    for (const auto cipher : {vless::VlessEncryptionAeadCipher::Aes256Gcm,
-                              vless::VlessEncryptionAeadCipher::Chacha20Poly1305}) {
-        for (const bool header_xor : {false, true}) {
-            RunWriterShutdownCase(cipher, header_xor);
-        }
-    }
+TEST_P(EncryptedWriter, PrecancelDoesNotAdvanceRecordAndCanResume) {
+    const auto [cipher, header_xor] = GetParam();
+    ResumePrecancelledWriter(cipher, header_xor);
 }
-
-TEST(VlessEncryptionIo, WriterPrecancelDoesNotAdvanceRecord) {
-    for (const auto cipher : {vless::VlessEncryptionAeadCipher::Aes256Gcm,
-                              vless::VlessEncryptionAeadCipher::Chacha20Poly1305}) {
-        for (const bool header_xor : {false, true}) {
-            RunWriterPrecancelCase(cipher, header_xor);
-        }
-    }
-}
+INSTANTIATE_TEST_SUITE_P(Modes, EncryptedWriter, testing::Combine(ciphers, testing::Bool()));
+}  // namespace
 
 TEST(VlessEncryptionCrypto, MlKemSeedPreservesBothHalves) {
     vless::VlessSecretBytes<vless::kVlessMlKem768SeedSize> seed;
@@ -661,7 +581,9 @@ TEST(VlessEncryptionCrypto, MlKemSeedPreservesBothHalves) {
     EXPECT_NE(rejected.bytes, other_z.bytes);
 }
 
-TEST(VlessEncryptionCrypto, MlKemNativeAndEncodedPublicKeysInteroperate) {
+namespace {
+class MlKemPublicKeyEncoding : public testing::TestWithParam<bool> {};
+TEST_P(MlKemPublicKeyEncoding, EncapsulationInteroperatesAndRejectsInvalidDecapsulationInputs) {
     auto key = vless::GenerateVlessMlKem768PrivateKey();
     ASSERT_TRUE(key);
     const auto public_key = vless::DeriveVlessMlKem768PublicKey(key.get());
@@ -671,7 +593,8 @@ TEST(VlessEncryptionCrypto, MlKemNativeAndEncodedPublicKeysInteroperate) {
     ASSERT_TRUE(peer);
     EXPECT_EQ(vless::DeriveVlessMlKem768PublicKey(peer.get()), public_key);
 
-    for (const bool encoded : {false, true}) {
+    {
+        const bool encoded = GetParam();
         const auto encapsulated = encoded
             ? vless::EncapsulateVlessMlKem768(*public_key)
             : vless::EncapsulateVlessMlKem768(peer.get());
@@ -690,6 +613,8 @@ TEST(VlessEncryptionCrypto, MlKemNativeAndEncodedPublicKeysInteroperate) {
             nullptr, encapsulated->ciphertext, shared.bytes));
     }
 }
+INSTANTIATE_TEST_SUITE_P(Forms, MlKemPublicKeyEncoding, testing::Bool());
+}
 
 TEST(VlessEncryptionCrypto, MlKemRejectsInvalidKeyMaterial) {
     std::array<uint8_t, vless::kVlessMlKem768SeedSize + 1> seed{};
@@ -706,7 +631,9 @@ TEST(VlessEncryptionCrypto, MlKemRejectsInvalidKeyMaterial) {
     EXPECT_FALSE(vless::DeriveVlessMlKem768PublicKey(nullptr));
 }
 
-TEST(VlessEncryptionCrypto, MlKemHandshakePreservesPfsAndTickets) {
+namespace {
+class MlKemHandshakeCipher : public testing::TestWithParam<Cipher> {};
+TEST_P(MlKemHandshakeCipher, PreservesPfsAndTicketsAndRejectsTamperedTicket) {
     vless::VlessSecretBytes<vless::kVlessMlKem768SeedSize> seed;
     auto key = vless::CreateVlessMlKem768PrivateKeyFromSeed(seed.bytes);
     ASSERT_TRUE(key);
@@ -726,8 +653,8 @@ TEST(VlessEncryptionCrypto, MlKemHandshakePreservesPfsAndTickets) {
         std::vector<uint8_t>(seed.bytes.begin(), seed.bytes.end()),
         std::vector<uint8_t>(public_key->begin(), public_key->end()), std::move(key));
 
-    for (const auto cipher : {vless::VlessEncryptionAeadCipher::Aes256Gcm,
-                              vless::VlessEncryptionAeadCipher::Chacha20Poly1305}) {
+    {
+        const auto cipher = GetParam();
         auto nfs = vless::BuildVlessEncryptionClientNfsHello(client);
         ASSERT_TRUE(nfs);
         auto opened_nfs = vless::OpenVlessEncryptionClientNfsHello(server, nfs->bytes);
@@ -766,46 +693,42 @@ TEST(VlessEncryptionCrypto, MlKemHandshakePreservesPfsAndTickets) {
             response->encrypted_ticket, cipher));
     }
 }
+INSTANTIATE_TEST_SUITE_P(Ciphers, MlKemHandshakeCipher, ciphers);
+}
 
-TEST(VlessEncryptionCrypto, AeadMovesPreserveNonceAndTransferOwnership) {
+namespace {
+class TransferredAead : public testing::TestWithParam<std::tuple<Cipher, bool>> {};
+TEST_P(TransferredAead, ContinuesRecordSequenceWithoutLeavingTwoUsableOwners) {
+    const auto [cipher, assignment] = GetParam();
     const std::array<uint8_t, vless::kVlessEncryptionIvSize> context{};
     const vless::VlessEncryptionUnitedKey key;
     const std::array<uint8_t, 4> plaintext{1, 2, 3, 4};
     std::array<uint8_t, plaintext.size() + vless::kVlessEncryptionTagSize> ciphertext{};
     std::array<uint8_t, plaintext.size()> opened{};
-    for (const auto cipher : {vless::VlessEncryptionAeadCipher::Aes256Gcm,
-                              vless::VlessEncryptionAeadCipher::Chacha20Poly1305}) {
-        auto source = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
-        auto reader = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
-        ASSERT_TRUE(source);
-        ASSERT_TRUE(reader);
-        ASSERT_EQ(source->Seal(plaintext, {}, ciphertext), ciphertext.size());
-        ASSERT_EQ(reader->Open(ciphertext, {}, opened), plaintext.size());
-        EXPECT_EQ(opened, plaintext);
-        const auto nonce = source->Nonce();
+    auto source = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+    auto reader = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+    ASSERT_TRUE(source);
+    ASSERT_TRUE(reader);
+    ASSERT_EQ(source->Seal(plaintext, {}, ciphertext), ciphertext.size());
+    ASSERT_EQ(reader->Open(ciphertext, {}, opened), plaintext.size());
+    EXPECT_EQ(opened, plaintext);
 
-        vless::VlessEncryptionAead moved(std::move(*source));
-        EXPECT_EQ(moved.Nonce(), nonce);
-        EXPECT_EQ(moved.Cipher(), cipher);
-        EXPECT_FALSE(source->Seal(plaintext, {}, ciphertext));
-        EXPECT_FALSE(source->Open(ciphertext, {}, opened));
-        ASSERT_EQ(moved.Seal(plaintext, {}, ciphertext), ciphertext.size());
-        ASSERT_EQ(reader->Open(ciphertext, {}, opened), plaintext.size());
-        EXPECT_EQ(opened, plaintext);
-
+    std::optional<vless::VlessEncryptionAead> destination;
+    if (assignment) {
         vless::VlessEncryptionUnitedKey replaced_key;
         replaced_key.bytes.fill(0xff);
-        auto assigned = vless::VlessEncryptionAead::Create(
-            context, replaced_key.bytes, cipher);
-        ASSERT_TRUE(assigned);
-        const auto next_nonce = moved.Nonce();
-        *assigned = std::move(moved);
-        EXPECT_EQ(assigned->Nonce(), next_nonce);
-        EXPECT_EQ(assigned->Cipher(), cipher);
-        EXPECT_FALSE(moved.Seal(plaintext, {}, ciphertext));
-        EXPECT_FALSE(moved.Open(ciphertext, {}, opened));
-        ASSERT_EQ(assigned->Seal(plaintext, {}, ciphertext), ciphertext.size());
-        ASSERT_EQ(reader->Open(ciphertext, {}, opened), plaintext.size());
-        EXPECT_EQ(opened, plaintext);
+        destination = vless::VlessEncryptionAead::Create(context, replaced_key.bytes, cipher);
+        ASSERT_TRUE(destination);
+        *destination = std::move(*source);
+    } else {
+        destination.emplace(std::move(*source));
     }
+    // Ownership transfer must not leave a second writer able to reuse a nonce.
+    EXPECT_FALSE(source->Seal(plaintext, {}, ciphertext));
+    EXPECT_FALSE(source->Open(ciphertext, {}, opened));
+    ASSERT_EQ(destination->Seal(plaintext, {}, ciphertext), ciphertext.size());
+    ASSERT_EQ(reader->Open(ciphertext, {}, opened), plaintext.size());
+    EXPECT_EQ(opened, plaintext);
 }
+INSTANTIATE_TEST_SUITE_P(Transfers, TransferredAead, testing::Combine(ciphers, testing::Bool()));
+}  // namespace

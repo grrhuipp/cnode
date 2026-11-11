@@ -22,41 +22,51 @@ private:
 
 }  // namespace
 
-TEST(XhttpUploadStreamSlot, Contract) {
-    ::detail::BasicXHttpUploadStreamSlot<TestStream> slot;
+TEST(XhttpUploadStreamSlot, RejectsSecondOwnerAndRetainsInFlightSnapshotUntilReleased) {
     size_t first_destructions = 0;
     size_t rejected_destructions = 0;
-    ASSERT_FALSE((!slot.Attach(std::make_unique<TestStream>(first_destructions))));
+    ::detail::BasicXHttpUploadStreamSlot<TestStream> slot;
+    ASSERT_TRUE(slot.Attach(std::make_unique<TestStream>(first_destructions)));
     auto in_flight = slot.Snapshot();
-    // A rejected temporary remains owned by the call expression.
-    const bool attached_again = slot.Attach(
-        std::make_unique<TestStream>(rejected_destructions));
-    ASSERT_FALSE((!in_flight || attached_again || rejected_destructions != 1));
-
+    const bool attached_again = slot.Attach(std::make_unique<TestStream>(rejected_destructions));
+    ASSERT_TRUE(in_flight);
+    EXPECT_FALSE(attached_again);
+    EXPECT_EQ(rejected_destructions, 1u);
     auto detached = slot.Take();
-    ASSERT_FALSE((!slot.Empty() || !detached || first_destructions != 0));
+    EXPECT_TRUE(slot.Empty());
+    ASSERT_TRUE(detached);
+    EXPECT_EQ(first_destructions, 0u);
     detached->Close();
     detached.reset();
-    ASSERT_FALSE((first_destructions != 0 || in_flight->IsOpen()));
+    EXPECT_EQ(first_destructions, 0u);
+    EXPECT_FALSE(in_flight->IsOpen());
     in_flight.reset();
-    ASSERT_FALSE((first_destructions != 1));
-    size_t allocation_failure_destructions = 0;
-    auto retained = std::make_unique<TestStream>(allocation_failure_destructions);
-    // The control block uses the process resource.
-    ::memory::reject_next_process_allocation = true;
+    EXPECT_EQ(first_destructions, 1u);
+}
+
+TEST(XhttpUploadStreamSlot, AllocationFailurePreservesCallerOwnershipAndAllowsRetry) {
+    size_t destructions = 0;
+    ::detail::BasicXHttpUploadStreamSlot<TestStream> slot;
+    auto retained = std::make_unique<TestStream>(destructions);
     bool allocation_failed = false;
-    try {
-        (void)slot.Attach(std::move(retained));
-    } catch (const std::bad_alloc&) {
-        allocation_failed = true;
+    {
+        struct RestoreAllocationFault {
+            ~RestoreAllocationFault() { ::memory::reject_next_process_allocation = false; }
+        } restore_fault;
+        ::memory::reject_next_process_allocation = true;
+        try {
+            (void)slot.Attach(std::move(retained));
+        } catch (const std::bad_alloc&) {
+            allocation_failed = true;
+        }
     }
-    const bool fault_consumed = !::memory::reject_next_process_allocation;
-    ::memory::reject_next_process_allocation = false;
-    ASSERT_FALSE((!allocation_failed || !fault_consumed || !retained || !slot.Empty() ||
-        allocation_failure_destructions != 0));
-    ASSERT_FALSE((!slot.Attach(std::move(retained)) || retained));
+    EXPECT_TRUE(allocation_failed);
+    EXPECT_TRUE(retained);
+    EXPECT_TRUE(slot.Empty());
+    EXPECT_EQ(destructions, 0u);
+    EXPECT_TRUE(slot.Attach(std::move(retained)));
+    EXPECT_FALSE(retained);
     auto recovered = slot.Take();
     recovered.reset();
-    ASSERT_FALSE((allocation_failure_destructions != 1));
-    { ASSERT_EQ((EXIT_SUCCESS), 0); return; }
+    EXPECT_EQ(destructions, 1u);
 }

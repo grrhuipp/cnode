@@ -7,12 +7,12 @@
 #include <openssl/ssl.h>
 
 #include <chrono>
-#include <cstdio>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <string_view>
 
 namespace {
 
@@ -57,10 +57,6 @@ bool WriteCertificateFiles(const CertificateFiles& files,
     return key_written;
 }
 
-bool Require(bool condition, const char* message) {
-    if (!condition) std::fprintf(stderr, "%s\n", message);
-    return condition;
-}
 
 bool VerifyCertificate(X509* certificate, const X509_VERIFY_PARAM* parameters) {
     X509_STORE* store = X509_STORE_new();
@@ -110,263 +106,205 @@ bool ReplaceCommonName(X509* certificate,
     return updated && X509_sign(certificate, private_key, EVP_sha256()) > 0;
 }
 
-}  // namespace
-
-TEST(TlsClientCertificate, Contract) {
-    auto material = ::transport::internet::AutoSignCertificate::Create("client.example");
+class ClientCertificateFiles : public testing::Test {
+protected:
+    void SetUp() override {
+        material = ::transport::internet::AutoSignCertificate::Create("client.example");
+        ASSERT_NE(material, nullptr);
+        ASSERT_TRUE(WriteCertificateFiles(files, material->Certificate(), material->Key()));
+        config.cert_file = files.cert.string();
+        config.key_file = files.key.string();
+        config.allow_insecure = true;
+        ::LoadTlsPemMaterial(config);
+    }
+    decltype(::transport::internet::AutoSignCertificate::Create("")) material;
     CertificateFiles files;
-    ASSERT_FALSE((!Require(material != nullptr,
-                 "client certificate material must be generated") ||
-        !Require(WriteCertificateFiles(files, material->Certificate(), material->Key()),
-                 "client certificate files must be written")));
-
     ::TlsConfig config;
-    config.cert_file = files.cert.string();
-    config.key_file = files.key.string();
-    config.allow_insecure = true;
-    ::LoadTlsPemMaterial(config);
+};
 
+TEST_F(ClientCertificateFiles, LoadsMatchingClientCredentials) {
     auto context = ::SslContext::CreateClient(config);
-    ASSERT_FALSE((!Require(context != nullptr, "client context must be created")));
-    ASSERT_FALSE((!Require(SSL_CTX_get0_certificate(context->Native()) != nullptr,
-                 "client context must expose the configured certificate")));
-    ASSERT_FALSE((!Require(SSL_CTX_get0_privatekey(context->Native()) != nullptr,
-                 "client context must expose the configured private key")));
-    ASSERT_FALSE((!Require(SSL_CTX_check_private_key(context->Native()) == 1,
-                 "client certificate and private key must match")));
-
-    ::TlsConfig private_ca_config;
-    private_ca_config.ca_file = files.cert.string();
-    ::LoadTlsPemMaterial(private_ca_config);
-    auto private_ca_context = ::SslContext::CreateClient(private_ca_config);
-    ASSERT_FALSE((!Require(private_ca_context != nullptr,
-                 "client context with private CA must be created")));
-    ASSERT_FALSE((!Require(VerifyCertificateWithContextStore(
-                     material->Certificate(), private_ca_context->Native()),
-                 "configured private CA must be present in the client trust store")));
-
-    // Like SSL_CTX_use_certificate_chain_file, only a clean end of input may
-    // follow the leaf: a malformed later block fails the whole chain.
-    auto malformed_chain = std::make_shared<::TlsPemMaterial>();
-    malformed_chain->certificate_chain = config.pem->certificate_chain +
-        "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
-    malformed_chain->private_key = config.pem->private_key;
-    ::TlsConfig malformed_chain_config = config;
-    malformed_chain_config.pem = std::move(malformed_chain);
-    ASSERT_FALSE((!Require(::SslContext::CreateClient(malformed_chain_config) == nullptr,
-                 "a malformed PEM block after the leaf certificate must be rejected")));
-
-    ::TlsConfig unreadable_config;
-    unreadable_config.ca_file = files.cert.string() + ".missing";
-    bool unreadable_rejected = false;
-    try {
-        ::LoadTlsPemMaterial(unreadable_config);
-    } catch (const std::invalid_argument&) {
-        unreadable_rejected = true;
-    }
-    ASSERT_FALSE((!Require(unreadable_rejected && !unreadable_config.pem,
-                 "an unreadable TLS file must be rejected while loading configuration")));
-
-    ::TlsConfig tls13_config;
-    tls13_config.allow_insecure = true;
-    tls13_config.min_version = ::TlsVersion::V1_3;
-    tls13_config.max_version = ::TlsVersion::V1_3;
-    auto tls13_context = ::SslContext::CreateClient(tls13_config);
-    ASSERT_FALSE((!Require(tls13_context != nullptr,
-                 "TLS 1.3-only client context must be created")));
-    ASSERT_FALSE((!Require(
-            SSL_CTX_get_min_proto_version(tls13_context->Native()) ==
-                TLS1_3_VERSION &&
-            SSL_CTX_get_max_proto_version(tls13_context->Native()) ==
-                TLS1_3_VERSION,
-            "TLS 1.3-only policy must reach the client SSL context")));
-
-    using namespace std::string_view_literals;
-    for (const auto identity : {"127.0.0.1:9"sv, "[::1]"sv, "bad..example"sv,
-                               "fe80::1%invalid"sv, "127.0.0.1\0ignored"sv}) {
-        SSL* client = SSL_new(context->Native());
-        const bool rejected = client && !::ConfigureTlsServerIdentity(client, identity);
-        SSL_free(client);
-        ASSERT_FALSE((!Require(rejected, "invalid TLS identity must be rejected before SNI or SAN setup")));
-    }
-    for (const auto identity : {"2001:db8::1", "fe80::1%3", "::ffff:192.0.2.1"}) {
-        SSL* client = SSL_new(context->Native());
-        const bool configured = client && ::ConfigureTlsServerIdentity(client, identity) &&
-            SSL_get_servername(client, TLSEXT_NAMETYPE_host_name) == nullptr;
-        SSL_free(client);
-        ASSERT_FALSE((!Require(configured, "IPv6 TLS identity must use IP SAN bytes without SNI")));
-    }
-
-    auto ip_material = ::transport::internet::AutoSignCertificate::Create("192.0.2.1");
-    SSL* ip_client = SSL_new(context->Native());
-    if (!Require(ip_material != nullptr &&
-                     ip_client != nullptr,
-                 "IP identity test material must be created")) {
-        if (ip_client) SSL_free(ip_client);
-        FAIL() << "IP identity test material must be created";
-    }
-    if (!Require(ReplaceCommonName(
-                     ip_material->Certificate(), ip_material->Key(), "unrelated.example"),
-                 "IP identity certificate common name must be replaced")) {
-        SSL_free(ip_client);
-        FAIL() << "IP identity certificate common name must be replaced";
-    }
-    if (!Require(::ConfigureTlsServerIdentity(ip_client, "192.0.2.1"),
-                 "IP server identity must be configured")) {
-        SSL_free(ip_client);
-        FAIL() << "IP server identity must be configured";
-    }
-    if (!Require(SSL_get_servername(
-                     ip_client, TLSEXT_NAMETYPE_host_name) == nullptr,
-                 "IP server identity must not be sent as SNI")) {
-        SSL_free(ip_client);
-        FAIL() << "IP server identity must not be sent as SNI";
-    }
-    const bool ip_verified = VerifyCertificate(
-        ip_material->Certificate(), SSL_get0_param(ip_client));
-    SSL_free(ip_client);
-    ASSERT_FALSE((!Require(ip_verified,
-                 "IP SAN certificate must verify for its configured identity")));
-
-    SSL* wrong_ip_client = SSL_new(context->Native());
-    if (!Require(wrong_ip_client != nullptr &&
-                     ::ConfigureTlsServerIdentity(
-                         wrong_ip_client, "192.0.2.2"),
-                 "wrong IP identity must be configured for rejection test")) {
-        if (wrong_ip_client) SSL_free(wrong_ip_client);
-        FAIL() << "wrong IP identity must be configured for rejection test";
-    }
-    const bool wrong_ip_verified = VerifyCertificate(
-        ip_material->Certificate(), SSL_get0_param(wrong_ip_client));
-    SSL_free(wrong_ip_client);
-    ASSERT_FALSE((!Require(!wrong_ip_verified,
-                 "IP SAN certificate must reject a different IP identity")));
-
-    SSL* dns_client = SSL_new(context->Native());
-    if (!Require(dns_client != nullptr &&
-                     ::ConfigureTlsServerIdentity(
-                         dns_client, "client.example"),
-                 "DNS server identity must be configured")) {
-        if (dns_client) SSL_free(dns_client);
-        FAIL() << "DNS server identity must be configured";
-    }
-    const char* configured_sni = SSL_get_servername(
-        dns_client, TLSEXT_NAMETYPE_host_name);
-    const bool dns_verified = VerifyCertificate(
-        material->Certificate(), SSL_get0_param(dns_client));
-    if (!Require(configured_sni != nullptr &&
-                     std::string_view(configured_sni) == "client.example",
-                 "DNS server identity must be sent as SNI")) {
-        SSL_free(dns_client);
-        FAIL() << "DNS server identity must be sent as SNI";
-    }
-    SSL_free(dns_client);
-    ASSERT_FALSE((!Require(dns_verified,
-                 "DNS SAN certificate must verify for its configured identity")));
-    // FQDN with trailing root dot must strip the dot for SNI (RFC 6066) and X.509 SAN host verification.
-    SSL* fqdn_client = SSL_new(context->Native());
-    if (!Require(fqdn_client != nullptr &&
-                     ::ConfigureTlsServerIdentity(fqdn_client, "client.example."),
-                 "FQDN server identity with trailing dot must be configured")) {
-        if (fqdn_client) SSL_free(fqdn_client);
-        FAIL() << "FQDN server identity with trailing dot must be configured";
-    }
-    const char* fqdn_sni = SSL_get_servername(fqdn_client, TLSEXT_NAMETYPE_host_name);
-    const bool fqdn_verified = VerifyCertificate(
-        material->Certificate(), SSL_get0_param(fqdn_client));
-    if (!Require(fqdn_sni != nullptr && std::string_view(fqdn_sni) == "client.example",
-                 "FQDN trailing root dot must be stripped from SNI")) {
-        SSL_free(fqdn_client);
-        FAIL() << "FQDN trailing root dot must be stripped from SNI";
-    }
-    SSL_free(fqdn_client);
-    ASSERT_FALSE((!Require(fqdn_verified,
-                 "FQDN with trailing root dot must verify against certificate SAN")));
-
-    std::vector<unsigned char> alpn_wire;
-    const std::vector<std::string> valid_alpn = {"h2", "http/1.1"};
-    const std::vector<unsigned char> expected_alpn_wire = {
-        2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
-    ASSERT_FALSE((!Require(::EncodeTlsAlpnProtocols(valid_alpn, alpn_wire) &&
-                     alpn_wire == expected_alpn_wire,
-                 "valid ALPN protocols must have canonical wire encoding")));
-    const std::vector<std::string> empty_alpn = {""};
-    ASSERT_FALSE((!Require(!::EncodeTlsAlpnProtocols(empty_alpn, alpn_wire),
-                 "empty ALPN protocol must be rejected")));
-    const std::vector<std::string> overlong_alpn = {std::string(256, 'a')};
-    ASSERT_FALSE((!Require(!::EncodeTlsAlpnProtocols(overlong_alpn, alpn_wire),
-                 "overlong ALPN protocol must be rejected")));
-    const std::vector<std::string> duplicate_alpn = {"h2", "h2"};
-    ASSERT_FALSE((!Require(!::EncodeTlsAlpnProtocols(duplicate_alpn, alpn_wire),
-                 "duplicate ALPN protocol must be rejected")));
+    ASSERT_NE(context, nullptr);
+    EXPECT_NE(SSL_CTX_get0_certificate(context->Native()), nullptr);
+    EXPECT_NE(SSL_CTX_get0_privatekey(context->Native()), nullptr);
+    EXPECT_EQ(SSL_CTX_check_private_key(context->Native()), 1);
 }
 
-TEST(QuicTlsContext, EnforcesVersionsAndNegotiatesConfiguredAlpn) {
-    auto material = transport::internet::AutoSignCertificate::Create("quic.example");
-    ASSERT_NE(material, nullptr);
-    CertificateFiles files;
-    ASSERT_TRUE(WriteCertificateFiles(files, material->Certificate(), material->Key()));
-    TlsConfig config;
-    config.cert_file = files.cert.string();
-    config.key_file = files.key.string();
-    config.min_version = TlsVersion::V1_2;
-    config.max_version = TlsVersion::V1_3;
-    LoadTlsPemMaterial(config);
-    const std::vector<std::string> server_alpn{"h3"};
-    auto context = SslContext::CreateQuicServer(config, server_alpn);
+TEST_F(ClientCertificateFiles, PrivateCaCanVerifyConfiguredCertificate) {
+    ::TlsConfig ca_config;
+    ca_config.ca_file = files.cert.string();
+    ::LoadTlsPemMaterial(ca_config);
+    auto context = ::SslContext::CreateClient(ca_config);
+    ASSERT_NE(context, nullptr);
+    EXPECT_TRUE(VerifyCertificateWithContextStore(material->Certificate(), context->Native()));
+}
+
+TEST_F(ClientCertificateFiles, RejectsMalformedPemAfterLeafCertificate) {
+    auto malformed = std::make_shared<::TlsPemMaterial>();
+    malformed->certificate_chain = config.pem->certificate_chain +
+        "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    malformed->private_key = config.pem->private_key;
+    config.pem = std::move(malformed);
+    EXPECT_EQ(::SslContext::CreateClient(config), nullptr);
+}
+
+TEST_F(ClientCertificateFiles, RejectsUnreadableCaWithoutPublishingPartialMaterial) {
+    ::TlsConfig unreadable;
+    unreadable.ca_file = files.cert.string() + ".missing";
+    EXPECT_THROW(::LoadTlsPemMaterial(unreadable), std::invalid_argument);
+    EXPECT_FALSE(unreadable.pem);
+}
+
+TEST(TlsClientCertificate, EnforcesExplicitTls13OnlyPolicy) {
+    ::TlsConfig config;
+    config.allow_insecure = true;
+    config.min_version = ::TlsVersion::V1_3;
+    config.max_version = ::TlsVersion::V1_3;
+    auto context = ::SslContext::CreateClient(config);
     ASSERT_NE(context, nullptr);
     EXPECT_EQ(SSL_CTX_get_min_proto_version(context->Native()), TLS1_3_VERSION);
     EXPECT_EQ(SSL_CTX_get_max_proto_version(context->Native()), TLS1_3_VERSION);
-    config.max_version = TlsVersion::V1_2;
-    EXPECT_EQ(SslContext::CreateQuicServer(config, server_alpn), nullptr);
-    config.max_version = TlsVersion::V1_3;
-    config.min_version = static_cast<TlsVersion>(255);
-    EXPECT_EQ(SslContext::CreateQuicServer(config, server_alpn), nullptr);
-    config.min_version = TlsVersion::V1_2;
-    EXPECT_EQ(SslContext::CreateQuicServer(config, {}), nullptr);
-    EXPECT_EQ(SslContext::CreateQuicServer(config, std::vector<std::string>{""}), nullptr);
+}
 
-    // 通过真实 TLS 状态机验证服务端 ALPN 回调与其上下文拥有的配置寿命。
-    for (const bool common_protocol : {true, false}) {
-        TlsConfig client_config;
-        client_config.allow_insecure = true;
-        client_config.alpn = common_protocol
-            ? std::vector<std::string>{"unrelated", "h3"}
-            : std::vector<std::string>{"unrelated"};
-        auto client_context = SslContext::CreateClient(client_config);
-        ASSERT_NE(client_context, nullptr);
-        bssl::UniquePtr<SSL> client(SSL_new(client_context->Native()));
-        bssl::UniquePtr<SSL> server(SSL_new(context->Native()));
+class TlsIdentityTest : public testing::Test {
+protected:
+    void SetUp() override {
+        ::TlsConfig config;
+        config.allow_insecure = true;
+        context = ::SslContext::CreateClient(config);
+        ASSERT_NE(context, nullptr);
+        client.reset(SSL_new(context->Native()));
         ASSERT_NE(client, nullptr);
-        ASSERT_NE(server, nullptr);
-        BIO* client_bio = nullptr;
-        BIO* server_bio = nullptr;
-        ASSERT_EQ(BIO_new_bio_pair(&client_bio, 0, &server_bio, 0), 1);
-        SSL_set_bio(client.get(), client_bio, client_bio);
-        SSL_set_bio(server.get(), server_bio, server_bio);
-        SSL_set_connect_state(client.get());
-        SSL_set_accept_state(server.get());
-        bool failed = false;
-        for (size_t round = 0; round < 16 && !failed &&
-             (!SSL_is_init_finished(client.get()) || !SSL_is_init_finished(server.get())); ++round) {
-            for (SSL* ssl : {client.get(), server.get()}) {
-                const int result = SSL_do_handshake(ssl);
-                if (result == 1) continue;
-                const int error = SSL_get_error(ssl, result);
-                if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
-                    failed = true;
-                    break;
-                }
+    }
+    decltype(::SslContext::CreateClient(::TlsConfig{})) context;
+    bssl::UniquePtr<SSL> client;
+};
+
+class InvalidTlsIdentity : public TlsIdentityTest, public testing::WithParamInterface<std::string_view> {};
+TEST_P(InvalidTlsIdentity, RejectsInvalidIdentityBeforeConfiguringSniOrSan) {
+    EXPECT_FALSE(::ConfigureTlsServerIdentity(client.get(), GetParam()));
+}
+using namespace std::string_view_literals;
+INSTANTIATE_TEST_SUITE_P(Identities, InvalidTlsIdentity, testing::Values(
+    "127.0.0.1:9"sv, "[::1]"sv, "bad..example"sv, "fe80::1%invalid"sv, "127.0.0.1\0ignored"sv));
+
+class Ipv6TlsIdentity : public TlsIdentityTest, public testing::WithParamInterface<const char*> {};
+TEST_P(Ipv6TlsIdentity, ConfiguresIpVerificationWithoutSendingSni) {
+    ASSERT_TRUE(::ConfigureTlsServerIdentity(client.get(), GetParam()));
+    EXPECT_EQ(SSL_get_servername(client.get(), TLSEXT_NAMETYPE_host_name), nullptr);
+}
+INSTANTIATE_TEST_SUITE_P(Addresses, Ipv6TlsIdentity,
+                        testing::Values("2001:db8::1", "fe80::1%3", "::ffff:192.0.2.1"));
+
+class IpSanVerification : public TlsIdentityTest, public testing::WithParamInterface<bool> {};
+TEST_P(IpSanVerification, VerifiesOnlyMatchingIpSanWithoutCommonNameFallback) {
+    auto material = ::transport::internet::AutoSignCertificate::Create("192.0.2.1");
+    ASSERT_NE(material, nullptr);
+    ASSERT_TRUE(ReplaceCommonName(material->Certificate(), material->Key(), "unrelated.example"));
+    ASSERT_TRUE(::ConfigureTlsServerIdentity(client.get(), GetParam() ? "192.0.2.1" : "192.0.2.2"));
+    EXPECT_EQ(SSL_get_servername(client.get(), TLSEXT_NAMETYPE_host_name), nullptr);
+    EXPECT_EQ(VerifyCertificate(material->Certificate(), SSL_get0_param(client.get())), GetParam());
+}
+INSTANTIATE_TEST_SUITE_P(MatchingAddress, IpSanVerification, testing::Bool());
+
+class DnsSanVerification : public TlsIdentityTest, public testing::WithParamInterface<const char*> {};
+TEST_P(DnsSanVerification, NormalizesRootDotForSniAndCertificateVerification) {
+    auto material = ::transport::internet::AutoSignCertificate::Create("client.example");
+    ASSERT_NE(material, nullptr);
+    ASSERT_TRUE(::ConfigureTlsServerIdentity(client.get(), GetParam()));
+    const auto* sni = SSL_get_servername(client.get(), TLSEXT_NAMETYPE_host_name);
+    ASSERT_NE(sni, nullptr);
+    EXPECT_STREQ(sni, "client.example");
+    EXPECT_TRUE(VerifyCertificate(material->Certificate(), SSL_get0_param(client.get())));
+}
+INSTANTIATE_TEST_SUITE_P(HostNames, DnsSanVerification, testing::Values("client.example", "client.example."));
+
+TEST(TlsClientCertificate, EncodesAlpnAsLengthPrefixedProtocolNames) {
+    std::vector<unsigned char> wire;
+    ASSERT_TRUE(::EncodeTlsAlpnProtocols(std::vector<std::string>{"h2", "http/1.1"}, wire));
+    EXPECT_EQ(wire, (std::vector<unsigned char>{2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'}));
+}
+
+class InvalidTlsAlpn : public testing::TestWithParam<std::vector<std::string>> {};
+TEST_P(InvalidTlsAlpn, RejectsEmptyOverlongOrDuplicateProtocolNames) {
+    std::vector<unsigned char> wire;
+    EXPECT_FALSE(::EncodeTlsAlpnProtocols(GetParam(), wire));
+}
+INSTANTIATE_TEST_SUITE_P(Protocols, InvalidTlsAlpn, testing::Values(
+    std::vector<std::string>{""}, std::vector<std::string>{std::string(256, 'a')},
+    std::vector<std::string>{"h2", "h2"}));
+
+TEST_F(ClientCertificateFiles, QuicServerRestrictsTlsToVersion13) {
+    config.min_version = ::TlsVersion::V1_2;
+    config.max_version = ::TlsVersion::V1_3;
+    auto context = ::SslContext::CreateQuicServer(config, std::vector<std::string>{"h3"});
+    ASSERT_NE(context, nullptr);
+    EXPECT_EQ(SSL_CTX_get_min_proto_version(context->Native()), TLS1_3_VERSION);
+    EXPECT_EQ(SSL_CTX_get_max_proto_version(context->Native()), TLS1_3_VERSION);
+}
+
+enum class InvalidQuicPolicy { Tls12Only, UnknownVersion, MissingAlpn, EmptyAlpn };
+class QuicRejectedPolicy : public ClientCertificateFiles, public testing::WithParamInterface<InvalidQuicPolicy> {};
+TEST_P(QuicRejectedPolicy, RejectsUnsupportedVersionOrAlpnPolicy) {
+    config.min_version = ::TlsVersion::V1_2;
+    config.max_version = ::TlsVersion::V1_3;
+    std::vector<std::string> alpn{"h3"};
+    switch (GetParam()) {
+        case InvalidQuicPolicy::Tls12Only: config.max_version = ::TlsVersion::V1_2; break;
+        case InvalidQuicPolicy::UnknownVersion: config.min_version = static_cast<::TlsVersion>(255); break;
+        case InvalidQuicPolicy::MissingAlpn: alpn.clear(); break;
+        case InvalidQuicPolicy::EmptyAlpn: alpn = {""}; break;
+    }
+    EXPECT_EQ(::SslContext::CreateQuicServer(config, alpn), nullptr);
+}
+INSTANTIATE_TEST_SUITE_P(Policies, QuicRejectedPolicy, testing::Values(
+    InvalidQuicPolicy::Tls12Only, InvalidQuicPolicy::UnknownVersion,
+    InvalidQuicPolicy::MissingAlpn, InvalidQuicPolicy::EmptyAlpn));
+
+class QuicAlpnHandshake : public ClientCertificateFiles, public testing::WithParamInterface<bool> {};
+TEST_P(QuicAlpnHandshake, NegotiatesOnlyACommonConfiguredProtocol) {
+    auto context = ::SslContext::CreateQuicServer(config, std::vector<std::string>{"h3"});
+    ASSERT_NE(context, nullptr);
+    ::TlsConfig client_config;
+    client_config.allow_insecure = true;
+    client_config.alpn = GetParam()
+        ? std::vector<std::string>{"unrelated", "h3"} : std::vector<std::string>{"unrelated"};
+    auto client_context = ::SslContext::CreateClient(client_config);
+    ASSERT_NE(client_context, nullptr);
+    bssl::UniquePtr<SSL> client(SSL_new(client_context->Native()));
+    bssl::UniquePtr<SSL> server(SSL_new(context->Native()));
+    ASSERT_NE(client, nullptr);
+    ASSERT_NE(server, nullptr);
+    BIO* client_bio = nullptr;
+    BIO* server_bio = nullptr;
+    ASSERT_EQ(BIO_new_bio_pair(&client_bio, 0, &server_bio, 0), 1);
+    SSL_set_bio(client.get(), client_bio, client_bio);
+    SSL_set_bio(server.get(), server_bio, server_bio);
+    SSL_set_connect_state(client.get());
+    SSL_set_accept_state(server.get());
+    bool failed = false;
+    for (size_t round = 0; round < 16 && !failed &&
+         (!SSL_is_init_finished(client.get()) || !SSL_is_init_finished(server.get())); ++round) {
+        for (SSL* ssl : {client.get(), server.get()}) {
+            const int result = SSL_do_handshake(ssl);
+            if (result == 1) continue;
+            const int error = SSL_get_error(ssl, result);
+            if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
+                failed = true;
+                break;
             }
         }
-        EXPECT_EQ(failed, !common_protocol);
-        if (common_protocol) {
-            ASSERT_TRUE(SSL_is_init_finished(client.get()));
-            ASSERT_TRUE(SSL_is_init_finished(server.get()));
-            const uint8_t* selected = nullptr;
-            unsigned int size = 0;
-            SSL_get0_alpn_selected(client.get(), &selected, &size);
-            EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(selected), size), "h3");
-        }
+    }
+    EXPECT_EQ(failed, !GetParam());
+    if (GetParam()) {
+        ASSERT_TRUE(SSL_is_init_finished(client.get()));
+        ASSERT_TRUE(SSL_is_init_finished(server.get()));
+        const uint8_t* selected = nullptr;
+        unsigned int size = 0;
+        SSL_get0_alpn_selected(client.get(), &selected, &size);
+        ASSERT_NE(selected, nullptr);
+        EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(selected), size), "h3");
     }
 }
+INSTANTIATE_TEST_SUITE_P(CommonProtocol, QuicAlpnHandshake, testing::Bool());
+}  // namespace

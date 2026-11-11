@@ -9,7 +9,6 @@
 #include "proxy/outbound_stream_endpoint.hpp"
 #include "app/dns/dns.hpp"
 #include "app/proxyman/outbound/handler.hpp"
-#include "infra/json.hpp"
 #include "app/relay.hpp"
 #include "common/const_buffer_span.hpp"
 #include "common/eof_cancellation.hpp"
@@ -74,9 +73,7 @@ public:
         const ::TimeoutsConfig& timeouts,
         ::StatsShard& stats,
         const ::RelayConfig& relay_config,
-        ::buf::MultiBufferBatch first_payload,
-        std::chrono::seconds relay_idle_timeout,
-        std::chrono::seconds relay_write_timeout) override;
+        ::buf::MultiBufferBatch first_payload) override;
 
 private:
     std::shared_ptr<const ::VlessOutboundConfig> config_;
@@ -543,9 +540,7 @@ proxy::vless::outbound::Handler::Process(
     const TimeoutsConfig& timeouts,
     StatsShard& stats,
     const RelayConfig& relay_config,
-    buf::MultiBufferBatch first_payload,
-    std::chrono::seconds relay_idle_timeout,
-    std::chrono::seconds relay_write_timeout) {
+    buf::MultiBufferBatch first_payload) {
     if (!inbound.Valid()) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
@@ -586,9 +581,9 @@ proxy::vless::outbound::Handler::Process(
     if (!handshake) co_return fail_abortive(handshake.error());
     active_reader = handshake->reader;
     active_writer = handshake->writer;
-    stream->SetIdleTimeout(relay_idle_timeout);
+    stream->SetIdleTimeout(relay_config.idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
-    stream->SetWriteTimeout(relay_write_timeout);
+    stream->SetWriteTimeout(relay_config.write_timeout);
     stream->ClearPhaseDeadline();
 
     if (use_xudp) {
@@ -631,129 +626,23 @@ const bool kVlessRegistered = (::proxyman::outbound::RegisterProxy(
     ::constants::protocol::kVless,
     [](const ::infra::OutboundSourceConfig& cfg)
         -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
-        // A present field of the wrong type is a configuration error, never
-        // an implicit default.
-        bool invalid_field = false;
-        auto json_string = [&](const ::json::object& obj,
-                               std::string_view key) -> std::string {
-            auto parsed = ::ParseJsonString(obj, key);
-            if (!parsed) {
-                LOG_ERROR("VLESS outbound '{}': {}", cfg.tag, parsed.error());
-                invalid_field = true;
-                return {};
-            }
-            return std::move(*parsed).value_or(std::string{});
-        };
-
+        const auto* settings = std::get_if<::infra::VlessSettings>(&cfg.settings);
+        if (!settings) return std::nullopt;
         ::VlessOutboundConfig vless_config;
-        std::string address;
-        uint16_t port = 443;
-        std::string uuid;
-        std::string encryption;
-
-        const auto& s = cfg.settings;
-        std::string packet_encoding;
-        const auto vnext_server = ::proxy::ParseOptionalSingleObjectArray(
-            s, "vnext", "VLESS", cfg.tag);
-        if (!vnext_server) {
-            return std::nullopt;
-        }
-        const ::json::object& server_obj = *vnext_server ? **vnext_server : s;
-        const ::json::object* user_obj = &s;
-        if (*vnext_server) {
-            user_obj = ::proxy::ParseRequiredSingleObjectArray(
-                server_obj, "users", "VLESS", cfg.tag);
-            if (!user_obj) {
-                return std::nullopt;
-            }
-        } else if (s.if_contains("users")) {
-            LOG_ERROR("VLESS outbound '{}': users requires vnext", cfg.tag);
-            return std::nullopt;
-        }
-        address = json_string(server_obj, "address");
-        const auto source_port = ::ReadJsonPort(server_obj, "port");
-        if (source_port.Invalid()) {
-            return std::nullopt;
-        }
-        if (source_port.Valid()) {
-            port = source_port.value;
-        }
-        uuid = json_string(*user_obj, "id");
-        if (*vnext_server && uuid.empty()) {
-            uuid = json_string(*user_obj, "uuid");
-        }
-        encryption = json_string(*user_obj, "encryption");
-        vless_config.flow = json_string(*user_obj, "flow");
-        packet_encoding = json_string(*user_obj, "packetEncoding");
-        if (*vnext_server) {
-            if (packet_encoding.empty()) {
-                packet_encoding = json_string(s, "packetEncoding");
-            }
-            if (encryption.empty()) {
-                encryption = json_string(s, "encryption");
-            }
-        }
-        if (invalid_field) {
-            return std::nullopt;
-        }
-
-            auto parsed = ::vless::ParseVlessClientEncryption(
-                encryption);
-            if (!parsed) {
-                LOG_WARN("VLESS outbound '{}': invalid encryption: {}",
-                         cfg.tag,
-                         ::vless::VlessEncryptionParseErrorMessage(
-                             parsed.error()));
-                return std::nullopt;
-            }
-            if (*parsed) vless_config.encryption = std::make_shared<const ::vless::VlessEncryptionConfig>(
-                std::move(**parsed));
-
-        packet_encoding = LowerAscii(std::move(packet_encoding));
-        if (packet_encoding.empty() || packet_encoding == "xudp") {
-            vless_config.packet_xudp = true;
-            vless_config.packet_addr = false;
-        } else if (packet_encoding == "none" || packet_encoding == "raw") {
-            vless_config.packet_xudp = false;
-            vless_config.packet_addr = false;
-        } else if (packet_encoding == "packetaddr" ||
-                   packet_encoding == "packet-addr" ||
-                   packet_encoding == "packet") {
-            vless_config.packet_xudp = false;
-            vless_config.packet_addr = true;
-        } else {
-            LOG_WARN("VLESS outbound '{}': packet encoding '{}' is not supported",
-                     cfg.tag, packet_encoding);
-            return std::nullopt;
-        }
-
-        vless_config.flow = ::vless::NormalizeFlow(vless_config.flow);
-        if (!vless_config.flow.empty() &&
-            !::vless::IsVisionFlow(vless_config.flow)) {
-            LOG_WARN("VLESS outbound '{}': flow '{}' is not supported",
-                     cfg.tag, vless_config.flow);
-            return std::nullopt;
-        }
-
-        const auto uuid_bytes = ::vless::ParseUuidBytes(uuid);
-        if (!uuid_bytes) {
-            LOG_ERROR("VLESS outbound '{}': invalid UUID", cfg.tag);
-            return std::nullopt;
-        }
-        vless_config.uuid_bytes = *uuid_bytes;
-        auto next_hop = ::proxy::PrepareNextHop(
-            cfg, std::move(address), port, ::OutboundStreamDefaults{});
-        if (!next_hop) {
-            return std::nullopt;
-        }
-        const auto& stream_settings = next_hop->sender.stream_settings;
+        vless_config.uuid_bytes = settings->id;
+        vless_config.flow = settings->flow;
+        vless_config.encryption = settings->encryption;
+        vless_config.packet_xudp = settings->packet_encoding == ::infra::PacketEncoding::Xudp;
+        vless_config.packet_addr = settings->packet_encoding == ::infra::PacketEncoding::PacketAddr;
+        auto next_hop = ::proxy::PrepareNextHop(cfg, settings->server, ::OutboundStreamDefaults{});
+        const auto& stream_settings = next_hop.sender.stream_settings;
         if (!vless_config.flow.empty() &&
             (!(stream_settings.IsTlsLike() || vless_config.encryption != nullptr) ||
              stream_settings.network_mode != ::NetworkMode::Tcp)) {
             LOG_ERROR("VLESS outbound '{}': Vision requires TCP with TLS, Reality, or VLESS Encryption", cfg.tag);
             return std::nullopt;
         }
-        vless_config.server = std::move(next_hop->server);
+        vless_config.server = std::move(next_hop.server);
         return ::proxyman::outbound::PreparedOutboundProxy{
             .create = ::proxyman::outbound::MakePreparedOutboundCreator<
                 ::VlessOutboundConfig,
@@ -764,7 +653,7 @@ const bool kVlessRegistered = (::proxyman::outbound::RegisterProxy(
                     return std::make_unique<::proxy::vless::outbound::Handler>(
                         std::move(cfg_state));
                 }>(std::move(vless_config)),
-            .sender = std::move(next_hop->sender),
+            .sender = std::move(next_hop.sender),
         };
     }), true);
 }  // namespace

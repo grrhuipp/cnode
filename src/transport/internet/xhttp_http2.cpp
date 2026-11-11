@@ -34,7 +34,7 @@ net::awaitable<bool> Http2ServerSession::RouteXHttpRequest(
             co_return true;
         }
         case XHttpRequestMeta::Kind::PacketDown: {
-            auto xsession = co_await GetXHttpPacketSession(
+            auto xsession = co_await GetXHttpPacketSession(coordinator_, 
                 io_context_, xhttp_config_->session_namespace,
                 meta.session_id, XHttpSessionAccess::Open);
             if (!xsession) co_return co_await ResetStream(stream_id, H2Error::Protocol);
@@ -52,7 +52,7 @@ net::awaitable<bool> Http2ServerSession::RouteXHttpRequest(
             co_return true;
         }
         case XHttpRequestMeta::Kind::StreamUp: {
-            auto xsession = co_await GetXHttpPacketSession(
+            auto xsession = co_await GetXHttpPacketSession(coordinator_, 
                 io_context_, xhttp_config_->session_namespace,
                 meta.session_id, XHttpSessionAccess::Open);
             if (!xsession) {
@@ -103,7 +103,7 @@ net::awaitable<bool> Http2ServerSession::RouteXHttpRequest(
             co_return true;
         }
         case XHttpRequestMeta::Kind::PacketUp: {
-            auto xsession = co_await GetXHttpPacketSession(
+            auto xsession = co_await GetXHttpPacketSession(coordinator_, 
                 io_context_, xhttp_config_->session_namespace,
                 meta.session_id, XHttpSessionAccess::Upload);
             if (!xsession) {

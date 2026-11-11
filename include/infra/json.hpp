@@ -280,10 +280,6 @@ struct JsonPortResult {
         return error == JsonPortError::None;
     }
 
-    [[nodiscard]] bool Invalid() const noexcept {
-        return error == JsonPortError::InvalidType ||
-               error == JsonPortError::OutOfRange;
-    }
 };
 
 [[nodiscard]] JsonPortResult ReadJsonPort(

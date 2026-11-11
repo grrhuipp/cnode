@@ -8,6 +8,7 @@
 #include "transport/internet/transport_stack.hpp"
 #include "transport/internet/xhttp_client.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -474,12 +475,31 @@ OutboundDialer::Dial(session::Context& ctx, const OutboundServer& server,
 }
 
 net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
-OutboundDialer::Dial(session::Context& ctx,
-                     std::span<const net::ip::address> addresses,
-                     uint16_t port) {
-    if (addresses.empty() || port == 0) {
-        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+OutboundDialer::Dial(session::Context& ctx, const TargetAddress& target,
+                     AddressFamilyPolicy policy) {
+    if (!target.IsValid()) co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    if (!target.IsDomain()) {
+        if (!target.resolved_addr) co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        if (!policy.restricts_literals) {
+            policy.accepts_v4 = true;
+            policy.accepts_v6 = true;
+        }
+        co_return co_await DialAddresses(ctx, {&*target.resolved_addr, 1}, target.port, policy);
     }
+    auto resolved = co_await dns_.Resolve(target.host);
+    if (!resolved.Ok()) co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
+    co_return co_await DialAddresses(ctx, resolved.addresses, target.port, policy);
+}
+
+net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+OutboundDialer::DialAddresses(session::Context& ctx,
+                              std::span<const net::ip::address> addresses,
+                              uint16_t port, AddressFamilyPolicy policy) {
+    const auto accepts = [&](const net::ip::address& remote) {
+        return iputil::NormalizeAddress(remote).is_v6() ? policy.accepts_v6 : policy.accepts_v4;
+    };
+    const auto count = static_cast<size_t>(std::ranges::count_if(addresses, accepts));
+    if (count == 0) co_return tl::unexpected(ErrorCode::DNS_NO_RECORD);
     const auto& bind = sender_.send_through;
     const auto ordered = SelectOrderedBind(ctx);
     const tcp::endpoint* inbound_local =
@@ -498,15 +518,21 @@ OutboundDialer::Dial(session::Context& ctx,
     target.timeout = timeout_;
     target.stream_settings = &sender_.stream_settings;
     target.security_context = security_.Context();
-    if (addresses.size() == 1) {
-        target.single_candidate = candidate_for(addresses.front());
+    if (count > 1) target.candidates.reserve(count);
+    const auto append = [&](const net::ip::address& remote) {
+        if (count == 1) target.single_candidate = candidate_for(remote);
+        else target.candidates.push_back(candidate_for(remote));
+    };
+    if (policy.preserves_dns_order) {
+        for (const auto& remote : addresses) if (accepts(remote)) append(remote);
     } else {
-        target.candidates.reserve(addresses.size());
-        for (const auto& remote : addresses) {
-            target.candidates.push_back(candidate_for(remote));
+        for (const bool want_v6 : {policy.prefers_v6, !policy.prefers_v6}) {
+            for (const auto& remote : addresses) {
+                if (accepts(remote) && iputil::NormalizeAddress(remote).is_v6() == want_v6) append(remote);
+            }
         }
     }
-    LOG_CONN_DEBUG(ctx, "dialing {} resolved candidates port={}", addresses.size(), port);
+    LOG_CONN_DEBUG(ctx, "dialing {} resolved candidates port={}", count, port);
     co_return co_await DialTarget(ctx, target);
 }
 
@@ -527,6 +553,7 @@ OutboundDialer::DialTarget(session::Context& ctx, const OutboundTransportTarget&
 tl::expected<net::ip::address, ErrorCode> OutboundDialer::SelectDatagramBind(
     const session::Context& ctx, const DatagramRemote& remote) const {
     const auto& bind = sender_.send_through;
+    const auto& policy = remote.family_policy;
     if (bind.GetMode() == OutboundBind::Mode::Explicit) {
         return iputil::NormalizeAddress(*bind.ExplicitAddress());
     }
@@ -544,14 +571,14 @@ tl::expected<net::ip::address, ErrorCode> OutboundDialer::SelectDatagramBind(
             if (auto bound = bind.BindAddressFor(local, *remote_addr)) return *bound;
         } else {
             const auto local_ip = iputil::NormalizeAddress(local->address());
-            if (local_ip.is_v6() ? remote.accepts_v6 : remote.accepts_v4) {
+            if (local_ip.is_v6() ? policy.accepts_v6 : policy.accepts_v4) {
                 if (auto bound = bind.BindAddressFor(local, local_ip)) return *bound;
             }
         }
     }
     const bool v6 = remote_addr ? remote_addr->is_v6()
-        : (remote.prefers_v6 && remote.accepts_v6) ? true
-        : !remote.accepts_v6 ? false
+        : (policy.prefers_v6 && policy.accepts_v6) ? true
+        : !policy.accepts_v6 ? false
         : family_hint ? family_hint->is_v6()
         : bind.PrefersIPv6();
     const net::ip::address any = v6
@@ -566,7 +593,7 @@ tl::expected<net::ip::address, ErrorCode> OutboundDialer::SelectDatagramBind(
     auto selected = bind.Select(remote_addr.value_or(any),
                                 client_ip, user_id, user_email, inbound_tag);
     // A hostname may still be reached over the other accepted family.
-    if (!selected.address && !remote_addr && (v6 ? remote.accepts_v4 : remote.accepts_v6)) {
+    if (!selected.address && !remote_addr && (v6 ? policy.accepts_v4 : policy.accepts_v6)) {
         const net::ip::address other = v6
             ? net::ip::address(net::ip::address_v4::any())
             : net::ip::address(net::ip::address_v6::any());

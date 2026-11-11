@@ -21,6 +21,7 @@
 #include <tl/expected.hpp>
 #include <utility>
 #include <vector>
+#include <variant>
 
 struct StatsShard;
 namespace ss {
@@ -147,6 +148,22 @@ struct Ss2022UdpTxState {
     ~Ss2022UdpTxState() noexcept {
         Clear();
     }
+};
+
+class UdpResponse final : public InboundDatagramResponse {
+public:
+    UdpResponse(KeyBytes reply_key, SsCipherInfo cipher_info)
+        : state_(ClassicState{std::move(reply_key), cipher_info}) {}
+    explicit UdpResponse(Ss2022UdpTxState session) : state_(std::move(session)) {}
+    [[nodiscard]] buf::MultiBuffer Encode(UDPPacketView packet) override;
+private:
+    struct ClassicState {
+        KeyBytes reply_key;
+        SsCipherInfo cipher_info{};
+    };
+    [[nodiscard]] size_t EncodePacketTo(const TargetAddress& target,
+        std::span<const uint8_t> payload, uint8_t* out, size_t out_capacity);
+    std::variant<ClassicState, Ss2022UdpTxState> state_;
 };
 
 struct Ss2022UdpSessionState : Ss2022UdpTxState {

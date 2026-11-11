@@ -38,10 +38,7 @@ namespace controller {
     // These protocols always terminate TLS; the panel switch declares that
     // this cnode instance owns a usable certificate.
     return node_config.EnableTLS ||
-        node_config.NodeType == constants::protocol::kAnyTLS ||
-        node_config.NodeType == constants::protocol::kTrojan ||
-        node_config.NodeType == constants::protocol::kHysteria ||
-        node_config.NodeType == constants::protocol::kHysteria2;
+        proxyman::inbound::RegisteredProtocolTraits(node_config.NodeType).requires_tls;
 }
 
 // Panel configuration mapping: node and user records to the source-neutral

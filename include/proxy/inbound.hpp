@@ -47,13 +47,14 @@ struct UDPPacketView {
     std::span<const uint8_t> data;
 };
 
-
+// Protocol-owned encoder. Ingress owns delivery, never protocol key/state.
 class InboundDatagramResponse {
 public:
     virtual ~InboundDatagramResponse() noexcept = default;
-
     [[nodiscard]] virtual buf::MultiBuffer Encode(UDPPacketView packet) = 0;
 };
+
+
 
 struct InboundDatagramOwner {
     static constexpr size_t kMaxBytes = 32;
@@ -87,34 +88,24 @@ struct InboundDatagramOwner {
 };
 
 struct InboundDatagramAssociationPolicy;
-
 enum class InboundDatagramCheck : uint8_t { Inspect, Commit };
 
-// Protocol-owned continuity state. Control calls require an exclusive claim;
-// the protocol's normal Process entry uses its concrete implementation locally.
+// The open protocol boundary for replay/path continuity. The directory retains
+// this state after relay closure, independently of the expired session owner.
 class InboundDatagramAssociation {
 public:
     using Clock = std::chrono::steady_clock;
     explicit InboundDatagramAssociation(const InboundDatagramAssociationPolicy& policy) noexcept
         : policy_(policy) {}
     virtual ~InboundDatagramAssociation() noexcept = default;
-    [[nodiscard]] virtual bool Check(
-        uint64_t packet_id, uint32_t worker, const udp::endpoint& endpoint,
-        InboundDatagramCheck check, Clock::time_point now = Clock::now()) noexcept = 0;
-    [[nodiscard]] const InboundDatagramAssociationPolicy& Policy() const noexcept {
-        return policy_;
-    }
-    [[nodiscard]] Clock::time_point ProtectedUntil() const noexcept {
-        return protected_until_;
-    }
-    // Guards against re-entrant local commits while handoff inspection/creation runs.
-    bool claimed{true};
-
+    [[nodiscard]] virtual bool Check(uint64_t packet_id, uint32_t worker,
+        const udp::endpoint& endpoint, InboundDatagramCheck check,
+        Clock::time_point now = Clock::now()) noexcept = 0;
+    [[nodiscard]] const InboundDatagramAssociationPolicy& Policy() const noexcept { return policy_; }
+    [[nodiscard]] Clock::time_point ProtectedUntil() const noexcept { return protected_until_; }
+    bool claimed = true;
 protected:
-    void ProtectUntil(Clock::time_point deadline) noexcept {
-        protected_until_ = deadline;
-    }
-
+    void ProtectUntil(Clock::time_point deadline) noexcept { protected_until_ = deadline; }
 private:
     const InboundDatagramAssociationPolicy& policy_;
     Clock::time_point protected_until_{};
@@ -125,6 +116,7 @@ struct InboundDatagramAssociationPolicy {
     std::chrono::steady_clock::duration retention;
     std::unique_ptr<InboundDatagramAssociation> (*create)();
 };
+
 
 struct InboundDatagramAssociationKey {
     InboundDatagramOwner owner;

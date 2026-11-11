@@ -9,37 +9,10 @@
 #include <unistd.h>
 #include <cerrno>
 #include <atomic>
+#include <algorithm>
 #include <stdexcept>
 #include <system_error>
 
-namespace {
-class WorkerCoordinatorService final : public net::execution_context::service {
-public:
-    static net::execution_context::id id;
-    explicit WorkerCoordinatorService(net::execution_context& context)
-        : net::execution_context::service(context) {}
-
-    bool Bind(std::weak_ptr<GroupCoordinator> coordinator, bool count_worker) {
-        coordinator_ = std::move(coordinator);
-        return count_worker && !std::exchange(registered_, true);
-    }
-
-    [[nodiscard]] GroupCoordinator* Coordinator() const noexcept {
-        return coordinator_.lock().get();
-    }
-
-private:
-    void shutdown() override {
-        coordinator_.reset();
-    }
-
-    std::weak_ptr<GroupCoordinator> coordinator_;
-    bool registered_ = false;
-};
-
-net::execution_context::id WorkerCoordinatorService::id;
-
-}  // namespace
 
 struct GroupCoordinator::ReservedState {
     explicit ReservedState(net::io_context& io)
@@ -57,6 +30,7 @@ struct GroupCoordinator::ReservedState {
     bool stopping = false;
     bool joined = false;
     std::atomic<uint32_t> worker_count{0};
+    memory::Vector<net::io_context*> workers;
 };
 
 GroupCoordinator::GroupCoordinator(net::io_context& io, size_t capacity)
@@ -82,8 +56,10 @@ void GroupCoordinator::Start() {
 
 
 void GroupCoordinator::RegisterWorker(net::io_context& reactor) {
-    net::use_service<WorkerCoordinatorService>(reactor_).Bind(weak_from_this(), false);
-    if (net::use_service<WorkerCoordinatorService>(reactor).Bind(weak_from_this(), true)) {
+    // Fixed cold-path routes only; consumers receive this coordinator directly.
+    if (std::find(reserved_->workers.begin(), reserved_->workers.end(), &reactor) ==
+        reserved_->workers.end()) {
+        reserved_->workers.push_back(&reactor);
         reserved_->worker_count.fetch_add(1, std::memory_order_release);
     }
 }
@@ -92,10 +68,6 @@ uint32_t GroupCoordinator::WorkerCount() const noexcept {
     return reserved_->worker_count.load(std::memory_order_acquire);
 }
 
-GroupCoordinator* GroupCoordinator::ForContext(net::execution_context& context) noexcept {
-    if (!net::has_service<WorkerCoordinatorService>(context)) return nullptr;
-    return net::use_service<WorkerCoordinatorService>(context).Coordinator();
-}
 
 void GroupCoordinator::PostReserved(std::unique_ptr<ReservedOperation> operation) noexcept {
     auto* node = operation.release();

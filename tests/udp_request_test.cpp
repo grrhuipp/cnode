@@ -4,7 +4,6 @@
 #include "app/dns/dns.hpp"
 #include "app/relay.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/internet/timeout_scheduler.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -15,9 +14,8 @@
 
 #include <array>
 #include <chrono>
-#include <iostream>
+#include <exception>
 #include <memory>
-#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -25,9 +23,9 @@ namespace {
 using namespace std::chrono_literals;
 using UdpRequest = proxy::freedom::outbound::UdpRequest;
 
-void Check(bool value, const char* message) {
-    if (!value) throw std::runtime_error(message);
-}
+enum class WriteAbort { RequestCancel, ParentCancellation, Deadline };
+enum class Deadline { Idle, Read, Phase };
+enum class RelayAbort { Cancellation, Deadline };
 
 TargetAddress Target(const udp::endpoint& endpoint) {
     return TargetAddress(endpoint.address(), endpoint.port());
@@ -37,7 +35,7 @@ buf::MultiBuffer Packet(const TargetAddress& target, size_t size) {
     std::vector<uint8_t> bytes(size);
     for (size_t i = 0; i < size; ++i) bytes[i] = static_cast<uint8_t>(i * 37);
     buf::MultiBuffer payload;
-    Check(buf::AppendSpanToMultiBuffer(bytes, payload), "packet allocation failed");
+    EXPECT_TRUE(buf::AppendSpanToMultiBuffer(bytes, payload));
     for (auto* buffer : payload) buffer->SetUDP(target);
     return payload;
 }
@@ -64,7 +62,7 @@ public:
     udp::endpoint Endpoint() const { return socket_.local_endpoint(); }
 
     net::awaitable<void> WaitForQuery() {
-        while (queries_.empty()) {
+        while (queries_.empty() && !stopped_) {
             query_ready_.expires_at(std::chrono::steady_clock::time_point::max());
             IoErrorCode error;
             co_await query_ready_.async_wait(net::redirect_error(net::use_awaitable, error));
@@ -136,249 +134,330 @@ private:
     bool stopped_ = false;
 };
 
-struct Fixture {
+class UdpRequestTest : public testing::Test {
+protected:
     net::io_context io;
     DnsPeer dns_peer{io};
-    app::dns::DNSWorker dns_worker;
-    app::dns::DNS dns;
+    app::dns::DNSWorker dns_worker{
+        io, app::dns::Config{.servers = {dns_peer.Endpoint()}}, 8};
+    app::dns::DNS dns{dns_worker};
+    std::vector<std::shared_ptr<UdpRequest>> requests;
 
-    Fixture()
-        : dns_worker(io, app::dns::Config{.servers = {dns_peer.Endpoint()}}, 8),
-          dns(dns_worker) {}
+    UdpRequest& Request() {
+        requests.push_back(std::make_shared<UdpRequest>(
+            io, dns, net::ip::address_v4::loopback()));
+        return *requests.back();
+    }
 
-    void Run(net::awaitable<void> task) {
+    template <typename Task>
+    void Run(Task task) {
         std::exception_ptr error;
         bool done = false;
         bool expired = false;
+        net::cancellation_signal cancellation;
         net::steady_timer watchdog(io, 8s);
+        auto cancel_requests = [&] {
+            for (const auto& request : requests) request->Cancel();
+        };
         watchdog.async_wait([&](const IoErrorCode& ec) {
-            if (!ec) { expired = true; io.stop(); }
+            if (!ec) {
+                expired = true;
+                cancel_requests();
+                dns_peer.Stop();
+                cancellation.emit(net::cancellation_type::all);
+            }
         });
-        net::co_spawn(io, std::move(task), [&](std::exception_ptr failure) {
-            error = failure;
-            done = true;
-            dns_peer.Stop();
-            watchdog.cancel();
-        });
+        net::co_spawn(io, task(), net::bind_cancellation_slot(cancellation.slot(),
+            [&](std::exception_ptr failure) {
+                error = failure;
+                done = true;
+                cancel_requests();
+                dns_peer.Stop();
+                watchdog.cancel();
+            }));
         io.run();
-        Check(done && !expired, "channel operation or cancellation did not finish");
+        EXPECT_TRUE(done);
+        EXPECT_FALSE(expired) << "request did not finish within its watchdog";
         if (error) std::rethrow_exception(error);
     }
 };
 
-net::awaitable<void> RoundTrip(Fixture& fixture, UdpRequest& channel, size_t size) {
-    udp::socket peer(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
+net::awaitable<void> RoundTrip(net::io_context& io, UdpRequest& channel, size_t size) {
+    udp::socket peer(io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     const auto target = Target(peer.local_endpoint());
     co_await channel.WriteMultiBuffer(Packet(target, size));
     std::vector<uint8_t> received(65535);
     udp::endpoint source;
     const size_t count = co_await peer.async_receive_from(net::buffer(received), source, net::use_awaitable);
-    Check(count == size, "one MultiBuffer must remain one complete UDP datagram");
-    for (size_t i = 0; i < count; ++i) Check(received[i] == static_cast<uint8_t>(i * 37), "send bytes changed");
+    EXPECT_EQ(count, size) << "one MultiBuffer must remain one UDP datagram";
+    for (size_t i = 0; i < count; ++i)
+        EXPECT_EQ(received[i], static_cast<uint8_t>(i * 37)) << "offset " << i;
     co_await peer.async_send_to(net::buffer(received.data(), count), source, net::use_awaitable);
     auto reply = co_await channel.ReadMultiBuffer();
     const auto datagram = buf::InspectUdpDatagram(reply);
-    Check(datagram.Valid() && datagram.payload_size == size, "UDP response was fragmented or lost");
-    Check(datagram.target && datagram.target->port == peer.local_endpoint().port(), "response target was lost");
+    EXPECT_TRUE(datagram.Valid());
+    EXPECT_EQ(datagram.payload_size, size);
+    EXPECT_NE(datagram.target, nullptr);
+    if (datagram.target) EXPECT_EQ(datagram.target->port, peer.local_endpoint().port());
     size_t offset = 0;
     for (auto* buffer : reply) {
         for (auto byte : buffer->Bytes()) {
-            Check(byte == static_cast<uint8_t>(offset++ * 37), "receive bytes changed");
+            EXPECT_EQ(byte, static_cast<uint8_t>(offset++ * 37));
         }
     }
 }
 
-net::awaitable<void> TestCancellationIsolation(Fixture& fixture) {
-    UdpRequest cancelled(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    UdpRequest survivor(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    struct Completion { bool finished = false; std::exception_ptr failure; };
-    auto completion = std::make_shared<Completion>();
-    net::co_spawn(fixture.io, cancelled.ReadMultiBuffer(),
-        [completion](std::exception_ptr error, buf::MultiBuffer) {
-            completion->failure = error;
-            completion->finished = true;
-        });
-    co_await Pause(fixture.io, 20ms);
-    cancelled.Cancel();
-    co_await Pause(fixture.io, 20ms);
-    Check(completion->finished && completion->failure,
-          "request cancellation left the pending reader waiting");
-    try {
-        std::rethrow_exception(completion->failure);
-    } catch (const transport::LinkError& error) {
-        Check(error.code() == ErrorCode::CANCELLED, "request cancellation changed its error");
-    }
-    cancelled.Close();
-    bool permanently_rejected = false;
-    try { co_await cancelled.ReadMultiBuffer(); }
-    catch (const transport::LinkError& error) {
-        permanently_rejected = error.code() == ErrorCode::CANCELLED;
-    }
-    Check(permanently_rejected, "closed request accepted a new read");
-    survivor.SetWriteTimeout(1s);
-    co_await RoundTrip(fixture, survivor, 20000);
-    co_await Pause(fixture.io, 1100ms);
-    Check(!survivor.ConsumeWriteTimeout(), "completed write left a live request deadline");
-    co_await RoundTrip(fixture, survivor, 11);
-}
-
-struct WriteCompletion {
+struct Completion {
     bool finished = false;
     std::exception_ptr failure;
 };
 
-enum class WriteAbort { RequestCancel, ParentCancellation, Deadline };
-
-void RecordWriteCompletion(const std::shared_ptr<WriteCompletion>& completion,
-                           std::exception_ptr error) {
-    completion->failure = error;
-    completion->finished = true;
+net::awaitable<void> Join(net::io_context& io, const Completion& completion) {
+    while (!completion.finished) co_await Pause(io, 5ms);
 }
 
-ErrorCode WriteFailure(const std::exception_ptr& failure) {
-    try {
-        if (failure) std::rethrow_exception(failure);
-    } catch (const transport::LinkError& error) {
-        return error.code();
-    }
-    return ErrorCode::OK;
-}
-
-net::awaitable<void> WaitForWrite(Fixture& fixture, const WriteCompletion& completion) {
-    for (int i = 0; i < 400 && !completion.finished; ++i)
-        co_await Pause(fixture.io, 5ms);
-    Check(completion.finished, "cancelled UDP write did not join promptly");
-}
-
-net::awaitable<void> TestDnsWriteCancellation(Fixture& fixture, WriteAbort abort) {
-    UdpRequest request(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    UdpRequest survivor(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    udp::socket sink(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
-    const auto port = sink.local_endpoint().port();
-    const char* domain = abort == WriteAbort::RequestCancel ? "request-cancel.example" :
-                         abort == WriteAbort::ParentCancellation ? "parent-cancel.example" :
-                                                                  "write-timeout.example";
-    request.SetWriteTimeout(1s);
-    auto completion = std::make_shared<WriteCompletion>();
-    net::cancellation_signal parent_cancellation;
-    auto complete = [completion](std::exception_ptr error) {
-        RecordWriteCompletion(completion, error);
-    };
-    auto write = request.WriteMultiBuffer(Packet(TargetAddress(domain, port), 32));
-    if (abort == WriteAbort::ParentCancellation) {
-        net::co_spawn(fixture.io, std::move(write),
-            net::bind_cancellation_slot(parent_cancellation.slot(), complete));
-    } else {
-        net::co_spawn(fixture.io, std::move(write), complete);
-    }
-
-    // This proves the request reached DNSWorker's real UDP exchange before the
-    // abort. The fake server then returns valid responses, including an A record
-    // for the sink, so a late continuation would be observable as a UDP packet.
-    co_await fixture.dns_peer.WaitForQuery();
-    if (abort == WriteAbort::RequestCancel) request.Cancel();
-    if (abort == WriteAbort::ParentCancellation)
-        parent_cancellation.emit(net::cancellation_type::all);
-    if (abort != WriteAbort::Deadline) fixture.dns_peer.ReplyPendingAndEnable();
-    else co_await Pause(fixture.io, 1100ms);
-
-    co_await WaitForWrite(fixture, *completion);
-    if (abort == WriteAbort::Deadline) {
-        Check(WriteFailure(completion->failure) == ErrorCode::CANCELLED &&
-              request.ConsumeWriteTimeout(), "write timeout did not cancel DNS-backed write");
-    } else {
-        Check(WriteFailure(completion->failure) == ErrorCode::CANCELLED,
-              "request/parent cancellation changed the DNS-backed write error");
-    }
-
-    if (abort == WriteAbort::Deadline) fixture.dns_peer.ReplyPendingAndEnable();
-    co_await Pause(fixture.io, 40ms);
-    Check(fixture.dns_peer.AReplies() != 0, "fake DNS peer did not return a valid A response");
-    IoErrorCode available_error;
-    Check(sink.available(available_error) == 0 && !available_error,
-          "cancelled DNS write sent a datagram after a valid A response");
-
-    // The timed-out/cancelled write deadline must be detached, and a separate
-    // request must remain usable despite resolution completion arriving late.
-    co_await RoundTrip(fixture, survivor, 32);
-    if (abort != WriteAbort::Deadline) {
-        co_await Pause(fixture.io, 1100ms);
-        Check(!request.ConsumeWriteTimeout(), "cancelled write left a live deadline");
-    } else {
-        co_await Pause(fixture.io, 1100ms);
-        Check(!request.ConsumeWriteTimeout(), "expired write deadline fired more than once");
-    }
-}
-
-net::awaitable<void> TestDeadlines(Fixture& fixture, int kind) {
-    UdpRequest channel(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    PhaseDeadlineHandle phase;
-    if (kind == 0) channel.SetIdleTimeout(1s);
-    if (kind == 1) channel.SetReadTimeout(1s);
-    if (kind == 2) phase = channel.StartPhaseDeadline(1s);
-    const auto started = std::chrono::steady_clock::now();
-    bool cancelled = false;
-    try { co_await channel.ReadMultiBuffer(); }
-    catch (const transport::LinkError& error) { cancelled = error.code() == ErrorCode::CANCELLED; }
-    const auto elapsed = std::chrono::steady_clock::now() - started;
-    Check(cancelled && elapsed >= 800ms && elapsed < 3s, "pending read ignored its deadline");
-    if (kind == 0) Check(channel.ConsumeIdleTimeout() && !channel.ConsumeIdleTimeout(), "idle signal was lost or duplicated");
-    if (kind == 1) Check(channel.ConsumeReadTimeout() && !channel.ConsumeReadTimeout(), "read signal was lost or duplicated");
-    if (kind == 2) {
-        Check(phase.Expired(), "phase handle did not observe expiry");
-        channel.ClearPhaseDeadline();
-        Check(!phase.Expired() && !channel.ConsumePhaseDeadline(), "clear left a stale phase expiry on a closed channel");
-        Check(!channel.StartPhaseDeadline(1s), "closed channel started a new phase");
-    }
-}
-
-net::awaitable<void> TestIdleActivityAndClear(Fixture& fixture) {
-    UdpRequest channel(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    channel.SetIdleTimeout(1s);
-    const auto old_phase = channel.StartPhaseDeadline(1s);
-    channel.ClearPhaseDeadline();
-    Check(!old_phase.Expired(), "cleared phase handle remained active");
-    for (int i = 0; i < 3; ++i) {
-        co_await Pause(fixture.io, 450ms);
-        co_await RoundTrip(fixture, channel, 32);
-    }
-    Check(!channel.ConsumeIdleTimeout(), "active datagrams did not refresh idle timeout");
-    channel.SetIdleTimeout(0s);
-    co_await Pause(fixture.io, 1100ms);
-    co_await RoundTrip(fixture, channel, 32);
-}
-
-net::awaitable<void> TestParentCancellation(Fixture& fixture) {
-    UdpRequest channel(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    net::cancellation_signal cancellation;
-    struct Completion { bool finished = false; std::exception_ptr failure; };
-    auto completion = std::make_shared<Completion>();
-    net::co_spawn(fixture.io, channel.ReadMultiBuffer(),
-        net::bind_cancellation_slot(cancellation.slot(),
+TEST_F(UdpRequestTest, CancellingOneReaderLeavesOtherRequestsUsable) {
+    Run([&]() -> net::awaitable<void> {
+        auto& cancelled = Request();
+        auto& survivor = Request();
+        auto completion = std::make_shared<Completion>();
+        net::co_spawn(io, cancelled.ReadMultiBuffer(),
             [completion](std::exception_ptr error, buf::MultiBuffer) {
-                completion->failure = error; completion->finished = true;
-            }));
-    co_await Pause(fixture.io, 20ms);
-    cancellation.emit(net::cancellation_type::all);
-    co_await Pause(fixture.io, 20ms);
-    Check(completion->finished && completion->failure, "parent cancellation left the logical reader waiting");
-    UdpRequest survivor(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    co_await RoundTrip(fixture, survivor, 32);
+                completion->failure = error;
+                completion->finished = true;
+            });
+        co_await Pause(io, 20ms);
+        const auto started = std::chrono::steady_clock::now();
+        cancelled.Cancel();
+        co_await Join(io, *completion);
+        EXPECT_LT(std::chrono::steady_clock::now() - started, 500ms);
+        EXPECT_NE(completion->failure, nullptr);
+        if (completion->failure) {
+            try { std::rethrow_exception(completion->failure); }
+            catch (const transport::LinkError& error) {
+                EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
+            }
+        }
+        co_await RoundTrip(io, survivor, 20000);
+    });
 }
 
-net::awaitable<void> TestRetiredTimer(Fixture& fixture) {
-    // Queue timer readiness while no handler can execute. Destroy the owner
-    // before yielding to the event loop; queued callbacks must not borrow it.
-    {
-        UdpRequest old(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-        old.StartPhaseDeadline(1s);
-        std::this_thread::sleep_for(1050ms);
-    }
-    UdpRequest current(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    co_await RoundTrip(fixture, current, 32);
-    current.StartPhaseDeadline(std::chrono::seconds::max());
-    co_await Pause(fixture.io, 20ms);
-    Check(!current.ConsumePhaseDeadline(), "large deadline overflowed into the present");
+TEST_F(UdpRequestTest, ClosedRequestRejectsNewReads) {
+    Run([&]() -> net::awaitable<void> {
+        auto& request = Request();
+        request.Close();
+        bool rejected = false;
+        try { co_await request.ReadMultiBuffer(); }
+        catch (const transport::LinkError& error) {
+            rejected = true;
+            EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
+        }
+        EXPECT_TRUE(rejected);
+    });
+}
+
+TEST_F(UdpRequestTest, CompletedWriteRetiresItsDeadline) {
+    Run([&]() -> net::awaitable<void> {
+        auto& request = Request();
+        request.SetWriteTimeout(1s);
+        co_await RoundTrip(io, request, 32);
+        co_await Pause(io, 1100ms);
+        EXPECT_FALSE(request.ConsumeWriteTimeout());
+        co_await RoundTrip(io, request, 11);
+    });
+}
+
+class DnsWriteAbortTest : public UdpRequestTest,
+                          public testing::WithParamInterface<WriteAbort> {};
+
+TEST_P(DnsWriteAbortTest, AbortedResolutionCannotSendAfterLateDnsResponse) {
+    Run([&]() -> net::awaitable<void> {
+        const auto abort = GetParam();
+        auto& request = Request();
+        auto& survivor = Request();
+        udp::socket sink(io, udp::endpoint(net::ip::address_v4::loopback(), 0));
+        request.SetWriteTimeout(1s);
+        auto completion = std::make_shared<Completion>();
+        net::cancellation_signal parent;
+        net::co_spawn(io, request.WriteMultiBuffer(
+            Packet(TargetAddress("cancelled-write.example", sink.local_endpoint().port()), 32)),
+            net::bind_cancellation_slot(parent.slot(),
+                [completion](std::exception_ptr error) {
+                    completion->failure = error;
+                    completion->finished = true;
+                }));
+
+        // Observe a real DNS exchange before releasing a valid, late A response.
+        co_await dns_peer.WaitForQuery();
+        if (abort == WriteAbort::RequestCancel) request.Cancel();
+        if (abort == WriteAbort::ParentCancellation)
+            parent.emit(net::cancellation_type::all);
+        if (abort == WriteAbort::Deadline) co_await Pause(io, 1100ms);
+        else dns_peer.ReplyPendingAndEnable();
+
+        co_await Join(io, *completion);
+        EXPECT_NE(completion->failure, nullptr);
+        if (completion->failure) {
+            try { std::rethrow_exception(completion->failure); }
+            catch (const transport::LinkError& error) {
+                EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
+            }
+        }
+        if (abort == WriteAbort::Deadline) {
+            EXPECT_TRUE(request.ConsumeWriteTimeout());
+            dns_peer.ReplyPendingAndEnable();
+        }
+        co_await Pause(io, 40ms);
+        EXPECT_GT(dns_peer.AReplies(), 0u);
+        IoErrorCode error;
+        EXPECT_EQ(sink.available(error), 0u);
+        EXPECT_FALSE(error);
+        co_await RoundTrip(io, survivor, 32);
+        co_await Pause(io, 1100ms);
+        EXPECT_FALSE(request.ConsumeWriteTimeout()) << "aborted write retained a deadline";
+    });
+}
+
+INSTANTIATE_TEST_SUITE_P(AbortModes, DnsWriteAbortTest,
+    testing::Values(WriteAbort::RequestCancel, WriteAbort::ParentCancellation,
+                    WriteAbort::Deadline),
+    [](const testing::TestParamInfo<WriteAbort>& info) {
+        switch (info.param) {
+        case WriteAbort::RequestCancel: return "RequestCancel";
+        case WriteAbort::ParentCancellation: return "ParentCancellation";
+        case WriteAbort::Deadline: return "Deadline";
+        }
+        return "Unknown";
+    });
+
+class UdpDeadlineTest : public UdpRequestTest,
+                        public testing::WithParamInterface<Deadline> {};
+
+TEST_P(UdpDeadlineTest, PendingReadExpiresOnceAtItsDeadline) {
+    Run([&]() -> net::awaitable<void> {
+        auto& channel = Request();
+        PhaseDeadlineHandle phase;
+        const auto kind = GetParam();
+        if (kind == Deadline::Idle) channel.SetIdleTimeout(1s);
+        if (kind == Deadline::Read) channel.SetReadTimeout(1s);
+        if (kind == Deadline::Phase) phase = channel.StartPhaseDeadline(1s);
+        const auto started = std::chrono::steady_clock::now();
+        bool cancelled = false;
+        try { co_await channel.ReadMultiBuffer(); }
+        catch (const transport::LinkError& error) {
+            cancelled = true;
+            EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        EXPECT_TRUE(cancelled);
+        EXPECT_GE(elapsed, 800ms);
+        EXPECT_LT(elapsed, 3s);
+        if (kind == Deadline::Idle) {
+            EXPECT_TRUE(channel.ConsumeIdleTimeout());
+            EXPECT_FALSE(channel.ConsumeIdleTimeout());
+        }
+        if (kind == Deadline::Read) {
+            EXPECT_TRUE(channel.ConsumeReadTimeout());
+            EXPECT_FALSE(channel.ConsumeReadTimeout());
+        }
+        if (kind == Deadline::Phase) {
+            EXPECT_TRUE(phase.Expired());
+            channel.ClearPhaseDeadline();
+            EXPECT_FALSE(phase.Expired());
+            EXPECT_FALSE(channel.ConsumePhaseDeadline());
+            EXPECT_FALSE(channel.StartPhaseDeadline(1s));
+        }
+    });
+}
+
+INSTANTIATE_TEST_SUITE_P(Deadlines, UdpDeadlineTest,
+    testing::Values(Deadline::Idle, Deadline::Read, Deadline::Phase),
+    [](const testing::TestParamInfo<Deadline>& info) {
+        switch (info.param) {
+        case Deadline::Idle: return "Idle";
+        case Deadline::Read: return "Read";
+        case Deadline::Phase: return "Phase";
+        }
+        return "Unknown";
+    });
+
+TEST_F(UdpRequestTest, DatagramActivityRefreshesIdleTimeout) {
+    Run([&]() -> net::awaitable<void> {
+        auto& channel = Request();
+        channel.SetIdleTimeout(1s);
+        for (int i = 0; i < 3; ++i) {
+            co_await Pause(io, 450ms);
+            co_await RoundTrip(io, channel, 32);
+        }
+        EXPECT_FALSE(channel.ConsumeIdleTimeout());
+    });
+}
+
+TEST_F(UdpRequestTest, ClearedDeadlinesDoNotCancelLaterTraffic) {
+    Run([&]() -> net::awaitable<void> {
+        auto& channel = Request();
+        channel.SetIdleTimeout(1s);
+        const auto phase = channel.StartPhaseDeadline(1s);
+        channel.ClearPhaseDeadline();
+        channel.SetIdleTimeout(0s);
+        co_await Pause(io, 1100ms);
+        EXPECT_FALSE(phase.Expired());
+        EXPECT_FALSE(channel.ConsumeIdleTimeout());
+        EXPECT_FALSE(channel.ConsumePhaseDeadline());
+        co_await RoundTrip(io, channel, 32);
+    });
+}
+
+TEST_F(UdpRequestTest, ParentCancellationJoinsReaderWithoutAffectingOtherRequests) {
+    Run([&]() -> net::awaitable<void> {
+        auto& channel = Request();
+        auto& survivor = Request();
+        net::cancellation_signal cancellation;
+        auto completion = std::make_shared<Completion>();
+        net::co_spawn(io, channel.ReadMultiBuffer(),
+            net::bind_cancellation_slot(cancellation.slot(),
+                [completion](std::exception_ptr error, buf::MultiBuffer) {
+                    completion->failure = error;
+                    completion->finished = true;
+                }));
+        co_await Pause(io, 20ms);
+        const auto started = std::chrono::steady_clock::now();
+        cancellation.emit(net::cancellation_type::all);
+        co_await Join(io, *completion);
+        EXPECT_LT(std::chrono::steady_clock::now() - started, 500ms);
+        EXPECT_NE(completion->failure, nullptr);
+        if (completion->failure) {
+            try { std::rethrow_exception(completion->failure); }
+            // Parent coroutine cancellation is an Asio operation abort, not
+            // the LinkError produced by explicitly cancelling the request.
+            catch (const IoSystemError& error) {
+                EXPECT_EQ(error.code(), io_error::operation_aborted);
+            }
+        }
+        co_await RoundTrip(io, survivor, 32);
+        co_await RoundTrip(io, channel, 32);
+    });
+}
+
+TEST_F(UdpRequestTest, QueuedDeadlineCallbacksDoNotBorrowDestroyedRequests) {
+    Run([&]() -> net::awaitable<void> {
+        {
+            UdpRequest old(io, dns, net::ip::address_v4::loopback());
+            old.StartPhaseDeadline(1s);
+            std::this_thread::sleep_for(1050ms);
+        }
+        co_await RoundTrip(io, Request(), 32);
+    });
+}
+
+TEST_F(UdpRequestTest, MaximumDurationDeadlineDoesNotOverflow) {
+    Run([&]() -> net::awaitable<void> {
+        auto& current = Request();
+        current.StartPhaseDeadline(std::chrono::seconds::max());
+        co_await Pause(io, 20ms);
+        EXPECT_FALSE(current.ConsumePhaseDeadline());
+        co_await RoundTrip(io, current, 32);
+    });
 }
 
 class OnePacketReader final : public transport::MultiBufferReader {
@@ -405,87 +484,83 @@ public:
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer>) override { co_return; }
 };
 
-net::awaitable<void> TestRelayRateAndAccounting(Fixture& fixture) {
-    udp::socket peer(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
-    UdpRequest target(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    OnePacketReader input(Target(peer.local_endpoint()));
-    IgnoreWriter output;
-    session::Context context;
-    context.content.network = Network::UDP;
-    StatsShard stats;
-    const auto started = std::chrono::steady_clock::now();
-    auto result = co_await DoRelayLink(fixture.io, input, output, nullptr,
-        target, context, stats, RelayConfig{.downlink_only = 1s, .speed_limit = 1000});
-    const auto elapsed = std::chrono::steady_clock::now() - started;
-    Check(result.error == ErrorCode::RELAY_TIMEOUT && result.bytes_up == 2000 && result.bytes_down == 0,
-          "generic UDP relay traffic result changed");
-    Check(stats.Snapshot().bytes_out == 2000 && context.traffic.bytes_up == 2000,
-          "UDP relay accounting did not follow successful writes");
-    Check(elapsed >= 1900ms && elapsed < 4s, "relay without client control ignored its rate limit or half-close budget");
+TEST_F(UdpRequestTest, RelayRateLimitAndHalfCloseBudgetPreserveSuccessfulWriteAccounting) {
+    Run([&]() -> net::awaitable<void> {
+        udp::socket peer(io, udp::endpoint(net::ip::address_v4::loopback(), 0));
+        auto& target = Request();
+        OnePacketReader input(Target(peer.local_endpoint()));
+        IgnoreWriter output;
+        session::Context context;
+        context.content.network = Network::UDP;
+        StatsShard stats;
+        const auto started = std::chrono::steady_clock::now();
+        const auto result = co_await DoRelayLink(io, input, output, nullptr,
+            target, context, stats, RelayConfig{.downlink_only = 1s, .speed_limit = 1000});
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        EXPECT_EQ(result.error, ErrorCode::RELAY_TIMEOUT);
+        EXPECT_EQ(result.bytes_up, 2000u);
+        EXPECT_EQ(result.bytes_down, 0u);
+        EXPECT_EQ(stats.Snapshot().bytes_out, 2000u);
+        EXPECT_EQ(context.traffic.bytes_up, 2000u);
+        EXPECT_GE(elapsed, 1900ms);
+        EXPECT_LT(elapsed, 4s);
+    });
 }
 
-net::awaitable<void> TestRelayErrorCode(Fixture& fixture) {
-    UdpRequest target(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    // Empty DNS server responses cannot be needed for a malformed datagram:
-    // the channel preserves its validation failure as an application error.
-    OnePacketReader input(TargetAddress{});
-    IgnoreWriter output;
-    session::Context context;
-    context.content.network = Network::UDP;
-    StatsShard stats;
-    auto result = co_await DoRelayLink(fixture.io, input, output, nullptr,
-                                      target, context, stats);
-    Check(result.error == ErrorCode::INVALID_ARGUMENT && result.bytes_up == 0 &&
-          context.traffic.bytes_up == 0 && stats.Snapshot().bytes_out == 0,
-          "logical UDP failure or failed-send accounting was lost");
+TEST_F(UdpRequestTest, InvalidDatagramRetainsErrorWithoutCountingFailedSend) {
+    Run([&]() -> net::awaitable<void> {
+        auto& target = Request();
+        OnePacketReader input(TargetAddress{});
+        IgnoreWriter output;
+        session::Context context;
+        context.content.network = Network::UDP;
+        StatsShard stats;
+        const auto result = co_await DoRelayLink(io, input, output, nullptr,
+                                               target, context, stats);
+        EXPECT_EQ(result.error, ErrorCode::INVALID_ARGUMENT);
+        EXPECT_EQ(result.bytes_up, 0u);
+        EXPECT_EQ(context.traffic.bytes_up, 0u);
+        EXPECT_EQ(stats.Snapshot().bytes_out, 0u);
+    });
 }
 
-net::awaitable<void> TestRelayExternalCancellation(Fixture& fixture, bool deadline) {
-    udp::socket peer(fixture.io, udp::endpoint(net::ip::address_v4::loopback(), 0));
-    UdpRequest target(fixture.io, fixture.dns, net::ip::address_v4::loopback());
-    OnePacketReader input(Target(peer.local_endpoint()));
-    IgnoreWriter output;
-    session::Context context;
-    context.content.network = Network::UDP;
-    StatsShard stats;
-    struct Cancellation final : TimeoutEvent {
-        explicit Cancellation(UdpRequest& target) : target(target) {}
-        void OnTimeout() override { target.Cancel(); }
-        UdpRequest& target;
-    } cancellation(target);
-    if (deadline) target.StartPhaseDeadline(1s);
-    else (void)TimeoutScheduler::ForIoContext(fixture.io).ScheduleAfter(50ms, cancellation);
-    const auto start = std::chrono::steady_clock::now();
-    const auto result = co_await DoRelayLink(fixture.io, input, output, nullptr,
-        target, context, stats, RelayConfig{.speed_limit = 100});
-    const auto elapsed = std::chrono::steady_clock::now() - start;
-    const auto expected = deadline ? ErrorCode::RELAY_TIMEOUT : ErrorCode::CANCELLED;
-    Check(result.error == expected,
-        "UDP external cancellation lost the terminal reason");
-    Check(result.bytes_up == 0 && stats.Snapshot().bytes_out == 0 && elapsed < (deadline ? 1800ms : 500ms),
-        "UDP cancellation failed to join the pending rate wait before sending");
+class UdpRelayAbortTest : public UdpRequestTest,
+                         public testing::WithParamInterface<RelayAbort> {};
+
+TEST_P(UdpRelayAbortTest, CancellationJoinsRateLimitedRelayWithoutCountingUnsentPayload) {
+    Run([&]() -> net::awaitable<void> {
+        udp::socket peer(io, udp::endpoint(net::ip::address_v4::loopback(), 0));
+        auto& target = Request();
+        OnePacketReader input(Target(peer.local_endpoint()));
+        IgnoreWriter output;
+        session::Context context;
+        context.content.network = Network::UDP;
+        StatsShard stats;
+        net::steady_timer cancellation(io);
+        const bool deadline = GetParam() == RelayAbort::Deadline;
+        if (deadline) target.StartPhaseDeadline(1s);
+        else {
+            cancellation.expires_after(50ms);
+            cancellation.async_wait([&](const IoErrorCode& error) {
+                if (!error) target.Cancel();
+            });
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const auto result = co_await DoRelayLink(io, input, output, nullptr,
+            target, context, stats, RelayConfig{.speed_limit = 100});
+        cancellation.cancel();
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        EXPECT_EQ(result.error, deadline ? ErrorCode::RELAY_TIMEOUT : ErrorCode::CANCELLED);
+        EXPECT_EQ(result.bytes_up, 0u);
+        EXPECT_EQ(context.traffic.bytes_up, 0u);
+        EXPECT_EQ(stats.Snapshot().bytes_out, 0u);
+        EXPECT_LT(elapsed, deadline ? 1800ms : 500ms);
+    });
 }
+
+INSTANTIATE_TEST_SUITE_P(AbortModes, UdpRelayAbortTest,
+    testing::Values(RelayAbort::Cancellation, RelayAbort::Deadline),
+    [](const testing::TestParamInfo<RelayAbort>& info) {
+        return info.param == RelayAbort::Deadline ? "Deadline" : "Cancellation";
+    });
 }  // namespace
-
-TEST(UdpRequest, Contract) {
-    try {
-        { Fixture fixture; fixture.Run(TestCancellationIsolation(fixture)); }
-        { Fixture fixture; fixture.Run(TestDnsWriteCancellation(fixture, WriteAbort::RequestCancel)); }
-        { Fixture fixture; fixture.Run(TestDnsWriteCancellation(fixture, WriteAbort::ParentCancellation)); }
-        { Fixture fixture; fixture.Run(TestDnsWriteCancellation(fixture, WriteAbort::Deadline)); }
-        for (int kind = 0; kind != 3; ++kind) {
-            Fixture fixture; fixture.Run(TestDeadlines(fixture, kind));
-        }
-        { Fixture fixture; fixture.Run(TestIdleActivityAndClear(fixture)); }
-        { Fixture fixture; fixture.Run(TestParentCancellation(fixture)); }
-        { Fixture fixture; fixture.Run(TestRetiredTimer(fixture)); }
-        { Fixture fixture; fixture.Run(TestRelayRateAndAccounting(fixture)); }
-        { Fixture fixture; fixture.Run(TestRelayErrorCode(fixture)); }
-        for (bool deadline : {false, true}) {
-            Fixture fixture; fixture.Run(TestRelayExternalCancellation(fixture, deadline));
-        }
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        FAIL() << error.what();
-    }
-}

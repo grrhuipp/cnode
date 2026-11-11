@@ -622,21 +622,19 @@ void UdpIngress::RegisterNativeJob(const ClientSessionPtr& session) {
 // connection reservations and the online-device guard until it ends.
 net::awaitable<void> UdpIngress::RunNativeDispatch(ClientSessionPtr client_session) {
     auto& request = *client_session->request_;
-    if (request.active_sessions) ++*request.active_sessions;
-    auto active_guard = MakeScopeExit([active = request.active_sessions]() noexcept {
-        if (active) --*active;
-    });
-    request.stats->OnConnectionAccepted();
-    auto connection_stats = MakeScopeExit([stats = request.stats]() noexcept {
-        stats->OnConnectionClosed();
-    });
+    app::RequestLoadState::PhysicalConnectionScope physical(*request.request_load);
+    ConnectionStatsScope connection_stats(request.admission->stats);
     std::optional<NativeAssociationAdmission> admission;
     try {
-        admission = co_await AdmitNativeAssociation(
-            request.context, request.profile, request.tracker, request.limiter,
-            *request.stats);
+        auto authentication = co_await proxy::BeginInboundAuthentication(*request.admission, request.context);
+        if (!authentication) {
+            request.admission->stats.OnError();
+            client_session->Close();
+            co_return;
+        }
+        auto bound = std::move(*authentication).Bind(request.profile, std::nullopt);
         request.profile = {};
-        request.tracker = nullptr;
+        admission = co_await AdmitNativeAssociation(*request.admission, request.context, std::move(bound));
         if (!admission || client_session->Closed()) {
             client_session->Close();
             co_return;
@@ -644,7 +642,7 @@ net::awaitable<void> UdpIngress::RunNativeDispatch(ClientSessionPtr client_sessi
         RelayResult result = co_await request.dispatcher->Dispatch(
             *request.io_context, request.policy, nullptr,
             transport::Link{client_session.get(), client_session.get()},
-            InitialPayload{}, request.context, *request.stats, request.timeouts);
+            InitialPayload{}, request.context, request.admission->stats, request.timeouts);
         if (result.error != ErrorCode::OK) {
             LOG_CONN_DEBUG(request.context,
                 "UDP dispatcher ended > {} up={}B down={}B",
@@ -708,6 +706,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
             ::proxy::LogInboundAuthFailure(
                 rejected, "datagram authentication or validation failed");
         }
+        (void)proxy::RejectInbound(datagram.environment.admission->stats, nullptr, decoded.error());
         return;
     }
     if (decoded->association_policy && decoded->session_id && decoded->packet_id) {
@@ -878,12 +877,10 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
         request.profile = *decoded->user;
         const auto& env = datagram.environment;
         request.dispatcher = env.dispatcher;
-        request.stats = env.stats;
-        request.limiter = env.limiter;
-        request.tracker = env.tracker;
-        request.active_sessions = env.active_sessions;
-        ::proxy::BindAuthenticatedInbound(
-            ctx, request.profile,
+        request.admission = env.admission;
+        request.request_load = env.request_load;
+        ::proxy::BindInboundRequestTarget(
+            ctx,
             ::proxy::InboundRequestTarget{
                 Network::UDP,
                 decoded->target,

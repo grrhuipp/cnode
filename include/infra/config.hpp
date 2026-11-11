@@ -1,7 +1,6 @@
 #pragma once
 
 #include "common/defaults.hpp"
-#include "common/ascii.hpp"
 #include "core/constants.hpp"
 #include "infra/config_types.hpp"
 #include "infra/json.hpp"
@@ -16,7 +15,6 @@
 #include <memory>
 #include <optional>
 #include <span>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tl/expected.hpp>
@@ -33,40 +31,10 @@ namespace infra {
 [[nodiscard]] XHttpConfig ParseXHttpConfig(const json::object& source);
 [[nodiscard]] RealityConfig ParseRealityConfig(const json::object& source);
 [[nodiscard]] StreamSettings ParseStreamSettings(const json::object& source, StreamEndpointRole role);
+[[nodiscard]] OutboundSettings ParseOutboundSettings(
+    std::string_view protocol, const json::object& settings);
 }  // namespace infra
 
-namespace proxy::freedom::outbound {
-
-enum class DomainStrategy : uint8_t {
-    AsIs,
-    UseIP,
-    UseIPv6v4,
-    UseIPv4,
-    UseIPv4v6,
-    UseIPv6,
-    ForceIP,
-    ForceIPv6v4,
-    ForceIPv6,
-    ForceIPv4v6,
-    ForceIPv4,
-};
-
-[[nodiscard]] inline std::optional<DomainStrategy> ParseDomainStrategy(std::string_view value) {
-    if (EqualsAsciiCI(value, "asis")) return DomainStrategy::AsIs;
-    if (EqualsAsciiCI(value, "useip")) return DomainStrategy::UseIP;
-    if (EqualsAsciiCI(value, "useipv6v4")) return DomainStrategy::UseIPv6v4;
-    if (EqualsAsciiCI(value, "useipv4")) return DomainStrategy::UseIPv4;
-    if (EqualsAsciiCI(value, "useipv4v6")) return DomainStrategy::UseIPv4v6;
-    if (EqualsAsciiCI(value, "useipv6")) return DomainStrategy::UseIPv6;
-    if (EqualsAsciiCI(value, "forceip")) return DomainStrategy::ForceIP;
-    if (EqualsAsciiCI(value, "forceipv6v4")) return DomainStrategy::ForceIPv6v4;
-    if (EqualsAsciiCI(value, "forceipv6")) return DomainStrategy::ForceIPv6;
-    if (EqualsAsciiCI(value, "forceipv4v6")) return DomainStrategy::ForceIPv4v6;
-    if (EqualsAsciiCI(value, "forceipv4")) return DomainStrategy::ForceIPv4;
-    return std::nullopt;
-}
-
-}  // namespace proxy::freedom::outbound
 
 class PanelNodeIds {
 public:
@@ -295,42 +263,14 @@ struct RealityServerInput {
     InboundListen fallback = InboundListen{});
 
 // Header presence policy is independent of v1/v2 format detection.
-[[nodiscard]] inline ProxyProtocolMode ParseProxyProtocolMode(
+[[nodiscard]] ProxyProtocolMode ParseProxyProtocolMode(
     const json::object& object, std::string_view key,
-    ProxyProtocolMode fallback = ProxyProtocolMode::Auto) {
-    const auto* value = object.if_contains(key);
-    if (!value) return fallback;
-    if (value->is_string()) {
-        const auto mode = LowerAscii(value->as_string());
-        if (mode == "off") return ProxyProtocolMode::Off;
-        if (mode == "auto") return ProxyProtocolMode::Auto;
-        if (mode == "on") return ProxyProtocolMode::On;
-    }
-    throw std::invalid_argument(
-        "proxyProtocol must be off, auto or on");
-}
+    ProxyProtocolMode fallback = ProxyProtocolMode::Auto);
 
 inline constexpr uint32_t kHttp2MaxInitialWindow = 0x7fffffffU;
+[[nodiscard]] tl::expected<std::optional<uint32_t>, std::string>
+ParseHttp2InitialWindow(const json::object& source);
 
-[[nodiscard]] inline tl::expected<std::optional<uint32_t>, std::string>
-ParseHttp2InitialWindow(const json::object& source) {
-    if (source.contains("initial_windows_size") ||
-        source.contains("initial_window_size")) {
-        return tl::unexpected(std::string(
-            "initial_windows_size/initial_window_size is not supported; use initialWindowSize"));
-    }
-    auto parsed = ParseJsonUint64(
-        source,
-        "initialWindowSize",
-        kHttp2MaxInitialWindow);
-    if (!parsed) {
-        return tl::unexpected(std::move(parsed.error()));
-    }
-    if (!*parsed) {
-        return std::optional<uint32_t>{};
-    }
-    return std::optional<uint32_t>{static_cast<uint32_t>(**parsed)};
-}
 }  // namespace infra
 
 using infra::kHttp2MaxInitialWindow;

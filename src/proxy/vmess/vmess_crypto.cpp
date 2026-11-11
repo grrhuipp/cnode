@@ -232,9 +232,12 @@ std::optional<MemoryAccount> MemoryAccount::FromUUID(std::string_view uuid_str) 
     if (!uuid_bytes) {
         return std::nullopt;
     }
+    return FromUuidBytes(*uuid_bytes);
+}
 
+MemoryAccount MemoryAccount::FromUuidBytes(const std::array<uint8_t, 16>& uuid) {
     MemoryAccount account;
-    account.uuid_bytes = *uuid_bytes;
+    account.uuid_bytes = uuid;
 
     std::array<uint8_t, 16 + kVmessMagic.size()> key_material{};
     std::memcpy(key_material.data(), account.uuid_bytes.data(), account.uuid_bytes.size());

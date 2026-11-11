@@ -8,6 +8,7 @@
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
 #include "proxy/inbound.hpp"
+#include "proxy/inbound_admission.hpp"
 #include "transport/internet/proxy_protocol.hpp"
 #include "transport/internet/transport_stack.hpp"
 
@@ -78,23 +79,6 @@ void CountEscapedInboundFailure(const session::Context& ctx, StatsShard& stats) 
     stats.OnError();
 }
 
-void RejectConnection(
-    const session::Context& ctx,
-    StatsShard& stats,
-    ConnectionLimiter::RejectReason reject,
-    bool before_transport_handshake = false) {
-    const char* reason = ConnectionLimiter::RejectReasonToString(reject);
-    if (before_transport_handshake &&
-        reject == ConnectionLimiter::RejectReason::IP_BANNED) {
-        LOG_CONN_DEBUG(ctx, "connection rejected source={}:{} > IP banned before transport handshake",
-                       ctx.inbound.source_ip, ctx.inbound.source_port);
-    } else {
-        LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > {}",
-                       ctx.inbound.source_ip, ctx.inbound.source_port, reason);
-    }
-    LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
-    stats.OnError();
-}
 
 }  // namespace
 
@@ -167,20 +151,10 @@ public:
 
         Handler& handler = *handler_;
         const inbound::ReceiverSettings& listener = handler.receiver_;
-        ConnectionStatsScope connection_stats(stats_);
-
-        ConnectionLimiter::Admission admission;
-        if (handler.limiter_.TracksAdmission()) {
-            admission = co_await handler.limiter_.ReserveLogical(
-                ctx.inbound.connection_family, ctx.inbound.tag, ctx.inbound.source_ip,
-                ctx.inbound.HasProxyProtocolClientIP());
+        proxy::InboundSubstreamAdmission admission(stats_);
+        if (auto pending = proxy::AdmitInboundSubstream(handler.environment_, ctx)) {
+            if (!admission.Hold(co_await std::move(*pending), ctx, stats_)) co_return;
         }
-        const auto reject = admission.reason;
-        if (reject != ConnectionLimiter::RejectReason::NONE) {
-            RejectConnection(ctx, stats_, reject);
-            co_return;
-        }
-        auto connection_limit = std::move(admission.reservation);
 
         (void)stream->StartPhaseDeadline(timeouts_.HandshakeTimeout());
 
@@ -209,11 +183,11 @@ private:
 };
 
 Handler::Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy,
-                 ConnectionLimiter& limiter)
+                 const AdmissionEnvironment& environment)
     : receiver_(std::move(receiver))
     , security_(receiver_.stream_settings, StreamEndpointRole::Inbound)
     , proxy_(std::move(proxy))
-    , limiter_(limiter) {}
+    , environment_(environment) {}
 
 Inbound& Handler::Proxy() {
     if (!proxy_) throw std::logic_error("inbound handler has no protocol");
@@ -304,14 +278,12 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     }
 
     ConnectionLimiter::Admission physical_admission;
-    if (limiter_.TracksAdmission()) {
-        physical_admission = co_await limiter_.ReservePhysical(
-            ctx.inbound.tag, ctx.inbound.source_ip,
-            ctx.inbound.HasProxyProtocolClientIP());
+    if (auto pending = proxy::ReserveInboundConnection(environment_, ConnectionLimiter::ReservationScope::Physical, ctx)) {
+        physical_admission = co_await std::move(*pending);
     }
     auto reject = physical_admission.reason;
     if (reject != ConnectionLimiter::RejectReason::NONE) {
-        RejectConnection(ctx, stats, reject, true);
+        proxy::RejectInboundAdmission(ctx, stats, reject);
         co_return;
     }
     auto connection_limit = std::move(physical_admission.reservation);
@@ -345,6 +317,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     const InboundFallbackContext fallback{
         .ctx = ctx, .stats = stats, .timeouts = timeouts, .dns_service = dns_service};
     auto build_result = co_await BuildInboundTransport(
+        environment_.coordinator,
         io_context,
         std::move(raw_conn),
         listener.stream_settings,
@@ -371,14 +344,12 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     ApplyHttpRealIp(ctx, local_metadata.real_ip);
     local_metadata = {};
     ConnectionLimiter::Admission ip_admission;
-    if (limiter_.TracksAdmission()) {
-        ip_admission = co_await limiter_.ReserveIP(
-            ctx.inbound.tag, ctx.inbound.source_ip,
-            ctx.inbound.HasProxyProtocolClientIP());
+    if (auto pending = proxy::ReserveInboundConnection(environment_, ConnectionLimiter::ReservationScope::ClientIp, ctx)) {
+        ip_admission = co_await std::move(*pending);
     }
     reject = ip_admission.reason;
     if (reject != ConnectionLimiter::RejectReason::NONE) {
-        RejectConnection(ctx, stats, reject);
+        proxy::RejectInboundAdmission(ctx, stats, reject);
         co_return;
     }
     auto ip_limit = std::move(ip_admission.reservation);
@@ -429,9 +400,10 @@ void RegisterProxy(
     const bool transport_consistent =
         (registration.datagram_transport == DatagramTransport::Packet) ==
             has_packet_datagrams;
-    if (protocol.empty() || !registration.create_runtime ||
-        !has_tcp ||
+    const bool has_quic = registration.create_quic_listener != nullptr;
+    if (protocol.empty() || !has_tcp ||
         !transport_consistent ||
+        (registration.datagram_transport == DatagramTransport::Quic) != has_quic ||
         has_user_builders != registration.user_protocol.has_value()) {
         throw std::invalid_argument(
             "invalid inbound protocol registration for '" +
@@ -459,6 +431,21 @@ DatagramTransport RegisteredDatagramTransport(
     std::string_view protocol) {
     const auto* registration = FindRegistration(protocol);
     return registration ? registration->datagram_transport : DatagramTransport::None;
+}
+
+InboundProtocolTraits RegisteredProtocolTraits(std::string_view protocol) {
+    const auto* registration = FindRegistration(protocol);
+    return registration ? registration->traits : InboundProtocolTraits{};
+}
+
+std::unique_ptr<transport::internet::QuicListener> NewQuicListener(
+    std::string_view protocol, uint32_t worker_id, uint32_t worker_count,
+    net::io_context& io, app::DatagramSessionEnvironment environment) {
+    const auto* registration = FindRegistration(protocol);
+    if (!registration || !registration->create_quic_listener) return nullptr;
+    if (worker_count == 0 || worker_id >= worker_count)
+        throw std::invalid_argument("invalid QUIC worker topology");
+    return registration->create_quic_listener(worker_id, worker_count, io, std::move(environment));
 }
 
 std::optional<BuildRequest> PrepareBuildRequest(
@@ -503,8 +490,8 @@ std::optional<UserSet> BuildUsers(
 // HandlerRegistry
 // ============================================================================
 
-HandlerRegistry::HandlerRegistry(StatsShard& stats)
-    : stats_(stats) {}
+HandlerRegistry::HandlerRegistry(const AdmissionEnvironment& environment)
+    : environment_(environment) {}
 
 HandlerRegistry::~HandlerRegistry() noexcept = default;
 
@@ -514,49 +501,27 @@ HandlerRegistry::HandlerPtr HandlerRegistry::GetHandler(std::string_view tag) no
 }
 
 std::unique_ptr<::Inbound> HandlerRegistry::NewHandler(
-    ::ConnectionLimiter* limiter,
     const BuildRequest& req) {
-    auto* runtime = GetOrCreateRuntime(req.protocol);
-    if (!runtime) {
-        return nullptr;
-    }
-    // GetOrCreateRuntime 成功即保证注册项存在，且注册时已校验 create_tcp_handler。
-    return FindRegistration(req.protocol)->create_tcp_handler(
-        *runtime, stats_, limiter, req);
+    const auto* registration = FindRegistration(req.protocol);
+    if (!registration) return nullptr;
+    return registration->create_tcp_handler(environment_, req);
 }
 
 DatagramHandlerBuildResult HandlerRegistry::NewDatagramHandler(
-    ::ConnectionLimiter* limiter,
     const BuildRequest& req) {
-    auto* runtime = GetOrCreateRuntime(req.protocol);
-    if (!runtime) {
-        return {DatagramHandlerBuildStatus::Failed, nullptr};
-    }
     const auto* registration = FindRegistration(req.protocol);
+    if (!registration) return {DatagramHandlerBuildStatus::Failed, nullptr};
     if (!registration->create_datagram_handler) {
         return {DatagramHandlerBuildStatus::Unsupported, nullptr};
     }
     auto handler = registration->create_datagram_handler(
-        *runtime, stats_, limiter, req);
+        environment_, req);
     if (!handler) {
         return {DatagramHandlerBuildStatus::Failed, nullptr};
     }
     return {DatagramHandlerBuildStatus::Ready, std::move(handler)};
 }
 
-ProtocolRuntime* HandlerRegistry::GetOrCreateRuntime(
-    std::string_view protocol) {
-    if (auto it = runtimes_.find(protocol); it != runtimes_.end()) {
-        return it->second.get();
-    }
-    const auto* registration = FindRegistration(protocol);
-    if (!registration) return nullptr;
-    auto runtime = registration->create_runtime();
-    if (!runtime) return nullptr;
-    auto result = runtimes_.emplace(
-        memory::String(protocol), std::move(runtime));
-    return result.first->second.get();
-}
 
 HandlerRegistry::HandlerPtr HandlerRegistry::ReplaceHandler(std::unique_ptr<Handler> handler) {
     if (!handler) {
@@ -586,13 +551,8 @@ void HandlerRegistry::RemoveHandler(std::string_view tag) {
 }
 
 std::vector<::OnlineDevice>
-HandlerRegistry::GetOnlineDevices(std::string_view protocol, std::string_view tag) const {
-    if (auto it = runtimes_.find(protocol); it != runtimes_.end()) {
-        if (auto* tracker = it->second->OnlineTracker()) {
-            return tracker->GetOnlineDevices(tag);
-        }
-    }
-    return {};
+HandlerRegistry::GetOnlineDevices(std::string_view tag) const {
+    return environment_.online_users.GetOnlineDevices(tag);
 }
 
 }  // namespace proxyman::inbound

@@ -1,51 +1,31 @@
-#include <stdexcept>
 #include <gtest/gtest.h>
 
 #include "transport/internet/http_headers.hpp"
 
-#include <cstdlib>
-#include <iostream>
 #include <string_view>
 
 namespace {
-
-void Require(bool condition, std::string_view message) {
-    if (!condition) {
-        std::cerr << message << '\n';
-        ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
-    }
+struct PathCase { std::string_view configured, requested; bool matches; };
+class HttpPathPrefix : public testing::TestWithParam<PathCase> {};
+TEST_P(HttpPathPrefix, RequiresSegmentBoundaryForPrefix) {
+    const auto& item = GetParam();
+    EXPECT_EQ(::transport::internet::detail::PathPrefixMatchesSegment(item.configured, item.requested), item.matches);
 }
+INSTANTIATE_TEST_SUITE_P(Paths, HttpPathPrefix, testing::Values(
+    PathCase{"/api", "/api", true}, PathCase{"/api", "/api/child", true},
+    PathCase{"/api", "/api?padding=1", true}, PathCase{"/api", "/apievil", false},
+    PathCase{"/api", "/api-v2", false}, PathCase{"/api/", "/api/session", true},
+    PathCase{"/api/", "/api", false}, PathCase{"/", "/anything", true},
+    PathCase{"", "/anything", true}, PathCase{"/", "relative", false}));
 
+class HttpPathExact : public testing::TestWithParam<PathCase> {};
+TEST_P(HttpPathExact, IgnoresQueryWithoutMakingRootAWildcard) {
+    const auto& item = GetParam();
+    EXPECT_EQ(::transport::internet::detail::PathMatchesExactly(item.configured, item.requested), item.matches);
+}
+INSTANTIATE_TEST_SUITE_P(Paths, HttpPathExact, testing::Values(
+    PathCase{"/up", "/up", true}, PathCase{"/up", "/up?ed=2048", true},
+    PathCase{"/up", "/down", false}, PathCase{"/up", "/up/", false},
+    PathCase{"/up", "/up/child?ed=2048", false}, PathCase{"/", "/?ed=2048", true},
+    PathCase{"", "/", true}, PathCase{"/", "/up", false}, PathCase{"", "/up?ed=2048", false}));
 }  // namespace
-
-TEST(HttpPathMatch, Contract) {
-    using ::transport::internet::detail::PathPrefixMatchesSegment;
-
-    Require(PathPrefixMatchesSegment("/api", "/api"), "exact path rejected");
-    Require(PathPrefixMatchesSegment("/api", "/api/child"), "child path rejected");
-    Require(PathPrefixMatchesSegment("/api", "/api?padding=1"), "query path rejected");
-    Require(!PathPrefixMatchesSegment("/api", "/apievil"), "adjacent prefix accepted");
-    Require(!PathPrefixMatchesSegment("/api", "/api-v2"), "dash suffix accepted");
-
-    Require(PathPrefixMatchesSegment("/api/", "/api/session"),
-            "normalized XHTTP child rejected");
-    Require(!PathPrefixMatchesSegment("/api/", "/api"),
-            "missing normalized separator accepted");
-    Require(PathPrefixMatchesSegment("/", "/anything"), "root path rejected");
-    Require(PathPrefixMatchesSegment({}, "/anything"), "empty root path rejected");
-    Require(!PathPrefixMatchesSegment("/", "relative"), "relative root path accepted");
-}
-
-TEST(HttpPathMatch, ExactIgnoresQueryWithoutRootWildcard) {
-    using ::transport::internet::detail::PathMatchesExactly;
-
-    EXPECT_TRUE(PathMatchesExactly("/up", "/up"));
-    EXPECT_TRUE(PathMatchesExactly("/up", "/up?ed=2048"));
-    EXPECT_FALSE(PathMatchesExactly("/up", "/down"));
-    EXPECT_FALSE(PathMatchesExactly("/up", "/up/"));
-    EXPECT_FALSE(PathMatchesExactly("/up", "/up/child?ed=2048"));
-    EXPECT_TRUE(PathMatchesExactly("/", "/?ed=2048"));
-    EXPECT_TRUE(PathMatchesExactly({}, "/"));
-    EXPECT_FALSE(PathMatchesExactly("/", "/up"));
-    EXPECT_FALSE(PathMatchesExactly({}, "/up?ed=2048"));
-}

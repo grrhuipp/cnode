@@ -6,8 +6,8 @@
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/steady_timer.hpp>
+#include <asio/use_future.hpp>
 #include <array>
-#include <iostream>
 #include <map>
 #include <optional>
 #include <set>
@@ -18,7 +18,6 @@ namespace net = ::net;
 using namespace std::chrono_literals;
 using ::app::dns::DNS;
 using ::app::dns::DnsResult;
-void Require(bool yes, const char* why) { if (!yes) throw std::runtime_error(why); }
 
 struct Peer {
     struct Query { std::vector<uint8_t> bytes; ::udp::endpoint sender; };
@@ -57,7 +56,7 @@ struct Peer {
     void Flush(const std::string& name) {
         auto group = std::move(queries.at(name));
         queries.erase(name);
-        Require(group.size() == batch_size, "all queries must be outstanding together");
+        EXPECT_EQ(group.size(), batch_size) << "all queries must be outstanding together";
         int ordinal = 4;
         for (auto it = group.rbegin(); it != group.rend(); ++it) {
             auto packet = it->bytes;
@@ -131,51 +130,92 @@ struct Peer {
     return c;
 }
 
-void TestQueries(bool ipv6) {
-    net::io_context io;
-    Peer peer(io, ipv6);
-    peer.noise = true;
-    ::app::dns::DNSWorker worker(io, Config(peer), 8);
-    DNS dns(worker);
-    std::exception_ptr error;
-    bool done = false;
-    auto run = [&]() -> net::awaitable<void> {
-        auto result = co_await dns.Resolve("first.example");
-        Require(result.Ok() && result.addresses.size() == 4 && result.ttl == 10,
-                "out-of-order responses must preserve multi-address union and minimum TTL");
-        Require(result.addresses[0] == net::ip::make_address("192.0.2.1") &&
-                result.addresses[3] == net::ip::make_address("2001:db8::1"),
-                "unrelated, wrong-question and foreign packets must not poison results");
-        auto cached = co_await dns.Resolve("FIRST.EXAMPLE.");
-        Require(cached.Ok() && cached.from_cache && peer.packets == 4,
-                "canonical names must share the one cache");
-        result = co_await dns.Resolve("second.example");
-        Require(result.Ok() && peer.packets == 8 && peer.ports.size() == 1,
-                "separate resolutions must reuse the same connected UDP socket");
-        peer.negative = true;
-        result = co_await dns.Resolve("negative.example");
-        Require(result.error == ::ErrorCode::DNS_NO_RECORD, "NXDOMAIN must be retained");
-        result = co_await dns.Resolve("negative.example");
-        Require(result.from_cache && peer.packets == 12, "negative answers must be cached");
-        peer.negative = false;
-        peer.nodata = true;
-        result = co_await dns.Resolve("nodata.example");
-        Require(result.error == ::ErrorCode::DNS_NO_RECORD &&
-                    result.error_msg.find("NODATA") != std::string::npos,
-                "an existing name without addresses must be distinguished from NXDOMAIN");
-        result = co_await dns.Resolve("nodata.example");
-        Require(result.from_cache && peer.packets == 16 &&
-                    result.error_msg.find("NODATA") != std::string::npos &&
-                    result.error_msg.find("NXDOMAIN") == std::string::npos,
-                "negative cache must not turn NODATA into NXDOMAIN");
-    };
-    net::co_spawn(io, run(), [&](std::exception_ptr e) { error = e; done = true; peer.Stop(); });
-    io.run_for(4s);
-    Require(done, "parallel DNS query test timed out");
-    if (error) std::rethrow_exception(error);
+template<class Service>
+void JoinService(net::io_context& io, Service& service) {
+    io.restart();
+    auto joined = net::co_spawn(io, service.AsyncJoin(), net::use_future);
+    io.run();
+    joined.get();
 }
 
-void TestIsolation(bool cancel) {
+class DnsDatagramQueries : public testing::TestWithParam<bool> {
+protected:
+    void Run(net::awaitable<void> scenario) {
+        bool done = false;
+        std::exception_ptr failure;
+        net::co_spawn(io, std::move(scenario), [&](std::exception_ptr error) {
+            failure = error;
+            done = true;
+            peer.Stop();
+        });
+        io.run_for(4s);
+        const bool completed_before_cleanup = done;
+        peer.Stop();
+        JoinService(io, worker);
+        EXPECT_TRUE(completed_before_cleanup) << "DNS 查询未在截止前完成";
+        if (failure) std::rethrow_exception(failure);
+    }
+    net::io_context io;
+    Peer peer{io, GetParam()};
+    ::app::dns::DNSWorker worker{io, Config(peer), 8};
+    DNS dns{worker};
+};
+
+TEST_P(DnsDatagramQueries, ValidatesOutOfOrderAnswersAndCachesCanonicalNames) {
+    peer.noise = true;
+    auto run = [&]() -> net::awaitable<void> {
+        const auto result = co_await dns.Resolve("first.example");
+        const std::vector<net::ip::address> expected{
+            net::ip::make_address("192.0.2.1"), net::ip::make_address("192.0.2.2"),
+            net::ip::make_address("192.0.2.3"), net::ip::make_address("2001:db8::1")};
+        EXPECT_TRUE(result.Ok());
+        EXPECT_EQ(result.addresses, expected);
+        EXPECT_EQ(result.ttl, 10u);
+        const auto cached = co_await dns.Resolve("FIRST.EXAMPLE.");
+        EXPECT_TRUE(cached.Ok());
+        EXPECT_TRUE(cached.from_cache);
+        EXPECT_EQ(cached.addresses, expected);
+        EXPECT_EQ(peer.packets, 4u);
+        const auto second = co_await dns.Resolve("second.example");
+        EXPECT_TRUE(second.Ok());
+        EXPECT_EQ(peer.packets, 8u);
+        EXPECT_EQ(peer.ports.size(), 1u);
+    };
+    Run(run());
+}
+
+TEST_P(DnsDatagramQueries, NxDomainIsCachedWithoutRepeatingUpstreamQueries) {
+    peer.negative = true;
+    auto run = [&]() -> net::awaitable<void> {
+        const auto first = co_await dns.Resolve("negative.example");
+        EXPECT_EQ(first.error, ::ErrorCode::DNS_NO_RECORD);
+        const auto cached = co_await dns.Resolve("negative.example");
+        EXPECT_EQ(cached.error, ::ErrorCode::DNS_NO_RECORD);
+        EXPECT_TRUE(cached.from_cache);
+        EXPECT_EQ(peer.packets, 4u);
+    };
+    Run(run());
+}
+
+TEST_P(DnsDatagramQueries, NoDataReasonSurvivesNegativeCaching) {
+    peer.nodata = true;
+    auto run = [&]() -> net::awaitable<void> {
+        const auto first = co_await dns.Resolve("nodata.example");
+        EXPECT_EQ(first.error, ::ErrorCode::DNS_NO_RECORD);
+        EXPECT_NE(first.error_msg.find("NODATA"), std::string::npos);
+        const auto cached = co_await dns.Resolve("nodata.example");
+        EXPECT_EQ(cached.error, ::ErrorCode::DNS_NO_RECORD);
+        EXPECT_TRUE(cached.from_cache);
+        EXPECT_NE(cached.error_msg.find("NODATA"), std::string::npos);
+        EXPECT_EQ(cached.error_msg.find("NXDOMAIN"), std::string::npos);
+        EXPECT_EQ(peer.packets, 4u);
+    };
+    Run(run());
+}
+
+class DnsDatagramIsolation : public testing::TestWithParam<bool> {};
+TEST_P(DnsDatagramIsolation, OneRequestEndingDoesNotCancelAnotherQuery) {
+    const bool cancel = GetParam();
     net::io_context io;
     Peer peer(io);
     peer.hold = cancel;
@@ -196,14 +236,25 @@ void TestIsolation(bool cancel) {
         if (!ec) { signal.emit(net::cancellation_type::terminal); peer.Flush("other.example"); }
     });
     io.run_for(3s);
-    Require(completed == 2 && !errors[1] && answers[1].Ok(),
-            "one cancellation/timeout must not cancel another query's shared socket");
-    Require(cancel ? (errors[0] || !answers[0].Ok()) : answers[0].error == ::ErrorCode::DNS_TIMEOUT,
-            "cancelled or expired requests must return promptly");
-    Require(peer.ports.size() == 1, "concurrent requests must multiplex one socket");
+    const bool completed_before_cleanup = completed == 2;
+    peer.Stop();
+    JoinService(io, worker);
+    EXPECT_TRUE(completed_before_cleanup);
+    EXPECT_EQ(completed, 2u);
+    EXPECT_FALSE(errors[1]);
+    EXPECT_TRUE(answers[1].Ok());
+    if (cancel) {
+        EXPECT_TRUE(errors[0] || answers[0].error == ::ErrorCode::CANCELLED);
+    } else {
+        EXPECT_FALSE(errors[0]);
+        EXPECT_EQ(answers[0].error, ::ErrorCode::DNS_TIMEOUT);
+    }
+    EXPECT_EQ(peer.ports.size(), 1) << "concurrent requests must multiplex one socket";
 }
 
-void TestSameDomainCancellation(size_t cancelled) {
+class DnsSameDomainCancellation : public testing::TestWithParam<size_t> {};
+TEST_P(DnsSameDomainCancellation, CancellingOneWaiterPreservesSharedUdpAnswerForSurvivor) {
+    const auto cancelled = GetParam();
     net::io_context io;
     Peer peer(io);
     peer.hold = true;
@@ -215,7 +266,7 @@ void TestSameDomainCancellation(size_t cancelled) {
     bool expired = false;
     net::steady_timer watchdog(io, 2s);
     watchdog.async_wait([&](::IoErrorCode ec) {
-        if (!ec) { expired = true; io.stop(); }
+        if (!ec) { expired = true; worker.RequestStop(); }
     });
     auto start = [&](size_t i) {
         net::co_spawn(io, worker.Resolve("same.example"),
@@ -228,20 +279,21 @@ void TestSameDomainCancellation(size_t cancelled) {
     };
     start(0);
     while (peer.packets != 4 && !expired) io.run_one();
-    Require(!expired, "leader must send all four real UDP questions");
+    EXPECT_FALSE(expired) << "leader must send all four real UDP questions";
     start(1);
     io.poll(); // Drain ready admission work while upstream replies remain held.
     signals[cancelled].emit(net::cancellation_type::terminal);
     io.poll();
-    Require(completed[cancelled] && !completed[1 - cancelled],
-            "only the cancelled same-domain waiter may finish before the UDP reply");
-    Require(errors[cancelled] || answers[cancelled].error == ::ErrorCode::CANCELLED,
-            "cancelled same-domain waiter must observe cancellation");
-    peer.Flush("same.example");
+    EXPECT_TRUE(completed[cancelled]);
+    EXPECT_FALSE(completed[1 - cancelled]);
+    EXPECT_TRUE(errors[cancelled] || answers[cancelled].error == ::ErrorCode::CANCELLED) << "cancelled same-domain waiter must observe cancellation";
+    if (!expired) peer.Flush("same.example");
     while (!completed[1 - cancelled] && !expired) io.run_one();
-    Require(!expired && !errors[1 - cancelled] && answers[1 - cancelled].Ok() &&
-                answers[1 - cancelled].addresses.size() == 4 && peer.packets == 4,
-            "surviving same-domain waiter must receive the original real UDP answer");
+    EXPECT_FALSE(expired);
+    EXPECT_FALSE(errors[1 - cancelled]);
+    EXPECT_TRUE(answers[1 - cancelled].Ok());
+    EXPECT_EQ(answers[1 - cancelled].addresses.size(), 4u);
+    EXPECT_EQ(peer.packets, 4u);
     bool joined = false;
     std::exception_ptr join_error;
     net::co_spawn(io, worker.AsyncJoin(), [&](std::exception_ptr error) {
@@ -252,10 +304,17 @@ void TestSameDomainCancellation(size_t cancelled) {
     });
     io.run();
     if (join_error) std::rethrow_exception(join_error);
-    Require(joined && !expired, "same-domain cancellation must leave join quiescent");
+    EXPECT_TRUE(joined);
+    EXPECT_FALSE(expired);
 }
 
-void TestMalformedFallback(int type, bool fallback) {
+struct MalformedAnswer {
+    int type;
+    bool fallback;
+};
+class DnsMalformedAnswer : public testing::TestWithParam<MalformedAnswer> {};
+TEST_P(DnsMalformedAnswer, RejectsInvalidAddressLengthWithoutPoisoningCache) {
+    const auto [type, fallback] = GetParam();
     net::io_context io;
     Peer first(io), second(io);
     first.malformed_type = type;
@@ -267,20 +326,22 @@ void TestMalformedFallback(int type, bool fallback) {
     auto run = [&]() -> net::awaitable<void> {
         auto result = co_await worker.Resolve("malformed.example");
         if (fallback) {
-            Require(result.Ok() && !result.from_cache && first.packets == 4 && second.packets == 4,
-                    "malformed address length must try the healthy fallback");
+            EXPECT_TRUE(result.Ok());
+            EXPECT_FALSE(result.from_cache);
+            EXPECT_EQ(first.packets, 4u);
+            EXPECT_EQ(second.packets, 4u);
             result = co_await worker.Resolve("malformed.example");
-            Require(result.Ok() && result.from_cache && first.packets == 4 && second.packets == 4,
-                    "fallback success must enter the positive cache, never a negative cache");
+            EXPECT_TRUE(result.Ok());
+            EXPECT_TRUE(result.from_cache);
+            EXPECT_EQ(first.packets, 4u);
+            EXPECT_EQ(second.packets, 4u);
         } else {
-            Require(result.error == ::ErrorCode::DNS_FORMAT_ERROR &&
-                        result.error_msg.find(type == 1 ? "A record has invalid RDLENGTH 3" :
-                                                        "AAAA record has invalid RDLENGTH 15") != std::string::npos,
-                    "malformed address length must retain a precise format-error reason");
+            EXPECT_EQ(result.error, ::ErrorCode::DNS_FORMAT_ERROR);
             result = co_await worker.Resolve("malformed.example");
-            Require(result.error == ::ErrorCode::DNS_FORMAT_ERROR && !result.from_cache &&
-                        first.packets == 8 && second.packets == 0,
-                    "malformed answers must never poison the negative cache");
+            EXPECT_EQ(result.error, ::ErrorCode::DNS_FORMAT_ERROR);
+            EXPECT_FALSE(result.from_cache);
+            EXPECT_EQ(first.packets, 8u);
+            EXPECT_EQ(second.packets, 0u);
         }
         co_await worker.AsyncJoin();
     };
@@ -288,11 +349,16 @@ void TestMalformedFallback(int type, bool fallback) {
         failure = error; done = true; first.Stop(); second.Stop();
     });
     io.run_for(3s);
+    const bool completed_before_cleanup = done;
+    first.Stop();
+    second.Stop();
+    JoinService(io, worker);
+    EXPECT_TRUE(completed_before_cleanup);
     if (failure) std::rethrow_exception(failure);
-    Require(done, "malformed fallback test timed out");
+    EXPECT_TRUE(done) << "malformed fallback test timed out";
 }
 
-void TestFallback() {
+TEST(DnsDatagram, RefusedUpstreamFallsBackAfterOutstandingQueriesFinish) {
     net::io_context io;
     Peer first(io), second(io);
     first.refuse = true;
@@ -305,11 +371,15 @@ void TestFallback() {
         ok = !e && result.Ok(); first.Stop(); second.Stop();
     });
     io.run_for(3s);
-    Require(ok && first.packets == 4 && second.packets == 4,
-            "failed upstream must fall back after all started queries are joined");
+    first.Stop();
+    second.Stop();
+    JoinService(io, worker);
+    EXPECT_TRUE(ok);
+    EXPECT_EQ(first.packets, 4u);
+    EXPECT_EQ(second.packets, 4u);
 }
 
-void TestIdRotation() {
+TEST(DnsDatagram, ExhaustedTransactionIdsRotatePortWithoutReuse) {
     net::io_context io;
     Peer peer(io);
     peer.batch_size = 1;
@@ -320,17 +390,24 @@ void TestIdRotation() {
         std::array<uint8_t, 19> query{0,0,1,0,0,1,0,0,0,0,0,0,1,'r',0,0,1,0,1};
         for (size_t i = 0; i < 65537; ++i) {
             auto result = co_await transport->Exchange(query, 1s);
-            Require(!result.error && result.size > 12, "ID retirement must preserve replies");
+            EXPECT_FALSE(result.error);
+            EXPECT_GT(result.size, 12u);
         }
     };
     net::co_spawn(io, run(), [&](std::exception_ptr e) { error = e; done = true; peer.Stop(); });
     io.run_for(12s);
-    Require(done && peer.packets == 65537 && peer.ports.size() == 2 && !peer.duplicate_id,
-            "65536 unique IDs must rotate the source port, never reuse a live socket's ID");
+    const bool completed_before_cleanup = done;
+    peer.Stop();
+    JoinService(io, *transport);
+    EXPECT_TRUE(completed_before_cleanup);
+    EXPECT_TRUE(done);
+    EXPECT_EQ(peer.packets, 65537u);
+    EXPECT_EQ(peer.ports.size(), 2u);
+    EXPECT_FALSE(peer.duplicate_id);
     if (error) std::rethrow_exception(error);
 }
 
-void TestCacheFailure() {
+TEST(DnsDatagram, CacheWriteFailurePreservesAnswerAndLaterWriteRecovers) {
     const auto rejected = ::memory::rejected_process_allocations;
     net::io_context io;
     Peer peer(io);
@@ -345,23 +422,29 @@ void TestCacheFailure() {
         const bool fault_consumed = !::memory::reject_next_process_allocation;
         ::memory::reject_next_process_allocation = false;
         const auto failed_stats = co_await worker.GetCacheStats();
-        Require(result.Ok() && fault_consumed &&
-                ::memory::rejected_process_allocations == rejected + 1 &&
-                failed_stats.entries == 0,
-                "cache allocation failure must not discard the acquired answer");
+        EXPECT_TRUE(result.Ok());
+        EXPECT_EQ(result.addresses.size(), 4u);
+        EXPECT_TRUE(fault_consumed);
+        EXPECT_GT(::memory::rejected_process_allocations, rejected);
+        EXPECT_EQ(failed_stats.entries, 0u);
         result = co_await dns.Resolve("cache-fault.example");
         const auto recovered_stats = co_await worker.GetCacheStats();
-        Require(result.Ok() && recovered_stats.entries == 1,
-                "cache must recover after write failure");
+        EXPECT_TRUE(result.Ok());
+        EXPECT_EQ(result.addresses.size(), 4u);
+        EXPECT_EQ(recovered_stats.entries, 1u);
     };
     net::co_spawn(io, run(), [&](std::exception_ptr e) { error = e; done = true; peer.Stop(); });
     io.run_for(3s);
     ::memory::reject_next_process_allocation = false;
-    Require(done, "cache fault test timed out");
+    const bool completed_before_cleanup = done;
+    peer.Stop();
+    JoinService(io, worker);
+    EXPECT_TRUE(completed_before_cleanup);
+    EXPECT_TRUE(done) << "cache fault test timed out";
     if (error) std::rethrow_exception(error);
 }
 
-void TestServiceStopJoin() {
+TEST(DnsDatagram, ServiceStopJoinsQueriesAndRejectsLateRepliesWithoutFallback) {
     net::io_context io;
     Peer peer(io), fallback(io);
     peer.hold = true;
@@ -384,10 +467,10 @@ void TestServiceStopJoin() {
     net::steady_timer watchdog(io, 2s);
     bool expired = false;
     watchdog.async_wait([&](::IoErrorCode ec) {
-        if (!ec) { expired = true; io.stop(); }
+        if (!ec) { expired = true; worker->RequestStop(); }
     });
     while (peer.packets != 12 && !expired) io.run_one();
-    Require(!expired, "all DNS leaders must reach their upstream before service stop");
+    EXPECT_FALSE(expired) << "all DNS leaders must reach their upstream before service stop";
     worker->RequestStop();
     worker->RequestStop();
     // Real late datagrams must neither revive a stopped receive nor trigger
@@ -405,8 +488,7 @@ void TestServiceStopJoin() {
     std::exception_ptr join_error;
     auto stop = [&]() -> net::awaitable<void> {
         const auto rejected = co_await worker->Resolve("192.0.2.9");
-        Require(rejected.error == ::ErrorCode::CANCELLED,
-                "stopped DNS must reject even a literal without doing new work");
+        EXPECT_EQ(rejected.error, ::ErrorCode::CANCELLED) << "stopped DNS must reject even a literal without doing new work";
         co_await worker->AsyncJoin();
         co_await worker->AsyncJoin();
         worker.reset();
@@ -419,18 +501,21 @@ void TestServiceStopJoin() {
         fallback.Stop();
     });
     io.run();
-    Require(!expired && joined && completed == answers.size(),
-            "stop must join every accepted leader and subscriber promptly");
+    EXPECT_FALSE(expired);
+    EXPECT_TRUE(joined);
+    EXPECT_EQ(completed, answers.size());
     if (join_error) std::rethrow_exception(join_error);
     for (size_t i = 0; i < answers.size(); ++i) {
-        Require(!errors[i] && answers[i].error == ::ErrorCode::CANCELLED,
-                "service cancellation must survive leader and subscriber completion");
+        EXPECT_FALSE(errors[i]) << i;
+        EXPECT_EQ(answers[i].error, ::ErrorCode::CANCELLED) << i;
     }
-    Require(peer.packets == 12 && fallback.packets == 0,
-            "late responses and cancellation must not restart queries or upstream fallback");
+    EXPECT_EQ(peer.packets, 12u);
+    EXPECT_EQ(fallback.packets, 0u);
 }
 
-void TestDatagramStopJoin(bool active) {
+class DnsDatagramStop : public testing::TestWithParam<bool> {};
+TEST_P(DnsDatagramStop, JoinsReceiveOwnerAndRejectsNewExchanges) {
+    const bool active = GetParam();
     net::io_context io;
     Peer peer(io);
     peer.hold = true;
@@ -453,10 +538,10 @@ void TestDatagramStopJoin(bool active) {
     net::steady_timer watchdog(io, 2s);
     bool expired = false;
     watchdog.async_wait([&](::IoErrorCode ec) {
-        if (!ec) { expired = true; io.stop(); }
+        if (!ec) { expired = true; transport->RequestStop(); }
     });
     while (active && peer.packets != 1 && !expired) io.run_one();
-    Require(!expired, "the datagram exchange must start real receive I/O");
+    EXPECT_FALSE(expired) << "the datagram exchange must start real receive I/O";
     transport->RequestStop();
     transport->RequestStop();
     bool joined = false;
@@ -464,11 +549,9 @@ void TestDatagramStopJoin(bool active) {
     auto stop = [&]() -> net::awaitable<void> {
         co_await transport->AsyncJoin();
         const auto rejected = co_await transport->Exchange(query, 30s);
-        Require(rejected.error == ::io_error::operation_aborted,
-                "a stopped exchange must not reopen its socket");
+        EXPECT_EQ(rejected.error, ::io_error::operation_aborted) << "a stopped exchange must not reopen its socket";
         transport.reset();
-        Require(weak.expired(),
-                "join must release the actual receive callback's captured owner");
+        EXPECT_TRUE(weak.expired()) << "join must release the actual receive callback's captured owner";
     };
     net::co_spawn(io, stop(), [&](std::exception_ptr error) {
         joined = true;
@@ -477,16 +560,16 @@ void TestDatagramStopJoin(bool active) {
         peer.Stop();
     });
     io.run();
-    Require(!expired && joined && query_done && !query_error,
-            "exchange and receive completions must both finish before destruction");
+    EXPECT_FALSE(expired);
+    EXPECT_TRUE(joined);
+    EXPECT_TRUE(query_done);
+    EXPECT_FALSE(query_error);
     if (join_error) std::rethrow_exception(join_error);
-    Require(!active || reply_error == ::io_error::operation_aborted,
-            "the stopped pending query must retain cancellation");
-    Require(peer.packets == (active ? 1 : 0),
-            "zero-query stop and late rejected queries must not send datagrams");
+    if (active) EXPECT_EQ(reply_error, ::io_error::operation_aborted);
+    EXPECT_EQ(peer.packets, (active ? 1 : 0)) << "zero-query stop and late rejected queries must not send datagrams";
 }
 
-void TestDatagramAllocationFailureJoin() {
+TEST(DnsDatagram, AllocationFailureUnwindsBeforeStopAndJoin) {
     const auto rejected = ::memory::rejected_process_allocations;
     net::io_context io;
     Peer peer(io);
@@ -508,7 +591,7 @@ void TestDatagramAllocationFailureJoin() {
         transport->RequestStop();
         co_await transport->AsyncJoin();
         transport.reset();
-        Require(weak.expired(), "failed exchange startup must retain no receive owner");
+        EXPECT_TRUE(weak.expired()) << "failed exchange startup must retain no receive owner";
     };
     net::co_spawn(io, run(), [&](std::exception_ptr error) {
         failure = error;
@@ -518,24 +601,27 @@ void TestDatagramAllocationFailureJoin() {
     io.run_for(2s);
     ::memory::reject_next_process_allocation = false;
     if (failure) std::rethrow_exception(failure);
-    Require(joined && failed && ::memory::rejected_process_allocations == rejected + 1 &&
-            peer.packets == 0,
-            "query registration allocation failure must unwind before stop and join");
+    EXPECT_TRUE(joined);
+    EXPECT_TRUE(failed);
+    EXPECT_GT(::memory::rejected_process_allocations, rejected);
+    EXPECT_EQ(peer.packets, 0u);
 }
 }
-TEST(DnsDatagram, Contract) {
-    try {
-        TestQueries(false); TestQueries(true); TestIsolation(true); TestIsolation(false);
-        TestSameDomainCancellation(0); TestSameDomainCancellation(1);
-        TestMalformedFallback(1, true); TestMalformedFallback(28, true);
-        TestMalformedFallback(1, false); TestMalformedFallback(28, false);
-        TestFallback(); TestCacheFailure(); TestIdRotation();
-        TestServiceStopJoin(); TestDatagramStopJoin(false); TestDatagramStopJoin(true);
-        TestDatagramAllocationFailureJoin();
-    }
-    catch (const std::exception& e) { std::cerr << e.what() << '\n'; FAIL() << e.what(); }
-    std::cout << "DNS parallel sampling / socket reuse / validation / isolation / fallback / cache: PASS\n";
-}
+INSTANTIATE_TEST_SUITE_P(TransportFamily, DnsDatagramQueries, testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) { return info.param ? "Ipv6" : "Ipv4"; });
+INSTANTIATE_TEST_SUITE_P(RequestEnd, DnsDatagramIsolation, testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) { return info.param ? "Cancellation" : "Timeout"; });
+INSTANTIATE_TEST_SUITE_P(WaiterRole, DnsSameDomainCancellation, testing::Values(size_t{0}, size_t{1}),
+    [](const testing::TestParamInfo<size_t>& info) { return info.param == 0 ? "Leader" : "Follower"; });
+INSTANTIATE_TEST_SUITE_P(Upstreams, DnsMalformedAnswer, testing::Values(
+    MalformedAnswer{1, false}, MalformedAnswer{28, false},
+    MalformedAnswer{1, true}, MalformedAnswer{28, true}),
+    [](const testing::TestParamInfo<MalformedAnswer>& info) {
+        return std::string(info.param.type == 1 ? "A" : "Aaaa") +
+            (info.param.fallback ? "WithFallback" : "WithoutFallback");
+    });
+INSTANTIATE_TEST_SUITE_P(Startup, DnsDatagramStop, testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) { return info.param ? "PendingQuery" : "Unused"; });
 
 struct TtlCase {
     uint32_t wire;
@@ -577,6 +663,10 @@ TEST_P(DnsTtl, PreservesAddressesButDoesNotCacheZeroTtl) {
         peer.Stop();
     });
     io.run_for(3s);
+    const bool completed_before_cleanup = done;
+    peer.Stop();
+    JoinService(io, worker);
+    EXPECT_TRUE(completed_before_cleanup);
     EXPECT_TRUE(done);
     if (error) std::rethrow_exception(error);
 }

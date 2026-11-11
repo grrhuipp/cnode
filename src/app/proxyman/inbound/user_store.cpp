@@ -274,7 +274,8 @@ UserStore::PublishedSnapshot UserStore::PrepareUsers(
 UserStore::PublishedSnapshot UserStore::PrepareUsers(
     std::span<const UserUpdate> updates) {
     auto next = std::make_shared<Snapshot>(*CaptureSnapshot());
-    for (const auto& [tag, users] : updates) {
+    for (const auto& [tag, borrowed_users] : updates) {
+        const auto& users = borrowed_users.get();
         if (const auto* vmess = std::get_if<PreparedVmessUsers>(&users)) {
             SetOrErase(next->vmess, tag, BuildVmessUsers(*vmess));
         } else if (const auto* vless = std::get_if<PreparedVlessUsers>(&users)) {
@@ -293,7 +294,9 @@ UserStore::PublishedSnapshot UserStore::PrepareUsers(
                 *hysteria, "Hysteria", ProjectProfile<PreparedHysteriaUser>));
         }
         const auto protocol = UserProtocolOf(users);
-        if (protocol == UserProtocol::Vmess || protocol == UserProtocol::Shadowsocks) continue;
+        if (!std::visit([](const auto& entries) {
+                return kHasKeyedInboundCredential<std::decay_t<decltype(entries)>>;
+            }, users)) continue;
         auto& revisions = next->credential_revisions[static_cast<size_t>(protocol)];
         if (std::visit([](const auto& entries) { return entries.empty(); }, users)) {
             EraseByTag(revisions, tag);

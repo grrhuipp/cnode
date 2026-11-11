@@ -1,3 +1,4 @@
+#include "transport_coordinator_fixture.hpp"
 #include <gtest/gtest.h>
 
 #include "common/allocator.hpp"
@@ -21,7 +22,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
+#include <tuple>
+#include <utility>
+#include <vector>
 #include <stdexcept>
 #include <string>
 
@@ -31,9 +34,51 @@
 namespace {
 namespace net = ::net;
 using namespace std::chrono_literals;
-void Require(bool yes, const char* why) {
-    if (!yes) throw std::runtime_error(why);
-}
+
+class TransportBehavior : public testing::Test {
+protected:
+    void SetUp() override { ::TlsStream::InitializeIo(); }
+    void TearDown() override {
+        ::memory::reject_next_process_allocation = false;
+        EXPECT_EQ(::memory::detail::test_buffers_live, 0);
+    }
+};
+
+class HttpDiagnosticBehavior : public TransportBehavior {
+protected:
+    void SetUp() override {
+        TransportBehavior::SetUp();
+        auto name = (std::filesystem::temp_directory_path() / "cnode-http-logs-XXXXXX").string();
+        ASSERT_NE(::mkdtemp(name.data()), nullptr);
+        directory = name;
+        ASSERT_TRUE(::Log::Init({.level = LogLevel::TRACE, .log_dir = directory,
+                                .access_path = {}, .error_path = "error.log", .max_days = 1,
+                                .rotate_daily = false, .gzip = false}));
+    }
+    void TearDown() override {
+        ::Log::Shutdown();
+        if (!directory.empty()) std::filesystem::remove_all(directory);
+        TransportBehavior::TearDown();
+    }
+    void ExpectRedactedDiagnostics() {
+        ::Log::Shutdown();
+        std::ifstream input(directory / "error.log");
+        ASSERT_TRUE(input.is_open());
+        std::string diagnostics;
+        for (std::string line; std::getline(input, line);) {
+            for (unsigned char ch : line) {
+                EXPECT_GE(ch, 0x20);
+                EXPECT_NE(ch, 0x7f);
+            }
+            diagnostics += line + '\n';
+        }
+        EXPECT_FALSE(diagnostics.empty());
+        for (const std::string_view secret : {
+                "review_password", "review_token", "review_fragment", "forged_log_line"})
+            EXPECT_EQ(diagnostics.find(secret), std::string::npos) << secret;
+    }
+    std::filesystem::path directory;
+};
 std::span<const uint8_t> Bytes(std::string_view value) {
     return {reinterpret_cast<const uint8_t*>(value.data()), value.size()};
 }
@@ -54,6 +99,7 @@ std::string Flatten(const ::buf::MultiBuffer& data) {
 // layers, and segmented/coalesced headers with payload larger than a TLS record.
 void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive) {
     net::io_context io;
+    TransportCoordinatorFixture transport_coordinator{io};
     net::experimental::channel<void(::IoErrorCode)> peer_finished(io, 1);
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(io), peer_socket(io);
@@ -111,7 +157,7 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
                 co_await net::async_read(wire, net::buffer(&byte, 1), net::use_awaitable);
                 header += byte;
             } while (!header.ends_with("\r\n\r\n"));
-            Require(header.starts_with("GET /up HTTP/1.1\r\n"), "unexpected outbound HTTP request");
+            EXPECT_TRUE(header.starts_with("GET /up HTTP/1.1\r\n")) << "unexpected outbound HTTP request";
         }
         const auto& header = outbound ? response : request;
         if (fragmented) {
@@ -134,20 +180,21 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
                 co_await net::async_read(wire, net::buffer(&byte, 1), net::use_awaitable);
                 record_header += byte;
             } while (!record_header.ends_with("\r\n\r\n"));
-            Require(record_header.starts_with(upgrade ? "HTTP/1.1 101 " : "HTTP/1.1 200 "), "unexpected inbound response");
+            EXPECT_TRUE(record_header.starts_with(upgrade ? "HTTP/1.1 101 " : "HTTP/1.1 200 ")) << "unexpected inbound response";
         }
         std::array<char, 3> ack{};
         co_await net::async_read(wire, net::buffer(ack), net::use_awaitable);
-        Require(std::string_view(ack.data(), ack.size()) == "ack", "cancellation disturbed writes");
+        EXPECT_EQ(std::string_view(ack.data(), ack.size()), "ack") << "cancellation disturbed writes";
         co_await net::async_write(wire, net::buffer("end", 3), net::use_awaitable);
         char byte;
         auto [ec, n] = co_await wire.async_read_some(net::buffer(&byte, 1), net::as_tuple(net::use_awaitable));
         if (abortive) {
-            Require(n == 0 && (ec == net::error::connection_reset ||
-                    ec == net::ssl::error::stream_truncated || (!tls && ec == net::error::eof)),
-                    "abortive close sent TLS close_notify or left the peer waiting");
+            EXPECT_EQ(n, 0);
+            EXPECT_TRUE(ec == net::error::connection_reset ||
+                        ec == net::ssl::error::stream_truncated || (!tls && ec == net::error::eof));
         } else {
-            Require(ec == net::error::eof && n == 0, "graceful shutdown omitted EOF or TLS close_notify");
+            EXPECT_EQ(ec, net::error::eof);
+            EXPECT_EQ(n, 0);
         }
         peer_eof = true;
     };
@@ -161,7 +208,7 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
             co_await peer(secured.next_layer());
             if (!abortive) secured.next_layer().shutdown(::tcp::socket::shutdown_send);
         }
-        Require(peer_finished.try_send(::IoErrorCode{}), "peer shutdown completion was lost");
+        EXPECT_TRUE(peer_finished.try_send(::IoErrorCode{})) << "peer shutdown completion was lost";
     };
     auto product = [&]() -> net::awaitable<void> {
         if (!outbound && !tls && !fragmented) {
@@ -173,7 +220,8 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
             while (retained.size() < request.size() + payload.size()) {
                 const size_t n = co_await raw->AsyncRead(net::buffer(
                     block.data(), std::min(block.size(), request.size() + payload.size() - retained.size())));
-                Require(n != 0, "preexisting byte-layer residual truncated");
+                EXPECT_NE(n, 0) << "preexisting byte-layer residual truncated";
+                if (n == 0) throw std::runtime_error("cannot continue with truncated residual");
                 retained.append(block.data(), n);
             }
             raw->PrependReadData(Bytes(retained));
@@ -182,11 +230,12 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
         if (outbound) {
             built = co_await ::BuildOutboundTransport(std::move(raw), settings, security.Context());
         } else {
-            built = co_await ::BuildInboundTransport(io, std::move(raw), settings, security.Context());
+            built = co_await ::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, security.Context());
         }
-        Require(built.has_value(), "HTTP transport handshake failed");
+        EXPECT_TRUE(built.has_value()) << "HTTP transport handshake failed";
+        if (!built || !*built) throw std::runtime_error("cannot read from failed HTTP handshake");
         stream = std::move(*built);
-        Require(stream->NativeHandle() == native, "handshake changed underlying socket ownership");
+        EXPECT_EQ(stream->NativeHandle(), native) << "handshake changed underlying socket ownership";
         stream->ClearPhaseDeadline();
         // Force a prepend while the actual read end still has handshake residual.
         // This prefix must precede both that residual and unread SSL/socket input.
@@ -195,23 +244,26 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
         ::memory::reject_next_process_allocation = true;
         bool failed = false;
         try { Prepend(*stream, "must-not-appear"); } catch (const std::bad_alloc&) { failed = true; }
-        Require(failed && ::memory::detail::test_buffers_live == pending_live,
-                "prepend OOM changed retained data ownership");
+        catch (...) { ::memory::reject_next_process_allocation = false; throw; }
+        ::memory::reject_next_process_allocation = false;
+        EXPECT_TRUE(failed);
+        EXPECT_EQ(::memory::detail::test_buffers_live, pending_live);
         std::string received;
         std::array<char, 3> small{};
         for (size_t i = 0; i < 5; ++i) {
             const size_t n = co_await stream->AsyncRead(net::buffer(small));
-            Require(n != 0, "small read lost handshake payload");
+            EXPECT_NE(n, 0) << "small read lost handshake payload";
+            if (n == 0) throw std::runtime_error("cannot continue after payload EOF");
             received.append(small.data(), n);
         }
         while (received.size() < payload.size() + 6) {
             auto buffers = co_await stream->ReadMultiBuffer();
-            Require(buffers.byte_size() != 0, "multi-buffer read truncated payload");
+            EXPECT_NE(buffers.byte_size(), 0) << "multi-buffer read truncated payload";
+            if (buffers.empty()) throw std::runtime_error("cannot continue after payload EOF");
             received += Flatten(buffers);
         }
-        Require(received == "prefix" + payload, "read-ahead lost, duplicated, decrypted at wrong layer, or reordered");
-        Require(::memory::detail::test_buffers_live == 0,
-                "consumed handshake residual retained payload blocks");
+        EXPECT_EQ(received, "prefix" + payload) << "read-ahead lost, duplicated, decrypted at wrong layer, or reordered";
+        EXPECT_EQ(::memory::detail::test_buffers_live, 0) << "consumed handshake residual retained payload blocks";
         net::steady_timer cancel(io, 5ms);
         cancel.async_wait([&](::IoErrorCode ec) { if (!ec) stream->Cancel(); });
         try {
@@ -224,23 +276,25 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
             if (failure.code() != ::io_error::operation_aborted) throw;
             cancelled = true;
         }
-        Require(cancelled && stream->IsOpen(), "pending read cancellation closed or stalled transport");
+        EXPECT_TRUE(cancelled);
+        EXPECT_TRUE(stream->IsOpen());
         co_await stream->AsyncWrite(net::buffer("ack", 3));
         received.clear();
         while (received.size() < 3) {
             const size_t n = co_await stream->AsyncRead(net::buffer(small));
-            Require(n != 0, "transport failed to resume after cancellation");
+            EXPECT_NE(n, 0) << "transport failed to resume after cancellation";
+            if (n == 0) throw std::runtime_error("cannot continue after resumed read EOF");
             received.append(small.data(), n);
         }
-        Require(received == "end", "resumed transport corrupted input");
+        EXPECT_EQ(received, "end") << "resumed transport corrupted input";
         if (!abortive) {
             co_await stream->AsyncShutdownWrite();
             co_await stream->AsyncShutdownWrite();
             Prepend(*stream, "discard-on-shutdown");
             stream->ShutdownRead();
             stream->ShutdownRead();
-            Require(co_await stream->AsyncRead(net::buffer(small)) == 0, "read shutdown leaked retained plaintext");
-            Require((co_await stream->ReadMultiBuffer()).byte_size() == 0, "read shutdown leaked multi-buffer data");
+            EXPECT_EQ(co_await stream->AsyncRead(net::buffer(small)), 0) << "read shutdown leaked retained plaintext";
+            EXPECT_EQ((co_await stream->ReadMultiBuffer()).byte_size(), 0) << "read shutdown leaked multi-buffer data";
             // Join the peer's graceful half-close before a repeated abortive close
             // can reset its socket; otherwise its shutdown_send races with RST.
             co_await peer_finished.async_receive(net::use_awaitable);
@@ -250,14 +304,15 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
         stream->CloseAbortive();
         stream->CloseAbortive();
         stream->Close();
-        Require(!stream->IsOpen(), "repeated close left transport open");
-        Require(co_await stream->AsyncRead(net::buffer(small)) == 0, "closed transport leaked read-ahead");
-        Require((co_await stream->ReadMultiBuffer()).byte_size() == 0, "closed transport leaked multi-buffer data");
-        Require(::memory::detail::test_buffers_live == 0, "shutdown/close retained payload blocks");
+        EXPECT_FALSE(stream->IsOpen()) << "repeated close left transport open";
+        EXPECT_EQ(co_await stream->AsyncRead(net::buffer(small)), 0) << "closed transport leaked read-ahead";
+        EXPECT_EQ((co_await stream->ReadMultiBuffer()).byte_size(), 0) << "closed transport leaked multi-buffer data";
+        EXPECT_EQ(::memory::detail::test_buffers_live, 0) << "shutdown/close retained payload blocks";
     };
     auto finish = [&](std::exception_ptr failure) {
         if (failure && !error) {
             error = failure;
+            peer_finished.close();
             if (stream) stream->CloseAbortive();
             if (raw) raw->Close();
             ::IoErrorCode ignored;
@@ -268,30 +323,21 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
     net::co_spawn(io, peer_task(), finish);
     net::co_spawn(io, product(), finish);
     io.run_for(5s);
+    EXPECT_EQ(completed, 2);
+    if (completed != 2) {
+        peer_finished.close();
+        if (stream) stream->CloseAbortive();
+        if (raw) raw->Close();
+        ::IoErrorCode ignored;
+        secured.next_layer().close(ignored);
+        io.restart();
+        io.run();
+    }
     if (error) std::rethrow_exception(error);
-    Require(completed == 2 && cancelled && peer_eof, "handshake/cancellation/shutdown failed to join");
+    EXPECT_TRUE(cancelled);
+    EXPECT_TRUE(peer_eof);
 }
 
-void ConnectedSocketOptions() {
-    net::io_context io;
-    ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    ::tcp::socket socket(io), peer(io);
-    socket.connect(acceptor.local_endpoint());
-    acceptor.accept(peer);
-    const auto native = socket.native_handle();
-    ::TcpStream stream(std::move(socket));
-    const auto require_option = [&](int level, int option, int expected) {
-        int value = 0;
-        socklen_t size = sizeof(value);
-        const int status = ::getsockopt(native, level, option, &value, &size);
-        Require(status == 0 && value == expected,
-                "connected TCP socket has incorrect keepalive settings");
-    };
-    require_option(SOL_SOCKET, SO_KEEPALIVE, 1);
-    require_option(IPPROTO_TCP, TCP_KEEPIDLE, 60);
-    require_option(IPPROTO_TCP, TCP_KEEPINTVL, 10);
-    require_option(IPPROTO_TCP, TCP_KEEPCNT, 6);
-}
 
 void WriteTimeoutResetsQueuedPayload() {
     net::io_context io;
@@ -312,22 +358,22 @@ void WriteTimeoutResetsQueuedPayload() {
         bool cancelled = false;
         try { (void)co_await stream.AsyncWrite(net::buffer(payload)); }
         catch (const ::IoSystemError& failure) {
-            Require(failure.code() == ::io_error::operation_aborted,
-                    "write deadline failed with unrelated I/O error");
+            EXPECT_EQ(failure.code(), ::io_error::operation_aborted) << "write deadline failed with unrelated I/O error";
             cancelled = true;
         }
-        Require(cancelled && stream.ConsumeWriteTimeout() && !stream.IsOpen(),
-                "write deadline did not cancel and retire its socket");
+        EXPECT_TRUE(cancelled);
+        EXPECT_TRUE(stream.ConsumeWriteTimeout());
+        EXPECT_FALSE(stream.IsOpen());
         std::array<char, 8192> buffer{};
         for (;;) {
             auto [ec, size] = co_await peer.async_read_some(
                 net::buffer(buffer), net::as_tuple(net::use_awaitable));
             if (ec) {
-                Require(ec == net::error::connection_reset,
-                        "write deadline gracefully drained payload instead of resetting");
+                EXPECT_EQ(ec, net::error::connection_reset) << "write deadline gracefully drained payload instead of resetting";
                 break;
             }
-            Require(size != 0, "write deadline peer read made no progress");
+            EXPECT_NE(size, 0) << "write deadline peer read made no progress";
+            if (size == 0) throw std::runtime_error("cannot continue without read progress");
         }
     };
     net::co_spawn(io, exercise(), [&](std::exception_ptr failure) {
@@ -335,8 +381,15 @@ void WriteTimeoutResetsQueuedPayload() {
         completed = true;
     });
     io.run_for(3s);
+    EXPECT_TRUE(completed);
+    if (!completed) {
+        stream.CloseAbortive();
+        ::IoErrorCode ignored;
+        peer.close(ignored);
+        io.restart();
+        io.run();
+    }
     if (error) std::rethrow_exception(error);
-    Require(completed, "write deadline left queued payload or native readiness unjoined");
 }
 
 void ExistingTcpResidual() {
@@ -354,19 +407,25 @@ void ExistingTcpResidual() {
     bool done = false;
     std::exception_ptr error;
     auto read = [&]() -> net::awaitable<void> {
-        char byte;
-        Require(co_await stream.AsyncRead(net::buffer(&byte, 1)) == 1 && byte == 'h', "prepend did not precede old residual");
+        char byte{};
+        EXPECT_EQ(co_await stream.AsyncRead(net::buffer(&byte, 1)), 1);
+        EXPECT_EQ(byte, 'h');
         auto data = co_await stream.ReadMultiBuffer();
-        Require(Flatten(data) == "ead" + tail, "preexisting residual was lost or reordered");
+        EXPECT_EQ(Flatten(data), "ead" + tail) << "preexisting residual was lost or reordered";
         data.clear();
         stream.PrependReadData(Bytes("discard"));
         stream.Close();
-        Require((co_await stream.ReadMultiBuffer()).byte_size() == 0, "close leaked old residual");
+        EXPECT_EQ((co_await stream.ReadMultiBuffer()).byte_size(), 0) << "close leaked old residual";
     };
     net::co_spawn(io, read(), [&](std::exception_ptr failure) { error = failure; done = true; });
     io.run_for(1s);
+    EXPECT_TRUE(done);
+    if (!done) {
+        stream.CloseAbortive();
+        io.restart();
+        io.run();
+    }
     if (error) std::rethrow_exception(error);
-    Require(done && !::memory::reject_next_process_allocation, "TCP residual test stalled");
 }
 
 void TlsReadTermination(bool multi_buffer, bool clean) {
@@ -382,7 +441,7 @@ void TlsReadTermination(bool multi_buffer, bool clean) {
     ::TlsConfig client_config;
     client_config.allow_insecure = true;
     auto client_context = ::SslContext::CreateClient(client_config);
-    Require(bool(client_context), "TLS termination client context creation failed");
+    ASSERT_NE(client_context, nullptr);
     net::ssl::stream<::tcp::socket> peer(std::move(peer_socket), server_context);
     ::TlsStream stream(std::make_unique<::TcpStream>(std::move(socket)),
                            *client_context, false);
@@ -400,27 +459,29 @@ void TlsReadTermination(bool multi_buffer, bool clean) {
         }
     };
     auto receive = [&]() -> net::awaitable<void> {
-        Require(co_await stream.Handshake(), "TLS termination fixture handshake failed");
+        const bool handshaken = co_await stream.Handshake();
+        EXPECT_TRUE(handshaken);
+        if (!handshaken) throw std::runtime_error("cannot read from failed TLS handshake");
         if (multi_buffer) {
-            Require(Flatten(co_await stream.ReadMultiBuffer()) == "x", "TLS fixture payload changed");
+            EXPECT_EQ(Flatten(co_await stream.ReadMultiBuffer()), "x") << "TLS fixture payload changed";
         } else {
             char byte{};
-            Require(co_await stream.AsyncRead(net::buffer(&byte, 1)) == 1 && byte == 'x',
-                    "TLS fixture payload changed");
+            EXPECT_EQ(co_await stream.AsyncRead(net::buffer(&byte, 1)), 1);
+            EXPECT_EQ(byte, 'x');
         }
         bool truncated = false;
         try {
             if (multi_buffer) {
-                Require((co_await stream.ReadMultiBuffer()).byte_size() == 0, "unexpected TLS payload");
+                EXPECT_EQ((co_await stream.ReadMultiBuffer()).byte_size(), 0) << "unexpected TLS payload";
             } else {
                 char byte{};
-                Require(co_await stream.AsyncRead(net::buffer(&byte, 1)) == 0, "unexpected TLS payload");
+                EXPECT_EQ(co_await stream.AsyncRead(net::buffer(&byte, 1)), 0) << "unexpected TLS payload";
             }
         } catch (const ::IoSystemError& error) {
             if (error.code() != net::ssl::error::stream_truncated) throw;
             truncated = true;
         }
-        Require(truncated == !clean, "TLS truncation was confused with authenticated EOF");
+        EXPECT_EQ(truncated, !clean) << "TLS truncation was confused with authenticated EOF";
         if (clean) co_await stream.AsyncShutdownWrite();
     };
     auto finish = [&](std::exception_ptr error) {
@@ -435,8 +496,15 @@ void TlsReadTermination(bool multi_buffer, bool clean) {
     net::co_spawn(io, send(), finish);
     net::co_spawn(io, receive(), finish);
     io.run_for(3s);
+    EXPECT_EQ(completed, 2);
+    if (completed != 2) {
+        stream.CloseAbortive();
+        ::IoErrorCode ignored;
+        peer.next_layer().close(ignored);
+        io.restart();
+        io.run();
+    }
     if (failure) std::rethrow_exception(failure);
-    Require(completed == 2, "TLS termination fixture did not join");
 }
 
 // Independent wire encoder/decoder: do not validate cnode with its own framing.
@@ -475,11 +543,11 @@ struct WsWireHeader {
 net::awaitable<WsWireHeader> ReadWsWireHeader(::tcp::socket& peer, bool masked) {
     std::array<uint8_t, 2> bytes{};
     co_await net::async_read(peer, net::buffer(bytes), net::use_awaitable);
-    Require((bytes[0] & 0xf0) == 0x80, "WS writer emitted fragmented/reserved header");
+    EXPECT_EQ((bytes[0] & 0xf0), 0x80) << "WS writer emitted fragmented/reserved header";
     WsWireHeader header;
     header.opcode = bytes[0] & 0x0f;
     header.masked = (bytes[1] & 0x80) != 0;
-    Require(header.masked == masked, "WS writer used wrong mask direction");
+    EXPECT_EQ(header.masked, masked) << "WS writer used wrong mask direction";
     const unsigned length = bytes[1] & 0x7f;
     uint64_t size = length;
     if (length >= 126) {
@@ -488,10 +556,14 @@ net::awaitable<WsWireHeader> ReadWsWireHeader(::tcp::socket& peer, bool masked) 
         co_await net::async_read(peer, net::buffer(extended.data(), count), net::use_awaitable);
         size = 0;
         for (size_t i = 0; i < count; ++i) size = (size << 8) | extended[i];
-        Require((length == 126 && size >= 126) || (length == 127 && size >= 65536),
-                "WS writer used noncanonical length");
+        if (length == 126) {
+            EXPECT_GE(size, 126);
+        } else {
+            EXPECT_GE(size, 65536);
+        }
     }
-    Require(size <= 4 * 1024 * 1024, "WS writer emitted an unexpected payload size");
+    EXPECT_LE(size, 4 * 1024 * 1024) << "WS writer emitted an unexpected payload size";
+    if (size > 4 * 1024 * 1024) throw std::runtime_error("cannot allocate unbounded WS fixture payload");
     header.size = static_cast<size_t>(size);
     if (masked) co_await net::async_read(peer, net::buffer(header.mask), net::use_awaitable);
     co_return header;
@@ -510,15 +582,16 @@ net::awaitable<std::string> ReadWsWirePayload(::tcp::socket& peer, const WsWireH
 net::awaitable<std::string> ReadWsWireFrame(
     ::tcp::socket& peer, bool masked, uint8_t opcode) {
     const auto header = co_await ReadWsWireHeader(peer, masked);
-    Require(header.opcode == opcode, "WS writer interleaved or misclassified a frame");
+    EXPECT_EQ(header.opcode, opcode) << "WS writer interleaved or misclassified a frame";
     co_return co_await ReadWsWirePayload(peer, header);
 }
 
-net::awaitable<void> RequireWireEof(::tcp::socket& peer) {
+net::awaitable<void> ReadWireEof(::tcp::socket& peer) {
     char byte{};
     const auto [error, size] = co_await peer.async_read_some(
         net::buffer(&byte, 1), net::as_tuple(net::use_awaitable));
-    Require(error == net::error::eof && size == 0, "WS Close was duplicated or omitted TCP EOF");
+    EXPECT_EQ(error, net::error::eof);
+    EXPECT_EQ(size, 0);
 }
 
 void WsResume(bool client, bool multi_buffer, size_t size, size_t cut, uint8_t opcode = 2) {
@@ -541,13 +614,12 @@ void WsResume(bool client, bool multi_buffer, size_t size, size_t cut, uint8_t o
     } else {
         frame = WsWireFrame(opcode, payload, !client);
     }
-    Require(cut < frame.size(), "invalid WS cancellation fixture boundary");
+    ASSERT_LT(cut, frame.size());
     // Handshake residual is deterministic: the entire prefix is consumed before
     // the first socket wait, then Cancel interrupts that actual lower read.
     ::buf::MultiBuffer residual;
-    Require(::buf::AppendSpanToMultiBuffer(
-                {reinterpret_cast<const uint8_t*>(frame.data()), cut}, residual),
-            "WS residual fixture allocation failed");
+    ASSERT_TRUE(::buf::AppendSpanToMultiBuffer(
+        {reinterpret_cast<const uint8_t*>(frame.data()), cut}, residual));
     stream.SetPendingMultiBuffer(std::move(residual));
     const std::string application = opcode == 2 || opcode == 1 ? payload : "application";
     bool cancelled = false;
@@ -564,46 +636,45 @@ void WsResume(bool client, bool multi_buffer, size_t size, size_t cut, uint8_t o
         try {
             while (true) {
                 const auto bytes = co_await read();
-                Require(!bytes.empty(), "WS cancellation was converted to EOF");
+                EXPECT_FALSE(bytes.empty()) << "WS cancellation was converted to EOF";
+                if (bytes.empty()) throw std::runtime_error("cannot continue after WS EOF");
                 received += bytes;
             }
         } catch (const ::IoSystemError& error) {
             if (error.code() != net::error::operation_aborted) throw;
             cancelled = true;
         }
-        Require(stream.IsOpen(), "WS read cancellation closed the connection");
+        EXPECT_TRUE(stream.IsOpen()) << "WS read cancellation closed the connection";
         if (opcode == 2) {
             const size_t header_size = (size < 126 ? 2 : size <= 65535 ? 4 : 10) + (client ? 0 : 4);
             const size_t prefix = cut > header_size ? cut - header_size : 0;
-            Require(received == payload.substr(0, prefix),
-                    "WS read waited to fill its caller buffer before delivering available payload");
+            EXPECT_EQ(received, payload.substr(0, prefix)) << "WS read waited to fill its caller buffer before delivering available payload";
         }
         co_await stream.AsyncWrite(net::buffer("ack", 3));
         if (opcode == 8) {
-            Require((co_await read()).empty(), "complete WS Close leaked application bytes");
+            EXPECT_TRUE((co_await read()).empty()) << "complete WS Close leaked application bytes";
         } else {
             while (received.size() < application.size()) {
                 const auto bytes = co_await read();
-                Require(!bytes.empty(), "WS resumed with premature EOF");
+                EXPECT_FALSE(bytes.empty()) << "WS resumed with premature EOF";
+                if (bytes.empty()) throw std::runtime_error("cannot continue after WS EOF");
                 received += bytes;
             }
-            Require(received == application, "WS cancellation lost, repeated, or remasked bytes");
+            EXPECT_EQ(received, application) << "WS cancellation lost, repeated, or remasked bytes";
             co_await stream.AsyncShutdownWrite();
             co_await stream.AsyncShutdownWrite();
         }
     };
     auto wire = [&]() -> net::awaitable<void> {
-        Require(co_await ReadWsWireFrame(peer, client, 2) == "ack", "WS cancellation disturbed writes");
+        EXPECT_EQ(co_await ReadWsWireFrame(peer, client, 2), "ack") << "WS cancellation disturbed writes";
         std::string suffix = frame.substr(cut);
         if (opcode == 9) suffix += WsWireFrame(2, application, !client);
         co_await net::async_write(peer, net::buffer(suffix), net::use_awaitable);
         if (opcode == 9 || opcode == 1)
-            Require(co_await ReadWsWireFrame(peer, client, 10) == (opcode == 1 ? "probe" : payload),
-                    "WS PONG changed PING payload");
+            EXPECT_EQ(co_await ReadWsWireFrame(peer, client, 10), (opcode == 1 ? "probe" : payload)) << "WS PONG changed PING payload";
         const auto close = co_await ReadWsWireFrame(peer, client, 8);
-        Require(close == (opcode == 8 ? payload : std::string("\x03\xe8", 2)),
-                "WS Close payload was not preserved");
-        co_await RequireWireEof(peer);
+        EXPECT_EQ(close, (opcode == 8 ? payload : std::string("\x03\xe8", 2))) << "WS Close payload was not preserved";
+        co_await ReadWireEof(peer);
     };
     auto finish = [&](std::exception_ptr error) {
         if (error && !failure) {
@@ -618,8 +689,16 @@ void WsResume(bool client, bool multi_buffer, size_t size, size_t cut, uint8_t o
     net::post(io, [&] { stream.Cancel(); });
     net::co_spawn(io, wire(), finish);
     io.run_for(3s);
+    EXPECT_EQ(completed, 2);
+    if (completed != 2) {
+        stream.CloseAbortive();
+        ::IoErrorCode ignored;
+        peer.close(ignored);
+        io.restart();
+        io.run();
+    }
     if (failure) std::rethrow_exception(failure);
-    Require(completed == 2 && cancelled, "WS cancellation fixture did not join");
+    EXPECT_TRUE(cancelled);
 }
 
 enum class WsConcurrent { Ping, Close, Cancel };
@@ -666,14 +745,14 @@ void WsWriteBoundary(WsConcurrent action, bool owned) {
         } catch (const ::IoSystemError& error) {
             if (action != WsConcurrent::Cancel || error.code() != net::error::operation_aborted) throw;
             write_cancelled = true;
-            Require(!stream.IsOpen(), "cancelled partial WS frame did not abort transport");
+            EXPECT_FALSE(stream.IsOpen()) << "cancelled partial WS frame did not abort transport";
         }
     };
     auto control = [&]() -> net::awaitable<void> {
         if (action == WsConcurrent::Ping) {
             std::array<char, 32> buffer{};
             const size_t n = co_await stream.AsyncRead(net::buffer(buffer));
-            Require(std::string_view(buffer.data(), n) == "ready", "WS PING escaped as application payload");
+            EXPECT_EQ(std::string_view(buffer.data(), n), "ready") << "WS PING escaped as application payload";
         } else {
             co_await close_now.async_receive(net::use_awaitable);
         }
@@ -688,27 +767,26 @@ void WsWriteBoundary(WsConcurrent action, bool owned) {
     };
     auto wire = [&]() -> net::awaitable<void> {
         const auto header = co_await ReadWsWireHeader(peer, true);
-        Require(header.opcode == 2 && header.size == payload.size(), "WS write lost physical data-frame boundary");
-        Require(!data_done, "WS write fixture did not establish backpressure");
+        EXPECT_EQ(header.opcode, 2);
+        EXPECT_EQ(header.size, payload.size());
+        EXPECT_FALSE(data_done) << "WS write fixture did not establish backpressure";
         if (action == WsConcurrent::Ping) {
             const auto input = WsWireFrame(9, "probe", false) + WsWireFrame(2, "ready", false);
             co_await net::async_write(peer, net::buffer(input), net::use_awaitable);
         } else {
-            Require(close_now.try_send(::IoErrorCode{}), "WS concurrent close signal was lost");
+            EXPECT_TRUE(close_now.try_send(::IoErrorCode{})) << "WS concurrent close signal was lost";
             co_await net::post(io, net::use_awaitable);
-            Require(!control_done, "WS Close completed in the middle of a data frame");
+            EXPECT_FALSE(control_done) << "WS Close completed in the middle of a data frame";
         }
         if (action == WsConcurrent::Cancel) {
             stream.Cancel();
             co_return;
         }
-        Require(co_await ReadWsWirePayload(peer, header) == payload,
-                "WS control frame was inserted inside physical data payload");
+        EXPECT_EQ(co_await ReadWsWirePayload(peer, header), payload) << "WS control frame was inserted inside physical data payload";
         if (action == WsConcurrent::Ping)
-            Require(co_await ReadWsWireFrame(peer, true, 10) == "probe", "WS backpressured PONG changed payload");
-        Require(co_await ReadWsWireFrame(peer, true, 8) == std::string("\x03\xe8", 2),
-                "WS concurrent Close was incomplete");
-        co_await RequireWireEof(peer);
+            EXPECT_EQ(co_await ReadWsWireFrame(peer, true, 10), "probe") << "WS backpressured PONG changed payload";
+        EXPECT_EQ(co_await ReadWsWireFrame(peer, true, 8), std::string("\x03\xe8", 2)) << "WS concurrent Close was incomplete";
+        co_await ReadWireEof(peer);
     };
     auto finish = [&](std::exception_ptr error) {
         if (error && !failure) {
@@ -724,11 +802,23 @@ void WsWriteBoundary(WsConcurrent action, bool owned) {
     net::co_spawn(io, control(), finish);
     net::co_spawn(io, wire(), finish);
     io.run_for(5s);
+    EXPECT_EQ(completed, 3);
+    if (completed != 3) {
+        close_now.close();
+        stream.CloseAbortive();
+        ::IoErrorCode ignored;
+        peer.close(ignored);
+        io.restart();
+        io.run();
+    }
     if (failure) std::rethrow_exception(failure);
-    Require(completed == 3, "WS concurrent-write fixture did not join");
-    Require(action == WsConcurrent::Cancel ? write_cancelled && close_cancelled
-                                           : data_done && control_done,
-            "WS write/close cancellation lost its actual completion type");
+    if (action == WsConcurrent::Cancel) {
+        EXPECT_TRUE(write_cancelled);
+        EXPECT_TRUE(close_cancelled);
+    } else {
+        EXPECT_TRUE(data_done);
+        EXPECT_TRUE(control_done);
+    }
 }
 
 void WsReject(std::string_view frame, bool client, bool multi_buffer) {
@@ -739,9 +829,8 @@ void WsReject(std::string_view frame, bool client, bool multi_buffer) {
     acceptor.accept(peer);
     ::BaseWsStream stream(std::make_unique<::TcpStream>(std::move(socket)), client);
     ::buf::MultiBuffer residual;
-    Require(::buf::AppendSpanToMultiBuffer(
-                {reinterpret_cast<const uint8_t*>(frame.data()), frame.size()}, residual),
-            "WS residual fixture allocation failed");
+    ASSERT_TRUE(::buf::AppendSpanToMultiBuffer(
+        {reinterpret_cast<const uint8_t*>(frame.data()), frame.size()}, residual));
     stream.SetPendingMultiBuffer(std::move(residual));
     peer.shutdown(::tcp::socket::shutdown_send);
     bool rejected = false, done = false;
@@ -755,72 +844,28 @@ void WsReject(std::string_view frame, bool client, bool multi_buffer) {
                 (void)co_await stream.AsyncRead(net::buffer(bytes));
             }
         } catch (const ::IoSystemError& error) {
-            Require(error.code() != net::error::operation_aborted, "WS protocol failure became cancellation");
+            EXPECT_NE(error.code(), net::error::operation_aborted) << "WS protocol failure became cancellation";
             rejected = true;
         }
-        Require(rejected && !stream.IsOpen(), "invalid/truncated WS frame became data or clean EOF");
+        EXPECT_TRUE(rejected);
+        EXPECT_FALSE(stream.IsOpen());
     };
     net::co_spawn(io, receive(), [&](std::exception_ptr error) { failure = error; done = true; });
     io.run_for(1s);
-    if (failure) std::rethrow_exception(failure);
-    Require(done && rejected, "WS invalid-frame fixture did not join");
-}
-
-void WsProtocolBoundaries() {
-    for (bool client : {false, true}) {
-        for (bool multi_buffer : {false, true}) {
-            WsResume(client, multi_buffer, 17, 1);
-            WsResume(client, multi_buffer, 257, 3);
-            WsResume(client, multi_buffer, 65539, 5);
-            if (!client) WsResume(client, multi_buffer, 17, 4);
-            WsResume(client, multi_buffer, 257, (client ? 4 : 8) + 3);
-            WsResume(client, multi_buffer, 9, (client ? 2 : 6) + 2, 9);
-            WsResume(client, multi_buffer, 5, (client ? 2 : 6) + 1, 8);
-            WsResume(client, multi_buffer, 0, 1, 8);
-            WsResume(client, multi_buffer, 7, 1, 1);
-
-            const bool masked = !client;
-            std::string reserved = WsWireFrame(2, "bad", masked);
-            reserved[0] = static_cast<char>(0xc2);
-            WsReject(reserved, client, multi_buffer);
-            for (uint8_t opcode : {uint8_t{3}, uint8_t{11}})
-                WsReject(WsWireFrame(opcode, "bad", masked), client, multi_buffer);
-            WsReject(WsWireFrame(2, "bad", !masked), client, multi_buffer);
-            WsReject(WsWireFrame(9, "bad", masked, false), client, multi_buffer);
-            WsReject(WsWireFrame(9, std::string(126, 'x'), masked), client, multi_buffer);
-            WsReject(WsWireFrame(0, "bad", masked), client, multi_buffer);
-            WsReject(WsWireFrame(2, "", masked, false) + WsWireFrame(2, "bad", masked),
-                     client, multi_buffer);
-            WsReject(WsWireFrame(8, "x", masked), client, multi_buffer);
-            WsReject(WsWireFrame(8, std::string("\x03\xed", 2), masked), client, multi_buffer);
-            WsReject(WsWireFrame(8, std::string("\x03\xe8\xc0\x80", 4), masked), client, multi_buffer);
-            WsReject(WsWireFrame(1, std::string("\xe2", 1), masked), client, multi_buffer);
-            const char direction = masked ? static_cast<char>(0x80) : 0;
-            std::string extended{static_cast<char>(0x82), static_cast<char>(direction | 126), 0, 125};
-            WsReject(extended, client, multi_buffer);
-            extended = std::string{static_cast<char>(0x82), static_cast<char>(direction | 127),
-                                   0, 0, 0, 0, 0, 0, static_cast<char>(0xff), static_cast<char>(0xff)};
-            WsReject(extended, client, multi_buffer);
-            extended[2] = static_cast<char>(0x80);
-            WsReject(extended, client, multi_buffer);
-            extended[2] = 0;
-            extended[7] = 0x40;
-            extended[8] = 0;
-            extended[9] = 1;
-            WsReject(extended, client, multi_buffer);
-            WsReject(std::string(1, static_cast<char>(0x82)), client, multi_buffer);
-            const auto truncated = WsWireFrame(2, "truncated", masked);
-            WsReject(std::string_view(truncated).substr(0, truncated.size() - 9), client, multi_buffer);
-        }
+    EXPECT_TRUE(done);
+    if (!done) {
+        stream.CloseAbortive();
+        io.restart();
+        io.run();
     }
-    for (bool owned : {false, true})
-        for (auto action : {WsConcurrent::Ping, WsConcurrent::Close, WsConcurrent::Cancel})
-            WsWriteBoundary(action, owned);
+    if (failure) std::rethrow_exception(failure);
 }
+
 
 void UpgradeHeaderTokens(bool outbound, bool websocket,
                          std::string_view connection, bool accepted) {
     net::io_context io;
+    TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
@@ -835,7 +880,12 @@ void UpgradeHeaderTokens(bool outbound, bool websocket,
     std::exception_ptr error;
     size_t completed = 0;
     auto finish = [&](std::exception_ptr failure) {
-        if (failure && !error) { error = failure; io.stop(); }
+        if (failure && !error) {
+            error = failure;
+            if (raw) raw->Close();
+            ::IoErrorCode ignored;
+            peer.close(ignored);
+        }
         ++completed;
     };
     auto wire = [&]() -> net::awaitable<void> {
@@ -871,16 +921,23 @@ void UpgradeHeaderTokens(bool outbound, bool websocket,
         if (outbound) {
             built = co_await ::BuildOutboundTransport(std::move(raw), settings, nullptr);
         } else {
-            built = co_await ::BuildInboundTransport(io, std::move(raw), settings, nullptr);
+            built = co_await ::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr);
         }
-        Require(built.has_value() == accepted, "Connection header token handshake mismatch");
-        if (built) (*built)->Close();
+        EXPECT_EQ(built.has_value(), accepted) << "Connection header token handshake mismatch";
+        if (built && *built) (*built)->Close();
     };
     net::co_spawn(io, wire(), finish);
     net::co_spawn(io, product(), finish);
-    io.run();
+    io.run_for(3s);
+    EXPECT_EQ(completed, 2);
+    if (completed != 2) {
+        if (raw) raw->Close();
+        ::IoErrorCode ignored;
+        peer.close(ignored);
+        io.restart();
+        io.run();
+    }
     if (error) std::rethrow_exception(error);
-    Require(completed == 2, "Connection token handshake stalled");
 }
 
 void ChunkExtensionBody(std::string_view wire, bool accepted, bool multi_buffer) {
@@ -896,7 +953,12 @@ void ChunkExtensionBody(std::string_view wire, bool accepted, bool multi_buffer)
     std::exception_ptr error;
     size_t completed = 0;
     auto finish = [&](std::exception_ptr failure) {
-        if (failure && !error) { error = failure; io.stop(); }
+        if (failure && !error) {
+            error = failure;
+            stream->Close();
+            ::IoErrorCode ignored;
+            peer.close(ignored);
+        }
         ++completed;
         // The stream is retained by this fixture, not by either coroutine.
         // Once both peers have joined, retire its idle timer as well; otherwise
@@ -926,46 +988,26 @@ void ChunkExtensionBody(std::string_view wire, bool accepted, bool multi_buffer)
                 }
             }
         } catch (const ::IoSystemError& failure) {
-            Require(failure.code() == ::io_error::invalid_argument,
-                    "chunk boundary failed with unrelated I/O error");
+            EXPECT_EQ(failure.code(), ::io_error::invalid_argument) << "chunk boundary failed with unrelated I/O error";
             rejected = true;
         }
-        Require(rejected != accepted, "transport chunk grammar acceptance mismatch");
-        if (accepted) Require(body == "OK", "transport chunk decoder leaked framing bytes");
+        EXPECT_NE(rejected, accepted) << "transport chunk grammar acceptance mismatch";
+        if (accepted) EXPECT_EQ(body, "OK") << "transport chunk decoder leaked framing bytes";
     };
     net::co_spawn(io, sender(), finish);
     net::co_spawn(io, receiver(), finish);
-    io.run();
+    io.run_for(3s);
+    EXPECT_EQ(completed, 2);
+    if (completed != 2) {
+        stream->Close();
+        ::IoErrorCode ignored;
+        peer.close(ignored);
+        io.restart();
+        io.run();
+    }
     if (error) std::rethrow_exception(error);
-    Require(completed == 2, "chunk boundary parser stalled");
 }
 
-void HttpBoundaryCases() {
-    for (bool outbound : {false, true}) {
-        for (bool websocket : {false, true}) {
-            for (const std::string_view headers : {
-                     "Connection: keep-alive\r\ncOnNeCtIoN: UpGrAdE\r\n",
-                     "Connection: , keep-alive, ,UPGRADE,\r\n",
-                     "Connection: Upgrade\r\nConnection: keep-alive\r\n"})
-                UpgradeHeaderTokens(outbound, websocket, headers, true);
-            for (const std::string_view headers : {
-                     "", "Connection: x-upgrade\r\n", "Connection: upgraded\r\n",
-                     "Connection: keep-alive\r\nConnection: not-upgrade\r\n"})
-                UpgradeHeaderTokens(outbound, websocket, headers, false);
-        }
-    }
-    for (bool multi_buffer : {false, true}) {
-        ChunkExtensionBody("2 \t; name = \"a;\\\"b\\\\c\";flag\r\nOK\r\n0\r\n\r\n",
-                           true, multi_buffer);
-        for (const std::string_view body : {
-                 "2;x=\"unterminated\r\nOK\r\n0\r\n\r\n",
-                 "2;x=\r\nOK\r\n0\r\n\r\n", "2;\r\nOK\r\n0\r\n\r\n",
-                 "2 0\r\nOK\r\n0\r\n\r\n", "2\nOK\r\n0\r\n\r\n",
-                 "2\r\nOK\n0\r\n\r\n", "2\r\nO", "0\r\n",
-                 "10000000000000000\r\nOK\r\n0\r\n\r\n"})
-            ChunkExtensionBody(body, false, multi_buffer);
-    }
-}
 
 class CloseHttpLogStream final : public ::InboundTransportStreamHandler {
 public:
@@ -983,6 +1025,7 @@ void HttpLogHandshake(std::string_view network, bool outbound,
                       std::string_view path = "/up",
                       std::string_view host = "localhost") {
     net::io_context io;
+    TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
@@ -1004,7 +1047,12 @@ void HttpLogHandshake(std::string_view network, bool outbound,
     std::exception_ptr error;
     size_t completed = 0;
     auto finish = [&](std::exception_ptr failure) {
-        if (failure && !error) { error = failure; io.stop(); }
+        if (failure && !error) {
+            error = failure;
+            if (raw) raw->Close();
+            ::IoErrorCode ignored;
+            peer.close(ignored);
+        }
         ++completed;
     };
     auto wire = [&]() -> net::awaitable<void> {
@@ -1015,8 +1063,7 @@ void HttpLogHandshake(std::string_view network, bool outbound,
                 co_await net::async_read(peer, net::buffer(&byte, 1), net::use_awaitable);
                 request += byte;
             } while (!request.ends_with("\r\n\r\n"));
-            Require(request.find(path) != std::string::npos,
-                    "HTTP log redaction changed the outbound request target");
+            EXPECT_NE(request.find(path), std::string::npos) << "HTTP log redaction changed the outbound request target";
         }
         std::string message(line);
         message += "\r\nHost: ";
@@ -1044,9 +1091,8 @@ void HttpLogHandshake(std::string_view network, bool outbound,
                 co_await net::async_read(peer, net::buffer(&byte, 1), net::use_awaitable);
                 response += byte;
             } while (!response.ends_with("\r\n\r\n"));
-            Require(response.starts_with(network == "ws" || network == "httpupgrade"
-                        ? "HTTP/1.1 101 " : "HTTP/1.1 200 "),
-                    "HTTP log redaction changed handshake response");
+            EXPECT_TRUE(response.starts_with(network == "ws" || network == "httpupgrade"
+                        ? "HTTP/1.1 101 " : "HTTP/1.1 200 ")) << "HTTP log redaction changed handshake response";
         }
     };
     auto product = [&]() -> net::awaitable<void> {
@@ -1056,147 +1102,292 @@ void HttpLogHandshake(std::string_view network, bool outbound,
         } else {
             const std::shared_ptr<::InboundTransportStreamHandler> sink =
                 network == "xhttp" ? std::make_shared<CloseHttpLogStream>() : nullptr;
-            built = co_await ::BuildInboundTransport(io, std::move(raw), settings, nullptr, 0, sink);
+            built = co_await ::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr, 0, sink);
         }
-        Require(built.has_value() == accepted, "HTTP log redaction changed request acceptance");
+        EXPECT_EQ(built.has_value(), accepted) << "HTTP log redaction changed request acceptance";
         if (built && *built) (*built)->Close();
     };
     net::co_spawn(io, wire(), finish);
     net::co_spawn(io, product(), finish);
-    io.run();
+    io.run_for(3s);
+    EXPECT_EQ(completed, 2);
+    if (completed != 2) {
+        if (raw) raw->Close();
+        ::IoErrorCode ignored;
+        peer.close(ignored);
+        io.restart();
+        io.run();
+    }
     if (error) std::rethrow_exception(error);
-    Require(completed == 2, "HTTP log redaction handshake stalled");
 }
 
-void HttpLogRedaction() {
-    auto name = (std::filesystem::temp_directory_path() / "cnode-http-logs-XXXXXX").string();
-    Require(::mkdtemp(name.data()) != nullptr, "HTTP log test directory creation failed");
-    const std::filesystem::path directory(name);
-    try {
-        Require(::Log::Init({.level = LogLevel::TRACE, .log_dir = directory,
-                            .access_path = {}, .error_path = "error.log", .max_days = 1,
-                            .rotate_daily = false, .gzip = false}),
-                "HTTP log test initialization failed");
-        constexpr std::string_view secret_url =
-            "http://user:review_password@example.com/?token=review_token#review_fragment";
-        for (const std::string_view network : {"http", "httpupgrade", "ws", "xhttp"}) {
-            const std::string method = network == "xhttp" ? "POST" : "GET";
-            const std::string target = network == "xhttp" ? "/up/" : "/up";
-            const std::string start = method + " " + target;
-            HttpLogHandshake(network, false, start + " HTTP/1.1", true);
-            HttpLogHandshake(network, false, method + "   " + target + "   HTTP/1.1", true);
-            HttpLogHandshake(network, false,
-                start + " HTTP/1.1 " + std::string(secret_url), network != "ws");
-            // WS tolerates extra tokens when the final version is HTTP/1.1.
-            HttpLogHandshake(network, false,
-                start + " HTTP/1.1 " + std::string(secret_url) + " HTTP/1.1", true);
-            HttpLogHandshake(network, false, start, false);
-            HttpLogHandshake(network, false, start + " ", network != "ws");
-            HttpLogHandshake(network, false,
-                start + " " + std::string(secret_url), network != "ws");
-            HttpLogHandshake(network, false,
-                start + " HTTP/1.review_password?review_token#review_fragment", network != "ws");
-            HttpLogHandshake(network, false,
-                start + "?token=review_token#review_fragment HTTP/1.1", true);
-            HttpLogHandshake(network, false,
-                start + " HTTP/1.1", true, "/up", secret_url);
-            for (const std::string_view invalid_target : {
-                    "http://user:review_password@example.com/up?token=review_token#review_fragment",
-                    "//user:review_password@example.com/up?token=review_token#review_fragment",
-                    "///user:review_password@example.com/up?token=review_token#review_fragment",
-                    "http:///user:review_password@example.com/up?token=review_token#review_fragment",
-                    "http://user:review_password@/up?token=review_token#review_fragment",
-                    "http:/user:review_password@example.com/up?token=review_token#review_fragment",
-                    "/up\nforged_log_line?token=review_token#review_fragment"}) {
-                HttpLogHandshake(network, false, method + " " + std::string(invalid_target) + " HTTP/1.1", false);
-            }
-            HttpLogHandshake(network, false,
-                std::string(secret_url) + " " + target + " HTTP/1.1", false);
+TEST_F(TransportBehavior, WriteDeadlineResetsQueuedPayload) {
+    WriteTimeoutResetsQueuedPayload();
+}
+
+TEST_F(TransportBehavior, PrependPreservesExistingTcpResidualAndCloseDiscardsIt) {
+    ExistingTcpResidual();
+}
+
+class HttpReadAhead : public TransportBehavior,
+                     public testing::WithParamInterface<std::tuple<bool, bool, bool, bool, bool>> {};
+TEST_P(HttpReadAhead, PreservesReadAheadThroughCancellationAndShutdown) {
+    const auto [outbound, tls, upgrade, fragmented, abortive] = GetParam();
+    Case(outbound, tls, upgrade, fragmented, abortive);
+}
+INSTANTIATE_TEST_SUITE_P(TransportModes, HttpReadAhead, testing::Combine(testing::Bool(), testing::Bool(), testing::Bool(), testing::Bool(), testing::Bool()), ([](const auto& info) { const auto [outbound, tls, upgrade, fragmented, abortive] = info.param;
+return std::string(outbound ? "Outbound" : "Inbound") + (tls ? "Tls" : "Tcp") +
+    (upgrade ? "Upgrade" : "Http") + (fragmented ? "Fragmented" : "Coalesced") +
+    (abortive ? "Abortive" : "Graceful"); }));
+
+class TlsTermination : public TransportBehavior,
+                       public testing::WithParamInterface<std::tuple<bool, bool>> {};
+TEST_P(TlsTermination, DistinguishesAuthenticatedEofFromTruncatedTls) {
+    const auto [multi_buffer, clean] = GetParam();
+    TlsReadTermination(multi_buffer, clean);
+}
+INSTANTIATE_TEST_SUITE_P(ReadModes, TlsTermination, testing::Combine(testing::Bool(), testing::Bool()), ([](const auto& info) { const auto [multi, clean] = info.param;
+return std::string(multi ? "MultiBuffer" : "SmallRead") + (clean ? "CloseNotify" : "Truncated"); }));
+
+enum class ResumeBoundary { ShortLength, Extended16, Extended64, Mask, Payload, Ping, Close, EmptyClose, Text };
+class WsReadResume : public TransportBehavior,
+                     public testing::WithParamInterface<std::tuple<bool, bool, ResumeBoundary>> {};
+TEST_P(WsReadResume, CancellationPreservesPartialFrameStateAndAllowsWrites) {
+    const auto [client, multi, boundary] = GetParam();
+    switch (boundary) {
+        case ResumeBoundary::ShortLength: WsResume(client, multi, 17, 1); break;
+        case ResumeBoundary::Extended16: WsResume(client, multi, 257, 3); break;
+        case ResumeBoundary::Extended64: WsResume(client, multi, 65539, 5); break;
+        case ResumeBoundary::Mask: WsResume(client, multi, 17, 4); break;
+        case ResumeBoundary::Payload: WsResume(client, multi, 257, (client ? 4 : 8) + 3); break;
+        case ResumeBoundary::Ping: WsResume(client, multi, 9, (client ? 2 : 6) + 2, 9); break;
+        case ResumeBoundary::Close: WsResume(client, multi, 5, (client ? 2 : 6) + 1, 8); break;
+        case ResumeBoundary::EmptyClose: WsResume(client, multi, 0, 1, 8); break;
+        case ResumeBoundary::Text: WsResume(client, multi, 7, 1, 1); break;
+    }
+}
+std::vector<std::tuple<bool, bool, ResumeBoundary>> ResumeCases() {
+    std::vector<std::tuple<bool, bool, ResumeBoundary>> cases;
+    for (bool client : {false, true})
+        for (bool multi : {false, true})
+            for (auto boundary : {ResumeBoundary::ShortLength, ResumeBoundary::Extended16,
+                    ResumeBoundary::Extended64, ResumeBoundary::Mask, ResumeBoundary::Payload,
+                    ResumeBoundary::Ping, ResumeBoundary::Close, ResumeBoundary::EmptyClose, ResumeBoundary::Text})
+                if (!client || boundary != ResumeBoundary::Mask) cases.emplace_back(client, multi, boundary);
+    return cases;
+}
+INSTANTIATE_TEST_SUITE_P(FrameBoundaries, WsReadResume, testing::ValuesIn(ResumeCases()), ([](const auto& info) { const auto [client, multi, boundary] = info.param;
+constexpr const char* names[]{"ShortLength", "Extended16", "Extended64", "Mask", "Payload",
+                             "Ping", "Close", "EmptyClose", "Text"};
+return std::string(client ? "Client" : "Server") + (multi ? "Multi" : "Small") +
+    names[static_cast<size_t>(boundary)]; }));
+
+class WsConcurrentWrite : public TransportBehavior,
+                          public testing::WithParamInterface<std::tuple<WsConcurrent, bool>> {};
+TEST_P(WsConcurrentWrite, SerializesControlFramesAndAbortsCancelledPartialWrite) {
+    const auto [action, owned] = GetParam();
+    WsWriteBoundary(action, owned);
+}
+INSTANTIATE_TEST_SUITE_P(ControlAndOwnership, WsConcurrentWrite, testing::Combine(testing::Values(WsConcurrent::Ping, WsConcurrent::Close, WsConcurrent::Cancel), testing::Bool()), ([](const auto& info) { const auto [action, owned] = info.param;
+const char* name = action == WsConcurrent::Ping ? "Ping" : action == WsConcurrent::Close ? "Close" : "Cancel";
+return std::string(name) + (owned ? "OwnedBuffers" : "BorrowedBuffers"); }));
+
+enum class InvalidWsFrame {
+    ReservedBits, ReservedDataOpcode, ReservedControlOpcode, WrongMask, FragmentedPing, OverlongPing,
+    UnexpectedContinuation, NewDataDuringContinuation, ShortClose, InvalidCloseCode, InvalidCloseUtf8,
+    InvalidTextUtf8, Noncanonical16, Noncanonical64, HighLengthBit, OversizedPayload, TruncatedHeader, TruncatedPayload
+};
+std::string InvalidFrame(InvalidWsFrame fault, bool masked) {
+    switch (fault) {
+        case InvalidWsFrame::ReservedBits: {
+            auto frame = WsWireFrame(2, "bad", masked);
+            frame[0] = static_cast<char>(0xc2);
+            return frame;
         }
-        HttpLogHandshake("xhttp", false,
-            "GET /up/session#review_fragment HTTP/1.1", true);
-        for (const std::string_view network : {"http", "httpupgrade", "ws"}) {
-            HttpLogHandshake(network, true, std::string("HTTP/1.1 400 ") + std::string(secret_url), false);
-            const std::string response = network == "http" ? "HTTP/1.1 200 OK" : "HTTP/1.1 101 Switching Protocols";
-            HttpLogHandshake(network, true, response, true,
+        case InvalidWsFrame::ReservedDataOpcode: return WsWireFrame(3, "bad", masked);
+        case InvalidWsFrame::ReservedControlOpcode: return WsWireFrame(11, "bad", masked);
+        case InvalidWsFrame::WrongMask: return WsWireFrame(2, "bad", !masked);
+        case InvalidWsFrame::FragmentedPing: return WsWireFrame(9, "bad", masked, false);
+        case InvalidWsFrame::OverlongPing: return WsWireFrame(9, std::string(126, 'x'), masked);
+        case InvalidWsFrame::UnexpectedContinuation: return WsWireFrame(0, "bad", masked);
+        case InvalidWsFrame::NewDataDuringContinuation:
+            return WsWireFrame(2, "", masked, false) + WsWireFrame(2, "bad", masked);
+        case InvalidWsFrame::ShortClose: return WsWireFrame(8, "x", masked);
+        case InvalidWsFrame::InvalidCloseCode: return WsWireFrame(8, std::string("\x03\xed", 2), masked);
+        case InvalidWsFrame::InvalidCloseUtf8: return WsWireFrame(8, std::string("\x03\xe8\xc0\x80", 4), masked);
+        case InvalidWsFrame::InvalidTextUtf8: return WsWireFrame(1, std::string("\xe2", 1), masked);
+        case InvalidWsFrame::TruncatedHeader: return std::string(1, static_cast<char>(0x82));
+        case InvalidWsFrame::TruncatedPayload: {
+            auto frame = WsWireFrame(2, "truncated", masked);
+            frame.resize(frame.size() - 9);
+            return frame;
+        }
+        default: break;
+    }
+    const char direction = masked ? static_cast<char>(0x80) : 0;
+    if (fault == InvalidWsFrame::Noncanonical16)
+        return {static_cast<char>(0x82), static_cast<char>(direction | 126), 0, 125};
+    std::string extended{static_cast<char>(0x82), static_cast<char>(direction | 127),
+                        0, 0, 0, 0, 0, 0, static_cast<char>(0xff), static_cast<char>(0xff)};
+    if (fault == InvalidWsFrame::HighLengthBit) extended[2] = static_cast<char>(0x80);
+    if (fault == InvalidWsFrame::OversizedPayload) {
+        extended[7] = 0x40;
+        extended[8] = 0;
+        extended[9] = 1;
+    }
+    return extended;
+}
+class WsMalformedFrame : public TransportBehavior,
+                         public testing::WithParamInterface<std::tuple<bool, bool, InvalidWsFrame>> {};
+TEST_P(WsMalformedFrame, RejectsProtocolViolationWithoutReturningDataOrCleanEof) {
+    const auto [client, multi, fault] = GetParam();
+    WsReject(InvalidFrame(fault, !client), client, multi);
+}
+INSTANTIATE_TEST_SUITE_P(ProtocolFaults, WsMalformedFrame, testing::Combine(
+    testing::Bool(), testing::Bool(), testing::Values(
+        InvalidWsFrame::ReservedBits, InvalidWsFrame::ReservedDataOpcode, InvalidWsFrame::ReservedControlOpcode,
+        InvalidWsFrame::WrongMask, InvalidWsFrame::FragmentedPing, InvalidWsFrame::OverlongPing,
+        InvalidWsFrame::UnexpectedContinuation, InvalidWsFrame::NewDataDuringContinuation,
+        InvalidWsFrame::ShortClose, InvalidWsFrame::InvalidCloseCode, InvalidWsFrame::InvalidCloseUtf8,
+        InvalidWsFrame::InvalidTextUtf8, InvalidWsFrame::Noncanonical16, InvalidWsFrame::Noncanonical64,
+        InvalidWsFrame::HighLengthBit, InvalidWsFrame::OversizedPayload,
+        InvalidWsFrame::TruncatedHeader, InvalidWsFrame::TruncatedPayload)));
+
+struct ConnectionTokens { const char* headers; bool accepted; };
+class HttpUpgradeTokens : public TransportBehavior,
+                         public testing::WithParamInterface<std::tuple<bool, bool, ConnectionTokens>> {};
+TEST_P(HttpUpgradeTokens, RequiresAnUpgradeTokenAcrossAllConnectionHeaders) {
+    const auto [outbound, websocket, tokens] = GetParam();
+    UpgradeHeaderTokens(outbound, websocket, tokens.headers, tokens.accepted);
+}
+INSTANTIATE_TEST_SUITE_P(DirectionsAndModes, HttpUpgradeTokens, testing::Combine(
+    testing::Bool(), testing::Bool(), testing::Values(
+        ConnectionTokens{"Connection: keep-alive\r\ncOnNeCtIoN: UpGrAdE\r\n", true},
+        ConnectionTokens{"Connection: , keep-alive, ,UPGRADE,\r\n", true},
+        ConnectionTokens{"Connection: Upgrade\r\nConnection: keep-alive\r\n", true},
+        ConnectionTokens{"", false}, ConnectionTokens{"Connection: x-upgrade\r\n", false},
+        ConnectionTokens{"Connection: upgraded\r\n", false},
+        ConnectionTokens{"Connection: keep-alive\r\nConnection: not-upgrade\r\n", false})));
+
+struct ChunkBody { const char* wire; bool accepted; };
+class HttpChunkGrammar : public TransportBehavior,
+                        public testing::WithParamInterface<std::tuple<bool, ChunkBody>> {};
+TEST_P(HttpChunkGrammar, DecodesValidExtensionsAndRejectsMalformedOrTruncatedFraming) {
+    const auto [multi, body] = GetParam();
+    ChunkExtensionBody(body.wire, body.accepted, multi);
+}
+INSTANTIATE_TEST_SUITE_P(ReadModesAndGrammar, HttpChunkGrammar, testing::Combine(
+    testing::Bool(), testing::Values(
+        ChunkBody{"2 \t; name = \"a;\\\"b\\\\c\";flag\r\nOK\r\n0\r\n\r\n", true},
+        ChunkBody{"2;x=\"unterminated\r\nOK\r\n0\r\n\r\n", false},
+        ChunkBody{"2;x=\r\nOK\r\n0\r\n\r\n", false}, ChunkBody{"2;\r\nOK\r\n0\r\n\r\n", false},
+        ChunkBody{"2 0\r\nOK\r\n0\r\n\r\n", false}, ChunkBody{"2\nOK\r\n0\r\n\r\n", false},
+        ChunkBody{"2\r\nOK\n0\r\n\r\n", false}, ChunkBody{"2\r\nO", false},
+        ChunkBody{"0\r\n", false}, ChunkBody{"10000000000000000\r\nOK\r\n0\r\n\r\n", false})));
+
+enum class DiagnosticRequest {
+    Normal, ExtraSpaces, TrailingSecret, VersionAfterSecret, MissingVersion, EmptyVersion,
+    SecretVersion, MalformedVersion, QuerySecret, SecretHost, AbsoluteTarget, AuthorityTarget,
+    TripleSlashTarget, EmptyAuthorityTarget, MissingHostTarget, MissingSlashTarget, ControlTarget, SecretMethod
+};
+constexpr std::string_view kSecretUrl =
+    "http://user:review_password@example.com/?token=review_token#review_fragment";
+class HttpInboundDiagnostics : public HttpDiagnosticBehavior,
+                              public testing::WithParamInterface<std::tuple<const char*, DiagnosticRequest>> {};
+TEST_P(HttpInboundDiagnostics, RedactsUntrustedInputWithoutChangingHandshakeAcceptance) {
+    const auto [network, fault] = GetParam();
+    const bool xhttp = std::string_view(network) == "xhttp";
+    const bool ws = std::string_view(network) == "ws";
+    const std::string method = xhttp ? "POST" : "GET";
+    const std::string target = xhttp ? "/up/" : "/up";
+    const std::string start = method + " " + target;
+    std::string line = start + " HTTP/1.1";
+    std::string host = "localhost";
+    bool accepted = true;
+    switch (fault) {
+        case DiagnosticRequest::Normal: break;
+        case DiagnosticRequest::ExtraSpaces: line = method + "   " + target + "   HTTP/1.1"; break;
+        case DiagnosticRequest::TrailingSecret: line = start + " HTTP/1.1 " + std::string(kSecretUrl); accepted = !ws; break;
+        case DiagnosticRequest::VersionAfterSecret: line = start + " HTTP/1.1 " + std::string(kSecretUrl) + " HTTP/1.1"; break;
+        case DiagnosticRequest::MissingVersion: line = start; accepted = false; break;
+        case DiagnosticRequest::EmptyVersion: line = start + " "; accepted = !ws; break;
+        case DiagnosticRequest::SecretVersion: line = start + " " + std::string(kSecretUrl); accepted = !ws; break;
+        case DiagnosticRequest::MalformedVersion:
+            line = start + " HTTP/1.review_password?review_token#review_fragment"; accepted = !ws; break;
+        case DiagnosticRequest::QuerySecret: line = start + "?token=review_token#review_fragment HTTP/1.1"; break;
+        case DiagnosticRequest::SecretHost: host = kSecretUrl; break;
+        case DiagnosticRequest::SecretMethod: line = std::string(kSecretUrl) + " " + target + " HTTP/1.1"; accepted = false; break;
+        default: {
+            constexpr const char* invalid_targets[]{
                 "http://user:review_password@example.com/up?token=review_token#review_fragment",
-                secret_url);
+                "//user:review_password@example.com/up?token=review_token#review_fragment",
+                "///user:review_password@example.com/up?token=review_token#review_fragment",
+                "http:///user:review_password@example.com/up?token=review_token#review_fragment",
+                "http://user:review_password@/up?token=review_token#review_fragment",
+                "http:/user:review_password@example.com/up?token=review_token#review_fragment",
+                "/up\nforged_log_line?token=review_token#review_fragment"};
+            line = method + " " + invalid_targets[static_cast<size_t>(fault) -
+                static_cast<size_t>(DiagnosticRequest::AbsoluteTarget)] + " HTTP/1.1";
+            accepted = false;
+            break;
+        }
+    }
+    HttpLogHandshake(network, false, line, accepted, "/up", host);
+    ExpectRedactedDiagnostics();
+}
+INSTANTIATE_TEST_SUITE_P(NetworksAndUntrustedFields, HttpInboundDiagnostics, testing::Combine(
+    testing::Values("http", "httpupgrade", "ws", "xhttp"), testing::Values(
+        DiagnosticRequest::Normal, DiagnosticRequest::ExtraSpaces, DiagnosticRequest::TrailingSecret,
+        DiagnosticRequest::VersionAfterSecret, DiagnosticRequest::MissingVersion, DiagnosticRequest::EmptyVersion,
+        DiagnosticRequest::SecretVersion, DiagnosticRequest::MalformedVersion, DiagnosticRequest::QuerySecret,
+        DiagnosticRequest::SecretHost, DiagnosticRequest::AbsoluteTarget, DiagnosticRequest::AuthorityTarget,
+        DiagnosticRequest::TripleSlashTarget, DiagnosticRequest::EmptyAuthorityTarget,
+        DiagnosticRequest::MissingHostTarget, DiagnosticRequest::MissingSlashTarget,
+        DiagnosticRequest::ControlTarget, DiagnosticRequest::SecretMethod)));
+
+TEST_F(HttpDiagnosticBehavior, RedactsXhttpDownlinkFragmentWithoutRejectingSession) {
+    HttpLogHandshake("xhttp", false, "GET /up/session#review_fragment HTTP/1.1", true);
+    ExpectRedactedDiagnostics();
+}
+
+enum class DiagnosticResponse { RejectedReason, AbsolutePath, MalformedAbsolutePath, PublicAtSignPath };
+class HttpOutboundDiagnostics : public HttpDiagnosticBehavior,
+                               public testing::WithParamInterface<std::tuple<const char*, DiagnosticResponse>> {};
+TEST_P(HttpOutboundDiagnostics, RedactsResponseAndConfiguredTargetWithoutChangingWireRequest) {
+    const auto [network, input] = GetParam();
+    const std::string response = std::string_view(network) == "http" ? "HTTP/1.1 200 OK" : "HTTP/1.1 101 Switching Protocols";
+    switch (input) {
+        case DiagnosticResponse::RejectedReason:
+            HttpLogHandshake(network, true, "HTTP/1.1 400 " + std::string(kSecretUrl), false); break;
+        case DiagnosticResponse::AbsolutePath:
             HttpLogHandshake(network, true, response, true,
-                "http:///user:review_password@example.com/up?token=review_token#review_fragment");
-            HttpLogHandshake(network, true, response, true, "/public/@name?token=review_token#review_fragment");
-        }
-        ::Log::Shutdown();
-        std::ifstream input(directory / "error.log");
-        Require(input.is_open(), "HTTP diagnostics were not written");
-        std::string diagnostics;
-        for (std::string line; std::getline(input, line);) {
-            for (unsigned char ch : line)
-                Require(ch >= 0x20 && ch != 0x7f, "HTTP diagnostic contains a raw control character");
-            diagnostics += line + '\n';
-        }
-        for (const std::string_view secret : {
-                "review_password", "review_token", "review_fragment", "forged_log_line"})
-            Require(diagnostics.find(secret) == std::string::npos, "HTTP diagnostics leaked untrusted input");
-        for (const std::string_view marker : {
-                "HTTPUpgrade server request line='GET /up HTTP/1.1'",
-                "WebSocket server path mismatch",
-                "XHTTP server H1 request line='POST /up/ HTTP/1.1'",
-                "XHTTP server split downlink ready session=session ",
-                "client request rejected", "WebSocket client upgrade rejected",
-                "[invalid HTTP target]", "[invalid version]", "[invalid method]",
-                "example.com/up", "/public/@name"})
-            Require(diagnostics.find(marker) != std::string::npos, "HTTP diagnostic coverage missing");
-    } catch (...) {
-        ::Log::Shutdown();
-        std::filesystem::remove_all(directory);
-        throw;
+                "http://user:review_password@example.com/up?token=review_token#review_fragment", kSecretUrl); break;
+        case DiagnosticResponse::MalformedAbsolutePath:
+            HttpLogHandshake(network, true, response, true,
+                "http:///user:review_password@example.com/up?token=review_token#review_fragment"); break;
+        case DiagnosticResponse::PublicAtSignPath:
+            HttpLogHandshake(network, true, response, true, "/public/@name?token=review_token#review_fragment"); break;
     }
-    std::filesystem::remove_all(directory);
+    ExpectRedactedDiagnostics();
 }
+INSTANTIATE_TEST_SUITE_P(NetworksAndUntrustedFields, HttpOutboundDiagnostics, testing::Combine(
+    testing::Values("http", "httpupgrade", "ws"), testing::Values(
+        DiagnosticResponse::RejectedReason, DiagnosticResponse::AbsolutePath,
+        DiagnosticResponse::MalformedAbsolutePath, DiagnosticResponse::PublicAtSignPath)));
 
-// D4：WebSocket 与 HTTPUpgrade 共用路径语义（同 Xray hub 比较 URL.Path）：忽略
-// query，未配置或配置为根路径时不放行其他路径。
-void UpgradePathMatching() {
-    for (const std::string_view network : {"ws", "httpupgrade"}) {
-        HttpLogHandshake(network, false, "GET /up?ed=2048 HTTP/1.1", true);
-        HttpLogHandshake(network, false, "GET /down HTTP/1.1", false);
-        HttpLogHandshake(network, false, "GET /up/child HTTP/1.1", false);
-        HttpLogHandshake(network, false, "GET /?ed=2048 HTTP/1.1", true, "/");
-        HttpLogHandshake(network, false, "GET /up HTTP/1.1", false, "/");
-        HttpLogHandshake(network, false, "GET /up?ed=2048 HTTP/1.1", false, "/");
-    }
+struct UpgradePath { const char* request; const char* configured; bool accepted; };
+class HttpUpgradePath : public TransportBehavior,
+                        public testing::WithParamInterface<std::tuple<const char*, UpgradePath>> {};
+TEST_P(HttpUpgradePath, IgnoresQueryButRequiresExactPathIncludingRoot) {
+    const auto [network, path] = GetParam();
+    HttpLogHandshake(network, false, path.request, path.accepted, path.configured);
 }
-
+INSTANTIATE_TEST_SUITE_P(NetworksAndPaths, HttpUpgradePath, testing::Combine(
+    testing::Values("ws", "httpupgrade"), testing::Values(
+        UpgradePath{"GET /up?ed=2048 HTTP/1.1", "/up", true},
+        UpgradePath{"GET /down HTTP/1.1", "/up", false},
+        UpgradePath{"GET /up/child HTTP/1.1", "/up", false},
+        UpgradePath{"GET /?ed=2048 HTTP/1.1", "/", true},
+        UpgradePath{"GET /up HTTP/1.1", "/", false},
+        UpgradePath{"GET /up?ed=2048 HTTP/1.1", "/", false})));
 }  // namespace
-
-TEST(HttpHandshakeReadAhead, Contract) {
-    ::TlsStream::InitializeIo();
-    bool passed = true;
-    try {
-        ConnectedSocketOptions();
-        WriteTimeoutResetsQueuedPayload();
-        ExistingTcpResidual();
-        for (bool multi_buffer : {false, true})
-            for (bool clean : {true, false})
-                TlsReadTermination(multi_buffer, clean);
-        WsProtocolBoundaries();
-        HttpBoundaryCases();
-        HttpLogRedaction();
-        UpgradePathMatching();
-        for (bool outbound : {false, true})
-            for (bool tls : {false, true})
-                for (bool upgrade : {false, true})
-                    for (bool fragmented : {false, true})
-                        for (bool abortive : {false, true})
-                            Case(outbound, tls, upgrade, fragmented, abortive);
-        Require(::memory::detail::test_buffers_live == 0, "test retained payload blocks");
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        passed = false;
-    }
-    { ASSERT_TRUE(passed); return; }
-}
-
-TEST(HttpHandshakeReadAhead, UpgradePathIgnoresQueryAndMatchesExactly) {
-    UpgradePathMatching();
-}

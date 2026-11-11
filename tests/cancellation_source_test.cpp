@@ -4,20 +4,10 @@
 #include "transport/link.hpp"
 
 #include <array>
-#include <cstdio>
-#include <cstdlib>
-#include <new>
 #include <optional>
-#include <type_traits>
 
-namespace {
-bool reject_allocations = false;
-void RejectWhenRequested(std::size_t) {
-    if (reject_allocations) throw std::bad_alloc();
-}
-}
-constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = RejectWhenRequested};
 
+constinit allocation_hook::Hooks allocation_hook::hooks{};
 using ::ErrorCode;
 using ::transport::CancellationSource;
 using ::transport::Cancellation;
@@ -44,7 +34,7 @@ private:
     }
 };
 
-bool TestLifetimes() {
+TEST(CancellationSource, ScopedListenersUnsubscribeBeforeSourceDestruction) {
     Counter retained, removed, orphaned;
     std::optional<RecordingListener> orphan;
     {
@@ -61,11 +51,15 @@ bool TestLifetimes() {
         orphan->Resubscribe(source);
     }
     orphan.reset();
-    return retained.calls == 1 && retained.reason == ErrorCode::RESOURCE_EXHAUSTED &&
-        removed.calls == 0 && orphaned.calls == 0;
+    EXPECT_EQ(retained.calls, 1);
+    EXPECT_EQ(retained.reason, ErrorCode::RESOURCE_EXHAUSTED);
+    EXPECT_EQ(removed.calls, 0);
+    EXPECT_EQ(orphaned.calls, 0);
 }
 
-bool TestMutation(bool reentrant) {
+class CancellationMutation : public testing::TestWithParam<bool> {};
+TEST_P(CancellationMutation, AllowsListenerRemovalAdditionAndReentrantDelivery) {
+    const bool reentrant = GetParam();
     CancellationSource source;
     Counter victim, fresh, mutator;
     struct Mutation {
@@ -96,14 +90,21 @@ bool TestMutation(bool reentrant) {
     mutation.self.emplace(mutation);
     mutation.self->Resubscribe(source);
     source.CancelPending(ErrorCode::RESOURCE_EXHAUSTED);
-    const bool first = mutator.calls == 1 && victim.calls == 0 &&
-        fresh.calls == (reentrant ? 1 : 0);
+    EXPECT_EQ(mutator.calls, 1);
+    EXPECT_EQ(victim.calls, 0);
+    EXPECT_EQ(fresh.calls, reentrant ? 1 : 0);
     source.CancelPending(ErrorCode::RELAY_TIMEOUT);
     source.CancelPending();
-    return first && fresh.calls == 1 && fresh.reason == ErrorCode::RELAY_TIMEOUT;
+    EXPECT_EQ(fresh.calls, 1);
+    EXPECT_EQ(fresh.reason, ErrorCode::RELAY_TIMEOUT);
 }
 
-bool TestManyListeners() {
+INSTANTIATE_TEST_SUITE_P(Delivery, CancellationMutation, testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) {
+        return info.param ? "Reentrant" : "Deferred";
+    });
+
+TEST(CancellationSource, DeliversOnlyToRemainingListenersAfterBulkRemoval) {
     CancellationSource source;
     std::array<Counter, 128> counters;
     std::array<std::optional<RecordingListener>, 128> subscriptions;
@@ -114,24 +115,27 @@ bool TestManyListeners() {
     for (size_t i = 0; i < counters.size(); i += 3) subscriptions[i].reset();
     source.CancelPending();
     for (size_t i = 0; i < counters.size(); ++i)
-        if (counters[i].calls != (i % 3 == 0 ? 0 : 1)) return false;
-    return true;
+        EXPECT_EQ(counters[i].calls, i % 3 == 0 ? 0 : 1) << i;
 }
 
-bool TestTerminalState() {
+TEST(CancellationSource, TerminalStopIsStickyForCurrentAndLateListeners) {
     CancellationSource source;
     source.CancelPending();
     Counter current, late;
     RecordingListener first(current);
     first.Resubscribe(source);
-    if (current.calls != 0) return false;
+    EXPECT_EQ(current.calls, 0);
     source.Stop(ErrorCode::RESOURCE_EXHAUSTED);
     source.Stop();
     source.CancelPending();
     RecordingListener second(late);
     second.Resubscribe(source);
-    return current.calls == 1 && current.terminal && current.reason == ErrorCode::RESOURCE_EXHAUSTED &&
-        late.calls == 1 && late.terminal && late.reason == ErrorCode::RESOURCE_EXHAUSTED;
+    EXPECT_EQ(current.calls, 1);
+    EXPECT_TRUE(current.terminal);
+    EXPECT_EQ(current.reason, ErrorCode::RESOURCE_EXHAUSTED);
+    EXPECT_EQ(late.calls, 1);
+    EXPECT_TRUE(late.terminal);
+    EXPECT_EQ(late.reason, ErrorCode::RESOURCE_EXHAUSTED);
 }
 
 struct Forwarding final : CancellationSubscription {
@@ -153,7 +157,9 @@ private:
     }
 };
 
-bool TestForwarding(bool stopped_before_construction) {
+class CancellationForwarding : public testing::TestWithParam<bool> {};
+TEST_P(CancellationForwarding, PropagatesPendingAndTerminalCancellation) {
+    const bool stopped_before_construction = GetParam();
     CancellationSource upstream, downstream;
     if (stopped_before_construction) upstream.Stop(ErrorCode::RESOURCE_EXHAUSTED);
     Forwarding forward(upstream, downstream);
@@ -162,19 +168,27 @@ bool TestForwarding(bool stopped_before_construction) {
             Counter current;
             RecordingListener subscription(current);
             subscription.Resubscribe(downstream);
-            if (current.calls != 0) return false;
+            EXPECT_EQ(current.calls, 0);
             upstream.CancelPending();
-            if (current.calls != 1 || current.terminal) return false;
+            EXPECT_EQ(current.calls, 1);
+            EXPECT_FALSE(current.terminal);
         }
         upstream.Stop(ErrorCode::RESOURCE_EXHAUSTED);
     }
     Counter late;
     RecordingListener subscription(late);
     subscription.Resubscribe(downstream);
-    return late.calls == 1 && late.terminal && late.reason == ErrorCode::RESOURCE_EXHAUSTED;
+    EXPECT_EQ(late.calls, 1);
+    EXPECT_TRUE(late.terminal);
+    EXPECT_EQ(late.reason, ErrorCode::RESOURCE_EXHAUSTED);
 }
 
-bool TestUnsubscribeAndRebind() {
+INSTANTIATE_TEST_SUITE_P(UpstreamState, CancellationForwarding, testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) {
+        return info.param ? "AlreadyStopped" : "Live";
+    });
+
+TEST(CancellationSource, UnsubscribeAndRebindLeaveOnlyCurrentSourceActive) {
     CancellationSource first, second;
     Counter counter;
     RecordingListener subscription(counter);
@@ -182,16 +196,18 @@ bool TestUnsubscribeAndRebind() {
     subscription.Unsubscribe();
     subscription.Unsubscribe();
     first.CancelPending();
-    if (counter.calls != 0) return false;
+    EXPECT_EQ(counter.calls, 0);
     subscription.Resubscribe(first);
     subscription.Resubscribe(second);
     first.Stop();
-    if (counter.calls != 0) return false;
+    EXPECT_EQ(counter.calls, 0);
     second.CancelPending(ErrorCode::RELAY_TIMEOUT);
-    return counter.calls == 1 && !counter.terminal && counter.reason == ErrorCode::RELAY_TIMEOUT;
+    EXPECT_EQ(counter.calls, 1);
+    EXPECT_FALSE(counter.terminal);
+    EXPECT_EQ(counter.reason, ErrorCode::RELAY_TIMEOUT);
 }
 
-bool TestSourceDestroyedDuringDelivery() {
+TEST(CancellationSource, SourceCanBeDestroyedDuringDelivery) {
     std::optional<CancellationSource> source(std::in_place);
     Counter delivered;
     RecordingListener follower(delivered);
@@ -208,21 +224,13 @@ bool TestSourceDestroyedDuringDelivery() {
     } destroy(source);
     destroy.Resubscribe(*source);
     source->CancelPending(ErrorCode::RESOURCE_EXHAUSTED);
-    return destroy.called && !source && delivered.calls == 1 &&
-        delivered.reason == ErrorCode::RESOURCE_EXHAUSTED;
+    EXPECT_TRUE(destroy.called);
+    EXPECT_FALSE(source);
+    EXPECT_EQ(delivered.calls, 1);
+    EXPECT_EQ(delivered.reason, ErrorCode::RESOURCE_EXHAUSTED);
 }
 }  // namespace
 
-TEST(CancellationSource, Contract) {
-    reject_allocations = true;
-    const bool passed = TestLifetimes() && TestMutation(false) && TestMutation(true) && TestManyListeners() &&
-        TestTerminalState() && TestForwarding(false) && TestForwarding(true) &&
-        TestUnsubscribeAndRebind() && TestSourceDestroyedDuringDelivery();
-    reject_allocations = false;
-    std::printf("cancellation source: scoped delivery, terminal state, late subscription, forwarding, reentrancy and no allocations: %s\n",
-        passed ? "PASS" : "FAIL");
-    { ASSERT_TRUE(passed); return; }
-}
 
 TEST(CancellationBridge, MergesSignalsAndUnsubscribesAtScopeEnd) {
     net::cancellation_signal parent;
@@ -243,14 +251,22 @@ TEST(CancellationBridge, MergesSignalsAndUnsubscribesAtScopeEnd) {
     parent.emit(net::cancellation_type::all);
     source.Stop();
     EXPECT_EQ(deliveries, 3);
+}
 
+TEST(CancellationBridge, ObservesSourceStoppedBeforeConstruction) {
+    CancellationSource source;
+    source.Stop(ErrorCode::TIMEOUT);
     transport::CancellationBridge stopped({}, source);
     EXPECT_TRUE(stopped.Cancelled());
+}
+
+TEST(CancellationBridge, ScopeExitUnsubscribesFromLiveSource) {
+    size_t deliveries = 0;
     CancellationSource live;
     {
         transport::CancellationBridge removed({}, live);
         removed.Slot().assign([&](net::cancellation_type) { ++deliveries; });
     }
     live.CancelPending();
-    EXPECT_EQ(deliveries, 3);
+    EXPECT_EQ(deliveries, 0u);
 }

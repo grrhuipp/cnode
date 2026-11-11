@@ -84,68 +84,65 @@ ClientHelloFixture BuildClientHello(
 
 }  // namespace
 
-TEST(TlsSniffer, Contract) {
-    auto valid = BuildClientHello();
-    const auto valid_result = ::SniffTls(valid.bytes);
-    ASSERT_TRUE(valid_result.success && valid_result.domain == "example.com")
-        << "a canonical ClientHello must be sniffed";
+TEST(TlsSniffer, ExtractsCanonicalClientHelloServerName) {
+    const auto result = ::SniffTls(BuildClientHello().bytes);
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.domain, "example.com");
+}
 
-    auto malformed_sni = BuildClientHello(true);
-    ASSERT_FALSE(::SniffTls(malformed_sni.bytes).success)
-        << "malformed bytes after SNI must be rejected";
+TEST(TlsSniffer, RejectsTrailingMalformedSniBytes) {
+    EXPECT_FALSE(::SniffTls(BuildClientHello(true).bytes).success);
+}
 
-    auto short_record = BuildClientHello();
-    SetU16(short_record.bytes, 3, short_record.bytes.size() - 6);
-    ASSERT_FALSE(::SniffTls(short_record.bytes).success)
-        << "bytes outside the declared TLS record must be ignored";
+TEST(TlsSniffer, DoesNotReadBeyondDeclaredRecord) {
+    auto hello = BuildClientHello();
+    SetU16(hello.bytes, 3, hello.bytes.size() - 6);
+    EXPECT_FALSE(::SniffTls(hello.bytes).success);
+}
 
-    auto long_record = BuildClientHello();
-    SetU16(long_record.bytes, 3, long_record.bytes.size() - 4);
-    const auto partial_record_res = ::SniffTls(long_record.bytes);
-    ASSERT_TRUE(!partial_record_res.success && partial_record_res.need_more &&
-                partial_record_res.protocol == "tls")
-        << "an incomplete TLS ClientHello record must request more bytes";
+TEST(TlsSniffer, IncompleteRecordRequestsMoreBytes) {
+    auto hello = BuildClientHello();
+    SetU16(hello.bytes, 3, hello.bytes.size() - 4);
+    const auto result = ::SniffTls(hello.bytes);
+    EXPECT_FALSE(result.success);
+    EXPECT_TRUE(result.need_more);
+    EXPECT_EQ(result.protocol, "tls");
+}
 
-    auto short_handshake = BuildClientHello();
-    SetU24(short_handshake.bytes, 6, short_handshake.bytes.size() - 10);
-    ASSERT_FALSE(::SniffTls(short_handshake.bytes).success)
-        << "bytes outside the declared ClientHello must be ignored";
+TEST(TlsSniffer, DoesNotReadBeyondDeclaredHandshake) {
+    auto hello = BuildClientHello();
+    SetU24(hello.bytes, 6, hello.bytes.size() - 10);
+    EXPECT_FALSE(::SniffTls(hello.bytes).success);
+}
 
-    auto long_extensions = BuildClientHello();
-    SetU16(long_extensions.bytes, long_extensions.extensions_length_offset,
-           long_extensions.bytes.size());
-    ASSERT_FALSE(::SniffTls(long_extensions.bytes).success)
-        << "truncated ClientHello extensions must be rejected";
+TEST(TlsSniffer, RejectsTruncatedExtensionList) {
+    auto hello = BuildClientHello();
+    SetU16(hello.bytes, hello.extensions_length_offset, hello.bytes.size());
+    EXPECT_FALSE(::SniffTls(hello.bytes).success);
+}
 
-    const auto ipv4_sni = BuildClientHello(false, "192.0.2.1");
-    ASSERT_FALSE(::SniffTls(ipv4_sni.bytes).success)
-        << "an IPv4 literal must not be accepted as TLS host_name";
+namespace {
+class TlsInvalidHostName : public testing::TestWithParam<const char*> {};
+TEST_P(TlsInvalidHostName, RejectsNonDnsSniIdentity) {
+    EXPECT_FALSE(::SniffTls(BuildClientHello(false, GetParam()).bytes).success);
+}
+INSTANTIATE_TEST_SUITE_P(Identities, TlsInvalidHostName, testing::Values(
+    "192.0.2.1", "example.com.", "bad..example", "bad_name.example"));
+}
 
-    const auto trailing_dot_sni = BuildClientHello(false, "example.com.");
-    ASSERT_FALSE(::SniffTls(trailing_dot_sni.bytes).success)
-        << "TLS host_name must not contain a trailing dot";
-
-    const auto empty_label_sni = BuildClientHello(false, "bad..example");
-    ASSERT_FALSE(::SniffTls(empty_label_sni.bytes).success)
-        << "TLS host_name must not contain an empty DNS label";
-
-    const auto invalid_label_sni = BuildClientHello(false, "bad_name.example");
-    ASSERT_FALSE(::SniffTls(invalid_label_sni.bytes).success)
-        << "TLS host_name must use DNS hostname labels";
-
-    // A ClientHello split across two TLS Handshake records must be reassembled and sniffed.
+TEST(TlsSniffer, ReassemblesClientHelloAcrossTlsRecords) {
+    const auto valid = BuildClientHello();
     const std::vector<uint8_t> handshake(valid.bytes.begin() + 5, valid.bytes.end());
     const std::size_t split = 20;
-    std::vector<uint8_t> two_records;
-    two_records.push_back(0x16);
-    AppendU16(two_records, 0x0301);
-    AppendU16(two_records, split);
-    two_records.insert(two_records.end(), handshake.begin(), handshake.begin() + split);
-    two_records.push_back(0x16);
-    AppendU16(two_records, 0x0303);
-    AppendU16(two_records, handshake.size() - split);
-    two_records.insert(two_records.end(), handshake.begin() + split, handshake.end());
-    const auto multi_record_res = ::SniffTls(two_records);
-    ASSERT_TRUE(multi_record_res.success && multi_record_res.domain == "example.com")
-        << "a ClientHello spanning two TLS records must be sniffed";
+    std::vector<uint8_t> wire{0x16};
+    AppendU16(wire, 0x0301);
+    AppendU16(wire, split);
+    wire.insert(wire.end(), handshake.begin(), handshake.begin() + split);
+    wire.push_back(0x16);
+    AppendU16(wire, 0x0303);
+    AppendU16(wire, handshake.size() - split);
+    wire.insert(wire.end(), handshake.begin() + split, handshake.end());
+    const auto result = ::SniffTls(wire);
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.domain, "example.com");
 }

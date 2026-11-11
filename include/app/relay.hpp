@@ -27,6 +27,8 @@
 struct RelayConfig {
     std::chrono::seconds uplink_only{defaults::kUplinkOnlyTimeout};     // 下行 EOF 后上行最多保留多久
     std::chrono::seconds downlink_only{defaults::kDownlinkOnlyTimeout}; // 上行 EOF 后下行最多保留多久
+    std::chrono::seconds idle_timeout{0};
+    std::chrono::seconds write_timeout{0};
     uint64_t speed_limit = 0;              // bytes/s，0 = 不限速
 };
 

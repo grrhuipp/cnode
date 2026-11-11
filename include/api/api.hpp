@@ -165,7 +165,7 @@ public:
 
 [[nodiscard]] std::unique_ptr<API> CreatePanelClient(
     net::io_context& io_context,
-    const Config& config,
+    Config config,
     app::dns::DNS& dns_service);
 
 }  // namespace api

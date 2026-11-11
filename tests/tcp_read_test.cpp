@@ -20,6 +20,8 @@ struct ReadFixture {
     tcp::acceptor acceptor{io, {net::ip::address_v4::loopback(), 0}};
     tcp::socket socket{io}, peer{io};
     std::unique_ptr<TcpStream> stream;
+    const bool previous_reject = memory::reject_next_process_allocation;
+    const std::size_t previous_peak = memory::detail::test_buffers_peak;
 
     ReadFixture() {
         socket.open(tcp::v4());
@@ -35,6 +37,8 @@ struct ReadFixture {
         socket.close(ignored);
         io.restart();
         io.run();
+        memory::reject_next_process_allocation = previous_reject;
+        memory::detail::test_buffers_peak = previous_peak;
     }
     void Start() {
         stream = std::make_unique<TcpStream>(std::move(socket));
@@ -56,8 +60,14 @@ struct ReadFixture {
     template<class T> T Finish(std::future<T> future) {
         io.restart();
         io.run_for(3s);
-        if (future.wait_for(0s) != std::future_status::ready)
+        if (future.wait_for(0s) != std::future_status::ready) {
+            if (stream) stream->CloseAbortive();
+            IoErrorCode ignored;
+            peer.close(ignored);
+            io.restart();
+            io.run();
             throw std::runtime_error("TCP read did not complete within deadline");
+        }
         return future.get();
     }
 };
@@ -84,21 +94,21 @@ net::awaitable<std::vector<uint8_t>> ReadToEof(TcpStream& stream) {
     co_return result;
 }
 
-TEST(TcpRead, QueuedPayloadAndFinPreserveBytesAcrossBoundedBatches) {
-    for (const std::size_t bytes : {1u, 8191u, 8192u, 8193u, 65536u, 131089u}) {
-        SCOPED_TRACE(bytes);
-        ReadFixture fixture;
-        const auto payload = Payload(bytes);
-        fixture.Preload(payload);
-        fixture.peer.shutdown(tcp::socket::shutdown_send);
-        fixture.Start();
-        memory::detail::test_buffers_peak = 0;
-        auto reading = net::co_spawn(fixture.io, ReadToEof(*fixture.stream), net::use_future);
-        EXPECT_EQ(fixture.Finish(std::move(reading)), payload);
-        EXPECT_EQ(memory::detail::test_buffers_live, 0u);
-        EXPECT_LE(memory::detail::test_buffers_peak, 1u);
-    }
+class TcpReadPayload : public testing::TestWithParam<std::size_t> {};
+TEST_P(TcpReadPayload, QueuedPayloadAndFinPreserveBytesAcrossBoundedBatches) {
+    ReadFixture fixture;
+    const auto payload = Payload(GetParam());
+    fixture.Preload(payload);
+    fixture.peer.shutdown(tcp::socket::shutdown_send);
+    fixture.Start();
+    memory::detail::test_buffers_peak = 0;
+    auto reading = net::co_spawn(fixture.io, ReadToEof(*fixture.stream), net::use_future);
+    EXPECT_EQ(fixture.Finish(std::move(reading)), payload);
+    EXPECT_EQ(memory::detail::test_buffers_live, 0u);
+    EXPECT_LE(memory::detail::test_buffers_peak, 1u);
 }
+INSTANTIATE_TEST_SUITE_P(BufferBoundaries, TcpReadPayload,
+    testing::Values(1u, 8191u, 8192u, 8193u, 65536u, 131089u));
 
 TEST(TcpRead, AllocationFailureDoesNotConsumeQueuedInput) {
     ReadFixture fixture;
@@ -109,10 +119,7 @@ TEST(TcpRead, AllocationFailureDoesNotConsumeQueuedInput) {
     fixture.stream->SetReadTimeout(0s);
     memory::detail::test_buffers_peak = 0;
     memory::reject_next_process_allocation = true;
-    auto attempt = [&]() -> net::awaitable<void> {
-        (void)co_await fixture.stream->ReadMultiBuffer();
-    };
-    auto failed = net::co_spawn(fixture.io, attempt(), net::use_future);
+    auto failed = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
     EXPECT_THROW(fixture.Finish(std::move(failed)), std::bad_alloc);
     EXPECT_FALSE(memory::reject_next_process_allocation);
     EXPECT_EQ(memory::detail::test_buffers_peak, 0u);
@@ -129,10 +136,7 @@ TEST(TcpRead, PeerResetIsAnErrorNotCleanEof) {
     fixture.Start();
     fixture.peer.set_option(net::socket_base::linger(true, 0));
     fixture.peer.close();
-    auto attempt = [&]() -> net::awaitable<void> {
-        (void)co_await fixture.stream->ReadMultiBuffer();
-    };
-    auto reading = net::co_spawn(fixture.io, attempt(), net::use_future);
+    auto reading = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
     try {
         fixture.Finish(std::move(reading));
         FAIL() << "peer reset was reported as successful completion";
@@ -145,10 +149,7 @@ TEST(TcpRead, PeerResetIsAnErrorNotCleanEof) {
 TEST(TcpRead, IdleReadBorrowsNoPayloadAndCancellationPreservesQueuedInput) {
     ReadFixture fixture;
     fixture.Start();
-    auto attempt = [&]() -> net::awaitable<void> {
-        (void)co_await fixture.stream->ReadMultiBuffer();
-    };
-    auto cancelled = net::co_spawn(fixture.io, attempt(), net::use_future);
+    auto cancelled = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
     fixture.io.run_for(1ms);
     ASSERT_NE(cancelled.wait_for(0s), std::future_status::ready);
     EXPECT_EQ(memory::detail::test_buffers_live, 0u);

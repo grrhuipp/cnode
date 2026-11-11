@@ -320,6 +320,7 @@ memory::ByteVector EncodeHttpResponseHeaders(const HttpHeaders&);
 net::awaitable<tl::expected<std::optional<H2RequestHeaders>, H2Error>> ParseH2RequestHeaders(
     AsyncStream&, HpackDecoder&, H2Frame, std::string_view, bool);
 net::awaitable<TransportBuildResult> StartHttp2ServerSession(
+    GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream>, uint32_t, H2PayloadCodec, net::io_context&,
     std::shared_ptr<InboundTransportStreamHandler>, uint64_t,
     const HttpConfig*, const XHttpConfig*, const GrpcConfig*);

@@ -43,7 +43,7 @@ public:
         infra::OutboundSourceConfig outbound;
         outbound.tag = "sampling-direct";
         outbound.protocol = "freedom";
-        outbound.settings["domainStrategy"] = "UseIP";
+        outbound.settings = infra::FreedomSettings{.domain_strategy = proxy::freedom::outbound::DomainStrategy::UseIP};
         auto prepared = proxyman::outbound::PrepareOutboundConfig(outbound);
         Require(prepared.has_value(), "Freedom preparation failed");
         worker.AddOutbound(std::move(*prepared));

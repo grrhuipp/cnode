@@ -4,20 +4,13 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
-#include <cstring>
-#include <iostream>
-#include <new>
-#include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
-void Check(bool ok, const char* message) {
-    if (!ok) throw std::runtime_error(message);
-}
 
-void TestHashes() {
+TEST(TrojanRequest, PasswordHashesMatchSha224Vectors) {
     struct Case { std::string_view password; std::string_view expected; };
     constexpr std::array cases{
         Case{"", "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f"},
@@ -26,7 +19,7 @@ void TestHashes() {
     };
     for (const auto& item : cases) {
         const auto hash = ::trojan::HashPassword(item.password);
-        Check(std::string_view(hash.data(), hash.size()) == item.expected, "SHA224 credential vector mismatch");
+        EXPECT_EQ((std::string_view(hash.data(), hash.size())), (item.expected)) << "SHA224 credential vector mismatch";
     }
 }
 
@@ -47,56 +40,56 @@ void TestRequest(::trojan::TrojanCommand command, const ::TargetAddress& target,
     std::array<uint8_t, 512> output{};
     const auto length = ::trojan::EncodeRequestTo(
         hash, command, target, output.data(), output.size());
-    Check(length == header_size, "request size mismatch");
+    ASSERT_EQ(length, header_size);
     std::copy(payload.begin(), payload.end(), output.begin() + static_cast<std::ptrdiff_t>(length));
-    Check(std::equal(expected.begin(), expected.end(), output.begin()), "Trojan wire bytes changed");
+    EXPECT_TRUE((std::equal(expected.begin(), expected.end(), output.begin()))) << "Trojan wire bytes changed";
 
     using ::trojan::RequestDecodeStatus;
     const auto decoded = ::trojan::DecodeRequest(
         std::span<const uint8_t>(output.data(), expected.size()));
-    Check(decoded.status == RequestDecodeStatus::Complete && decoded.consumed == header_size,
-          "request parser did not preserve trailing payload");
-    Check(decoded.request.command == command && decoded.request.target.SameEndpoint(target),
-          "request metadata changed");
-    Check(decoded.request.PasswordHashView() == expected_hash, "authentication digest changed");
+    EXPECT_TRUE((decoded.status == RequestDecodeStatus::Complete && decoded.consumed == header_size)) << "request parser did not preserve trailing payload";
+    EXPECT_TRUE((decoded.request.command == command && decoded.request.target.SameEndpoint(target))) << "request metadata changed";
+    EXPECT_EQ((decoded.request.PasswordHashView()), (expected_hash)) << "authentication digest changed";
 
-    // Each Incomplete result names the next boundary and never asks past the
-    // header, so a reader driven by it cannot consume payload bytes.
+    // 增量解析的下一边界不得越过头部，避免读端误吞随后的 payload。
     size_t available = 0;
     for (;;) {
         const auto step = ::trojan::DecodeRequest(std::span<const uint8_t>(output.data(), available));
         if (step.status == RequestDecodeStatus::Complete) {
-            Check(step.consumed == header_size, "incremental Trojan decode consumed a different header");
+            EXPECT_EQ((step.consumed), (header_size)) << "incremental Trojan decode consumed a different header";
             break;
         }
-        Check(step.status == RequestDecodeStatus::Incomplete && step.required > available &&
-                  step.required <= header_size,
-              "incremental Trojan decode asked beyond the request header");
+        ASSERT_EQ(step.status, RequestDecodeStatus::Incomplete);
+        ASSERT_GT(step.required, available);
+        ASSERT_LE(step.required, header_size);
         available = step.required;
     }
 
     output.fill(0x5a);
     const auto short_length = ::trojan::EncodeRequestTo(
         hash, command, target, output.data(), header_size - 1);
-    Check(short_length == 0 && std::all_of(output.begin(), output.end(), [](auto b) { return b == 0x5a; }),
-          "short output buffer was partially modified");
+    EXPECT_TRUE((short_length == 0 && std::all_of(output.begin(), output.end(), [](auto b) { return b == 0x5a; }))) << "short output buffer was partially modified";
 }
 }  // namespace
 
-TEST(TrojanRequest, Contract) {
-    try {
-        TestHashes();
-        constexpr std::array<uint8_t, 5> ipv4{1, 127, 0, 0, 1};
-        constexpr std::array<uint8_t, 17> ipv6{4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
-        constexpr std::array<uint8_t, 13> domain{3, 11, 'e','x','a','m','p','l','e','.','c','o','m'};
-        for (const auto command : {::trojan::TrojanCommand::CONNECT, ::trojan::TrojanCommand::UDP_ASSOCIATE}) {
-            TestRequest(command, ::TargetAddress(::net::ip::make_address("127.0.0.1"), 443), ipv4);
-            TestRequest(command, ::TargetAddress(::net::ip::make_address("::1"), 53), ipv6);
-            TestRequest(command, ::TargetAddress(std::string_view("example.com"), 443), domain);
-        }
-        std::cout << "Trojan SHA224 vectors and TCP/UDP IPv4/IPv6/domain wire bytes passed\n";
-    } catch (const std::exception& error) {
-        std::cerr << "Trojan request encoding failed: " << error.what() << '\n';
-        FAIL() << error.what();
+class TrojanRequestWire : public testing::TestWithParam<
+    std::tuple<::trojan::TrojanCommand, int>> {};
+
+TEST_P(TrojanRequestWire, PreservesHeaderPayloadAndIncrementalBoundaries) {
+    const auto [command, family] = GetParam();
+    if (family == 0) {
+        constexpr std::array<uint8_t, 5> address{1, 127, 0, 0, 1};
+        TestRequest(command, TargetAddress(net::ip::make_address("127.0.0.1"), 443), address);
+    } else if (family == 1) {
+        constexpr std::array<uint8_t, 17> address{4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+        TestRequest(command, TargetAddress(net::ip::make_address("::1"), 53), address);
+    } else {
+        constexpr std::array<uint8_t, 13> address{3, 11, 'e','x','a','m','p','l','e','.','c','o','m'};
+        TestRequest(command, TargetAddress(std::string_view("example.com"), 443), address);
     }
 }
+
+INSTANTIATE_TEST_SUITE_P(AddressFamilies, TrojanRequestWire,
+    testing::Combine(testing::Values(::trojan::TrojanCommand::CONNECT,
+                                    ::trojan::TrojanCommand::UDP_ASSOCIATE),
+                     testing::Values(0, 1, 2)));

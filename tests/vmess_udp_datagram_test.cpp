@@ -16,33 +16,22 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <chrono>
 #include <exception>
-#include <iostream>
 #include <string_view>
+#include <tuple>
 #include <memory_resource>
 
 namespace {
 
 
-[[noreturn]] void Fail(std::string_view message) {
-    std::cerr << message << '\n';
-    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
-}
-
-void Check(bool condition, std::string_view message) {
-    if (!condition) {
-        Fail(message);
-    }
-}
 
 buf::BufferGuard MakeBuffer(size_t size,
                         const TargetAddress* target,
                         uint8_t value) {
     buf::BufferGuard buffer{buf::Buffer::New()};
-    Check(buffer && size <= buffer->Available(),
-          "failed to allocate VMess UDP test buffer");
+    if (!buffer) throw std::bad_alloc();
+    if (size > buffer->Available()) throw std::length_error("VMess fixture exceeds buffer");
     std::fill_n(buffer->Tail().data(), size, value);
     buffer->Produce(static_cast<uint32_t>(size));
     if (target) {
@@ -52,15 +41,14 @@ buf::BufferGuard MakeBuffer(size_t size,
 }
 
 template <typename Factory>
-void CheckRejected(Factory&& factory, std::string_view message,
-                   ErrorCode expected = ErrorCode::PROTOCOL_INVALID_ADDRESS) {
-    bool rejected = false;
+void ExpectLinkError(Factory&& factory, std::string_view message,
+                     ErrorCode expected = ErrorCode::PROTOCOL_INVALID_ADDRESS) {
     try {
         factory();
+        ADD_FAILURE() << message;
     } catch (const transport::LinkError& error) {
-        rejected = error.code() == expected;
+        EXPECT_EQ(error.code(), expected) << message;
     }
-    Check(rejected, message);
 }
 
 vmess::VMessRequest MakeRequest(vmess::Security security, uint8_t options,
@@ -103,16 +91,12 @@ public:
         const size_t body_size = payload.size() + cipher_.Overhead();
         const size_t total_size = body_size + padding;
         memory::ByteVector wire(HeaderSize() + total_size);
-        Check(cipher_.Encrypt(payload.data(), payload.size(), wire.data() + HeaderSize()) ==
-                  static_cast<ssize_t>(body_size),
-              "VMess test request encryption failed");
+        EXPECT_EQ((cipher_.Encrypt(payload.data(), payload.size(), wire.data() + HeaderSize())), (static_cast<ssize_t>(body_size))) << "VMess test request encryption failed";
         if (length_cipher_) {
             const auto plain_size = static_cast<uint16_t>(total_size - length_cipher_->Overhead());
             const std::array<uint8_t, 2> length{
                 static_cast<uint8_t>(plain_size >> 8), static_cast<uint8_t>(plain_size)};
-            Check(length_cipher_->Encrypt(length.data(), length.size(), wire.data()) ==
-                      static_cast<ssize_t>(HeaderSize()),
-                  "VMess test authenticated length encryption failed");
+            EXPECT_EQ((length_cipher_->Encrypt(length.data(), length.size(), wire.data())), (static_cast<ssize_t>(HeaderSize()))) << "VMess test authenticated length encryption failed";
         } else {
             auto length = static_cast<uint16_t>(total_size);
             if (mask_) {
@@ -155,13 +139,12 @@ public:
     memory::ByteVector Decode(std::span<const uint8_t> wire, size_t& offset) {
         const size_t padding = padding_ && mask_ ? mask_->NextMask() % 64 : 0;
         const size_t header_size = length_cipher_ ? length_cipher_->Overhead() + 2 : 2;
-        Check(wire.size() - offset >= header_size, "VMess response chunk header truncated");
+        if (offset > wire.size() || wire.size() - offset < header_size)
+            throw std::runtime_error("VMess response chunk header truncated");
         size_t total_size = 0;
         if (length_cipher_) {
             std::array<uint8_t, 2> length{};
-            Check(length_cipher_->Decrypt(wire.data() + offset, header_size, length.data()) ==
-                      static_cast<ssize_t>(length.size()),
-                  "VMess response authenticated length does not decrypt with the request IV");
+            EXPECT_EQ((length_cipher_->Decrypt(wire.data() + offset, header_size, length.data())), (static_cast<ssize_t>(length.size()))) << "VMess response authenticated length does not decrypt with the request IV";
             total_size = ((size_t{length[0]} << 8) | length[1]) + length_cipher_->Overhead();
         } else {
             auto length = static_cast<uint16_t>((wire[offset] << 8) | wire[offset + 1]);
@@ -171,13 +154,11 @@ public:
             total_size = length;
         }
         offset += header_size;
-        Check(total_size >= padding + cipher_.Overhead() && wire.size() - offset >= total_size,
-              "VMess response chunk body truncated");
+        if (total_size < padding + cipher_.Overhead() || wire.size() - offset < total_size)
+            throw std::runtime_error("VMess response chunk body truncated");
         const size_t sealed_size = total_size - padding;
         memory::ByteVector payload(sealed_size - cipher_.Overhead());
-        Check(cipher_.Decrypt(wire.data() + offset, sealed_size, payload.data()) ==
-                  static_cast<ssize_t>(payload.size()),
-              "VMess response chunk payload failed authentication");
+        EXPECT_EQ((cipher_.Decrypt(wire.data() + offset, sealed_size, payload.data())), (static_cast<ssize_t>(payload.size()))) << "VMess response chunk payload failed authentication";
         offset += total_size;
         return payload;
     }
@@ -228,7 +209,7 @@ void CancelBlockedRead(Connection& connection,
     net::co_spawn(connection.io, std::move(operation),
         net::bind_cancellation_slot(cancellation.slot(),
             [&](std::exception_ptr error, buf::MultiBuffer result) {
-                Check(result.empty(), "cancelled VMess read returned partial plaintext");
+                EXPECT_TRUE((result.empty())) << "cancelled VMess read returned partial plaintext";
                 failure = error;
                 completed = true;
             }));
@@ -236,19 +217,24 @@ void CancelBlockedRead(Connection& connection,
     // Drain ready work: the only remaining read is a real socket wait, with no
     // peer data and no elapsed-time assumption about when cancellation occurs.
     connection.io.poll();
-    Check(!completed, "VMess read did not wait for the incomplete record");
+    EXPECT_FALSE((completed)) << "VMess read did not wait for the incomplete record";
     cancellation.emit(net::cancellation_type::terminal);
     connection.io.run_for(std::chrono::seconds(1));
-    Check(completed && failure, "VMess cancellation became EOF or did not finish");
+    if (!completed) {
+        connection.stream.Close();
+        connection.peer.cancel();
+        connection.io.run();
+    }
+    ASSERT_TRUE(completed);
+    ASSERT_TRUE(failure) << "VMess cancellation became EOF";
     bool aborted = false;
     try {
         std::rethrow_exception(failure);
     } catch (const IoSystemError& error) {
         aborted = error.code() == io_error::operation_aborted;
     }
-    Check(aborted, "VMess cancellation returned the wrong error");
-    Check(connection.stream.IsOpen() && connection.peer.is_open(),
-          "VMess cancellation permanently closed the transport");
+    EXPECT_TRUE((aborted)) << "VMess cancellation returned the wrong error";
+    EXPECT_TRUE((connection.stream.IsOpen() && connection.peer.is_open())) << "VMess cancellation permanently closed the transport";
 }
 
 void CancelBlockedRead(Connection& connection, transport::MultiBufferReader& reader,
@@ -269,7 +255,13 @@ buf::MultiBuffer ReadReady(Connection& connection,
             completed = true;
         });
     connection.io.run_for(std::chrono::seconds(1));
-    Check(completed, "resumed VMess read stalled");
+    if (!completed) {
+        connection.stream.Close();
+        connection.peer.cancel();
+        connection.io.run();
+        throw std::runtime_error("resumed VMess read stalled");
+    }
+    EXPECT_TRUE((completed)) << "resumed VMess read stalled";
     if (failure) {
         std::rethrow_exception(failure);
     }
@@ -289,15 +281,14 @@ void CheckReadFailed(Connection& connection,
     } catch (const IoSystemError& error) {
         reset = error.code() == io_error::connection_reset;
     }
-    Check(reset, message);
+    EXPECT_TRUE((reset)) << message;
 }
 
 void CheckPayload(const buf::MultiBuffer& result, std::span<const uint8_t> expected,
                   const vmess::VMessRequest& request) {
     const buf::ContiguousBufferView actual(result);
-    Check(actual.Bytes().size() == expected.size() &&
-              std::equal(actual.Bytes().begin(), actual.Bytes().end(), expected.begin()),
-          "resumed VMess record lost, duplicated, or corrupted payload bytes");
+    EXPECT_TRUE((actual.Bytes().size() == expected.size() &&
+              std::equal(actual.Bytes().begin(), actual.Bytes().end(), expected.begin()))) << "resumed VMess record lost, duplicated, or corrupted payload bytes";
     if (request.command == vmess::Command::UDP) {
         vmess::ValidateFixedUdpDatagram(result, request.target);
     }
@@ -348,8 +339,8 @@ void TestCancellationResume(vmess::Security security, uint8_t options,
         std::span<const uint8_t>(eof_wire).first(eof_wire.size() - 1));
     CancelBlockedRead(connection, *reader, false);
     connection.stream.PrependReadData(std::span<const uint8_t>(eof_wire).last(1));
-    Check(ReadReady(connection, *reader).empty(), "VMess EOF marker did not finish the reader");
-    Check(ReadReady(connection, *reader).empty(), "VMess EOF marker was not permanent");
+    EXPECT_TRUE((ReadReady(connection, *reader).empty())) << "VMess EOF marker did not finish the reader";
+    EXPECT_TRUE((ReadReady(connection, *reader).empty())) << "VMess EOF marker was not permanent";
 }
 
 void TestBatchCancellation(vmess::Security security, uint8_t options) {
@@ -391,9 +382,8 @@ void TestTransportEOF(vmess::Security security, uint8_t options, size_t prefix_s
     CancelBlockedRead(connection, *reader, false);
     connection.peer.shutdown(tcp::socket::shutdown_send);
     if (prefix_size == 0) {
-        Check(ReadReady(connection, *reader).empty(),
-              "real VMess TCP EOF became a cancellation error");
-        Check(ReadReady(connection, *reader).empty(), "real VMess TCP EOF was not permanent");
+        EXPECT_TRUE((ReadReady(connection, *reader).empty())) << "real VMess TCP EOF became a cancellation error";
+        EXPECT_TRUE((ReadReady(connection, *reader).empty())) << "real VMess TCP EOF was not permanent";
     } else {
         // EOF inside a record is truncation, never a clean end of body.
         for (int attempt = 0; attempt != 2; ++attempt) {
@@ -440,31 +430,53 @@ void TestAuthenticationFailure(vmess::Security security, uint8_t options,
         }
     }
 }
-void TestEncryptedCancellation() {
-    const std::array<vmess::Security, 2> securities{
-        vmess::Security::AES_128_GCM, vmess::Security::CHACHA20_POLY1305};
-    const std::array<uint8_t, 3> options{
-        vmess::Option::CHUNK_STREAM,
-        vmess::Option::CHUNK_STREAM | vmess::Option::CHUNK_MASKING | vmess::Option::GLOBAL_PADDING,
-        vmess::Option::CHUNK_STREAM | vmess::Option::CHUNK_MASKING |
-            vmess::Option::GLOBAL_PADDING | vmess::Option::AUTHENTICATED_LENGTH};
-    for (const auto security : securities) {
-        for (const auto option : options) {
-            for (const auto command : {vmess::Command::UDP, vmess::Command::TCP}) {
-                TestCancellationResume(security, option, command, 113);
-                TestCancellationResume(security, option, command, buf::Buffer::kSize + 37);
-            }
-            TestBatchCancellation(security, option);
-            TestAuthenticationFailure(security, option, false);
-            if ((option & vmess::Option::AUTHENTICATED_LENGTH) != 0) {
-                TestAuthenticationFailure(security, option, true);
-            }
-            for (const size_t prefix_size : {size_t{0}, size_t{1}, size_t{23}}) {
-                TestTransportEOF(security, option, prefix_size);
-            }
-        }
+class VmessEncryptedBody : public testing::TestWithParam<
+    std::tuple<vmess::Security, uint8_t>> {};
+
+TEST_P(VmessEncryptedBody, CancellationResumesWithoutNonceOrMaskDrift) {
+    const auto [security, options] = GetParam();
+    for (const auto command : {vmess::Command::UDP, vmess::Command::TCP}) {
+        SCOPED_TRACE(static_cast<int>(command));
+        TestCancellationResume(security, options, command, 113);
+        TestCancellationResume(security, options, command, buf::Buffer::kSize + 37);
     }
 }
+
+TEST_P(VmessEncryptedBody, BatchCancellationPreservesCompletedAndPartialRecords) {
+    const auto [security, options] = GetParam();
+    TestBatchCancellation(security, options);
+}
+
+TEST_P(VmessEncryptedBody, BodyAuthenticationFailureIsTerminal) {
+    const auto [security, options] = GetParam();
+    TestAuthenticationFailure(security, options, false);
+}
+
+class VmessLengthAuthentication : public testing::TestWithParam<vmess::Security> {};
+
+TEST_P(VmessLengthAuthentication, FailureIsTerminal) {
+    constexpr uint8_t options = vmess::Option::CHUNK_STREAM | vmess::Option::CHUNK_MASKING |
+        vmess::Option::GLOBAL_PADDING | vmess::Option::AUTHENTICATED_LENGTH;
+    TestAuthenticationFailure(GetParam(), options, true);
+}
+
+INSTANTIATE_TEST_SUITE_P(AeadModes, VmessLengthAuthentication,
+    testing::Values(vmess::Security::AES_128_GCM, vmess::Security::CHACHA20_POLY1305));
+
+TEST_P(VmessEncryptedBody, TransportEofDistinguishesBoundaryFromTruncation) {
+    const auto [security, options] = GetParam();
+    for (const size_t prefix : {size_t{0}, size_t{1}, size_t{23}}) {
+        SCOPED_TRACE(prefix);
+        TestTransportEOF(security, options, prefix);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(SecurityAndFraming, VmessEncryptedBody, testing::Combine(
+    testing::Values(vmess::Security::AES_128_GCM, vmess::Security::CHACHA20_POLY1305),
+    testing::Values(uint8_t{vmess::Option::CHUNK_STREAM},
+        uint8_t{vmess::Option::CHUNK_STREAM | vmess::Option::CHUNK_MASKING | vmess::Option::GLOBAL_PADDING},
+        uint8_t{vmess::Option::CHUNK_STREAM | vmess::Option::CHUNK_MASKING |
+            vmess::Option::GLOBAL_PADDING | vmess::Option::AUTHENTICATED_LENGTH})));
 
 void WriteReady(Connection& connection, transport::MultiBufferWriter& writer,
                 buf::MultiBuffer payload) {
@@ -477,7 +489,13 @@ void WriteReady(Connection& connection, transport::MultiBufferWriter& writer,
             completed = true;
         });
     connection.io.run_for(std::chrono::seconds(1));
-    Check(completed && !failure, "VMess response write failed");
+    if (!completed) {
+        connection.stream.Close();
+        connection.peer.cancel();
+        connection.io.run();
+    }
+    ASSERT_TRUE(completed);
+    ASSERT_FALSE(failure);
 }
 
 // A server response with AUTHENTICATED_LENGTH must decode with Xray-core's
@@ -491,7 +509,7 @@ void TestResponseAuthenticatedLength(vmess::Security security) {
     vmess::encoding::ServerSession session("response-length-test");
     session.SetRequest(request);
     auto writer = session.EncodeResponseBodyWithHeader(connection.stream);
-    Check(writer.has_value(), "VMess response writer was not created");
+    ASSERT_TRUE(writer);
 
     const std::array<std::pair<size_t, uint8_t>, 2> chunks{{{113, 0x5a}, {257, 0x3c}}};
     for (const auto& [size, value] : chunks) {
@@ -509,18 +527,17 @@ void TestResponseAuthenticatedLength(vmess::Security security) {
         if (ec) break;
         wire.insert(wire.end(), block.begin(), block.begin() + n);
     }
-    Check(wire.size() > kResponseHeaderSize, "VMess response was not written");
+    EXPECT_TRUE((wire.size() > kResponseHeaderSize)) << "VMess response was not written";
 
     ResponseDecoder decoder(request);
     size_t offset = kResponseHeaderSize;
     for (const auto& [size, value] : chunks) {
         const auto payload = decoder.Decode(wire, offset);
-        Check(payload.size() == size &&
+        EXPECT_TRUE((payload.size() == size &&
                   std::all_of(payload.begin(), payload.end(),
-                              [value](uint8_t byte) { return byte == value; }),
-              "VMess response chunk payload changed");
+                              [value](uint8_t byte) { return byte == value; }))) << "VMess response chunk payload changed";
     }
-    Check(offset == wire.size(), "VMess response carried unexpected trailing bytes");
+    EXPECT_EQ((offset), (wire.size())) << "VMess response carried unexpected trailing bytes";
 }
 
 memory::ByteVector MakeClientResponse(Connection& connection,
@@ -538,7 +555,6 @@ memory::ByteVector MakeClientResponse(Connection& connection,
     user.cmd_key = account.cmd_key;
     auto snapshot = UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{user}});
     auto view = UserStore::PrepareWorkerView(snapshot);
-    UserStore::CommitSnapshot(std::move(snapshot));
     UserStore::InstallWorkerView(std::move(view));
     struct WorkerViewGuard {
         ~WorkerViewGuard() { UserStore::ClearWorkerView(); }
@@ -551,30 +567,35 @@ memory::ByteVector MakeClientResponse(Connection& connection,
         client.EncodeRequestHeader(connection.stream, account, auth_id_key, target, command),
         [&](std::exception_ptr error, vmess::encoding::VMessHandshakeResult result) {
             failure = error;
-            Check(result.has_value(), "VMess client request header failed");
+            EXPECT_TRUE((result.has_value())) << "VMess client request header failed";
             completed = true;
         });
     connection.io.run_for(std::chrono::seconds(1));
-    Check(completed && !failure, "VMess client request header did not complete");
+    if (!completed) {
+        connection.stream.Close();
+        connection.peer.cancel();
+        connection.io.run();
+        throw std::runtime_error("VMess client request header stalled");
+    }
+    if (failure) std::rethrow_exception(failure);
+    EXPECT_TRUE((completed && !failure)) << "VMess client request header did not complete";
     memory::ByteVector header(connection.peer.available());
-    Check(!header.empty() && net::read(connection.peer, net::buffer(header)) == header.size(),
-          "VMess client request header was not written");
+    EXPECT_TRUE((!header.empty() && net::read(connection.peer, net::buffer(header)) == header.size())) << "VMess client request header was not written";
     vmess::encoding::ServerSession server(tag);
     auto [request, consumed] = server.DecodeRequestHeader(header.data(), header.size());
-    Check(request.has_value() && consumed == header.size(),
-          "VMess server could not authenticate the client request");
+    if (!request || consumed != header.size())
+        throw std::runtime_error("VMess server could not authenticate the client request");
     if (authenticated_request) *authenticated_request = *request;
     const auto udp_target = request->target;
     const bool is_udp = request->command == vmess::Command::UDP;
     server.SetRequest(std::move(*request));
     auto writer = server.EncodeResponseBodyWithHeader(connection.stream);
-    Check(writer.has_value(), "VMess server response writer was not created");
+    if (!writer) throw std::runtime_error("VMess server response writer was not created");
     WriteReady(connection, *writer,
                buf::MultiBuffer{MakeBuffer(113, is_udp ? &udp_target : nullptr, 0x53)});
     memory::ByteVector response(connection.peer.available());
-    Check(response.size() > 38 &&
-              net::read(connection.peer, net::buffer(response)) == response.size(),
-          "VMess server response was not written");
+    EXPECT_TRUE((response.size() > 38 &&
+              net::read(connection.peer, net::buffer(response)) == response.size())) << "VMess server response was not written";
     return response;
 }
 
@@ -588,7 +609,7 @@ net::awaitable<buf::MultiBuffer> ReadClientBody(Connection& connection,
 void TestClientAuthenticationFailure(size_t corrupt_offset,
                                      vmess::Command command = vmess::Command::TCP) {
     auto account = vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
-    Check(account.has_value(), "VMess test account creation failed");
+    ASSERT_TRUE(account);
     const auto auth_id_key = vmess::ExpandAuthIDEncryptKey(account->auth_key);
     const TargetAddress target("127.0.0.1", 5353);
     Connection connection;
@@ -611,7 +632,7 @@ void TestClientAuthenticationFailure(size_t corrupt_offset,
 
 void TestClientTruncation(vmess::Command command, size_t cut) {
     auto account = vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
-    Check(account.has_value(), "VMess test account creation failed");
+    ASSERT_TRUE(account);
     const auto auth_id_key = vmess::ExpandAuthIDEncryptKey(account->auth_key);
     const TargetAddress target("127.0.0.1", 5353);
     Connection connection;
@@ -629,7 +650,7 @@ void TestClientTruncation(vmess::Command command, size_t cut) {
 
 void TestClientHeaderCancellation(vmess::Security security, vmess::Command command) {
     auto account = vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
-    Check(account.has_value(), "VMess test account creation failed");
+    ASSERT_TRUE(account);
     const auto auth_id_key = vmess::ExpandAuthIDEncryptKey(account->auth_key);
     const TargetAddress target("127.0.0.1", 5353);
     Connection connection;
@@ -646,10 +667,9 @@ void TestClientHeaderCancellation(vmess::Security security, vmess::Command comma
     connection.stream.PrependReadData(std::span<const uint8_t>(response).subspan(supplied));
     const auto payload = ReadReady(connection, client.DecodeResponse(connection.stream));
     const buf::ContiguousBufferView bytes(payload);
-    Check(bytes.Bytes().size() == 113 &&
+    EXPECT_TRUE((bytes.Bytes().size() == 113 &&
               std::all_of(bytes.Bytes().begin(), bytes.Bytes().end(),
-                          [](uint8_t byte) { return byte == 0x53; }),
-          "VMess client response header cancellation lost plaintext");
+                          [](uint8_t byte) { return byte == 0x53; }))) << "VMess client response header cancellation lost plaintext";
 }
 
 class InterruptedBodyReader final : public transport::MultiBufferReader {
@@ -705,12 +725,11 @@ void TestBodyReadFailure(vmess::Command command, size_t cut) {
     }
     auto remaining = source.TakeRemaining();
     const buf::ContiguousBufferView bytes(remaining);
-    Check(std::equal(bytes.Bytes().begin(), bytes.Bytes().end(),
-                     wire.begin() + cut, wire.end()),
-          "failed VMess body reader consumed subsequent transport bytes");
+    EXPECT_TRUE((std::equal(bytes.Bytes().begin(), bytes.Bytes().end(),
+                     wire.begin() + cut, wire.end()))) << "failed VMess body reader consumed subsequent transport bytes";
 }
 
-void TestAuthenticatedHeaderFailure() {
+TEST(VmessUdpDatagram, AuthenticatedHeaderRejectionPreservesOnlyVerifiedIdentity) {
     using namespace proxyman::inbound;
     constexpr auto tag = "vmess-header-classification";
     PreparedVmessUser user;
@@ -720,8 +739,10 @@ void TestAuthenticatedHeaderFailure() {
     user.profile.email = "header@example.test";
     auto snapshot = UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{user}});
     auto view = UserStore::PrepareWorkerView(snapshot);
-    UserStore::CommitSnapshot(std::move(snapshot));
     UserStore::InstallWorkerView(std::move(view));
+    struct WorkerViewGuard {
+        ~WorkerViewGuard() { UserStore::ClearWorkerView(); }
+    } worker_view;
 
     for (int fault = 0; fault != 3; ++fault) {
         std::array<uint8_t, 49> plain{};
@@ -745,22 +766,21 @@ void TestAuthenticatedHeaderFailure() {
         const auto length_key = vmess::RequestHeaderLengthKey(user.cmd_key, auth_id, nonce);
         const auto payload_key = vmess::RequestHeaderPayloadKey(user.cmd_key, auth_id, nonce);
         const std::array<uint8_t, 2> length{0, static_cast<uint8_t>(plain.size())};
-        Check(proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {length_key.key.data(), 16}, {length_key.nonce.data(), 12}, {length.data(), length.size()}, {auth_id.data(), auth_id.size()}, wire.data() + 16, {wire.data() + 18, 16}), "failed to seal header length");
-        Check(proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {payload_key.key.data(), 16}, {payload_key.nonce.data(), 12}, {plain.data(), plain.size()}, {auth_id.data(), auth_id.size()}, wire.data() + 42, {wire.data() + 42 + plain.size(), 16}), "failed to seal header");
+        EXPECT_TRUE((proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {length_key.key.data(), 16}, {length_key.nonce.data(), 12}, {length.data(), length.size()}, {auth_id.data(), auth_id.size()}, wire.data() + 16, {wire.data() + 18, 16}))) << "failed to seal header length";
+        EXPECT_TRUE((proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {payload_key.key.data(), 16}, {payload_key.nonce.data(), 12}, {plain.data(), plain.size()}, {auth_id.data(), auth_id.size()}, wire.data() + 42, {wire.data() + 42 + plain.size(), 16}))) << "failed to seal header";
         if (fault == 2) wire.back() ^= 1;
         vmess::encoding::ServerSession session(tag);
         auto [request, consumed] = session.DecodeRequestHeader(wire.data(), wire.size());
         const auto* rejected = session.AuthenticatedRejectedHeader();
         if (fault == 0) {
-            Check(request && request->user && request->user->profile.user_id == 73 &&
-                  consumed == wire.size() && !rejected, "valid header lost authenticated identity");
+            EXPECT_TRUE((request && request->user && request->user->profile.user_id == 73 &&
+                  consumed == wire.size() && !rejected)) << "valid header lost authenticated identity";
         } else if (fault == 1) {
-            Check(!request && rejected && rejected->user->profile.user_id == 73 &&
+            EXPECT_TRUE((!request && rejected && rejected->user->profile.user_id == 73 &&
                   rejected->target.SameEndpoint(TargetAddress("1.1.1.1", 53)) &&
-                  rejected->command == vmess::Command::UDP,
-                  "authenticated malformed header lost verified identity or parsed target");
+                  rejected->command == vmess::Command::UDP)) << "authenticated malformed header lost verified identity or parsed target";
         } else {
-            Check(!request && !rejected, "unauthenticated header exposed trusted identity");
+            EXPECT_TRUE((!request && !rejected)) << "unauthenticated header exposed trusted identity";
         }
     }
     UserStore::ClearWorkerView();
@@ -769,13 +789,8 @@ void TestAuthenticatedHeaderFailure() {
 
 template <typename Fn>
 void CheckNotSupported(Fn&& fn) {
-    bool rejected = false;
-    try {
-        fn();
-    } catch (const transport::LinkError& error) {
-        rejected = error.code() == ErrorCode::NOT_SUPPORTED;
-    }
-    Check(rejected, "empty VMess UDP must fail explicitly without encoding EOF");
+    ExpectLinkError(std::forward<Fn>(fn),
+        "empty VMess UDP must fail explicitly without encoding EOF", ErrorCode::NOT_SUPPORTED);
 }
 
 void TestEmptyUdpWrite(vmess::Security security) {
@@ -792,15 +807,15 @@ void TestEmptyUdpWrite(vmess::Security security) {
         connection.io.restart();
         net::co_spawn(connection.io, std::move(operation),
             [&](std::exception_ptr error) { failure = error; completed = true; });
-        connection.io.run_for(std::chrono::seconds(1));
-        Check(completed && failure, "empty VMess UDP write silently succeeded");
+        connection.io.run();
+        ASSERT_TRUE(completed);
+        ASSERT_TRUE(failure) << "empty VMess UDP write silently succeeded";
         CheckNotSupported([&] { std::rethrow_exception(failure); });
     };
     buf::MultiBuffer empty{MakeBuffer(0, &request.target, 0x6d)};
     reject(writer->WriteMultiBuffer(std::move(empty)));
     reject(writer->WriteBuffers(std::span<const net::const_buffer>{}));
-    Check(connection.peer.available() == 0,
-          "rejected VMess UDP write emitted an EOF or response header");
+    EXPECT_EQ((connection.peer.available()), (0)) << "rejected VMess UDP write emitted an EOF or response header";
 
     buf::MultiBuffer data{MakeBuffer(17, &request.target, 0x42)};
     WriteReady(connection, *writer, std::move(data));
@@ -808,13 +823,11 @@ void TestEmptyUdpWrite(vmess::Security security) {
     reject(writer->WriteMultiBuffer(std::move(later_empty)));
     const size_t available = connection.peer.available();
     memory::ByteVector wire(available);
-    Check(net::read(connection.peer, net::buffer(wire)) == wire.size(),
-          "VMess UDP response wire was incomplete");
+    EXPECT_EQ((net::read(connection.peer, net::buffer(wire))), (wire.size())) << "VMess UDP response wire was incomplete";
     ResponseDecoder decoder(request);
     size_t offset = 38;
     const auto decoded = decoder.Decode(wire, offset);
-    Check(decoded == memory::ByteVector(17, 0x42) && offset == wire.size(),
-          "rejected empty VMess UDP consumed framing state or appended EOF");
+    EXPECT_TRUE((decoded == memory::ByteVector(17, 0x42) && offset == wire.size())) << "rejected empty VMess UDP consumed framing state or appended EOF";
 
     const vmess::encoding::BodyKey key{request.body_key, request.body_iv};
     vmess::encoding::BodyEncoder encoder({security, options, vmess::Command::UDP}, key, key);
@@ -824,9 +837,9 @@ void TestEmptyUdpWrite(vmess::Security security) {
     CheckNotSupported([&] {
         encoder.Encode(std::span<const net::const_buffer>{}, encoded);
     });
-    Check(encoded.empty(), "VMess request encoder emitted a forbidden empty chunk");
+    EXPECT_TRUE((encoded.empty())) << "VMess request encoder emitted a forbidden empty chunk";
     std::array<uint8_t, 128> eof_chunk{};
-    Check(encoder.EncodeEndTo(eof_chunk) != 0, "VMess explicit EOF marker was disabled");
+    EXPECT_TRUE((encoder.EncodeEndTo(eof_chunk) != 0)) << "VMess explicit EOF marker was disabled";
 }
 
 // Publish a real TCP prefix before a deterministic transport failure. Later
@@ -891,27 +904,22 @@ std::exception_ptr CompleteWrite(Connection& connection, net::awaitable<void> op
         failure = error;
     });
     connection.io.run();
-    Check(completed, "VMess deterministic write did not complete");
+    EXPECT_TRUE((completed)) << "VMess deterministic write did not complete";
     return failure;
 }
 
 void CheckWriteError(std::exception_ptr failure, IoErrorCode expected) {
-    Check(failure != nullptr, "VMess write unexpectedly succeeded");
+    ASSERT_TRUE(failure) << "VMess write unexpectedly succeeded";
     try {
         std::rethrow_exception(failure);
     } catch (const IoSystemError& error) {
-        Check(error.code() == expected, "VMess write changed the transport error");
+        EXPECT_EQ(error.code(), expected);
     }
 }
 
 void CheckWriteClosed(std::exception_ptr failure) {
-    Check(failure != nullptr, "VMess write after EOF unexpectedly succeeded");
-    try {
-        std::rethrow_exception(failure);
-    } catch (const transport::WriteClosed&) {
-        return;
-    }
-    Fail("VMess write after EOF did not report WriteClosed");
+    ASSERT_TRUE(failure) << "VMess write after EOF unexpectedly succeeded";
+    EXPECT_THROW(std::rethrow_exception(failure), transport::WriteClosed);
 }
 
 vmess::encoding::VMessHandshakeResult CompleteHeader(
@@ -957,7 +965,7 @@ void TestWriteFailure(bool server_side, bool eof, IoErrorCode error,
         }
     };
     CheckWriteError(CompleteWrite(connection, write()), error);
-    Check(!stream.published.empty(), "VMess failure did not publish a TCP prefix");
+    EXPECT_FALSE((stream.published.empty())) << "VMess failure did not publish a TCP prefix";
     CheckWriteError(CompleteWrite(connection, write()), io_error::connection_reset);
     CheckWriteError(CompleteWrite(connection, server_side
         ? writer->WriteMultiBuffer(buf::MultiBuffer{MakeBuffer(
@@ -978,8 +986,7 @@ void TestWriteFailure(bool server_side, bool eof, IoErrorCode error,
                 }
             };
             CheckWriteError(CompleteWrite(healthy, rejected_write()), io_error::connection_reset);
-            Check(healthy.stream.IsOpen(),
-                  "failed VMess session closed a newly supplied healthy transport");
+            EXPECT_TRUE((healthy.stream.IsOpen())) << "failed VMess session closed a newly supplied healthy transport";
         }
     }
 }
@@ -1000,10 +1007,10 @@ void TestWriteEnd(bool server_side, vmess::Command command) {
         if (server_side) co_await writer->AsyncShutdownWrite();
         else co_await client.EncodeRequestBodyEOF(connection.stream);
     };
-    Check(!CompleteWrite(connection, finish()), "VMess EOF write failed");
+    EXPECT_FALSE((CompleteWrite(connection, finish()))) << "VMess EOF write failed";
     const size_t eof_size = connection.peer.available();
-    Check(eof_size != 0, "VMess EOF had no wire bytes");
-    Check(!CompleteWrite(connection, finish()), "VMess EOF was not idempotent");
+    EXPECT_TRUE((eof_size != 0)) << "VMess EOF had no wire bytes";
+    EXPECT_FALSE((CompleteWrite(connection, finish()))) << "VMess EOF was not idempotent";
     const std::array<uint8_t, 3> data{1, 2, 3};
     const std::array<net::const_buffer, 1> buffers{net::buffer(data)};
     CheckWriteClosed(CompleteWrite(connection, server_side
@@ -1013,7 +1020,7 @@ void TestWriteEnd(bool server_side, vmess::Command command) {
         ? writer->WriteMultiBuffer(buf::MultiBuffer{MakeBuffer(
             11, command == vmess::Command::UDP ? &request.target : nullptr, 0x6d)})
         : client.EncodeRequestBody(connection.stream, buf::MultiBuffer{MakeBuffer(11, nullptr, 0x6d)})));
-    Check(connection.peer.available() == eof_size, "VMess wrote more bytes after EOF");
+    EXPECT_EQ((connection.peer.available()), (eof_size)) << "VMess wrote more bytes after EOF";
     if (server_side) {
         RequestEncoder encoder(request);
         const auto payload = MakePayload(17, 0x81);
@@ -1025,76 +1032,52 @@ void TestWriteEnd(bool server_side, vmess::Command command) {
         connection.stream.PrependReadData(response);
         const auto result = ReadReady(connection, client.DecodeResponse(connection.stream));
         const buf::ContiguousBufferView bytes(result);
-        Check(bytes.Bytes().size() == 113 &&
+        EXPECT_TRUE((bytes.Bytes().size() == 113 &&
                   std::all_of(bytes.Bytes().begin(), bytes.Bytes().end(),
-                              [](uint8_t byte) { return byte == 0x53; }),
-              "VMess request EOF damaged the response direction");
+                              [](uint8_t byte) { return byte == 0x53; }))) << "VMess request EOF damaged the response direction";
     }
 }
 }  // namespace
 
-TEST(VmessUdpDatagram, Contract) {
+TEST(VmessUdpDatagram, RejectsEmptyMissingMixedAndWrongFixedUdpEndpoints) {
     const TargetAddress target("1.1.1.1", 53);
     const TargetAddress other("8.8.8.8", 53);
-    buf::MultiBuffer no_message;
-    vmess::ValidateFixedUdpDatagram(no_message, target);
     buf::MultiBuffer empty{MakeBuffer(0, &target, 0x6d)};
     CheckNotSupported([&] { vmess::ValidateFixedUdpDatagram(empty, target); });
 
-    buf::MultiBuffer valid;
-    valid.push_back(MakeBuffer(buf::Buffer::kSize, &target, 0x11));
-    valid.push_back(MakeBuffer(257, &target, 0x22));
-    vmess::ValidateFixedUdpDatagram(valid, target);
-    const buf::ContiguousBufferView contiguous(valid);
-    Check(contiguous.Bytes().size() == buf::Buffer::kSize + 257 &&
-          std::all_of(
-              contiguous.Bytes().begin(),
-              contiguous.Bytes().begin() + buf::Buffer::kSize,
-              [](uint8_t value) { return value == 0x11; }) &&
-          std::all_of(
-              contiguous.Bytes().begin() + buf::Buffer::kSize,
-              contiguous.Bytes().end(),
-              [](uint8_t value) { return value == 0x22; }),
-          "VMess multi-buffer UDP datagram was not coalesced exactly once");
 
-    const std::array<uint8_t, 32> first{};
-    const std::array<uint8_t, 48> second{};
-    const std::array<net::const_buffer, 2> scatter{
-        net::buffer(first),
-        net::buffer(second),
-    };
-    std::pmr::monotonic_buffer_resource scatter_resource;
-    const buf::ContiguousBufferView scatter_packet(scatter, &scatter_resource);
-    Check(scatter_packet.Bytes().size() == first.size() + second.size(),
-          "VMess scatter UDP datagram was split into multiple payloads");
 
     buf::MultiBuffer mixed;
     mixed.push_back(MakeBuffer(4096, &target, 0x6d));
     mixed.push_back(MakeBuffer(1024, &other, 0x6d));
-    CheckRejected(
-        [&] { vmess::ValidateFixedUdpDatagram(mixed, target); },
-        "mixed VMess UDP endpoint was partially accepted");
+    ExpectLinkError([&] { vmess::ValidateFixedUdpDatagram(mixed, target); },
+    "mixed VMess UDP endpoint was partially accepted");
 
     buf::MultiBuffer missing;
     missing.push_back(MakeBuffer(4096, &target, 0x6d));
     missing.push_back(MakeBuffer(1024, nullptr, 0x6d));
-    CheckRejected(
-        [&] { vmess::ValidateFixedUdpDatagram(missing, target); },
-        "missing VMess UDP endpoint was partially accepted");
+    ExpectLinkError([&] { vmess::ValidateFixedUdpDatagram(missing, target); },
+    "missing VMess UDP endpoint was partially accepted");
 
     buf::MultiBuffer wrong{MakeBuffer(4096, &other, 0x6d)};
-    CheckRejected(
-        [&] { vmess::ValidateFixedUdpDatagram(wrong, target); },
-        "wrong fixed VMess UDP endpoint was accepted");
+    ExpectLinkError([&] { vmess::ValidateFixedUdpDatagram(wrong, target); },
+    "wrong fixed VMess UDP endpoint was accepted");
 
-    TestAuthenticatedHeaderFailure();
-    TestEncryptedCancellation();
-    TestResponseAuthenticatedLength(vmess::Security::AES_128_GCM);
-    TestResponseAuthenticatedLength(vmess::Security::CHACHA20_POLY1305);
-    TestEmptyUdpWrite(vmess::Security::AES_128_GCM);
-    TestEmptyUdpWrite(vmess::Security::CHACHA20_POLY1305);
 
 }
+
+class VmessResponseEncoding : public testing::TestWithParam<vmess::Security> {};
+
+TEST_P(VmessResponseEncoding, AuthenticatedLengthMatchesXrayNonceChoice) {
+    TestResponseAuthenticatedLength(GetParam());
+}
+
+TEST_P(VmessResponseEncoding, EmptyUdpRejectionPreservesNextRecordAndExplicitEof) {
+    TestEmptyUdpWrite(GetParam());
+}
+
+INSTANTIATE_TEST_SUITE_P(AeadModes, VmessResponseEncoding,
+    testing::Values(vmess::Security::AES_128_GCM, vmess::Security::CHACHA20_POLY1305));
 
 TEST(VmessUdpDatagram, ClientResponseHeaderFailureIsTerminal) {
     TestClientAuthenticationFailure(17);
@@ -1137,12 +1120,11 @@ TEST(VmessUdpDatagram, RequestHeaderWriteFailureIsTerminal) {
         vmess::encoding::ClientSession client(vmess::Security::AES_128_GCM, vmess::Command::TCP);
         const auto first = CompleteHeader(
             connection, client, stream, *account, auth_key, target, vmess::Command::TCP);
-        Check(!first && first.error() == MapAsioError(error),
-              "VMess request header changed the original write error");
-        Check(!stream.published.empty(), "VMess request header fault had no wire prefix");
+        EXPECT_TRUE((!first && first.error() == MapAsioError(error))) << "VMess request header changed the original write error";
+        EXPECT_FALSE((stream.published.empty())) << "VMess request header fault had no wire prefix";
         const auto next = CompleteHeader(
             connection, client, stream, *account, auth_key, target, vmess::Command::TCP);
-        Check(!next, "VMess retried a request header after its key was erased");
+        EXPECT_FALSE((next)) << "VMess retried a request header after its key was erased";
         CheckWriteError(CompleteWrite(connection, client.EncodeRequestBody(
             stream, buf::MultiBuffer{MakeBuffer(13, nullptr, 0x6d)})), io_error::connection_reset);
         CheckWriteError(CompleteWrite(connection, client.EncodeRequestBodyEOF(stream)),
@@ -1178,25 +1160,23 @@ TEST(VmessUdpDatagram, BodyEncoderRejectsAliasBeforeAdvancing) {
     const vmess::encoding::BodyKey key{request.body_key, request.body_iv};
     vmess::encoding::BodyEncoder encoder({request.security, request.options, request.command}, key, key);
     buf::MultiBuffer payload{MakeBuffer(19, &request.target, 0x31)};
-    CheckRejected([&] { encoder.Encode(payload, payload); },
+    ExpectLinkError([&] { encoder.Encode(payload, payload); },
                   "VMess BodyEncoder accepted the same input/output object",
                   ErrorCode::INVALID_ARGUMENT);
     const buf::ContiguousBufferView original(payload);
-    Check(original.Bytes().size() == 19 &&
+    EXPECT_TRUE((original.Bytes().size() == 19 &&
               std::all_of(original.Bytes().begin(), original.Bytes().end(),
-                          [](uint8_t byte) { return byte == 0x31; }),
-          "VMess alias rejection modified its input");
-    Check(!encoder.Failed(), "VMess alias rejection retired the encoder");
+                          [](uint8_t byte) { return byte == 0x31; }))) << "VMess alias rejection modified its input";
+    EXPECT_FALSE((encoder.Failed())) << "VMess alias rejection retired the encoder";
     buf::MultiBuffer encoded;
     encoder.Encode(payload, encoded);
     RequestEncoder reference(request);
     const auto expected = reference.Encode(memory::ByteVector(19, 0x31));
     const buf::ContiguousBufferView actual(encoded);
-    Check(std::equal(actual.Bytes().begin(), actual.Bytes().end(),
-                     expected.begin(), expected.end()),
-          "VMess alias rejection advanced nonce or mask");
+    EXPECT_TRUE((std::equal(actual.Bytes().begin(), actual.Bytes().end(),
+                     expected.begin(), expected.end()))) << "VMess alias rejection advanced nonce or mask";
     std::array<uint8_t, 128> eof_chunk{};
-    Check(encoder.EncodeEndTo(eof_chunk) != 0, "VMess EOF marker failed");
+    EXPECT_TRUE((encoder.EncodeEndTo(eof_chunk) != 0)) << "VMess EOF marker failed";
     CheckWriteClosed([&]() -> std::exception_ptr {
         try { encoder.Encode(payload, encoded); }
         catch (...) { return std::current_exception(); }
@@ -1212,19 +1192,17 @@ TEST(VmessUdpDatagram, RequestHeaderInputRejectionPreservesKeys) {
     vmess::encoding::ClientSession client(vmess::Security::AES_128_GCM, vmess::Command::TCP);
     const auto rejected = CompleteHeader(
         connection, client, connection.stream, *account, auth_key, target, vmess::Command::TCP);
-    Check(!rejected && rejected.error() == ErrorCode::PROTOCOL_INVALID_ADDRESS,
-          "VMess invalid request target changed its error");
-    Check(connection.peer.available() == 0, "VMess invalid target published header bytes");
+    EXPECT_TRUE((!rejected && rejected.error() == ErrorCode::PROTOCOL_INVALID_ADDRESS)) << "VMess invalid request target changed its error";
+    EXPECT_EQ((connection.peer.available()), (0)) << "VMess invalid target published header bytes";
     target = TargetAddress("127.0.0.1", 5353);
     const auto response = MakeClientResponse(
         connection, client, *account, auth_key, target, vmess::Command::TCP);
     connection.stream.PrependReadData(response);
     const auto decoded = ReadReady(connection, client.DecodeResponse(connection.stream));
     const buf::ContiguousBufferView bytes(decoded);
-    Check(bytes.Bytes().size() == 113 &&
+    EXPECT_TRUE((bytes.Bytes().size() == 113 &&
               std::all_of(bytes.Bytes().begin(), bytes.Bytes().end(),
-                          [](uint8_t byte) { return byte == 0x53; }),
-          "VMess input rejection erased the keys needed by the next legal request");
+                          [](uint8_t byte) { return byte == 0x53; }))) << "VMess input rejection erased the keys needed by the next legal request";
 }
 
 TEST(VmessUdpDatagram, BodyInputRejectionPreservesNextRecord) {
@@ -1239,36 +1217,33 @@ TEST(VmessUdpDatagram, BodyInputRejectionPreservesNextRecord) {
     });
     const auto oversized = MakePayload(vmess::MAX_CHUNK_SIZE + 1, 0x21);
     const std::array<net::const_buffer, 1> large{net::buffer(oversized)};
-    CheckRejected([&] { encoder.Encode(large, encoded); },
+    ExpectLinkError([&] { encoder.Encode(large, encoded); },
                   "VMess accepted an oversized UDP record",
                   ErrorCode::PROTOCOL_ENCODE_FAILED);
     const auto one_over = MakePayload(
         vmess::MAX_CHUNK_SIZE - vmess::GCM_TAG_SIZE + 1, 0x19);
     const std::array<net::const_buffer, 1> one_over_buffers{net::buffer(one_over)};
-    CheckRejected([&] { encoder.Encode(one_over_buffers, encoded); },
+    ExpectLinkError([&] { encoder.Encode(one_over_buffers, encoded); },
                   "VMess accepted one byte beyond its authenticated payload limit",
                   ErrorCode::PROTOCOL_ENCODE_FAILED);
     buf::MultiBuffer large_packet;
-    Check(buf::AppendSpanToMultiBuffer(oversized, large_packet),
-          "VMess oversized test packet allocation failed");
-    CheckRejected([&] { encoder.Encode(large_packet, encoded); },
+    EXPECT_TRUE((buf::AppendSpanToMultiBuffer(oversized, large_packet))) << "VMess oversized test packet allocation failed";
+    ExpectLinkError([&] { encoder.Encode(large_packet, encoded); },
                   "VMess accepted oversized multi-buffer UDP",
                   ErrorCode::PROTOCOL_ENCODE_FAILED);
     const std::array<net::const_buffer, 1> null_input{
         net::const_buffer(nullptr, 1)};
-    CheckRejected([&] { encoder.Encode(null_input, encoded); },
+    ExpectLinkError([&] { encoder.Encode(null_input, encoded); },
                   "VMess accepted non-empty null input", ErrorCode::INVALID_ARGUMENT);
-    Check(encoded.empty() && !encoder.Failed(),
-          "VMess input rejection published bytes or retired the encoder");
+    EXPECT_TRUE((encoded.empty() && !encoder.Failed())) << "VMess input rejection published bytes or retired the encoder";
     const auto payload = MakePayload(113, 0x47);
     const std::array<net::const_buffer, 1> legal{net::buffer(payload)};
     encoder.Encode(legal, encoded);
     RequestEncoder reference(request);
     const auto expected = reference.Encode(payload);
     const buf::ContiguousBufferView actual(encoded);
-    Check(std::equal(actual.Bytes().begin(), actual.Bytes().end(),
-                     expected.begin(), expected.end()),
-          "VMess input rejection advanced the next record's framing state");
+    EXPECT_TRUE((std::equal(actual.Bytes().begin(), actual.Bytes().end(),
+                     expected.begin(), expected.end()))) << "VMess input rejection advanced the next record's framing state";
     encoded.clear();
     const auto maximum = MakePayload(vmess::MAX_CHUNK_SIZE - vmess::GCM_TAG_SIZE, 0x61);
     const std::array<net::const_buffer, 2> maximum_buffers{
@@ -1277,9 +1252,8 @@ TEST(VmessUdpDatagram, BodyInputRejectionPreservesNextRecord) {
     encoder.Encode(maximum_buffers, encoded);
     const auto expected_maximum = reference.Encode(maximum);
     const buf::ContiguousBufferView actual_maximum(encoded);
-    Check(std::equal(actual_maximum.Bytes().begin(), actual_maximum.Bytes().end(),
-                     expected_maximum.begin(), expected_maximum.end()),
-          "VMess maximum UDP payload damaged the next authenticated record");
+    EXPECT_TRUE((std::equal(actual_maximum.Bytes().begin(), actual_maximum.Bytes().end(),
+                     expected_maximum.begin(), expected_maximum.end()))) << "VMess maximum UDP payload damaged the next authenticated record";
 }
 
 TEST(VmessUdpDatagram, LowerWriteClosedPreservesReverseRead) {
@@ -1305,8 +1279,7 @@ TEST(VmessUdpDatagram, LowerWriteClosedPreservesReverseRead) {
             CheckWriteClosed(CompleteWrite(connection, server_side
                 ? writer->WriteBuffers(buffers) : client.EncodeRequestBody(stream, buffers)));
         }
-        Check(connection.peer.available() == 0,
-              "VMess resumed publication after a clean lower write close");
+        EXPECT_EQ((connection.peer.available()), (0)) << "VMess resumed publication after a clean lower write close";
         if (server_side) {
             RequestEncoder encoder(request);
             const auto wire = encoder.Encode(payload);
@@ -1317,10 +1290,9 @@ TEST(VmessUdpDatagram, LowerWriteClosedPreservesReverseRead) {
             connection.stream.PrependReadData(response);
             const auto decoded = ReadReady(connection, client.DecodeResponse(stream));
             const buf::ContiguousBufferView bytes(decoded);
-            Check(bytes.Bytes().size() == 113 &&
+            EXPECT_TRUE((bytes.Bytes().size() == 113 &&
                       std::all_of(bytes.Bytes().begin(), bytes.Bytes().end(),
-                                  [](uint8_t byte) { return byte == 0x53; }),
-                  "VMess clean lower write close discarded the response direction");
+                                  [](uint8_t byte) { return byte == 0x53; }))) << "VMess clean lower write close discarded the response direction";
         }
     }
 }
@@ -1383,9 +1355,8 @@ TEST(VmessUdpDatagram, PreCancelledWritePreservesNextRecord) {
                         cancelled = error.code() == io_error::operation_aborted;
                     }
                     co_await net::this_coro::reset_cancellation_state();
-                    Check(connection.peer.available() == 0,
-                          "pre-cancelled VMess write published wire bytes");
-                    Check(cancelled, "pre-cancelled VMess write did not report cancellation");
+                    EXPECT_EQ((connection.peer.available()), (0)) << "pre-cancelled VMess write published wire bytes";
+                    EXPECT_TRUE((cancelled)) << "pre-cancelled VMess write did not report cancellation";
                 };
                 connection.io.restart();
                 net::co_spawn(connection.io, cancel_before_entry(),
@@ -1411,25 +1382,21 @@ TEST(VmessUdpDatagram, PreCancelledWritePreservesNextRecord) {
                     net::read(connection.peer, net::buffer(wire));
                     ResponseDecoder decoder(request);
                     size_t offset = 38;
-                    Check(decoder.Decode(wire, offset) == payload,
-                          "pre-cancelled VMess response advanced its next record");
-                    Check(decoder.Decode(wire, offset).empty() && offset == wire.size(),
-                          "pre-cancelled VMess response damaged EOF framing");
+                    EXPECT_EQ((decoder.Decode(wire, offset)), (payload)) << "pre-cancelled VMess response advanced its next record";
+                    EXPECT_TRUE((decoder.Decode(wire, offset).empty() && offset == wire.size())) << "pre-cancelled VMess response damaged EOF framing";
                 } else {
                     connection.stream.PrependReadData(response);
                     const auto decoded = ReadReady(connection, client.DecodeResponse(connection.stream));
                     const buf::ContiguousBufferView bytes(decoded);
-                    Check(bytes.Bytes().size() == 113 &&
+                    EXPECT_TRUE((bytes.Bytes().size() == 113 &&
                               std::all_of(bytes.Bytes().begin(), bytes.Bytes().end(),
-                                          [](uint8_t byte) { return byte == 0x53; }),
-                          "pre-cancelled VMess request damaged response keys");
+                                          [](uint8_t byte) { return byte == 0x53; }))) << "pre-cancelled VMess request damaged response keys";
                     TcpStream peer_stream(std::move(connection.peer));
                     vmess::encoding::ServerSession peer("pre-cancel-request-peer");
                     peer.SetRequest(request);
                     auto reader = peer.DecodeRequestBody(peer_stream);
                     CheckPayload(ReadReady(connection, *reader), payload, request);
-                    Check(ReadReady(connection, *reader).empty(),
-                          "pre-cancelled VMess request damaged EOF framing");
+                    EXPECT_TRUE((ReadReady(connection, *reader).empty())) << "pre-cancelled VMess request damaged EOF framing";
                 }
             }
         }

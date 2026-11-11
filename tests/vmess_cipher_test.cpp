@@ -1,13 +1,9 @@
-#include <stdexcept>
 #include <gtest/gtest.h>
 
 #include "proxy/vmess/vmess_crypto.hpp"
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
-#include <iostream>
-#include <string_view>
 #include <new>
 #include <openssl/evp.h>
 
@@ -35,79 +31,97 @@ extern "C" int __wrap_EVP_DigestSqueeze(EVP_MD_CTX* ctx, uint8_t* out, size_t si
 
 namespace {
 using namespace ::vmess;
+constexpr std::array<uint8_t, 16> key{}, iv{};
 
-void Check(bool condition, std::string_view message) {
-    if (!condition) {
-        std::cerr << message << '\n';
-        ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
-    }
-}
-}  // namespace
-
-TEST(VmessCipher, Contract) {
-    const std::array<uint8_t, 16> key{}, iv{};
 #ifdef CNODE_TEST_CRYPTO_FAULT
-    fail_digest_allocation = true;
+class CryptoFaultReset {
+public:
+    ~CryptoFaultReset() {
+        fail_digest_allocation = false;
+        fail_mask_output = false;
+        cipher_allocation_countdown = 0;
+    }
+};
+
+TEST(VmessCipher, DigestAllocationFailureRejectsMaskAndCipherConstruction) {
     bool mask_failed = false, key_failed = false;
-    try { ShakeMask mask(iv.data()); }
-    catch (const std::bad_alloc&) { mask_failed = true; }
-    try { VMessCipher cipher(Security::CHACHA20_POLY1305, key.data(), iv.data()); }
-    catch (const std::bad_alloc&) { key_failed = true; }
-    fail_digest_allocation = false;
-    Check(mask_failed && key_failed, "crypto allocation failure produced usable protocol state");
     {
+        CryptoFaultReset reset;
+        fail_digest_allocation = true;
+        try { ShakeMask mask(iv.data()); }
+        catch (const std::bad_alloc&) { mask_failed = true; }
+        try { VMessCipher cipher(Security::CHACHA20_POLY1305, key.data(), iv.data()); }
+        catch (const std::bad_alloc&) { key_failed = true; }
+    }
+    EXPECT_TRUE(mask_failed);
+    EXPECT_TRUE(key_failed);
+}
+
+TEST(VmessCipher, AeadAllocationFailureRejectsConstruction) {
+    bool failed = false;
+    {
+        CryptoFaultReset reset;
         cipher_allocation_countdown = 1;
-        bool failed = false;
         try { VMessCipher cipher(Security::AES_128_GCM, key.data(), iv.data()); }
         catch (const std::bad_alloc&) { failed = true; }
-        cipher_allocation_countdown = 0;
-        Check(failed, "AEAD context allocation failure did not fail construction");
     }
+    EXPECT_TRUE(failed);
+}
+
+TEST(VmessCipher, FailedShakeOutputDoesNotSynthesizeMask) {
     ShakeMask mask(iv.data());
-    fail_mask_output = true;
-    bool squeeze_failed = false;
-    try { (void)mask.NextMask(); }
-    catch (const std::runtime_error&) { squeeze_failed = true; }
-    fail_mask_output = false;
-    Check(squeeze_failed, "failed SHAKE output was replaced by synthetic mask bytes");
+    bool failed = false;
+    {
+        CryptoFaultReset reset;
+        fail_mask_output = true;
+        try { (void)mask.NextMask(); }
+        catch (const std::runtime_error&) { failed = true; }
+    }
+    EXPECT_TRUE(failed);
+}
 #endif
-    const std::array<uint8_t, 16> empty_gcm_tag{
+
+TEST(VmessCipher, EmptyAesGcmMatchesZeroKeyZeroNonceVector) {
+    const std::array<uint8_t, 16> expected{
         0x58, 0xe2, 0xfc, 0xce, 0xfa, 0x7e, 0x30, 0x61,
         0x36, 0x7f, 0x1d, 0x57, 0xa4, 0xe7, 0x45, 0x5a};
-    size_t frames = 0;
-    for (const Security security : {Security::AES_128_GCM,
-                                   Security::CHACHA20_POLY1305,
-                                   Security::NONE, Security::ZERO}) {
-        VMessCipher encoder(security, key.data(), iv.data());
-        VMessCipher decoder(security, key.data(), iv.data());
-        for (const size_t size : {size_t{0}, size_t{1}, size_t{127}, size_t{0}, size_t{31}}) {
-            std::array<uint8_t, 128> input{}, output{};
-            std::array<uint8_t, 144> wire{};
-            for (size_t i = 0; i < size; ++i) input[i] = static_cast<uint8_t>(i + frames);
-            const auto encoded = encoder.Encrypt(size ? input.data() : nullptr, size, wire.data());
-            Check(encoded == static_cast<ssize_t>(size + encoder.Overhead()),
-                  "empty/data chunk encryption failed");
-            if (security == Security::AES_128_GCM && frames == 0) {
-                Check(std::equal(empty_gcm_tag.begin(), empty_gcm_tag.end(), wire.begin()),
-                      "empty AES-GCM tag differs from the zero-key/zero-nonce vector");
-            }
-            Check(decoder.Decrypt(wire.data(), static_cast<size_t>(encoded), output.data()) ==
-                      static_cast<ssize_t>(size), "empty/data chunk authentication failed");
-            Check(std::equal(input.begin(), input.begin() + size, output.begin()),
-                  "chunk plaintext changed");
-            ++frames;
-        }
-        if (encoder.Overhead()) {
-            VMessCipher fresh_encoder(security, key.data(), iv.data());
-            VMessCipher fresh_decoder(security, key.data(), iv.data());
-            std::array<uint8_t, 16> tag{};
-            uint8_t unused = 0;
-            Check(fresh_encoder.Encrypt(nullptr, 0, tag.data()) == 16,
-                  "empty authentication tag was not generated");
-            tag.back() ^= 1;
-            Check(fresh_decoder.Decrypt(tag.data(), tag.size(), &unused) < 0,
-                  "corrupted empty authentication tag was accepted");
-        }
-    }
-    std::cout << "vmess-cipher frames=" << frames << " empty-tag-tamper=2: PASS\n";
+    VMessCipher encoder(Security::AES_128_GCM, key.data(), iv.data());
+    std::array<uint8_t, 16> wire{};
+    ASSERT_EQ(encoder.Encrypt(nullptr, 0, wire.data()), 16);
+    EXPECT_EQ(wire, expected);
 }
+
+class VmessCipherRecords : public testing::TestWithParam<Security> {};
+TEST_P(VmessCipherRecords, EmptyAndDataRecordsAdvanceMatchingNonces) {
+    VMessCipher encoder(GetParam(), key.data(), iv.data());
+    VMessCipher decoder(GetParam(), key.data(), iv.data());
+    size_t frame = 0;
+    for (const size_t size : {size_t{0}, size_t{1}, size_t{127}, size_t{0}, size_t{31}}) {
+        SCOPED_TRACE(frame);
+        std::array<uint8_t, 128> input{}, output{};
+        std::array<uint8_t, 144> wire{};
+        for (size_t i = 0; i < size; ++i) input[i] = static_cast<uint8_t>(i + frame);
+        const auto encoded = encoder.Encrypt(size ? input.data() : nullptr, size, wire.data());
+        ASSERT_EQ(encoded, static_cast<ssize_t>(size + encoder.Overhead()));
+        ASSERT_EQ(decoder.Decrypt(wire.data(), static_cast<size_t>(encoded), output.data()),
+                  static_cast<ssize_t>(size));
+        EXPECT_TRUE(std::equal(input.begin(), input.begin() + size, output.begin()));
+        ++frame;
+    }
+}
+INSTANTIATE_TEST_SUITE_P(SecurityModes, VmessCipherRecords,
+    testing::Values(Security::AES_128_GCM, Security::CHACHA20_POLY1305, Security::NONE, Security::ZERO));
+
+class VmessAuthenticatedCipher : public testing::TestWithParam<Security> {};
+TEST_P(VmessAuthenticatedCipher, RejectsTamperedEmptyRecordTag) {
+    VMessCipher encoder(GetParam(), key.data(), iv.data());
+    VMessCipher decoder(GetParam(), key.data(), iv.data());
+    std::array<uint8_t, 16> tag{};
+    uint8_t unused = 0;
+    ASSERT_EQ(encoder.Encrypt(nullptr, 0, tag.data()), 16);
+    tag.back() ^= 1;
+    EXPECT_LT(decoder.Decrypt(tag.data(), tag.size(), &unused), 0);
+}
+INSTANTIATE_TEST_SUITE_P(AeadModes, VmessAuthenticatedCipher,
+    testing::Values(Security::AES_128_GCM, Security::CHACHA20_POLY1305));
+}  // namespace

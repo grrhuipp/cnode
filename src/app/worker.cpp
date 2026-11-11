@@ -4,7 +4,6 @@
 #include "app/prepared_inbound.hpp"
 #include "app/rate_limiter.hpp"
 #include "common/awaitable_task_group.hpp"
-#include "transport/internet/hysteria/hysteria_ingress.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "app/stats.hpp"
 #include "common/session.hpp"
@@ -117,7 +116,7 @@ struct Worker::ListenerSlot {
     app::DatagramSessionEnvironment datagram_environment;
     std::unique_ptr<worker_detail::TcpListenerOwner> tcp_listeners;
     RetirableIngress<worker_detail::UdpIngress> udp;
-    RetirableIngress<transport::internet::hysteria::HysteriaIngress> quic;
+    RetirableIngress<transport::internet::QuicListener> quic;
     std::optional<SocketBinding> tcp_binding;
     std::optional<SocketBinding> udp_binding;
 };
@@ -137,7 +136,6 @@ struct Worker::ListenerState {
     uint64_t udp_resource_drops = 0;
     size_t udp_receive_loops = 0;
     size_t tcp_tasks = 0;
-    uint32_t active_sessions = 0;
     bool stopping = false;
     struct TaskCancellation final : transport::CancellationSubscription {
         explicit TaskCancellation(ListenerState& state) : owner(state), next(state.tasks) {
@@ -170,7 +168,6 @@ struct Worker::ListenerState {
                std::unique_ptr<TaskCancellation> registration) {
         auto cancel_slot = registration->signal.slot();
         ++tcp_tasks;
-        if (!listener) ++active_sessions;
         try {
             net::co_spawn(worker.io_context_,
                 std::move(task),
@@ -179,7 +176,6 @@ struct Worker::ListenerState {
                         std::exception_ptr error) mutable {
                         registration.reset();
                         --tcp_tasks;
-                        if (!listener) --active_sessions;
                         NotifyCompletion();
                         if (!error) return;
                         try { std::rethrow_exception(error); }
@@ -201,7 +197,6 @@ struct Worker::ListenerState {
                     }));
         } catch (...) {
             --tcp_tasks;
-            if (!listener) --active_sessions;
             throw;
         }
     }
@@ -321,6 +316,8 @@ struct Worker::RuntimeState {
     // Constructed on this Worker's executor; outlives managers, retired
     // listeners and their request guards. Runtime teardown stays on that thread.
     std::shared_ptr<ConnectionLimiter> connection_limiter;
+    std::optional<UserOnlineTracker> online_users;
+    std::optional<proxyman::inbound::AdmissionEnvironment> admission;
 
     // Declared before the row owners: Stop precedes their teardown, but the
     // reclaimer remains alive while all map-owned hooks are unlinked.
@@ -548,7 +545,6 @@ void Worker::RuntimeState::Start(Worker& worker) {
                 static_cast<Worker*>(ctx)->ReportFailure(std::move(error));
             });
     session_tracking = std::make_unique<app::SessionTrackingState>();
-    inbound_handlers = std::make_unique<proxyman::inbound::HandlerRegistry>(stats);
     detect_rule_policy = std::make_unique<rule::DetectRulePolicy>();
     const auto* config = startup_config.get();
     if (!connection_limiter) {
@@ -558,6 +554,9 @@ void Worker::RuntimeState::Start(Worker& worker) {
             .ip_ban = config->limits.ip_ban,
         }, worker.group_coordinator_);
     }
+    online_users.emplace(*worker.group_coordinator_);
+    admission.emplace(*worker.group_coordinator_, *connection_limiter, *online_users, stats);
+    inbound_handlers = std::make_unique<proxyman::inbound::HandlerRegistry>(*admission);
     router = std::make_unique<app::router::Router>(config->routing, geo_database);
     LOG_DEBUG("router initialized worker={} rules={}",
               worker.id_, config->routing.rules.size());
@@ -927,8 +926,7 @@ bool Worker::RegisterInbound(
     proxyman::inbound::ReceiverSettings receiver) {
     auto mutation = BeginColdMutation();
     auto prepared = std::make_shared<const proxyman::inbound::BuildRequest>(req);
-    auto handler = runtime_->inbound_handlers->NewHandler(
-        runtime_->connection_limiter.get(), req);
+    auto handler = runtime_->inbound_handlers->NewHandler(req);
     if (!handler) {
         LOG_WARN("failed to create inbound handler worker={} tag={} protocol={}",
                  id_, receiver.inbound_tag, req.protocol);
@@ -936,7 +934,7 @@ bool Worker::RegisterInbound(
     }
     auto inbound_handler =
         std::make_unique<proxyman::inbound::Handler>(
-            std::move(receiver), std::move(handler), *runtime_->connection_limiter);
+            std::move(receiver), std::move(handler), *runtime_->admission);
     const auto& settings = inbound_handler->ReceiverSettings();
     const memory::String key(settings.inbound_tag);
     auto [slot_it, slot_inserted] =
@@ -959,15 +957,11 @@ bool Worker::RegisterInbound(
         return false;
     }
     slot_it->second->handler = registered;
-    auto* protocol_runtime = runtime_->inbound_handlers->GetOrCreateRuntime(req.protocol);
     slot_it->second->datagram_environment = app::DatagramSessionEnvironment{
         .timeouts = runtime_->timeouts,
         .dispatcher = runtime_->dispatcher.get(),
-        .stats = &runtime_->stats,
-        .limiter = runtime_->connection_limiter.get(),
+        .admission = &*runtime_->admission,
         .request_load = &runtime_->request_load,
-        .tracker = protocol_runtime ? protocol_runtime->OnlineTracker() : nullptr,
-        .active_sessions = &runtime_->listener_state->active_sessions,
         .handler = registered,
         .prepared = std::move(prepared),
     };
@@ -1059,8 +1053,7 @@ std::vector<OnlineDevice> Worker::GetOnlineDevices(std::string_view tag) const {
     if (!runtime_ || !runtime_->inbound_handlers) return {};
     auto handler = runtime_->inbound_handlers->GetHandler(tag);
     if (!handler) return {};
-    return runtime_->inbound_handlers->GetOnlineDevices(
-        handler->ReceiverSettings().protocol, tag);
+    return runtime_->inbound_handlers->GetOnlineDevices(tag);
 }
 
 // ============================================================================
@@ -1073,7 +1066,7 @@ WorkerRuntimeStatsSnapshot Worker::CollectRuntimeStats(bool include_resources) c
     snapshot.udp_sockets = transport::internet::DatagramSocket::ActiveCount();
     snapshot.stats = runtime_->stats.Snapshot();
     snapshot.worker_id = id_;
-    snapshot.active_connections = runtime_->listener_state->active_sessions;
+    snapshot.active_connections = runtime_->request_load.ActiveConnections();
     if (!include_resources) return snapshot;
     auto& resources = snapshot.resources.emplace();
     resources.udp_resource_drops = runtime_->listener_state->udp_resource_drops;
@@ -1123,8 +1116,7 @@ net::awaitable<bool> Worker::AddUdpListenerTask(
             *this, binding);
     }
     auto result =
-        runtime_->inbound_handlers->NewDatagramHandler(
-            runtime_->connection_limiter.get(), req);
+        runtime_->inbound_handlers->NewDatagramHandler(req);
     switch (result.status) {
         case proxyman::inbound::DatagramHandlerBuildStatus::Unsupported:
             co_return true;
@@ -1157,8 +1149,10 @@ net::awaitable<bool> Worker::ListenerState::StartQuicListening(
                   worker.id_, binding.tag);
         co_return false;
     }
-    auto replacement = std::make_unique<transport::internet::hysteria::HysteriaIngress>(
-        worker.id_, worker.runtime_->io_context, slot_it->second->datagram_environment);
+    auto replacement = proxyman::inbound::NewQuicListener(
+        binding.protocol, worker.id_, worker.group_coordinator_->WorkerCount(),
+        worker.runtime_->io_context, slot_it->second->datagram_environment);
+    if (!replacement) co_return false;
 
     size_t bound = 0;
     const auto candidates = binding.listen.Candidates();

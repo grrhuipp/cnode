@@ -100,19 +100,16 @@ public:
     ConnectionLimiter(const ConnectionLimiter&) = delete;
     ConnectionLimiter& operator=(const ConnectionLimiter&) = delete;
 
-    net::awaitable<Admission> ReservePhysical(
-        std::string_view tag = {}, std::string_view ip = {}, bool check_ban = false);
-    net::awaitable<Admission> ReserveIP(std::string_view tag, std::string_view ip,
-                                        bool check_ban);
-    net::awaitable<Admission> ReserveLogical(std::shared_ptr<Family> family,
-        std::string_view tag, std::string_view ip, bool check_ban);
+    enum class ReservationScope : uint8_t { Physical, ClientIp, Logical };
+    struct ReservationRequest {
+        ReservationScope scope;
+        std::shared_ptr<Family> family{};
+        std::string_view tag{};
+        std::string_view ip{};
+        bool check_ban = false;
+    };
+    [[nodiscard]] std::optional<net::awaitable<Admission>> TryReserve(ReservationRequest request);
     [[nodiscard]] bool TracksAuthBan() const noexcept { return config_.ip_ban.enabled; }
-    // False when no quota or ban table is configured: every Reserve* call
-    // would return an empty admission, so callers skip the coroutine.
-    [[nodiscard]] bool TracksAdmission() const noexcept {
-        return config_.max_connections > 0 || config_.max_conn_per_ip > 0 ||
-               config_.ip_ban.enabled;
-    }
     // 任意 Worker 线程可调用：只读取构造后不变的指纹上下文。
     [[nodiscard]] AuthCredentialKey FingerprintCredential(
         std::string_view tag, std::span<const uint8_t> credential,
@@ -125,6 +122,8 @@ public:
 private:
     class Service;
     ConnectionLimiter(const RateLimitConfig& config, std::shared_ptr<GroupCoordinator> coordinator);
+    net::awaitable<Admission> ReservePhysical(
+        std::string_view tag, std::string_view ip, bool check_ban);
     net::awaitable<Admission> Reserve(std::shared_ptr<Family> family,
         std::string_view tag, std::string_view ip, bool check_ban);
 

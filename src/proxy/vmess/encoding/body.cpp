@@ -1,6 +1,6 @@
 #include "proxy/vmess/encoding/body.hpp"
 #include "proxy/buffered_stream_reader.hpp"
-#include "proxy/expiring_keyed_map.hpp"
+#include "proxy/vmess/session_history.hpp"
 #include "transport/failure.hpp"
 #include "common/scoped_cleanse.hpp"
 
@@ -1105,26 +1105,6 @@ namespace {
 
 using SessionKey = std::array<uint8_t, 32>;
 
-struct SessionHistory {
-    static constexpr int64_t kTtlSeconds = 180;
-    static constexpr int64_t kCleanupIntervalSeconds = 30;
-    static constexpr size_t kMaxEntries = 65536;
-    proxy::ExpiringKeyedMap<32, std::monostate, int64_t> entries{kMaxEntries};
-    int64_t last_cleanup = 0;
-
-    bool AddIfNew(const SessionKey& key, int64_t now) {
-        if (now - last_cleanup >= kCleanupIntervalSeconds || entries.size() >= kMaxEntries) {
-            last_cleanup = now;
-            entries.Prune(now);
-        }
-        auto* entry = entries.Find(key);
-        if (entry && entry->expires_at > now) return false;
-        const auto expires_at = now + kTtlSeconds;
-        if (entry) entries.Rearm(key, *entry, expires_at);
-        else entries.Insert(key, expires_at, std::monostate{});
-        return true;
-    }
-};
 
 struct alignas(64) HotUserCache {
     static constexpr size_t kMaxHotUsers = 32;
@@ -1288,24 +1268,21 @@ FindByAuthIDForTag(
 }
 
 net::awaitable<bool> RegisterSessionIfNew(
+    GroupCoordinator& coordinator,
     const proxyman::inbound::UserStore::VmessCredential& user,
     const std::array<uint8_t, 16>& body_key,
     const std::array<uint8_t, 16>& body_iv) {
-    auto executor = co_await net::this_coro::executor;
-    auto* coordinator = GroupCoordinator::ForContext(
-        net::query(executor, net::execution::context));
-    if (!coordinator) throw std::logic_error("VMess replay admission requires a registered coordinator");
     std::array<uint8_t, 48> material{};
     std::memcpy(material.data(), user.uuid_bytes.data(), 16);
     std::memcpy(material.data() + 16, body_key.data(), 16);
     std::memcpy(material.data() + 32, body_iv.data(), 16);
     const SessionKey key = SHA256Hash(material.data(), material.size());
     OPENSSL_cleanse(material.data(), material.size());
-    co_return co_await coordinator->PostCall([coordinator, key] {
+    co_return co_await coordinator.PostCall([&coordinator, key] {
         const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         return net::use_service<HistoryService>(
-            coordinator->Services()).history.AddIfNew(key, now);
+            coordinator.Services()).history.AddIfNew(key, now);
     });
 }
 

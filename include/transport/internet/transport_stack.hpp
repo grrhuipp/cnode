@@ -9,6 +9,7 @@
 #include <span>
 #include <string_view>
 
+class GroupCoordinator;
 class SslContext;
 struct StatsShard;
 struct TimeoutsConfig;
@@ -64,6 +65,7 @@ net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
 // required for REALITY with dest; an unauthenticated ClientHello is then
 // relayed to dest and the call yields a null stream.
 net::awaitable<TransportBuildResult> BuildInboundTransport(
+    GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> raw,
     const StreamSettings& s,

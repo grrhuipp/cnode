@@ -28,11 +28,18 @@ class Http1BodyStream final : public AsyncStream {
 public:
     Http1BodyStream(std::unique_ptr<AsyncStream> inner,
                     const Http1ReadFraming& read_framing,
-                    bool write_chunked)
+                    bool write_chunked, Http1BodyReadOptions read_options)
         : inner_(std::move(inner))
+        , read_budget_(read_options.max_body_bytes)
+        , max_line_bytes_(read_options.max_line_bytes)
+        , max_trailer_lines_(read_options.max_trailer_lines)
+        , max_trailer_bytes_(read_options.max_trailer_bytes)
+        , count_trailer_terminator_(read_options.count_trailer_terminator)
         , read_chunked_(std::holds_alternative<Http1BodyChunked>(read_framing))
-        , write_chunked_(write_chunked) {
+        , write_chunked_(write_chunked)
+        , reject_trailing_read_ahead_(read_options.reject_trailing_read_ahead) {
         if (const auto* length = std::get_if<Http1BodyContentLength>(&read_framing)) {
+            if (length->bytes > read_budget_) FailBodyRead("HTTP body too large");
             content_remaining_ = length->bytes;
         }
     }
@@ -50,6 +57,8 @@ public:
             const auto max_bytes = static_cast<size_t>(
                 std::min<uint64_t>(mb.byte_size(), *content_remaining_));
             if (max_bytes < mb.byte_size()) {
+                if (reject_trailing_read_ahead_)
+                    FailBodyRead("trailing bytes after HTTP/1 Content-Length body");
                 buf::MultiBuffer trimmed;
                 if (!mb.MovePrefixTo(trimmed, max_bytes)) {
                     throw std::bad_alloc();
@@ -96,9 +105,12 @@ public:
         }
         if (!read_chunked_) {
             if (pending_.byte_size() != 0) {
+                ChargeBodyRead(pending_.byte_size());
                 co_return std::move(pending_);
             }
-            co_return co_await inner_->ReadMultiBuffer();
+            auto payload = co_await inner_->ReadMultiBuffer();
+            ChargeBodyRead(payload.byte_size());
+            co_return payload;
         }
         if (chunk_remaining_ == 0 && !co_await EnsureChunkPayload()) {
             co_return buf::MultiBuffer{};
@@ -111,6 +123,7 @@ public:
             FailBodyRead("truncated HTTP/1 chunk payload");
         }
         if (pending_.byte_size() <= chunk_remaining_) {
+            ChargeBodyRead(pending_.byte_size());
             chunk_remaining_ -= pending_.byte_size();
             if (chunk_remaining_ == 0) chunk_terminator_pending_ = true;
             co_return std::move(pending_);
@@ -118,6 +131,7 @@ public:
         const size_t n = std::min(pending_.byte_size(), chunk_remaining_);
         buf::MultiBuffer payload;
         if (!pending_.MovePrefixTo(payload, n)) throw std::bad_alloc();
+        ChargeBodyRead(n);
         chunk_remaining_ -= n;
         if (chunk_remaining_ == 0) chunk_terminator_pending_ = true;
         co_return payload;
@@ -252,9 +266,11 @@ protected:
     }
 
 private:
-    static constexpr size_t kMaxChunkLine = 8192;
-    static constexpr size_t kMaxTrailerLines = 128;
-    static constexpr size_t kMaxTrailerBytes = 64 * 1024;
+    void ChargeTrailerLine(size_t bytes) {
+        if (bytes > max_trailer_bytes_ - trailer_bytes_)
+            FailBodyRead("HTTP/1 chunk trailers exceed limit");
+        trailer_bytes_ += bytes;
+    }
 
     net::awaitable<size_t> ReadRaw(net::mutable_buffer buffer) {
         if (closed_ || read_closed_) {
@@ -268,9 +284,12 @@ private:
         if (pending_.byte_size() != 0) {
             const size_t n = pending_.ConsumePrefixTo(std::span<uint8_t>(out, capacity));
             pending_.ReleaseIfIdle();
+            ChargeBodyRead(n);
             co_return n;
         }
-        co_return co_await inner_->AsyncRead(buffer);
+        const auto n = co_await inner_->AsyncRead(buffer);
+        ChargeBodyRead(n);
+        co_return n;
     }
 
     // RFC 9112 6.3: a Content-Length body ends after exactly that many bytes;
@@ -312,13 +331,17 @@ private:
             }
         }
         if (pending_.byte_size() <= *content_remaining_) {
+            ChargeBodyRead(pending_.byte_size());
             *content_remaining_ -= pending_.byte_size();
             co_return std::move(pending_);
         }
         buf::MultiBuffer payload;
+        if (reject_trailing_read_ahead_)
+            FailBodyRead("trailing bytes after HTTP/1 Content-Length body");
         if (!pending_.MovePrefixTo(payload, static_cast<size_t>(*content_remaining_))) {
             throw std::bad_alloc();
         }
+        ChargeBodyRead(payload.byte_size());
         *content_remaining_ = 0;
         pending_.clear();
         co_return payload;
@@ -327,7 +350,8 @@ private:
     // Parser state belongs to the stream, not a suspended read. A sniff read
     // can be cancelled after consuming part of a size line or chunk terminator.
     net::awaitable<bool> ReadLine() {
-        while (line_.size() < kMaxChunkLine) {
+        const size_t wire_limit = max_line_bytes_ + 2;
+        while (line_.size() < wire_limit) {
             if (pending_.byte_size() == 0) {
                 pending_ = co_await inner_->ReadMultiBuffer();
                 if (pending_.byte_size() == 0) co_return false;
@@ -337,7 +361,7 @@ private:
             const bool finished = end != bytes.end();
             const size_t count = end == bytes.end() ? bytes.size()
                 : static_cast<size_t>(end - bytes.begin()) + 1;
-            if (count > kMaxChunkLine - line_.size()) co_return false;
+            if (count > wire_limit - line_.size()) co_return false;
             line_.append(reinterpret_cast<const char*>(bytes.data()), count);
             pending_.DropPrefixBytes(count);
             pending_.ReleaseIfIdle();
@@ -345,6 +369,7 @@ private:
                 if (line_.size() < 2 || line_[line_.size() - 2] != '\r')
                     co_return false;
                 line_.resize(line_.size() - 2);
+                if (line_.size() > max_line_bytes_) co_return false;
                 co_return true;
             }
         }
@@ -353,6 +378,11 @@ private:
 
     void ResetLine() noexcept {
         memory::String{}.swap(line_);
+    }
+
+    void ChargeBodyRead(size_t bytes) {
+        if (bytes > read_budget_) FailBodyRead("HTTP body too large");
+        read_budget_ -= bytes;
     }
 
     [[noreturn]] void FailBodyRead(const char* what) {
@@ -397,6 +427,9 @@ private:
             }
             if (reading_trailers_) {
                 if (line_.empty()) {
+                    if (count_trailer_terminator_) ChargeTrailerLine(2);
+                    if (reject_trailing_read_ahead_ && pending_.byte_size() != 0)
+                        FailBodyRead("trailing bytes after HTTP/1 chunked body");
                     ResetLine();
                     read_closed_ = true;
                     pending_.clear();
@@ -411,11 +444,9 @@ private:
                 const size_t line_bytes = line_.size() + 2;
                 ResetLine();
                 ++trailer_lines_;
-                if (trailer_lines_ > kMaxTrailerLines ||
-                    line_bytes > kMaxTrailerBytes - trailer_bytes_) {
+                if (trailer_lines_ > max_trailer_lines_)
                     FailBodyRead("HTTP/1 chunk trailers exceed limit");
-                }
-                trailer_bytes_ += line_bytes;
+                ChargeTrailerLine(line_bytes);
                 continue;
             }
             const auto chunk_size = ParseHttpChunkSize(line_);
@@ -425,6 +456,7 @@ private:
                 reading_trailers_ = true;
                 continue;
             }
+            if (*chunk_size > read_budget_) FailBodyRead("HTTP body too large");
             chunk_remaining_ = *chunk_size;
         }
         co_return true;
@@ -457,6 +489,11 @@ private:
     size_t chunk_remaining_ = 0;
     // Unread Content-Length body bytes; empty unless the body is so framed.
     std::optional<uint64_t> content_remaining_;
+    uint64_t read_budget_;
+    size_t max_line_bytes_;
+    size_t max_trailer_lines_;
+    size_t max_trailer_bytes_;
+    bool count_trailer_terminator_;
     memory::String line_;
     size_t chunk_terminator_bytes_ = 0;
     size_t trailer_lines_ = 0;
@@ -465,6 +502,7 @@ private:
     bool reading_trailers_ = false;
     bool read_chunked_ = false;
     bool write_chunked_ = false;
+    bool reject_trailing_read_ahead_ = false;
     bool read_closed_ = false;
     bool write_closed_ = false;
     bool closed_ = false;
@@ -524,8 +562,105 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadClientResponse(
 
 }  // namespace
 
+net::awaitable<tl::expected<Http1ResponseHead, ErrorCode>>
+ReadHttp1ResponseHead(AsyncStream& stream, Http1HeadReadLimits limits) {
+    Http1ResponseHead response;
+    size_t total_head_bytes = 0;
+    for (;;) {
+        auto remaining_limits = limits;
+        if (limits.max_head_bytes != 0) {
+            if (total_head_bytes >= limits.max_head_bytes)
+                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            remaining_limits.max_head_bytes -= total_head_bytes;
+        }
+        auto read = co_await ReadHttp1MessageHead(stream, response.head, {}, remaining_limits);
+        if (!read) co_return tl::unexpected(read.error());
+        total_head_bytes += response.head.header_end;
+        if (limits.max_head_bytes == 0 && total_head_bytes > 256 * 1024)
+            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        const auto text = response.head.Text();
+        const auto line = ExtractStartLine(text);
+        const size_t space = line.find(' ');
+        if (space == std::string_view::npos)
+            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        const auto version = line.substr(0, space);
+        const auto rest = line.substr(space + 1);
+        const auto token = rest.substr(0, rest.find(' '));
+        int status = 0;
+        const auto [end, ec] = std::from_chars(
+            token.data(), token.data() + token.size(), status);
+        if ((version != "HTTP/1.0" && version != "HTTP/1.1") ||
+            token.size() != 3 || ec != std::errc{} ||
+            end != token.data() + token.size() || status < 100 || status > 599 ||
+            !IsValidHttpHeaderValue(rest))
+            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+
+        std::optional<uint64_t> length;
+        bool transfer_encoding = false;
+        size_t coding_count = 0;
+        bool only_chunked = true;
+        size_t offset = line.size() + 2;
+        while (offset < text.size() - 2) {
+            const size_t end_line = text.find("\r\n", offset);
+            if (end_line == std::string_view::npos)
+                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            std::string_view name, value;
+            if (!SplitAndValidateHttpHeaderLine(
+                    text.substr(offset, end_line - offset), name, value))
+                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            offset = end_line + 2;
+            if (EqualsAsciiCI(name, "Content-Length")) {
+                uint64_t parsed = 0;
+                const auto [last, error] = std::from_chars(
+                    value.data(), value.data() + value.size(), parsed);
+                if (value.empty() || error != std::errc{} ||
+                    last != value.data() + value.size() || (length && *length != parsed))
+                    co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                length = parsed;
+            } else if (EqualsAsciiCI(name, "Transfer-Encoding")) {
+                transfer_encoding = true;
+                while (!value.empty()) {
+                    const size_t comma = value.find(',');
+                    const auto coding = TrimHttpOws(value.substr(0, comma));
+                    value = comma == std::string_view::npos ? std::string_view{}
+                        : value.substr(comma + 1);
+                    if (coding.empty()) continue;
+                    ++coding_count;
+                    only_chunked &= EqualsAsciiCI(coding, "chunked");
+                }
+            }
+        }
+        if (status < 200) {
+            if (status == 101)
+                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            continue;
+        }
+        response.status = status;
+        response.header_bytes = total_head_bytes;
+        // RFC 9112 6.3 rule 1: representation metadata on 304 is not a body.
+        if (status == 204 || status == 304) {
+            response.framing = Http1BodyContentLength{0};
+        } else if (transfer_encoding) {
+            if (version == "HTTP/1.0" || length || coding_count != 1 || !only_chunked)
+                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            response.framing = Http1BodyChunked{};
+        } else if (length) {
+            response.framing = Http1BodyContentLength{*length};
+        }
+        co_return response;
+    }
+}
+
 net::awaitable<tl::expected<void, ErrorCode>> ReadHttp1MessageHead(
-    AsyncStream& stream, Http1MessageHead& head, std::span<const uint8_t> initial) {
+    AsyncStream& stream, Http1MessageHead& head, std::span<const uint8_t> initial,
+    Http1HeadReadLimits limits) {
+    if (!head.extended_storage.empty() && head.header_end != 0) {
+        head.extended_storage.erase(0, head.header_end);
+        head.size = head.extended_storage.size();
+        head.header_end = 0;
+        head.bytes = unsafe::ptr_cast<const uint8_t>(head.extended_storage.data());
+        if (head.extended_storage.empty()) memory::String{}.swap(head.extended_storage);
+    }
     if (head.storage) {
         if (head.header_end != 0) {
             const size_t remaining = head.size - head.header_end;
@@ -588,44 +723,83 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadHttp1MessageHead(
     }
     uint8_t* data = head.storage->Tail().data();
     const size_t capacity = head.storage->Available();
-    head.bytes = data;
+    const size_t head_limit = limits.max_head_bytes ? limits.max_head_bytes : capacity;
+    if (head.extended_storage.empty()) head.bytes = data;
     if (!initial.empty()) {
-        if (initial.size() > capacity - head.size) {
+        if (initial.size() > head_limit || head.size > head_limit - initial.size())
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        if (head.extended_storage.empty() && initial.size() <= capacity - head.size) {
+            std::memcpy(data + head.size, initial.data(), initial.size());
+        } else {
+            if (head.extended_storage.empty())
+                head.extended_storage.assign(unsafe::ptr_cast<const char>(data), head.size);
+            head.extended_storage.append(
+                unsafe::ptr_cast<const char>(initial.data()), initial.size());
+            head.bytes = unsafe::ptr_cast<const uint8_t>(head.extended_storage.data());
         }
-        std::memcpy(data + head.size, initial.data(), initial.size());
         head.size += initial.size();
     }
 
     constexpr std::string_view kTerminator = "\r\n\r\n";
     size_t scanned = 0;
-    while (true) {
-        // Resume behind the last scanned byte; a terminator may straddle reads.
-        const std::string_view received(unsafe::ptr_cast<const char>(data), head.size);
+    size_t line_start = 0;
+    size_t line_scanned = 0;
+    for (;;) {
+        const std::string_view received(unsafe::ptr_cast<const char>(head.bytes), head.size);
         const size_t from = scanned < kTerminator.size() - 1
             ? 0 : scanned - (kTerminator.size() - 1);
-        if (const size_t end = received.find(kTerminator, from);
-            end != std::string_view::npos) {
-            head.header_end = end + kTerminator.size();
+        const size_t end = received.find(kTerminator, from);
+        const size_t checked_size = end == std::string_view::npos
+            ? received.size() : end + kTerminator.size();
+        if (checked_size > head_limit)
+            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        if (limits.max_line_bytes != 0) {
+            while (line_start < checked_size) {
+                const size_t scan_from = line_scanned > line_start ? line_scanned - 1 : line_start;
+                const size_t crlf = received.find("\r\n", scan_from);
+                if (crlf != std::string_view::npos && crlf + 2 <= checked_size) {
+                    if (crlf - line_start > limits.max_line_bytes)
+                        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                    line_start = line_scanned = crlf + 2;
+                } else {
+                    const size_t partial = checked_size - line_start;
+                    if (partial > limits.max_line_bytes &&
+                        (partial - limits.max_line_bytes != 1 || received[checked_size - 1] != '\r'))
+                        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                    line_scanned = checked_size;
+                    break;
+                }
+            }
+        }
+        if (end != std::string_view::npos) {
+            head.header_end = checked_size;
             co_return tl::expected<void, ErrorCode>{};
         }
         scanned = head.size;
-        if (head.size == capacity) {
+        if (head.size >= head_limit)
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        if (head.extended_storage.empty() && head.size < capacity) {
+            const size_t want = std::min(capacity - head.size, head_limit - head.size);
+            const size_t n = co_await stream.AsyncRead(net::buffer(data + head.size, want));
+            if (n == 0) co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+            head.size += n;
+        } else {
+            if (head.extended_storage.empty())
+                head.extended_storage.assign(unsafe::ptr_cast<const char>(data), head.size);
+            const size_t want = std::min(capacity, head_limit - head.size);
+            const size_t n = co_await stream.AsyncRead(net::buffer(data, want));
+            if (n == 0) co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+            head.extended_storage.append(unsafe::ptr_cast<const char>(data), n);
+            head.size += n;
+            head.bytes = unsafe::ptr_cast<const uint8_t>(head.extended_storage.data());
         }
-        const size_t n = co_await stream.AsyncRead(
-            net::buffer(data + head.size, capacity - head.size));
-        if (n == 0) {
-            co_return tl::unexpected(ErrorCode::SOCKET_EOF);
-        }
-        head.size += n;
     }
 }
 
 net::awaitable<tl::expected<Http1MessageHead, ErrorCode>> ReadHttp1MessageHead(
-    AsyncStream& stream, std::span<const uint8_t> initial) {
+    AsyncStream& stream, std::span<const uint8_t> initial, Http1HeadReadLimits limits) {
     Http1MessageHead head;
-    if (auto res = co_await ReadHttp1MessageHead(stream, head, initial); !res) {
+    if (auto res = co_await ReadHttp1MessageHead(stream, head, initial, limits); !res) {
         co_return tl::unexpected(res.error());
     }
     co_return std::move(head);
@@ -1040,8 +1214,10 @@ std::unique_ptr<AsyncStream> MakeHttp1BodyStream(
     std::unique_ptr<AsyncStream> inner,
     Http1ReadFraming read_framing,
     bool write_chunked,
-    buf::MultiBuffer&& read_ahead) {
-    auto body = std::make_unique<Http1BodyStream>(std::move(inner), read_framing, write_chunked);
+    buf::MultiBuffer&& read_ahead,
+    Http1BodyReadOptions read_options) {
+    auto body = std::make_unique<Http1BodyStream>(
+        std::move(inner), read_framing, write_chunked, read_options);
     body->SetPendingMultiBuffer(std::move(read_ahead));
     return body;
 }

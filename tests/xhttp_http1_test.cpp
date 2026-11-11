@@ -1,19 +1,20 @@
+#include "transport_coordinator_fixture.hpp"
 #include <gtest/gtest.h>
 
 #include "transport/internet/tcp_stream.hpp"
 #include "transport/internet/transport_stack.hpp"
 
 #include <asio/as_tuple.hpp>
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/experimental/channel.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/write.hpp>
 #include <array>
 #include <chrono>
-#include <cstdio>
 #include <exception>
 #include <memory>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -21,18 +22,15 @@ namespace {
 namespace net = ::net;
 using namespace std::chrono_literals;
 
-void Require(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
-}
 
 template<class Predicate>
-void RunUntil(net::io_context& io, Predicate predicate, const char* message) {
+bool PumpUntil(net::io_context& io, Predicate predicate) {
     const auto deadline = std::chrono::steady_clock::now() + 3s;
     while (!predicate() && std::chrono::steady_clock::now() < deadline) {
         io.restart();
         io.run_for(5ms);
     }
-    Require(predicate(), message);
+    return predicate();
 }
 
 void Settle(net::io_context& io) {
@@ -56,49 +54,6 @@ size_t Count(std::string_view haystack, std::string_view needle) {
     }
     return count;
 }
-
-// A client socket plus the server-side transport build running on its peer.
-struct Connection {
-    Connection(net::io_context& io, ::tcp::acceptor& acceptor,
-               const ::StreamSettings& settings,
-               std::shared_ptr<::InboundTransportStreamHandler> sink)
-        : client(io), accepted(io) {
-        client.connect(acceptor.local_endpoint());
-        acceptor.accept(accepted);
-        client.non_blocking(true);
-        auto raw = std::make_unique<::TcpStream>(std::move(accepted));
-        auto build = [this, &io, raw = std::move(raw), &settings,
-                      sink = std::move(sink)]() mutable -> net::awaitable<void> {
-            auto result = co_await ::BuildInboundTransport(
-                io, std::move(raw), settings, nullptr, 0, std::move(sink));
-            build_ok = result.has_value() && !*result;
-        };
-        net::co_spawn(io, std::move(build), [this](std::exception_ptr error) {
-            failure = error;
-            returned = true;
-        });
-    }
-
-    void Write(std::string_view bytes) { net::write(client, net::buffer(bytes)); }
-
-    const std::string& Received() {
-        std::array<char, 4096> chunk{};
-        while (true) {
-            ::IoErrorCode error;
-            const size_t n = client.read_some(net::buffer(chunk), error);
-            if (error) break;
-            received.append(chunk.data(), n);
-        }
-        return received;
-    }
-
-    ::tcp::socket client;
-    ::tcp::socket accepted;
-    std::string received;
-    std::exception_ptr failure;
-    bool returned = false;
-    bool build_ok = false;
-};
 
 // Reads the uplink until `expected` arrives, answers on the downlink, then
 // holds the logical stream until released.
@@ -135,6 +90,69 @@ public:
     int started = 0;
     int finished = 0;
 };
+// A client socket plus the server-side transport build running on its peer.
+struct Connection {
+    Connection(GroupCoordinator& coordinator, net::io_context& io, ::tcp::acceptor& acceptor,
+               const ::StreamSettings& settings,
+               std::shared_ptr<EchoSink> sink)
+        : io(io), sink(sink), client(io), accepted(io) {
+        client.connect(acceptor.local_endpoint());
+        acceptor.accept(accepted);
+        client.non_blocking(true);
+        auto raw = std::make_unique<::TcpStream>(std::move(accepted));
+        auto build = [state = state, &io, &coordinator, raw = std::move(raw), settings,
+                      sink = std::move(sink)]() mutable -> net::awaitable<void> {
+            auto result = co_await ::BuildInboundTransport(coordinator, io, std::move(raw), settings, nullptr, 0, std::move(sink));
+            state->build_ok = result.has_value() && !*result;
+        };
+        net::co_spawn(io, std::move(build),
+            net::bind_cancellation_slot(cancellation.slot(),
+                [state = state](std::exception_ptr error) {
+                    state->failure = error;
+                    state->returned = true;
+                }));
+    }
+
+    ~Connection() {
+        (void)sink->release.try_send(::IoErrorCode{});
+        ::IoErrorCode ignored;
+        client.close(ignored);
+        cancellation.emit(net::cancellation_type::terminal);
+        EXPECT_TRUE(PumpUntil(io, [&] {
+            return returned && sink->finished == sink->started;
+        })) << "transport tasks did not drain during fixture teardown";
+    }
+
+    void Write(std::string_view bytes) { net::write(client, net::buffer(bytes)); }
+
+    const std::string& Received() {
+        std::array<char, 4096> chunk{};
+        while (true) {
+            ::IoErrorCode error;
+            const size_t n = client.read_some(net::buffer(chunk), error);
+            if (error) break;
+            received.append(chunk.data(), n);
+        }
+        return received;
+    }
+
+    struct BuildState {
+        std::exception_ptr failure;
+        bool returned = false;
+        bool build_ok = false;
+    };
+    std::shared_ptr<BuildState> state = std::make_shared<BuildState>();
+    net::io_context& io;
+    std::shared_ptr<EchoSink> sink;
+    net::cancellation_signal cancellation;
+    ::tcp::socket client;
+    ::tcp::socket accepted;
+    std::string received;
+    std::exception_ptr& failure = state->failure;
+    bool& returned = state->returned;
+    bool& build_ok = state->build_ok;
+};
+
 
 std::string PacketUp(std::string_view session, int seq, std::string_view body,
                      bool close = false) {
@@ -146,191 +164,188 @@ std::string PacketUp(std::string_view session, int seq, std::string_view body,
 // RFC 9112 9.3: packet-up uploads share one persistent, pipelined connection,
 // and an upload may precede its downlink GET on another connection. A late
 // upload for an ended session is answered without closing the connection.
-void PacketUpPersistsAndPrecedesDownlink() {
+TEST(XhttpHttp1, PacketUpPersistsAndPrecedesDownlink) {
     net::io_context io;
+    TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     const auto settings = XHttpSettings(::XHttpMode::PacketUp);
     auto sink = std::make_shared<EchoSink>(io, "hello world", "pong");
 
-    Connection upload(io, acceptor, settings, sink);
+    Connection upload(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
     upload.Write(PacketUp("s1", 0, "hello ") + PacketUp("s1", 1, "world"));
     Settle(io);
-    Require(!upload.returned && upload.Received().empty(),
-            "upload before its downlink was not held for the downlink");
+    EXPECT_TRUE((!upload.returned && upload.Received().empty())) << "upload before its downlink was not held for the downlink";
 
-    Connection downlink(io, acceptor, settings, sink);
+    Connection downlink(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
     downlink.Write("GET /fixture/s1 HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    RunUntil(io, [&] {
+    ASSERT_TRUE(PumpUntil(io, [&] {
         return Count(upload.Received(), "HTTP/1.1 200 OK\r\n") == 2 &&
                downlink.Received().find("4\r\npong\r\n") != std::string::npos;
-    }, "pipelined uploads or downlink reply missing");
-    Require(sink->uplink == "hello world", "uploads reached the session out of order");
-    Require(upload.Received().find("Connection: close") == std::string::npos && !upload.returned,
-            "persistent upload connection was closed");
+    })) << "pipelined uploads or downlink reply missing";
+    EXPECT_EQ(sink->uplink, "hello world") << "uploads reached the session out of order";
+    EXPECT_TRUE((upload.Received().find("Connection: close") == std::string::npos && !upload.returned)) << "persistent upload connection was closed";
 
-    Require(sink->release.try_send(::IoErrorCode{}), "sink release failed");
-    RunUntil(io, [&] { return sink->finished == 1; }, "logical stream did not finish");
+    EXPECT_TRUE((sink->release.try_send(::IoErrorCode{}))) << "sink release failed";
+    ASSERT_TRUE(PumpUntil(io, [&] { return sink->finished == 1; })) << "logical stream did not finish";
     upload.Write(PacketUp("s1", 2, "late"));
-    RunUntil(io, [&] { return upload.Received().find("404 Not Found") != std::string::npos; },
-             "late upload for an ended session was not rejected");
-    Require(!upload.returned, "late upload closed the shared connection");
+    ASSERT_TRUE(PumpUntil(io, [&] { return upload.Received().find("404 Not Found") != std::string::npos; })) << "late upload for an ended session was not rejected";
+    EXPECT_FALSE(upload.returned) << "late upload closed the shared connection";
     upload.Write(PacketUp("s1", 3, "bye", true));
-    RunUntil(io, [&] { return upload.returned; }, "Connection: close was not honoured");
-    Require(Count(upload.Received(), "Connection: close") == 1, "close response not announced");
+    ASSERT_TRUE(PumpUntil(io, [&] { return upload.returned; })) << "Connection: close was not honoured";
+    EXPECT_EQ(Count(upload.Received(), "Connection: close"), 1) << "close response not announced";
+    EXPECT_EQ(Count(upload.Received(), "HTTP/1.1 404 Not Found\r\n"), 2)
+        << "every upload for the retired session must be rejected";
+    EXPECT_EQ(sink->started, 1) << "a late upload recreated the logical stream";
+    EXPECT_EQ(sink->finished, 1);
     if (upload.failure) std::rethrow_exception(upload.failure);
-    Require(upload.build_ok, "upload connection ended with an error");
+    EXPECT_TRUE((upload.build_ok)) << "upload connection ended with an error";
 
     ::IoErrorCode ignored;
     downlink.client.close(ignored);
-    RunUntil(io, [&] { return downlink.returned; }, "downlink connection did not finish");
+    ASSERT_TRUE(PumpUntil(io, [&] { return downlink.returned; })) << "downlink connection did not finish";
+    if (downlink.failure) std::rethrow_exception(downlink.failure);
+    EXPECT_TRUE(downlink.build_ok) << "downlink connection ended with an error";
 }
 
 // Uploads on separate connections may all reach a session before its downlink
 // GET; that GET releases every one of them, not just one.
-void ConcurrentUploadsPrecedeDownlink() {
+TEST(XhttpHttp1, ConcurrentUploadsPrecedeDownlink) {
     net::io_context io;
+    TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     const auto settings = XHttpSettings(::XHttpMode::PacketUp);
     auto sink = std::make_shared<EchoSink>(io, "abc", "ok");
 
-    Connection first(io, acceptor, settings, sink);
-    Connection second(io, acceptor, settings, sink);
-    Connection third(io, acceptor, settings, sink);
+    Connection first(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
+    Connection second(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
+    Connection third(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
     first.Write(PacketUp("s2", 0, "a"));
     second.Write(PacketUp("s2", 1, "b"));
     third.Write(PacketUp("s2", 2, "c"));
     Settle(io);
-    Require(first.Received().empty() && second.Received().empty() && third.Received().empty(),
-            "uploads were answered before their downlink");
+    EXPECT_TRUE((first.Received().empty() && second.Received().empty() && third.Received().empty())) << "uploads were answered before their downlink";
 
-    Connection downlink(io, acceptor, settings, sink);
+    Connection downlink(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
     downlink.Write("GET /fixture/s2 HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    RunUntil(io, [&] {
+    ASSERT_TRUE(PumpUntil(io, [&] {
         return first.Received().starts_with("HTTP/1.1 200 OK\r\n") &&
                second.Received().starts_with("HTTP/1.1 200 OK\r\n") &&
                third.Received().starts_with("HTTP/1.1 200 OK\r\n") &&
                downlink.Received().find("2\r\nok\r\n") != std::string::npos;
-    }, "an upload waiting for the downlink was not released");
-    Require(sink->uplink == "abc", "uploads reached the session out of order");
+    })) << "an upload waiting for the downlink was not released";
+    EXPECT_EQ(sink->uplink, "abc") << "uploads reached the session out of order";
 
-    Require(sink->release.try_send(::IoErrorCode{}), "sink release failed");
-    RunUntil(io, [&] { return sink->finished == 1; }, "logical stream did not finish");
+    EXPECT_TRUE((sink->release.try_send(::IoErrorCode{}))) << "sink release failed";
+    ASSERT_TRUE(PumpUntil(io, [&] { return sink->finished == 1; })) << "logical stream did not finish";
     ::IoErrorCode ignored;
     for (Connection* connection : {&first, &second, &third, &downlink}) {
         connection->client.close(ignored);
     }
-    RunUntil(io, [&] {
+    ASSERT_TRUE(PumpUntil(io, [&] {
         return first.returned && second.returned && third.returned && downlink.returned;
-    }, "connections did not finish");
+    })) << "connections did not finish";
     for (Connection* connection : {&first, &second, &third}) {
         if (connection->failure) std::rethrow_exception(connection->failure);
-        Require(connection->build_ok, "upload connection ended with an error");
+        EXPECT_TRUE((connection->build_ok)) << "upload connection ended with an error";
     }
 }
 
 // RFC 9112 9.6: "close" in any Connection field line ends the connection
 // after the response; a request pipelined behind it is not processed.
-void LaterConnectionCloseFieldEndsConnection() {
+TEST(XhttpHttp1, LaterConnectionCloseFieldEndsConnection) {
     net::io_context io;
+    TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     const auto settings = XHttpSettings(::XHttpMode::PacketUp);
     auto sink = std::make_shared<EchoSink>(io, "a", "ok");
 
-    Connection downlink(io, acceptor, settings, sink);
+    Connection downlink(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
     downlink.Write("GET /fixture/s3 HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    RunUntil(io, [&] { return sink->started == 1; }, "downlink did not start");
+    ASSERT_TRUE(PumpUntil(io, [&] { return sink->started == 1; })) << "downlink did not start";
 
-    Connection upload(io, acceptor, settings, sink);
+    Connection upload(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
     upload.Write("POST /fixture/s3/0 HTTP/1.1\r\nHost: localhost\r\n"
                  "Connection: keep-alive\r\nContent-Length: 1\r\nConnection: close\r\n\r\na" +
                  PacketUp("s3", 1, "b"));
-    RunUntil(io, [&] { return upload.returned; }, "Connection: close in a later field line ignored");
-    Require(Count(upload.Received(), "HTTP/1.1 ") == 1 &&
-                upload.Received().find("Connection: close\r\n") != std::string::npos,
-            "request pipelined behind Connection: close was processed");
+    ASSERT_TRUE(PumpUntil(io, [&] { return upload.returned; })) << "Connection: close in a later field line ignored";
+    EXPECT_TRUE((Count(upload.Received(), "HTTP/1.1 ") == 1 &&
+                upload.Received().find("Connection: close\r\n") != std::string::npos)) << "request pipelined behind Connection: close was processed";
     if (upload.failure) std::rethrow_exception(upload.failure);
-    Require(upload.build_ok, "upload connection ended with an error");
+    EXPECT_TRUE((upload.build_ok)) << "upload connection ended with an error";
 
-    Require(sink->release.try_send(::IoErrorCode{}), "sink release failed");
-    RunUntil(io, [&] { return sink->finished == 1; }, "logical stream did not finish");
+    EXPECT_TRUE((sink->release.try_send(::IoErrorCode{}))) << "sink release failed";
+    ASSERT_TRUE(PumpUntil(io, [&] { return sink->finished == 1; })) << "logical stream did not finish";
     ::IoErrorCode ignored;
     downlink.client.close(ignored);
-    RunUntil(io, [&] { return downlink.returned; }, "downlink connection did not finish");
+    ASSERT_TRUE(PumpUntil(io, [&] { return downlink.returned; })) << "downlink connection did not finish";
 }
 
 // Without a session id one POST carries both directions: the chunked request
 // body is the uplink and the chunked response body the downlink.
-void StreamOneOverHttp1() {
+TEST(XhttpHttp1, StreamOneSupportsChunkedDuplexBody) {
     net::io_context io;
+    TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     const auto settings = XHttpSettings(::XHttpMode::StreamOne);
     auto sink = std::make_shared<EchoSink>(io, "hello", "world");
-    Connection connection(io, acceptor, settings, sink);
+    Connection connection(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
     connection.Write("POST /fixture/ HTTP/1.1\r\nHost: localhost\r\n"
                      "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n");
-    RunUntil(io, [&] {
+    ASSERT_TRUE(PumpUntil(io, [&] {
         const auto& wire = connection.Received();
         return wire.starts_with("HTTP/1.1 200 OK\r\n") &&
                wire.find("Transfer-Encoding: chunked\r\n") != std::string::npos &&
                wire.find("\r\n\r\n5\r\nworld\r\n") != std::string::npos;
-    }, "stream-one response missing");
-    Require(sink->uplink == "hello", "stream-one request body lost");
-    Require(sink->release.try_send(::IoErrorCode{}), "sink release failed");
-    RunUntil(io, [&] { return connection.returned; }, "stream-one connection did not finish");
+    })) << "stream-one response missing";
+    EXPECT_EQ(sink->uplink, "hello") << "stream-one request body lost";
+    EXPECT_TRUE((sink->release.try_send(::IoErrorCode{}))) << "sink release failed";
+    ASSERT_TRUE(PumpUntil(io, [&] { return connection.returned; })) << "stream-one connection did not finish";
     if (connection.failure) std::rethrow_exception(connection.failure);
 }
 
 // RFC 9112 6.3: a stream-one Content-Length body ends after its declared
 // octets, so a request pipelined behind it never reaches the uplink. 6.1-6.3:
 // conflicting, repeated, unsupported or missing framing is refused.
-void StreamOneHonoursBodyFraming() {
+TEST(XhttpHttp1, ContentLengthExcludesPipelinedRequestFromStreamOneUplink) {
     net::io_context io;
+    TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     const auto settings = XHttpSettings(::XHttpMode::StreamOne);
     // Asks for more than the body holds: only body EOF ends the read.
     auto sink = std::make_shared<EchoSink>(io, "hello!", "world");
-    Connection connection(io, acceptor, settings, sink);
+    Connection connection(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
     connection.Write("POST /fixture/ HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello"
                      "POST /fixture/ HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nbye");
-    RunUntil(io, [&] {
+    ASSERT_TRUE(PumpUntil(io, [&] {
         return connection.Received().find("\r\n\r\n5\r\nworld\r\n") != std::string::npos;
-    }, "stream-one response missing");
-    Require(sink->uplink == "hello", "bytes past Content-Length reached the uplink");
-    Require(sink->release.try_send(::IoErrorCode{}), "sink release failed");
-    RunUntil(io, [&] { return connection.returned; }, "stream-one connection did not finish");
+    })) << "stream-one response missing";
+    EXPECT_EQ(sink->uplink, "hello") << "bytes past Content-Length reached the uplink";
+    EXPECT_TRUE((sink->release.try_send(::IoErrorCode{}))) << "sink release failed";
+    ASSERT_TRUE(PumpUntil(io, [&] { return connection.returned; })) << "stream-one connection did not finish";
     if (connection.failure) std::rethrow_exception(connection.failure);
 
-    constexpr std::array<std::string_view, 4> kRejected{
-        "Transfer-Encoding: chunked\r\nContent-Length: 5\r\n",
-        "Transfer-Encoding: gzip, chunked\r\n",
-        "Content-Length: 5\r\nContent-Length: 5\r\n",
-        "",
-    };
-    for (const std::string_view framing : kRejected) {
+}
+
+class InvalidStreamOneFraming : public testing::TestWithParam<std::string_view> {};
+TEST_P(InvalidStreamOneFraming, RefusesAmbiguousUnsupportedOrMissingFraming) {
+    net::io_context io;
+    TransportCoordinatorFixture transport_coordinator{io};
+    ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
+    const auto settings = XHttpSettings(::XHttpMode::StreamOne);
+    const auto framing = GetParam();
         auto rejecting = std::make_shared<EchoSink>(io, "hello", "world");
-        Connection rejected(io, acceptor, settings, rejecting);
+        Connection rejected(transport_coordinator.Coordinator(), io, acceptor, settings, rejecting);
         rejected.Write("POST /fixture/ HTTP/1.1\r\nHost: localhost\r\n" + std::string(framing) +
                        "\r\n5\r\nhello\r\n0\r\n\r\n");
-        RunUntil(io, [&] { return rejected.returned; }, "invalid stream-one framing was not refused");
+        ASSERT_TRUE(PumpUntil(io, [&] { return rejected.returned; })) << "invalid stream-one framing was not refused";
         if (rejected.failure) std::rethrow_exception(rejected.failure);
-        Require(!rejected.build_ok && rejecting->started == 0,
-                "stream-one request with invalid framing was accepted");
-    }
+        EXPECT_TRUE((!rejected.build_ok && rejecting->started == 0)) << "stream-one request with invalid framing was accepted";
 }
+INSTANTIATE_TEST_SUITE_P(Headers, InvalidStreamOneFraming, testing::Values(
+    std::string_view("Transfer-Encoding: chunked\r\nContent-Length: 5\r\n"),
+    std::string_view("Transfer-Encoding: gzip, chunked\r\n"),
+    std::string_view("Content-Length: 5\r\nContent-Length: 5\r\n"),
+    std::string_view("")));
 
 }  // namespace
 
-TEST(XhttpHttp1, Contract) {
-    try {
-        PacketUpPersistsAndPrecedesDownlink();
-        ConcurrentUploadsPrecedeDownlink();
-        LaterConnectionCloseFieldEndsConnection();
-        StreamOneOverHttp1();
-        StreamOneHonoursBodyFraming();
-        std::puts("XHTTP HTTP/1: persistent packet-up and stream-one completed");
-        return;
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "XHTTP HTTP/1: %s\n", error.what());
-        FAIL() << error.what();
-    }
-}

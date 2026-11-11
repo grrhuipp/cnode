@@ -3,15 +3,13 @@
 #include "proxy/shadowsocks/ss_udp.hpp"
 #include "proxy/inbound.hpp"
 
-class UserOnlineTracker;
+namespace proxyman::inbound { struct AdmissionEnvironment; }
 
 namespace proxy::shadowsocks::inbound {
 
 class Handler final : public ::Inbound {
 public:
-    Handler(::UserOnlineTracker& tracker,
-            ::StatsShard& stats,
-            ::ConnectionLimiter* limiter,
+    Handler(const ::proxyman::inbound::AdmissionEnvironment& environment,
             ::ss::SsCipherInfo cipher_info);
 
     // 解析首包：读 salt + 首 chunk，尝试所有用户密钥，解析 SOCKS5 地址
@@ -35,9 +33,7 @@ public:
     CreateDatagramResponse(const ::InboundDatagramResult& decoded) override;
 
 private:
-    ::UserOnlineTracker& tracker_;
-    ::StatsShard& stats_;
-    ::ConnectionLimiter* limiter_;
+    const ::proxyman::inbound::AdmissionEnvironment& environment_;
     ::ss::SsCipherInfo cipher_info_;
     ::ss::Ss2022UdpReplayCache udp_replay_cache_;
     // 上次匹配成功的用户索引，用于优先尝试（大概率命中同一活跃用户）

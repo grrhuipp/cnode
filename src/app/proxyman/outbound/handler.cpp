@@ -29,13 +29,10 @@ net::awaitable<OutboundProcessResult> Handler::Dispatch(
     const TimeoutsConfig& timeouts,
     StatsShard& stats,
     const RelayConfig& relay_config,
-    buf::MultiBufferBatch&& first_payload,
-    std::chrono::seconds relay_idle_timeout,
-    std::chrono::seconds relay_write_timeout) {
+    buf::MultiBufferBatch&& first_payload) {
     // Not a coroutine: the callee frame is the request's outbound frame.
     return proxy_->Process(ctx, inbound, dialer_, timeouts, stats, relay_config,
-                           std::move(first_payload), relay_idle_timeout,
-                           relay_write_timeout);
+                           std::move(first_payload));
 }
 
 // ============================================================================

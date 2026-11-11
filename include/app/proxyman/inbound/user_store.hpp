@@ -10,6 +10,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -137,6 +138,13 @@ enum class UserProtocol : uint8_t {
     AnyTls,
     Hysteria,
 };
+
+template <typename Users>
+inline constexpr bool kHasKeyedInboundCredential =
+    std::is_same_v<Users, PreparedVlessUsers> ||
+    std::is_same_v<Users, PreparedTrojanUsers> ||
+    std::is_same_v<Users, PreparedAnyTlsUsers> ||
+    std::is_same_v<Users, PreparedHysteriaUsers>;
 
 [[nodiscard]] inline UserProtocol UserProtocolOf(const UserSet& users) noexcept {
     return std::visit([](const auto& value) noexcept {
@@ -296,7 +304,7 @@ public:
 
     struct UserUpdate {
         std::string_view tag;
-        const UserSet& users;
+        std::reference_wrapper<const UserSet> users;
     };
 
     [[nodiscard]] static VmessUsersView VmessUsers(std::string_view tag);

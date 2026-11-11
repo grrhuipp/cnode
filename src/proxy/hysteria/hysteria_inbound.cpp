@@ -3,6 +3,7 @@
 #include "app/relay.hpp"
 #include "transport/internet/hysteria/hysteria_wire.hpp"
 #include "transport/internet/hysteria/hysteria_settings.hpp"
+#include "transport/internet/hysteria/hysteria_ingress.hpp"
 
 #include "app/proxyman/inbound/handler.hpp"
 #include "app/stats.hpp"
@@ -189,13 +190,11 @@ PrepareSettings(wire::Version version, const InboundProtocolSettings& config) {
 }
 
 std::unique_ptr<::Inbound> CreateInbound(
-    proxyman::inbound::ProtocolRuntime&,
-    StatsShard& stats,
-    ConnectionLimiter*,
+    const proxyman::inbound::AdmissionEnvironment& environment,
     const proxyman::inbound::BuildRequest& request) {
     const auto* settings = wire::GetSettings(request);
     if (!settings) return nullptr;
-    return std::make_unique<HysteriaInbound>(stats, settings->version);
+    return std::make_unique<HysteriaInbound>(environment.stats, settings->version);
 }
 
 std::optional<proxyman::inbound::UserSet> BuildUsers(
@@ -213,7 +212,12 @@ proxyman::inbound::ProxyRegistration Registration() {
     proxyman::inbound::ProxyRegistration registration;
     registration.user_protocol = proxyman::inbound::UserProtocol::Hysteria;
     registration.datagram_transport = proxyman::inbound::DatagramTransport::Quic;
-    registration.create_runtime = &::proxy::CreateUserOnlineProtocolRuntime;
+    registration.traits = {.mailbox_email_defaults_to_tag = true, .requires_tls = true};
+    registration.create_quic_listener = [](
+        uint32_t worker_id, uint32_t worker_count, net::io_context& io,
+        app::DatagramSessionEnvironment environment) -> std::unique_ptr<transport::internet::QuicListener> {
+        return std::make_unique<wire::HysteriaIngress>(worker_id, worker_count, io, std::move(environment));
+    };
     registration.create_tcp_handler = &CreateInbound;
     registration.build_users = &BuildUsers;
     return registration;

@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -59,43 +60,45 @@ std::string EncodeRealityBase64Url(std::span<const uint8_t> bytes) {
 
 }  // namespace
 
-TEST(RealityKey, Contract) {
-    using ::transport::internet::NormalizeRealityFingerprint;
-    using ::transport::internet::ParseRealityKey;
-    using ::transport::internet::ParseRealityMldsa65PublicKey;
-    using ::transport::internet::ParseRealityMldsa65Seed;
+TEST(RealityKey, DecodesCanonicalBase64UrlKey) {
+    const auto parsed = ::transport::internet::ParseRealityKey(std::string(43, 'A'));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(*parsed, RealityKey{});
+}
 
-    const std::string zero_key(43, 'A');
-    const auto parsed = ParseRealityKey(zero_key);
-    ASSERT_TRUE(parsed && *parsed == RealityKey{})
-        << "canonical 32-byte Base64URL key must decode";
+namespace {
+class RealityInvalidKey : public testing::TestWithParam<std::string> {};
+TEST_P(RealityInvalidKey, RejectsNoncanonicalOrMalformedKey) {
+    EXPECT_FALSE(::transport::internet::ParseRealityKey(GetParam()));
+}
+INSTANTIATE_TEST_SUITE_P(Base64Url, RealityInvalidKey, testing::Values(
+    std::string(42, 'A'), std::string(44, 'A'), std::string(42, 'A') + "=",
+    std::string(42, 'A') + "B", std::string(42, 'A') + "!"));
+}
 
-    std::string noncanonical = zero_key;
-    noncanonical.back() = 'B';
-    for (const std::string& invalid : {
-             std::string(42, 'A'), std::string(44, 'A'),
-             zero_key.substr(0, 42) + "=", noncanonical,
-             zero_key.substr(0, 42) + "!"}) {
-        ASSERT_FALSE(ParseRealityKey(invalid))
-            << "invalid REALITY key must be rejected";
-    }
+TEST(RealityKey, ParsesMldsaSeedAndDerivedPublicKey) {
+    const auto seed = ::transport::internet::ParseRealityMldsa65Seed(std::string(43, 'A'));
+    ASSERT_TRUE(seed.has_value());
+    const auto public_key = DeriveRealityMldsa65PublicKeyFromSeed(*seed);
+    ASSERT_TRUE(public_key.has_value());
+    const auto parsed = ::transport::internet::ParseRealityMldsa65PublicKey(EncodeRealityBase64Url(*public_key));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(*parsed, *public_key);
+}
 
-    const auto mldsa_seed = ParseRealityMldsa65Seed(zero_key);
-    ASSERT_TRUE(mldsa_seed.has_value())
-        << "valid 32-byte ML-DSA-65 seed must parse";
-    const auto mldsa_pub = DeriveRealityMldsa65PublicKeyFromSeed(*mldsa_seed);
-    ASSERT_TRUE(mldsa_pub.has_value())
-        << "ML-DSA-65 public key derivation from seed failed";
-    const std::string encoded_pub = EncodeRealityBase64Url(*mldsa_pub);
-    const auto parsed_pub = ParseRealityMldsa65PublicKey(encoded_pub);
-    ASSERT_TRUE(parsed_pub && *parsed_pub == *mldsa_pub)
-        << "ML-DSA-65 public key round-trip failed";
-    ASSERT_FALSE(ParseRealityMldsa65PublicKey("invalid-pub"))
-        << "invalid ML-DSA-65 public key must be rejected";
+TEST(RealityKey, RejectsMalformedMldsaPublicKey) {
+    EXPECT_FALSE(::transport::internet::ParseRealityMldsa65PublicKey("invalid-pub"));
+}
 
-    ASSERT_TRUE(NormalizeRealityFingerprint("Chrome") == "chrome" &&
-                NormalizeRealityFingerprint("Firefox") == "firefox" &&
-                NormalizeRealityFingerprint("iOS") == "ios" &&
-                !NormalizeRealityFingerprint("unknown-browser"))
-        << "REALITY fingerprint normalization failed";
+namespace {
+class RealityFingerprint : public testing::TestWithParam<std::pair<const char*, const char*>> {};
+TEST_P(RealityFingerprint, NormalizesSupportedBrowserName) {
+    EXPECT_EQ(::transport::internet::NormalizeRealityFingerprint(GetParam().first), GetParam().second);
+}
+INSTANTIATE_TEST_SUITE_P(Browsers, RealityFingerprint, testing::Values(
+    std::pair{"Chrome", "chrome"}, std::pair{"Firefox", "firefox"}, std::pair{"iOS", "ios"}));
+}
+
+TEST(RealityKey, RejectsUnsupportedFingerprint) {
+    EXPECT_FALSE(::transport::internet::NormalizeRealityFingerprint("unknown-browser"));
 }

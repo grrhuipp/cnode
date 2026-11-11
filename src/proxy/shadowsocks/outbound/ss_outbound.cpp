@@ -15,9 +15,7 @@ public:
         const ::TimeoutsConfig& timeouts,
         ::StatsShard& stats,
         const ::RelayConfig& relay_config,
-        ::buf::MultiBufferBatch first_payload,
-        std::chrono::seconds relay_idle_timeout,
-        std::chrono::seconds relay_write_timeout) override;
+        ::buf::MultiBufferBatch first_payload) override;
 
 private:
     std::shared_ptr<const PreparedSettings> prepared_;
@@ -35,7 +33,6 @@ private:
 #include "proxy/outbound_stream_endpoint.hpp"
 #include "app/relay.hpp"
 #include "app/proxyman/outbound/handler.hpp"
-#include "infra/json.hpp"
 #include "app/dns/dns.hpp"
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"
@@ -620,9 +617,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     const TimeoutsConfig& timeouts,
     StatsShard& stats,
     const RelayConfig& relay_config,
-    buf::MultiBufferBatch first_payload,
-    std::chrono::seconds relay_idle_timeout,
-    std::chrono::seconds relay_write_timeout) {
+    buf::MultiBufferBatch first_payload) {
     if (!inbound.Valid()) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
@@ -642,9 +637,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
                 OutboundDialer::DatagramRemote{
                     .address = server.literal_address,
                     .family_hint = {},
-                    .accepts_v4 = true,
-                    .accepts_v6 = true,
-                    .prefers_v6 = false,
+                    .family_policy = {},
                 },
                 target_endpoint,
                 std::move(server_target),
@@ -655,8 +648,8 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
             !opened) {
             co_return tl::unexpected(opened.error());
         }
-        target_endpoint->SetIdleTimeout(relay_idle_timeout);
-        target_endpoint->SetWriteTimeout(relay_write_timeout);
+        target_endpoint->SetIdleTimeout(relay_config.idle_timeout);
+        target_endpoint->SetWriteTimeout(relay_config.write_timeout);
         co_return co_await DoRelayLink(
             dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
             *target_endpoint, ctx, stats, relay_config, std::move(first_payload));
@@ -708,9 +701,9 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         }
     }
 
-    stream->SetIdleTimeout(relay_idle_timeout);
+    stream->SetIdleTimeout(relay_config.idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
-    stream->SetWriteTimeout(relay_write_timeout);
+    stream->SetWriteTimeout(relay_config.write_timeout);
     stream->ClearPhaseDeadline();
 
     auto relay_endpoint = [&](auto& endpoint) {
@@ -735,138 +728,29 @@ proxy::shadowsocks::outbound::Handler::Handler(
 namespace proxy::shadowsocks::outbound {
 
 std::optional<Credentials> Credentials::Prepare(
-    std::string_view method, std::string_view password) {
-    const auto cipher = ss::ParseCipherMethod(method);
-    if (!cipher || password.empty()) {
-        return std::nullopt;
-    }
-    if (!ss::Is2022Cipher(cipher->type)) {
-        auto key = ss::DeriveKey(password, cipher->key_size);
-        if (key.size != cipher->key_size) {
-            return std::nullopt;
-        }
-        return Credentials(*cipher, key, {});
+    const ss::SsCipherInfo& cipher, std::string_view password) {
+    if (password.empty()) return std::nullopt;
+    if (!ss::Is2022Cipher(cipher.type)) {
+        auto key = ss::DeriveKey(password, cipher.key_size);
+        if (key.size != cipher.key_size) return std::nullopt;
+        return Credentials(cipher, key, {});
     }
 
     std::vector<ss::KeyBytes> chain;
     for (;;) {
         const auto separator = password.find(':');
-        const auto key = ss::Decode2022Psk(password.substr(0, separator), cipher->key_size);
-        if (key.size != cipher->key_size) {
-            return std::nullopt;
-        }
+        const auto key = ss::Decode2022Psk(password.substr(0, separator), cipher.key_size);
+        if (key.size != cipher.key_size) return std::nullopt;
         chain.push_back(key);
-        if (separator == std::string_view::npos) {
-            break;
-        }
-        // The production TCP/UDP codecs support identity chains only for AES.
-        if (!ss::Is2022AesCipher(cipher->type)) {
-            return std::nullopt;
-        }
+        if (separator == std::string_view::npos) break;
+        // 生产 TCP/UDP 编码器仅支持 AES 身份链。
+        if (!ss::Is2022AesCipher(cipher.type)) return std::nullopt;
         password.remove_prefix(separator + 1);
     }
     const auto master_key = chain.back();
-    return Credentials(*cipher, master_key, std::move(chain));
+    return Credentials(cipher, master_key, std::move(chain));
 }
 
-namespace {
-
-tl::expected<proxy::uot::Version, std::string> ParseVersionValue(
-    const json::value& value,
-    std::string_view field) {
-    const auto raw = JsonUnsignedInteger(value);
-    if (!raw) {
-        return tl::unexpected(std::format("{} must be 1 or 2", field));
-    }
-
-    if (*raw == 1) return proxy::uot::Version::V1;
-    if (*raw == 2) return proxy::uot::Version::V2;
-
-    return tl::unexpected(std::format("{} must be 1 or 2", field));
-}
-
-tl::expected<std::optional<proxy::uot::Version>, std::string> ReadTopLevelVersion(
-    const json::object& source) {
-    const auto* value = source.if_contains("uotVersion");
-    if (!value) {
-        return std::optional<proxy::uot::Version>{};
-    }
-    auto parsed = ParseVersionValue(*value, "uotVersion");
-    if (!parsed) {
-        return tl::unexpected(std::move(parsed.error()));
-    }
-    return std::optional<proxy::uot::Version>{*parsed};
-}
-
-tl::expected<std::optional<proxy::uot::Version>, std::string> ParseActivation(
-    const json::value& value,
-    std::string_view field,
-    std::optional<proxy::uot::Version> top_level_version) {
-    if (value.is_bool()) {
-        if (!value.as_bool()) {
-            if (top_level_version) {
-                return tl::unexpected(std::format(
-                    "{} is disabled but a UoT version is configured", field));
-            }
-            return std::optional<proxy::uot::Version>{};
-        }
-        return std::optional<proxy::uot::Version>{
-            top_level_version.value_or(proxy::uot::Version::V2)};
-    }
-
-    if (!value.is_object()) {
-        return tl::unexpected(std::format(
-            "{} must be a boolean or object", field));
-    }
-    if (top_level_version) {
-        return tl::unexpected(std::format(
-            "top-level UoT version cannot be combined with {} object", field));
-    }
-
-    const auto& object = value.as_object();
-    bool enabled = true;
-    if (const auto* enabled_value = object.if_contains("enabled")) {
-        if (!enabled_value->is_bool()) {
-            return tl::unexpected(std::format(
-                "{}.enabled must be a boolean", field));
-        }
-        enabled = enabled_value->as_bool();
-    }
-
-    const auto* version_value = object.if_contains("version");
-    if (!enabled) {
-        if (version_value) {
-            return tl::unexpected(std::format(
-                "{} is disabled but version is configured", field));
-        }
-        return std::optional<proxy::uot::Version>{};
-    }
-    if (!version_value) {
-        return std::optional<proxy::uot::Version>{proxy::uot::Version::V2};
-    }
-    auto version = ParseVersionValue(*version_value, std::format("{}.version", field));
-    if (!version) return tl::unexpected(std::move(version.error()));
-    return std::optional<proxy::uot::Version>{*version};
-}
-
-}  // namespace
-
-tl::expected<std::optional<proxy::uot::Version>, std::string>
-ParseUotVersion(const json::object& source) {
-    auto top_level_version = ReadTopLevelVersion(source);
-    if (!top_level_version) {
-        return tl::unexpected(std::move(top_level_version.error()));
-    }
-
-    const auto* uot = source.if_contains("uot");
-    if (!uot) {
-        if (*top_level_version) {
-            return tl::unexpected("UoT version requires uot");
-        }
-        return std::optional<proxy::uot::Version>{};
-    }
-    return ParseActivation(*uot, "uot", *top_level_version);
-}
 
 }  // namespace proxy::shadowsocks::outbound
 
@@ -878,64 +762,11 @@ const bool kSsOutboundRegistered = (::proxyman::outbound::RegisterProxy(
     ::constants::protocol::kShadowsocks,
     [](const ::infra::OutboundSourceConfig& cfg)
         -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
-        std::string password;
-        std::string method(::constants::protocol::kAes256Gcm);
-        std::string address;
-        uint16_t port = 8388;
-        std::optional<::proxy::uot::Version> uot_version;
-        // A present field of the wrong type is a configuration error, never
-        // an implicit default.
-        auto read_ss_server = [&](const ::json::object& obj) {
-            const auto fail = [&](std::string_view error) {
-                LOG_ERROR("Shadowsocks outbound '{}': {}", cfg.tag, error);
-                return false;
-            };
-            auto source_address = ::ParseJsonString(obj, "address");
-            if (!source_address) return fail(source_address.error());
-            const auto source_port = ::ReadJsonPort(obj, "port");
-            if (source_port.Invalid()) return fail("invalid port");
-            auto source_password = ::ParseJsonString(obj, "password");
-            if (!source_password) return fail(source_password.error());
-            auto source_key = ::ParseJsonString(obj, "key");
-            if (!source_key) return fail(source_key.error());
-            auto source_method = ::ParseJsonString(obj, "method");
-            if (!source_method) return fail(source_method.error());
-            if (*source_method && (*source_method)->empty()) return fail("method must not be empty");
-
-            address = std::move(*source_address).value_or(std::string{});
-            if (source_port.Valid()) {
-                port = source_port.value;
-            }
-            password = std::move(*source_password).value_or(std::string{});
-            if (password.empty()) {
-                password = std::move(*source_key).value_or(std::string{});
-            }
-            if (*source_method) {
-                method = LowerAscii(std::move(**source_method));
-            }
-            auto parsed_uot = ::proxy::shadowsocks::outbound::ParseUotVersion(obj);
-            if (!parsed_uot) {
-                LOG_ERROR("Shadowsocks outbound '{}': invalid UoT settings: {}",
-                          cfg.tag, parsed_uot.error());
-                return false;
-            }
-            uot_version = *parsed_uot;
-            return true;
-        };
-
-        const auto server_obj = ::proxy::ParseOptionalSingleObjectArray(
-            cfg.settings, "servers", "Shadowsocks", cfg.tag);
-        if (!server_obj ||
-            !read_ss_server(*server_obj ? **server_obj : cfg.settings)) {
-            return std::nullopt;
-        }
-        auto next_hop = ::proxy::PrepareNextHop(
-            cfg, std::move(address), port, ::OutboundStreamDefaults{});
-        if (!next_hop) {
-            return std::nullopt;
-        }
+        const auto* settings = std::get_if<::infra::ShadowsocksSettings>(&cfg.settings);
+        if (!settings) return std::nullopt;
+        auto next_hop = ::proxy::PrepareNextHop(cfg, settings->server, ::OutboundStreamDefaults{});
         auto credentials = ::proxy::shadowsocks::outbound::Credentials::Prepare(
-            method, password);
+            settings->cipher, settings->password);
         if (!credentials) {
             LOG_ERROR("Shadowsocks outbound '{}': invalid cipher, password or identity chain", cfg.tag);
             return std::nullopt;
@@ -952,11 +783,11 @@ const bool kSsOutboundRegistered = (::proxyman::outbound::RegisterProxy(
                         std::move(state));
                 }>(PreparedSettings{
                     ::SsOutboundConfig{
-                        .server = std::move(next_hop->server),
-                        .uot_version = uot_version,
+                        .server = std::move(next_hop.server),
+                        .uot_version = settings->uot_version,
                     },
                     std::move(*credentials)}),
-            .sender = std::move(next_hop->sender),
+            .sender = std::move(next_hop.sender),
         };
     }), true);
 }  // namespace

@@ -1,3 +1,4 @@
+#include "transport_coordinator_fixture.hpp"
 #include <gtest/gtest.h>
 
 #include "transport/internet/tcp_stream.hpp"
@@ -10,7 +11,6 @@
 #include <asio/write.hpp>
 #include <array>
 #include <chrono>
-#include <cstdio>
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -21,9 +21,6 @@ namespace {
 namespace net = ::net;
 using namespace std::chrono_literals;
 
-void Require(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
-}
 
 std::string Frame(uint8_t type, uint8_t flags, uint32_t stream, std::string_view payload = {}) {
     std::string result;
@@ -92,6 +89,19 @@ public:
     int cleanup_finished = 0;
 };
 
+struct SessionJoin {
+    net::io_context& io;
+    ::tcp::socket& peer;
+    CleanupSink& sink;
+    ~SessionJoin() {
+        ::IoErrorCode ignored;
+        peer.close(ignored);
+        sink.release_cleanup.close();
+        io.restart();
+        io.run();
+    }
+};
+
 template<class Predicate>
 void RunUntil(net::io_context& io, Predicate predicate, const char* message) {
     const auto deadline = std::chrono::steady_clock::now() + 3s;
@@ -99,7 +109,7 @@ void RunUntil(net::io_context& io, Predicate predicate, const char* message) {
         io.restart();
         io.run_for(10ms);
     }
-    Require(predicate(), message);
+    EXPECT_TRUE(predicate()) << message;
 }
 
 ::StreamSettings FixtureSettings(std::string_view network) {
@@ -116,6 +126,7 @@ void RunUntil(net::io_context& io, Predicate predicate, const char* message) {
 
 void ParentWaitsForCleanup(std::string_view network, bool protocol_error) {
     net::io_context io;
+    TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket client(io), accepted(io);
     client.connect(acceptor.local_endpoint());
@@ -126,19 +137,21 @@ void ParentWaitsForCleanup(std::string_view network, bool protocol_error) {
     bool returned = false;
     std::exception_ptr failure;
     auto build = [&]() -> net::awaitable<void> {
-        const auto result = co_await ::BuildInboundTransport(io, std::move(raw), settings, nullptr, 0, sink);
-        Require(result.has_value() && !*result, "demux builder returned a request stream");
-        Require(sink->cleanup_finished == 1, "builder returned before child cleanup finished");
+        const auto result = co_await ::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr, 0, sink);
+        EXPECT_TRUE(result.has_value() && !*result);
+        EXPECT_EQ(sink->cleanup_finished, 1);
     };
     net::co_spawn(io, build(), [&](std::exception_ptr error) {
         failure = error;
         returned = true;
     });
+    SessionJoin join{io, client, *sink};
     const auto opening = std::string("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") +
         Frame(4, 0, 0) + Frame(1, 4, 1, Headers(network));
     net::write(client, net::buffer(opening));
     RunUntil(io, [&] { return sink->started == 1 || returned; }, "logical request did not start");
-    Require(sink->started == 1 && !returned, "builder detached the active request");
+    EXPECT_EQ(sink->started, 1);
+    EXPECT_FALSE(returned);
     if (protocol_error) {
         // RFC 9113 section 6.7: PING on a nonzero stream is a connection error.
         const auto invalid = Frame(6, 0, 1, "bad-ping");
@@ -151,12 +164,13 @@ void ParentWaitsForCleanup(std::string_view network, bool protocol_error) {
              "physical termination did not cancel the request");
     io.restart();
     io.run_for(20ms);
-    Require(sink->cleanup_started == 1 && sink->cleanup_finished == 0 && !returned,
-            "parent completed while request cleanup was suspended");
-    Require(sink->release_cleanup.try_send(::IoErrorCode{}), "cleanup gate was not released");
+    EXPECT_EQ(sink->cleanup_started, 1);
+    EXPECT_EQ(sink->cleanup_finished, 0);
+    EXPECT_FALSE(returned);
+    EXPECT_TRUE(sink->release_cleanup.try_send(::IoErrorCode{}));
     RunUntil(io, [&] { return returned; }, "parent failed to join released request cleanup");
     if (failure) std::rethrow_exception(failure);
-    Require(sink->cleanup_finished == 1, "request cleanup was skipped or repeated");
+    EXPECT_EQ(sink->cleanup_finished, 1);
 }
 
 // Returns true once `wire` holds a complete RST_STREAM(stream, PROTOCOL_ERROR).
@@ -182,6 +196,7 @@ bool HasProtocolReset(std::string_view wire, uint32_t stream) {
 // never reaches the sink, and a later request on the same connection does.
 void ResetsMalformedRequest(std::string_view network, std::string_view extra_field) {
     net::io_context io;
+    TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::tcp::socket client(io), accepted(io);
     client.connect(acceptor.local_endpoint());
@@ -192,13 +207,14 @@ void ResetsMalformedRequest(std::string_view network, std::string_view extra_fie
     bool returned = false;
     std::exception_ptr failure;
     auto build = [&]() -> net::awaitable<void> {
-        const auto result = co_await ::BuildInboundTransport(io, std::move(raw), settings, nullptr, 0, sink);
-        Require(result.has_value() && !*result, "demux builder returned a request stream");
+        const auto result = co_await ::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr, 0, sink);
+        EXPECT_TRUE(result.has_value() && !*result);
     };
     net::co_spawn(io, build(), [&](std::exception_ptr error) {
         failure = error;
         returned = true;
     });
+    SessionJoin join{io, client, *sink};
     const auto opening = std::string("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") +
         Frame(4, 0, 0) + Frame(1, 4, 1, Headers(network) + std::string(extra_field)) +
         Frame(1, 4, 3, Headers(network));
@@ -214,30 +230,31 @@ void ResetsMalformedRequest(std::string_view network, std::string_view extra_fie
     };
     RunUntil(io, [&] { return (reset_seen() && sink->started == 1) || returned; },
              "malformed request was not reset while its sibling started");
-    Require(!returned, "malformed request ended the connection");
-    Require(sink->started == 1, "malformed request was delivered");
+    EXPECT_FALSE(returned);
+    EXPECT_EQ(sink->started, 1);
     ::IoErrorCode ignored;
     client.close(ignored);
     RunUntil(io, [&] { return sink->cleanup_started == 1; }, "sibling request was not cancelled");
-    Require(sink->release_cleanup.try_send(::IoErrorCode{}), "cleanup gate was not released");
+    EXPECT_TRUE(sink->release_cleanup.try_send(::IoErrorCode{}));
     RunUntil(io, [&] { return returned; }, "parent failed to join released request cleanup");
     if (failure) std::rethrow_exception(failure);
-    Require(sink->started == 1 && sink->cleanup_finished == 1, "malformed request was delivered");
+    EXPECT_EQ(sink->started, 1);
+    EXPECT_EQ(sink->cleanup_finished, 1);
 }
 }  // namespace
 
-TEST(Http2ServerErrors, Contract) {
-    try {
-        for (const auto network : {"grpc", "h2", "xhttp"}) {
-            ParentWaitsForCleanup(network, false);
-            ParentWaitsForCleanup(network, true);
-            ResetsMalformedRequest(network, HeaderField(":path", "/fixture"));
-            ResetsMalformedRequest(network, HeaderField("host", "other.example"));
-        }
-        std::puts("HTTP/2 parent cleanup: all network cases completed");
-        return;
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "HTTP/2 parent cleanup: %s\n", error.what());
-        FAIL() << error.what();
-    }
+class Http2ServerErrors : public testing::TestWithParam<const char*> {};
+TEST_P(Http2ServerErrors, DisconnectWaitsForRequestCleanup) {
+    ParentWaitsForCleanup(GetParam(), false);
 }
+TEST_P(Http2ServerErrors, ProtocolErrorWaitsForRequestCleanup) {
+    ParentWaitsForCleanup(GetParam(), true);
+}
+TEST_P(Http2ServerErrors, DuplicatePathResetsOnlyMalformedRequest) {
+    ResetsMalformedRequest(GetParam(), HeaderField(":path", "/fixture"));
+}
+TEST_P(Http2ServerErrors, ConflictingHostResetsOnlyMalformedRequest) {
+    ResetsMalformedRequest(GetParam(), HeaderField("host", "other.example"));
+}
+INSTANTIATE_TEST_SUITE_P(Transports, Http2ServerErrors,
+    testing::Values("grpc", "h2", "xhttp"));

@@ -1,7 +1,7 @@
 #pragma once
 
-// 出站冷路径的下一跳与 streamSettings 准备、Xray 风格单元素数组配置解析，
-// 以及原生 UDP 出站的目标解析。端点基类见 proxy/outbound_endpoint_base.hpp。
+// 出站冷路径的下一跳与 streamSettings 准备，以及原生 UDP 出站的目标解析。
+// 端点基类见 proxy/outbound_endpoint_base.hpp。
 
 #include "app/dns/dns.hpp"
 #include "common/target_address.hpp"
@@ -52,61 +52,17 @@ struct PreparedNextHop {
     return settings;
 }
 
-[[nodiscard]] inline std::optional<PreparedNextHop> PrepareNextHop(
+[[nodiscard]] inline PreparedNextHop PrepareNextHop(
     const infra::OutboundSourceConfig& source,
-    std::string address,
-    uint16_t port,
+    const OutboundServer& server,
     const OutboundStreamDefaults& defaults) {
-    auto server = MakeOutboundServer(std::move(address), port);
-    if (!server) {
-        LOG_ERROR("{} outbound '{}': {}", source.protocol, source.tag, server.error());
-        return std::nullopt;
-    }
-    PreparedNextHop prepared{.server = std::move(*server), .sender = {}};
-    prepared.sender.stream_settings = PrepareOutboundStream(source, prepared.server, defaults);
-    return prepared;
+    return PreparedNextHop{
+        .server = server,
+        .sender = {.stream_settings = PrepareOutboundStream(source, server, defaults),
+                   .send_through = {}},
+    };
 }
 
-// Validates an optional Xray-style single-element object array (e.g. "servers"
-// or "vnext"). Returns nullptr when absent, the single object when valid, or
-// std::nullopt on a malformed present field (Fail-Closed).
-[[nodiscard]] inline std::optional<const json::object*>
-ParseOptionalSingleObjectArray(
-    const json::object& parent,
-    std::string_view key,
-    std::string_view protocol,
-    std::string_view tag) {
-    const auto* value = parent.if_contains(key);
-    if (!value) {
-        return static_cast<const json::object*>(nullptr);
-    }
-    if (!value->is_array() ||
-        value->as_array().size() != 1 ||
-        !value->as_array()[0].is_object()) {
-        LOG_ERROR("{} outbound '{}': {} must be a single-element object array",
-                  protocol, tag, key);
-        return std::nullopt;
-    }
-    return &value->as_array()[0].as_object();
-}
-
-[[nodiscard]] inline const json::object*
-ParseRequiredSingleObjectArray(
-    const json::object& parent,
-    std::string_view key,
-    std::string_view protocol,
-    std::string_view tag) {
-    const auto parsed = ParseOptionalSingleObjectArray(parent, key, protocol, tag);
-    if (!parsed) {
-        return nullptr;
-    }
-    if (!*parsed) {
-        LOG_ERROR("{} outbound '{}': {} must be a single-element object array",
-                  protocol, tag, key);
-        return nullptr;
-    }
-    return *parsed;
-}
 
 
 // Outbound-only endpoint preparation. A packet's target and payload remain

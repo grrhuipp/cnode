@@ -17,7 +17,6 @@
 #include <chrono>
 #include <filesystem>
 #include <future>
-#include <iostream>
 #include <memory_resource>
 #include <stdexcept>
 #include <string>
@@ -27,9 +26,6 @@ namespace {
 namespace net = ::net;
 using namespace std::chrono_literals;
 
-void Require(bool value, const char* why) {
-    if (!value) throw std::runtime_error(why);
-}
 
 // An independent public-API TLS peer. Memory BIOs are test wire capture only:
 // they let the test split an authenticated TLS record at an exact byte boundary.
@@ -37,7 +33,7 @@ class Peer {
 public:
     Peer(::tcp::socket socket, SSL_CTX* context, bool server)
         : socket(std::move(socket)), ssl(SSL_new(context), SSL_free) {
-        Require(ssl != nullptr, "peer SSL allocation failed");
+        if (!ssl) throw std::runtime_error("peer SSL allocation failed");
         BIO* input = BIO_new(BIO_s_mem());
         BIO* output = BIO_new(BIO_s_mem());
         if (!input || !output) {
@@ -55,8 +51,8 @@ public:
         BIO* output = SSL_get_wbio(ssl.get());
         std::vector<uint8_t> bytes(BIO_ctrl_pending(output));
         if (!bytes.empty())
-            Require(BIO_read(output, bytes.data(), static_cast<int>(bytes.size())) ==
-                        static_cast<int>(bytes.size()), "peer BIO output was incomplete");
+            EXPECT_TRUE(BIO_read(output, bytes.data(), static_cast<int>(bytes.size())) ==
+                        static_cast<int>(bytes.size())) << "peer BIO output was incomplete";
         return bytes;
     }
 
@@ -68,8 +64,8 @@ public:
     net::awaitable<void> Feed() {
         std::array<uint8_t, 16384> bytes;
         const auto n = co_await socket.async_read_some(net::buffer(bytes), net::use_awaitable);
-        Require(BIO_write(SSL_get_rbio(ssl.get()), bytes.data(), static_cast<int>(n)) ==
-                    static_cast<int>(n), "peer BIO input was incomplete");
+        EXPECT_TRUE(BIO_write(SSL_get_rbio(ssl.get()), bytes.data(), static_cast<int>(n)) ==
+                    static_cast<int>(n)) << "peer BIO input was incomplete";
     }
 
     net::awaitable<void> Handshake() {
@@ -79,7 +75,7 @@ public:
             const int error = rc > 0 ? SSL_ERROR_NONE : SSL_get_error(ssl.get(), rc);
             co_await Flush();
             if (rc > 0) co_return;
-            Require(error == SSL_ERROR_WANT_READ, "peer handshake failed");
+            if (error != SSL_ERROR_WANT_READ) throw std::runtime_error("peer handshake failed");
             co_await Feed();
         }
     }
@@ -87,7 +83,7 @@ public:
     std::vector<uint8_t> Encrypt(std::string_view plain) {
         ERR_clear_error();
         const int n = SSL_write(ssl.get(), plain.data(), static_cast<int>(plain.size()));
-        Require(n == static_cast<int>(plain.size()), "peer encryption failed");
+        EXPECT_TRUE(n == static_cast<int>(plain.size())) << "peer encryption failed";
         return TakeOutput();
     }
 
@@ -102,7 +98,7 @@ public:
             if (n > 0) result.append(plain.data(), static_cast<std::size_t>(n));
             else if (error == SSL_ERROR_ZERO_RETURN) break;
             else {
-                Require(error == SSL_ERROR_WANT_READ, "peer decryption failed");
+                if (error != SSL_ERROR_WANT_READ) throw std::runtime_error("peer decryption failed");
                 co_await Feed();
             }
         }
@@ -115,6 +111,7 @@ public:
 
 struct Fixture {
     explicit Fixture(bool product_server = false, bool large_chain = false) {
+        ::TlsStream::InitializeIo();
         const auto dir = std::filesystem::path(CNODE_TEST_SOURCE_DIR) / "tests/fixtures/anytls-pool";
         ::TlsConfig server_config;
         server_config.cert_file = (dir / "cert.pem").string();
@@ -127,16 +124,15 @@ struct Fixture {
         client_config.allow_insecure = true;
         client_config.alpn = {"h2"};
         client = ::SslContext::CreateClient(client_config);
-        Require(server && client, "TLS fixture contexts failed");
+        if (!server || !client) throw std::runtime_error("TLS fixture contexts failed");
         SSL_CTX_set_num_tickets(server->Native(), 0);
         SSL_CTX_set_max_cert_list(client->Native(), 512 * 1024);
         if (large_chain) {
             X509* certificate = SSL_CTX_get0_certificate(server->Native());
             const int size = i2d_X509(certificate, nullptr);
-            Require(size > 0, "certificate encoding failed");
+            if (size <= 0) throw std::runtime_error("certificate encoding failed");
             for (int bytes = size; bytes < 160 * 1024; bytes += size)
-                Require(SSL_CTX_add1_chain_cert(server->Native(), certificate) == 1,
-                        "large certificate chain preparation failed");
+                EXPECT_TRUE(SSL_CTX_add1_chain_cert(server->Native(), certificate) == 1) << "large certificate chain preparation failed";
         }
         ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
         ::tcp::socket socket(io), other(io);
@@ -155,18 +151,23 @@ struct Fixture {
         try {
             auto first = net::co_spawn(io, stream->Handshake(), net::use_future);
             auto second = net::co_spawn(io, peer->Handshake(), net::use_future);
-            Require(Wait(first), "product handshake failed");
+            EXPECT_TRUE(Wait(first)) << "product handshake failed";
             Wait(second);
-            if (!product_server) Require(stream->NegotiatedAlpn() == "h2", "negotiated ALPN was lost");
+            if (!product_server) EXPECT_TRUE(stream->NegotiatedAlpn() == "h2") << "negotiated ALPN was lost";
         } catch (...) {
             CloseAndJoin();
             throw;
         }
     }
 
-    ~Fixture() { CloseAndJoin(); }
+    ~Fixture() {
+        CloseAndJoin();
+        EXPECT_EQ(::memory::detail::test_buffers_live, relay_buffers_before_handshake);
+        ::memory::reject_next_process_allocation = previous_reject;
+    }
 
     void CloseAndJoin() {
+        ::memory::reject_next_process_allocation = false;
         stream->CloseAbortive();
         ::IoErrorCode ignored;
         peer->socket.close(ignored);
@@ -189,6 +190,7 @@ struct Fixture {
     std::unique_ptr<Peer> peer;
     std::unique_ptr<::TlsStream> stream;
     std::size_t relay_buffers_before_handshake = 0;
+    const bool previous_reject = ::memory::reject_next_process_allocation;
 };
 
 struct JoinPending {
@@ -210,13 +212,13 @@ net::awaitable<std::string> ReadBytes(::TlsStream& stream, std::size_t count) {
     std::string result;
     while (result.size() < count) {
         auto data = co_await stream.ReadMultiBuffer();
-        Require(!data.empty(), "TLS payload ended early");
+        if (data.empty()) throw std::runtime_error("TLS payload ended early");
         result += Flatten(std::move(data));
     }
     co_return result;
 }
 
-void FragmentedAndCoalesced() {
+TEST(TlsRecordBuffer, FragmentedAndCoalescedRecordsPreserveUnreadPlaintextAfterCancellation) {
     Fixture fixture;
     const auto idle_buffers = ::memory::detail::test_buffers_live;
     auto first = fixture.peer->Encrypt(std::string(9000, 'a'));
@@ -226,9 +228,8 @@ void FragmentedAndCoalesced() {
     auto read = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
     fixture.io.restart();
     fixture.io.run_for(20ms);
-    Require(read.wait_for(0s) != std::future_status::ready, "partial TLS header completed a read");
-    Require(::memory::detail::test_buffers_live == idle_buffers,
-            "partial record wait retained a relay buffer");
+    EXPECT_TRUE(read.wait_for(0s) != std::future_status::ready) << "partial TLS header completed a read";
+    EXPECT_TRUE(::memory::detail::test_buffers_live == idle_buffers) << "partial record wait retained a relay buffer";
     fixture.stream->Cancel();
     bool cancelled = false;
     try { (void)fixture.Wait(read); }
@@ -236,25 +237,29 @@ void FragmentedAndCoalesced() {
         if (error.code() != net::error::operation_aborted) throw;
         cancelled = true;
     }
-    Require(cancelled && fixture.stream->IsOpen(),
-            "partial-record cancellation was EOF or closed TLS");
+    EXPECT_TRUE(cancelled && fixture.stream->IsOpen()) << "partial-record cancellation was EOF or closed TLS";
     read = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
     net::write(fixture.peer->socket, net::buffer(first.data() + 3, first.size() - 3));
     std::string plain = Flatten(fixture.Wait(read));
     while (plain.size() < 9013) {
         auto next = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
-        plain += Flatten(fixture.Wait(next));
+        auto data = fixture.Wait(next);
+        ASSERT_FALSE(data.empty()) << "TLS payload ended before the coalesced suffix";
+        plain += Flatten(std::move(data));
     }
-    Require(plain == std::string(9000, 'a') + "second-record", "coalesced TLS records lost their suffix");
-    Require(::memory::detail::test_buffers_live == idle_buffers,
-            "completed TLS read retained relay payload");
+    EXPECT_TRUE(plain == std::string(9000, 'a') + "second-record") << "coalesced TLS records lost their suffix";
+    EXPECT_TRUE(::memory::detail::test_buffers_live == idle_buffers) << "completed TLS read retained relay payload";
+}
+
+TEST(TlsRecordBuffer, AllocationFailurePreservesRetainedPlaintextForRetry) {
+    Fixture fixture;
 
     const auto record = fixture.peer->Encrypt("after-resource-failure");
     net::write(fixture.peer->socket, net::buffer(record));
     char prefix = 0;
     auto consume = net::co_spawn(fixture.io,
         fixture.stream->AsyncRead(net::buffer(&prefix, 1)), net::use_future);
-    Require(fixture.Wait(consume) == 1 && prefix == 'a', "OOM fixture did not retain plaintext");
+    EXPECT_TRUE(fixture.Wait(consume) == 1 && prefix == 'a') << "OOM fixture did not retain plaintext";
     // SSL_pending avoids socket-wait allocation; the next process-resource request
     // is the relay Buffer itself, not a coroutine or asynchronous socket handler.
     ::memory::reject_next_process_allocation = true;
@@ -265,28 +270,26 @@ void FragmentedAndCoalesced() {
     } catch (const std::bad_alloc&) { rejected = true; }
     const bool consumed_fault = !::memory::reject_next_process_allocation;
     ::memory::reject_next_process_allocation = false;
-    Require(rejected && consumed_fault && fixture.stream->IsOpen(),
-            "read allocation failure became EOF or closed TLS");
+    EXPECT_TRUE(rejected && consumed_fault && fixture.stream->IsOpen()) << "read allocation failure became EOF or closed TLS";
     auto retry = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
-    Require(Flatten(fixture.Wait(retry)) == "fter-resource-failure", "OOM consumed retained plaintext");
+    EXPECT_TRUE(Flatten(fixture.Wait(retry)) == "fter-resource-failure") << "OOM consumed retained plaintext";
 }
 
-void DuplexKeyUpdate() {
+TEST(TlsRecordBuffer, DuplexKeyUpdatePreservesFramesThroughCancellationAndHalfClose) {
     Fixture fixture;
     const auto idle_buffers = ::memory::detail::test_buffers_live;
     const std::string payload(512 * 1024, 'w');
     const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
-    Require(fixture.stream->DeferWriteCancellation(), "TLS cancellation deferral unavailable");
+    EXPECT_TRUE(fixture.stream->DeferWriteCancellation()) << "TLS cancellation deferral unavailable";
     net::cancellation_signal cancellation;
     JoinPending join{fixture};
     auto write = net::co_spawn(fixture.io, fixture.stream->WriteBuffers(buffers),
         net::bind_cancellation_slot(cancellation.slot(), net::use_future));
     fixture.io.restart();
     fixture.io.run_for(20ms);
-    Require(write.wait_for(0s) != std::future_status::ready, "backpressure fixture did not suspend write");
+    EXPECT_TRUE(write.wait_for(0s) != std::future_status::ready) << "backpressure fixture did not suspend write";
     cancellation.emit(net::cancellation_type::all);
-    Require(SSL_key_update(fixture.peer->ssl.get(), SSL_KEY_UPDATE_REQUESTED) == 1,
-            "peer KeyUpdate failed");
+    EXPECT_TRUE(SSL_key_update(fixture.peer->ssl.get(), SSL_KEY_UPDATE_REQUESTED) == 1) << "peer KeyUpdate failed";
     const auto incoming = fixture.peer->Encrypt("concurrent-control-record");
     net::write(fixture.peer->socket, net::buffer(incoming));
     auto read = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
@@ -295,39 +298,36 @@ void DuplexKeyUpdate() {
     catch (const ::IoSystemError& error) {
         if (error.code() != net::error::operation_aborted) throw;
     }
-    Require(fixture.Wait(received) == payload, "logical cancellation truncated or interleaved physical TLS output");
-    Require(Flatten(fixture.Wait(read)) == "concurrent-control-record", "full-duplex TLS control record stalled");
-    Require(::memory::detail::test_buffers_live == idle_buffers,
-            "completed duplex TLS operation retained relay payload");
+    EXPECT_TRUE(fixture.Wait(received) == payload) << "logical cancellation truncated or interleaved physical TLS output";
+    EXPECT_TRUE(Flatten(fixture.Wait(read)) == "concurrent-control-record") << "full-duplex TLS control record stalled";
+    EXPECT_TRUE(::memory::detail::test_buffers_live == idle_buffers) << "completed duplex TLS operation retained relay payload";
 
     const std::string next_record = "after-backpressure-and-key-update";
     auto next_write = net::co_spawn(fixture.io,
         fixture.stream->AsyncWrite(net::buffer(next_record)), net::use_future);
     auto next_read = net::co_spawn(fixture.io,
         fixture.peer->Read(next_record.size()), net::use_future);
-    Require(fixture.Wait(next_write) == next_record.size() &&
-                fixture.Wait(next_read) == next_record,
-            "resuming direct output after a queued TLS control record corrupted the sequence");
-    Require(::memory::detail::test_buffers_live == idle_buffers,
-            "resumed TLS output retained relay payload");
+    EXPECT_TRUE(fixture.Wait(next_write) == next_record.size() &&
+                fixture.Wait(next_read) == next_record) << "resuming direct output after a queued TLS control record corrupted the sequence";
+    EXPECT_TRUE(::memory::detail::test_buffers_live == idle_buffers) << "resumed TLS output retained relay payload";
 
     auto close = net::co_spawn(fixture.io, fixture.stream->AsyncShutdownWrite(), net::use_future);
     auto eof = net::co_spawn(fixture.io, fixture.peer->Read(1), net::use_future);
     fixture.Wait(close);
-    Require(fixture.Wait(eof).empty(), "TLS half-close did not send close_notify");
+    EXPECT_TRUE(fixture.Wait(eof).empty()) << "TLS half-close did not send close_notify";
     const auto response = fixture.peer->Encrypt("after-half-close");
     net::write(fixture.peer->socket, net::buffer(response));
     auto remaining = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
-    Require(Flatten(fixture.Wait(remaining)) == "after-half-close", "TLS write half-close discarded peer data");
+    EXPECT_TRUE(Flatten(fixture.Wait(remaining)) == "after-half-close") << "TLS write half-close discarded peer data";
     ERR_clear_error();
-    Require(SSL_shutdown(fixture.peer->ssl.get()) >= 0, "peer close_notify failed");
+    EXPECT_TRUE(SSL_shutdown(fixture.peer->ssl.get()) >= 0) << "peer close_notify failed";
     auto flush = net::co_spawn(fixture.io, fixture.peer->Flush(), net::use_future);
     auto finished = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
     fixture.Wait(flush);
-    Require(fixture.Wait(finished).empty(), "peer close_notify was not authenticated EOF");
+    EXPECT_TRUE(fixture.Wait(finished).empty()) << "peer close_notify was not authenticated EOF";
 }
 
-void BidirectionalBackpressure() {
+TEST(TlsRecordBuffer, BidirectionalBackpressureStillAllowsConcurrentReaders) {
     Fixture fixture;
     const std::string outbound(512 * 1024, 'u');
     const std::string inbound(512 * 1024, 'd');
@@ -339,30 +339,27 @@ void BidirectionalBackpressure() {
         fixture.peer->socket, net::buffer(encrypted), net::use_future);
     fixture.io.restart();
     fixture.io.run_for(20ms);
-    Require(outgoing.wait_for(0s) != std::future_status::ready &&
-                incoming.wait_for(0s) != std::future_status::ready,
-            "duplex fixture did not backpressure both physical writers");
+    EXPECT_TRUE(outgoing.wait_for(0s) != std::future_status::ready &&
+                incoming.wait_for(0s) != std::future_status::ready) << "duplex fixture did not backpressure both physical writers";
     auto product_read = net::co_spawn(fixture.io,
         ReadBytes(*fixture.stream, inbound.size()), net::use_future);
     auto peer_read = net::co_spawn(fixture.io,
         fixture.peer->Read(outbound.size()), net::use_future);
-    Require(fixture.Wait(outgoing) == outbound.size(), "product duplex write was incomplete");
-    Require(fixture.Wait(incoming) == encrypted.size(), "peer duplex write was incomplete");
-    Require(fixture.Wait(product_read) == inbound && fixture.Wait(peer_read) == outbound,
-            "TLS physical write gate blocked concurrent inbound progress");
+    EXPECT_TRUE(fixture.Wait(outgoing) == outbound.size()) << "product duplex write was incomplete";
+    EXPECT_TRUE(fixture.Wait(incoming) == encrypted.size()) << "peer duplex write was incomplete";
+    EXPECT_TRUE(fixture.Wait(product_read) == inbound && fixture.Wait(peer_read) == outbound) << "TLS physical write gate blocked concurrent inbound progress";
 }
 
-void LargeHandshake() {
+TEST(TlsRecordBuffer, LargeHandshakeReleasesPayloadAndPreservesRecordSequence) {
     Fixture fixture(true, true);
-    Require(::memory::detail::test_buffers_live == fixture.relay_buffers_before_handshake,
-            "large handshake retained relay payload");
+    EXPECT_TRUE(::memory::detail::test_buffers_live == fixture.relay_buffers_before_handshake) << "large handshake retained relay payload";
     const auto record = fixture.peer->Encrypt("after-large-flight");
     net::write(fixture.peer->socket, net::buffer(record));
     auto read = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
-    Require(Flatten(fixture.Wait(read)) == "after-large-flight", "large handshake corrupted record sequence");
+    EXPECT_TRUE(Flatten(fixture.Wait(read)) == "after-large-flight") << "large handshake corrupted record sequence";
 }
 
-void ReadDeadline() {
+TEST(TlsRecordBuffer, ReadDeadlineAbortsPhysicalConnection) {
     Fixture fixture;
     fixture.stream->SetReadTimeout(1s);
     auto read = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
@@ -372,60 +369,45 @@ void ReadDeadline() {
         if (error.code() != net::error::operation_aborted) throw;
         timed_out = true;
     }
-    Require(timed_out && fixture.stream->ConsumeReadTimeout() &&
-                !fixture.stream->IsOpen(), "TLS readable wait escaped the physical read deadline");
+    EXPECT_TRUE(timed_out && fixture.stream->ConsumeReadTimeout() &&
+                !fixture.stream->IsOpen()) << "TLS readable wait escaped the physical read deadline";
 }
 }  // namespace
 
-TEST(TlsRecordBuffer, Contract) {
-    ::TlsStream::InitializeIo();
-    bool passed = true;
-    try {
-        FragmentedAndCoalesced();
-        DuplexKeyUpdate();
-        BidirectionalBackpressure();
-        LargeHandshake();
-        ReadDeadline();
-        Require(::memory::detail::test_buffers_live == 0,
-                "TLS test retained operation payload");
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        passed = false;
-    }
-    { ASSERT_TRUE(passed); return; }
-}
 
-TEST(TlsRecordBuffer, SocketResetAbortsDirectAndBackpressuredWrites) {
-    TlsStream::InitializeIo();
-    for (const bool backpressured : {false, true}) {
-        SCOPED_TRACE(backpressured);
-        Fixture fixture;
-        const std::string payload(512 * 1024, 'r');
-        JoinPending join{fixture};
-        std::future<std::size_t> write;
-        if (backpressured) {
-            write = net::co_spawn(fixture.io,
-                fixture.stream->AsyncWrite(net::buffer(payload)), net::use_future);
-            fixture.io.restart();
-            fixture.io.run_for(20ms);
-            ASSERT_NE(write.wait_for(0s), std::future_status::ready);
-        }
-        fixture.peer->socket.set_option(net::socket_base::linger(true, 0));
-        fixture.peer->socket.close();
-        if (!backpressured)
-            write = net::co_spawn(fixture.io,
-                fixture.stream->AsyncWrite(net::buffer(payload)), net::use_future);
-        bool failed = false;
-        try { (void)fixture.Wait(write); }
-        catch (const IoSystemError& error) {
-            EXPECT_TRUE(error.code() == net::error::connection_reset ||
-                        error.code() == net::error::broken_pipe) << error.what();
-            failed = true;
-        }
-        EXPECT_TRUE(failed);
-        EXPECT_FALSE(fixture.stream->IsOpen());
+class TlsWriteReset : public testing::TestWithParam<bool> {};
+TEST_P(TlsWriteReset, SocketResetAbortsWrites) {
+    Fixture fixture;
+    const bool backpressured = GetParam();
+    const std::string payload(512 * 1024, 'r');
+    JoinPending join{fixture};
+    std::future<std::size_t> write;
+    if (backpressured) {
+        write = net::co_spawn(fixture.io,
+            fixture.stream->AsyncWrite(net::buffer(payload)), net::use_future);
+        fixture.io.restart();
+        fixture.io.run_for(20ms);
+        EXPECT_NE(write.wait_for(0s), std::future_status::ready);
     }
+    fixture.peer->socket.set_option(net::socket_base::linger(true, 0));
+    fixture.peer->socket.close();
+    if (!backpressured)
+        write = net::co_spawn(fixture.io,
+            fixture.stream->AsyncWrite(net::buffer(payload)), net::use_future);
+    bool failed = false;
+    try { (void)fixture.Wait(write); }
+    catch (const IoSystemError& error) {
+        EXPECT_TRUE(error.code() == net::error::connection_reset ||
+                    error.code() == net::error::broken_pipe) << error.what();
+        failed = true;
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_FALSE(fixture.stream->IsOpen());
 }
+INSTANTIATE_TEST_SUITE_P(WriteStates, TlsWriteReset, testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) {
+        return info.param ? "Backpressured" : "Direct";
+    });
 
 TEST(TlsRecordBuffer, PeerResetCannotBecomeSuccessfulCloseNotify) {
     TlsStream::InitializeIo();

@@ -1,4 +1,5 @@
 #pragma once
+#include "proxy/vmess/security.hpp"
 
 // ============================================================================
 // vmess_crypto.hpp — VMess 协议类型与密码学原语
@@ -25,13 +26,6 @@
 #include <string_view>
 namespace vmess {
 
-// Wire values of the request header security nibble.
-enum class Security : uint8_t {
-    AES_128_GCM       = 3,
-    CHACHA20_POLY1305 = 4,
-    NONE              = 5,
-    ZERO              = 6
-};
 
 constexpr uint8_t VERSION             = 1;
 constexpr size_t  GCM_TAG_SIZE        = 16;
@@ -94,6 +88,7 @@ struct MemoryAccount {
         OPENSSL_cleanse(auth_key.data(), auth_key.size());
     }
     static std::optional<MemoryAccount> FromUUID(std::string_view uuid_str);
+    static MemoryAccount FromUuidBytes(const std::array<uint8_t, 16>& uuid);
 };
 
 // ============================================================================

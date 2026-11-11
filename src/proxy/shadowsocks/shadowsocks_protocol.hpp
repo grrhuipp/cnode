@@ -1,5 +1,6 @@
 #pragma once
 #include "proxy/handshake_errors.hpp"
+#include "proxy/shadowsocks/cipher.hpp"
 
 #include "app/proxyman/inbound/user_store.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
@@ -33,20 +34,6 @@ namespace ss {
 // ============================================================================
 // 密码类型
 // ============================================================================
-enum class SsCipherType : uint8_t {
-    AES_128_GCM                  = 0,
-    AES_256_GCM                  = 1,
-    CHACHA20_POLY1305            = 2,
-    AES_128_GCM_2022             = 3,
-    AES_256_GCM_2022             = 4,
-    CHACHA20_POLY1305_2022       = 5,
-};
-
-struct SsCipherInfo {
-    SsCipherType type;
-    size_t key_size;   // bytes（主密钥长度 == 子密钥长度 == salt 长度）
-    size_t salt_size;  // bytes
-};
 
 // 根据方法名获取密码参数（不区分大小写），含 AEAD 与 2022-blake3 方法。
 [[nodiscard]] std::optional<SsCipherInfo> ParseCipherMethod(std::string_view method);
@@ -127,6 +114,7 @@ static constexpr size_t kMaxChunkPayload = 0x3FFF;
 // ============================================================================
 static constexpr size_t kSs2022MaxChunkPayload = 0xFFFF;
 static constexpr size_t kSs2022RequestFixedHeaderSize = 1 + 8 + 2;
+inline constexpr uint64_t kSs2022MaxTimestampSkew = 30;
 
 inline uint64_t UnixSecondsNow() noexcept {
     return static_cast<uint64_t>(
@@ -135,8 +123,8 @@ inline uint64_t UnixSecondsNow() noexcept {
 }
 
 inline bool TimestampFresh(uint64_t remote, uint64_t now) noexcept {
-    constexpr uint64_t kMaxSkew = 30;
-    return remote <= now + kMaxSkew && remote + kMaxSkew >= now;
+    return remote <= now + kSs2022MaxTimestampSkew &&
+           remote + kSs2022MaxTimestampSkew >= now;
 }
 
 template<size_t Size>

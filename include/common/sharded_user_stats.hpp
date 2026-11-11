@@ -33,17 +33,17 @@ struct OnlineDevice {
 };
 
 class UserOnlineSessionGuard;
+class GroupCoordinator;
 
 class UserOnlineTracker {
 public:
-    UserOnlineTracker() = default;
+    explicit UserOnlineTracker(GroupCoordinator& coordinator) noexcept : coordinator_(coordinator) {}
     ~UserOnlineTracker() = default;
     // UserOnlineSessionGuard 借用本对象地址：禁止拷贝，且不声明移动。
     UserOnlineTracker(const UserOnlineTracker&) = delete;
     UserOnlineTracker& operator=(const UserOnlineTracker&) = delete;
-    // Process-wide device quota is owned by the current execution context's
-    // coordinator; anonymous sessions (user_id <= 0) are admitted without a
-    // reservation.
+    // Process-wide device quota belongs to the explicitly supplied coordinator;
+    // anonymous sessions (user_id <= 0) are admitted without a reservation.
     [[nodiscard]] net::awaitable<std::optional<UserOnlineSessionGuard>> TryConnectSession(
         std::string_view tag,
         int64_t user_id,
@@ -74,6 +74,7 @@ private:
                                         TransparentStringHash,
                                         TransparentStringEq>;
 
+    GroupCoordinator& coordinator_;
     TagDeviceMap devices_;
 };
 

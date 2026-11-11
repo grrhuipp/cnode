@@ -1,54 +1,56 @@
 #include <gtest/gtest.h>
-
 #include "proxy/vless/vless_codec.hpp"
 #include "proxy/vless/vless_encryption_config.hpp"
-
-#include <array>
-#include <iostream>
 #include <string>
 #include <string_view>
 
-TEST(VlessCredentials, Contract) {
-    struct Case { std::string_view id; std::string_view expected; };
-    constexpr std::array cases{
-        Case{"b831381d-6324-4d53-ad4f-8cda48b30811", "b831381d63244d53ad4f8cda48b30811"},
-        Case{"B831381D63244D53AD4F8CDA48B30811", "b831381d63244d53ad4f8cda48b30811"},
-        Case{"not-a-uuid", "9b70e619d7b355b1b743756ebd573b4e"},
-        Case{"a", "35b65f33a6795e76af3c273ea349ede4"},
-        Case{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "d20a3bd49d5852e08caa820ca42d1ad0"},
-        Case{std::string_view("abc\0def", 7), "dc7cb0d5f28d517b9fda4afd2126242f"},
-    };
+namespace {
+struct IdentityCase { std::string_view id; std::string_view expected; };
+class VlessIdentity : public testing::TestWithParam<IdentityCase> {};
+TEST_P(VlessIdentity, MapsUuidOrCustomIdToProtocolIdentity) {
+    const auto& item = GetParam();
+    const auto bytes = ::vless::ParseUuidBytes(item.id);
+    ASSERT_TRUE(bytes);
     constexpr std::string_view hex = "0123456789abcdef";
-    for (const auto& item : cases) {
-        const auto bytes = ::vless::ParseUuidBytes(item.id);
-        if (!bytes) { std::cerr << "valid VLESS id rejected\n"; FAIL() << "valid VLESS id rejected"; }
-        std::string actual;
-        for (const auto byte : *bytes) {
-            actual += hex[byte >> 4];
-            actual += hex[byte & 0x0f];
-        }
-        ASSERT_EQ(actual, item.expected) << "VLESS identity vector changed";
+    std::string actual;
+    for (const auto byte : *bytes) {
+        actual += hex[byte >> 4];
+        actual += hex[byte & 0x0f];
     }
-    for (const auto invalid : {"", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "b831381d-6324-4d53-ad4f-8cda48b3081Z"}) {
-        if (::vless::ParseUuidBytes(invalid)) { std::cerr << "invalid VLESS id accepted\n"; FAIL() << "invalid VLESS id accepted"; }
-    }
-    if (::vless::NormalizeFlow("XTLS-rprx-VISION") != "xtls-rprx-vision" ||
-        !::vless::NormalizeFlow("").empty()) {
-        std::cerr << "flow normalization changed\n";
-        FAIL() << "flow normalization changed";
-    }
-    std::cout << "VLESS UUID/custom identity vectors, byte-length limits and flow normalization passed\n";
+    EXPECT_EQ(actual, item.expected);
+}
+INSTANTIATE_TEST_SUITE_P(Vectors, VlessIdentity, testing::Values(
+    IdentityCase{"b831381d-6324-4d53-ad4f-8cda48b30811", "b831381d63244d53ad4f8cda48b30811"},
+    IdentityCase{"B831381D63244D53AD4F8CDA48B30811", "b831381d63244d53ad4f8cda48b30811"},
+    IdentityCase{"not-a-uuid", "9b70e619d7b355b1b743756ebd573b4e"},
+    IdentityCase{"a", "35b65f33a6795e76af3c273ea349ede4"},
+    IdentityCase{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "d20a3bd49d5852e08caa820ca42d1ad0"},
+    IdentityCase{std::string_view("abc\0def", 7), "dc7cb0d5f28d517b9fda4afd2126242f"}));
+
+class InvalidVlessIdentity : public testing::TestWithParam<const char*> {};
+TEST_P(InvalidVlessIdentity, RejectsInvalidLengthOrMalformedUuid) {
+    EXPECT_FALSE(::vless::ParseUuidBytes(GetParam()));
+}
+INSTANTIATE_TEST_SUITE_P(Inputs, InvalidVlessIdentity, testing::Values(
+    "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "b831381d-6324-4d53-ad4f-8cda48b3081Z"));
+
+class VlessEncryptionAbsent : public testing::TestWithParam<const char*> {};
+TEST_P(VlessEncryptionAbsent, NoneIsSuccessfulAbsence) {
+    auto client = vless::ParseVlessClientEncryption(GetParam());
+    auto server = vless::ParseVlessServerDecryption(GetParam());
+    ASSERT_TRUE(client);
+    ASSERT_TRUE(server);
+    EXPECT_FALSE(client->has_value());
+    EXPECT_FALSE(server->has_value());
+}
+INSTANTIATE_TEST_SUITE_P(Spellings, VlessEncryptionAbsent, testing::Values("", "none", "NONE"));
+}  // namespace
+
+TEST(VlessCredentials, NormalizesFlowCase) {
+    EXPECT_EQ(::vless::NormalizeFlow("XTLS-rprx-VISION"), "xtls-rprx-vision");
 }
 
-TEST(VlessCredentials, EncryptionNoneIsSuccessfulAbsence) {
-    for (auto value : {"", "none", "NONE"}) {
-        auto client = vless::ParseVlessClientEncryption(value);
-        auto server = vless::ParseVlessServerDecryption(value);
-        ASSERT_TRUE(client);
-        ASSERT_TRUE(server);
-        EXPECT_FALSE(client->has_value());
-        EXPECT_FALSE(server->has_value());
-    }
+TEST(VlessCredentials, RejectsUnknownEncryption) {
     EXPECT_FALSE(vless::ParseVlessClientEncryption("invalid"));
     EXPECT_FALSE(vless::ParseVlessServerDecryption("invalid"));
 }

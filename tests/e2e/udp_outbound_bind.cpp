@@ -19,8 +19,9 @@ Json Inbound(uint16_t port, std::string_view tag = "probe", std::string_view out
     return {{"tag", tag}, {"protocol", "vless"}, {"listen", "127.0.0.1"}, {"port", port},
         {"outboundTag", outbound}, {"settings", {{"clients", Json::array({{{"id", UserA}}})}}}};
 }
-Json Outbound(const Json& addresses, std::string_view strategy) {
-    return {{"tag", "chosen"}, {"protocol", "freedom"}, {"settings", {{"domainStrategy", "UseIPv6v4"}}},
+Json Outbound(const Json& addresses, std::string_view strategy,
+              std::string_view domain_strategy = "UseIPv6v4") {
+    return {{"tag", "chosen"}, {"protocol", "freedom"}, {"settings", {{"domainStrategy", domain_strategy}}},
         {"sendThrough", addresses}, {"sendThroughStrategy", strategy}};
 }
 std::string PeerHost(const Socket& socket) {
@@ -81,9 +82,10 @@ struct BindCase {
     std::string strategy;
     bool succeeds;
     bool domain = false;
+    std::string domain_strategy = "UseIPv6v4";
 };
 class OutboundBind : public testing::TestWithParam<BindCase> {};
-TEST_P(OutboundBind, OrderedSameFamilySelectionAndSystemFallback) {
+TEST_P(OutboundBind, RespectsAddressFamilyAndOrderedBinding) {
     const auto& item = GetParam();
     TempDir root;
     PortReservation inbound;
@@ -107,7 +109,8 @@ TEST_P(OutboundBind, OrderedSameFamilySelectionAndSystemFallback) {
         dns = std::make_unique<DualStackDns>();
         config["dns"] = {{"servers", Json::array({"127.0.0.1:" + std::to_string(dns->Port())})}, {"timeout", 5}};
     }
-    ConfigFiles(root, config, Json::array({Inbound(inbound.port)}), Json::array({Outbound(item.addresses, item.strategy)}));
+    ConfigFiles(root, config, Json::array({Inbound(inbound.port)}),
+                Json::array({Outbound(item.addresses, item.strategy, item.domain_strategy)}));
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
     child.WaitForLog("server started");
     if (item.succeeds) {
@@ -124,7 +127,7 @@ TEST_P(OutboundBind, OrderedSameFamilySelectionAndSystemFallback) {
         EXPECT_EQ(source, "127.0.0.1");
     } else {
         auto connection = Socket::Connect(inbound.port);
-        connection.Write(VlessRequest(target.Port(), Payload, 1, "127.0.0.1", UserA));
+        connection.Write(VlessRequest(target.Port(), Payload, 1, item.domain ? "dual.test" : "127.0.0.1", UserA));
         std::string answer;
         try { answer = connection.ReadExact(2 + Payload.size(), 12s); }
         catch (const std::runtime_error& error) {
@@ -133,7 +136,7 @@ TEST_P(OutboundBind, OrderedSameFamilySelectionAndSystemFallback) {
                 message != "E2E operation deadline exceeded") throw;
         }
         EXPECT_TRUE(answer.empty());
-        EXPECT_FALSE(Readable(target.Fd(), 100ms)) << "strict first address must not fall through";
+        EXPECT_FALSE(Readable(target.Fd(), 100ms)) << "rejected family or bind must not reach the target";
         EXPECT_TRUE(child.Running());
     }
     if (dns) { dns->Join(); EXPECT_GT(dns->Requests(), 0u); }
@@ -146,7 +149,12 @@ INSTANTIATE_TEST_SUITE_P(OrderedSourceBinding, OutboundBind, testing::Values(
     BindCase{"StrictFirstIp", Json::array({"192.0.2.3", "127.0.0.1/32"}), "ip_hash", false},
     BindCase{"NoSameFamily", Json::array({"2001:db8:ffff::/64"}), "ip_hash", true},
     BindCase{"DnsV6BindFailedV4Default", Json::array({"2001:db8:ffff::/64"}), "ip_hash", true, true},
-    BindCase{"DnsV6RefusedV4Default", Json::array({"::1"}), "ip_hash", true, true}),
+    BindCase{"DnsV6RefusedV4Default", Json::array({"::1"}), "ip_hash", true, true},
+    BindCase{"DnsIpv4Only", Json::array({"::1"}), "ip_hash", true, true, "UseIPv4"},
+    BindCase{"DnsIpv6OnlyRejectsV4", Json::array({"127.0.0.1"}), "ip_hash", false, true, "UseIPv6"},
+    BindCase{"DnsForceIpv6RejectsV4", Json::array({"127.0.0.1"}), "ip_hash", false, true, "ForceIPv6"},
+    BindCase{"LiteralUseIpv6PreservesIpv4", Json::array({"127.0.0.1"}), "ip_hash", true, false, "UseIPv6"},
+    BindCase{"LiteralForceIpv6RejectsIpv4", Json::array({"127.0.0.1"}), "ip_hash", false, false, "ForceIPv6"}),
     [](const testing::TestParamInfo<BindCase>& info) { return info.param.name; });
 
 struct RejectedCase { std::string name; Json addresses; std::string strategy; };

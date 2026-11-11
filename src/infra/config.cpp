@@ -1,4 +1,5 @@
 #include "infra/config.hpp"
+#include "common/ascii.hpp"
 #include "common/domain_name.hpp"
 #include "common/ip_utils.hpp"
 #include "common/target_address.hpp"
@@ -47,6 +48,36 @@ std::optional<RoutingIpNetwork> RoutingIpNetwork::Parse(std::string_view value) 
 }
 
 namespace infra {
+ProxyProtocolMode ParseProxyProtocolMode(
+    const json::object& object, std::string_view key,
+    ProxyProtocolMode fallback) {
+    const auto* value = object.if_contains(key);
+    if (!value) return fallback;
+    if (value->is_string()) {
+        const auto mode = LowerAscii(value->as_string());
+        if (mode == "off") return ProxyProtocolMode::Off;
+        if (mode == "auto") return ProxyProtocolMode::Auto;
+        if (mode == "on") return ProxyProtocolMode::On;
+    }
+    throw std::invalid_argument(
+        "proxyProtocol must be off, auto or on");
+}
+
+tl::expected<std::optional<uint32_t>, std::string>
+ParseHttp2InitialWindow(const json::object& source) {
+    auto parsed = ParseJsonUint64(
+        source,
+        "initialWindowSize",
+        kHttp2MaxInitialWindow);
+    if (!parsed) {
+        return tl::unexpected(std::move(parsed.error()));
+    }
+    if (!*parsed) {
+        return std::optional<uint32_t>{};
+    }
+    return std::optional<uint32_t>{static_cast<uint32_t>(**parsed)};
+}
+
 OutboundBind ParseOutboundBindConfig(
     const json::value& value, const json::value* strategy) {
     if (value.is_string()) {
@@ -99,12 +130,6 @@ OutboundBind ParseOutboundBindConfig(
 
 std::optional<OutboundBind> ParseOptionalOutboundBind(
     const json::object& source, std::string_view context) {
-    if (source.contains("send_through") ||
-        source.contains("send_through_strategy")) {
-        throw std::invalid_argument(
-            std::string(context) +
-            " binding must use sendThrough/sendThroughStrategy without underscores");
-    }
     const auto* send_through = source.if_contains("sendThrough");
     const auto* strategy = source.if_contains("sendThroughStrategy");
     if (strategy && !send_through) {
@@ -125,9 +150,9 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
     cfg.tag = JsonStringOr(j, "tag", "");
     cfg.protocol = LowerAscii(JsonStringOr(j, "protocol", ""));
 
-    if (const auto* settings = RequireJson(ParseJsonObject(j, "settings"))) {
-        cfg.settings = *settings;
-    }
+    const auto* settings = RequireJson(ParseJsonObject(j, "settings"));
+    const json::object empty_settings;
+    cfg.settings = ParseOutboundSettings(cfg.protocol, settings ? *settings : empty_settings);
     if (const auto* stream_settings = RequireJson(ParseJsonObject(j, "streamSettings"))) {
         cfg.stream_settings = ParseStreamSettings(
             *stream_settings, StreamEndpointRole::Outbound);
@@ -1223,27 +1248,14 @@ StreamSettings infra::ParseStreamSettings(const json::object& source, StreamEndp
 // ============================================================================
 namespace {
 
-// Static clients name their credential `id` or `password` depending on the
-// protocol; resolve that alias here so every source yields one credential.
-[[nodiscard]] std::string StaticCredential(
-    std::string_view protocol, std::string id, std::string password) {
-    if (protocol == constants::protocol::kVmess) return id;
-    if (protocol == constants::protocol::kTrojan ||
-        protocol == constants::protocol::kShadowsocks) {
-        return password;
-    }
-    if (protocol == constants::protocol::kAnyTLS ||
-        protocol == constants::protocol::kHysteria ||
-        protocol == constants::protocol::kHysteria2) {
-        return password.empty() ? std::move(id) : std::move(password);
-    }
-    return id.empty() ? std::move(password) : std::move(id);
-}
 
 void ParseStaticSettings(
     std::string_view protocol,
     const json::object& settings,
     StaticInboundConfig& cfg) {
+    const bool vless = protocol == constants::protocol::kVless;
+    const std::string_view credential_field =
+        vless || protocol == constants::protocol::kVmess ? "id" : "password";
     if (protocol == constants::protocol::kVmess) {
         RequireJsonKeys(settings, {"clients"}, "inbound.settings");
     } else if (protocol == constants::protocol::kVless) {
@@ -1294,10 +1306,6 @@ void ParseStaticSettings(
         top_level_email = JsonStringOr(settings, "email", "");
     }
 
-    if (settings.contains("users")) {
-        throw std::invalid_argument(
-            "static inbound settings.users is not supported; use settings.clients");
-    }
 
     const auto* client_values = settings.if_contains("clients");
     if (client_values && !client_values->is_array()) {
@@ -1331,15 +1339,16 @@ void ParseStaticSettings(
                 throw std::invalid_argument("clients entries must be objects");
             }
             const auto& client_obj = client.as_object();
-            RequireJsonKeys(client_obj, {"email", "id", "password", "flow"}, "inbound.settings.clients");
+            if (vless) {
+                RequireJsonKeys(client_obj, {"email", "id", "flow"}, "inbound.settings.clients");
+            } else {
+                RequireJsonKeys(client_obj, {"email", credential_field}, "inbound.settings.clients");
+            }
             cfg.users.push_back(InboundUserSpec{
                 .user_id = 0,
                 .email = JsonStringOr(client_obj, "email", ""),
-                .credential = StaticCredential(
-                    protocol,
-                    JsonStringOr(client_obj, "id", ""),
-                    JsonStringOr(client_obj, "password", "")),
-                .flow = LowerAscii(JsonStringOr(client_obj, "flow", "")),
+                .credential = JsonStringOr(client_obj, credential_field, ""),
+                .flow = vless ? LowerAscii(JsonStringOr(client_obj, "flow", "")) : std::string{},
                 .speed_limit = 0,
                 .device_limit = 0,
             });
@@ -1791,6 +1800,7 @@ std::optional<Config> LoadConfig(const std::filesystem::path& path) {
         infra::OutboundSourceConfig direct;
         direct.tag = std::string(constants::protocol::kDirect);
         direct.protocol = std::string(constants::protocol::kFreedom);
+        direct.settings = infra::FreedomSettings{};
         cfg.outbounds.insert(cfg.outbounds.begin(), std::move(direct));
     }
 
@@ -1798,6 +1808,7 @@ std::optional<Config> LoadConfig(const std::filesystem::path& path) {
         infra::OutboundSourceConfig blackhole;
         blackhole.tag = std::string(constants::protocol::kBlackhole);
         blackhole.protocol = std::string(constants::protocol::kBlackhole);
+        blackhole.settings = infra::BlackholeSettings{};
         cfg.outbounds.push_back(std::move(blackhole));
     }
 

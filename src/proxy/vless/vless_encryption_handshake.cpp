@@ -990,6 +990,7 @@ RunVlessEncryptionClientHandshake(
 
 namespace {
 net::awaitable<VlessEncryptionHandshakeResult> ResumeServerTicket(
+    GroupCoordinator& coordinator,
     proxy::BufferedStreamReader& raw_reader, transport::MultiBufferWriter& raw_writer,
     const std::shared_ptr<const VlessEncryptionConfig>& namespace_config,
     std::string_view inbound_tag, const VlessEncryptionServerNfsOpenResult& nfs,
@@ -1011,7 +1012,7 @@ net::awaitable<VlessEncryptionHandshakeResult> ResumeServerTicket(
         }
 
         auto pfs_key = co_await LookupVlessTicket(
-            namespace_config, inbound_tag, *ticket, nfs.nfs_key);
+            coordinator, namespace_config, inbound_tag, *ticket, nfs.nfs_key);
         if (!pfs_key) {
             co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
         }
@@ -1099,6 +1100,7 @@ net::awaitable<VlessEncryptionHandshakeResult> CompleteServerPfs(
 
 net::awaitable<VlessEncryptionHandshakeResult>
 RunVlessEncryptionServerHandshake(
+    GroupCoordinator& coordinator,
     proxy::BufferedStreamReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
     std::shared_ptr<const VlessEncryptionConfig> namespace_config,
@@ -1152,7 +1154,7 @@ RunVlessEncryptionServerHandshake(
     }
 
     if (*client_pfs_length == kVlessEncryptionEncryptedTicketSize) {
-        co_return co_await ResumeServerTicket(raw_reader, raw_writer, namespace_config,
+        co_return co_await ResumeServerTicket(coordinator, raw_reader, raw_writer, namespace_config,
             inbound_tag, *nfs, *nfs_aead, cipher);
     }
     co_return co_await CompleteServerPfs(raw_reader, raw_writer, config, *nfs, *nfs_aead, cipher);

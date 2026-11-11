@@ -467,6 +467,7 @@ const TcpStream* Http2ServerSubStream::BaseTcpStream() const {
 }
 
 net::awaitable<TransportBuildResult> StartHttp2ServerSession(
+    GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
     uint32_t initial_window,
     H2PayloadCodec payload_codec,
@@ -480,7 +481,7 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     // arbitrarily large configured window.
     initial_window = std::min<uint32_t>(initial_window, kHttp2MaxQueuedStreamBytes);
     auto session = std::make_shared<Http2ServerSession>(
-        io_context, std::move(stream), std::move(stream_handler), payload_codec,
+        coordinator, io_context, std::move(stream), std::move(stream_handler), payload_codec,
         conn_id, http_config, xhttp_config, grpc_config, initial_window);
     const auto initial_window_setting = EncodeInitialWindowSetting(initial_window);
     std::array<uint8_t, 12> settings{};

@@ -15,11 +15,8 @@
 
 namespace {
 
-void Require(bool condition, const char* what) {
-    if (!condition) throw std::runtime_error(what);
-}
 
-TEST(SessionGroupExecutor, WorkerRouteRegistrationAndBoundedCoordinatorControl) {
+TEST(SessionGroupExecutor, RoutesWorkerCallsAndReservedOperationsToControlExecutor) {
     net::io_context control, first, second;
     auto control_work = net::make_work_guard(control);
     auto first_work = net::make_work_guard(first);
@@ -29,30 +26,32 @@ TEST(SessionGroupExecutor, WorkerRouteRegistrationAndBoundedCoordinatorControl) 
     coordinator->RegisterWorker(first);
     coordinator->RegisterWorker(second);
 
-    Require(coordinator->WorkerCount() == 2, "worker count mismatch");
-    Require(GroupCoordinator::ForContext(control) == coordinator.get(), "control context binding missing");
-    Require(GroupCoordinator::ForContext(first) == coordinator.get(), "worker 0 context binding missing");
-    Require(GroupCoordinator::ForContext(second) == coordinator.get(), "worker 1 context binding missing");
+    EXPECT_EQ(coordinator->WorkerCount(), 2u);
 
     std::thread control_thread([&] { control.run(); });
     std::thread first_thread([&] { first.run(); });
     std::thread second_thread([&] { second.run(); });
 
-    const auto control_tid = net::co_spawn(
-        first,
-        coordinator->PostCall([] { return std::this_thread::get_id(); }),
-        net::use_future).get();
-    Require(control_tid != std::this_thread::get_id(), "PostCall did not execute on control thread");
+    std::exception_ptr failure;
+    try {
+        const auto control_tid = net::co_spawn(
+            first,
+            coordinator->PostCall([] { return std::this_thread::get_id(); }),
+            net::use_future).get();
+        EXPECT_EQ(control_tid, control_thread.get_id());
 
-    std::promise<void> reserved_done;
-    auto reserved_fut = reserved_done.get_future();
-    struct Returned final : GroupCoordinator::ReservedOperation {
-        std::promise<void>& complete;
-        explicit Returned(std::promise<void>& value) : complete(value) {}
-        void Invoke() noexcept override { complete.set_value(); }
-    };
-    coordinator->PostReserved(std::make_unique<Returned>(reserved_done));
-    reserved_fut.get();
+        std::promise<void> reserved_done;
+        auto reserved_fut = reserved_done.get_future();
+        struct Returned final : GroupCoordinator::ReservedOperation {
+            std::promise<void>& complete;
+            explicit Returned(std::promise<void>& value) : complete(value) {}
+            void Invoke() noexcept override { complete.set_value(); }
+        };
+        coordinator->PostReserved(std::make_unique<Returned>(reserved_done));
+        reserved_fut.get();
+    } catch (...) {
+        failure = std::current_exception();
+    }
 
     coordinator->CloseAdmission();
     auto finalize = net::co_spawn(
@@ -72,6 +71,7 @@ TEST(SessionGroupExecutor, WorkerRouteRegistrationAndBoundedCoordinatorControl) 
     control_thread.join();
     first_thread.join();
     second_thread.join();
+    if (failure) std::rethrow_exception(failure);
 }
 
 }  // namespace

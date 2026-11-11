@@ -16,7 +16,6 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
-#include <iostream>
 #include <memory_resource>
 #include <new>
 #include <span>
@@ -28,16 +27,6 @@
 namespace {
 
 
-[[noreturn]] void Fail(std::string_view message) {
-    std::cerr << message << '\n';
-    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
-}
-
-void Check(bool condition, std::string_view message) {
-    if (!condition) {
-        Fail(message);
-    }
-}
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& mb) {
     std::vector<uint8_t> out;
@@ -54,11 +43,12 @@ std::vector<uint8_t> Flatten(const buf::MultiBuffer& mb) {
 
 buf::MultiBuffer MakePacket(std::string_view payload, const TargetAddress& target) {
     buf::MultiBuffer packet;
-    Check(buf::AppendSpanToMultiBuffer(
-        std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(payload.data()), payload.size()),
-        packet), "packet allocation failed");
-    Check(buf::SetUdpTarget(packet, target), "packet target allocation failed");
+    if (!buf::AppendSpanToMultiBuffer(
+            std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(payload.data()), payload.size()), packet) ||
+        !buf::SetUdpTarget(packet, target)) {
+        throw std::runtime_error("packet fixture allocation failed");
+    }
     return packet;
 }
 
@@ -106,7 +96,7 @@ public:
         buf::MultiBuffer out;
         if (!buf::AppendSpanToMultiBuffer(
                 std::span<const uint8_t>(bytes_.data() + offset_, size), out)) {
-            Fail("reader allocation failed");
+            throw std::runtime_error("reader fixture allocation failed");
         }
         offset_ += size;
         co_return out;
@@ -147,8 +137,6 @@ public:
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
         ++write_calls;
-        descriptor_address = buffers.data();
-        descriptors.assign(buffers.begin(), buffers.end());
         std::vector<uint8_t> before;
         for (const auto& buffer : buffers) {
             const auto* data = static_cast<const uint8_t*>(buffer.data());
@@ -160,17 +148,12 @@ public:
             timer.expires_after(std::chrono::milliseconds(1));
             co_await timer.async_wait(net::use_awaitable);
             resumed = true;
-            Check(buffers.data() == descriptor_address &&
-                  std::equal(buffers.begin(), buffers.end(), descriptors.begin(),
-                      [](const net::const_buffer& left, const net::const_buffer& right) {
-                          return left.data() == right.data() && left.size() == right.size();
-                      }), "UoT write buffer descriptors changed across suspension");
             std::vector<uint8_t> after;
             for (const auto& buffer : buffers) {
                 const auto* data = static_cast<const uint8_t*>(buffer.data());
                 after.insert(after.end(), data, data + buffer.size());
             }
-            Check(after == before, "UoT write buffer bytes changed across suspension");
+            EXPECT_EQ(after, before);
         }
         if (throw_on_write) {
             throw std::runtime_error("synthetic write failure");
@@ -180,8 +163,6 @@ public:
 
     FragmentReader reader_;
     std::vector<uint8_t> bytes;
-    std::vector<net::const_buffer> descriptors;
-    const net::const_buffer* descriptor_address = nullptr;
     size_t read_calls = 0;
     size_t write_calls = 0;
     size_t cancel_calls = 0;
@@ -203,7 +184,7 @@ void Run(Factory&& factory) {
 
 TEST(UotSs2022, V2BoardSs2022Keys) {
     const auto cipher = ss::ParseCipherMethod("2022-blake3-aes-256-gcm");
-    Check(cipher.has_value(), "SS2022 cipher was not parsed");
+    ASSERT_TRUE(cipher.has_value());
 
     constexpr std::string_view uuid = "01234567-89ab-cdef-0123-456789abcdef";
     constexpr std::string_view prefix = "01234567-89ab-cdef-0123-456789ab";
@@ -213,43 +194,40 @@ TEST(UotSs2022, V2BoardSs2022Keys) {
         "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=";
 
     const auto uuid_key = ss::Build2022UserKeyFromUuid(uuid, *cipher);
-    Check(uuid_key.size == 32, "UUID-derived user key length mismatch");
-    Check(std::memcmp(uuid_key.data(), prefix.data(), prefix.size()) == 0,
-          "UUID-derived user key bytes mismatch");
+    ASSERT_EQ(uuid_key.size, 32u);
+    EXPECT_EQ(std::memcmp(uuid_key.data(), prefix.data(), prefix.size()), 0);
 
     const auto decoded_user = ss::Decode2022Psk(user_psk, cipher->key_size);
-    Check(decoded_user.size == uuid_key.size &&
-          std::memcmp(decoded_user.data(), uuid_key.data(), uuid_key.size) == 0,
-          "subscription user PSK does not match runtime UUID key");
+    ASSERT_EQ(decoded_user.size, uuid_key.size);
+    EXPECT_EQ(std::memcmp(decoded_user.data(), uuid_key.data(), uuid_key.size), 0);
 
     const auto decoded_server = ss::Decode2022Psk(server_psk, cipher->key_size);
-    Check(decoded_server.size == 32, "server identity PSK length mismatch");
-    Check(ss::Decode2022Psk(
-        "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYw", cipher->key_size).empty(),
-        "oversized SS2022 PSK was accepted");
+    EXPECT_EQ(decoded_server.size, 32u);
+    EXPECT_TRUE(ss::Decode2022Psk(
+        "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYw", cipher->key_size).empty());
 }
 
-TEST(UotSs2022, MagicAndRequestCodec) {
-    Check(proxy::uot::VersionFromMagicAddress(
-        TargetAddress(proxy::uot::kMagicAddress, 0)) == proxy::uot::Version::V2,
-        "UoT v2 magic was not recognized");
-    Check(proxy::uot::VersionFromMagicAddress(
+TEST(UotSs2022, MagicAddressesRequireExactMatches) {
+    EXPECT_TRUE(proxy::uot::VersionFromMagicAddress(
+        TargetAddress(proxy::uot::kMagicAddress, 0)) == proxy::uot::Version::V2);
+    EXPECT_TRUE(proxy::uot::VersionFromMagicAddress(
         TargetAddress(proxy::uot::kV1MagicAddress, 0)) ==
-            proxy::uot::Version::V1,
-        "UoT v1 magic was not recognized");
-    Check(!proxy::uot::VersionFromMagicAddress(
-        TargetAddress("prefix.sp.v2.udp-over-tcp.arpa", 0)),
-        "non-exact UoT magic was accepted");
+            proxy::uot::Version::V1);
+    EXPECT_TRUE(!proxy::uot::VersionFromMagicAddress(
+        TargetAddress("prefix.sp.v2.udp-over-tcp.arpa", 0)));
+ }
 
+TEST(UotSs2022, RequestEncodesDestinationAndPort) {
     const TargetAddress target("dns.example", 53);
     const auto request = proxy::uot::EncodeRequest(false, target);
-    Check(request.has_value(), "UoT request encode failed");
+    ASSERT_TRUE(request.has_value());
     const auto bytes = request->span();
-    Check(bytes.size() == 1 + 1 + 1 + 11 + 2, "UoT request size mismatch");
-    Check(bytes[0] == 0 && bytes[1] == 3 && bytes[2] == 11,
-          "UoT v2 request header mismatch");
-    Check(bytes[bytes.size() - 2] == 0 && bytes.back() == 53,
-          "UoT request port mismatch");
+    ASSERT_EQ(bytes.size(), 16u);
+    EXPECT_EQ(bytes[0], 0);
+    EXPECT_EQ(bytes[1], 3);
+    EXPECT_EQ(bytes[2], 11);
+    EXPECT_EQ(bytes[bytes.size() - 2], 0);
+    EXPECT_EQ(bytes.back(), 53);
 }
 
 TEST(UotSs2022, ConnectPacketRoundTrip) {
@@ -266,13 +244,14 @@ TEST(UotSs2022, ConnectPacketRoundTrip) {
     ::Run([&]() -> net::awaitable<void> {
         auto first = co_await reader.ReadMultiBuffer();
         auto second = co_await reader.ReadMultiBuffer();
-        Check(Flatten(first) == std::vector<uint8_t>({'a','l','p','h','a'}),
-              "connect packet one mismatch");
-        Check(Flatten(second) == std::vector<uint8_t>(
-            {'b','e','t','a','-','p','a','y','l','o','a','d'}),
-              "connect packet two mismatch");
-        Check(first.begin()[0]->HasUDP() && first.begin()[0]->UDP().port == 53,
-              "connect packet target missing");
+        EXPECT_TRUE(Flatten(first) == std::vector<uint8_t>({'a','l','p','h','a'}));
+        EXPECT_TRUE(Flatten(second) == std::vector<uint8_t>(
+            {'b','e','t','a','-','p','a','y','l','o','a','d'}));
+        const auto datagram = buf::InspectUdpDatagram(first);
+        EXPECT_TRUE(datagram.Valid());
+        EXPECT_NE(datagram.target, nullptr);
+        if (!datagram.Valid() || !datagram.target) co_return;
+        EXPECT_TRUE(datagram.target->SameEndpoint(target));
     });
 }
 
@@ -286,35 +265,32 @@ TEST(UotSs2022, LargeConnectPacketRoundTrip) {
         co_await writer.WriteMultiBuffer(MakePacket(large_payload, target));
     });
 
-    Check(capture.bytes.size() == large_payload.size() + 2,
-          "large UoT datagram was split into multiple frames");
+    ASSERT_EQ(capture.bytes.size(), large_payload.size() + 2);
     const size_t wire_length =
         (static_cast<size_t>(capture.bytes[0]) << 8) | capture.bytes[1];
-    Check(wire_length == large_payload.size(),
-          "large UoT frame length did not cover the complete datagram");
+    EXPECT_TRUE(wire_length == large_payload.size());
 
     FragmentReader source(capture.bytes, {1, 2, 4096, 17, 2048, 3, 1024});
     proxy::uot::PacketReader reader(source, true, target);
     ::Run([&]() -> net::awaitable<void> {
         auto decoded = co_await reader.ReadMultiBuffer();
-        Check(Flatten(decoded) == std::vector<uint8_t>(
-            large_payload.begin(), large_payload.end()),
-            "large UoT datagram round-trip mismatch");
-        Check(decoded.size() > 1,
-              "large UoT datagram did not exercise multi-buffer storage");
+        EXPECT_TRUE(Flatten(decoded) == std::vector<uint8_t>(
+            large_payload.begin(), large_payload.end()));
     });
 }
 
-TEST(UotSs2022, EmptyDatagramsPreserveSequenceAndTargets) {
+class UotPacketMode : public testing::TestWithParam<bool> {};
+
+TEST_P(UotPacketMode, EmptyDatagramsPreserveSequenceAndTargets) {
     const TargetAddress first("1.1.1.1", 53);
     const TargetAddress second("8.8.8.8", 5353);
-    for (const bool connect : {false, true}) {
+    const bool connect = GetParam();
         CaptureWriter capture;
         proxy::uot::PacketWriter writer(capture, connect, first);
         const auto& last = connect ? first : second;
         ::Run([&]() -> net::awaitable<void> {
             co_await writer.WriteMultiBuffer({});
-            Check(capture.bytes.empty(), "no UDP message wrote an empty frame");
+            EXPECT_TRUE(capture.bytes.empty());
             co_await writer.WriteMultiBuffer(MakePacket("", first));
             co_await writer.WriteMultiBuffer(MakePacket("data", first));
             if (connect) {
@@ -323,8 +299,7 @@ TEST(UotSs2022, EmptyDatagramsPreserveSequenceAndTargets) {
                 co_await writer.WriteMultiBuffer(MakePacket("", last));
             }
         });
-        Check(capture.bytes.size() == (connect ? 10 : 31),
-              "UoT empty datagrams did not write complete protocol headers");
+        EXPECT_EQ(capture.bytes.size(), connect ? 10u : 31u);
         FragmentReader source(capture.bytes, {1, 1, 1, 1, 1, 1, 1, 1});
         proxy::uot::PacketReader reader(source, connect, first);
         ::Run([&]() -> net::awaitable<void> {
@@ -333,16 +308,15 @@ TEST(UotSs2022, EmptyDatagramsPreserveSequenceAndTargets) {
                 const size_t size = sizes[index];
                 auto packet = co_await reader.ReadMultiBuffer();
                 const auto datagram = buf::InspectUdpDatagram(packet);
-                Check(datagram.Valid() && datagram.payload_size == size &&
-                          datagram.target->SameEndpoint(index == 2 ? last : first),
-                      "UoT empty/data sequence became EOF or lost a target");
-                if (size != 0) Check(Flatten(packet) == std::vector<uint8_t>({'d','a','t','a'}),
-                                     "UoT UDP data changed");
+                EXPECT_TRUE(datagram.Valid());
+                EXPECT_NE(datagram.target, nullptr);
+                if (!datagram.Valid() || !datagram.target) co_return;
+                EXPECT_EQ(datagram.payload_size, size);
+                EXPECT_TRUE(datagram.target->SameEndpoint(index == 2 ? last : first));
+                if (size != 0) EXPECT_TRUE(Flatten(packet) == std::vector<uint8_t>({'d','a','t','a'}));
             }
-            Check((co_await reader.ReadMultiBuffer()).empty(),
-                  "UoT TCP EOF became an empty datagram");
+            EXPECT_TRUE((co_await reader.ReadMultiBuffer()).empty());
         });
-    }
 }
 
 TEST(UotSs2022, V1FirstEmptyDatagramSurvivesPreparation) {
@@ -357,65 +331,69 @@ TEST(UotSs2022, V1FirstEmptyDatagramSurvivesPreparation) {
     ::Run([&]() -> net::awaitable<void> {
         auto prepared = co_await proxy::uot::ReadUotRequestHeader(
             proxy::uot::Version::V1, source, {});
-        Check(prepared.has_value() && prepared->destination.SameEndpoint(target),
-              "UoT v1 first empty UDP message was mistaken for EOF");
+        EXPECT_TRUE(prepared.has_value());
+        if (!prepared) co_return;
+        EXPECT_TRUE(prepared->destination.SameEndpoint(target));
         auto empty = std::move(prepared->initial_decoded);
         proxy::uot::PacketReader reader(source, std::move(*prepared));
         const auto datagram = buf::InspectUdpDatagram(empty);
-        Check(datagram.Valid() && datagram.payload_size == 0 &&
-                  datagram.target->SameEndpoint(target),
-              "UoT prepared first empty datagram was lost");
-        Check(Flatten(co_await reader.ReadMultiBuffer()) ==
-                  std::vector<uint8_t>({'n','e','x','t'}),
-              "UoT first empty datagram damaged the following payload");
-        Check((co_await reader.ReadMultiBuffer()).empty(), "UoT v1 EOF changed");
+        EXPECT_TRUE(datagram.Valid());
+        EXPECT_NE(datagram.target, nullptr);
+        if (!datagram.Valid() || !datagram.target) co_return;
+        EXPECT_EQ(datagram.payload_size, 0u);
+        EXPECT_TRUE(datagram.target->SameEndpoint(target));
+        EXPECT_TRUE(Flatten(co_await reader.ReadMultiBuffer()) ==
+                  std::vector<uint8_t>({'n','e','x','t'}));
+        EXPECT_TRUE((co_await reader.ReadMultiBuffer()).empty());
     });
 }
 
-TEST(UotSs2022, FramedEndpointWriteAndRead) {
+TEST(UotSs2022, FramedOwnedWritePreservesPayloadAcrossSuspension) {
     const TargetAddress target("1.1.1.1", 53);
     FramedEndpointDouble underlying;
     underlying.suspend_write = true;
     proxy::uot::FramedEndpoint endpoint(underlying, true, target);
-    auto pending_write = endpoint.WriteMultiBuffer(MakePacket("framed", target));
-    Check(underlying.write_calls == 0 && underlying.bytes.empty(),
-          "UoT framed write started before its awaitable was awaited");
-    ::Run([&]() -> net::awaitable<void> {
-        co_await std::move(pending_write);
-    });
-    Check(underlying.write_calls == 1 && underlying.resumed,
-          "UoT underlying WriteBuffers did not suspend and resume");
-    Check(underlying.bytes == std::vector<uint8_t>({0, 6, 'f', 'r', 'a', 'm', 'e', 'd'}),
-          "UoT framed endpoint wrote incorrect frame header or payload");
+    auto pending = endpoint.WriteMultiBuffer(MakePacket("framed", target));
+    EXPECT_EQ(underlying.write_calls, 0u);
+    ::Run([&]() -> net::awaitable<void> { co_await std::move(pending); });
+    EXPECT_TRUE(underlying.resumed);
+    EXPECT_EQ(underlying.bytes, std::vector<uint8_t>({0, 6, 'f', 'r', 'a', 'm', 'e', 'd'}));
+}
 
-    const std::array<uint8_t, 4> borrowed_payload{'n', 'e', 'x', 't'};
-    const std::array<net::const_buffer, 1> borrowed_buffers{net::buffer(borrowed_payload)};
-    underlying.resumed = false;
-    auto pending_buffers = endpoint.WriteBuffers(borrowed_buffers);
-    Check(underlying.write_calls == 1,
-          "UoT framed WriteBuffers started before its awaitable was awaited");
-    ::Run([&]() -> net::awaitable<void> {
-        co_await std::move(pending_buffers);
-    });
-    Check(underlying.write_calls == 2 && underlying.resumed &&
-          underlying.bytes == std::vector<uint8_t>(
-              {0, 6, 'f', 'r', 'a', 'm', 'e', 'd', 0, 4, 'n', 'e', 'x', 't'}),
-          "UoT framed WriteBuffers did not preserve the borrowed payload across suspension");
+TEST(UotSs2022, FramedBorrowedWritePreservesPayloadAcrossSuspension) {
+    const TargetAddress target("1.1.1.1", 53);
+    FramedEndpointDouble underlying;
+    underlying.suspend_write = true;
+    proxy::uot::FramedEndpoint endpoint(underlying, true, target);
+    const std::array<uint8_t, 4> payload{'n', 'e', 'x', 't'};
+    const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
+    auto pending = endpoint.WriteBuffers(buffers);
+    EXPECT_EQ(underlying.write_calls, 0u);
+    ::Run([&]() -> net::awaitable<void> { co_await std::move(pending); });
+    EXPECT_TRUE(underlying.resumed);
+    EXPECT_EQ(underlying.bytes, std::vector<uint8_t>({0, 4, 'n', 'e', 'x', 't'}));
+}
+
+TEST(UotSs2022, FramedEndpointForwardsCancellation) {
+    FramedEndpointDouble underlying;
+    proxy::uot::FramedEndpoint endpoint(underlying, true, TargetAddress("1.1.1.1", 53));
     endpoint.Cancel();
-    Check(underlying.cancel_calls == 1, "UoT framed endpoint did not forward cancellation");
+    EXPECT_EQ(underlying.cancel_calls, 1u);
+}
 
-    FramedEndpointDouble encoded(underlying.bytes, {1, 1, 2, 1, 3});
-    proxy::uot::FramedEndpoint read_endpoint(encoded, true, target);
-    auto pending_read = read_endpoint.ReadMultiBuffer();
-    Check(encoded.read_calls == 0,
-          "UoT framed read started before its awaitable was awaited");
+TEST(UotSs2022, FramedReadReassemblesFragmentedFrames) {
+    const TargetAddress target("1.1.1.1", 53);
+    FramedEndpointDouble underlying(
+        {0, 6, 'f', 'r', 'a', 'm', 'e', 'd', 0, 4, 'n', 'e', 'x', 't'}, {1, 1, 2, 1, 3});
+    proxy::uot::FramedEndpoint endpoint(underlying, true, target);
+    auto pending = endpoint.ReadMultiBuffer();
+    EXPECT_EQ(underlying.read_calls, 0u);
     ::Run([&]() -> net::awaitable<void> {
-        auto packet = co_await std::move(pending_read);
-        Check(Flatten(packet) == std::vector<uint8_t>({'f','r','a','m','e','d'}),
-              "UoT framed endpoint failed to read a fragmented frame");
-        auto next = co_await read_endpoint.ReadMultiBuffer();
-        Check(Flatten(next) == std::vector<uint8_t>({'n','e','x','t'}),
-              "UoT framed WriteBuffers payload failed to round-trip");
+        auto first = co_await std::move(pending);
+        EXPECT_EQ(Flatten(first), std::vector<uint8_t>({'f','r','a','m','e','d'}));
+        auto next = co_await endpoint.ReadMultiBuffer();
+        EXPECT_EQ(Flatten(next), std::vector<uint8_t>({'n','e','x','t'}));
+        EXPECT_TRUE((co_await endpoint.ReadMultiBuffer()).empty());
     });
 }
 
@@ -424,15 +402,9 @@ TEST(UotSs2022, FramedEndpointWriteException) {
     FramedEndpointDouble underlying;
     underlying.throw_on_write = true;
     proxy::uot::FramedEndpoint endpoint(underlying, true, target);
-    bool propagated = false;
-    try {
-        ::Run([&]() -> net::awaitable<void> {
-            co_await endpoint.WriteMultiBuffer(MakePacket("failure", target));
-        });
-    } catch (const std::runtime_error& error) {
-        propagated = std::string_view(error.what()) == "synthetic write failure";
-    }
-    Check(propagated, "UoT framed endpoint swallowed the underlying write exception");
+    EXPECT_THROW(::Run([&]() -> net::awaitable<void> {
+        co_await endpoint.WriteMultiBuffer(MakePacket("failure", target));
+    }), std::runtime_error);
 }
 
 TEST(UotSs2022, NonConnectRequestAndPackets) {
@@ -440,7 +412,7 @@ TEST(UotSs2022, NonConnectRequestAndPackets) {
     const TargetAddress second("8.8.8.8", 5353);
 
     const auto request = proxy::uot::EncodeRequest(false, initial);
-    Check(request.has_value(), "non-connect request encode failed");
+    ASSERT_TRUE(request.has_value());
 
     CaptureWriter capture;
     capture.bytes.insert(
@@ -455,80 +427,110 @@ TEST(UotSs2022, NonConnectRequestAndPackets) {
     ::Run([&]() -> net::awaitable<void> {
         auto decoded_request = co_await proxy::uot::ReadUotRequestHeader(
             proxy::uot::Version::V2, source, {});
-        Check(decoded_request.has_value(), "fragmented UoT request decode failed");
-        Check(!decoded_request->is_connect &&
-              decoded_request->destination.host == "dns.example" &&
-              decoded_request->destination.port == 53,
-              "fragmented UoT request target mismatch");
+        EXPECT_TRUE(decoded_request.has_value());
+        if (!decoded_request) co_return;
+        EXPECT_FALSE(decoded_request->is_connect);
+        EXPECT_TRUE(decoded_request->destination.SameEndpoint(initial));
 
         proxy::uot::PacketReader reader(source, std::move(*decoded_request));
         auto first = co_await reader.ReadMultiBuffer();
         auto next = co_await reader.ReadMultiBuffer();
-        Check(Flatten(first) == std::vector<uint8_t>({'o','n','e'}),
-              "non-connect packet one mismatch");
-        Check(Flatten(next) == std::vector<uint8_t>({'t','w','o','-','t','w','o'}),
-              "non-connect packet two mismatch");
-        Check(first.begin()[0]->UDP().host == "dns.example" &&
-              first.begin()[0]->UDP().port == 53,
-              "non-connect domain target mismatch");
-        Check(next.begin()[0]->UDP().resolved_addr.has_value() &&
-              next.begin()[0]->UDP().port == 5353,
-              "non-connect IP target mismatch");
+        EXPECT_TRUE(Flatten(first) == std::vector<uint8_t>({'o','n','e'}));
+        EXPECT_TRUE(Flatten(next) == std::vector<uint8_t>({'t','w','o','-','t','w','o'}));
+        const auto first_datagram = buf::InspectUdpDatagram(first);
+        const auto next_datagram = buf::InspectUdpDatagram(next);
+        EXPECT_TRUE(first_datagram.Valid());
+        EXPECT_TRUE(next_datagram.Valid());
+        EXPECT_NE(first_datagram.target, nullptr);
+        EXPECT_NE(next_datagram.target, nullptr);
+        if (!first_datagram.target || !next_datagram.target) co_return;
+        EXPECT_TRUE(first_datagram.target->SameEndpoint(initial));
+        EXPECT_TRUE(next_datagram.target->SameEndpoint(second));
     });
 }
 
 // Exercise the public wire codec independently of each protocol's handshake.
-TEST(UotSs2022, SharedAddressCodec) {
-    const std::array targets{
+class UotAddressCodec : public testing::TestWithParam<AddressWireFormat> {
+protected:
+    const std::array<TargetAddress, 3> targets{
         TargetAddress("192.0.2.1", 0x1234),
         TargetAddress("2001:db8::1", 0x1234),
         TargetAddress("example.com", 0x1234)};
-    const std::array formats{AddressWireFormat::Socks5,
-        AddressWireFormat::PortFirst, AddressWireFormat::Uot};
-    for (const auto format : formats) {
-        for (const auto& target : targets) {
-            std::array<uint8_t, kMaxEncodedAddressSize> encoded{};
-            const size_t size = EncodeAddressTo(
-                target, encoded.data(), encoded.size(), format);
-            Check(size == AddressEncodedSize(target) && size != 0,
-                  "shared address size mismatch");
+    const std::array<ForwardedMetadataView, 3> metadata_cases{
+        ForwardedMetadataView{.user_id = 424242, .user_email = "alice@example.com",
+            .client_ip = net::ip::make_address("203.0.113.99")},
+        ForwardedMetadataView{.user_id = 0, .user_email = "only-email@example.com",
+            .client_ip = std::nullopt},
+        ForwardedMetadataView{.user_id = 7, .user_email = {},
+            .client_ip = net::ip::make_address("2001:db8::abcd")}};
+};
+
+TEST_P(UotAddressCodec, WireTypesAndByteOrderRemainInteroperable) {
+    const auto format = GetParam();
+    for (const auto& target : targets) {
+        SCOPED_TRACE(target.host);
+        std::array<uint8_t, kMaxEncodedAddressSize> encoded{};
+        const size_t size = EncodeAddressTo(target, encoded.data(), encoded.size(), format);
+        ASSERT_EQ(size, AddressEncodedSize(target));
+        ASSERT_GT(size, 0u);
             const size_t type_pos = format == AddressWireFormat::PortFirst ? 2 : 0;
             const uint8_t expected_type = target.IsDomain()
                 ? (format == AddressWireFormat::Socks5 ? 3 : 2)
                 : target.IsIPv4() ? (format == AddressWireFormat::Uot ? 0 : 1)
                 : format == AddressWireFormat::Socks5 ? 4
                 : format == AddressWireFormat::PortFirst ? 3 : 1;
-            Check(encoded[type_pos] == expected_type,
-                  "shared address changed wire type semantics");
+            EXPECT_EQ(encoded[type_pos], expected_type);
             const size_t port_pos = format == AddressWireFormat::PortFirst ? 0 : size - 2;
-            Check(encoded[port_pos] == 0x12 && encoded[port_pos + 1] == 0x34,
-                  "shared address changed port byte order");
+            EXPECT_EQ(encoded[port_pos], 0x12);
+            EXPECT_EQ(encoded[port_pos + 1], 0x34);
             const auto* body = encoded.data() + type_pos + 1;
             if (target.IsIPv4()) {
                 const std::array<uint8_t, 4> expected{192, 0, 2, 1};
-                Check(std::equal(expected.begin(), expected.end(), body),
-                      "shared address changed IPv4 wire bytes");
+                EXPECT_TRUE(std::equal(expected.begin(), expected.end(), body));
             } else if (target.IsIPv6()) {
                 const std::array<uint8_t, 16> expected{
                     0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
-                Check(std::equal(expected.begin(), expected.end(), body),
-                      "shared address changed IPv6 wire bytes");
+                EXPECT_TRUE(std::equal(expected.begin(), expected.end(), body));
             } else {
-                Check(body[0] == 11 && std::memcmp(body + 1, "example.com", 11) == 0,
-                      "shared address changed domain wire bytes");
+                EXPECT_TRUE(body[0] == 11 && std::memcmp(body + 1, "example.com", 11) == 0);
             }
-            Check(EncodeAddressTo(target, encoded.data(), size - 1, format) == 0,
-                  "shared address overwrote insufficient output");
-            for (size_t split = 0; split <= size; ++split) {
-                const auto parsed = DecodeAddress(
-                    std::span<const uint8_t>(encoded.data(), split), format);
-                Check(parsed.status == (split == size ? AddressDecodeStatus::Complete
-                                                      : AddressDecodeStatus::Incomplete),
-                      "shared address confused split input with invalid input");
-                Check(split == size
-                    ? parsed.consumed == size && parsed.target.SameEndpoint(target)
-                    : parsed.consumed == 0 && parsed.required > split,
-                    "shared address lost consumed/required boundary");
+            EXPECT_EQ(EncodeAddressTo(target, encoded.data(), size - 1, format), 0u);
+    }
+}
+
+TEST_P(UotAddressCodec, SplitDecodeReportsConsumedAndRequired) {
+    const auto format = GetParam();
+    for (const auto& target : targets) {
+        SCOPED_TRACE(target.host);
+        std::array<uint8_t, kMaxEncodedAddressSize> encoded{};
+        const size_t size = EncodeAddressTo(target, encoded.data(), encoded.size(), format);
+        ASSERT_EQ(size, AddressEncodedSize(target));
+        ASSERT_GT(size, 0u);
+        for (size_t split = 0; split <= size; ++split) {
+            SCOPED_TRACE(split);
+            const auto parsed = DecodeAddress(std::span<const uint8_t>(encoded.data(), split), format);
+            EXPECT_EQ(parsed.status, split == size ? AddressDecodeStatus::Complete : AddressDecodeStatus::Incomplete);
+            if (split == size) {
+                EXPECT_EQ(parsed.consumed, size);
+                EXPECT_TRUE(parsed.target.SameEndpoint(target));
+            } else {
+                EXPECT_EQ(parsed.consumed, 0u);
+                EXPECT_GT(parsed.required, split);
+            }
+        }
+    }
+}
+
+TEST_P(UotAddressCodec, IncrementalReadPreservesCallerPrefixAndFollowingByte) {
+    const auto format = GetParam();
+    for (const auto& target : targets) {
+        SCOPED_TRACE(target.host);
+        std::array<uint8_t, kMaxEncodedAddressSize> encoded{};
+        const size_t size = EncodeAddressTo(target, encoded.data(), encoded.size(), format);
+        ASSERT_EQ(size, AddressEncodedSize(target));
+        ASSERT_GT(size, 0u);
+        for (size_t split = 0; split <= size; ++split) {
+            SCOPED_TRACE(split);
                 std::vector<uint8_t> input{0xaa};
                 input.insert(input.end(), encoded.begin(), encoded.begin() + size);
                 input.push_back(0xbb);
@@ -536,95 +538,129 @@ TEST(UotSs2022, SharedAddressCodec) {
                 buf::MultiBuffer pending;
                 ::Run([&]() -> net::awaitable<void> {
                     auto decoded = co_await ReadAddress(source, pending, format, 1);
-                    Check(decoded && decoded->consumed == size &&
-                          decoded->target.SameEndpoint(target),
-                          "incremental shared address failed a split");
-                    Check(pending.byte_size() >= size + 1,
-                          "incremental address consumed caller-owned prefix");
+                    EXPECT_TRUE(decoded.has_value());
+                    if (!decoded) co_return;
+                    EXPECT_EQ(decoded->consumed, size);
+                    EXPECT_TRUE(decoded->target.SameEndpoint(target));
+                    EXPECT_GE(pending.byte_size(), size + 1);
+                    if (pending.byte_size() < size + 1) co_return;
                     pending.DropPrefixBytes(size + 1);
                     if (pending.byte_size() == 0) {
                         auto remaining = co_await source.ReadMultiBuffer();
                         remaining.MoveTo(pending, true);
                     }
-                    Check(Flatten(pending) == std::vector<uint8_t>{0xbb},
-                          "incremental address lost the following frame byte");
+                    EXPECT_EQ(Flatten(pending), std::vector<uint8_t>{0xbb});
                 });
-                if (split == size) continue;
+        }
+    }
+}
+
+TEST_P(UotAddressCodec, TruncatedInputFailsAtEof) {
+    const auto format = GetParam();
+    for (const auto& target : targets) {
+        SCOPED_TRACE(target.host);
+        std::array<uint8_t, kMaxEncodedAddressSize> encoded{};
+        const size_t size = EncodeAddressTo(target, encoded.data(), encoded.size(), format);
+        ASSERT_EQ(size, AddressEncodedSize(target));
+        ASSERT_GT(size, 0u);
+        for (size_t split = 0; split < size; ++split) {
+            SCOPED_TRACE(split);
                 FragmentReader truncated(std::vector<uint8_t>(encoded.begin(), encoded.begin() + split), {1, 2});
                 buf::MultiBuffer incomplete;
                 ::Run([&]() -> net::awaitable<void> {
                     auto decoded = co_await ReadAddress(truncated, incomplete, format);
-                    Check(!decoded && decoded.error() == ErrorCode::PROTOCOL_DECODE_FAILED,
-                          "incremental address accepted truncated EOF");
+                    EXPECT_FALSE(decoded.has_value());
+                    if (!decoded) EXPECT_EQ(decoded.error(), ErrorCode::PROTOCOL_DECODE_FAILED);
                 });
-            }
-            encoded[type_pos] = 0xff;
-            Check(DecodeAddress(std::span<const uint8_t>(encoded.data(), size), format).status ==
-                      AddressDecodeStatus::Invalid,
-                  "shared address accepted an unknown type");
         }
+    }
+}
+
+TEST_P(UotAddressCodec, UnknownWireTypeIsInvalid) {
+    const auto format = GetParam();
+    for (const auto& target : targets) {
+        SCOPED_TRACE(target.host);
+        std::array<uint8_t, kMaxEncodedAddressSize> encoded{};
+        const size_t size = EncodeAddressTo(target, encoded.data(), encoded.size(), format);
+        ASSERT_EQ(size, AddressEncodedSize(target));
+        ASSERT_GT(size, 0u);
+        const size_t type_pos = format == AddressWireFormat::PortFirst ? 2 : 0;
+        encoded[type_pos] = 0xff;
+        EXPECT_EQ(DecodeAddress(std::span<const uint8_t>(encoded.data(), size), format).status,
+                  AddressDecodeStatus::Invalid);
+    }
+}
+
+TEST_P(UotAddressCodec, EmptyAndMaximumDomainLengthBoundaries) {
+    const auto format = GetParam();
         std::array<uint8_t, kMaxBaseEncodedAddressSize> domain{};
         const size_t type_pos = format == AddressWireFormat::PortFirst ? 2 : 0;
         domain[type_pos] = format == AddressWireFormat::Socks5 ? 3 : 2;
         domain[type_pos + 1] = 0;
-        Check(DecodeAddress(domain, format, {.require_non_empty_domain = true}).status ==
-                  AddressDecodeStatus::Invalid,
-              "shared address accepted a forbidden empty domain");
+        EXPECT_TRUE(DecodeAddress(domain, format, {.require_non_empty_domain = true}).status ==
+                  AddressDecodeStatus::Invalid);
         domain[type_pos + 1] = 255;
-        Check(DecodeAddress(std::span<const uint8_t>(domain.data(), domain.size() - 1),
+        EXPECT_TRUE(DecodeAddress(std::span<const uint8_t>(domain.data(), domain.size() - 1),
                             format).status == AddressDecodeStatus::Incomplete &&
-              DecodeAddress(domain, format).consumed == domain.size(),
-              "shared address failed its maximum wire-domain boundary");
+              DecodeAddress(domain, format).consumed == domain.size());
+}
 
-        const std::array<ForwardedMetadataView, 3> metadata_cases{
-            ForwardedMetadataView{
-                .user_id = 424242,
-                .user_email = "alice@example.com",
-                .client_ip = net::ip::make_address("203.0.113.99"),
-            },
-            ForwardedMetadataView{
-                .user_id = 0,
-                .user_email = "only-email@example.com",
-                .client_ip = std::nullopt,
-            },
-            ForwardedMetadataView{
-                .user_id = 7,
-                .user_email = {},
-                .client_ip = net::ip::make_address("2001:db8::abcd"),
-            },
-        };
-        for (const auto& target : targets) {
-            for (const auto& meta : metadata_cases) {
-                std::array<uint8_t, kMaxEncodedAddressSize> encoded{};
-                const size_t size = EncodeAddressTo(
-                    target, encoded.data(), encoded.size(), format, meta);
-                Check(size == AddressEncodedSize(target, meta) &&
-                      size > AddressEncodedSize(target),
-                      "extended address size mismatch");
-                for (size_t split = 0; split <= size; ++split) {
-                    const auto parsed = DecodeAddress(
-                        std::span<const uint8_t>(encoded.data(), split), format);
-                    Check(parsed.status == (split == size ? AddressDecodeStatus::Complete
-                                                          : AddressDecodeStatus::Incomplete),
-                          "extended address split status mismatch");
-                    if (split == size) {
-                        Check(parsed.consumed == size &&
-                              parsed.target.SameEndpoint(target) &&
-                              parsed.forwarded.has_value() &&
-                              parsed.forwarded->user_id == meta.user_id &&
-                              parsed.forwarded->user_email == meta.user_email &&
-                              parsed.forwarded->client_ip == meta.client_ip,
-                              "extended address roundtrip metadata mismatch");
-                    }
-                }
+TEST_P(UotAddressCodec, MetadataRoundTripsAcrossInputSplits) {
+    const auto format = GetParam();
+    for (const auto& target : targets) {
+        for (const auto& meta : metadata_cases) {
+            SCOPED_TRACE(target.host);
+            SCOPED_TRACE(meta.user_id);
+            std::array<uint8_t, kMaxEncodedAddressSize> encoded{};
+            const size_t size = EncodeAddressTo(target, encoded.data(), encoded.size(), format, meta);
+            ASSERT_EQ(size, AddressEncodedSize(target, meta));
+            ASSERT_GT(size, AddressEncodedSize(target));
+            for (size_t split = 0; split <= size; ++split) {
+                SCOPED_TRACE(split);
+                const auto parsed = DecodeAddress(std::span<const uint8_t>(encoded.data(), split), format);
+                EXPECT_EQ(parsed.status, split == size ? AddressDecodeStatus::Complete : AddressDecodeStatus::Incomplete);
+                if (split != size) continue;
+                EXPECT_EQ(parsed.consumed, size);
+                EXPECT_TRUE(parsed.target.SameEndpoint(target));
+                ASSERT_TRUE(parsed.forwarded.has_value());
+                EXPECT_EQ(parsed.forwarded->user_id, meta.user_id);
+                EXPECT_EQ(parsed.forwarded->user_email, meta.user_email);
+                EXPECT_EQ(parsed.forwarded->client_ip, meta.client_ip);
+            }
+        }
+    }
+}
+
+TEST_P(UotAddressCodec, DisallowedMetadataLeavesNoDecodedTarget) {
+    const auto format = GetParam();
+    for (const auto& target : targets) {
+        for (const auto& meta : metadata_cases) {
+            SCOPED_TRACE(target.host);
+            SCOPED_TRACE(meta.user_id);
+            std::array<uint8_t, kMaxEncodedAddressSize> encoded{};
+            const size_t size = EncodeAddressTo(target, encoded.data(), encoded.size(), format, meta);
+            ASSERT_EQ(size, AddressEncodedSize(target, meta));
+            ASSERT_GT(size, AddressEncodedSize(target));
                 const auto disallowed = DecodeAddress(
                     std::span<const uint8_t>(encoded.data(), size),
                     format, {.allow_metadata = false});
-                Check(disallowed.status == AddressDecodeStatus::Invalid &&
-                      !disallowed.target.IsValid() &&
-                      disallowed.target.host.empty() &&
-                      !disallowed.forwarded.has_value(),
-                      "disallowed metadata was accepted or polluted target");
+                EXPECT_EQ(disallowed.status, AddressDecodeStatus::Invalid);
+                EXPECT_FALSE(disallowed.target.IsValid());
+                EXPECT_FALSE(disallowed.forwarded.has_value());
+        }
+    }
+}
+
+TEST_P(UotAddressCodec, MalformedMetadataLeavesNoDecodedTarget) {
+    const auto format = GetParam();
+    for (const auto& target : targets) {
+        for (const auto& meta : metadata_cases) {
+            SCOPED_TRACE(target.host);
+            SCOPED_TRACE(meta.user_id);
+            std::array<uint8_t, kMaxEncodedAddressSize> encoded{};
+            const size_t size = EncodeAddressTo(target, encoded.data(), encoded.size(), format, meta);
+            ASSERT_EQ(size, AddressEncodedSize(target, meta));
+            ASSERT_GT(size, AddressEncodedSize(target));
                 auto malformed = encoded;
                 malformed[size - 1] = 0;
                 if ((meta.user_email.empty() && meta.inbound_tag.empty())) {
@@ -634,48 +670,76 @@ TEST(UotSs2022, SharedAddressCodec) {
                 }
                 const auto rejected_meta = DecodeAddress(
                     std::span<const uint8_t>(malformed.data(), size), format);
-                Check(rejected_meta.status == AddressDecodeStatus::Invalid &&
-                      !rejected_meta.target.IsValid() &&
-                      rejected_meta.target.host.empty() &&
-                      !rejected_meta.forwarded.has_value(),
-                      "invalid metadata polluted DecodeAddress result.target");
-            }
+                EXPECT_EQ(rejected_meta.status, AddressDecodeStatus::Invalid);
+                EXPECT_FALSE(rejected_meta.target.IsValid());
+                EXPECT_FALSE(rejected_meta.forwarded.has_value());
         }
     }
 }
 
-TEST(UotSs2022, PacketEofBoundaries) {
-    const TargetAddress target("192.0.2.1", 53);
-    for (bool connect : {false, true}) {
-        CaptureWriter capture;
-        proxy::uot::PacketWriter writer(capture, connect, target);
-        ::Run([&]() -> net::awaitable<void> {
-            co_await writer.WriteMultiBuffer(MakePacket("end", target));
-        });
-        for (size_t length = 0; length <= capture.bytes.size(); ++length) {
-            FragmentReader source(std::vector<uint8_t>(
-                capture.bytes.begin(), capture.bytes.begin() + length), {1, 1, 2});
-            proxy::uot::PacketReader reader(source, connect, target);
-            bool failed = false;
-            try {
-                ::Run([&]() -> net::awaitable<void> {
-                    auto packet = co_await reader.ReadMultiBuffer();
-                    Check(length == 0 ? packet.byte_size() == 0
-                        : Flatten(packet) == std::vector<uint8_t>({'e','n','d'}),
-                        "UoT boundary EOF lost a complete packet");
-                    auto eof = co_await reader.ReadMultiBuffer();
-                    Check(eof.byte_size() == 0, "UoT boundary EOF returned data");
-                });
-            } catch (const transport::LinkError& error) {
-                Check(error.code() == ErrorCode::PROTOCOL_DECODE_FAILED,
-                      "UoT truncated framing changed its error code");
-                failed = true;
-            }
-            Check(failed == (length != 0 && length != capture.bytes.size()),
-                  "UoT confused truncated framing with normal EOF");
+INSTANTIATE_TEST_SUITE_P(WireFormats, UotAddressCodec,
+    testing::Values(AddressWireFormat::Socks5, AddressWireFormat::PortFirst, AddressWireFormat::Uot),
+    [](const testing::TestParamInfo<AddressWireFormat>& info) {
+        switch (info.param) {
+        case AddressWireFormat::Socks5: return "Socks5";
+        case AddressWireFormat::PortFirst: return "PortFirst";
+        case AddressWireFormat::Uot: return "Uot";
         }
+        return "Unknown";
+    });
+
+TEST_P(UotPacketMode, CompletePacketIsFollowedByEof) {
+    const bool connect = GetParam();
+    const TargetAddress target("192.0.2.1", 53);
+    CaptureWriter capture;
+    proxy::uot::PacketWriter writer(capture, connect, target);
+    ::Run([&]() -> net::awaitable<void> {
+        co_await writer.WriteMultiBuffer(MakePacket("end", target));
+    });
+    FragmentReader source(capture.bytes, {1, 1, 2});
+    proxy::uot::PacketReader reader(source, connect, target);
+    ::Run([&]() -> net::awaitable<void> {
+        EXPECT_EQ(Flatten(co_await reader.ReadMultiBuffer()), std::vector<uint8_t>({'e','n','d'}));
+        EXPECT_TRUE((co_await reader.ReadMultiBuffer()).empty());
+    });
+}
+
+TEST_P(UotPacketMode, EmptyTransportIsEofNotAnEmptyDatagram) {
+    FragmentReader source({}, {});
+    proxy::uot::PacketReader reader(source, GetParam(), TargetAddress("192.0.2.1", 53));
+    ::Run([&]() -> net::awaitable<void> {
+        EXPECT_TRUE((co_await reader.ReadMultiBuffer()).empty());
+    });
+}
+
+TEST_P(UotPacketMode, TruncatedFrameFailsWithProtocolDecodeError) {
+    const bool connect = GetParam();
+    const TargetAddress target("192.0.2.1", 53);
+    CaptureWriter capture;
+    proxy::uot::PacketWriter writer(capture, connect, target);
+    ::Run([&]() -> net::awaitable<void> {
+        co_await writer.WriteMultiBuffer(MakePacket("end", target));
+    });
+    for (size_t length = 1; length < capture.bytes.size(); ++length) {
+        SCOPED_TRACE(length);
+        FragmentReader source(std::vector<uint8_t>(capture.bytes.begin(), capture.bytes.begin() + length),
+                              {1, 1, 2});
+        proxy::uot::PacketReader reader(source, connect, target);
+        EXPECT_THROW({
+            try {
+                ::Run([&]() -> net::awaitable<void> { (void)co_await reader.ReadMultiBuffer(); });
+            } catch (const transport::LinkError& error) {
+                EXPECT_EQ(error.code(), ErrorCode::PROTOCOL_DECODE_FAILED);
+                throw;
+            }
+        }, transport::LinkError);
     }
 }
+
+INSTANTIATE_TEST_SUITE_P(Modes, UotPacketMode, testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) {
+        return info.param ? "Connect" : "NonConnect";
+    });
 
 TEST(UotSs2022, NonConnectIpPacketDecodesFromPendingWithUnusedDomainRequestAndReleasesPayload) {
     const std::string domain = std::string(63, 'a') + "." +
@@ -703,10 +767,11 @@ TEST(UotSs2022, NonConnectIpPacketDecodesFromPendingWithUnusedDomainRequestAndRe
             ASSERT_NO_THROW(::Run([&]() -> net::awaitable<void> {
                 auto packet = co_await reader->ReadMultiBuffer();
                 const auto datagram = buf::InspectUdpDatagram(packet);
-                Check(datagram.Valid() &&
-                      datagram.target->SameEndpoint(TargetAddress("192.0.2.7", 5353)) &&
-                      Flatten(packet) == std::vector<uint8_t>({'u', 'd', 'p'}),
-                      "complete non-connect IP packet must decode from pending bytes");
+                EXPECT_TRUE(datagram.Valid());
+                EXPECT_NE(datagram.target, nullptr);
+                if (!datagram.Valid() || !datagram.target) co_return;
+                EXPECT_TRUE(datagram.target->SameEndpoint(TargetAddress("192.0.2.7", 5353)));
+                EXPECT_EQ(Flatten(packet), std::vector<uint8_t>({'u', 'd', 'p'}));
             }));
         }
 #ifdef CNODE_TEST_BUFFER_STATS

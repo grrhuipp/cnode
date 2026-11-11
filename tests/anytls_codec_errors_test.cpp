@@ -6,15 +6,15 @@
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>
 #include <array>
-#include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <tuple>
 #include <cstring>
 #include <stdexcept>
 #include <limits>
 
 namespace {
 enum class Fault { None, Memory, Link, Cancelled, Timeout, Reset, Unexpected, NonStandard };
-constexpr std::array names{"none", "memory", "link", "cancelled", "timeout", "reset", "unexpected", "non-standard"};
 
 [[noreturn]] void Raise(Fault fault) {
     switch (fault) {
@@ -122,50 +122,48 @@ net::awaitable<ErrorCode> Invoke(Stream& stream, int operation) {
     }
 }
 
-bool RunFrameBatch() {
+TEST(AnytlsCodecErrors, FrameBatchReencodesAfterGrowthAndShrink) {
     anytls::FrameBatch batch;
     for (size_t count : {size_t(1), size_t(9), size_t(1), size_t(0)}) {
+        SCOPED_TRACE(count);
         auto payload = Payload(count);
-        if (!batch.Encode(2, 1, payload)) return false;
+        ASSERT_TRUE(batch.Encode(2, 1, payload));
         const auto buffers = batch.Buffers();
-        if (buffers.size() != count * 2) return false;
+        ASSERT_EQ(buffers.size(), count * 2);
         size_t index = 0;
         for (const auto* block : payload) {
             const auto& header = buffers[index * 2];
             const auto& body = buffers[index * 2 + 1];
-            const auto* bytes = static_cast<const uint8_t*>(header.data());
-            if (header.size() != 7 || bytes[0] != 2 || bytes[1] != 0 ||
-                bytes[2] != 0 || bytes[3] != 0 || bytes[4] != 1 ||
-                bytes[5] != 0 || bytes[6] != 1 || body.size() != 1 ||
-                body.data() != block->Bytes().data()) return false;
+            ASSERT_EQ(header.size(), 7);
+            const std::array<uint8_t, 7> expected{2, 0, 0, 0, 1, 0, 1};
+            EXPECT_EQ(std::memcmp(header.data(), expected.data(), expected.size()), 0);
+            ASSERT_EQ(body.size(), 1);
+            EXPECT_EQ(*static_cast<const uint8_t*>(body.data()), block->Bytes()[0]);
             ++index;
         }
     }
-    return true;
 }
 
-bool RunDeferredBatch() {
+TEST(AnytlsCodecErrors, DeferredBatchOwnsPayloadUntilAwaited) {
     net::io_context io;
     Stream stream;
     auto pending = anytls::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1));
-    const bool idle_before_await = stream.transferred == 0;
+    EXPECT_EQ(stream.transferred, 0);
     bool returned = false;
     ErrorCode code = ErrorCode::INTERNAL;
     net::co_spawn(io, std::move(pending), [&](std::exception_ptr error, tl::expected<void, ErrorCode> result) {
         returned = error == nullptr;
         code = Result(result);
     });
-    const bool idle_before_run = stream.transferred == 0;
+    EXPECT_EQ(stream.transferred, 0);
     io.run();
-    const bool passed = idle_before_await && idle_before_run && returned &&
-        code == ErrorCode::OK && stream.transferred == anytls::kFrameHeaderSize + 1 && memory::detail::test_buffers_live == 0;
-    if (!passed) std::printf("deferred batch: FAIL (idle=%d/%d returned=%s code=%s transferred=%zu)\n",
-        idle_before_await, idle_before_run, returned ? "true" : "false",
-        ErrorCodeToString(code).data(), stream.transferred);
-    return passed;
+    EXPECT_TRUE(returned);
+    EXPECT_EQ(code, ErrorCode::OK);
+    EXPECT_EQ(stream.transferred, anytls::kFrameHeaderSize + 1);
+    EXPECT_EQ(memory::detail::test_buffers_live, 0);
 }
 
-bool Run(int operation, Fault fault, size_t threshold) {
+void ExerciseOperation(int operation, Fault fault, size_t threshold) {
     net::io_context io;
     Stream stream;
     stream.fault = fault;
@@ -193,33 +191,59 @@ bool Run(int operation, Fault fault, size_t threshold) {
         : fault == Fault::Reset ? (read ? ErrorCode::SOCKET_READ_FAILED : ErrorCode::SOCKET_CLOSED)
         : read && fault == Fault::Memory ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::OK;
     const bool exceptional = (!read && fault == Fault::Memory) || fault == Fault::Link || fault == Fault::Unexpected || fault == Fault::NonStandard;
-    bool passed = returned && !stream.closed && (exceptional ? observed == fault : observed == Fault::None && code == expected);
-    passed &= fault == Fault::None || (stream.failures == 1 && stream.transferred == threshold);
-    passed &= memory::detail::test_buffers_live == 0;
-    if (!passed) std::printf("op=%d fault=%s after=%zu returned=%s observed=%s: FAIL\n",
-        operation, names[int(fault)], threshold, ErrorCodeToString(code).data(), names[int(observed)]);
-    return passed;
+    ASSERT_TRUE(returned);
+    EXPECT_FALSE(stream.closed);
+    if (exceptional) {
+        EXPECT_EQ(observed, fault);
+    } else {
+        EXPECT_EQ(observed, Fault::None);
+        EXPECT_EQ(code, expected);
+    }
+    if (fault != Fault::None) {
+        EXPECT_EQ(stream.failures, 1);
+        EXPECT_EQ(stream.transferred, threshold);
+    }
+    EXPECT_EQ(memory::detail::test_buffers_live, 0);
 }
 }
 
-TEST(AnytlsCodecErrors, Contract) {
-    size_t passed = 0, total = 0;
-    passed += RunFrameBatch(); ++total;
-    passed += RunDeferredBatch(); ++total;
-    for (int operation = 0; operation < 18; ++operation) {
-        passed += ::Run(operation, Fault::None, 0); ++total;
-        for (int fault = 1; fault < 8; ++fault) {
-            for (size_t threshold : {size_t(0), size_t(3)}) {
-                passed += ::Run(operation, Fault(fault), threshold); ++total;
-            }
-        }
-    }
-    for (int fault = 1; fault < 8; ++fault) {
-        passed += ::Run(16, Fault(fault), 65536); ++total;
-    }
-    std::printf("codec cases=%zu passed=%zu failed=%zu released=%d\n", total, passed, total - passed, memory::detail::test_buffers_live == 0);
-    { ASSERT_TRUE(passed == total); return; }
+class AnytlsCodecOperation : public testing::TestWithParam<int> {};
+
+TEST_P(AnytlsCodecOperation, CompletesAndReleasesPayload) {
+    ExerciseOperation(GetParam(), Fault::None, 0);
 }
+
+
+constexpr std::array operation_names{
+    "ReadHeader", "ReadText", "DiscardPayload", "ReadPayload", "WriteAll",
+    "WriteFrame", "WriteOwnedFrame", "WriteSingleBatch", "WriteLargeBatch",
+    "WritePaddedBatch", "WriteSingleBuffer", "WriteBuffers", "WritePaddedBuffers",
+    "WritePaddedPacket", "WritePacket", "WriteUnpaddedBatch", "WriteLargePadding",
+    "WriteSplitPadding"};
+INSTANTIATE_TEST_SUITE_P(Operations, AnytlsCodecOperation, testing::Range(0, 18),
+    [](const testing::TestParamInfo<int>& info) { return operation_names[info.param]; });
+
+class AnytlsCodecFault : public testing::TestWithParam<std::tuple<int, int, size_t>> {};
+
+TEST_P(AnytlsCodecFault, PreservesFailureAndReleasesPayload) {
+    const auto [operation, fault, threshold] = GetParam();
+    ExerciseOperation(operation, Fault(fault), threshold);
+}
+
+INSTANTIATE_TEST_SUITE_P(IoBoundaries, AnytlsCodecFault, testing::Combine(
+    testing::Range(0, 18), testing::Range(1, 8), testing::Values(size_t{0}, size_t{3})),
+    ([](const testing::TestParamInfo<AnytlsCodecFault::ParamType>& info) {
+        const auto [operation, fault, threshold] = info.param;
+        return std::string(operation_names[operation]) + "Fault" + std::to_string(fault) +
+            "After" + std::to_string(threshold);
+    }));
+
+class AnytlsLargePaddingFault : public testing::TestWithParam<int> {};
+
+TEST_P(AnytlsLargePaddingFault, ReleasesPayloadAfterPartialWrite) {
+    ExerciseOperation(16, Fault(GetParam()), 65536);
+}
+INSTANTIATE_TEST_SUITE_P(Faults, AnytlsLargePaddingFault, testing::Range(1, 8));
 
 TEST(AnytlsCodecErrors, HandshakeEofDistinguishesCloseFromTruncation) {
     for (size_t prefix = 0; prefix < anytls::kFrameHeaderSize; ++prefix) {
@@ -227,13 +251,17 @@ TEST(AnytlsCodecErrors, HandshakeEofDistinguishesCloseFromTruncation) {
         Stream stream;
         stream.eof_after = prefix;
         ErrorCode result = ErrorCode::INTERNAL;
+        std::exception_ptr failure;
+        bool has_header = true;
         net::co_spawn(io, anytls::ReadFrameHeader(stream),
-            [&](std::exception_ptr failure, tl::expected<anytls::FrameHeader, ErrorCode> header) {
-                EXPECT_FALSE(failure);
-                ASSERT_FALSE(header);
-                result = header.error();
+            [&](std::exception_ptr error, tl::expected<anytls::FrameHeader, ErrorCode> header) {
+                failure = error;
+                has_header = header.has_value();
+                if (!header) result = header.error();
             });
         io.run();
+        ASSERT_FALSE(failure);
+        ASSERT_FALSE(has_header);
         EXPECT_EQ(result, prefix == 0 ? ErrorCode::SOCKET_EOF
                                      : ErrorCode::PROTOCOL_DECODE_FAILED);
     }

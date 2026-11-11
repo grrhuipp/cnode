@@ -1,21 +1,15 @@
-#include "app/dns/dns.hpp"
 #include "app/proxyman/outbound/handler.hpp"
 #include "app/relay.hpp"
-#include "common/allocator.hpp"
-#include "common/ip_utils.hpp"
 #include "common/session.hpp"
 #include "common/target_address.hpp"
 #include "core/constants.hpp"
 #include "infra/log.hpp"
 #include "proxy/freedom/freedom_udp.hpp"
-#include "infra/config.hpp"
+#include "infra/outbound_types.hpp"
 #include "proxy/outbound.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
 
-#include <algorithm>
-#include <cctype>
 #include <chrono>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -23,14 +17,10 @@
 
 namespace proxy::freedom::outbound {
 
-struct FreedomSettings {
-    DomainStrategy domain_strategy = DomainStrategy::AsIs;
-    std::optional<TargetAddress> redirect;
-};
 
 class Handler final : public Outbound {
 public:
-    explicit Handler(const FreedomSettings& settings);
+    explicit Handler(const infra::FreedomSettings& settings);
 
     net::awaitable<OutboundProcessResult> Process(
         session::Context& ctx,
@@ -39,84 +29,40 @@ public:
         const TimeoutsConfig& timeouts,
         StatsShard& stats,
         const RelayConfig& relay_config,
-        buf::MultiBufferBatch first_payload,
-        std::chrono::seconds relay_idle_timeout,
-        std::chrono::seconds relay_write_timeout) override;
+        buf::MultiBufferBatch first_payload) override;
 
 private:
-    net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
-    DialTarget(OutboundDialer& dialer, session::Context& ctx);
-
     DomainStrategy domain_strategy_;
     std::optional<TargetAddress> redirect_target_;
 };
 
 namespace {
 
-std::optional<DomainStrategy> ParseConfiguredDomainStrategy(
-    const json::object& settings) {
-    const auto* value = settings.if_contains("domainStrategy");
-    if (!value) return DomainStrategy::AsIs;
-    if (!value->is_string()) return std::nullopt;
-    return ParseDomainStrategy(value->as_string());
-}
-
-bool AcceptsIPv4(DomainStrategy strategy) {
-    switch (strategy) {
-        case DomainStrategy::UseIPv6:
-        case DomainStrategy::ForceIPv6:
-            return false;
-        default:
-            return true;
-    }
-}
-
-bool AcceptsIPv6(DomainStrategy strategy) {
+OutboundDialer::AddressFamilyPolicy FamilyPolicy(DomainStrategy strategy) {
+    using Policy = OutboundDialer::AddressFamilyPolicy;
     switch (strategy) {
         case DomainStrategy::UseIPv4:
+            return Policy{.accepts_v6 = false};
         case DomainStrategy::ForceIPv4:
-            return false;
-        default:
-            return true;
-    }
-}
-
-bool PreferIPv6First(DomainStrategy strategy) {
-    switch (strategy) {
-        case DomainStrategy::UseIPv6v4:
-        case DomainStrategy::ForceIPv6v4:
-            return true;
-        default:
-            return false;
-    }
-}
-
-bool PreservesDnsOrder(DomainStrategy strategy) {
-    switch (strategy) {
-        case DomainStrategy::AsIs:
-        case DomainStrategy::UseIP:
-        case DomainStrategy::ForceIP:
-            return true;
-        default:
-            return false;
-    }
-}
-
-bool StrategyPrefersIPv6(DomainStrategy strategy) {
-    switch (strategy) {
+            return Policy{.accepts_v6 = false, .restricts_literals = true};
         case DomainStrategy::UseIPv6:
+            return Policy{.accepts_v4 = false, .prefers_v6 = true};
         case DomainStrategy::ForceIPv6:
+            return Policy{.accepts_v4 = false, .prefers_v6 = true, .restricts_literals = true};
         case DomainStrategy::UseIPv6v4:
         case DomainStrategy::ForceIPv6v4:
-            return true;
+            return Policy{.prefers_v6 = true, .preserves_dns_order = false};
+        case DomainStrategy::UseIPv4v6:
+        case DomainStrategy::ForceIPv4v6:
+            return Policy{.preserves_dns_order = false};
         default:
-            return false;
+            return Policy{};
     }
 }
 
 }  // namespace
 
-Handler::Handler(const FreedomSettings& settings)
+Handler::Handler(const infra::FreedomSettings& settings)
     : domain_strategy_(settings.domain_strategy)
     , redirect_target_(settings.redirect) {}
 
@@ -127,9 +73,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     const TimeoutsConfig& /*timeouts*/,
     StatsShard& stats,
     const RelayConfig& relay_config,
-    buf::MultiBufferBatch first_payload,
-    std::chrono::seconds relay_idle_timeout,
-    std::chrono::seconds relay_write_timeout) {
+    buf::MultiBufferBatch first_payload) {
     if (!inbound.Valid()) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
@@ -142,14 +86,12 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         if (auto opened = dialer.OpenDatagram(ctx, OutboundDialer::DatagramRemote{
                 .address = target.IsDomain() ? std::nullopt : target.resolved_addr,
                 .family_hint = target.IsDomain() ? target.resolved_addr : std::nullopt,
-                .accepts_v4 = AcceptsIPv4(domain_strategy_),
-                .accepts_v6 = AcceptsIPv6(domain_strategy_),
-                .prefers_v6 = StrategyPrefersIPv6(domain_strategy_),
+                .family_policy = FamilyPolicy(domain_strategy_),
             }, endpoint); !opened) {
             co_return tl::unexpected(opened.error());
         }
-        endpoint->SetIdleTimeout(relay_idle_timeout);
-        endpoint->SetWriteTimeout(relay_write_timeout);
+        endpoint->SetIdleTimeout(relay_config.idle_timeout);
+        endpoint->SetWriteTimeout(relay_config.write_timeout);
         co_return co_await DoRelayLink(dialer.IoContext(), *inbound.reader, *inbound.writer,
             inbound.control, *endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
@@ -161,105 +103,25 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         ctx.outbound.target = *redirect_target_;
     }
 
-    auto dialed = co_await DialTarget(dialer, ctx);
+    auto dialed = co_await dialer.Dial(ctx, ctx.outbound.target, FamilyPolicy(domain_strategy_));
     if (!dialed) {
         co_return tl::unexpected(dialed.error());
     }
     auto stream = std::move(*dialed);
-    stream->SetIdleTimeout(relay_idle_timeout);
+    stream->SetIdleTimeout(relay_config.idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
-    stream->SetWriteTimeout(relay_write_timeout);
+    stream->SetWriteTimeout(relay_config.write_timeout);
     co_return co_await DoRelayLink(
         dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
         *stream, ctx, stats, relay_config, std::move(first_payload));
 }
 
-net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
-Handler::DialTarget(OutboundDialer& dialer, session::Context& ctx) {
-    const auto& target = ctx.outbound.target;
-    if (!target.IsValid()) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-    }
-
-    if (!target.IsDomain()) {
-        if (!target.resolved_addr) {
-            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-        }
-        if ((domain_strategy_ == DomainStrategy::ForceIPv4 ||
-             domain_strategy_ == DomainStrategy::ForceIPv6) &&
-            !(target.resolved_addr->is_v6()
-                ? AcceptsIPv6(domain_strategy_)
-                : AcceptsIPv4(domain_strategy_))) {
-            co_return tl::unexpected(ErrorCode::DNS_NO_RECORD);
-        }
-        const net::ip::address address = *target.resolved_addr;
-        co_return co_await dialer.Dial(
-            ctx, std::span<const net::ip::address>(&address, 1), target.port);
-    }
-
-    LOG_CONN_DEBUG(ctx, "resolving target {}", target);
-    auto dns_result = co_await dialer.Dns().Resolve(target.host);
-    if (!dns_result.Ok()) {
-        co_return tl::unexpected(ErrorCode::DNS_RESOLVE_FAILED);
-    }
-    if (dns_result.addresses.empty()) {
-        co_return tl::unexpected(ErrorCode::DNS_NO_RECORD);
-    }
-
-    // 保序且两族都接受时过滤是恒等变换：直接借用解析结果，dns_result 存活至拨号结束。
-    if (PreservesDnsOrder(domain_strategy_) &&
-        AcceptsIPv4(domain_strategy_) && AcceptsIPv6(domain_strategy_)) {
-        co_return co_await dialer.Dial(
-            ctx, std::span<const net::ip::address>(dns_result.addresses), target.port);
-    }
-
-    memory::Vector<net::ip::address> addresses;
-    addresses.reserve(dns_result.addresses.size());
-
-    auto append_family = [&](const bool want_v6) {
-        for (const auto& dns_addr : dns_result.addresses) {
-            if (want_v6 ? dns_addr.is_v6() : dns_addr.is_v4()) {
-                addresses.push_back(dns_addr);
-            }
-        }
-    };
-
-    if (PreservesDnsOrder(domain_strategy_)) {
-        for (const auto& dns_addr : dns_result.addresses) {
-            if ((dns_addr.is_v4() && AcceptsIPv4(domain_strategy_)) ||
-                (dns_addr.is_v6() && AcceptsIPv6(domain_strategy_))) {
-                addresses.push_back(dns_addr);
-            }
-        }
-    } else if (PreferIPv6First(domain_strategy_)) {
-        if (AcceptsIPv6(domain_strategy_)) {
-            append_family(true);
-        }
-        if (AcceptsIPv4(domain_strategy_)) {
-            append_family(false);
-        }
-    } else {
-        if (AcceptsIPv4(domain_strategy_)) {
-            append_family(false);
-        }
-        if (AcceptsIPv6(domain_strategy_)) {
-            append_family(true);
-        }
-    }
-
-    if (addresses.empty()) {
-        co_return tl::unexpected(ErrorCode::DNS_NO_RECORD);
-    }
-    co_return co_await dialer.Dial(
-        ctx, std::span<const net::ip::address>(addresses.data(), addresses.size()),
-        target.port);
-}
 
 [[nodiscard]] proxyman::outbound::PreparedOutboundCreator
-PrepareOutbound(FreedomSettings settings) {
+PrepareOutbound(infra::FreedomSettings settings) {
     return proxyman::outbound::MakePreparedOutboundCreator<
-        FreedomSettings,
-        +[](std::string_view, std::shared_ptr<const FreedomSettings> config,
+        infra::FreedomSettings,
+        +[](std::string_view, std::shared_ptr<const infra::FreedomSettings> config,
             net::io_context&, AwaitableTaskGroup&) -> std::unique_ptr<Outbound> {
             return std::make_unique<Handler>(*config);
         }>(std::move(settings));
@@ -274,41 +136,14 @@ const bool kFreedomRegistered = (::proxyman::outbound::RegisterProxy(
     ::constants::protocol::kFreedom,
     [](const ::infra::OutboundSourceConfig& cfg)
         -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
-        const auto& s = cfg.settings;
-        ::proxy::freedom::outbound::FreedomSettings settings;
-        // Freedom keeps the default raw TCP stream; its sendThrough defaults
-        // to same-in-same-out. A top-level sendThrough overrides this nested one.
-        ::OutboundSenderSettings sender{.stream_settings = {},
-                                            .send_through = ::OutboundBind::Auto()};
-
-        try {
-            if (auto bind = ::infra::ParseOptionalOutboundBind(s, "freedom")) {
-                sender.send_through = std::move(*bind);
-            }
-        } catch (const std::invalid_argument&) {
-            return std::nullopt;
-        }
-        const auto domain_strategy =
-            ::proxy::freedom::outbound::ParseConfiguredDomainStrategy(s);
-        if (!domain_strategy) {
-            return std::nullopt;
-        }
-        settings.domain_strategy = *domain_strategy;
-        // 空字符串与缺省同义（Xray 示例配置写法），其他值必须是合法的 host:port。
-        if (const auto* v = s.if_contains("redirect");
-            v && !(v->is_string() && v->as_string().empty())) {
-            auto redirect = v->is_string()
-                ? ::TargetAddress::Parse(v->as_string())
-                : std::nullopt;
-            if (!redirect || !redirect->IsValid()) {
-                LOG_ERROR("freedom outbound '{}': redirect must be a valid host:port", cfg.tag);
-                return std::nullopt;
-            }
-            settings.redirect = std::move(*redirect);
-        }
-
+        const auto* settings = std::get_if<::infra::FreedomSettings>(&cfg.settings);
+        if (!settings) return std::nullopt;
+        ::OutboundSenderSettings sender{
+            .stream_settings = {},
+            .send_through = ::OutboundBind::Auto(),
+        };
         return ::proxyman::outbound::PreparedOutboundProxy{
-            .create = ::proxy::freedom::outbound::PrepareOutbound(std::move(settings)),
+            .create = ::proxy::freedom::outbound::PrepareOutbound(*settings),
             .sender = std::move(sender),
         };
     }), true);
