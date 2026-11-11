@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "transport/link.hpp"
 
 #include <array>
@@ -9,14 +10,13 @@
 #include <optional>
 #include <type_traits>
 
-namespace { bool reject_allocations = false; }
-void* operator new(std::size_t size) {
+namespace {
+bool reject_allocations = false;
+void RejectWhenRequested(std::size_t) {
     if (reject_allocations) throw std::bad_alloc();
-    if (void* value = std::malloc(size ? size : 1)) return value;
-    throw std::bad_alloc();
 }
-void operator delete(void* value) noexcept { std::free(value); }
-void operator delete(void* value, std::size_t) noexcept { std::free(value); }
+}
+constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = RejectWhenRequested};
 
 using ::ErrorCode;
 using ::transport::CancellationSource;

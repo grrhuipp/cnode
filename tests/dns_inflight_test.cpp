@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "app/dns/dns.hpp"
 #include "app/worker_mailbox.hpp"
 #include "common/allocator.hpp"
@@ -557,19 +558,18 @@ void TestDNSWorkerCrossExecutorStop() {
     }
 }
 
-}  // namespace
-
-void* operator new(std::size_t size) {
+void FailSize(std::size_t size) {
     if (fail_size && size == fail_size) {
         fail_size = 0;
         ++injected_failures;
         throw std::bad_alloc();
     }
-    if (void* pointer = std::malloc(size ? size : 1)) return pointer;
-    throw std::bad_alloc();
 }
-void operator delete(void* pointer) noexcept { std::free(pointer); }
-void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
+
+}  // namespace
+
+constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = FailSize};
+
 TEST(DnsInflight, Contract) {
     bool passed = true;
     try {

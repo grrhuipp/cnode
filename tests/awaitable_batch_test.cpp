@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "common/awaitable_batch.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -270,18 +271,16 @@ void TestExecutorOwnership() {
     }
 }
 
-}  // namespace
-
-void* operator new(std::size_t size) {
+void FailAfterCount(std::size_t) {
     if (fail_after >= 0 && fail_after-- == 0) {
         ++injected_failures;
         throw std::bad_alloc();
     }
-    if (void* pointer = std::malloc(size ? size : 1)) return pointer;
-    throw std::bad_alloc();
 }
-void operator delete(void* pointer) noexcept { std::free(pointer); }
-void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
+
+}  // namespace
+
+constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = FailAfterCount};
 
 TEST(AwaitableBatch, Contract) {
     try {

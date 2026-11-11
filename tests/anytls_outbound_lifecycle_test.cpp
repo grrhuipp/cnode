@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "anytls_codec.hpp"
 #include "app/relay.hpp"
 #include "app/dns/dns.hpp"
@@ -51,13 +52,8 @@ size_t AllocationFailures() {
     return operator_new_failures + memory::rejected_process_allocations;
 }
 static_assert(alignof(::buf::Buffer) <= alignof(std::max_align_t));
-}
-#if defined(__GNUC__) || defined(__clang__)
-#define CNODE_TEST_NOINLINE __attribute__((noinline))
-#else
-#define CNODE_TEST_NOINLINE
-#endif
-CNODE_TEST_NOINLINE void* operator new(std::size_t size) {
+
+void FailArmedAllocation(std::size_t size) {
     if (fail_next_allocation && memory::rejected_process_allocations != armed_process_rejections) {
         fail_next_allocation = false;
     }
@@ -65,15 +61,9 @@ CNODE_TEST_NOINLINE void* operator new(std::size_t size) {
         DisarmAllocationFailure();
         ++operator_new_failures; failed_allocation_size = size; throw std::bad_alloc();
     }
-    if (auto* result = std::malloc(size ? size : 1)) return result;
-    throw std::bad_alloc();
 }
-CNODE_TEST_NOINLINE void operator delete(void* value) noexcept { std::free(value); }
-CNODE_TEST_NOINLINE void operator delete(void* value, std::size_t) noexcept { ::operator delete(value); }
-CNODE_TEST_NOINLINE void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
-    try { return ::operator new(size); } catch (...) { return nullptr; }
 }
-CNODE_TEST_NOINLINE void operator delete(void* value, const std::nothrow_t&) noexcept { ::operator delete(value); }
+constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = FailArmedAllocation};
 
 namespace {
 using namespace std::chrono_literals;

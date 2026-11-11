@@ -1,9 +1,9 @@
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "transport/internet/stream_settings.hpp"
 
 #include <cstdio>
-#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <new>
@@ -12,25 +12,14 @@
 
 namespace {
 thread_local std::ptrdiff_t fail_after = -1;
-}
 
-void* operator new(std::size_t size) {
+void FailAfterCount(std::size_t) {
     if (fail_after == 0) throw std::bad_alloc();
     if (fail_after > 0) --fail_after;
-    if (void* memory = std::malloc(size ? size : 1)) return memory;
-    throw std::bad_alloc();
 }
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
-    try { return ::operator new(size); } catch (...) { return nullptr; }
 }
-void operator delete(void* memory, const std::nothrow_t&) noexcept {
-    ::operator delete(memory);
-}
-void* operator new[](std::size_t size) { return ::operator new(size); }
-void operator delete(void* memory) noexcept { std::free(memory); }
-void operator delete[](void* memory) noexcept { std::free(memory); }
-void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
-void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
+
+constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = FailAfterCount};
 
 namespace {
 
