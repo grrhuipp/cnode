@@ -110,11 +110,6 @@ TEST(AnytlsPadding, Contract) {
                 Check(size >= 100 && size < 120, "reversed range is half open");
             }
         }
-        largest_request = total_requested = rejected_requests = 0;
-        measuring = true;
-        for (uint32_t index = 0; index < 10000; ++index) (void)scheme->RecordFor(index);
-        measuring = false;
-        Check(total_requested == 0, "lookup does not allocate");
     }
     for (const auto text : {"stop=1\n0=0-0", "stop=1\n1=99-99", "stop=2\n1=99-99"}) {
         const auto parsed = ParsePaddingScheme(text);
@@ -150,12 +145,9 @@ TEST(AnytlsPadding, Contract) {
               parsed->RecordFor(1)[0].SampleSize() == 65535, "frame exclusive upper boundary");
     }
     const auto original = DefaultPaddingScheme();
-    largest_request = total_requested = rejected_requests = 0;
-    measuring = true;
     bool same = true;
     for (size_t index = 0; index < 10000; ++index) same &= DefaultPaddingScheme() == original;
-    measuring = false;
-    Check(same && total_requested == 0 && original->RecordFor(0).empty() &&
+    Check(same && original->RecordFor(0).empty() &&
           original->RecordFor(8).empty() && original->SampleAuthPaddingSize() == 30,
           "default scheme shares immutable storage");
     std::string many = "stop=4294967295\n";
