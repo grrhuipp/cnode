@@ -535,14 +535,13 @@ void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer
     const ::udp::endpoint endpoint{::net::ip::address_v4::loopback(), 48234};
     Ingress ingress("directory-tombstone", std::make_unique<NativeInbound>(),
                     reclaimer, budget, io);
+    auto record = directory.Claim(key, configuration, policy);
     auto session = ingress.CreateClientSession(
         key.listener, key.client, io, {},
         {::net::ip::address_v4::loopback(), 48234},
-        owner, std::chrono::steady_clock::now(), 0s);
-    auto record = directory.Claim(key, configuration, policy);
+        owner, std::chrono::steady_clock::now(), 0s, record);
     if (!session || !record || !record->association->Check(31, 0, endpoint, ::InboundDatagramCheck::Commit))
         Fail("failed to prepare live directory association");
-    record->session = session;
     record->association->claimed = false;
     ingress.CleanupClientSessions(key.listener);
     if (!session->Closed() || record->session.expired())
@@ -550,6 +549,26 @@ void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer
     session.reset();
     if (!record->session.expired() || budget.GetUsage().associations != 0)
         Fail("directory kept a closed association alive");
+    const std::weak_ptr<Ingress::ClientSession> empty_session;
+    if (record->session.owner_before(empty_session) ||
+        empty_session.owner_before(record->session))
+        Fail("replay tombstone retained the closed session allocation");
+    auto previous = ingress.CreateClientSession(
+        key.listener, key.client, io, {}, endpoint, owner,
+        std::chrono::steady_clock::now(), 0s, record);
+    auto replacement = ingress.CreateClientSession(
+        key.listener, key.client, io, {}, endpoint, owner,
+        std::chrono::steady_clock::now(), 0s, record);
+    if (!previous || !replacement || !previous->Closed())
+        Fail("failed to replace a retained session owner");
+    previous.reset();
+    if (record->session.lock() != replacement)
+        Fail("old session destruction detached its live replacement");
+    ingress.CleanupClientSessions(key.listener);
+    replacement.reset();
+    if (record->session.owner_before(empty_session) ||
+        empty_session.owner_before(record->session))
+        Fail("replacement retained its closed session allocation");
     const std::weak_ptr<UdpHandoffRecord> tombstone = record;
     record.reset();
     configuration.reset();

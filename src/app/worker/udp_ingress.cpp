@@ -259,16 +259,23 @@ UdpIngress::ClientSession::ClientSession(
     udp::endpoint reply_endpoint,
     InboundDatagramOwner session_owner,
     UdpResourceBudget& budget,
-    UdpResourceBudget::AssociationLease association)
+    UdpResourceBudget::AssociationLease association,
+    std::shared_ptr<UdpHandoffRecord> record)
     : association_(std::move(association))
     , budget_(&budget)
     , reader_signal_(io_context, 1)
     , reply_(std::move(reply))
     , reply_endpoint_(std::move(reply_endpoint))
-    , session_owner_(std::move(session_owner)) {}
+    , session_owner_(std::move(session_owner))
+    , handoff_record_(std::move(record)) {}
 
 UdpIngress::ClientSession::~ClientSession() noexcept {
     Close();
+    // A replay tombstone needs the association, not the expired weak owner of
+    // this make_shared allocation. The implicit weak reference keeps the
+    // control block alive until this destructor returns.
+    if (handoff_record_ && handoff_record_->session.expired())
+        handoff_record_->session.reset();
 }
 
 transport::CancellationSource& UdpIngress::ClientSession::Cancellation() noexcept {
@@ -859,7 +866,7 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
         auto client_session = CreateClientSession(
             socket_key, client_session_key, datagram.io_context,
             std::move(reply), datagram.client_endpoint,
-            decoded->session_owner, now, datagram.environment.timeouts.IdleTimeout());
+            decoded->session_owner, now, datagram.environment.timeouts.IdleTimeout(), record);
         if (!client_session) return;
         packet_session = client_session;
         preparation_session = client_session;
@@ -868,9 +875,7 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
             client_session->Close();
             return;
         }
-        client_session->handoff_record_ = record;
         if (record) {
-            record->session = client_session;
             auto socket = udp_sockets_.find(socket_key);
             if (socket == udp_sockets_.end() ||
                 socket->second.socket.get() != datagram.sock) return;
@@ -1039,7 +1044,8 @@ UdpIngress::ClientSessionPtr UdpIngress::CreateClientSession(
     udp::endpoint reply_endpoint,
     InboundDatagramOwner session_owner,
     std::chrono::steady_clock::time_point last_active,
-    std::chrono::seconds idle_timeout) {
+    std::chrono::seconds idle_timeout,
+    std::shared_ptr<UdpHandoffRecord> record) {
     if (state_ != State::Running) return nullptr;
     if (client_key.owner.size == 0 || !client_key.owner.Same(session_owner)) return nullptr;
     auto association = budget_.AcquireAssociation();
@@ -1048,7 +1054,8 @@ UdpIngress::ClientSessionPtr UdpIngress::CreateClientSession(
         io_context,
         std::move(reply),
         std::move(reply_endpoint),
-        std::move(session_owner), budget_, std::move(association));
+        std::move(session_owner), budget_, std::move(association), record);
+    if (record) record->session = session;
     reclaimer_.ReserveRow();
     auto [sessions_it, group_inserted] = FindOrEmplaceStringKey(
         client_sessions_, socket_key);
