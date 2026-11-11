@@ -328,7 +328,9 @@ template <class T, class... Args>
 inline void ConfigureProcessAllocator() noexcept {
     DisableTransparentHugePages();
     mi_option_set(mi_option_allow_thp, 0);
-    mi_option_set(mi_option_purge_delay, 10);
+    // Empty pages stay committed for 1 s so bursty connection churn reuses them
+    // instead of decommitting and recommitting on every wave.
+    mi_option_set(mi_option_purge_delay, 1000);
 }
 
 // Forces this thread's process-layer mimalloc state to return empty pages now.
