@@ -42,7 +42,7 @@ void Settle(net::io_context& io) {
 
 ::StreamSettings XHttpSettings(::XHttpMode mode) {
     ::StreamSettings settings;
-    settings.network = "xhttp";
+    settings.network_mode = ::NetworkMode::XHttp;
     settings.xhttp.path = "/fixture";
     settings.xhttp.mode = mode;
     return ::NormalizeStreamSettings(settings);

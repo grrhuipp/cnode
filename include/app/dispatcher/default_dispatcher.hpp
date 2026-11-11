@@ -14,7 +14,7 @@
 
 namespace proxyman::outbound {
 class Handler;
-class HandlerLookup;
+class HandlerRegistry;
 }  // namespace proxyman::outbound
 
 namespace rule {
@@ -78,7 +78,7 @@ class DefaultDispatcher final : public routing::Dispatcher {
 public:
     DefaultDispatcher(
         const routing::Router& router,
-        proxyman::outbound::HandlerLookup& outbound_handlers,
+        const proxyman::outbound::HandlerRegistry& outbound_handlers,
         rule::DetectRulePolicy& request_policy,
         app::SessionTrackingState& session_tracking,
         app::dns::DNS& dns_service,
@@ -125,7 +125,7 @@ private:
         std::optional<detail::OutboundSelection> initial_selection);
 
     const routing::Router& router_;
-    proxyman::outbound::HandlerLookup& outbound_handlers_;
+    const proxyman::outbound::HandlerRegistry& outbound_handlers_;
     rule::DetectRulePolicy& request_policy_;
     app::SessionTrackingState& session_tracking_;
     app::dns::DNS& dns_service_;

@@ -16,6 +16,7 @@
 #include "common/buf/multi_buffer.hpp"
 #include "common/error.hpp"
 #include "common/target_address.hpp"
+#include "proxy/udp_datagram_frame.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/link.hpp"
 #include <openssl/aes.h>
@@ -29,6 +30,7 @@
 #include <span>
 #include <string_view>
 #include <utility>
+#include <variant>
 
 namespace vmess {
 
@@ -45,25 +47,12 @@ FindByAuthIDForTag(std::string_view tag,
     const std::array<uint8_t, 16>& body_key,
     const std::array<uint8_t, 16>& body_iv);
 
+// VMess UDP 会话的目标在请求头里固定；每份数据报封为一个认证 chunk，
+// 空 body 保留给 EOF，所以空数据报不可编码（NOT_SUPPORTED）。
 inline void ValidateFixedUdpDatagram(const buf::MultiBuffer& payload,
                                      const TargetAddress& fixed_target) {
-    const auto datagram = buf::InspectUdpDatagram(payload);
-    if (datagram.status == buf::UdpDatagramStatus::Empty) {
-        return;
-    }
-    if (!datagram.Valid() || !datagram.target ||
-        !datagram.target->IsValid()) {
-        throw IoSystemError(
-            io_error::invalid_argument,
-            "VMess UDP datagram contains missing or mixed endpoints");
-    }
-    if (!datagram.target->SameEndpoint(fixed_target)) {
-        throw IoSystemError(
-            io_error::invalid_argument,
-            "VMess UDP datagram target differs from the fixed session target");
-    }
-    // VMess reserves an empty authenticated body for end-of-stream.
-    if (datagram.payload_size == 0) {
+    const auto datagram = proxy::RequireUdpDatagram(payload, &fixed_target);
+    if (datagram && datagram->payload_size == 0) {
         throw transport::LinkError(ErrorCode::NOT_SUPPORTED);
     }
 }
@@ -85,6 +74,23 @@ struct BodyKey {
 // key/IV, as in Xray-core.
 [[nodiscard]] BodyKey ResponseBodyKey(const BodyKey& request);
 
+// AEAD 请求头线上布局：AuthID ‖ 密封长度(2 + tag) ‖ 连接 nonce ‖ 密封头(明文 + tag)。
+inline constexpr size_t kAuthIdSize = 16;
+inline constexpr size_t kConnectionNonceSize = 8;
+inline constexpr size_t kSealedHeaderLengthSize = 2 + GCM_TAG_SIZE;
+inline constexpr size_t kConnectionNonceOffset = kAuthIdSize + kSealedHeaderLengthSize;
+inline constexpr size_t kRequestHeaderPrefixSize = kConnectionNonceOffset + kConnectionNonceSize;
+// 明文请求头的定长部分：版本、body IV、body key、响应认证字节、选项、
+// padding 长度/security、保留字节、命令。
+inline constexpr size_t kRequestHeaderFixedSize = 1 + 16 + 16 + 1 + 1 + 1 + 1 + 1;
+inline constexpr size_t kRequestHeaderChecksumSize = 4;
+// padding 长度占 security 字节的高半字节。
+inline constexpr size_t kMaxRequestHeaderPaddingSize = 0x0F;
+inline constexpr size_t kMaxRequestHeaderPlainSize = kRequestHeaderFixedSize +
+    kMaxEncodedAddressSize + kMaxRequestHeaderPaddingSize + kRequestHeaderChecksumSize;
+inline constexpr size_t kMaxRequestHeaderWireSize =
+    kRequestHeaderPrefixSize + kMaxRequestHeaderPlainSize + GCM_TAG_SIZE;
+
 // Request header fields that select the body framing for both directions.
 struct BodyOptions {
     Security security = Security::AES_128_GCM;
@@ -100,8 +106,7 @@ class BodyChunkCipher {
 public:
     BodyChunkCipher(const BodyOptions& options,
                     const BodyKey& request_body,
-                    const BodyKey& direction_key,
-                    proxy::AeadDirection direction);
+                    const BodyKey& direction_key);
 
     [[nodiscard]] size_t Overhead() const { return payload_.Overhead(); }
     [[nodiscard]] size_t LengthSize() const { return length_ ? length_->Overhead() + 2 : 2; }
@@ -137,7 +142,8 @@ public:
     // Stream mode splits payload into chunks that fit one fixed-size Buffer;
     // packet mode seals the whole datagram as exactly one chunk, rejecting
     // empty UDP with NOT_SUPPORTED because an empty body is the EOF marker.
-    // Input/output must be distinct; input rejection does not advance framing.
+    // LinkError input rejection leaves output, nonce and mask unchanged:
+    // INVALID_ARGUMENT for alias/null input; PROTOCOL_ENCODE_FAILED for oversize.
     void Encode(const buf::MultiBuffer& payload, buf::MultiBuffer& out);
     void Encode(std::span<const net::const_buffer> payload, buf::MultiBuffer& out);
     // Zero-length chunk ending this direction; repeated EOF emits no bytes.
@@ -191,7 +197,7 @@ private:
     enum class State { Active, Finished, Failed };
 
     void EncodeStream(std::span<const uint8_t> bytes, buf::MultiBuffer& out);
-    void EncodePacket(std::span<const uint8_t> bytes, buf::MultiBuffer& out);
+    void ValidatePacketSize(size_t size) const;
     void EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& out);
     // Seals one chunk (length, ciphertext, random padding) into dst; returns its wire size.
     size_t SealChunkTo(std::span<const uint8_t> bytes,
@@ -231,7 +237,7 @@ public:
 private:
     enum class State { Active, Finished, Failed };
 
-    [[nodiscard]] bool TryConsumePending(std::span<uint8_t> out, size_t& filled) noexcept;
+
     net::awaitable<buf::MultiBuffer> ReadChunk(transport::MultiBufferReader& src);
     [[noreturn]] void Fail(const char* what);
     void FinishRecord() noexcept;
@@ -302,16 +308,17 @@ private:
     BodyEncoder request_encoder_;
     BodyDecoder response_decoder_;
     // Response header progress survives a cancelled read.
-    std::array<uint8_t, 18> response_length_{};
+    std::array<uint8_t, kSealedHeaderLengthSize> response_length_{};
     size_t response_length_read_ = 0;
     memory::ByteVector response_header_sealed_;
     size_t response_header_read_ = 0;
     bool response_header_received_ = false;
 };
 
-inline constexpr size_t kResponseHeaderSize = 38;
-inline constexpr size_t kMaxRequestHeaderWireSize =
-    42 + 38 + kMaxEncodedAddressSize + 15 + 4 + 16;
+// 响应头：密封长度 ‖ 密封的 4 字节明文（响应认证字节、选项、命令、命令长度）。
+inline constexpr size_t kResponseHeaderPlainSize = 4;
+inline constexpr size_t kResponseHeaderSize =
+    kSealedHeaderLengthSize + kResponseHeaderPlainSize + GCM_TAG_SIZE;
 
 class RequestBodyReader final : public transport::MultiBufferReader {
 public:
@@ -386,36 +393,52 @@ private:
 
 class ServerSession final {
 public:
+    // AuthID 匹配到用户、整头尚未解出的进度。
+    struct Pending {
+        std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> user;
+        uint16_t header_length = 0;
+    };
+    // 头已通过 AEAD 认证但语义非法：身份可信，只用于计入该用户的拒绝日志。
+    // command/target 是解析到失败点为止的字段，可能不完整。
+    struct Rejected {
+        std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> user;
+        Command command = Command::TCP;
+        TargetAddress target;
+    };
+    // 认证与防重放都已通过，body 编解码只从这里取参数。
+    struct Accepted {
+        VMessRequest request;
+    };
+
     explicit ServerSession(std::string_view tag);
 
     // Re-submit the same growing prefix until complete. RequiredHeaderBytes()
     // is the next structured boundary; zero with no request is terminal failure.
     // This step authenticates/decrypts syntax only. The inbound handshake must
-    // await validator.RegisterSessionIfNew before accepting or dispatching it.
+    // await vmess::RegisterSessionIfNew before accepting or dispatching it.
     std::pair<std::optional<VMessRequest>, size_t> DecodeRequestHeader(
         const uint8_t* data,
         size_t len,
         uint64_t trace_conn_id = 0);
     [[nodiscard]] size_t RequiredHeaderBytes() const noexcept { return required_header_bytes_; }
     [[nodiscard]] std::string_view HeaderFailureReason() const noexcept { return header_failure_reason_; }
-    [[nodiscard]] const VMessRequest* AuthenticatedRejectedHeader() const noexcept {
-        return !request_set_ && request_.user ? &request_ : nullptr;
+    [[nodiscard]] const Rejected* AuthenticatedRejectedHeader() const noexcept {
+        return std::get_if<Rejected>(&state_);
     }
 
     void SetRequest(VMessRequest request);
 
-    std::optional<RequestBodyReader> DecodeRequestBody(
+    // 只能在 SetRequest 之后调用（否则 INTERNAL）；分配失败 → RESOURCE_EXHAUSTED，
+    // 其余构造异常属于系统故障，直接上抛。
+    tl::expected<RequestBodyReader, ErrorCode> DecodeRequestBody(
         AsyncStream& stream);
 
-    std::optional<ResponseBodyWriter> EncodeResponseBodyWithHeader(
+    tl::expected<ResponseBodyWriter, ErrorCode> EncodeResponseBodyWithHeader(
         AsyncStream& stream);
 private:
     std::string_view tag_;
-    VMessRequest request_;
-    bool request_set_ = false;
-    std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> header_user_;
-    size_t required_header_bytes_ = 42;
-    uint16_t header_length_ = 0;
+    std::variant<Pending, Rejected, Accepted> state_;
+    size_t required_header_bytes_ = kRequestHeaderPrefixSize;
     std::string_view header_failure_reason_;
 };
 

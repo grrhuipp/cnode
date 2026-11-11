@@ -34,7 +34,7 @@ template<class Scenario>
 bool RunFixture(const RateLimitConfig& config, Scenario scenario) {
     net::io_context io;
     auto coordinator = std::make_shared<GroupCoordinator>(io);
-    coordinator->RegisterWorker(0, io);
+    coordinator->RegisterWorker(io);
     auto limiter = ConnectionLimiter::Acquire(config, coordinator);
     bool result = false;
     bool finalized = false;
@@ -255,7 +255,7 @@ bool TestQuota(uint32_t limit, bool reject_ip, bool reverse) {
                 .stream_settings = {},
                 .dispatch_policy = {{}, routing::ForceOutbound{"direct"}},
                 .proxy_protocol = ProxyProtocolMode::Off};
-            receiver.stream_settings.network = "grpc";
+            receiver.stream_settings.network_mode = ::NetworkMode::Grpc;
             receiver.stream_settings = NormalizeStreamSettings(receiver.stream_settings);
             auto handler = std::make_shared<proxyman::inbound::Handler>(
                 std::move(receiver), std::make_unique<QuotaProxy>(test), limiter);
@@ -317,7 +317,7 @@ TEST(InboundProcessErrors, Contract) {
             .stream_settings = {},
             .dispatch_policy = {{}, routing::ForceOutbound{"direct"}},
             .proxy_protocol = ProxyProtocolMode::Off};
-        receiver.stream_settings.network = logical ? "grpc" : "tcp";
+        receiver.stream_settings.network_mode = logical ? ::NetworkMode::Grpc : ::NetworkMode::Tcp;
         receiver.stream_settings = NormalizeStreamSettings(receiver.stream_settings);
         auto handler = std::make_shared<proxyman::inbound::Handler>(
             std::move(receiver), std::make_unique<Proxy>(fault, codec), limiter);

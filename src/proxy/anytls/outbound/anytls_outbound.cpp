@@ -6,7 +6,7 @@
 #include "proxy/anytls_padding.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
 #include "proxy/outbound_stream_endpoint.hpp"
-#include "proxy/inbound_admission.hpp"
+#include "proxy/handshake_errors.hpp"
 #include "proxy/uot/uot.hpp"
 #include "transport/internet/async_write_gate.hpp"
 #include "app/dns/dns.hpp"
@@ -961,7 +961,8 @@ DialPhysicalSession(
     auto deadline = new_stream->StartPhaseDeadline(handshake_timeout);
 
     const uint16_t auth_padding_size = opening_scheme.SampleAuthPaddingSize();
-    const size_t auth_packet_size = 34 + static_cast<size_t>(auth_padding_size);
+
+    const size_t auth_packet_size = ::anytls::kAuthPrefixSize + static_cast<size_t>(auth_padding_size);
     std::array<uint8_t, 256> inline_auth{};
     memory::ByteVector heap_auth;
     ScopedCleanse cleanse_auth_packet{inline_auth, heap_auth};

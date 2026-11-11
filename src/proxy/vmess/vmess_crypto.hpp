@@ -23,7 +23,6 @@
 #include <optional>
 #include <span>
 #include <string_view>
-#include <variant>
 namespace vmess {
 
 // Wire values of the request header security nibble.
@@ -141,23 +140,6 @@ HeaderAeadKey ResponseHeaderPayloadKey(std::span<const uint8_t, 16> response_key
                                        std::span<const uint8_t, 16> response_iv);
 
 // ============================================================================
-// AES-128-GCM
-// ============================================================================
-
-bool AES128GCMDecryptTo(
-    const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
-    const uint8_t* ciphertext, size_t len,
-    const uint8_t* aad, size_t aad_len,
-    uint8_t* plaintext, size_t plaintext_capacity,
-    size_t& plaintext_len);
-
-bool AES128GCMEncrypt(
-    const uint8_t* key, const uint8_t* nonce,
-    const uint8_t* aad, size_t aad_len,
-    const uint8_t* plaintext, size_t len,
-    uint8_t* ciphertext, uint8_t* tag);
-
-// ============================================================================
 // 校验和
 // ============================================================================
 
@@ -176,13 +158,12 @@ void GenerateAuthID(const AES_KEY& auth_id_key, int64_t timestamp, uint8_t* out_
 // VMessCipher — 单方向 AEAD per-chunk 加密/解密器
 //
 // 支持：AES-128-GCM、ChaCha20-Poly1305；NONE/ZERO 原样复制。
-// 每次 Encrypt/Decrypt 递增内部计数器（16-bit，嵌入 nonce）。
+// 每次 Encrypt/Decrypt 递增内部计数器（16-bit，嵌入 nonce）；一个实例只用于一个方向。
 // 其他 Security 值构造即抛出，不进入数据路径。
 // ============================================================================
 class VMessCipher {
 public:
-    VMessCipher(Security security, const uint8_t* key, const uint8_t* iv,
-                proxy::AeadDirection direction);
+    VMessCipher(Security security, const uint8_t* key, const uint8_t* iv);
     ~VMessCipher() noexcept {
         OPENSSL_cleanse(iv_.data(), iv_.size());
     }
@@ -210,7 +191,7 @@ private:
     std::array<uint8_t, 16> iv_;
     uint16_t count_ = 0;
 
-    std::variant<std::monostate, proxy::AeadEncryptor, proxy::AeadDecryptor> cipher_;
+    proxy::AeadContext aead_;
 };
 
 // ============================================================================

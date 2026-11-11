@@ -671,7 +671,7 @@ bool RunOpenOrder(int mode, bool before) {
     }
     const bool timely = done;
     const auto expected = mode <= 2 ? ErrorCode::OK : mode == 6 ? ErrorCode::TIMEOUT :
-        mode == 7 ? ErrorCode::CANCELLED : mode == 8 ? ErrorCode::CONNECTION_CLOSED : ErrorCode::PROTOCOL_DECODE_FAILED;
+        mode == 7 ? ErrorCode::CANCELLED : ErrorCode::PROTOCOL_DECODE_FAILED;
     bool passed = timely && !failure && observed == expected &&
         tested.received == (mode == 0 || mode == 2 ? 5u : 0u) &&
         (before || waited_without_signal) && scenario.fin_replies == 0 && scenario.payload_after_close == 0;
@@ -1122,7 +1122,7 @@ bool RunPoolLifecycle(bool join_before_retirement) {
 bool RunDomainPoolIsolation() {
     net::io_context io;
     auto coordinator = std::make_shared<GroupCoordinator>(io, 2);
-    coordinator->RegisterWorker(0, io);
+    coordinator->RegisterWorker(io);
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
     app::dns::DNSWorker dns_worker(io, dns_config, 8);

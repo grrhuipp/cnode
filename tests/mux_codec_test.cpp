@@ -112,7 +112,7 @@ TEST(MuxCodec, Contract) {
     Check(buf::AppendSpanToMultiBuffer(xudp_wire, xudp_input),
           "failed to allocate large XUDP fixture");
     buf::LengthPrefixedPacketBuffer xudp_decoder;
-    xudp_decoder.Append(std::move(xudp_input));
+    Check(xudp_decoder.Append(std::move(xudp_input)), "XUDP input rejected");
     buf::MultiBuffer decoded_xudp_packet;
     const auto xudp_result = xudp_decoder.Pop(decoded_xudp_packet);
     std::vector<uint8_t> recovered_xudp_packet(large_xudp_packet.size());
@@ -123,13 +123,13 @@ TEST(MuxCodec, Contract) {
               recovered_xudp_packet == large_xudp_packet &&
               xudp_decoder.PendingBytes() == 0,
           "XUDP packet larger than one Buffer was rejected or truncated");
-    xudp_decoder.Finish();
+    Check(xudp_decoder.Finish(), "XUDP EOF rejected at frame boundary");
     xudp_decoder.Reset();
     const std::array<uint8_t, 5> empty_then_packet{0, 0, 0, 1, 0x4f};
     buf::MultiBuffer empty_input;
     Check(buf::AppendSpanToMultiBuffer(empty_then_packet, empty_input),
           "failed to allocate empty XUDP fixture");
-    xudp_decoder.Append(std::move(empty_input));
+    Check(xudp_decoder.Append(std::move(empty_input)), "empty XUDP input rejected");
     Check(xudp_decoder.Pop(decoded_xudp_packet) ==
               buf::LengthPrefixedPacketBuffer::PopResult::Packet &&
           decoded_xudp_packet.empty() && xudp_decoder.PendingBytes() == 3,
@@ -138,24 +138,18 @@ TEST(MuxCodec, Contract) {
               buf::LengthPrefixedPacketBuffer::PopResult::Packet &&
           decoded_xudp_packet.byte_size() == 1,
           "zero-length XUDP frame corrupted its successor");
-    xudp_decoder.Finish();
+    Check(xudp_decoder.Finish(), "XUDP EOF rejected after empty frame");
     for (const auto& truncated : {std::vector<uint8_t>{0},
                                   std::vector<uint8_t>{0, 2, 0x41}}) {
         xudp_decoder.Reset();
         buf::MultiBuffer input;
         Check(buf::AppendSpanToMultiBuffer(truncated, input),
               "failed to allocate truncated XUDP fixture");
-        xudp_decoder.Append(std::move(input));
+        Check(xudp_decoder.Append(std::move(input)), "partial XUDP input rejected");
         Check(xudp_decoder.Pop(decoded_xudp_packet) ==
                   buf::LengthPrefixedPacketBuffer::PopResult::NeedMore,
               "truncated XUDP frame was emitted");
-        bool rejected = false;
-        try {
-            xudp_decoder.Finish();
-        } catch (const IoSystemError&) {
-            rejected = true;
-        }
-        Check(rejected, "XUDP EOF accepted a partial length or payload");
+        Check(!xudp_decoder.Finish(), "XUDP EOF accepted a partial length or payload");
     }
 
     Check(EncodeNewHeaderTo(

@@ -81,7 +81,7 @@ void GroupCoordinator::Start() {
 }
 
 
-void GroupCoordinator::RegisterWorker(uint32_t, net::io_context& reactor) {
+void GroupCoordinator::RegisterWorker(net::io_context& reactor) {
     net::use_service<WorkerCoordinatorService>(reactor_).Bind(weak_from_this(), false);
     if (net::use_service<WorkerCoordinatorService>(reactor).Bind(weak_from_this(), true)) {
         reserved_->worker_count.fetch_add(1, std::memory_order_release);

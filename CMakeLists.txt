@@ -93,18 +93,31 @@ set(CNODE_CORE_SOURCES
     src/transport/internet/datagram_socket.cpp
     src/transport/internet/tcp_stream.cpp
     src/transport/internet/timeout_scheduler.cpp
+    src/transport/internet/tls_context.cpp
     src/transport/internet/tls_stream.cpp
+    src/transport/internet/reality_tls.cpp
     src/transport/internet/ws_stream.cpp
     src/transport/internet/http1_handshake.cpp
     src/transport/internet/xhttp_session.cpp
     src/transport/internet/http2_session.cpp
+    src/transport/internet/hpack.cpp
+    src/transport/internet/h2_frame.cpp
+    src/transport/internet/http2_client.cpp
+    src/transport/internet/http2_server.cpp
+    src/transport/internet/xhttp_http2.cpp
     src/transport/internet/transport_stack.cpp
     src/transport/internet/transport_dialer.cpp
+    src/transport/internet/outbound_bind.cpp
+    src/transport/internet/xhttp_client.cpp
     src/transport/internet/hysteria/hysteria_ingress.cpp
+    src/transport/internet/hysteria/hysteria_wire.cpp
     src/transport/internet/proxy_protocol.cpp
 
     # App (Application layer)
     src/app/dispatcher/default_dispatcher.cpp
+    src/app/session_tracking.cpp
+    src/app/rate_limiter.cpp
+    src/app/relay.cpp
     src/app/proxyman/inbound/handler.cpp
     src/app/worker/udp_ingress.cpp
     src/app/proxyman/inbound/user_store.cpp
@@ -112,6 +125,7 @@ set(CNODE_CORE_SOURCES
     src/app/worker.cpp
     src/app/session_group_executor.cpp
     src/service/controller/controller.cpp
+    src/service/controller/traffic_journal.cpp
     src/app/prepared_inbound.cpp
     src/common/rule.cpp
     src/common/session.cpp
@@ -124,6 +138,9 @@ set(CNODE_CORE_SOURCES
     # Common - Mux
     src/common/mux/mux_codec.cpp
 
+    # Proxy - Mux
+    src/proxy/mux/mux_server.cpp
+
     # Proxy - VMess
     src/proxy/vmess/vmess_crypto.cpp
     src/proxy/vmess/encoding/body.cpp
@@ -132,7 +149,11 @@ set(CNODE_CORE_SOURCES
 
     # Proxy - VLESS
     src/proxy/vless/vless_codec.cpp
-    src/proxy/vless/vless_encryption.cpp
+    src/proxy/vless/vless_encryption_config.cpp
+    src/proxy/vless/vless_encryption_primitives.cpp
+    src/proxy/vless/vless_encryption_handshake.cpp
+    src/proxy/vless/vless_encryption_ticket.cpp
+    src/proxy/vless/vless_encryption_record.cpp
     src/proxy/vless/inbound/vless_inbound.cpp
     src/proxy/vless/outbound/vless_outbound.cpp
 
@@ -150,6 +171,7 @@ set(CNODE_CORE_SOURCES
     # Proxy - Shadowsocks
     src/proxy/shadowsocks/shadowsocks_protocol.cpp
     src/proxy/shadowsocks/ss_udp.cpp
+    src/proxy/shadowsocks/ss_stream.cpp
     src/proxy/shadowsocks/inbound/ss_inbound.cpp
     src/proxy/shadowsocks/outbound/ss_outbound.cpp
 
@@ -290,7 +312,7 @@ target_link_options(cnode_shadowsocks_stream_crypto_test PRIVATE
 foreach(target IN ITEMS cnode_anytls_outbound_lifecycle_test cnode_anytls_padding_test
                         cnode_awaitable_batch_test cnode_awaitable_task_group_test
                         cnode_cancellation_source_test cnode_dns_inflight_test cnode_grpc_hunk_test
-                        cnode_stream_settings_test cnode_timeout_scheduler_test
+                        cnode_timeout_scheduler_test
                         cnode_user_store_batch_test)
     target_link_libraries(${target} PRIVATE cnode_allocation_hook)
 endforeach()

@@ -1,13 +1,14 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/stream_settings.hpp"
+#include "transport/internet/outbound_bind.hpp"
 #include "infra/config.hpp"
-#include "common/target_address.hpp"
 
 #include <asio/ip/network_v4.hpp>
 #include <asio/ip/network_v6.hpp>
 
 #include <array>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 

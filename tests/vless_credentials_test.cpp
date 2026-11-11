@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "proxy/vless/vless_codec.hpp"
+#include "proxy/vless/vless_encryption_config.hpp"
 
 #include <array>
 #include <iostream>
@@ -37,4 +38,17 @@ TEST(VlessCredentials, Contract) {
         FAIL() << "flow normalization changed";
     }
     std::cout << "VLESS UUID/custom identity vectors, byte-length limits and flow normalization passed\n";
+}
+
+TEST(VlessCredentials, EncryptionNoneIsSuccessfulAbsence) {
+    for (auto value : {"", "none", "NONE"}) {
+        auto client = vless::ParseVlessClientEncryption(value);
+        auto server = vless::ParseVlessServerDecryption(value);
+        ASSERT_TRUE(client);
+        ASSERT_TRUE(server);
+        EXPECT_FALSE(client->has_value());
+        EXPECT_FALSE(server->has_value());
+    }
+    EXPECT_FALSE(vless::ParseVlessClientEncryption("invalid"));
+    EXPECT_FALSE(vless::ParseVlessServerDecryption("invalid"));
 }

@@ -1,4 +1,5 @@
-#include "common/awaitable_batch.hpp"
+#include "app/bootstrap.hpp"
+#include "app/worker_batch.hpp"
 #include "common/monitor_loop.hpp"
 #include "app/process_descriptors.hpp"
 #include "api/api.hpp"
@@ -392,6 +393,7 @@ void SetupPanels(net::io_context& main_ctx,
     pool.workers.reserve(workers);
     pool.io_contexts.reserve(workers);
     pool.work_guards.reserve(workers);
+    auto coordinator = std::make_shared<GroupCoordinator>(control_io);
 
     // 每个 Worker context 只由其数据线程运行（RunDataThread/RunEventLoop）。
     // hint 1 让本线程发起的 post 进入线程私有队列；它仍是加锁调度器与反应器，
@@ -402,10 +404,8 @@ void SetupPanels(net::io_context& main_ctx,
         auto& worker_stats = stats.GetShard(i);
         pool.workers.push_back(std::make_unique<Worker>(
             i, *pool.io_contexts[i], runtime_config, worker_stats, dns_worker,
-            geo_database));
+            coordinator, geo_database));
     }
-    auto coordinator = std::make_shared<GroupCoordinator>(control_io);
-    for (const auto& worker : pool.workers) worker->SetGroupCoordinator(coordinator);
 
     return pool;
 }
@@ -432,18 +432,20 @@ void SetupPanels(net::io_context& main_ctx,
     env.stats = std::make_unique<ShardedStats>(config.workers);
     const WorkerRuntimeConfig worker_runtime_config =
         MakeWorkerRuntimeConfig(config, std::move(config.routing), std::move(outbounds));
-    // Every source and protocol payload is prepared before one RCU publication.
-    // Workers do not exist yet: each captures the committed snapshot when it is
-    // constructed below. These borrowed references stay in this call.
+    // Every source and protocol payload is prepared before one RCU publication
+    // through the core shared with panel nodes. Workers do not exist yet: each
+    // captures the committed snapshot when it is constructed below. These
+    // borrowed references stay in this call.
     std::vector<proxyman::inbound::UserStore::UserUpdate> user_updates;
     user_updates.reserve(inbounds.size());
     for (const auto& inbound : inbounds) {
         user_updates.push_back({inbound.binding.tag, *inbound.users});
     }
-    const auto previous_users = proxyman::inbound::UserStore::CaptureSnapshot();
+    std::optional<PreparedUserPublication> user_publication;
     if (!user_updates.empty()) {
-        proxyman::inbound::UserStore::CommitSnapshot(
-            proxyman::inbound::UserStore::PrepareUsers(user_updates));
+        user_publication = PrepareUserPublication(
+            proxyman::inbound::UserStore::PrepareUsers(user_updates), 0);
+        user_publication->Commit();
     }
     for (auto& inbound : inbounds) {
         inbound.users.reset();
@@ -463,7 +465,10 @@ void SetupPanels(net::io_context& main_ctx,
         env.enable_controller = !config.panels.empty();
         return env;
     } catch (...) {
-        proxyman::inbound::UserStore::CommitSnapshot(previous_users);
+        if (user_publication) {
+            proxyman::inbound::UserStore::CommitSnapshot(
+                std::move(user_publication->rollback.previous));
+        }
         throw;
     }
 }
@@ -580,10 +585,6 @@ public:
                   [this] { return RuntimeStatsOutputLoop(); }, ReportMonitorExit),
           } {}
 
-    void ThrowIfStopping() const {
-        if (stopping) throw IoSystemError(net::error::operation_aborted);
-    }
-
     void StartMonitor() {
         try {
             for (const auto& loop : monitor_loops) loop->Start();
@@ -628,21 +629,14 @@ public:
 
     net::awaitable<std::vector<WorkerRuntimeStatsSnapshot>>
     CollectWorkerRuntimeStats(bool include_resources) const {
-        ThrowIfStopping();
-        const auto& workers = env.worker_pool.workers;
-        std::vector<WorkerRuntimeStatsSnapshot> snapshots(workers.size());
-        co_await RunWorkerBatch(env.main_ctx->get_executor(), workers,
-            [this, &snapshots, include_resources](Worker& worker, size_t index) {
-                return [](const RuntimeOwner& owner, Worker* current,
-                          WorkerRuntimeStatsSnapshot& out,
-                          bool collect_resources) -> net::awaitable<void> {
-                    owner.ThrowIfStopping();
-                    out = co_await current->PostCall([current, collect_resources] {
-                        return current->CollectRuntimeStats(collect_resources);
-                    });
-                }(*this, &worker, snapshots[index], include_resources);
+        auto snapshots = co_await PostToEachWorker(env.main_ctx->get_executor(),
+            env.worker_pool.workers, stopping,
+            [include_resources](Worker& worker, size_t) {
+                return worker.PostCall([&worker, include_resources] {
+                    return worker.CollectRuntimeStats(include_resources);
+                });
             });
-        ThrowIfStopping();
+        ThrowIfStopping(stopping);
         co_return snapshots;
     }
 
@@ -681,7 +675,7 @@ public:
                     .bytes_out = snapshot.stats.bytes_out,
                     .errors = snapshot.stats.errors,
                     .active_sessions = snapshot.active_connections,
-                    .udp_sockets = snapshot.memory.udp_sockets,
+                    .udp_sockets = snapshot.udp_sockets,
                 };
                 auto& state = heap_states[index];
                 if (!state.previous || *state.previous != activity) {
@@ -695,19 +689,16 @@ public:
                 try {
                     // Statistics quiet does not prove I/O quiescence. Native
                     // collection is safe because it never releases live blocks.
-                    co_await RunWorkerBatch(env.main_ctx->get_executor(), idle_workers,
-                        [this](Worker& worker, size_t) {
-                            return [](const RuntimeOwner& owner, Worker* current) -> net::awaitable<void> {
-                                owner.ThrowIfStopping();
-                                co_await current->PostCall([] { memory::CollectThreadHeap(); });
-                            }(*this, &worker);
+                    co_await PostToEachWorker(env.main_ctx->get_executor(), idle_workers,
+                        stopping, [](Worker& worker, size_t) {
+                            return worker.PostCall([] { memory::CollectThreadHeap(); });
                         });
-                    ThrowIfStopping();
+                    ThrowIfStopping(stopping);
                     for (const Worker* worker : idle_workers)
                         heap_states[worker->Id()].collected = true;
                     memory::CollectThreadHeap();
                 } catch (const std::exception& error) {
-                    ThrowIfStopping();
+                    ThrowIfStopping(stopping);
                     LOG_CONSOLE_WARN("Idle thread heap collection skipped: {}", error.what());
                 }
             }
@@ -732,7 +723,7 @@ public:
             auto snapshot = env.stats->WithCurrentRate(AggregateWorkerStats(worker_snapshots));
 
             const auto dns_stats = co_await env.dns_worker->GetCacheStats();
-            ThrowIfStopping();
+            ThrowIfStopping(stopping);
             const uint64_t dns_total = dns_stats.hits + dns_stats.misses;
             const double dns_hit_rate = dns_total > 0
                 ? 100.0 * static_cast<double>(dns_stats.hits) / static_cast<double>(dns_total)
@@ -747,7 +738,7 @@ public:
 
             size_t total_udp_sockets = 0;
             for (const auto& worker_snapshot : worker_snapshots) {
-                total_udp_sockets += worker_snapshot.memory.udp_sockets;
+                total_udp_sockets += worker_snapshot.udp_sockets;
             }
             const auto total_users = proxyman::inbound::UserStore::TotalUsers();
             LOG_CONSOLE("Runtime activity: conn={} users={} udp_sockets={}",
@@ -767,7 +758,7 @@ public:
             for (const auto& worker : worker_snapshots) {
                 const auto& r = *worker.resources;
                 LOG_CONSOLE("Worker activity: id={} conn={} udp_sockets={} timeout_heap={}/{} timeout_waiters={}",
-                            worker.worker_id, worker.active_connections, worker.memory.udp_sockets,
+                            worker.worker_id, worker.active_connections, worker.udp_sockets,
                             r.timeout_events, r.timeout_heap_capacity, r.timeout_waiters);
                 LOG_CONSOLE("Worker UDP resources: id={} udp_listeners={} udp_receive_loops={} udp_resource_drops={} udp_associations={} udp_closed={} udp_reply_senders={}",
                             worker.worker_id, r.udp_listeners, r.udp_receive_loops, r.udp_resource_drops,
@@ -822,17 +813,17 @@ public:
         const auto& workers = env.worker_pool.workers;
         if (!stopping) {
             try {
-                for (const auto& worker : workers) {
-                    co_await worker->PostTask(
-                        StartWorkerInbounds(*worker, env.inbound_startup));
-                }
+                co_await PostToEachWorkerInOrder(workers, stopping,
+                    [this](Worker& worker, size_t) {
+                        return worker.PostTask(StartWorkerInbounds(worker, env.inbound_startup));
+                    });
                 if (!stopping) {
                     if (env.enable_controller) env.controller->Start();
                     StartMonitor();
                     for (const auto& inbound : env.inbound_startup) {
                         LOG_CONSOLE("Static inbound ready: tag={} port={} protocol={} network={}",
                             inbound.binding.tag, inbound.binding.port, inbound.binding.protocol,
-                            inbound.receiver.stream_settings.network);
+                            inbound.receiver.stream_settings.NetworkName());
                     }
                     env.inbound_startup.clear();
                     env.inbound_startup.shrink_to_fit();
@@ -950,9 +941,10 @@ int RunApplicationRuntime(BootstrapEnvironment& env) noexcept {
         try {
             owner.signals = InstallShutdownHandler(main_ctx, [&owner] { owner.RequestStop(); });
             for (size_t i = 0; i < workers.size(); ++i) {
-                workers[i]->SetFailureHandler([&owner](std::exception_ptr error) {
-                    owner.PublishFailure(error);
-                });
+                workers[i]->SetFailureHandler(&owner,
+                    [](void* context, std::exception_ptr error) noexcept {
+                        static_cast<RuntimeOwner*>(context)->PublishFailure(error);
+                    });
                 threads.emplace_back([&owner, i] { RunDataThread(owner, i); });
                 ++owner.started_threads;
             }
@@ -1017,13 +1009,7 @@ int RunFromCommandLine(int argc, char* argv[]) {
     }
     const Config& config = *config_opt;
 
-    if (!Log::Init(config.log.level,
-                   config.log.log_dir,
-                   config.log.max_days,
-                   config.log.access_path,
-                   config.log.error_path,
-                   config.log.rotate_daily,
-                   config.log.gzip)) {
+    if (!Log::Init(config.log)) {
         Log::WriteConsole(LogLevel::ERROR, "Failed to initialize logging");
         return 1;
     }

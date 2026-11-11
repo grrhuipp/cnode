@@ -4,7 +4,6 @@
 #include "app/proxyman/inbound/user_store.hpp"
 
 #include <array>
-#include <iostream>
 #include <new>
 
 namespace {
@@ -17,22 +16,35 @@ void Commit(UserStore::PublishedSnapshot snapshot) {
     UserStore::InstallWorkerView(std::move(view));
 }
 
-// Inject at the real cold snapshot and Worker-lease allocation boundaries.
 void FailAfterCount(std::size_t) {
     if (fail_after == 0) throw std::bad_alloc();
     if (fail_after > 0) --fail_after;
 }
-}
+
+class UserStoreBatch : public ::testing::Test {
+protected:
+    void SetUp() override { previous_ = UserStore::CaptureSnapshot(); }
+    void TearDown() override {
+        fail_after = -1;
+        UserStore::ClearWorkerView();
+        UserStore::CommitSnapshot(std::move(previous_));
+    }
+private:
+    UserStore::PublishedSnapshot previous_;
+};
+}  // namespace
 
 constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = FailAfterCount};
 
-TEST(UserStoreBatch, Contract) {
+namespace {
+TEST_F(UserStoreBatch, AllocationFailureLeavesWholeBatchAndWorkerViewUnchanged) {
     const UserSet first_old = PreparedVmessUsers{PreparedVmessUser{
         .profile = {.user_id = 101, .email = {}}}};
     const UserSet second_old = PreparedTrojanUsers{PreparedTrojanUser{
         .password_hash = "old-second",
         .profile = {.user_id = 102, .email = {}}}};
-    const UserSet unrelated = PreparedVmessUsers{PreparedVmessUser{.profile = {}}};
+    const UserSet unrelated = PreparedVmessUsers{PreparedVmessUser{
+        .profile = {.user_id = 103, .email = {}}}};
     const std::array initial{
         UserStore::UserUpdate{"first", first_old}, UserStore::UserUpdate{"second", second_old},
         UserStore::UserUpdate{"unrelated", unrelated}};
@@ -40,17 +52,13 @@ TEST(UserStoreBatch, Contract) {
     const auto old_snapshot = UserStore::CaptureSnapshot();
     const auto first_view = UserStore::VmessUsers("first").users;
     const auto second_view = UserStore::FindTrojanUser("second", "old-second");
-    const auto unrelated_view = UserStore::VmessUsers("unrelated").users;
+    ASSERT_TRUE(first_view);
+    ASSERT_TRUE(second_view);
     const UserSet first_new = PreparedVmessUsers{
-        PreparedVmessUser{
-            .uuid_bytes = {1},
-            .profile = {.user_id = 201, .email = {}}},
-        PreparedVmessUser{
-            .uuid_bytes = {2},
-            .profile = {.user_id = 202, .email = {}}}};
+        PreparedVmessUser{.uuid_bytes = {1}, .profile = {.user_id = 201, .email = {}}},
+        PreparedVmessUser{.uuid_bytes = {2}, .profile = {.user_id = 202, .email = {}}}};
     const UserSet second_new = PreparedTrojanUsers{PreparedTrojanUser{
-        .password_hash = "new-second",
-        .profile = {.user_id = 203, .email = {}}}};
+        .password_hash = "new-second", .profile = {.user_id = 203, .email = {}}}};
     const UserSet third_new = PreparedVlessUsers{PreparedVlessUser{}};
     const std::array updates{
         UserStore::UserUpdate{"first", first_new}, UserStore::UserUpdate{"second", second_new},
@@ -63,58 +71,81 @@ TEST(UserStoreBatch, Contract) {
         try {
             Commit(UserStore::PrepareUsers(updates));
             completed = true;
-        } catch (const std::bad_alloc&) { ++failures; }
+        } catch (const std::bad_alloc&) {
+            ++failures;
+        }
         fail_after = -1;
         if (completed) break;
-        if (UserStore::CaptureSnapshot() != old_snapshot ||
-            UserStore::VmessUsers("first").users != first_view ||
-            UserStore::FindTrojanUser("second", "old-second") != second_view ||
-            UserStore::FindTrojanUser("second", "new-second") || UserStore::FindVlessUser("third", {})) {
-            std::cerr << "allocation failure changed a committed snapshot or Worker view\n";
-            FAIL() << "allocation failure changed a committed snapshot or Worker view";
-        }
+        SCOPED_TRACE(limit);
+        EXPECT_EQ(UserStore::CaptureSnapshot(), old_snapshot);
+        EXPECT_EQ(UserStore::VmessUsers("first").users, first_view);
+        EXPECT_EQ(UserStore::FindTrojanUser("second", "old-second"), second_view);
+        EXPECT_FALSE(UserStore::FindTrojanUser("second", "new-second"));
+        EXPECT_FALSE(UserStore::FindVlessUser("third", {}));
     }
-    ASSERT_FALSE((!completed || failures < 5 || UserStore::VmessUsers("first").size() != 2 ||
-        !UserStore::FindTrojanUser("second", "new-second") ||
-        UserStore::FindTrojanUser("second", "old-second") ||
-        !UserStore::FindVlessUser("third", {}) ||
-        UserStore::VmessUsers("unrelated").users != unrelated_view ||
-        first_view->size() != 1 || (*first_view)[0].profile.user_id != 101 || second_view->profile.user_id != 102));
-
-    auto current = UserStore::CaptureSnapshot();
-    auto worker_one = UserStore::PrepareWorkerView(current);
-    auto worker_two = UserStore::PrepareWorkerView(current);
-    UserStore::InstallWorkerView(std::move(worker_one));
-    auto first_lease_user = UserStore::FindTrojanUser("second", "new-second");
-    UserStore::InstallWorkerView(std::move(worker_two));
-    auto second_lease_user = UserStore::FindTrojanUser("second", "new-second");
-    ASSERT_FALSE((first_lease_user.get() != second_lease_user.get() ||
-        (!first_lease_user.owner_before(second_lease_user) &&
-         !second_lease_user.owner_before(first_lease_user))));
-    // A shared table has distinct per-Worker control blocks. Lookup does not
-    // allocate, and retiring a Worker leaves already authenticated users alive.
-    fail_after = 0;
-    auto hot_user = UserStore::FindTrojanUser("second", "new-second");
-    fail_after = -1;
-    UserStore::ClearWorkerView();
-    ASSERT_FALSE((UserStore::FindTrojanUser("second", "new-second") ||
-        hot_user->profile.user_id != 203 || first_lease_user->profile.user_id != 203));
-    std::weak_ptr<const UserStore::TrojanCredential> retired_lease = hot_user;
-    hot_user.reset();
-    second_lease_user.reset();
-    ASSERT_FALSE((!retired_lease.expired()));
-    UserStore::InstallWorkerView(UserStore::PrepareWorkerView(current));
-
-    PreparedShadowsocksUser ss_user;
-    ss_user.profile.user_id = 7;
-    ss_user.psk_hash.fill(0x11);
-    Commit(UserStore::PrepareUsers("ss-hash", UserSet{PreparedShadowsocksUsers{ss_user}}));
-    const auto ss_view = UserStore::ShadowsocksUsers("ss-hash");
-    ss_user.psk_hash.fill(0x22);
-    Commit(UserStore::PrepareUsers("ss-hash", UserSet{PreparedShadowsocksUsers{ss_user}}));
-    ASSERT_FALSE((ss_view[0].psk_hash[0] != 0x11 || UserStore::ShadowsocksUsers("ss-hash")[0].psk_hash[0] != 0x22));
-    Commit(UserStore::PrepareClearUsers(UserProtocol::Shadowsocks, "ss-hash"));
-    ASSERT_FALSE((!UserStore::ShadowsocksUsers("ss-hash").empty() || ss_view[0].psk_hash[0] != 0x11));
-    UserStore::ClearWorkerView();
-    std::cout << "snapshot/Worker-lease atomicity preserved across " << failures << " allocation failures\n";
+    ASSERT_TRUE(completed);
+    EXPECT_GT(failures, 0);
+    EXPECT_EQ(UserStore::VmessUsers("first").size(), 2);
+    EXPECT_TRUE(UserStore::FindTrojanUser("second", "new-second"));
+    EXPECT_FALSE(UserStore::FindTrojanUser("second", "old-second"));
+    EXPECT_TRUE(UserStore::FindVlessUser("third", {}));
+    const auto untouched = UserStore::VmessUsers("unrelated");
+    ASSERT_EQ(untouched.size(), 1);
+    EXPECT_EQ(untouched[0].profile.user_id, 103);
+    ASSERT_EQ(first_view->size(), 1);
+    EXPECT_EQ((*first_view)[0].profile.user_id, 101);
+    EXPECT_EQ(second_view->profile.user_id, 102);
 }
+
+TEST_F(UserStoreBatch, WorkerRetirementPreservesAuthenticatedUsersUntilLastReference) {
+    const UserSet users = PreparedTrojanUsers{PreparedTrojanUser{
+        .password_hash = "credential", .profile = {.user_id = 203, .email = {}}}};
+    Commit(UserStore::PrepareUsers("leases", users));
+    const auto snapshot = UserStore::CaptureSnapshot();
+    auto worker_one = UserStore::PrepareWorkerView(snapshot);
+    auto worker_two = UserStore::PrepareWorkerView(snapshot);
+    UserStore::InstallWorkerView(std::move(worker_one));
+    const auto first_user = UserStore::FindTrojanUser("leases", "credential");
+    UserStore::InstallWorkerView(std::move(worker_two));
+    auto second_user = UserStore::FindTrojanUser("leases", "credential");
+    ASSERT_TRUE(first_user);
+    ASSERT_TRUE(second_user);
+    const std::weak_ptr<const UserStore::TrojanCredential> retired = second_user;
+    UserStore::ClearWorkerView();
+    EXPECT_FALSE(UserStore::FindTrojanUser("leases", "credential"));
+    EXPECT_EQ(first_user->profile.user_id, 203);
+    EXPECT_EQ(second_user->profile.user_id, 203);
+    second_user.reset();
+    EXPECT_TRUE(retired.expired());
+    EXPECT_EQ(first_user->profile.user_id, 203);
+}
+
+TEST_F(UserStoreBatch, CredentialLookupDoesNotAllocate) {
+    const UserSet users = PreparedTrojanUsers{PreparedTrojanUser{
+        .password_hash = "credential", .profile = {.user_id = 203, .email = {}}}};
+    Commit(UserStore::PrepareUsers("lookup", users));
+    fail_after = 0;
+    const auto user = UserStore::FindTrojanUser("lookup", "credential");
+    fail_after = -1;
+    ASSERT_TRUE(user);
+    EXPECT_EQ(user->profile.user_id, 203);
+}
+
+TEST_F(UserStoreBatch, ShadowsocksReplacementAndClearPreserveRetiredCredentials) {
+    PreparedShadowsocksUser user;
+    user.profile.user_id = 7;
+    user.psk_hash.fill(0x11);
+    Commit(UserStore::PrepareUsers("ss-hash", UserSet{PreparedShadowsocksUsers{user}}));
+    const auto old = UserStore::ShadowsocksUsers("ss-hash");
+    ASSERT_EQ(old.size(), 1);
+    user.psk_hash.fill(0x22);
+    Commit(UserStore::PrepareUsers("ss-hash", UserSet{PreparedShadowsocksUsers{user}}));
+    EXPECT_EQ(old[0].psk_hash[0], 0x11);
+    const auto current = UserStore::ShadowsocksUsers("ss-hash");
+    ASSERT_EQ(current.size(), 1);
+    EXPECT_EQ(current[0].psk_hash[0], 0x22);
+    Commit(UserStore::PrepareClearUsers(UserProtocol::Shadowsocks, "ss-hash"));
+    EXPECT_TRUE(UserStore::ShadowsocksUsers("ss-hash").empty());
+    EXPECT_EQ(old[0].psk_hash[0], 0x11);
+}
+}  // namespace

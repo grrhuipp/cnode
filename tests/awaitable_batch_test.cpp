@@ -16,7 +16,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
-#include <iostream>
 #include <new>
 #include <stdexcept>
 #include <thread>
@@ -54,7 +53,7 @@ struct TaskScope {
     }
 }
 
-void TestFailureBarrier() {
+TEST(AwaitableBatch, FailureJoinsEveryChild) {
     ::net::io_context io_context;
     int active = 0;
     int peak_active = 0;
@@ -79,9 +78,10 @@ void TestFailureBarrier() {
         saw_failure = true;
     }
 
-    if (!saw_failure || peak_active != 3 || active != 0 || completed != 3) {
-        throw std::runtime_error("a failed batch must still join every task");
-    }
+    EXPECT_TRUE(saw_failure);
+    EXPECT_EQ(peak_active, 3);
+    EXPECT_EQ(active, 0);
+    EXPECT_EQ(completed, 3);
 }
 
 ::net::awaitable<void> OrderedFailure(bool cancel_first, bool& completed) {
@@ -94,7 +94,7 @@ void TestFailureBarrier() {
     throw ::IoSystemError(::net::error::address_in_use);
 }
 
-void TestFailureOutranksCancellation() {
+TEST(AwaitableBatch, FailureOutranksCancellation) {
     ::net::io_context io_context;
     bool failed_child_completed = false;
     std::vector<::net::awaitable<void>> tasks;
@@ -110,9 +110,8 @@ void TestFailureOutranksCancellation() {
     } catch (const ::IoSystemError& error) {
         reported = error.code();
     }
-    if (!failed_child_completed || reported != ::net::error::address_in_use) {
-        throw std::runtime_error("a cancelled child must not mask a joined child's real failure");
-    }
+    EXPECT_TRUE(failed_child_completed);
+    EXPECT_EQ(reported, ::net::error::address_in_use);
 }
 
 ::net::awaitable<void> GatedTask(
@@ -130,7 +129,7 @@ void TestFailureOutranksCancellation() {
         }, token);
 }
 
-void TestCancellationBarrier() {
+TEST(AwaitableBatch, CancellationJoinsEveryChild) {
     ::net::io_context io_context;
     ::net::cancellation_signal cancel;
     int active = 0;
@@ -151,20 +150,21 @@ void TestCancellationBarrier() {
             completed_at_return = completed;
         }));
     io_context.poll();
-    if (active != 3) throw std::runtime_error("all children must be waiting before cancellation");
+    EXPECT_EQ(active, 3);
     cancel.emit(::net::cancellation_type::terminal);
     io_context.poll();
     const bool returned_before_release = completed_at_return != -1;
     gate.cancel();
     io_context.run();
-    if (returned_before_release || completed_at_return != 3 || active != 0 || completed != 3) {
-        throw std::runtime_error("cancellation must not return while children still borrow caller state");
-    }
-    if (!failure) throw std::runtime_error("cancellation must be reported after joining children");
+    EXPECT_FALSE(returned_before_release);
+    EXPECT_EQ(completed_at_return, 3);
+    EXPECT_EQ(active, 0);
+    EXPECT_EQ(completed, 3);
+    ASSERT_TRUE(failure);
     try {
         std::rethrow_exception(failure);
     } catch (const ::IoSystemError& error) {
-        if (error.code() != ::net::error::operation_aborted) throw;
+        EXPECT_EQ(error.code(), ::net::error::operation_aborted);
     }
 }
 
@@ -181,7 +181,7 @@ void TestCancellationBarrier() {
     fail_after = -1;
 }
 
-void TestAllocationFailureBarrier() {
+TEST(AwaitableBatch, AllocationFailureJoinsStartedChildren) {
     int covered = 0;
     int partial_launch_failures = 0;
     bool finished_sweep = false;
@@ -216,16 +216,14 @@ void TestAllocationFailureBarrier() {
         const bool returned_with_children = active != 0 && completed_at_return != -1;
         gate.cancel();
         io_context.restart();
-        io_context.run_for(std::chrono::milliseconds(250));
+        io_context.run();
         // Asio may throw from initiation before entering the batch coroutine.
         // Such failures are safe only if no child has started at all.
         const bool failed_before_start = initiation_failed && completed == 0;
-        if (returned_with_children || active != 0 ||
-            (!failed_before_start && completed_at_return != completed)) {
-            std::cerr << "allocation=" << allocation << " active=" << active
-                      << " completed=" << completed << " returned=" << completed_at_return << '\n';
-            throw std::runtime_error("allocation failure must join started children before returning");
-        }
+        SCOPED_TRACE(allocation);
+        EXPECT_FALSE(returned_with_children);
+        EXPECT_EQ(active, 0);
+        EXPECT_TRUE(failed_before_start || completed_at_return == completed);
         if (injected_failures == failures_before) {
             finished_sweep = true;
             break;
@@ -233,9 +231,9 @@ void TestAllocationFailureBarrier() {
         if (completed > 0 && completed < 3 && returned_error) ++partial_launch_failures;
         ++covered;
     }
-    if (!finished_sweep || covered == 0 || partial_launch_failures == 0) {
-        throw std::runtime_error("allocation sweep must exercise failures and eventual success");
-    }
+    EXPECT_TRUE(finished_sweep);
+    EXPECT_GT(covered, 0);
+    EXPECT_GT(partial_launch_failures, 0);
 }
 
 ::net::awaitable<void> ObserveExecutor(
@@ -252,7 +250,7 @@ void TestAllocationFailureBarrier() {
     caller_matched = (co_await ::net::this_coro::executor) == caller;
 }
 
-void TestExecutorOwnership() {
+TEST(AwaitableBatch, ChildAndCallerKeepTheirExecutors) {
     ::net::io_context caller;
     ::net::io_context worker;
     auto guard = ::net::make_work_guard(worker);
@@ -266,9 +264,8 @@ void TestExecutorOwnership() {
     guard.reset();
     worker_thread.join();
     result.get();
-    if (!child_matched || !caller_matched) {
-        throw std::runtime_error("batch tasks and caller must resume on their own executors");
-    }
+    EXPECT_TRUE(child_matched);
+    EXPECT_TRUE(caller_matched);
 }
 
 void FailAfterCount(std::size_t) {
@@ -282,16 +279,3 @@ void FailAfterCount(std::size_t) {
 
 constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = FailAfterCount};
 
-TEST(AwaitableBatch, Contract) {
-    try {
-        TestFailureBarrier();
-        TestCancellationBarrier();
-        TestFailureOutranksCancellation();
-        TestAllocationFailureBarrier();
-        TestExecutorOwnership();
-    } catch (const std::exception& error) {
-        fail_after = -1;
-        std::cerr << error.what() << '\n';
-        FAIL() << error.what();
-    }
-}

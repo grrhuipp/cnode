@@ -1,6 +1,7 @@
 #pragma once
 
 #include "api/api.hpp"
+#include "common/ascii.hpp"
 #include "common/asio_types.hpp"
 #include "core/constants.hpp"
 #include "infra/json.hpp"
@@ -43,11 +44,6 @@ struct Response {
     bool not_modified = false;
 };
 
-inline std::string TrimHeaderValue(std::string_view value) {
-    return std::string(transport::internet::TrimHttpOws(value));
-}
-
-
 inline bool AppendStreambuf(net::streambuf& buffer, std::string& out) {
     const auto data = buffer.data();
     const size_t size = data.size();
@@ -74,13 +70,14 @@ inline std::optional<size_t> ParseContentLength(std::string_view value) noexcept
     return length;
 }
 
-inline std::optional<size_t> FindCrlf(const net::streambuf& buffer) {
+// 从 `from` 起查找 CRLF；调用方传入已扫描且确认无 CRLF 的偏移，避免重扫。
+inline std::optional<size_t> FindCrlf(const net::streambuf& buffer, size_t from) {
     const auto data = buffer.data();
     const auto begin = net::buffers_begin(data);
     const auto end = net::buffers_end(data);
     constexpr std::array<char, 2> delimiter{'\r', '\n'};
     const auto match = std::search(
-        begin, end, delimiter.begin(), delimiter.end());
+        begin + static_cast<std::ptrdiff_t>(from), end, delimiter.begin(), delimiter.end());
     if (match == end) {
         return std::nullopt;
     }
@@ -91,8 +88,12 @@ template <typename Stream>
 net::awaitable<tl::expected<std::string, std::string>> ReadCrlfLine(
     Stream& stream,
     net::streambuf& buffer) {
+    // 已确认不含 CRLF 的前缀长度；末字节可能是与下一次读入的 LF 配对的 CR，
+    // 因此下一轮从它开始扫描，整行扫描保持 O(N)。
+    size_t scanned = 0;
+    IoErrorCode read_error;
     for (;;) {
-        if (const auto line_size = FindCrlf(buffer)) {
+        if (const auto line_size = FindCrlf(buffer, scanned)) {
             if (*line_size > kMaxHttpLineSize) {
                 co_return tl::unexpected("HTTP line too large");
             }
@@ -102,6 +103,10 @@ net::awaitable<tl::expected<std::string, std::string>> ReadCrlfLine(
             buffer.consume(*line_size + 2);
             co_return line;
         }
+        if (read_error) {
+            co_return tl::unexpected(read_error.message());
+        }
+        scanned = buffer.size() == 0 ? 0 : buffer.size() - 1;
         // A maximum-length line can have its CR buffered while the LF is
         // still in flight. The delimiter is not part of the line-size limit.
         if (buffer.size() > kMaxHttpLineSize &&
@@ -115,9 +120,7 @@ net::awaitable<tl::expected<std::string, std::string>> ReadCrlfLine(
         if (bytes > 0) {
             buffer.commit(bytes);
         }
-        if (read_ec && !FindCrlf(buffer).has_value()) {
-            co_return tl::unexpected(read_ec.message());
-        }
+        read_error = read_ec;
     }
 }
 
@@ -219,14 +222,14 @@ struct TransferCodings {
 inline void AppendTransferCodings(std::string_view value, TransferCodings& codings) {
     while (!value.empty()) {
         const size_t comma = value.find(',');
-        const std::string coding = TrimHeaderValue(value.substr(0, comma));
+        const auto coding = transport::internet::TrimHttpOws(value.substr(0, comma));
         value = comma == std::string_view::npos ? std::string_view{} : value.substr(comma + 1);
         // RFC 9110 §5.6.1: recipients ignore empty list elements.
         if (coding.empty()) {
             continue;
         }
         ++codings.count;
-        if (LowerAscii(coding) != "chunked") {
+        if (!EqualsAsciiCI(coding, "chunked")) {
             codings.only_chunked = false;
         }
     }
@@ -308,7 +311,7 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
             }
             if (line_result->empty()) break;
 
-            const std::string& line = *line_result;
+            const std::string_view line = *line_result;
 
             const size_t colon = line.find(':');
             if (colon == std::string::npos || colon == 0) {
@@ -317,27 +320,28 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
                 co_return result;
             }
 
-            const auto name = LowerAscii(std::string_view(line).substr(0, colon));
+            // 头名大小写无关：只做原地 ASCII 不分大小写比较，不为每个头分配小写副本。
+            const auto name = line.substr(0, colon);
             if (!transport::internet::IsValidHttpHeaderName(name)) {
                 result.status = -1;
                 result.body = "invalid HTTP header name";
                 co_return result;
             }
-            const auto value = TrimHeaderValue(std::string_view(line).substr(colon + 1));
+            const auto value = transport::internet::TrimHttpOws(line.substr(colon + 1));
             if (!transport::internet::IsValidHttpHeaderValue(value)) {
                 result.status = -1;
                 result.body = "invalid HTTP header value";
                 co_return result;
             }
 
-            if (name == "etag") {
+            if (EqualsAsciiCI(name, "etag")) {
                 if (has_etag) {
                     result.status = -1;
                     result.body = "duplicate ETag";
                     co_return result;
                 }
                 has_etag = true;
-                result.etag = value;
+                result.etag.assign(value);
                 if (result.etag.size() >= 2 && result.etag.front() == '"' &&
                     result.etag.back() == '"') {
                     result.etag = result.etag.substr(1, result.etag.size() - 2);
@@ -353,12 +357,12 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
                     result.body = "invalid ETag";
                     co_return result;
                 }
-            } else if (name == "transfer-encoding") {
+            } else if (EqualsAsciiCI(name, "transfer-encoding")) {
                 if (!transfer_codings) {
                     transfer_codings.emplace();
                 }
                 AppendTransferCodings(value, *transfer_codings);
-            } else if (name == "content-length") {
+            } else if (EqualsAsciiCI(name, "content-length")) {
                 const auto parsed_length = ParseContentLength(value);
                 if (!parsed_length ||
                     (content_length && *content_length != *parsed_length)) {

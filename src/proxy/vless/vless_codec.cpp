@@ -1,4 +1,5 @@
 #include "proxy/vless/vless_codec.hpp"
+#include "proxy/udp_datagram_frame.hpp"
 #include "common/address_codec.hpp"
 #include "common/const_buffer_span.hpp"
 #include "common/eof_cancellation.hpp"
@@ -79,6 +80,10 @@ bool WriteHeaderAddons(ByteWriter& writer, std::string_view flow) noexcept {
 }
 
 
+constexpr size_t kPacketAddrV4HeaderSize = 1 + sizeof(net::ip::address_v4::bytes_type) + sizeof(uint16_t);
+constexpr size_t kPacketAddrV6HeaderSize = 1 + sizeof(net::ip::address_v6::bytes_type) + sizeof(uint16_t);
+constexpr size_t kMaxUdpHeaderSize = sizeof(uint16_t) + kPacketAddrV6HeaderSize;
+
 struct PacketAddrHeader {
     TargetAddress target;
     size_t consumed = 0;
@@ -91,7 +96,7 @@ size_t EncodePacketAddrHeaderTo(const TargetAddress& target,
         return 0;
     }
     if (target.resolved_addr->is_v4()) {
-        if (capacity < 7) {
+        if (capacity < kPacketAddrV4HeaderSize) {
             return 0;
         }
         out[0] = 0x01;
@@ -99,10 +104,10 @@ size_t EncodePacketAddrHeaderTo(const TargetAddress& target,
         std::memcpy(out + 1, bytes.data(), bytes.size());
         out[5] = static_cast<uint8_t>(target.port >> 8);
         out[6] = static_cast<uint8_t>(target.port);
-        return 7;
+        return kPacketAddrV4HeaderSize;
     }
     if (target.resolved_addr->is_v6()) {
-        if (capacity < 19) {
+        if (capacity < kPacketAddrV6HeaderSize) {
             return 0;
         }
         out[0] = 0x02;
@@ -110,7 +115,7 @@ size_t EncodePacketAddrHeaderTo(const TargetAddress& target,
         std::memcpy(out + 1, bytes.data(), bytes.size());
         out[17] = static_cast<uint8_t>(target.port >> 8);
         out[18] = static_cast<uint8_t>(target.port);
-        return 19;
+        return kPacketAddrV6HeaderSize;
     }
     return 0;
 }
@@ -146,25 +151,23 @@ std::optional<PacketAddrHeader> DecodePacketAddrHeader(
     return std::nullopt;
 }
 
-size_t EncodeUdpHeaderTo(const TargetAddress& target,
+size_t EncodeRequiredUdpHeaderTo(const TargetAddress& target,
                          bool packet_addr,
                          size_t payload_size,
-                         std::span<uint8_t> out) noexcept {
-    if (payload_size > std::numeric_limits<uint16_t>::max()) {
-        return 0;
-    }
+                         std::span<uint8_t> out) {
+    if (!target.IsValid()) throw transport::LinkError(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    if (payload_size > proxy::kMaxFramedDatagramPayload)
+        throw transport::LinkError(ErrorCode::PROTOCOL_ENCODE_FAILED);
 
-    std::array<uint8_t, 19> address{};
+    std::array<uint8_t, kPacketAddrV6HeaderSize> address{};
     const size_t address_size = packet_addr
         ? EncodePacketAddrHeaderTo(target, address.data(), address.size())
         : 0;
-    if (packet_addr && address_size == 0) {
-        return 0;
-    }
+    if (packet_addr && address_size == 0)
+        throw transport::LinkError(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     if (address_size > std::numeric_limits<uint16_t>::max() - payload_size ||
-        out.size() < address_size + 2) {
-        return 0;
-    }
+        out.size() < address_size + 2)
+        throw transport::LinkError(ErrorCode::PROTOCOL_ENCODE_FAILED);
 
     const size_t frame_payload_size = address_size + payload_size;
     out[0] = static_cast<uint8_t>(frame_payload_size >> 8);
@@ -547,7 +550,9 @@ bool IsPacketAddrMagic(const TargetAddress& target) noexcept {
 }
 
 void UdpFramer::Feed(buf::MultiBuffer input) {
-    pending_.Append(std::move(input));
+    if (!pending_.Append(std::move(input))) {
+        throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
 }
 
 bool UdpFramer::Next(FramedUdpPacket& out) {
@@ -558,7 +563,7 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
     case buf::LengthPrefixedPacketBuffer::PopResult::Finished:
         return false;
     case buf::LengthPrefixedPacketBuffer::PopResult::Invalid:
-        throw IoSystemError(io_error::invalid_argument, "invalid VLESS UDP frame");
+        throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
     case buf::LengthPrefixedPacketBuffer::PopResult::Packet:
         break;
     }
@@ -569,8 +574,7 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
             std::span<const uint8_t>(address.data(), copied));
         if (!header || !header->target.IsValid()) {
             pending_.Fail();
-            throw IoSystemError(
-                io_error::invalid_argument, "invalid VLESS packet address");
+            throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         out.target = std::move(header->target);
         (void)payload.DropPrefixBytes(header->consumed);
@@ -580,7 +584,9 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
 }
 
 void UdpFramer::Finish() {
-    pending_.Finish();
+    if (!pending_.Finish()) {
+        throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
 }
 
 net::awaitable<buf::MultiBuffer> UdpFramer::ReadDatagram(
@@ -611,70 +617,24 @@ net::awaitable<buf::MultiBuffer> UdpFramer::ReadDatagram(
 }
 
 net::awaitable<void> WriteUdpDatagram(
-    transport::MultiBufferWriter& writer,
-    buf::MultiBuffer payload,
-    bool packet_addr,
-    const TargetAddress* fixed_target) {
-    const auto datagram = buf::InspectUdpDatagram(payload);
-    if (datagram.status == buf::UdpDatagramStatus::Empty) {
-        co_return;
-    }
-    if (!datagram.Valid() || !datagram.target || !datagram.target->IsValid()) {
-        throw IoSystemError(
-            io_error::invalid_argument,
-            "VLESS UDP datagram contains missing or mixed endpoints");
-    }
-    if (!packet_addr && fixed_target &&
-        !datagram.target->SameEndpoint(*fixed_target)) {
-        throw IoSystemError(
-            io_error::invalid_argument,
-            "VLESS UDP datagram target differs from the fixed session target");
-    }
-
-    if (datagram.payload_size > std::numeric_limits<uint16_t>::max()) {
-        throw IoSystemError(
-            io_error::message_size, "VLESS UDP datagram is too large");
-    }
-
-    std::array<uint8_t, 32> header{};
-    const size_t header_size = EncodeUdpHeaderTo(
-        *datagram.target, packet_addr, datagram.payload_size, header);
-    if (header_size == 0) {
-        throw IoSystemError(
-            io_error::message_size, "invalid VLESS UDP datagram size or target");
-    }
-
-    ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
-    framed.Append(net::buffer(header.data(), header_size));
-    framed.AppendMultiBuffer(payload);
-    co_await writer.WriteBuffers(framed.Span());
-    payload.clear();
+    transport::MultiBufferWriter& writer, buf::MultiBuffer payload,
+    bool packet_addr, const TargetAddress* fixed_target) {
+    const auto datagram = proxy::RequireUdpDatagram(
+        payload, packet_addr ? nullptr : fixed_target);
+    if (!datagram) co_return;
+    std::array<uint8_t, kMaxUdpHeaderSize> header{};
+    const auto size = EncodeRequiredUdpHeaderTo(
+        *datagram->target, packet_addr, datagram->payload_size, header);
+    co_await proxy::WriteFramedDatagram(writer, std::span(header).first(size), payload);
 }
 
 net::awaitable<void> WriteUdpDatagram(
-    transport::MultiBufferWriter& writer,
-    const TargetAddress& target,
-    bool packet_addr,
-    std::span<const net::const_buffer> payload) {
-    const auto payload_size = buf::TrySumBufferSizes(
-        payload, std::numeric_limits<uint16_t>::max());
-    if (!payload_size) {
-        throw IoSystemError(
-            io_error::message_size, "VLESS UDP datagram is too large");
-    }
-
-    std::array<uint8_t, 32> header{};
-    const size_t header_size = EncodeUdpHeaderTo(
-        target, packet_addr, *payload_size, header);
-    if (header_size == 0) {
-        throw IoSystemError(
-            io_error::message_size, "invalid VLESS UDP datagram size or target");
-    }
-
-    ConstBufferSpanBuilder<8> framed;
-    framed.Append(net::buffer(header.data(), header_size));
-    framed.AppendBuffers(payload);
-    co_await writer.WriteBuffers(framed.Span());
+    transport::MultiBufferWriter& writer, const TargetAddress& target,
+    bool packet_addr, std::span<const net::const_buffer> payload) {
+    const auto payload_size = proxy::RequireUdpPayloadSize(payload);
+    std::array<uint8_t, kMaxUdpHeaderSize> header{};
+    const auto size = EncodeRequiredUdpHeaderTo(target, packet_addr, payload_size, header);
+    co_await proxy::WriteFramedDatagram(writer, std::span(header).first(size), payload);
 }
 
 bool IsVisionFlow(std::string_view flow) noexcept {

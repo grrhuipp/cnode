@@ -35,7 +35,6 @@ extern "C" int __wrap_EVP_DigestSqueeze(EVP_MD_CTX* ctx, uint8_t* out, size_t si
 
 namespace {
 using namespace ::vmess;
-using ::proxy::AeadDirection;
 
 void Check(bool condition, std::string_view message) {
     if (!condition) {
@@ -52,14 +51,14 @@ TEST(VmessCipher, Contract) {
     bool mask_failed = false, key_failed = false;
     try { ShakeMask mask(iv.data()); }
     catch (const std::bad_alloc&) { mask_failed = true; }
-    try { VMessCipher cipher(Security::CHACHA20_POLY1305, key.data(), iv.data(), AeadDirection::Encrypt); }
+    try { VMessCipher cipher(Security::CHACHA20_POLY1305, key.data(), iv.data()); }
     catch (const std::bad_alloc&) { key_failed = true; }
     fail_digest_allocation = false;
     Check(mask_failed && key_failed, "crypto allocation failure produced usable protocol state");
-    for (const AeadDirection direction : {AeadDirection::Encrypt, AeadDirection::Decrypt}) {
+    {
         cipher_allocation_countdown = 1;
         bool failed = false;
-        try { VMessCipher cipher(Security::AES_128_GCM, key.data(), iv.data(), direction); }
+        try { VMessCipher cipher(Security::AES_128_GCM, key.data(), iv.data()); }
         catch (const std::bad_alloc&) { failed = true; }
         cipher_allocation_countdown = 0;
         Check(failed, "AEAD context allocation failure did not fail construction");
@@ -79,8 +78,8 @@ TEST(VmessCipher, Contract) {
     for (const Security security : {Security::AES_128_GCM,
                                    Security::CHACHA20_POLY1305,
                                    Security::NONE, Security::ZERO}) {
-        VMessCipher encoder(security, key.data(), iv.data(), AeadDirection::Encrypt);
-        VMessCipher decoder(security, key.data(), iv.data(), AeadDirection::Decrypt);
+        VMessCipher encoder(security, key.data(), iv.data());
+        VMessCipher decoder(security, key.data(), iv.data());
         for (const size_t size : {size_t{0}, size_t{1}, size_t{127}, size_t{0}, size_t{31}}) {
             std::array<uint8_t, 128> input{}, output{};
             std::array<uint8_t, 144> wire{};
@@ -99,8 +98,8 @@ TEST(VmessCipher, Contract) {
             ++frames;
         }
         if (encoder.Overhead()) {
-            VMessCipher fresh_encoder(security, key.data(), iv.data(), AeadDirection::Encrypt);
-            VMessCipher fresh_decoder(security, key.data(), iv.data(), AeadDirection::Decrypt);
+            VMessCipher fresh_encoder(security, key.data(), iv.data());
+            VMessCipher fresh_decoder(security, key.data(), iv.data());
             std::array<uint8_t, 16> tag{};
             uint8_t unused = 0;
             Check(fresh_encoder.Encrypt(nullptr, 0, tag.data()) == 16,

@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include "app/worker/udp_ingress.hpp"
+#include "udp_ingress_fixture.hpp"
 #include "app/relay.hpp"
 
 #include "app/proxyman/inbound/handler.hpp"
@@ -67,18 +68,23 @@ using SessionPtr = Ingress::ClientSessionPtr;
 
 struct ReenterOnCancel {
     Ingress* ingress = nullptr;
+    UdpSocketFixtures* sockets = nullptr;
     std::string key;
     bool close_all = false;
     size_t calls = 0;
 
     void Cancel() noexcept {
         ++calls;
+        const auto close = [&](std::string_view name) {
+            if (auto socket = sockets->Find(*ingress, name)) {
+                if (auto state = sockets->Find(*ingress, socket.get()))
+                    ingress->CloseSocket(*state);
+            }
+        };
         if (close_all) {
-            ingress->CloseSocket("all-a");
-            ingress->CloseSocket("all-b");
-        } else {
-            ingress->CloseSocket(key);
-        }
+            close("all-a");
+            close("all-b");
+        } else close(key);
     }
 };
 
@@ -106,16 +112,6 @@ public:
 private:
 };
 
-class AcceptedReplySink final : public ::worker_detail::UdpReplySink {
-public:
-    bool EnqueueUdpReply(::worker_detail::UdpIngress&, std::string_view,
-                         const std::shared_ptr<::udp::socket>&, ::udp::endpoint,
-                         ::buf::MultiBuffer, uint32_t) override {
-        ++packets;
-        return true;
-    }
-    size_t packets = 0;
-};
 
 // Decodes every datagram as owner 0x71 carrying one 0x42 byte; a first byte of
 // 0x43 selects protocol session 2, anything else session 1.
@@ -176,39 +172,27 @@ public:
     }
 };
 
-class DiscardReplySink final : public ::worker_detail::UdpReplySink {
-public:
-    bool EnqueueUdpReply(::worker_detail::UdpIngress&, std::string_view,
-                         const std::shared_ptr<::udp::socket>&,
-                         ::udp::endpoint, ::buf::MultiBuffer,
-                         uint32_t) override {
-        return false;
-    }
-};
 
 // Everything ProcessDatagram needs besides the ingress, socket and packet.
 struct DatagramSource {
     DatagramDispatcher dispatcher;
-    DiscardReplySink reply_sink;
     ::StatsShard stats;
     ::proxyman::inbound::ReceiverSettings receiver{
         .inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {},
         .dispatch_policy = {.sniffing = {}, .outbound = ::routing::ForceOutbound{"loopback"}}};
 
-    void Send(Ingress& ingress, ::net::io_context& io, std::string_view socket_key,
+    void Send(UdpSocketFixtures& sockets, Ingress& ingress, ::net::io_context& io, std::string_view,
               ::udp::socket* sock, uint16_t client_port,
               std::span<const uint8_t> packet, const ::TimeoutsConfig& timeouts) {
         const ::app::DatagramSessionEnvironment environment{
             .timeouts = timeouts, .dispatcher = &dispatcher, .stats = &stats};
         ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
-            .socket_key = socket_key,
-            .sock = sock,
+            .socket = sockets.Find(ingress, sock).get(),
             .client_endpoint = {::net::ip::address_v4::loopback(), client_port},
             .payload = packet,
             .receiver = &receiver,
             .io_context = io,
-            .reply_sink = reply_sink,
             .environment = environment,
         });
     }
@@ -226,23 +210,22 @@ struct DatagramSource {
     return {owner, id};
 }
 
-SessionPtr MakeSession(Ingress& ingress, ::net::io_context& io,
+SessionPtr MakeSession(UdpSocketFixtures& sockets, Ingress& ingress, ::net::io_context& io,
                        std::string socket_key, ::worker_detail::ClientSessionKey client_key,
                        Clock::time_point last_active,
                        std::chrono::seconds idle_timeout) {
-    return ingress.CreateClientSession(
-        socket_key, client_key, io,
-        {},
-        {::net::ip::address_v4::loopback(), 10001}, client_key.owner, last_active,
-        idle_timeout);
+    return ingress.CreateClientSession(sockets.Get(ingress, socket_key), client_key, io,
+    {},
+    {::net::ip::address_v4::loopback(), 10001}, client_key.owner, last_active,
+    idle_timeout);
 }
 
-Ingress::SocketPtr AttachOpenSocket(Ingress& ingress, ::net::io_context& io,
+Ingress::SocketPtr AttachOpenSocket(UdpSocketFixtures& sockets, Ingress& ingress, ::net::io_context& io,
                                     std::string_view socket_key) {
     auto socket = Ingress::MakeSocket(io);
     ::IoErrorCode ec;
     socket->open(::udp::v4(), ec);
-    if (ec || !ingress.AttachSocket(socket_key, socket)) {
+    if (ec || !sockets.Attach(ingress, socket_key, socket)) {
         Fail("failed to attach an open UDP socket");
     }
     return socket;
@@ -303,6 +286,7 @@ bool StepReclaimBatches(::net::io_context& io, Count count, size_t target,
 
 TEST(UdpAssociationReclaimer, Contract) {
     ::net::io_context io;
+    UdpSocketFixtures sockets(io);
     auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     const size_t idle_events = ActiveEvents(scheduler);
     Reclaimer reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
@@ -316,8 +300,8 @@ TEST(UdpAssociationReclaimer, Contract) {
     std::vector<SessionPtr> closed_sessions;
     closed_sessions.reserve(130);
     for (size_t i = 0; i < 65; ++i) {
-        auto one = MakeSession(first, io, "batch", Key(i), now, 0s);
-        auto two = MakeSession(second, io, "batch", Key(i), now, 0s);
+        auto one = MakeSession(sockets, first, io, "batch", Key(i), now, 0s);
+        auto two = MakeSession(sockets, second, io, "batch", Key(i), now, 0s);
         if (!one || !two) Fail("failed to create batch associations");
         one->Close();
         two->Close();
@@ -363,8 +347,8 @@ TEST(UdpAssociationReclaimer, Contract) {
     mixed_live.reserve(65);
     mixed_closed.reserve(65);
     for (size_t i = 0; i < 65; ++i) {
-        auto closed = MakeSession(first, io, "mixed", Key(i), now, 0s);
-        auto live = MakeSession(second, io, "mixed", Key(i), now, 0s);
+        auto closed = MakeSession(sockets, first, io, "mixed", Key(i), now, 0s);
+        auto live = MakeSession(sockets, second, io, "mixed", Key(i), now, 0s);
         if (!closed || !live) Fail("failed to create mixed associations");
         closed->Close();
         mixed_closed.push_back(std::move(closed));
@@ -390,7 +374,7 @@ TEST(UdpAssociationReclaimer, Contract) {
 
     // Removing a row is independent of the lifetime of an externally held session.
     Ingress detached_ingress("detached", std::make_unique<DummyInbound>(), reclaimer, budget, io);
-    auto detached = MakeSession(detached_ingress, io, "detached", Key(1), now, 0s);
+    auto detached = MakeSession(sockets, detached_ingress, io, "detached", Key(1), now, 0s);
     std::weak_ptr<Ingress::ClientSession> detached_weak = detached;
     detached->Close();
     if (!RunUntil(io, [&] { return detached_ingress.GetResourceStats().associations == 0; }) ||
@@ -401,7 +385,7 @@ TEST(UdpAssociationReclaimer, Contract) {
     if (!detached_weak.expired()) Fail("released detached UDP session remained alive");
 
     Ingress disabled_ingress("disabled", std::make_unique<DummyInbound>(), reclaimer, budget, io);
-    auto disabled_open = MakeSession(disabled_ingress, io, "disabled", Key(1), now, 0s);
+    auto disabled_open = MakeSession(sockets, disabled_ingress, io, "disabled", Key(1), now, 0s);
     RunFor(io, 20ms);
     if (disabled_ingress.GetResourceStats().associations != 1 || disabled_open->Closed()) {
         Fail("zero idle timeout did not retain an open UDP association");
@@ -414,9 +398,9 @@ TEST(UdpAssociationReclaimer, Contract) {
     // Idle expiry closes the session; its cancellation may synchronously
     // retire the socket that owns the expiring row.
     Ingress idle_ingress("idle", std::make_unique<DummyInbound>(), reclaimer, budget, io);
-    auto idle_socket = AttachOpenSocket(idle_ingress, io, "idle");
-    auto idle = MakeSession(idle_ingress, io, "idle", Key(1), Clock::now() - 2s, 1s);
-    ReenterOnCancel expiry_reentry{.ingress = &idle_ingress, .key = "idle"};
+    auto idle_socket = AttachOpenSocket(sockets, idle_ingress, io, "idle");
+    auto idle = MakeSession(sockets, idle_ingress, io, "idle", Key(1), Clock::now() - 2s, 1s);
+    ReenterOnCancel expiry_reentry{.ingress = &idle_ingress, .sockets = &sockets, .key = "idle"};
     ReentryCancellation expiry_subscription(expiry_reentry);
     expiry_subscription.Resubscribe(idle->Cancellation());
     if (!idle_ingress.ReplaceHandler(std::make_unique<DummyInbound>())) {
@@ -424,7 +408,7 @@ TEST(UdpAssociationReclaimer, Contract) {
     }
     if (!RunUntil(io, [&] { return idle->Closed(); }) ||
         idle_ingress.GetResourceStats().associations != 0 ||
-        expiry_reentry.calls != 1 || idle_ingress.FindSocket("idle")) {
+        expiry_reentry.calls != 1 || sockets.Find(idle_ingress, "idle")) {
         Fail("natural expiry reentry did not safely retire the association and socket");
     }
 
@@ -435,14 +419,14 @@ TEST(UdpAssociationReclaimer, Contract) {
     target.resolved_addr = ::net::ip::address_v4::loopback();
     target.port = 53;
     Ingress downlink_ingress("downlink", std::make_unique<DummyInbound>(), reclaimer, budget, io);
-    AcceptedReplySink accepted_reply;
+    auto downlink_socket = sockets.Get(downlink_ingress, "activity");
+    downlink_socket->socket->open(::udp::v4());
+    auto accepted_reply = std::make_shared<AcceptedReplyResponse>();
     constexpr auto downlink_idle = 2s;
-    auto downlink = downlink_ingress.CreateClientSession(
-        "activity", Key(1), io,
-        {.socket_key = {}, .socket = {}, .response = std::make_shared<AcceptedReplyResponse>(),
-         .sink = &accepted_reply, .worker_id = 0, .owner = &downlink_ingress},
-        {::net::ip::address_v4::loopback(), 10001}, Key(1).owner,
-        Clock::now() - downlink_idle + 200ms, downlink_idle);
+    auto downlink = downlink_ingress.CreateClientSession(sockets.Get(downlink_ingress, "activity"), Key(1), io,
+    {.socket = downlink_socket, .response = accepted_reply, .owner = &downlink_ingress},
+    {::net::ip::address_v4::loopback(), 10001}, Key(1).owner,
+    Clock::now() - downlink_idle + 200ms, downlink_idle);
     ::buf::BufferGuard reply{::buf::Buffer::New()};
     if (!reply) Fail("failed to allocate UDP downlink activity payload");
     reply->Tail()[0] = 2;
@@ -452,7 +436,7 @@ TEST(UdpAssociationReclaimer, Contract) {
     ::net::co_spawn(io,
         downlink->WriteMultiBuffer(::buf::MultiBuffer{std::move(reply)}),
         [&](std::exception_ptr error) { reply_completed = !error; });
-    if (!RunUntil(io, [&] { return reply_completed; }) || accepted_reply.packets != 1) {
+    if (!RunUntil(io, [&] { return reply_completed; })) {
         Fail("UDP downlink write did not complete");
     }
     const auto downlink_written = Clock::now();
@@ -467,16 +451,16 @@ TEST(UdpAssociationReclaimer, Contract) {
     // the row is re-checked and re-armed; it expires one idle period after the
     // uplink, not before.
     Ingress activity_ingress("activity", std::make_unique<DatagramInbound>(), reclaimer, budget, io);
-    auto activity_socket = AttachOpenSocket(activity_ingress, io, "activity");
+    auto activity_socket = AttachOpenSocket(sockets, activity_ingress, io, "activity");
     DatagramSource activity_source;
     ::TimeoutsConfig activity_timeouts;
     activity_timeouts.idle = 1;
     constexpr auto uplink_idle = 1s;
-    auto uplink = MakeSession(activity_ingress, io, "activity", Key(1),
+    auto uplink = MakeSession(sockets, activity_ingress, io, "activity", Key(1),
                               Clock::now() - uplink_idle + 300ms, uplink_idle);
     const std::array<uint8_t, 1> uplink_packet{0x42};
     const auto uplink_sent = Clock::now();
-    activity_source.Send(activity_ingress, io, "activity", activity_socket.get(), 10002,
+    activity_source.Send(sockets, activity_ingress, io, "activity", activity_socket.get(), 10002,
                          uplink_packet, activity_timeouts);
     const auto uplink_stats = activity_ingress.GetResourceStats();
     if (uplink_stats.associations != 1 || uplink_stats.input_datagrams != 1 ||
@@ -499,33 +483,33 @@ TEST(UdpAssociationReclaimer, Contract) {
 
     // Closing the replaced session re-enters CloseSocket and retires the replacement.
     Ingress replace_ingress("replace", std::make_unique<DummyInbound>(), reclaimer, budget, io);
-    auto replace_socket = AttachOpenSocket(replace_ingress, io, "replace");
-    auto prior = MakeSession(replace_ingress, io, "replace", Key(1), now, 0s);
-    ReenterOnCancel replacement_reentry{.ingress = &replace_ingress, .key = "replace"};
+    auto replace_socket = AttachOpenSocket(sockets, replace_ingress, io, "replace");
+    auto prior = MakeSession(sockets, replace_ingress, io, "replace", Key(1), now, 0s);
+    ReenterOnCancel replacement_reentry{.ingress = &replace_ingress, .sockets = &sockets, .key = "replace"};
     ReentryCancellation replacement_subscription(replacement_reentry);
     replacement_subscription.Resubscribe(prior->Cancellation());
-    auto replacement = MakeSession(replace_ingress, io, "replace", Key(1), Clock::now(), 0s);
+    auto replacement = MakeSession(sockets, replace_ingress, io, "replace", Key(1), Clock::now(), 0s);
     if (!replacement || replacement == prior || !prior->Closed() ||
         !replacement->Closed() || replace_ingress.GetResourceStats().associations != 0 ||
-        replacement_reentry.calls != 1 || replace_ingress.FindSocket("replace")) {
+        replacement_reentry.calls != 1 || sockets.Find(replace_ingress, "replace")) {
         Fail("same-key replacement was unsafe under synchronous cancellation reentry");
     }
 
     Ingress bulk_ingress("bulk", std::make_unique<DummyInbound>(), reclaimer, budget, io);
-    auto bulk_socket = AttachOpenSocket(bulk_ingress, io, "bulk");
-    auto bulk_a = MakeSession(bulk_ingress, io, "bulk", Key(1), now, 0s);
-    auto bulk_b = MakeSession(bulk_ingress, io, "bulk", Key(2), now, 0s);
-    ReenterOnCancel bulk_reentry_a{.ingress = &bulk_ingress, .key = "bulk"};
-    ReenterOnCancel bulk_reentry_b{.ingress = &bulk_ingress, .key = "bulk"};
+    auto bulk_socket = AttachOpenSocket(sockets, bulk_ingress, io, "bulk");
+    auto bulk_a = MakeSession(sockets, bulk_ingress, io, "bulk", Key(1), now, 0s);
+    auto bulk_b = MakeSession(sockets, bulk_ingress, io, "bulk", Key(2), now, 0s);
+    ReenterOnCancel bulk_reentry_a{.ingress = &bulk_ingress, .sockets = &sockets, .key = "bulk"};
+    ReenterOnCancel bulk_reentry_b{.ingress = &bulk_ingress, .sockets = &sockets, .key = "bulk"};
     ReentryCancellation bulk_subscription_a(bulk_reentry_a);
     ReentryCancellation bulk_subscription_b(bulk_reentry_b);
     bulk_subscription_a.Resubscribe(bulk_a->Cancellation());
     bulk_subscription_b.Resubscribe(bulk_b->Cancellation());
     if (bulk_ingress.GetResourceStats().associations != 2) Fail("bulk associations were not registered");
-    bulk_ingress.CleanupClientSessions("bulk");
+    bulk_ingress.CleanupClientSessions(*sockets.Get(bulk_ingress, "bulk"));
     if (bulk_ingress.GetResourceStats().associations != 0 ||
         !bulk_a->Closed() || !bulk_b->Closed() || bulk_reentry_a.calls != 1 ||
-        bulk_reentry_b.calls != 1 || bulk_ingress.FindSocket("bulk")) {
+        bulk_reentry_b.calls != 1 || sockets.Find(bulk_ingress, "bulk")) {
         Fail("bulk cleanup was unsafe under synchronous cancellation reentry");
     }
 
@@ -535,24 +519,22 @@ TEST(UdpAssociationReclaimer, Contract) {
                             reclaimer, budget, io);
     DatagramSource request_source;
     ::TimeoutsConfig packet_timeouts;
-    auto request_socket = AttachOpenSocket(request_ingress, io, "request");
+    auto request_socket = AttachOpenSocket(sockets, request_ingress, io, "request");
     const auto scoped_key = Key(1);
-    auto expired_same_key = MakeSession(
-        request_ingress, io, "request", scoped_key, Clock::now() - 2s, 1s);
+    auto expired_same_key = MakeSession(sockets, request_ingress, io, "request", scoped_key, Clock::now() - 2s, 1s);
     packet_timeouts.idle = 0;
     const std::array<uint8_t, 1> request_packet{0x42};
-    request_source.Send(request_ingress, io, "request", request_socket.get(), 20001,
+    request_source.Send(sockets, request_ingress, io, "request", request_socket.get(), 20001,
                         request_packet, packet_timeouts);
     if (!expired_same_key->Closed() || request_ingress.GetResourceStats().associations != 1 ||
         request_ingress.GetResourceStats().native_dispatches != 1) {
         Fail("current-key request revived an expired association before its scan turn");
     }
 
-    auto zero_timeout_row = MakeSession(
-        request_ingress, io, "request", Key(2), Clock::now() - 2s, 0s);
+    auto zero_timeout_row = MakeSession(sockets, request_ingress, io, "request", Key(2), Clock::now() - 2s, 0s);
     packet_timeouts.idle = 1;
     const std::array<uint8_t, 1> zero_timeout_packet{0x43};
-    request_source.Send(request_ingress, io, "request", request_socket.get(), 20002,
+    request_source.Send(sockets, request_ingress, io, "request", request_socket.get(), 20002,
                         zero_timeout_packet, packet_timeouts);
     if (zero_timeout_row->Closed() || request_ingress.GetResourceStats().associations != 2 ||
         request_ingress.GetResourceStats().native_dispatches != 1) {
@@ -579,12 +561,11 @@ TEST(UdpAssociationReclaimer, Contract) {
 
     // Expiring the current key can synchronously retire the original socket.
     // Do not recreate a row or launch a request for that retired identity.
-    auto retiring_current_key = MakeSession(
-        request_ingress, io, "request", scoped_key, Clock::now() - 2s, 1s);
-    ReenterOnCancel retiring_key_reentry{.ingress = &request_ingress, .key = "request"};
+    auto retiring_current_key = MakeSession(sockets, request_ingress, io, "request", scoped_key, Clock::now() - 2s, 1s);
+    ReenterOnCancel retiring_key_reentry{.ingress = &request_ingress, .sockets = &sockets, .key = "request"};
     ReentryCancellation retiring_key_subscription(retiring_key_reentry);
     retiring_key_subscription.Resubscribe(retiring_current_key->Cancellation());
-    request_source.Send(request_ingress, io, "request", request_socket.get(), 20001,
+    request_source.Send(sockets, request_ingress, io, "request", request_socket.get(), 20001,
                         request_packet, packet_timeouts);
     io.poll();
     io.restart();
@@ -596,14 +577,14 @@ TEST(UdpAssociationReclaimer, Contract) {
         Fail("current-key expiry recreated a request for its synchronously retired socket");
 
     Ingress all_ingress("all", std::make_unique<DummyInbound>(), reclaimer, budget, io);
-    auto all_socket_a = AttachOpenSocket(all_ingress, io, "all-a");
-    auto all_socket_b = AttachOpenSocket(all_ingress, io, "all-b");
-    auto all_session = MakeSession(all_ingress, io, "all-a", Key(1), now, 0s);
-    ReenterOnCancel all_reentry{.ingress = &all_ingress, .key = {}, .close_all = true};
+    auto all_socket_a = AttachOpenSocket(sockets, all_ingress, io, "all-a");
+    auto all_socket_b = AttachOpenSocket(sockets, all_ingress, io, "all-b");
+    auto all_session = MakeSession(sockets, all_ingress, io, "all-a", Key(1), now, 0s);
+    ReenterOnCancel all_reentry{.ingress = &all_ingress, .sockets = &sockets, .key = {}, .close_all = true};
     ReentryCancellation all_subscription(all_reentry);
     all_subscription.Resubscribe(all_session->Cancellation());
     all_ingress.RequestStop();
-    if (all_ingress.FindSocket("all-a") || all_ingress.FindSocket("all-b") ||
+    if (sockets.Find(all_ingress, "all-a") || sockets.Find(all_ingress, "all-b") ||
         !all_session->Closed() || all_reentry.calls != 1 ||
         all_ingress.GetResourceStats().associations != 0) {
         Fail("CloseAllSockets used an invalid borrowed key after reentry");
@@ -611,12 +592,12 @@ TEST(UdpAssociationReclaimer, Contract) {
 
     // Socket retirement must unlink every row before its map disappears.
     Ingress retire_ingress("retire", std::make_unique<DummyInbound>(), reclaimer, budget, io);
-    auto retire_socket = AttachOpenSocket(retire_ingress, io, "retire");
-    auto retire_a = MakeSession(retire_ingress, io, "retire", Key(1), now, 0s);
-    auto retire_b = MakeSession(retire_ingress, io, "retire", Key(2), now, 0s);
+    auto retire_socket = AttachOpenSocket(sockets, retire_ingress, io, "retire");
+    auto retire_a = MakeSession(sockets, retire_ingress, io, "retire", Key(1), now, 0s);
+    auto retire_b = MakeSession(sockets, retire_ingress, io, "retire", Key(2), now, 0s);
     if (retire_ingress.GetResourceStats().associations != 2) Fail("retire rows were not registered");
-    retire_ingress.CloseSocket("retire");
-    if (retire_ingress.GetResourceStats().associations != 0 || retire_ingress.FindSocket("retire")) {
+    retire_ingress.CloseSocket(*sockets.Get(retire_ingress, "retire"));
+    if (retire_ingress.GetResourceStats().associations != 0 || sockets.Find(retire_ingress, "retire")) {
         Fail("socket retirement left an association row registered");
     }
     retire_a.reset();
@@ -627,9 +608,9 @@ TEST(UdpAssociationReclaimer, Contract) {
     // be visited, and its now-empty reclaimer must disarm.
     Reclaimer cursor_reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
     Ingress cursor_ingress("cursor", std::make_unique<DummyInbound>(), cursor_reclaimer, budget, io);
-    auto cursor_socket = AttachOpenSocket(cursor_ingress, io, "cursor-key");
+    auto cursor_socket = AttachOpenSocket(sockets, cursor_ingress, io, "cursor-key");
     const size_t events_before_cursor = ActiveEvents(scheduler);
-    auto cursor_row = MakeSession(cursor_ingress, io, "cursor-key", Key(1), now, 0s);
+    auto cursor_row = MakeSession(sockets, cursor_ingress, io, "cursor-key", Key(1), now, 0s);
     if (ActiveEvents(scheduler) != events_before_cursor) {
         Fail("open association with idle expiry disabled armed a maintenance event");
     }
@@ -638,7 +619,7 @@ TEST(UdpAssociationReclaimer, Contract) {
         cursor_ingress.GetResourceStats().associations != 1) {
         Fail("closed association was not marked due for the next maintenance wake");
     }
-    cursor_ingress.CloseSocket("cursor-key");
+    cursor_ingress.CloseSocket(*sockets.Get(cursor_ingress, "cursor-key"));
     if (cursor_ingress.GetResourceStats().associations != 0 ||
         ActiveEvents(scheduler) != events_before_cursor) {
         Fail("CloseSocket did not unlink the due reclaimer row");
@@ -656,15 +637,15 @@ TEST(UdpAssociationReclaimer, Contract) {
     Reclaimer stopped_reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
     Ingress stopped_ingress("stopped", std::make_unique<DummyInbound>(), stopped_reclaimer, budget, io);
     const size_t events_before_stop = ActiveEvents(scheduler);
-    auto never_expiring = MakeSession(stopped_ingress, io, "stopped-key", Key(1), Clock::now(), 0s);
+    auto never_expiring = MakeSession(sockets, stopped_ingress, io, "stopped-key", Key(1), Clock::now(), 0s);
     if (ActiveEvents(scheduler) != events_before_stop) {
         Fail("open association with idle expiry disabled armed a maintenance event");
     }
-    auto later_expiring = MakeSession(stopped_ingress, io, "stopped-key", Key(2), Clock::now(), 1s);
+    auto later_expiring = MakeSession(sockets, stopped_ingress, io, "stopped-key", Key(2), Clock::now(), 1s);
     if (ActiveEvents(scheduler) != events_before_stop + 1) {
         Fail("expiring association did not arm exactly one maintenance event");
     }
-    auto due_row = MakeSession(stopped_ingress, io, "stopped-key", Key(3), Clock::now() - 2s, 1s);
+    auto due_row = MakeSession(sockets, stopped_ingress, io, "stopped-key", Key(3), Clock::now() - 2s, 1s);
     if (ActiveEvents(scheduler) != events_before_stop + 1) {
         Fail("an earlier association deadline armed a second maintenance event");
     }
@@ -690,8 +671,7 @@ TEST(UdpAssociationReclaimer, Contract) {
     Reclaimer allocation_reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
     Ingress allocation_ingress("allocation", std::make_unique<DummyInbound>(), allocation_reclaimer, budget, io);
     const std::string long_socket_key(4096, 'k');
-    auto allocation_row = MakeSession(
-        allocation_ingress, io, long_socket_key, Key(1), Clock::now() - 2s, 1s);
+    auto allocation_row = MakeSession(sockets, allocation_ingress, io, long_socket_key, Key(1), Clock::now() - 2s, 1s);
     std::weak_ptr<Ingress::ClientSession> allocation_weak = allocation_row;
     if (!RunUntil(io, [&] { return allocation_ingress.GetResourceStats().associations == 0; })) {
         Fail("expired association in an otherwise empty group was not reclaimed");

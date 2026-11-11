@@ -1,25 +1,27 @@
 #pragma once
 
+#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/defaults.hpp"
 #include "common/domain_name.hpp"
 #include "common/error.hpp"
 #include "common/ip_utils.hpp"
-#include "common/target_address.hpp"
 #include "common/session.hpp"
+#include "common/target_address.hpp"
 #include "transport/async_stream.hpp"
-#include "common/allocator.hpp"
+#include "transport/internet/outbound_bind.hpp"
 #include "transport/internet/stream_settings.hpp"
+#include "transport/internet/transport_security.hpp"
+
+#include <tl/expected.hpp>
 
 #include <chrono>
 #include <memory>
 #include <optional>
 #include <span>
-#include <string_view>
 #include <string>
-#include <tl/expected.hpp>
+#include <string_view>
 #include <utility>
-#include <vector>
 
 namespace app::dns {
 class DNS;

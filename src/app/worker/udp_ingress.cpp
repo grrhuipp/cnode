@@ -63,7 +63,7 @@ void UdpAssociationReclaimer::ReserveRow() {
 }
 
 void UdpAssociationReclaimer::Register(
-    UdpAssociationHook& hook, UdpIngress& owner, std::string_view socket_key,
+    UdpAssociationHook& hook, UdpIngress& owner, UdpSocketState& socket,
     const ClientSessionKey& client_key, std::chrono::seconds idle_timeout,
     TimePoint deadline) noexcept {
     if (stopped_) {
@@ -76,7 +76,7 @@ void UdpAssociationReclaimer::Register(
         FailRuntime("udp-maintenance", "association registered without reserved capacity");
     }
     hook.owner = &owner;
-    hook.socket_key = socket_key;
+    hook.socket = &socket;
     hook.client_key = &client_key;
     hook.idle_timeout = idle_timeout;
     hook.deadline = deadline;
@@ -251,7 +251,7 @@ template <class Function>
 bool UdpIngress::ReplyRoute::Send(UDPPacketView packet, const udp::endpoint& endpoint) {
     auto payload = response->Encode(packet);
     if (payload.empty()) return false;
-    return sink->EnqueueUdpReply(*owner, socket_key, socket, endpoint, std::move(payload), worker_id);
+    return owner->SendReply(socket, endpoint, std::move(payload), worker_id);
 }
 
 UdpIngress::ClientSession::ClientSession(
@@ -391,7 +391,7 @@ UdpIngress::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
 }
 
 std::optional<UdpIngress::PendingUdpReply> UdpIngress::BeginReplySend(
-    ReplyQueueState& queue) {
+    SocketState& queue) {
     if (queue.active_id != 0 || queue.pending.empty()) return std::nullopt;
     if (last_reply_id_ == std::numeric_limits<uint64_t>::max())
         throw IoSystemError(io_error::no_buffer_space, "UDP reply send generation exhausted");
@@ -414,9 +414,9 @@ std::optional<UdpIngress::PendingUdpReply> UdpIngress::BeginReplySend(
     return packet;
 }
 
-void UdpIngress::Link(UdpClientSession& row, std::string_view socket_key,
+void UdpIngress::Link(UdpClientSession& row, SocketState& socket,
                       const ClientSessionKey& client_key, std::chrono::seconds idle_timeout) noexcept {
-    reclaimer_.Register(row.reclaim_hook, *this, socket_key, client_key, idle_timeout,
+    reclaimer_.Register(row.reclaim_hook, *this, socket, client_key, idle_timeout,
                         UdpAssociationExpiry(row.reclaim_hook.last_active, idle_timeout));
     row.link->association_hook_ = &row.reclaim_hook;
 }
@@ -424,21 +424,19 @@ void UdpIngress::Link(UdpClientSession& row, std::string_view socket_key,
 void UdpIngress::SetLocalAssociation(const UdpAssociationHook& hook,
                                      InboundDatagramAssociation* association) noexcept {
     if (!hook.client_key || !hook.client_key->session_id) return;
-    auto socket = udp_sockets_.find(hook.socket_key);
-    if (socket == udp_sockets_.end()) return;
+    if (!hook.socket) return;
     const auto& key = *hook.client_key;
-    auto entry = socket->second.associations.find(
+    auto entry = hook.socket->associations.find(
         InboundDatagramAssociationKey{key.owner, *key.session_id, key.configuration});
-    if (entry != socket->second.associations.end()) entry->second = association;
+    if (entry != hook.socket->associations.end()) entry->second = association;
 }
 
 void UdpIngress::Unlink(UdpClientSession& row) noexcept {
     const auto& hook = row.reclaim_hook;
     if (hook.client_key && hook.client_key->session_id) {
-        auto socket = udp_sockets_.find(hook.socket_key);
-        if (socket != udp_sockets_.end()) {
+        if (hook.socket) {
             const auto& key = *hook.client_key;
-            socket->second.associations.erase(
+            hook.socket->associations.erase(
                 InboundDatagramAssociationKey{key.owner, *key.session_id, key.configuration});
         }
     }
@@ -474,20 +472,21 @@ UdpIngress::UdpIngress(
     , proxy_(std::move(proxy))
     , reclaimer_(reclaimer)
     , budget_(budget)
+    , io_context_(io_context)
     , completion_signal_(io_context, 1) {}
 
 UdpIngress::~UdpIngress() noexcept {
-    if (outstanding_jobs_ != 0) {
+    if (outstanding_jobs_ != 0 || reply_senders_ != 0) {
         FailRuntime("udp-ingress", "destroyed with native dispatch jobs outstanding");
     }
-    CleanupAllClientSessions();
+    RequestStop();
 }
 
 UdpIngress::ResourceStats UdpIngress::GetResourceStats() const noexcept {
     ResourceStats stats{};
-    for (const auto& [socket_key, sessions] : client_sessions_) {
-        (void)socket_key;
-        for (const auto& [client_key, session] : sessions) {
+    for (const auto& [identity, socket] : sockets_) {
+        (void)identity;
+        for (const auto& [client_key, session] : socket->sessions) {
             (void)client_key;
             ++stats.associations;
             if (!session.link || session.link->Closed()) {
@@ -498,10 +497,7 @@ UdpIngress::ResourceStats UdpIngress::GetResourceStats() const noexcept {
                 stats.input_bytes += session.link->queued_bytes_;
             }
         }
-    }
-    stats.native_dispatches = outstanding_jobs_;
-    for (const auto& [socket_key, queue] : reply_queues_) {
-        (void)socket_key;
+        const auto& queue = *socket;
         stats.reply_datagrams += queue.pending.size();
         stats.reply_bytes += queue.queued_bytes;
         if (queue.active_id != 0) {
@@ -510,6 +506,7 @@ UdpIngress::ResourceStats UdpIngress::GetResourceStats() const noexcept {
             stats.reply_bytes += queue.active_payload_size;
         }
     }
+    stats.native_dispatches = outstanding_jobs_;
     return stats;
 }
 
@@ -525,11 +522,9 @@ bool UdpIngress::ReplaceHandler(
 void UdpIngress::RequestStop() noexcept {
     if (state_ != State::Running) return;
     state_ = State::Stopping;
-    while (!udp_sockets_.empty()) {
-        CloseSocket(udp_sockets_.begin()->first);
+    while (!sockets_.empty()) {
+        CloseSocket(*sockets_.begin()->second);
     }
-    CleanupAllClientSessions();
-    reply_queues_.clear();
 
     ClientSession* notify = jobs_;
     jobs_ = nullptr;
@@ -549,7 +544,7 @@ void UdpIngress::RequestStop() noexcept {
         auto pin = std::move(current->notification_pin_);
         if (pin) pin->Close();
     }
-    if (outstanding_jobs_ == 0) state_ = State::Drained;
+    NotifyCompletion();
 }
 
 net::awaitable<void> UdpIngress::AsyncJoin() {
@@ -564,11 +559,11 @@ net::awaitable<void> UdpIngress::AsyncJoin() {
             ~ReleaseObserver() { --observers; }
         } release{join_observers_};
         try {
-            while (outstanding_jobs_ != 0) {
+            while (outstanding_jobs_ != 0 || reply_senders_ != 0) {
                 auto [ec] = co_await completion_signal_.async_receive(
                     net::as_tuple(asio::bind_cancellation_slot(
                         asio::cancellation_slot{}, net::use_awaitable)));
-                if (ec && outstanding_jobs_ != 0)
+                if (ec && (outstanding_jobs_ != 0 || reply_senders_ != 0))
                     throw IoSystemError(ec, "UDP native dispatch join failed");
             }
             if (state_ == State::Stopping)
@@ -601,22 +596,13 @@ void UdpIngress::DetachNativeJob(ClientSession& session) noexcept {
         FailRuntime("udp-ingress", "native dispatch completion underflow");
     }
     --outstanding_jobs_;
-    if (state_ == State::Stopping && outstanding_jobs_ == 0)
-        state_ = State::Drained;
-    if (join_observers_ != 0 && outstanding_jobs_ == 0) {
-        try {
-            if (!completion_signal_.try_send(IoErrorCode{}))
-                FailRuntime("udp-ingress-join", "completion event channel was full");
-        } catch (...) {
-            FailRuntime("udp-ingress-join", "failed to signal native job drain");
-        }
-    }
+    NotifyCompletion();
 }
 
 void UdpIngress::RetireNativeJob(ClientSession& session) noexcept {
-    DetachNativeJob(session);
     session.job_pin_.reset();
     session.request_.reset();
+    DetachNativeJob(session);
 }
 
 void UdpIngress::RegisterNativeJob(const ClientSessionPtr& session) {
@@ -683,7 +669,7 @@ net::awaitable<void> UdpIngress::RunNativeDispatch(ClientSessionPtr client_sessi
 
 void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
     if (state_ != State::Running || !proxy_ ||
-        !datagram.sock || datagram.payload.empty()) {
+        !datagram.socket || !OwnsSocket(*datagram.socket) || datagram.payload.empty()) {
         return;
     }
     if (!datagram.receiver) {
@@ -694,9 +680,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         return;
     }
 
-    const std::string_view socket_key = datagram.socket_key;
-    const auto socket = udp_sockets_.find(socket_key);
-    if (socket == udp_sockets_.end() || socket->second.socket.get() != datagram.sock) return;
+    auto& socket = *datagram.socket;
     const auto now = std::chrono::steady_clock::now();
 
     const auto normalized_client_addr =
@@ -704,7 +688,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
     auto decoded = proxy_->Process(InboundDatagramRequest{
         .tag = tag_,
         .payload = datagram.payload,
-        .associations = &socket->second.associations,
+        .associations = &socket.associations,
         .configuration = datagram.environment.prepared
             ? datagram.environment.prepared->settings.get() : nullptr,
         .worker_id = datagram.worker_id,
@@ -732,10 +716,8 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         if (decoded->committed_association) {
             const ClientSessionKey key{decoded->session_owner, decoded->session_id, {},
                                        prepared->settings.get()};
-            if (auto outer = client_sessions_.find(socket_key);
-                outer != client_sessions_.end()) {
-                auto row = outer->second.find(key);
-                if (row != outer->second.end() && row->second.link) {
+            if (auto row = socket.sessions.find(key); row != socket.sessions.end()) {
+                if (row->second.link) {
                     auto session = row->second.link;
                     if (session->handoff_record_ && !session->Closed() &&
                         session->handoff_record_->association.get() == decoded->committed_association) {
@@ -749,14 +731,13 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         }
         if (!decoded->user) return;
         UdpHandoffIdentity identity{
-            memory::String(socket_key), memory::String(tag_),
-            prepared->settings.get(),
+            &socket,
             ClientSessionKey{decoded->session_owner, decoded->session_id, {},
                              prepared->settings.get()}};
-        auto record = UdpHandoffDirectory::Claim(
-            handoff_records_, identity, prepared->settings,
-            *decoded->association_policy);
+        auto record = handoff_directory_.Claim(
+            identity, prepared->settings, *decoded->association_policy);
         if (!record) return;
+        record->socket_pin = sockets_.at(&socket);
         auto release_claim = MakeScopeExit([record]() noexcept {
             record->association->claimed = false;
         });
@@ -788,7 +769,7 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
     InboundDatagramResult result, std::chrono::steady_clock::time_point now,
     std::shared_ptr<UdpHandoffRecord> record) {
     auto* decoded = &result;
-    const auto socket_key = datagram.socket_key;
+    auto& socket = *datagram.socket;
 
     auto client_key_log = [&]() {
         return TargetAddress(client_address, datagram.client_endpoint.port());
@@ -806,16 +787,15 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
     }
 
     ClientSessionPtr current_session;
-    if (auto outer = client_sessions_.find(socket_key);
-        outer != client_sessions_.end()) {
-        if (auto row = outer->second.find(client_session_key);
-            row != outer->second.end()) {
+    {
+        if (auto row = socket.sessions.find(client_session_key);
+            row != socket.sessions.end()) {
             if (ShouldReclaim(
                     row->second, now, row->second.reclaim_hook.idle_timeout)) {
                 ReclaimAssociation(row->second.reclaim_hook, now);
                 // Synchronous cancellation may retire or replace the listener.
                 // The decoded packet cannot create a request for its old socket.
-                if (!OwnsSocket(socket_key, datagram.sock)) return;
+                if (!OwnsSocket(socket)) return;
             } else if (row->second.link && !row->second.link->Closed()) {
                 current_session = row->second.link;
                 if (current_session->Owns(decoded->session_owner)) {
@@ -846,41 +826,31 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
             return;
         }
 
-        const auto sock_it = udp_sockets_.find(socket_key);
-        if (sock_it == udp_sockets_.end() ||
-            sock_it->second.socket.get() != datagram.sock ||
-            state_ != State::Running) {
-            return;
-        }
-        auto stable_socket = sock_it->second.socket;
-        // Copied out: session creation may re-enter CloseSocket and erase the row.
-        const auto local_endpoint = sock_it->second.local_endpoint;
+        if (!OwnsSocket(socket) || state_ != State::Running) return;
+        const auto local_endpoint = socket.local_endpoint;
 
         const uint32_t worker_id = datagram.worker_id;
+        auto socket_pin = sockets_.at(&socket);
         ReplyRoute reply{
-            .socket_key = memory::String{socket_key},
-            .socket = stable_socket,
+            .socket = socket_pin,
             .response = std::move(*response),
-            .sink = &datagram.reply_sink,
-            .worker_id = worker_id,
-            .owner = this};
+            .owner = this,
+            .worker_id = worker_id};
         auto client_session = CreateClientSession(
-            socket_key, client_session_key, datagram.io_context,
+            socket_pin, client_session_key, datagram.io_context,
             std::move(reply), datagram.client_endpoint,
             decoded->session_owner, now, datagram.environment.timeouts.IdleTimeout(), record);
         if (!client_session) return;
         packet_session = client_session;
         preparation_session = client_session;
         if (state_ != State::Running ||
-            !OwnsSocket(socket_key, stable_socket.get())) {
+            !OwnsSocket(socket)) {
             client_session->Close();
             return;
         }
         if (record) {
-            auto socket = udp_sockets_.find(socket_key);
-            if (socket == udp_sockets_.end() ||
-                socket->second.socket.get() != datagram.sock) return;
-            socket->second.associations.insert_or_assign(
+            if (!OwnsSocket(socket)) return;
+            socket.associations.insert_or_assign(
                 InboundDatagramAssociationKey{decoded->session_owner, *decoded->session_id,
                     client_session_key.configuration},
                 record->association.get());
@@ -972,241 +942,214 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
 }
 
 UdpIngress::ReplyEnqueueResult UdpIngress::EnqueueReply(
-    std::string_view socket_key,
-    udp::endpoint endpoint,
-    buf::MultiBuffer payload) {
-    const size_t payload_size = payload.byte_size();
-    if (payload_size == 0 || payload_size > kMaxQueuedUdpBytes) {
+    const SocketStatePtr& socket, udp::endpoint endpoint, buf::MultiBuffer payload) {
+    if (!socket || !OwnsSocket(*socket) || state_ != State::Running)
         return ReplyEnqueueResult::Rejected;
-    }
-    auto queue_it = reply_queues_.find(socket_key);
-    if (queue_it != reply_queues_.end() &&
-        WouldOverflowUdpQueue(queue_it->second.pending.size(), queue_it->second.queued_bytes, payload_size)) {
+    const auto bytes = payload.byte_size();
+    if (bytes == 0 || WouldOverflowUdpQueue(socket->pending.size(), socket->queued_bytes, bytes))
         return ReplyEnqueueResult::Rejected;
-    }
     auto reservation = budget_.ReservePayload(payload);
     if (!reservation) return ReplyEnqueueResult::Rejected;
-
-    if (queue_it == reply_queues_.end()) {
-        queue_it = reply_queues_.try_emplace(memory::String(socket_key)).first;
-    }
-    auto& queue = queue_it->second;
-    const bool should_start_send = queue.active_id == 0;
-
-    queue.pending.push_back(QueuedUdpReply{
-        .endpoint = std::move(endpoint),
-        .payload = std::move(payload),
-        .payload_size = payload_size,
-        .reservation = std::move(reservation)});
-    queue.queued_bytes += payload_size;
-    return should_start_send
-        ? ReplyEnqueueResult::StartSend
-        : ReplyEnqueueResult::Queued;
+    const bool start = !socket->sender_running && socket->active_id == 0;
+    socket->pending.push_back(SocketState::QueuedReply{
+        std::move(endpoint), std::move(payload), bytes, std::move(reservation)});
+    socket->queued_bytes += bytes;
+    return start ? ReplyEnqueueResult::StartSend : ReplyEnqueueResult::Queued;
 }
 
-std::optional<UdpIngress::PendingUdpReply>
-UdpIngress::BeginReplySend(std::string_view socket_key) {
-    auto it = reply_queues_.find(socket_key);
-    if (it == reply_queues_.end()) return std::nullopt;
-    return BeginReplySend(it->second);
+std::optional<UdpIngress::PendingUdpReply> UdpIngress::CompleteReplySend(
+    SocketState& socket, uint64_t id) {
+    if (id == 0 || socket.active_id != id) return std::nullopt;
+    socket.active_id = 0;
+    socket.active_payload_size = 0;
+    return BeginReplySend(socket);
 }
 
-std::optional<UdpIngress::PendingUdpReply>
-UdpIngress::CompleteReplySend(
-    std::string_view socket_key,
-    uint64_t completed_id) {
-    auto it = reply_queues_.find(socket_key);
-    if (it == reply_queues_.end()) {
-        return std::nullopt;
-    }
-
-    auto& queue = it->second;
-    if (completed_id == 0 || queue.active_id != completed_id) {
-        return std::nullopt;
-    }
-    queue.active_id = 0;
-    queue.active_payload_size = 0;
-    return BeginReplySend(queue);
+void UdpIngress::ClearReplyQueue(SocketState& socket) noexcept {
+    socket.pending.clear();
+    socket.queued_bytes = 0;
+    socket.active_id = 0;
+    socket.active_payload_size = 0;
 }
 
-void UdpIngress::ClearReplyQueue(std::string_view socket_key) {
-    const auto it = reply_queues_.find(socket_key);
-    if (it != reply_queues_.end()) {
-        reply_queues_.erase(it);
+bool UdpIngress::SendReply(const SocketStatePtr& socket, udp::endpoint endpoint,
+                          buf::MultiBuffer payload, uint32_t worker_id) {
+    const auto result = EnqueueReply(socket, std::move(endpoint), std::move(payload));
+    if (result == ReplyEnqueueResult::Rejected) return false;
+    if (result != ReplyEnqueueResult::StartSend) return true;
+    socket->sender_running = true;
+    ++reply_senders_;
+    try {
+        net::co_spawn(io_context_, SendUdpReplies(*this, socket, worker_id),
+            [this, socket, worker_id](std::exception_ptr error) {
+                socket->sender_running = false;
+                --reply_senders_;
+                if (error) {
+                    ClearReplyQueue(*socket);
+                    try {
+                        try { std::rethrow_exception(error); }
+                        catch (const std::exception& failure) {
+                            LOG_ERROR("UDP reply sender failed worker={} > {}", worker_id, failure.what());
+                        } catch (...) {
+                            LOG_ERROR("UDP reply sender failed worker={} > unknown error", worker_id);
+                        }
+                    } catch (...) {}
+                }
+                NotifyCompletion();
+            });
+    } catch (...) {
+        socket->sender_running = false;
+        --reply_senders_;
+        ClearReplyQueue(*socket);
+        NotifyCompletion();
+        throw;
     }
-    MaybeShrinkHashContainer(reply_queues_, 8);
+    return true;
+}
+
+net::awaitable<void> UdpIngress::SendUdpReplies(
+    UdpIngress& ingress, SocketStatePtr socket, uint32_t worker_id) {
+    auto packet = ingress.BeginReplySend(*socket);
+    while (packet && ingress.OwnsSocket(*socket)) {
+        auto [ec, bytes] = co_await socket->socket->async_send_to(
+            packet->SendBuffers(), packet->endpoint, net::as_tuple(net::use_awaitable));
+        if (ec || bytes != packet->payload.byte_size()) {
+            ingress.ClearReplyQueue(*socket);
+            if (ec && ec != net::error::operation_aborted)
+                LOG_NET_DEBUG("UDP reply failed worker={} > {}", worker_id, ec.message());
+            co_return;
+        }
+        packet = ingress.CompleteReplySend(*socket, packet->id);
+    }
+    ingress.ClearReplyQueue(*socket);
+}
+
+void UdpIngress::NotifyCompletion() noexcept {
+    if (outstanding_jobs_ != 0 || reply_senders_ != 0) return;
+    if (state_ == State::Stopping) state_ = State::Drained;
+    if (join_observers_ == 0) return;
+    try {
+        if (!completion_signal_.try_send(IoErrorCode{}))
+            FailRuntime("udp-ingress-join", "completion channel full");
+    } catch (...) {
+        FailRuntime("udp-ingress-join", "completion signal failed");
+    }
 }
 
 UdpIngress::ClientSessionPtr UdpIngress::CreateClientSession(
-    std::string_view socket_key,
-    const ClientSessionKey& client_key,
-    net::io_context& io_context,
-    ReplyRoute reply,
-    udp::endpoint reply_endpoint,
-    InboundDatagramOwner session_owner,
-    std::chrono::steady_clock::time_point last_active,
-    std::chrono::seconds idle_timeout,
-    std::shared_ptr<UdpHandoffRecord> record) {
-    if (state_ != State::Running) return nullptr;
-    if (client_key.owner.size == 0 || !client_key.owner.Same(session_owner)) return nullptr;
+    const SocketStatePtr& socket, const ClientSessionKey& client_key,
+    net::io_context& io_context, ReplyRoute reply, udp::endpoint reply_endpoint,
+    InboundDatagramOwner owner, std::chrono::steady_clock::time_point last_active,
+    std::chrono::seconds idle_timeout, std::shared_ptr<UdpHandoffRecord> record) {
+    if (state_ != State::Running || !socket || !OwnsSocket(*socket) ||
+        client_key.owner.size == 0 || !client_key.owner.Same(owner)) return nullptr;
     auto association = budget_.AcquireAssociation();
     if (!association) return nullptr;
     auto session = std::make_shared<ClientSession>(
-        io_context,
-        std::move(reply),
-        std::move(reply_endpoint),
-        std::move(session_owner), budget_, std::move(association), record);
-    if (record) record->session = session;
+        io_context, std::move(reply), std::move(reply_endpoint), std::move(owner),
+        budget_, std::move(association), record);
     reclaimer_.ReserveRow();
-    auto [sessions_it, group_inserted] = FindOrEmplaceStringKey(
-        client_sessions_, socket_key);
-    auto& sessions = sessions_it->second;
-    auto session_it = sessions.find(client_key);
-    if (session_it == sessions.end()) {
-        try {
-            UdpClientSession candidate{.link = session, .reclaim_hook = {}};
-            candidate.reclaim_hook.last_active = last_active;
-            auto [inserted_it, inserted] = sessions.try_emplace(
-                client_key, std::move(candidate));
-            if (inserted) {
-                Link(inserted_it->second, sessions_it->first, inserted_it->first,
-                     idle_timeout);
-            }
-        } catch (...) {
-            if (group_inserted) client_sessions_.erase(sessions_it);
-            throw;
-        }
+    auto [row, inserted] = socket->sessions.try_emplace(client_key);
+    auto previous = std::move(row->second.link);
+    if (previous) previous->association_hook_ = nullptr;
+    if (!inserted) SetLocalAssociation(row->second.reclaim_hook, nullptr);
+    row->second.link = session;
+    row->second.reclaim_hook.last_active = last_active;
+    if (inserted) {
+        Link(row->second, *socket, row->first, idle_timeout);
     } else {
-        auto& row = session_it->second;
-        // The replaced session's closure must not mark the reused row due.
-        auto previous = std::move(row.link);
-        if (previous) previous->association_hook_ = nullptr;
-        SetLocalAssociation(row.reclaim_hook, nullptr);
-        row.link = session;
-        row.reclaim_hook.last_active = last_active;
-        row.reclaim_hook.idle_timeout = idle_timeout;
-        session->association_hook_ = &row.reclaim_hook;
-        reclaimer_.Rearm(row.reclaim_hook, UdpAssociationExpiry(last_active, idle_timeout));
-        // Close may synchronously call CloseSocket and erase this replacement.
-        // Do not access map iterators or key views after invoking it.
-        if (previous) previous->Close();
+        row->second.reclaim_hook.idle_timeout = idle_timeout;
+        session->association_hook_ = &row->second.reclaim_hook;
+        reclaimer_.Rearm(row->second.reclaim_hook, UdpAssociationExpiry(last_active, idle_timeout));
     }
+    if (record) record->session = session;
+    if (previous) previous->Close();
     return session;
 }
 
 void UdpIngress::ReclaimAssociation(
-    UdpAssociationHook& hook,
-    std::chrono::steady_clock::time_point now) noexcept {
-    auto outer = client_sessions_.find(hook.socket_key);
-    if (outer == client_sessions_.end()) {
-        reclaimer_.Unregister(hook);
-        return;
-    }
-    auto row = outer->second.find(*hook.client_key);
-    if (row == outer->second.end() || &row->second.reclaim_hook != &hook) {
+    UdpAssociationHook& hook, std::chrono::steady_clock::time_point now) noexcept {
+    auto* socket = hook.socket;
+    if (!socket) return;
+    auto row = socket->sessions.find(*hook.client_key);
+    if (row == socket->sessions.end() || &row->second.reclaim_hook != &hook) {
         reclaimer_.Unregister(hook);
         return;
     }
     if (!ShouldReclaim(row->second, now, hook.idle_timeout)) {
-        // Uplink activity moved last_active without touching the heap.
-        reclaimer_.Rearm(hook, UdpAssociationExpiry(row->second.reclaim_hook.last_active,
-                                                    hook.idle_timeout));
+        reclaimer_.Rearm(hook, UdpAssociationExpiry(hook.last_active, hook.idle_timeout));
         return;
     }
     auto session = row->second.link;
-    const bool idle = session && !session->Closed() &&
-        hook.idle_timeout.count() > 0 &&
-        now - row->second.reclaim_hook.last_active > hook.idle_timeout;
     Unlink(row->second);
-    outer->second.erase(row);
-    // Release the last group before Close(): cancellation subscribers may
-    // synchronously re-enter this ingress and erase the same socket key.
-    if (outer->second.empty()) client_sessions_.erase(outer);
-    if (idle) session->Close();
+    socket->sessions.erase(row);
+    MaybeShrinkHashContainer(socket->sessions);
+    if (session) session->Close();
 }
 
-void UdpIngress::CleanupClientSessions(std::string_view socket_key) noexcept {
-    auto sessions_it = client_sessions_.find(socket_key);
-    if (sessions_it == client_sessions_.end()) {
-        return;
+void UdpIngress::CleanupClientSessions(SocketState& socket) noexcept {
+    for (auto& [key, row] : socket.sessions) {
+        (void)key;
+        Unlink(row);
     }
-
-    for (auto& [client_key, session] : sessions_it->second) {
-        (void)client_key;
-        Unlink(session);
-    }
-    auto detached = client_sessions_.extract(sessions_it);
-    for (auto& [client_key, session] : detached.mapped()) {
-        (void)client_key;
-        if (session.link) session.link->Close();
+    decltype(socket.sessions) detached;
+    detached.swap(socket.sessions);
+    for (auto& [key, row] : detached) {
+        (void)key;
+        if (row.link) row.link->Close();
     }
 }
 
 void UdpIngress::CleanupAllClientSessions() noexcept {
-    while (!client_sessions_.empty()) {
-        CleanupClientSessions(client_sessions_.begin()->first);
+    for (;;) {
+        const auto found = std::find_if(sockets_.begin(), sockets_.end(),
+            [](const auto& entry) { return !entry.second->sessions.empty(); });
+        if (found == sockets_.end()) return;
+        auto socket = found->second;
+        CleanupClientSessions(*socket);
     }
 }
 
-UdpIngress::SocketPtr UdpIngress::AttachSocket(
-    std::string_view socket_key,
-    SocketPtr socket) {
-    if (!socket || state_ != State::Running) {
-        return nullptr;
+UdpIngress::SocketStatePtr UdpIngress::AttachSocket(SocketPtr socket) {
+    if (!socket || state_ != State::Running) return nullptr;
+    for (const auto& [identity, state] : sockets_) {
+        (void)identity;
+        if (state->socket == socket) return nullptr;
     }
-    if (udp_sockets_.find(socket_key) != udp_sockets_.end()) {
-        return nullptr;
-    }
-    std::optional<tcp::endpoint> local_endpoint;
-    IoErrorCode local_ec;
-    const auto local_ep = socket->local_endpoint(local_ec);
-    if (!local_ec && !local_ep.address().is_unspecified()) {
-        local_endpoint.emplace(iputil::NormalizeAddress(local_ep.address()), local_ep.port());
-    }
-    udp_sockets_.try_emplace(
-        memory::String{socket_key},
-        BoundSocket{
-            .socket = socket,
-            .local_endpoint = std::move(local_endpoint),
-            .associations = {}});
-    return socket;
+    auto state = std::make_shared<SocketState>();
+    state->owner = this;
+    state->socket = std::move(socket);
+    IoErrorCode ec;
+    const auto local = state->socket->local_endpoint(ec);
+    if (!ec && !local.address().is_unspecified())
+        state->local_endpoint.emplace(iputil::NormalizeAddress(local.address()), local.port());
+    sockets_.emplace(state.get(), state);
+    return state;
 }
 
-UdpIngress::SocketPtr UdpIngress::FindSocket(
-    std::string_view socket_key) noexcept {
-    auto it = udp_sockets_.find(socket_key);
-    return it == udp_sockets_.end() ? nullptr : it->second.socket;
+bool UdpIngress::OwnsSocket(const SocketState& socket) const noexcept {
+    return socket.owner == this;
 }
 
-bool UdpIngress::OwnsSocket(
-    std::string_view socket_key,
-    const udp::socket* socket) const noexcept {
-    auto it = udp_sockets_.find(socket_key);
-    return socket && it != udp_sockets_.end() &&
-        it->second.socket.get() == socket;
-}
+size_t UdpIngress::SocketCount() const noexcept { return sockets_.size(); }
 
-size_t UdpIngress::SocketCount() const noexcept {
-    return udp_sockets_.size();
-}
-
-void UdpIngress::CloseSocket(std::string_view socket_key) noexcept {
-    // Find in every independent table before extraction can invalidate a key
-    // view borrowed from any one of those tables.
-    auto sessions_it = client_sessions_.find(socket_key);
-    auto reply_it = reply_queues_.find(socket_key);
-    auto sock_it = udp_sockets_.find(socket_key);
-    SocketPtr socket_identity = sock_it == udp_sockets_.end()
-        ? SocketPtr{} : sock_it->second.socket;
-
+void UdpIngress::CloseSocket(SocketState& socket) noexcept {
+    auto found = sockets_.find(&socket);
+    if (found == sockets_.end()) return;
+    auto pin = std::move(found->second);
+    sockets_.erase(found);
+    socket.owner = nullptr;
+    ClearReplyQueue(socket);
+    IoErrorCode ec;
+    socket.socket->cancel(ec);
+    socket.socket->close(ec);
+    CleanupClientSessions(socket);
     ClientSession* notify = nullptr;
     for (auto* job = jobs_; job;) {
         auto* next = job->job_next_;
-        if (socket_identity && job->reply_.socket == socket_identity) {
-            if (job->job_previous_)
-                job->job_previous_->job_next_ = next;
-            else
-                jobs_ = next;
+        if (job->reply_.socket.get() == &socket) {
+            if (job->job_previous_) job->job_previous_->job_next_ = next;
+            else jobs_ = next;
             if (next) next->job_previous_ = job->job_previous_;
             job->job_previous_ = nullptr;
             job->job_next_ = nullptr;
@@ -1217,50 +1160,68 @@ void UdpIngress::CloseSocket(std::string_view socket_key) noexcept {
         }
         job = next;
     }
-    ClientSessionOuterMap::node_type detached_sessions;
-    if (sessions_it != client_sessions_.end()) {
-        for (auto& [client_key, session] : sessions_it->second) {
-            (void)client_key;
-            Unlink(session);
-        }
-        detached_sessions = client_sessions_.extract(sessions_it);
-    }
-
-    ReplyQueueMap::node_type detached_replies;
-    if (reply_it != reply_queues_.end()) {
-        detached_replies = reply_queues_.extract(reply_it);
-    }
-
-    UdpSocketMap::node_type detached_socket;
-    if (sock_it != udp_sockets_.end()) {
-        detached_socket = udp_sockets_.extract(sock_it);
-    }
-
     while (notify) {
         auto* current = notify;
         notify = current->notify_next_;
         current->notify_next_ = nullptr;
-        auto pin = std::move(current->notification_pin_);
-        if (pin) pin->Close();
+        auto session = std::move(current->notification_pin_);
+        if (session) session->Close();
     }
+}
 
-    // All views into the live maps are now retired before callbacks can re-enter.
-    if (!detached_sessions.empty()) {
-        for (auto& [client_key, session] : detached_sessions.mapped()) {
-            (void)client_key;
-            if (session.link) session.link->Close();
+std::shared_ptr<UdpHandoffRecord> UdpHandoffDirectory::Claim(
+    const UdpHandoffIdentity& key,
+    std::shared_ptr<const proxyman::inbound::ProtocolSettings> configuration,
+    const InboundDatagramAssociationPolicy& policy) {
+    using Clock = InboundDatagramAssociation::Clock;
+    if (auto found = records_.find(key); found != records_.end()) {
+        auto& record = found->second;
+        if (&record->association->Policy() != &policy || record->association->claimed) return {};
+        if (record->session.expired() &&
+            record->association->ProtectedUntil() != Clock::time_point{} &&
+            record->association->ProtectedUntil() < Clock::now()) {
+            auto association = policy.create();
+            record->association = std::move(association);
+            record->configuration = std::move(configuration);
         }
+        record->association->claimed = true;
+        return record;
     }
-    (void)detached_replies;
-
-    auto socket = detached_socket.empty()
-        ? SocketPtr{}
-        : std::move(detached_socket.mapped().socket);
-    if (socket) {
-        IoErrorCode ec;
-        socket->cancel(ec);
-        socket->close(ec);
+    // 满表每次最多检查固定批次；游标跨请求续扫，绝不按包全表遍历。
+    const auto now = Clock::now();
+    const auto checks = std::min<std::size_t>(64, records_.size());
+    for (std::size_t index = 0; records_.size() >= policy.capacity && cursor_ && index < checks; ++index) {
+        auto* row = cursor_;
+        cursor_ = row->next;
+        if (row->association->claimed || !row->session.expired() ||
+            row->association->ProtectedUntil() >= now) continue;
+        if (row->next == row) cursor_ = nullptr;
+        else {
+            row->previous->next = row->next;
+            row->next->previous = row->previous;
+        }
+        const auto* identity = std::exchange(row->identity, nullptr);
+        row->previous = nullptr;
+        row->next = nullptr;
+        records_.erase(*identity);
     }
+    if (records_.size() >= policy.capacity) return {};
+    auto record = std::make_shared<UdpHandoffRecord>(policy);
+    record->configuration = std::move(configuration);
+    const auto [inserted, accepted] = records_.emplace(key, record);
+    if (!accepted) throw std::logic_error("duplicate UDP handoff identity");
+    record->identity = &inserted->first;
+    if (!cursor_) {
+        record->next = record.get();
+        record->previous = record.get();
+        cursor_ = record.get();
+    } else {
+        record->next = cursor_;
+        record->previous = cursor_->previous;
+        cursor_->previous->next = record.get();
+        cursor_->previous = record.get();
+    }
+    return record;
 }
 
 }  // namespace worker_detail

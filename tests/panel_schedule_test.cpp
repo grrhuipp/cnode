@@ -4,12 +4,14 @@
 
 #include <chrono>
 
-TEST(PanelSchedule, Contract) {
-    using ::controller::PanelInterval;
+TEST(PanelSchedule, UsesPositiveConfiguredInterval) {
     using namespace std::chrono_literals;
+    EXPECT_EQ(::controller::PanelInterval(45, 60), 45s);
+    EXPECT_EQ(::controller::PanelInterval(30, 60), 30s);
+}
 
-    ASSERT_FALSE((PanelInterval(45, 60) != 45s));
-    ASSERT_FALSE((PanelInterval(30, 60) != 30s));
-    ASSERT_FALSE((PanelInterval(0, 60) != 60s));
-    ASSERT_FALSE((PanelInterval(-1, 30) != 30s));
+TEST(PanelSchedule, FallsBackForNonpositiveConfiguredInterval) {
+    using namespace std::chrono_literals;
+    EXPECT_EQ(::controller::PanelInterval(0, 60), 60s);
+    EXPECT_EQ(::controller::PanelInterval(-1, 30), 30s);
 }

@@ -104,7 +104,8 @@ public:
     explicit Fixture(std::string_view network = "http", uint32_t initial_window = kStreamWindow,
                      ::XHttpMode mode = ::XHttpMode::StreamOne)
         : acceptor(io, {net::ip::address_v4::loopback(), 0}), peer(io), sink(std::make_shared<HoldingSink>()) {
-        settings.network = network;
+        settings.network_mode = ParseNetworkMode(network);
+        settings.http.force_http2 = EqualsAsciiCI(network, "h2");
         settings.http.path = "/fixture";
         settings.http.method = "POST";
         settings.http.initial_window_size = initial_window;
@@ -197,7 +198,7 @@ public:
     void Open(uint32_t id, std::string_view path = {}, std::string_view method = "POST",
               bool end = false) {
         Send(Frame(1, static_cast<uint8_t>(4 | (end ? 1 : 0)), id,
-                   Headers(settings.network, path, method)));
+                   Headers(settings.NetworkName(), path, method)));
         Until([&] {
             return std::any_of(frames.begin(), frames.end(), [&](const auto& f) {
                 return f.id == id && f.type == 1;

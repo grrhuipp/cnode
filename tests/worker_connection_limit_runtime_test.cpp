@@ -7,6 +7,7 @@
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
+#include "worker_coordinator_fixture.hpp"
 #include "common/allocator.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"
@@ -209,7 +210,8 @@ net::awaitable<void> Exercise(net::io_context& io, Worker& worker, FixtureState&
 
 void RunCase(app::dns::DNSWorker& dns, uint32_t global, uint32_t per_ip, bool limited) {
     net::io_context control;
-    auto coordinator = std::make_shared<GroupCoordinator>(control);
+    WorkerCoordinatorFixture control_fixture(control);
+    auto coordinator = control_fixture.Get();
     coordinator->Start();
     std::exception_ptr control_failure;
     std::thread control_thread([&] {
@@ -233,8 +235,7 @@ void RunCase(app::dns::DNSWorker& dns, uint32_t global, uint32_t per_ip, bool li
                 config.limits.max_connections_per_ip = per_ip;
                 config.timeouts.idle = 0;
                 config.timeouts.read = 0;
-                auto worker = std::make_unique<Worker>(id, io, config, stats, dns);
-                worker->SetGroupCoordinator(coordinator);
+                auto worker = std::make_unique<Worker>(id, io, config, stats, dns, coordinator);
                 net::co_spawn(io, Exercise(io, *worker, state, ready, limited),
                     [&](std::exception_ptr error) { failures[id] = error; });
                 io.run();

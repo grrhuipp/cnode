@@ -19,7 +19,7 @@ public:
     ~GroupCoordinator();
     void Start();
     // Register fixed Worker routes before their request admission starts.
-    void RegisterWorker(uint32_t worker_id, net::io_context& reactor);
+    void RegisterWorker(net::io_context& reactor);
     [[nodiscard]] uint32_t WorkerCount() const noexcept;
     [[nodiscard]] static GroupCoordinator* ForContext(net::execution_context& context) noexcept;
 
@@ -37,9 +37,6 @@ public:
             return std::invoke(function);
         });
     }
-    template<class T> net::awaitable<T> Post(net::awaitable<T> task) {
-        return mailbox_.Post(RunControl(std::move(task)));
-    }
     [[nodiscard]] net::io_context& Reactor() noexcept { return reactor_; }
     [[nodiscard]] net::execution_context& Services() noexcept { return *services_; }
     void CloseAdmission() noexcept { mailbox_.CloseAdmission(); }
@@ -50,12 +47,6 @@ public:
 private:
     struct ReservedState;
     void EnsureStarted();
-    template<class T> net::awaitable<T> RunControl(net::awaitable<T> task) {
-        EnsureStarted();
-        DrainReserved();
-        if constexpr (std::is_void_v<T>) co_await std::move(task);
-        else co_return co_await std::move(task);
-    }
     void ArmReserved();
     void DrainReserved() noexcept;
     net::io_context& reactor_;

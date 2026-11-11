@@ -63,35 +63,12 @@ namespace {
 void NormalizeInPlace(StreamSettings& settings) {
     // 仅初始化/配置更新时调用，热路径不再做字符串比较
     settings.prepared_security.reset();
-    settings.network = LowerAscii(std::move(settings.network));
-    settings.security = LowerAscii(std::move(settings.security));
-
-    settings.network_mode = ParseNetworkMode(settings.network);
-    if (settings.network_mode == NetworkMode::Http && settings.network == "h2") {
-        settings.http.force_http2 = true;
-    }
-
-    if (settings.security.empty() || settings.security == constants::protocol::kNone) {
-        settings.security_mode = SecurityMode::None;
-    } else if (settings.security == constants::protocol::kTls) {
-        settings.security_mode = SecurityMode::Tls;
-    } else if (settings.security == constants::protocol::kReality) {
-        settings.security_mode = SecurityMode::Reality;
+    if (settings.security_mode == SecurityMode::Reality) {
         settings.tls.min_version = TlsVersion::V1_3;
         settings.tls.max_version = TlsVersion::V1_3;
         if (settings.tls.server_name.empty() && !settings.reality.server_name.empty()) {
             settings.tls.server_name = settings.reality.server_name;
         }
-    } else {
-        settings.security_mode = SecurityMode::Unsupported;
-    }
-
-    if (settings.network_mode == NetworkMode::Grpc) {
-        settings.network = std::string(constants::protocol::kGrpc);
-    } else if (settings.network_mode == NetworkMode::Http) {
-        settings.network = settings.http.force_http2 ? "h2" : std::string(constants::protocol::kHttp);
-    } else if (settings.network_mode == NetworkMode::XHttp) {
-        settings.network = std::string(constants::protocol::kXHttp);
     }
 
     const bool tls_like_for_alpn = settings.IsTls();
@@ -145,6 +122,36 @@ NetworkMode ParseNetworkMode(std::string_view network) noexcept {
     return NetworkMode::Unsupported;
 }
 
+SecurityMode ParseSecurityMode(std::string_view security) noexcept {
+    if (security.empty() || EqualsAsciiCI(security, constants::protocol::kNone)) return SecurityMode::None;
+    if (EqualsAsciiCI(security, constants::protocol::kTls)) return SecurityMode::Tls;
+    if (EqualsAsciiCI(security, constants::protocol::kReality)) return SecurityMode::Reality;
+    return SecurityMode::Unsupported;
+}
+
+std::string_view NetworkModeName(NetworkMode mode) noexcept {
+    switch (mode) {
+        case NetworkMode::Tcp: return "tcp";
+        case NetworkMode::Ws: return "ws";
+        case NetworkMode::HttpUpgrade: return "httpupgrade";
+        case NetworkMode::Grpc: return "grpc";
+        case NetworkMode::Http: return "http";
+        case NetworkMode::XHttp: return "xhttp";
+        case NetworkMode::Unsupported: return "unsupported";
+    }
+    return "unsupported";
+}
+
+std::string_view SecurityModeName(SecurityMode mode) noexcept {
+    switch (mode) {
+        case SecurityMode::None: return "none";
+        case SecurityMode::Tls: return "tls";
+        case SecurityMode::Reality: return "reality";
+        case SecurityMode::Unsupported: return "unsupported";
+    }
+    return "unsupported";
+}
+
 XHttpMode ResolveXHttpOutboundMode(const StreamSettings& settings) noexcept {
     const XHttpConfig& cfg = settings.xhttp;
     if (cfg.mode != XHttpMode::Auto) {
@@ -173,9 +180,7 @@ StreamSettings NormalizeStreamSettings(const StreamSettings& source) {
 StreamSettings NormalizeOutboundStreamSettings(
     const StreamSettings& source, const OutboundStreamDefaults& defaults) {
     auto settings = source;
-    if (settings.network.empty()) settings.network = constants::protocol::kTcp;
-    if (settings.security.empty()) settings.security = constants::protocol::kNone;
-    if (defaults.require_tls) settings.security = constants::protocol::kTls;
+    if (defaults.require_tls) settings.security_mode = SecurityMode::Tls;
     NormalizeInPlace(settings);
     if (settings.IsTls()) {
         if (settings.tls.server_name.empty() && !defaults.fallback_server_name.empty()) {

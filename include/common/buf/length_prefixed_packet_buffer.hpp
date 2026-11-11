@@ -57,28 +57,32 @@ inline void AppendCoalescedStreamInput(MultiBuffer& pending, MultiBuffer input) 
     }
 }
 
-inline void AppendPacketStreamInput(MultiBuffer& pending, MultiBuffer input) {
+// Input rejection is a framing result, not an operating-system I/O failure.
+[[nodiscard]] inline bool AppendPacketStreamInput(MultiBuffer& pending, MultiBuffer input) {
     if (pending.byte_size() > kPacketStreamPendingLimit ||
         input.byte_size() > kPacketStreamPendingLimit - pending.byte_size()) {
-        throw IoSystemError(io_error::message_size, "packet stream pending buffer exceeded");
+        return false;
     }
     AppendCoalescedStreamInput(pending, std::move(input));
+    return true;
 }
 
 class LengthPrefixedPacketBuffer final {
 public:
     enum class PopResult : uint8_t { NeedMore, Packet, Invalid, Finished };
 
-    void Append(MultiBuffer input) {
-        if (state_ != State::Active) {
-            throw IoSystemError(io_error::invalid_argument, "inactive packet stream");
-        }
+    [[nodiscard]] bool Append(MultiBuffer input) {
+        if (state_ != State::Active) return false;
         try {
-            AppendPacketStreamInput(pending_, std::move(input));
+            if (!AppendPacketStreamInput(pending_, std::move(input))) {
+                Fail();
+                return false;
+            }
         } catch (...) {
             Fail();
             throw;
         }
+        return true;
     }
 
     [[nodiscard]] PopResult Pop(MultiBuffer& payload) {
@@ -105,12 +109,13 @@ public:
         return PopResult::Packet;
     }
 
-    void Finish() {
+    [[nodiscard]] bool Finish() noexcept {
         if (state_ == State::Failed || pending_.byte_size() != 0) {
             Fail();
-            throw IoSystemError(io_error::invalid_argument, "truncated packet stream");
+            return false;
         }
         state_ = State::Finished;
+        return true;
     }
 
     void Fail() noexcept {

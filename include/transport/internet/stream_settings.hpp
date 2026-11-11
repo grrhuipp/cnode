@@ -6,12 +6,11 @@
 #include "common/domain_name.hpp"
 #include <openssl/mem.h>
 #include "core/constants.hpp"
-#include "infra/json.hpp"
 #include "transport/internet/http_headers.hpp"
+#include "transport/internet/outbound_bind.hpp"
 
 #include <algorithm>
 #include <array>
-#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -21,59 +20,6 @@
 #include <string_view>
 #include <tl/expected.hpp>
 #include <vector>
-
-class OutboundBind {
-public:
-    enum class Mode : uint8_t {
-        None,
-        Auto,
-        Explicit,
-        Ordered,
-    };
-
-    enum class ChoicePolicy : uint8_t { Random, IpHash, UserHash };
-
-    struct Selection {
-        std::optional<net::ip::address> address; // Empty only when no same-family entry exists.
-    };
-
-    OutboundBind() = default;
-
-    [[nodiscard]] Mode GetMode() const noexcept { return mode_; }
-    [[nodiscard]] bool PrefersIPv6() const noexcept {
-        return mode_ == Mode::Ordered && entries_ && !entries_->empty() && entries_->front().is_v6;
-    }
-    [[nodiscard]] const std::optional<net::ip::address>& ExplicitAddress() const& noexcept {
-        return explicit_address_;
-    }
-    const std::optional<net::ip::address>& ExplicitAddress() const&& = delete;
-
-    [[nodiscard]] static OutboundBind Auto() noexcept;
-    [[nodiscard]] static std::optional<OutboundBind> Parse(std::string_view value);
-    [[nodiscard]] static std::optional<OutboundBind> ParseCandidates(
-        std::span<const std::string_view> entries, ChoicePolicy policy);
-    [[nodiscard]] Selection Select(
-        const net::ip::address& remote,
-        std::string_view client_ip,
-        int64_t user_id = 0,
-        std::string_view user_email = {},
-        std::string_view inbound_tag = {}) const noexcept;
-    // Local address for the None/Auto/Explicit modes; Ordered binds use Select.
-    [[nodiscard]] std::optional<net::ip::address> BindAddressFor(
-        const tcp::endpoint* inbound_local, const net::ip::address& remote) const noexcept;
-
-private:
-    struct Entry {
-        bool is_v6 = false;
-        net::ip::address network_or_ip;
-        uint8_t prefix_length = 0;
-    };
-
-    Mode mode_ = Mode::None;
-    ChoicePolicy policy_ = ChoicePolicy::Random;
-    std::optional<net::ip::address> explicit_address_;
-    std::shared_ptr<const std::vector<Entry>> entries_; // Immutable cold-path snapshot.
-};
 
 namespace transport::internet {
 
@@ -174,43 +120,6 @@ ParseRealityClientVersion(std::string_view value) noexcept {
     return LoadU32BE(version.data());
 }
 
-enum class TlsServerNameExtensionError {
-    InvalidFormat,
-};
-
-[[nodiscard]] inline tl::expected<std::string_view, TlsServerNameExtensionError>
-ParseTlsServerNameExtension(std::span<const uint8_t> extension) noexcept {
-    ByteReader outer(extension);
-    const auto list = outer.ReadBytes(outer.ReadU16BE());
-    if (!outer.Ok() || !outer.Empty()) {
-        return tl::unexpected(TlsServerNameExtensionError::InvalidFormat);
-    }
-
-    std::bitset<256> seen_types;
-    std::string_view host_name;
-    ByteReader reader(list);
-    while (!reader.Empty()) {
-        const uint8_t name_type = reader.ReadU8();
-        const uint16_t name_size = reader.ReadU16BE();
-        const std::string_view name = reader.ReadStringView(name_size);
-        if (!reader.Ok() || name_size == 0 || seen_types.test(name_type)) {
-            return tl::unexpected(TlsServerNameExtensionError::InvalidFormat);
-        }
-        seen_types.set(name_type);
-        if (name_type == 0) {
-            if (std::ranges::find(name, '\0') != name.end()) {
-                return tl::unexpected(
-                    TlsServerNameExtensionError::InvalidFormat);
-            }
-            host_name = name;
-        }
-    }
-    if (host_name.empty()) {
-        return tl::unexpected(TlsServerNameExtensionError::InvalidFormat);
-    }
-    return host_name;
-}
-
 [[nodiscard]] inline bool IsRealityServerNameAllowed(
     std::span<const std::string> allowed,
     std::string_view requested) noexcept {
@@ -228,10 +137,9 @@ enum class StreamEndpointRole {
 
 struct XHttpDownloadSettings;
 class TransportSecurity;
-class SslContext;
 
 // ============================================================================
-// 传输模式缓存（初始化期归一化，运行时零字符串比较）
+// 传输模式（仅配置边界解析名称，运行时只持有枚举）
 // ============================================================================
 enum class NetworkMode : uint8_t {
     Tcp = 0,
@@ -250,6 +158,10 @@ enum class SecurityMode : uint8_t {
     Unsupported = 255,
 };
 
+[[nodiscard]] std::string_view NetworkModeName(NetworkMode mode) noexcept;
+[[nodiscard]] std::string_view SecurityModeName(SecurityMode mode) noexcept;
+[[nodiscard]] SecurityMode ParseSecurityMode(std::string_view security) noexcept;
+
 // ============================================================================
 // WebSocket 传输配置
 // ============================================================================
@@ -262,7 +174,6 @@ struct WsConfig {
     // 显式设为空字符串可禁用；也可选择其他 HTTP header。
     std::string real_ip_header = "X-Forwarded-For";
 
-    static WsConfig FromJson(const json::object& j);
 };
 
 // ============================================================================
@@ -276,7 +187,6 @@ struct HttpUpgradeConfig {
     // 与 WS 相同，只在明确配置后信任指定 header。
     std::string real_ip_header;
 
-    static HttpUpgradeConfig FromJson(const json::object& j);
 };
 
 // ============================================================================
@@ -297,7 +207,6 @@ struct HttpConfig {
 
     std::optional<uint32_t> initial_window_size;
 
-    static HttpConfig FromJson(const json::object& j);
 };
 
 // ============================================================================
@@ -312,7 +221,6 @@ struct GrpcConfig {
     // Derived by stream-settings normalization from RequestPath().
     std::string request_path;
 
-    static GrpcConfig FromJson(const json::object& j);
     [[nodiscard]] std::string RequestPath() const;
 };
 
@@ -352,7 +260,6 @@ struct XHttpConfig {
     // from the wire. Separates equal session ids on different listeners.
     std::string session_namespace;
 
-    static XHttpConfig FromJson(const json::object& j);
     [[nodiscard]] std::string NormalizedPath() const;
     [[nodiscard]] bool IsStreamOne() const noexcept { return mode == XHttpMode::StreamOne; }
     [[nodiscard]] bool AcceptsStreamOne() const noexcept {
@@ -509,35 +416,25 @@ struct RealityConfig {
                spider_x == other.spider_x &&
                verify_equal;
     }
-    static RealityConfig FromJson(const json::object& j);
 };
 
 // ============================================================================
 // StreamSettings - 传输层 + 安全层组合配置
 //
-// 实现 Xray 式「传输层自由组合」：
-//   network (raw/tcp | ws/websocket | http/http2/h2 | httpupgrade | grpc | xhttp/splithttp)
-//     × security (none | tls)
-//   REALITY 按 Xray 生态约束只支持 raw/tcp、grpc、xhttp/splithttp。
-//
-// 示例：
-//   { "network": "ws", "security": "tls" }          → WS over TLS
-//   { "network": "httpupgrade", "security": "tls" } → HTTPUpgrade over TLS
-//   { "network": "tcp", "security": "none" }        → 明文 TCP
+// network × security 自由组合；REALITY 按 Xray 生态约束只与 raw/tcp、grpc、
+// xhttp 组合。network_mode 决定下方哪一个传输子配置生效，security_mode
+// 决定 tls 或 reality 是否生效；其余子配置保持默认值且不被读取。
 // ============================================================================
 struct StreamSettings {
-    std::string network  = std::string(constants::protocol::kTcp);
-    std::string security = std::string(constants::protocol::kNone);
 
-    TlsConfig tls;             // 当 security == "tls" 时生效
-    RealityConfig reality;     // 当 security == "reality" 时生效
-    WsConfig  ws;              // 当 network  == "ws" / "websocket" 时生效
-    HttpUpgradeConfig http_upgrade; // 当 network == "httpupgrade" 时生效
-    HttpConfig http;            // 当 network == "http" / "h2" 时生效
-    GrpcConfig grpc;           // 当 network == "grpc" 时生效
-    XHttpConfig xhttp;          // 当 network == "xhttp" / "splithttp" 时生效
+    TlsConfig tls;
+    RealityConfig reality;
+    WsConfig  ws;
+    HttpUpgradeConfig http_upgrade;
+    HttpConfig http;
+    GrpcConfig grpc;
+    XHttpConfig xhttp;
 
-    // 归一化后的缓存字段（热路径使用）
     NetworkMode  network_mode  = NetworkMode::Tcp;
     SecurityMode security_mode = SecurityMode::None;
     // Explicit outbound Host/:authority of the ws/httpupgrade/grpc/xhttp
@@ -560,8 +457,10 @@ struct StreamSettings {
                security_mode == SecurityMode::Unsupported;
     }
 
-    static StreamSettings FromJson(
-        const json::object& j, StreamEndpointRole role);
+    [[nodiscard]] std::string_view NetworkName() const noexcept {
+        return IsHttp() && http.force_http2 ? "h2" : NetworkModeName(network_mode);
+    }
+
 };
 
 struct XHttpDownloadSettings {
@@ -592,37 +491,4 @@ struct OutboundStreamDefaults {
 [[nodiscard]] StreamSettings NormalizeOutboundStreamSettings(
     const StreamSettings& source, const OutboundStreamDefaults& defaults = {});
 
-// ============================================================================
-// TransportSecurity - shared immutable TLS / REALITY configuration
-//
-// Prepare once before publishing receiver settings. Each Worker owns its
-// SSL/socket independently and borrows only this immutable context. Auto-sign
-// renewal publishes a new SSL_CTX snapshot off all Worker threads; active SSL
-// objects retain their old snapshot through the library reference count.
-// ============================================================================
-class TransportSecurity {
-public:
-    // Throws std::invalid_argument when a configured TLS or REALITY context
-    // cannot be built; the failing step is logged by the context builder.
-    TransportSecurity(const StreamSettings& settings, StreamEndpointRole role);
-    ~TransportSecurity();
-    static void Prepare(StreamSettings& settings, StreamEndpointRole role);
-
-    // Pinned: in-flight handshakes borrow the contexts by address.
-    TransportSecurity(const TransportSecurity&) = delete;
-    TransportSecurity& operator=(const TransportSecurity&) = delete;
-
-    // Null when the settings use security "none".
-    [[nodiscard]] SslContext* Context() const noexcept { return context_.get(); }
-
-    // Null unless an outbound XHTTP stream has downloadSettings.
-    [[nodiscard]] const TransportSecurity* XHttpDownload() const noexcept {
-        return xhttp_download_.get();
-    }
-
-private:
-    StreamEndpointRole role_ = StreamEndpointRole::Inbound;
-    std::shared_ptr<SslContext> context_;
-    std::shared_ptr<TransportSecurity> xhttp_download_;
-};
 

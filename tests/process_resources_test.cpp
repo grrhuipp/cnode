@@ -2,29 +2,35 @@
 
 #include "app/process_descriptors.hpp"
 
-#include <cstdio>
-#include <type_traits>
-
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
-
-TEST(ProcessResources, Contract) {
+TEST(ProcessResources, DescriptorCountTracksOpenAndClose) {
     const auto before = ::ReadProcessDescriptors();
-    const int resource = ::open("/dev/null", O_RDONLY);
-    ASSERT_FALSE((resource < 0));
+    const int descriptor = ::open("/dev/null", O_RDONLY);
+    ASSERT_GE(descriptor, 0);
     const auto during = ::ReadProcessDescriptors();
-    ::close(resource);
+    const int closed = ::close(descriptor);
     const auto after = ::ReadProcessDescriptors();
-    ASSERT_FALSE((!before.open || !during.open || !after.open ||
-        *during.open != *before.open + 1 || *after.open != *before.open));
+    EXPECT_EQ(closed, 0);
+    ASSERT_TRUE(before.open);
+    ASSERT_TRUE(during.open);
+    ASSERT_TRUE(after.open);
+    EXPECT_EQ(*during.open, *before.open + 1);
+    EXPECT_EQ(*after.open, *before.open);
+}
+
+TEST(ProcessResources, ReportsOperatingSystemSoftLimit) {
     rlimit limits{};
-    if (::getrlimit(RLIMIT_NOFILE, &limits) == 0) {
-        if (limits.rlim_cur == RLIM_INFINITY) {
-            ASSERT_FALSE((!before.soft_limit_unlimited || before.soft_limit));
-        } else ASSERT_FALSE((before.soft_limit_unlimited || !before.soft_limit ||
-                   *before.soft_limit != static_cast<size_t>(limits.rlim_cur)));
+    ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &limits), 0);
+    const auto sample = ::ReadProcessDescriptors();
+    if (limits.rlim_cur == RLIM_INFINITY) {
+        EXPECT_TRUE(sample.soft_limit_unlimited);
+        EXPECT_FALSE(sample.soft_limit);
+    } else {
+        EXPECT_FALSE(sample.soft_limit_unlimited);
+        ASSERT_TRUE(sample.soft_limit);
+        EXPECT_EQ(*sample.soft_limit, static_cast<size_t>(limits.rlim_cur));
     }
-    std::printf("process descriptor sampling: open=%zu\n", before.open.value_or(0));
 }

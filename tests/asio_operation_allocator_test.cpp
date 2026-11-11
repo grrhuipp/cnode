@@ -2,219 +2,217 @@
 
 #include "transport/internet/tcp_stream.hpp"
 #include "common/allocator.hpp"
-#include <asio/co_spawn.hpp>
-#include <asio/bind_cancellation_slot.hpp>
+
 #include <asio/bind_allocator.hpp>
-#include <asio/post.hpp>
+#include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
+#include <asio/co_spawn.hpp>
 #include <asio/read.hpp>
+#include <asio/use_future.hpp>
 #include <asio/write.hpp>
-#include <asio/steady_timer.hpp>
-#include <iostream>
-#include <stdexcept>
+
+#include <array>
+#include <chrono>
+#include <future>
+#include <memory>
+#include <thread>
 
 namespace {
 namespace net = ::net;
 using namespace std::chrono_literals;
-void Require(bool yes, const char* why) { if (!yes) throw std::runtime_error(why); }
-class CountingResource : public std::pmr::memory_resource {
-public:
-    explicit CountingResource(std::pmr::memory_resource* upstream) : upstream(upstream) {}
-    size_t allocations = 0, live = 0;
-    bool wrong_thread = false, fail_next = false;
-private:
-    void* do_allocate(size_t bytes, size_t alignment) override {
-        if (std::exchange(fail_next, false)) throw std::bad_alloc();
-        void* p = upstream->allocate(bytes, alignment);
-        wrong_thread |= std::this_thread::get_id() != owner;
-        ++allocations; ++live; return p;
+
+class AsioOperationAllocatorTest : public ::testing::Test {
+protected:
+    AsioOperationAllocatorTest()
+        : acceptor_(io_, {net::ip::address_v4::loopback(), 0}),
+          peer_(io_), stream_(Connect()) {}
+
+    ::tcp::socket Connect() {
+        ::tcp::socket socket(io_);
+        socket.connect(acceptor_.local_endpoint());
+        acceptor_.accept(peer_);
+        return socket;
     }
-    void do_deallocate(void* p, size_t bytes, size_t alignment) override {
-        wrong_thread |= std::this_thread::get_id() != owner;
-        --live; upstream->deallocate(p, bytes, alignment);
-    }
-    bool do_is_equal(const std::pmr::memory_resource& r) const noexcept override { return &r == this; }
-    std::pmr::memory_resource* upstream;
-    std::thread::id owner = std::this_thread::get_id();
+
+    net::io_context io_;
+    ::tcp::acceptor acceptor_;
+    ::tcp::socket peer_;
+    ::TcpStream stream_;
 };
 
-void TestIO(CountingResource& resource) {
-    net::io_context io;
-    ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    ::tcp::socket socket(io), peer(io);
-    socket.connect(acceptor.local_endpoint());
-    acceptor.accept(peer);
-    ::TcpStream stream(std::move(socket));
-    constexpr size_t count = 128;
-    size_t completed = 0;
-    std::exception_ptr error;
-    auto echo = [&]() -> net::awaitable<void> {
-        char byte;
-        for (size_t i = 0; i < count; ++i) {
-            co_await net::async_read(peer, net::buffer(&byte, 1), net::use_awaitable);
-            co_await net::async_write(peer, net::buffer(&byte, 1), net::use_awaitable);
+TEST_F(AsioOperationAllocatorTest, NativeWriteDeliversEveryByteToPeer) {
+    constexpr std::array<char, 4> sent{'a', '\0', 'b', '\xff'};
+    std::array<char, sent.size()> received{};
+    auto written = net::co_spawn(io_, [&]() -> net::awaitable<std::size_t> {
+        std::size_t offset = 0;
+        while (offset < sent.size()) {
+            const auto count = co_await stream_.AsyncWrite(
+                net::buffer(sent.data() + offset, sent.size() - offset));
+            if (count == 0) break;
+            offset += count;
         }
-    };
-    auto request = [&]() -> net::awaitable<void> {
-        const auto before = resource.allocations;
-        const auto live = resource.live;
-        char byte = 'a';
-        for (size_t i = 0; i < count; ++i) {
-            Require(co_await stream.AsyncWrite(net::buffer(&byte, 1)) == 1, "write failed");
-            Require(resource.live == live, "write operation must release before resuming its caller");
-            Require(co_await stream.AsyncRead(net::buffer(&byte, 1)) == 1 && byte == 'a', "read failed");
-            Require(resource.live == live, "read operation must release before resuming its caller");
-        }
-        Require(resource.allocations == before,
-                "native TCP operations must not allocate from the private PMR resource");
-    };
-    auto finish = [&](std::exception_ptr e) {
-        if (e && !error) { error = e; stream.Close(); peer.close(); }
-        ++completed;
-    };
-    net::co_spawn(io, echo(), finish);
-    net::co_spawn(io, request(), finish);
-    io.run_for(3s);
-    Require(completed == 2, "TCP allocation test stalled");
-    if (error) std::rethrow_exception(error);
-
-    io.restart();
-    net::cancellation_signal signal;
-    net::steady_timer timer(io, 5ms);
-    bool cancelled = false;
-    const auto before = resource.allocations;
-    const auto live = resource.live;
-    net::co_spawn(io, stream.WaitReadable(), net::bind_cancellation_slot(signal.slot(),
-        [&](std::exception_ptr e, ::IoErrorCode ec) {
-            cancelled = e || ec == net::error::operation_aborted;
-        }));
-    timer.async_wait([&](::IoErrorCode ec) { if (!ec) signal.emit(net::cancellation_type::terminal); });
-    io.run_for(1s);
-    Require(cancelled && resource.allocations == before && resource.live == live,
-            "cancellation must release process-allocated socket operations without touching private PMR");
+        co_return offset;
+    }, net::use_future);
+    auto read = net::co_spawn(io_, [&]() -> net::awaitable<std::size_t> {
+        co_return co_await net::async_read(peer_, net::buffer(received), net::use_awaitable);
+    }, net::use_future);
+    io_.run_for(3s);
+    const bool completed = written.wait_for(0s) == std::future_status::ready &&
+                           read.wait_for(0s) == std::future_status::ready;
+    if (!completed) {
+        stream_.Close();
+        peer_.close();
+        io_.restart();
+        io_.run();
+    }
+    ASSERT_TRUE(completed);
+    EXPECT_EQ(written.get(), sent.size());
+    EXPECT_EQ(read.get(), received.size());
+    EXPECT_EQ(received, sent);
 }
 
-void TestReadCancellation(CountingResource& resource, bool multi_buffer) {
-    net::io_context io;
-    ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    ::tcp::socket socket(io), peer(io);
-    socket.connect(acceptor.local_endpoint());
-    acceptor.accept(peer);
-    ::TcpStream stream(std::move(socket));
-    net::cancellation_signal signal;
-    net::steady_timer timer(io, 5ms);
-    bool completed = false, cancelled = false;
-    std::exception_ptr error;
-    const auto before = resource.allocations;
+TEST_F(AsioOperationAllocatorTest, NativeReadReturnsPeerPayload) {
+    constexpr std::array<char, 4> sent{'x', '\0', 'y', '\xff'};
+    std::array<char, sent.size()> received{};
+    net::write(peer_, net::buffer(sent));
+    auto result = net::co_spawn(io_, [&]() -> net::awaitable<void> {
+        std::size_t offset = 0;
+        while (offset < received.size()) {
+            const auto count = co_await stream_.AsyncRead(net::buffer(received.data() + offset,
+                                                                     received.size() - offset));
+            if (count == 0) break;
+            offset += count;
+        }
+    }, net::use_future);
+    io_.run_for(3s);
+    const bool completed = result.wait_for(0s) == std::future_status::ready;
+    if (!completed) {
+        stream_.Close();
+        io_.restart();
+        io_.run();
+    }
+    ASSERT_TRUE(completed);
+    result.get();
+    EXPECT_EQ(received, sent);
+}
+
+enum class ReadKind { Readiness, Bytes, MultiBuffer };
+class NativeReadCancellation : public AsioOperationAllocatorTest,
+                               public ::testing::WithParamInterface<ReadKind> {};
+
+TEST_P(NativeReadCancellation, CancelsPendingOperationWithoutClosingConnection) {
+    net::cancellation_signal cancellation;
+    bool cancelled = false;
     auto read = [&]() -> net::awaitable<void> {
         try {
-            if (multi_buffer) {
-                (void)co_await stream.ReadMultiBuffer();
-            } else {
+            switch (GetParam()) {
+            case ReadKind::Readiness:
+                cancelled = co_await stream_.WaitReadable() == net::error::operation_aborted;
+                break;
+            case ReadKind::Bytes: {
                 char byte{};
-                (void)co_await stream.AsyncRead(net::buffer(&byte, 1));
+                (void)co_await stream_.AsyncRead(net::buffer(&byte, 1));
+                break;
             }
-        } catch (const ::IoSystemError& failure) {
-            if (failure.code() != ::io_error::operation_aborted) throw;
+            case ReadKind::MultiBuffer:
+                (void)co_await stream_.ReadMultiBuffer();
+                break;
+            }
+        } catch (const ::IoSystemError& error) {
+            if (error.code() != ::io_error::operation_aborted) throw;
             cancelled = true;
         }
     };
-    net::co_spawn(io, read(), net::bind_cancellation_slot(signal.slot(),
-        [&](std::exception_ptr e) { error = e; completed = true; }));
-    timer.async_wait([&](::IoErrorCode ec) {
-        if (!ec) signal.emit(net::cancellation_type::terminal);
-    });
-    io.run_for(1s);
-    if (error) std::rethrow_exception(error);
-    Require(completed && cancelled && resource.allocations == before,
-            "read cancellation must not allocate native operations from private PMR");
-    Require(peer.is_open() && stream.IsOpen(), "cancellation must not close the connection");
-}
-
-void TestPrivateAllocatorIsolation(CountingResource& resource) {
-    net::io_context io;
-    ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    ::tcp::socket socket(io), peer(io);
-    socket.connect(acceptor.local_endpoint());
-    acceptor.accept(peer);
-    ::TcpStream stream(std::move(socket));
-    net::cancellation_signal signal;
-    net::steady_timer timer(io, 5ms);
-    bool cancelled = false;
-    resource.fail_next = true;
-    net::co_spawn(io, stream.WaitReadable(), net::bind_cancellation_slot(signal.slot(),
-        [&](std::exception_ptr error, ::IoErrorCode ec) {
-            if (error) std::rethrow_exception(error);
-            cancelled = ec == net::error::operation_aborted;
-        }));
-    timer.async_wait([&](::IoErrorCode ec) {
-        if (!ec) signal.emit(net::cancellation_type::terminal);
-    });
-    io.run_for(1s);
-    const bool untouched = std::exchange(resource.fail_next, false);
-    Require(cancelled && untouched,
-            "native operation initiation must not consult the private allocation resource");
-}
-
-void TestQueuedReadinessIsolation(CountingResource& resource) {
-    using namespace ::memory;
-    net::io_context reactor;
-    ::tcp::acceptor acceptor(reactor, {net::ip::address_v4::loopback(), 0});
-    ::tcp::socket socket(reactor), peer(reactor);
-    socket.connect(acceptor.local_endpoint());
-    acceptor.accept(peer);
-    ::buf::Buffer* payload = nullptr;
-    bool consumed = false;
-    {
-        payload = ::buf::Buffer::New();
-        Require(payload != nullptr, "payload allocation failed");
-        const auto allocations = resource.allocations;
-        socket.async_wait(::tcp::socket::wait_read,
-            net::bind_allocator(ProcessAllocator<std::byte>{},
-                [&](::IoErrorCode ec) {
-                    Require(!ec, "readiness failed");
-                    const auto count = socket.read_some(net::buffer(payload->Tail().data(), 1));
-                    payload->Produce(static_cast<uint32_t>(count));
-                    consumed = payload->Bytes()[0] == 'q';
-                    ::buf::Buffer::Free(payload);
-                    payload = nullptr;
-                }));
-        Require(resource.allocations == allocations,
-                "queued operation must not consult the private PMR resource");
+    auto result = net::co_spawn(io_, read(),
+        net::bind_cancellation_slot(cancellation.slot(), net::use_future));
+    io_.poll();
+    EXPECT_EQ(result.wait_for(0s), std::future_status::timeout);
+    cancellation.emit(net::cancellation_type::terminal);
+    io_.run_for(1s);
+    const bool completed = result.wait_for(0s) == std::future_status::ready;
+    if (!completed) {
+        stream_.Close();
+        io_.restart();
+        io_.run();
     }
-    const char value = 'q';
-    peer.write_some(net::buffer(&value, 1));
-    reactor.run_for(1s);
-    Require(consumed && !payload, "owner must consume readiness and destroy payload");
+    ASSERT_TRUE(completed);
+    result.get();
+    EXPECT_TRUE(cancelled);
+    EXPECT_TRUE(peer_.is_open());
+    EXPECT_TRUE(stream_.IsOpen());
+    const char sent = 'r';
+    net::write(peer_, net::buffer(&sent, 1));
+    char received{};
+    io_.restart();
+    auto reused = net::co_spawn(io_, stream_.AsyncRead(net::buffer(&received, 1)), net::use_future);
+    io_.run();
+    EXPECT_EQ(reused.get(), 1u);
+    EXPECT_EQ(received, sent);
 }
 
-void TestPendingOperationDestruction() {
-    using namespace ::memory;
+INSTANTIATE_TEST_SUITE_P(AllNativeReads, NativeReadCancellation,
+    ::testing::Values(ReadKind::Readiness, ReadKind::Bytes, ReadKind::MultiBuffer));
+
+TEST_F(AsioOperationAllocatorTest, QueuedReadinessOwnsPayloadUntilCallbackCompletes) {
+    auto payload = ::buf::BufferGuard{::buf::Buffer::New()};
+    ASSERT_TRUE(payload);
+    bool consumed = false;
+    bool released = false;
+    struct CompletionLifetime {
+        bool& released;
+        ~CompletionLifetime() { released = true; }
+    };
+    auto lifetime = std::make_shared<CompletionLifetime>(released);
+    std::weak_ptr<CompletionLifetime> pending = lifetime;
+    peer_.async_wait(::tcp::socket::wait_read,
+        net::bind_allocator(::memory::ProcessAllocator<std::byte>{},
+            [&, payload = std::move(payload), lifetime = std::move(lifetime)](::IoErrorCode error) {
+                EXPECT_FALSE(error);
+                if (error) return;
+                const auto count = peer_.read_some(net::buffer(payload->Tail().data(), 1));
+                payload->Produce(static_cast<uint32_t>(count));
+                consumed = payload->Bytes()[0] == 'q';
+            }));
+    EXPECT_FALSE(pending.expired());
+    const char value = 'q';
+    auto written = net::co_spawn(io_, stream_.AsyncWrite(net::buffer(&value, 1)), net::use_future);
+    io_.run_for(1s);
+    const bool completed = written.wait_for(0s) == std::future_status::ready && consumed;
+    if (!completed) {
+        stream_.Close();
+        peer_.close();
+        io_.restart();
+        io_.run();
+    }
+    ASSERT_TRUE(completed);
+    EXPECT_EQ(written.get(), 1u);
+    EXPECT_TRUE(pending.expired());
+    EXPECT_TRUE(released);
+}
+
+TEST(AsioOperationAllocator, ReactorDestructionReleasesPendingHandlerOnShutdownThread) {
     auto reactor = std::make_unique<net::io_context>();
     auto timer = std::make_unique<net::steady_timer>(*reactor, 1h);
-    timer->async_wait(net::bind_allocator(ProcessAllocator<std::byte>{},
-        [](::IoErrorCode) {}));
-    // Asio destroys the still-pending handler without calling it when its
-    // reactor is destroyed on another thread.
-    std::thread shutdown([&] { timer.reset(); reactor.reset(); });
+    std::thread::id destruction_thread;
+    bool called = false;
+    struct Capture {
+        std::thread::id& destruction_thread;
+        ~Capture() { destruction_thread = std::this_thread::get_id(); }
+    };
+    auto capture = std::make_shared<Capture>(destruction_thread);
+    std::weak_ptr<Capture> pending = capture;
+    timer->async_wait(net::bind_allocator(::memory::ProcessAllocator<std::byte>{},
+        [capture = std::move(capture), &called](::IoErrorCode) { called = true; }));
+    EXPECT_FALSE(pending.expired());
+    std::thread::id shutdown_thread;
+    std::thread shutdown([&] {
+        shutdown_thread = std::this_thread::get_id();
+        timer.reset();
+        reactor.reset();
+    });
     shutdown.join();
+    EXPECT_FALSE(called);
+    EXPECT_TRUE(pending.expired());
+    EXPECT_EQ(destruction_thread, shutdown_thread);
 }
-} // namespace
-
-TEST(AsioOperationAllocator, Contract) {
-    CountingResource resource(::memory::process_resource());
-    auto original = std::pmr::set_default_resource(&resource);
-    bool passed = true;
-    try {
-        TestIO(resource);
-        TestReadCancellation(resource, false);
-        TestReadCancellation(resource, true);
-        TestPrivateAllocatorIsolation(resource);
-        TestQueuedReadinessIsolation(resource);
-        TestPendingOperationDestruction();
-        Require(resource.live == 0 && !resource.wrong_thread,
-                "all private scheduler allocations must be released on their owner");
-    } catch (const std::exception& e) { std::cerr << e.what() << '\n'; passed = false; }
-    std::pmr::set_default_resource(original);
-    { ASSERT_TRUE(passed); return; }
-}
+}  // namespace

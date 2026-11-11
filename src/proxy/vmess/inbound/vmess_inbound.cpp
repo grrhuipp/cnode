@@ -1,4 +1,6 @@
 #include "common/mux/mux_codec.hpp"
+#include "proxy/handshake_errors.hpp"
+#include "proxy/mux/mux_server.hpp"
 #include "app/relay.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "proxy/inbound.hpp"
@@ -33,10 +35,9 @@ Network RequestNetwork(::vmess::Command command) noexcept {
 net::awaitable<tl::expected<UserOnlineSessionGuard, ErrorCode>>
 ParseHandshake(AsyncStream& stream,
                ::vmess::encoding::ServerSession& vmess_session,
-               ::UserOnlineTracker& validator,
+               ::UserOnlineTracker& tracker,
                ConnectionLimiter* limiter,
-               session::Context& ctx,
-               std::string_view client_ip) {
+               session::Context& ctx) {
     std::array<uint8_t, ::vmess::encoding::kMaxRequestHeaderWireSize> header_buf{};
     size_t total_read = 0;
     std::optional<::vmess::VMessRequest> request;
@@ -46,24 +47,12 @@ ParseHandshake(AsyncStream& stream,
         if (required > header_buf.size()) {
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
-        while (total_read < required) {
-            size_t n = 0;
-            try {
-                n = co_await stream.AsyncRead(net::buffer(
-                    header_buf.data() + total_read, required - total_read));
-            } catch (const IoSystemError& error) {
-                co_return tl::unexpected(
-                    proxy::ClassifyHandshakeReadException(stream, error));
-            }
-            if (n == 0) {
-                co_return tl::unexpected(
-                    proxy::ResolveHandshakeReadFailure(
-                        stream,
-                        total_read == 0 ? ErrorCode::SOCKET_EOF
-                                        : ErrorCode::PROTOCOL_DECODE_FAILED));
-            }
-            total_read += n;
-        }
+        auto read = co_await proxy::ReadHandshakeExact(
+            stream, {header_buf.data() + total_read, required - total_read},
+            total_read == 0 ? proxy::HandshakeProgress::NotStarted
+                            : proxy::HandshakeProgress::Started);
+        if (!read) co_return tl::unexpected(read.error());
+        total_read = required;
         auto decoded = vmess_session.DecodeRequestHeader(
             header_buf.data(), total_read, ctx.conn_id);
         request = std::move(decoded.first);
@@ -79,9 +68,7 @@ ParseHandshake(AsyncStream& stream,
                 ctx, authenticated->user->profile,
                 proxy::InboundRequestTarget{
                     RequestNetwork(authenticated->command), authenticated->target});
-            LOG_CONN_WARN(ctx, "request rejected from {}:{} > {}",
-                          client_ip, ctx.inbound.source_port, reason);
-            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+            proxy::LogInboundRequestRejected(ctx, reason);
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
     }
@@ -101,9 +88,7 @@ ParseHandshake(AsyncStream& stream,
             *request->user, request->body_key, request->body_iv)) {
         // Replay is not a credential failure: it never feeds the ban table.
         constexpr std::string_view reason = "session replay admission rejected";
-        LOG_CONN_WARN(ctx, "request rejected from {}:{} > {}",
-                      client_ip, ctx.inbound.source_port, reason);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+        proxy::LogInboundRequestRejected(ctx, reason);
         co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
     }
 
@@ -116,7 +101,7 @@ ParseHandshake(AsyncStream& stream,
                    consumed);
 
     auto user_session = co_await proxy::AdmitAuthenticatedInbound(
-        validator, ctx, request->user->profile);
+        tracker, ctx, request->user->profile);
     if (!user_session) {
         co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
     }
@@ -136,7 +121,7 @@ namespace proxy::vmess::inbound {
 
 class Handler final : public ::Inbound {
 public:
-    Handler(::UserOnlineTracker& validator,
+    Handler(::UserOnlineTracker& tracker,
             ::StatsShard& stats,
             ::ConnectionLimiter* limiter);
 
@@ -150,7 +135,7 @@ public:
         uint32_t pressure_idle_timeout) override;
 
 private:
-    ::UserOnlineTracker& validator_;
+    ::UserOnlineTracker& tracker_;
     ::StatsShard& stats_;
     ::ConnectionLimiter* limiter_;
 };
@@ -162,10 +147,10 @@ private:
 // ============================================================================
 
 proxy::vmess::inbound::Handler::Handler(
-    ::UserOnlineTracker& validator,
+    ::UserOnlineTracker& tracker,
     StatsShard& stats,
     ConnectionLimiter* limiter)
-    : validator_(validator)
+    : tracker_(tracker)
     , stats_(stats)
     , limiter_(limiter)
 {}
@@ -196,13 +181,17 @@ proxy::vmess::inbound::Handler::Process(
         {
             ::vmess::encoding::ServerSession vmess_session(tag);
             auto parsed_session = co_await ParseHandshake(
-                *stream, vmess_session, validator_, limiter_, ctx, client_ip);
+                *stream, vmess_session, tracker_, limiter_, ctx);
             if (!parsed_session) {
                 co_return proxy::RejectInbound(stats_, stream.get(), parsed_session.error());
             }
             user_session.emplace(std::move(*parsed_session));
-            request_reader = vmess_session.DecodeRequestBody(*stream);
-            response_writer = vmess_session.EncodeResponseBodyWithHeader(*stream);
+            auto reader = vmess_session.DecodeRequestBody(*stream);
+            if (!reader) co_return proxy::RejectInbound(stats_, stream.get(), reader.error());
+            auto writer = vmess_session.EncodeResponseBodyWithHeader(*stream);
+            if (!writer) co_return proxy::RejectInbound(stats_, stream.get(), writer.error());
+            request_reader.emplace(std::move(*reader));
+            response_writer.emplace(std::move(*writer));
         }
     } catch (const WorkerMailboxFull&) {
         co_return proxy::RejectInbound(stats_, stream.get(), ErrorCode::RESOURCE_EXHAUSTED);
@@ -217,7 +206,7 @@ proxy::vmess::inbound::Handler::Process(
     const Network net = ctx.content.network;
 
     if (net == Network::MUX) {
-        co_return co_await mux::ProcessInbound(
+        co_return co_await proxy::ServeMuxInbound(
             io_context,
             transport::Link{&*request_reader, &*response_writer},
             *stream,

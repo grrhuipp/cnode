@@ -3,6 +3,8 @@
 #include "common/asio_types.hpp"
 
 #include <asio/ip/address.hpp>
+#include <asio/ip/network_v4.hpp>
+#include <asio/ip/network_v6.hpp>
 
 #include <algorithm>
 #include <array>
@@ -95,6 +97,36 @@ inline net::ip::address NormalizeAddress(
         }
     }
     return addr;
+}
+
+struct IpNetwork {
+    net::ip::address address;
+    uint8_t prefix_length;
+};
+
+// 地址与前缀必须在同一地址族内解释，禁止归一化 IPv4-mapped 地址时猜测 CIDR 位数。
+[[nodiscard]] inline std::optional<IpNetwork> ParseNetwork(std::string_view text) noexcept {
+    const auto slash = text.find('/');
+    const auto parsed = ParseLiteral(text.substr(0, slash));
+    if (!parsed) return std::nullopt;
+    auto address = NormalizeAddress(*parsed);
+    if (slash != std::string_view::npos && parsed->is_v6() != address.is_v6()) return std::nullopt;
+    const unsigned maximum = address.is_v6() ? 128U : 32U;
+    unsigned prefix = maximum;
+    if (slash != std::string_view::npos) {
+        const auto length = text.substr(slash + 1);
+        if (length.empty() || (length.size() > 1 && length.front() == '0')) return std::nullopt;
+        const auto [end, error] = std::from_chars(length.data(), length.data() + length.size(), prefix);
+        if (error != std::errc{} || end != length.data() + length.size() || prefix > maximum) {
+            return std::nullopt;
+        }
+        if (address.is_v6()) {
+            address = net::ip::network_v6(address.to_v6(), static_cast<unsigned short>(prefix)).network();
+        } else {
+            address = net::ip::network_v4(address.to_v4(), static_cast<unsigned short>(prefix)).network();
+        }
+    }
+    return IpNetwork{address, static_cast<uint8_t>(prefix)};
 }
 
 // Value-owned text; views are valid only while this stack buffer is alive.

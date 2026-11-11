@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "infra/log.hpp"
+#include "infra/config_types.hpp"
 
 #include <array>
 #include <cstdio>
@@ -94,7 +95,9 @@ struct StreamCapture {
 
 void CheckConsoleFileOffset(const std::filesystem::path& directory) {
     StreamCapture capture(STDOUT_FILENO);
-    Expect(::Log::Init("info", directory, 1, "access.log", "error.log", false, false),
+    Expect(::Log::Init({.level = LogLevel::INFO, .log_dir = directory,
+                       .access_path = "access.log", .error_path = "error.log", .max_days = 1,
+                       .rotate_daily = false, .gzip = false}),
            "cannot initialize redirected console");
     ::Log::WriteConsole(::LogLevel::INFO, "async console offset");
     ::Log::Shutdown();
@@ -128,7 +131,9 @@ void CheckBlockedConsole(const std::filesystem::path& directory) {
         ::dup2(pipe[1], STDOUT_FILENO);
         ::close(pipe[1]);
         // Retain the read descriptor without consuming bytes: EAGAIN, not EPIPE.
-        if (!::Log::Init("info", directory, 1, "access.log", "error.log", false, false))
+        if (!::Log::Init({.level = LogLevel::INFO, .log_dir = directory,
+                         .access_path = "access.log", .error_path = "error.log", .max_days = 1,
+                         .rotate_daily = false, .gzip = false}))
             ::_exit(2);
         const std::string message(512, 'x');
         for (int i = 0; i < 20000; ++i)
@@ -154,8 +159,10 @@ void CheckSocketConsole(const std::filesystem::path& directory) {
     const int saved = ::dup(STDOUT_FILENO);
     Expect(saved >= 0 && ::dup2(sockets[0], STDOUT_FILENO) >= 0, "cannot redirect socket stdout");
     const int flags = ::fcntl(sockets[0], F_GETFL);
-    const bool initialized = ::Log::Init(
-        "info", directory, 1, "access.log", "error.log", false, false);
+    const bool initialized = ::Log::Init({
+        .level = LogLevel::INFO, .log_dir = directory,
+        .access_path = "access.log", .error_path = "error.log", .max_days = 1,
+        .rotate_daily = false, .gzip = false});
     ::Log::WriteConsole(::LogLevel::INFO, "journald console record");
     ::Log::Shutdown();
     const bool unchanged = ::fcntl(sockets[0], F_GETFL) == flags;
@@ -190,8 +197,10 @@ void CheckAliasedSocketPartialRecord(const std::filesystem::path& directory) {
            ::dup2(sockets[0], STDERR_FILENO) >= 0, "cannot alias console descriptors");
     // Warning suppresses the initialization info record, leaving the socket's
     // controlled free space for this single large, valid logfmt record.
-    const bool initialized = ::Log::Init(
-        "warning", directory, 1, "access.log", "error.log", false, false);
+    const bool initialized = ::Log::Init({
+        .level = LogLevel::WARN, .log_dir = directory,
+        .access_path = "access.log", .error_path = "error.log", .max_days = 1,
+        .rotate_daily = false, .gzip = false});
     ::Log::WriteConsole(::LogLevel::WARN, std::string(4000, 'x'));
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     int available = 0;
@@ -243,8 +252,9 @@ TEST(LogFormat, Contract) {
     try {
         StreamCapture console(STDOUT_FILENO);
         StreamCapture errors(STDERR_FILENO);
-        Expect(::Log::Init("trace", directory, 1,
-                              "access.log", "error.log", false, false),
+        Expect(::Log::Init({.level = LogLevel::TRACE, .log_dir = directory,
+                           .access_path = "access.log", .error_path = "error.log", .max_days = 1,
+                           .rotate_daily = false, .gzip = false}),
                "logger initialization failed");
         std::string injection = "diagnostic injection\nforged\r\t\x1b";
         injection.push_back('\0');
@@ -316,8 +326,9 @@ TEST(LogFormat, Contract) {
                    !Contains(diagnostics, secret), "panel URL credentials leaked");
         }
 
-        Expect(::Log::Init("warning", directory / "filtered", 1,
-                              "access.log", "error.log", false, false),
+        Expect(::Log::Init({.level = LogLevel::WARN, .log_dir = directory / "filtered",
+                           .access_path = "access.log", .error_path = "error.log", .max_days = 1,
+                           .rotate_daily = false, .gzip = false}),
                "filtered logger initialization failed");
         ::Log::WriteConsole(::LogLevel::INFO, "hidden console event");
         ::Log::WriteSystem(::LogLevel::DEBUG, "hidden diagnostic event");
@@ -331,8 +342,9 @@ TEST(LogFormat, Contract) {
         Expect(Contains(ReadLines(directory / "filtered/access.log"), "accepted despite"),
                "diagnostic filtering must not discard access facts");
 
-        Expect(::Log::Init("none", directory / "disabled", 1,
-                              "access.log", "error.log", false, false),
+        Expect(::Log::Init({.level = LogLevel::NONE, .log_dir = directory / "disabled",
+                           .access_path = "access.log", .error_path = "error.log", .max_days = 1,
+                           .rotate_daily = false, .gzip = false}),
                "disabled logger initialization failed");
         LOG_CONSOLE_ERROR("hidden ordinary error");
         ::Log::WriteConsole(::LogLevel::ERROR, "unconditional fatal startup failure");
@@ -345,8 +357,9 @@ TEST(LogFormat, Contract) {
         Expect(Contains(ReadLines(directory / "disabled/access.log"), "rejected despite"),
                "disabled diagnostics must preserve access facts");
 
-        Expect(::Log::Init("info", directory / "failed-error", 1,
-                              "access.log", "/dev/full", false, false),
+        Expect(::Log::Init({.level = LogLevel::INFO, .log_dir = directory / "failed-error",
+                           .access_path = "access.log", .error_path = "/dev/full", .max_days = 1,
+                           .rotate_daily = false, .gzip = false}),
                "cannot initialize failing error sink");
         for (int i = 0; i < 100; ++i)
             ::Log::WriteSystem(::LogLevel::WARN, "unwritable error record");
@@ -356,8 +369,9 @@ TEST(LogFormat, Contract) {
                Contains(ReadLines(directory / "failed-error/access.log"), "healthy access"),
                "error sink failure was silent or affected access channel");
 
-        Expect(::Log::Init("info", directory / "failed-access", 1,
-                              "/dev/full", "error.log", false, false),
+        Expect(::Log::Init({.level = LogLevel::INFO, .log_dir = directory / "failed-access",
+                           .access_path = "/dev/full", .error_path = "error.log", .max_days = 1,
+                           .rotate_daily = false, .gzip = false}),
                "cannot initialize failing access sink");
         ::Log::WriteAccess("unwritable access record");
         ::Log::WriteSystem(::LogLevel::WARN, "healthy error channel");

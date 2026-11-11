@@ -26,8 +26,8 @@ TEST(SessionGroupExecutor, WorkerRouteRegistrationAndBoundedCoordinatorControl) 
     auto second_work = net::make_work_guard(second);
 
     auto coordinator = std::make_shared<GroupCoordinator>(control, 2);
-    coordinator->RegisterWorker(0, first);
-    coordinator->RegisterWorker(1, second);
+    coordinator->RegisterWorker(first);
+    coordinator->RegisterWorker(second);
 
     Require(coordinator->WorkerCount() == 2, "worker count mismatch");
     Require(GroupCoordinator::ForContext(control) == coordinator.get(), "control context binding missing");

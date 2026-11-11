@@ -1,10 +1,11 @@
 #include "common/domain_name.hpp"
+#include "proxy/outbound_endpoint_base.hpp"
 #include "common/ip_utils.hpp"
 #include <openssl/mem.h>
 #include "proxy/outbound.hpp"
 #include "proxy/vmess/encoding/body.hpp"
 #include "proxy/vmess/vmess_crypto.hpp"
-#include "proxy/inbound_admission.hpp"
+#include "proxy/handshake_errors.hpp"
 #include "proxy/outbound_stream_endpoint.hpp"
 #include "app/relay.hpp"
 #include "app/dns/dns.hpp"

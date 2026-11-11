@@ -7,6 +7,7 @@
 #include "app/proxyman/outbound/handler.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
+#include "worker_coordinator_fixture.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "common/allocator.hpp"
 #include "common/session.hpp"
@@ -224,7 +225,11 @@ public:
         if (!inbound.reader || !state_.cleanup_gate)
             throw std::logic_error("delayed outbound missing owner-local link/gate");
         std::array<uint8_t, 2> bytes{};
-        auto first = first_payload.PopFront();
+        // Without sniffing the first datagram remains on the real Link; a
+        // prefetched batch is optional, not a promise made by Dispatch.
+        auto first = first_payload.empty()
+            ? co_await inbound.reader->ReadMultiBuffer()
+            : first_payload.PopFront();
         const bool payload_ok = first_payload.empty() &&
             first.CopyPrefixTo(bytes) == bytes.size() &&
             bytes[0] == 0x51 && bytes[1] == 0x52;
@@ -376,7 +381,7 @@ void SendLateDnsReply(::udp::socket& socket, DnsPacket& query) {
     ::proxyman::inbound::ReceiverSettings receiver{
         .inbound_tag = std::string(kTag), .inbound_tags = {}, .protocol = std::string(kProtocol),
         .stream_settings = {},
-        .dispatch_policy = {.sniffing = {}, .outbound = ::routing::ForceOutbound{"native-test"}}};
+        .dispatch_policy = {.sniffing = {.enabled = false}, .outbound = ::routing::ForceOutbound{"native-test"}}};
     if (!worker.RegisterInbound(request, receiver))
         Fail("real native inbound registration failed");
     const auto listen = ::InboundListen::Parse("127.0.0.1");
@@ -433,7 +438,7 @@ template <typename Predicate>
     return {.inbound_tag = std::move(tag), .inbound_tags = {}, .protocol = std::string(kProtocol),
             .stream_settings = {},
             .dispatch_policy = {
-                .sniffing = {},
+                .sniffing = {.enabled = false},
                 .outbound = ::routing::ForceOutbound(std::move(outbound_tag))}};
 }
 
@@ -719,6 +724,9 @@ template <typename T>
     const auto deadline = std::chrono::steady_clock::now() + limit;
     while (future.wait_for(0ms) != std::future_status::ready) {
         if (std::chrono::steady_clock::now() >= deadline) return false;
+        // The delayed scenario has no pending DNS receive to keep control
+        // alive before the data Worker posts its first admission request.
+        if (io.stopped()) io.restart();
         io.poll_one();
         std::this_thread::sleep_for(1ms);
     }
@@ -734,6 +742,7 @@ TEST_P(WorkerUdpRetirementRuntime, Lifecycle) {
     try {
         RegisterProtocol();
         ::net::io_context control_io;
+        WorkerCoordinatorFixture coordinator(control_io);
         ::udp::socket dns_peer(control_io);
         const auto dns_port = BindUdp(control_io, dns_peer);
         ::app::dns::Config dns_config{
@@ -756,7 +765,8 @@ TEST_P(WorkerUdpRetirementRuntime, Lifecycle) {
                 ::net::io_context data_io;
                 ::StatsShard stats;
                 FixtureState fixture;
-                auto worker = std::make_unique<::Worker>(1, data_io, runtime, stats, dns);
+                auto worker = std::make_unique<::Worker>(
+                    1, data_io, runtime, stats, dns, coordinator.Get());
                 shared.worker = worker.get();
                 std::string runtime_error;
                 ::net::co_spawn(data_io, WorkerJob(data_io, *worker, fixture,
@@ -818,7 +828,7 @@ TEST_P(WorkerUdpRetirementRuntime, Lifecycle) {
                 if (ec) failure = std::make_exception_ptr(
                     std::runtime_error("sending delayed native UDP request failed"));
             }
-            if (!failure && entered.wait_for(7s) != std::future_status::ready)
+            if (!failure && !PollUntilReady(control_io, entered, 7s))
                 failure = std::make_exception_ptr(std::runtime_error(
                     "test outbound did not receive the real first Link payload before watchdog"));
             if (!failure) {

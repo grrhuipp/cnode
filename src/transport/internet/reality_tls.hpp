@@ -5,24 +5,15 @@
 #include "transport/internet/stream_settings.hpp"
 #include <algorithm>
 #include <array>
-#include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <cstddef>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
-#include <string>
-#include <string_view>
-#include <vector>
 #include <tl/expected.hpp>
-#include <openssl/evp.h>
-#include <openssl/ossl_typ.h>
 #include <openssl/ssl.h>
 #include <openssl/mem.h>
 #include <openssl/mldsa.h>
-#include <openssl/x509.h>
 
 
 namespace transport::internet {
@@ -80,21 +71,6 @@ ParseRealityClientKeyShareExtension(
     return tl::unexpected(RealityKeyShareError::InvalidFormat);
 }
 
-
-// Built from trusted configuration before accepting connections. No SNI-driven
-// generation, mutable certificate cache, or request-path key rotation.
-class AutoSignCertificate {
-public:
-    [[nodiscard]] static std::unique_ptr<AutoSignCertificate> Create(std::string_view identity);
-    AutoSignCertificate(const AutoSignCertificate&) = delete;
-    AutoSignCertificate& operator=(const AutoSignCertificate&) = delete;
-    [[nodiscard]] X509* Certificate() const noexcept { return certificate_.get(); }
-    [[nodiscard]] EVP_PKEY* Key() const noexcept { return key_.get(); }
-private:
-    AutoSignCertificate() = default;
-    bssl::UniquePtr<X509> certificate_;
-    bssl::UniquePtr<EVP_PKEY> key_;
-};
 }  // namespace transport::internet
 
 class SslContext;
@@ -153,56 +129,7 @@ public:
             ? header_.size() - header_size_
             : std::min<size_t>(remaining_, 1024);
     }
-    void Append(std::span<const uint8_t> bytes) {
-        if (bytes.empty() || bytes.size() > ReadSize()) {
-            status_ = Status::Invalid;
-            return;
-        }
-        wire_.insert(wire_.end(), bytes.begin(), bytes.end());
-        if (header_size_ < header_.size()) {
-            std::copy(bytes.begin(), bytes.end(), header_.begin() + header_size_);
-            header_size_ += bytes.size();
-            if ((header_size_ >= 1 && header_[0] != 22) ||
-                (header_size_ >= 2 && header_[1] != 3)) {
-                status_ = Status::Invalid;
-                return;
-            }
-            if (header_size_ != header_.size()) return;
-            remaining_ = LoadU16BE(header_.data() + 3);
-            if (remaining_ == 0 || remaining_ > 16384) {
-                status_ = Status::Invalid;
-            }
-            return;
-        }
-        remaining_ -= bytes.size();
-        if (hello_.size() < 4) {
-            const size_t header_bytes = std::min(bytes.size(), 4 - hello_.size());
-            hello_.insert(hello_.end(), bytes.begin(), bytes.begin() + header_bytes);
-            bytes = bytes.subspan(header_bytes);
-            if (hello_[0] != 1) {
-                status_ = Status::Invalid;
-                return;
-            }
-            if (hello_.size() == 4) {
-                hello_size_ = 4 + LoadU24BE(hello_.data() + 1);
-                if (hello_size_ < 4 + 2 + 32 + 1 + 32 + 2 + 2 + 1 + 1 + 2 || hello_size_ > kMaxHelloSize) {
-                    status_ = Status::Invalid;
-                    return;
-                }
-            }
-        }
-        if (hello_size_) {
-            if (bytes.size() + remaining_ > hello_size_ - hello_.size()) {
-                status_ = Status::Invalid;
-                return;
-            }
-            hello_.insert(hello_.end(), bytes.begin(), bytes.end());
-        }
-        if (remaining_ == 0) {
-            if (hello_size_ && hello_.size() == hello_size_) status_ = Status::Complete;
-            else header_size_ = 0;
-        }
-    }
+    void Append(std::span<const uint8_t> bytes);
     [[nodiscard]] std::span<const uint8_t> Hello() const noexcept { return hello_; }
     [[nodiscard]] memory::ByteVector TakeHello() noexcept { return std::move(hello_); }
     [[nodiscard]] memory::ByteVector TakeWire() noexcept { return std::move(wire_); }
@@ -215,47 +142,3 @@ private:
     memory::ByteVector wire_;
     memory::ByteVector hello_;
 };
-
-// One registration per prepared configuration, not per Worker or handshake.
-// A single bounded background scheduler signs and publishes immutable contexts.
-class AutoSignContextRenewal {
-public:
-    using Clock = std::chrono::system_clock;
-    using Builder = std::function<std::shared_ptr<SSL_CTX>()>;
-    static std::shared_ptr<AutoSignContextRenewal> Start(
-        std::shared_ptr<SSL_CTX> initial, Builder builder);
-    [[nodiscard]] std::shared_ptr<SSL_CTX> Acquire(Clock::time_point now = Clock::now()) const noexcept;
-private:
-    friend class AutoSignRenewalScheduler;
-    struct Snapshot {
-        std::shared_ptr<SSL_CTX> context;
-        Clock::time_point expires;
-    };
-    AutoSignContextRenewal(std::shared_ptr<SSL_CTX> initial, Builder builder);
-    bool Publish(std::shared_ptr<SSL_CTX> context);
-    std::atomic<std::shared_ptr<const Snapshot>> current_;
-    Builder builder_;
-    std::atomic<Clock::time_point> next_attempt_{Clock::time_point::min()};
-};
-
-[[nodiscard]] bool ConfigureTlsServerIdentity(
-    SSL* ssl, std::string_view identity);
-
-[[nodiscard]] bool ConfigureTlsProtocolVersions(
-    SSL_CTX* context,
-    TlsVersion min_version,
-    TlsVersion max_version) noexcept;
-
-[[nodiscard]] bool EncodeTlsAlpnProtocols(
-    std::span<const std::string> protocols,
-    std::vector<unsigned char>& wire);
-
-// Client ALPN is a context property: configured once at load time.
-[[nodiscard]] bool ConfigureTlsClientAlpn(
-    SSL_CTX* context, std::span<const std::string> protocols);
-
-// Installs the PEM certificate chain (leaf first) and its private key, the
-// in-memory equivalent of SSL_CTX_use_certificate_chain_file plus
-// SSL_CTX_use_PrivateKey_file. Logs the failing step.
-[[nodiscard]] bool ConfigureTlsCertificatePem(
-    SSL_CTX* context, const TlsPemMaterial& pem);

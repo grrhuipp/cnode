@@ -1,6 +1,8 @@
 #include "proxy/inbound_admission.hpp"
+#include "proxy/handshake_errors.hpp"
 #include "app/relay.hpp"
-#include "transport/internet/hysteria/hysteria_ingress.hpp"
+#include "transport/internet/hysteria/hysteria_wire.hpp"
+#include "transport/internet/hysteria/hysteria_settings.hpp"
 
 #include "app/proxyman/inbound/handler.hpp"
 #include "app/stats.hpp"
@@ -68,7 +70,8 @@ ReadTcpRequest(AsyncStream& stream, wire::Version version, session::Context& ctx
         }
         if (chunk.byte_size() == 0) {
             co_return tl::unexpected(ResolveHandshakeReadFailure(
-                stream, ErrorCode::PROTOCOL_DECODE_FAILED));
+                stream, received.byte_size() == 0 ? ErrorCode::SOCKET_EOF
+                                                  : ErrorCode::PROTOCOL_DECODE_FAILED));
         }
         buf::AppendCoalescedStreamInput(received, std::move(chunk));
 
@@ -97,9 +100,7 @@ ReadTcpRequest(AsyncStream& stream, wire::Version version, session::Context& ctx
         }
         const std::string_view reason = target.error() == wire::ProtocolError::Incomplete
             ? "request header too large" : "invalid request header";
-        LOG_CONN_WARN(ctx, "request rejected from {}:{} > {}",
-                      ctx.inbound.source_ip, ctx.inbound.source_port, reason);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+        LogInboundRequestRejected(ctx, reason);
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 }
@@ -120,12 +121,11 @@ public:
         session::Context& ctx,
         const TimeoutsConfig& timeouts,
         uint32_t /*pressure_idle_timeout*/) override {
-        if (auto* session = dynamic_cast<wire::UdpSessionStream*>(stream.get())) {
-            BindInboundRequestTarget(
-                ctx, InboundRequestTarget{Network::UDP, session->FirstTarget()});
+        if (ctx.content.network == Network::UDP) {
+            const transport::Link client{stream.get(), stream.get()};
             co_return co_await dispatcher.Dispatch(
                 io_context, receiver.dispatch_policy, std::move(stream),
-                transport::Link{session, session}, InitialPayload{},
+                client, InitialPayload{},
                 ctx, stats_, timeouts);
         }
 
@@ -145,11 +145,12 @@ public:
             } catch (const transport::LinkError& error) {
                 co_return RejectInbound(
                     stats_, stream.get(),
-                    ResolveHandshakeReadFailure(*stream, error.code()));
+                    (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout() ||
+                     stream->ConsumeWriteTimeout() ? ErrorCode::TIMEOUT : error.code()));
             } catch (const IoSystemError& error) {
                 co_return RejectInbound(
                     stats_, stream.get(),
-                    ClassifyHandshakeReadException(*stream, error));
+                    ClassifyHandshakeWriteException(*stream, error));
             }
             BindInboundRequestTarget(
                 ctx, InboundRequestTarget{Network::TCP, std::move(request->target)});

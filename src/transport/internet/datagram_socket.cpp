@@ -33,17 +33,13 @@ std::size_t MaxUdpPayload(bool ipv6) noexcept {
     return ipv6 ? kMaxUdpPayloadV6 : kMaxUdpPayloadV4;
 }
 
-[[noreturn]] void ThrowLink(ErrorCode error) {
-    throw transport::LinkError(error);
-}
-
 [[noreturn]] void ThrowCancelled(ErrorCode reason) {
-    ThrowLink(reason == ErrorCode::OK ? ErrorCode::CANCELLED : reason);
+    throw LinkError(reason == ErrorCode::OK ? ErrorCode::CANCELLED : reason);
 }
 
 void ValidateDestination(const udp::endpoint& destination, bool ipv6) {
     if (destination.port() == 0 || destination.address().is_v6() != ipv6)
-        ThrowLink(ErrorCode::INVALID_ARGUMENT);
+        throw LinkError(ErrorCode::INVALID_ARGUMENT);
 }
 
 
@@ -52,9 +48,9 @@ void ValidateBuffers(
     total = 0;
     for (const auto& buffer : buffers) {
         if (buffer.size() != 0 && buffer.data() == nullptr)
-            ThrowLink(ErrorCode::INVALID_ARGUMENT);
+            throw LinkError(ErrorCode::INVALID_ARGUMENT);
         if (buffer.size() > maximum - total)
-            ThrowLink(ErrorCode::INVALID_ARGUMENT);
+            throw LinkError(ErrorCode::INVALID_ARGUMENT);
         total += buffer.size();
     }
 }
@@ -74,6 +70,55 @@ std::size_t PeekDatagramSize(udp::socket& socket, IoErrorCode& error) noexcept {
     }
 }
 
+void UdpReceiveBuffer::Release() noexcept {
+    small_ = buf::BufferGuard{};
+    if (large_.capacity() != 0) {
+        memory::ByteVector empty{large_.get_allocator()};
+        large_.swap(empty);
+    }
+}
+
+net::mutable_buffer UdpReceiveBuffer::Prepare(std::size_t available_bytes) {
+    const std::size_t capacity = std::clamp<std::size_t>(available_bytes, 1, kMaxWireBytes);
+    if (capacity <= buf::Buffer::kSize) {
+        if (large_.capacity() != 0) {
+            memory::ByteVector empty{large_.get_allocator()};
+            large_.swap(empty);
+        }
+        if (!small_) {
+            small_ = buf::BufferGuard{buf::Buffer::New()};
+            if (!small_) return {};
+        }
+        return net::buffer(small_->data, buf::Buffer::kSize);
+    }
+
+    small_ = buf::BufferGuard{};
+    try {
+        large_.resize(capacity);
+    } catch (const std::bad_alloc&) {
+        Release();
+        return {};
+    }
+    return net::buffer(large_.data(), large_.size());
+}
+
+std::span<const uint8_t> UdpReceiveBuffer::Data(std::size_t bytes) const noexcept {
+    if (!large_.empty()) {
+        return std::span<const uint8_t>(large_.data(), std::min(bytes, large_.size()));
+    }
+    if (small_) {
+        return std::span<const uint8_t>(
+            small_->data, std::min(bytes, static_cast<std::size_t>(buf::Buffer::kSize)));
+    }
+    return {};
+}
+
+bool IsTransientUdpReceiveError(const IoErrorCode& error) noexcept {
+    return error == io_error::would_block || error == io_error::try_again ||
+        error == io_error::interrupted || error == io_error::connection_refused ||
+        error == io_error::connection_reset;
+}
+
 struct DatagramSocket::Impl final {
     using Timeouts = detail::ConnectionTimeouts<Impl>;
 
@@ -82,7 +127,7 @@ struct DatagramSocket::Impl final {
         , timeouts(io_context, *this)
         , ipv6(bind_address.is_v6()) {
         if (active_sockets >= kMaxActiveSockets)
-            ThrowLink(ErrorCode::RESOURCE_EXHAUSTED);
+            throw LinkError(ErrorCode::RESOURCE_EXHAUSTED);
         IoErrorCode ec;
         socket.open(ipv6 ? udp::v6() : udp::v4(), ec);
         if (ec) throw IoSystemError(ec);
@@ -219,7 +264,7 @@ net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& op
             guards[i] = buf::BufferGuard(buf::Buffer::New());
             if (!guards[i]) {
                 read_drain_budget = 0;
-                ThrowLink(ErrorCode::RESOURCE_EXHAUSTED);
+                throw LinkError(ErrorCode::RESOURCE_EXHAUSTED);
             }
             buffers[i] = net::buffer(guards[i]->Tail().data(), guards[i]->Available());
         }
@@ -244,7 +289,7 @@ net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& op
             read_drain_budget = kReadDrainBudget - 1;
         }
         if (received > count * buf::Buffer::kSize) continue;
-        if (source.address().is_v6() != ipv6) ThrowLink(ErrorCode::INTERNAL);
+        if (source.address().is_v6() != ipv6) throw LinkError(ErrorCode::INTERNAL);
 
         buf::MultiBuffer payload;
         std::size_t remaining = received;
@@ -278,7 +323,7 @@ net::awaitable<void> DatagramSocket::Impl::SendBuffers(
                 merged.insert(merged.end(), first, first + buffer.size());
             }
         } catch (const std::bad_alloc&) {
-            ThrowLink(ErrorCode::RESOURCE_EXHAUSTED);
+            throw LinkError(ErrorCode::RESOURCE_EXHAUSTED);
         }
         single[0] = net::buffer(merged.data(), merged.size());
         buffers = single;
@@ -295,7 +340,7 @@ net::awaitable<void> DatagramSocket::Impl::SendBuffers(
             // only for backpressure and never retains payload pointers.
             const auto sent = socket.send_to(buffers, destination, 0, send_ec);
             if (!send_ec) {
-                if (sent != total) ThrowLink(ErrorCode::INTERNAL);
+                if (sent != total) throw LinkError(ErrorCode::INTERNAL);
                 break;
             }
             if (send_ec != io_error::would_block && send_ec != io_error::try_again)
@@ -315,14 +360,14 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
     ValidateDestination(destination, ipv6);
     const auto maximum = MaxUdpPayload(ipv6);
     if (payload.byte_size() > maximum)
-        ThrowLink(ErrorCode::INVALID_ARGUMENT);
+        throw LinkError(ErrorCode::INVALID_ARGUMENT);
     std::size_t total = 0;
     for (const auto* buffer : payload) {
         if (!buffer || buffer->Bytes().size() > maximum - total)
-            ThrowLink(ErrorCode::INVALID_ARGUMENT);
+            throw LinkError(ErrorCode::INVALID_ARGUMENT);
         total += buffer->Bytes().size();
     }
-    if (total != payload.byte_size()) ThrowLink(ErrorCode::INVALID_ARGUMENT);
+    if (total != payload.byte_size()) throw LinkError(ErrorCode::INVALID_ARGUMENT);
 
     const auto cancellation_state = co_await net::this_coro::cancellation_state;
     if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
@@ -347,7 +392,7 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
                 destination, 0, send_ec);
         }
         if (!send_ec) {
-            if (sent != total) ThrowLink(ErrorCode::INTERNAL);
+            if (sent != total) throw LinkError(ErrorCode::INTERNAL);
             timeouts.TouchActivity();
             co_return;
         }
@@ -362,7 +407,7 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
     try {
         spans.AppendMultiBuffer(payload);
     } catch (const std::bad_alloc&) {
-        ThrowLink(ErrorCode::RESOURCE_EXHAUSTED);
+        throw LinkError(ErrorCode::RESOURCE_EXHAUSTED);
     }
     co_await SendBuffers(operation, std::move(destination), spans.Span(), false);
 }
@@ -371,11 +416,11 @@ DatagramSocket::ReadOperation::ReadOperation(Impl& impl)
     : impl_(&impl)
     , generation_(impl.generation) {
     if (impl.closed) ThrowCancelled(impl.cancellation_reason);
-    if (impl.read_active) ThrowLink(ErrorCode::INVALID_ARGUMENT);
+    if (impl.read_active) throw LinkError(ErrorCode::INVALID_ARGUMENT);
     try {
         impl.timeouts.BeginRead();
     } catch (const std::bad_alloc&) {
-        ThrowLink(ErrorCode::RESOURCE_EXHAUSTED);
+        throw LinkError(ErrorCode::RESOURCE_EXHAUSTED);
     }
     impl.read_active = true;
 }
@@ -402,11 +447,11 @@ DatagramSocket::WriteOperation::WriteOperation(Impl& impl)
     : impl_(&impl)
     , generation_(impl.generation) {
     if (impl.closed) ThrowCancelled(impl.cancellation_reason);
-    if (impl.write_active) ThrowLink(ErrorCode::INVALID_ARGUMENT);
+    if (impl.write_active) throw LinkError(ErrorCode::INVALID_ARGUMENT);
     try {
         impl.timeouts.BeginWrite();
     } catch (const std::bad_alloc&) {
-        ThrowLink(ErrorCode::RESOURCE_EXHAUSTED);
+        throw LinkError(ErrorCode::RESOURCE_EXHAUSTED);
     }
     impl.write_active = true;
 }
@@ -419,7 +464,7 @@ DatagramSocket::WriteOperation::~WriteOperation() noexcept {
 
 void DatagramSocket::WriteOperation::CheckAvailable() {
     if (Cancelled()) ThrowCancelled(CancellationReason());
-    if (send_started_) ThrowLink(ErrorCode::INVALID_ARGUMENT);
+    if (send_started_) throw LinkError(ErrorCode::INVALID_ARGUMENT);
     send_started_ = true;
 }
 
@@ -454,19 +499,19 @@ DatagramSocket::WriteOperation DatagramSocket::StartWrite() { return WriteOperat
 
 void DatagramSocket::SetIdleTimeout(std::chrono::seconds timeout) {
     try { impl_->timeouts.SetIdleTimeout(timeout); }
-    catch (const std::bad_alloc&) { ThrowLink(ErrorCode::RESOURCE_EXHAUSTED); }
+    catch (const std::bad_alloc&) { throw LinkError(ErrorCode::RESOURCE_EXHAUSTED); }
 }
 void DatagramSocket::SetReadTimeout(std::chrono::seconds timeout) {
     try { impl_->timeouts.SetReadTimeout(timeout); }
-    catch (const std::bad_alloc&) { ThrowLink(ErrorCode::RESOURCE_EXHAUSTED); }
+    catch (const std::bad_alloc&) { throw LinkError(ErrorCode::RESOURCE_EXHAUSTED); }
 }
 void DatagramSocket::SetWriteTimeout(std::chrono::seconds timeout) {
     try { impl_->timeouts.SetWriteTimeout(timeout); }
-    catch (const std::bad_alloc&) { ThrowLink(ErrorCode::RESOURCE_EXHAUSTED); }
+    catch (const std::bad_alloc&) { throw LinkError(ErrorCode::RESOURCE_EXHAUSTED); }
 }
 PhaseDeadlineHandle DatagramSocket::StartPhaseDeadline(std::chrono::seconds timeout) {
     try { return impl_->timeouts.StartPhaseDeadline(timeout); }
-    catch (const std::bad_alloc&) { ThrowLink(ErrorCode::RESOURCE_EXHAUSTED); }
+    catch (const std::bad_alloc&) { throw LinkError(ErrorCode::RESOURCE_EXHAUSTED); }
 }
 void DatagramSocket::ClearPhaseDeadline() noexcept { impl_->timeouts.ClearPhaseDeadline(); }
 bool DatagramSocket::ConsumeIdleTimeout() noexcept { return impl_->timeouts.ConsumeIdleTimeout(); }

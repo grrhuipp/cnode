@@ -383,7 +383,7 @@ TEST_P(HysteriaThroughputBenchmark, VerifiedTcpTransfer) {
     WriteJson(root.Path(), "config.json", {{"workers", Workers},
         {"timeouts", {{"handshake", 10}, {"connIdle", IdleTimeout.count()},
             {"write", 120}, {"uplinkOnly", 10}, {"downlinkOnly", 10}}},
-        {"log", {{"enable", false}, {"logDir", (root.Path() / "logs").string()}}}});
+        {"log", {{"logDir", (root.Path() / "logs").string()}}}});
     reservation.Close();
 
     // There is exactly one child process and no other child is reaped here.

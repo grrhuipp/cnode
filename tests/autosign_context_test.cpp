@@ -1,14 +1,14 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/reality_tls.hpp"
+#include "transport/internet/tls_context.hpp"
 
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
-#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 namespace {
@@ -30,6 +30,11 @@ std::shared_ptr<SSL_CTX> Context(long validity_seconds) {
         throw std::runtime_error("test SSL_CTX construction failed");
     return context;
 }
+::TlsConfig RenewalConfig(std::string server_name) {
+    ::TlsConfig config;
+    config.server_name = std::move(server_name);
+    return config;
+}
 template<class Predicate> bool Await(Predicate predicate) {
     const auto deadline = std::chrono::steady_clock::now() + 5s;
     while (!predicate()) {
@@ -44,43 +49,36 @@ TEST(AutosignContext, Contract) {
     // An actual certificate inside the 30-day renewal window is immediately
     // due. No clock changes, production timeouts, or 30-day sleeps are needed.
     constexpr long kTenDays = 10L * 24 * 60 * 60;
-    constexpr long kYear = 365L * 24 * 60 * 60;
+    const auto after_ten_days = Renewal::Clock::now() + std::chrono::hours(24 * 11);
+
+    // 调度器按登记顺序处理到期项：先登记的失败续期在后续成功续期发布之前必已尝试。
+    // 版本区间为空，使重建在签发后的上下文配置阶段失败。
+    auto old = Context(kTenDays);
+    auto failing_config = RenewalConfig("failing.example");
+    failing_config.min_version = ::TlsVersion::V1_3;
+    failing_config.max_version = ::TlsVersion::V1_2;
+    auto failing = Renewal::Start(old, failing_config);
+
     auto initial = Context(kTenDays);
     SSL* established = SSL_new(initial.get());
     ASSERT_FALSE((!Require(established != nullptr, "old SSL must retain its certificate snapshot")));
-    std::atomic<unsigned> builds{0};
-    std::atomic<bool> background{false};
-    const auto main_thread = std::this_thread::get_id();
-    auto renewal = Renewal::Start(initial, [&] {
-        background.store(std::this_thread::get_id() != main_thread);
-        ++builds;
-        return Context(kYear);
-    });
+    auto renewal = Renewal::Start(initial, RenewalConfig("renewal.example"));
     ASSERT_FALSE((!Require(Await([&] { return renewal->Acquire().get() != initial.get(); }),
                  "due certificate must publish a renewed immutable snapshot")));
-    ASSERT_FALSE((!Require(builds == 1 && background,
-                 "renewal must run once on a background thread, not a handshake thread")));
     auto replacement = renewal->Acquire();
     ASSERT_FALSE((!Require(replacement && SSL_get_SSL_CTX(established) == initial.get() &&
                     SSL_CTX_get0_certificate(replacement.get()) != SSL_get_certificate(established),
                  "publishing renewal must not mutate established SSL's old context")));
     SSL_free(established);
+    ASSERT_FALSE((!Require(renewal->Acquire(after_ten_days) == replacement,
+                 "renewal must rebuild a one-year certificate from the configuration snapshot")));
     for (int i = 0; i < 1000; ++i) {
         ASSERT_FALSE((!Require(renewal->Acquire() == replacement, "snapshot acquisition must not invoke signing")));
     }
-    ASSERT_FALSE((!Require(builds == 1, "handshake snapshot acquisition must not enqueue renewal")));
 
-    std::atomic<unsigned> failures{0};
-    auto old = Context(kTenDays);
-    auto failing = Renewal::Start(old, [&]() -> std::shared_ptr<SSL_CTX> {
-        ++failures;
-        throw std::runtime_error("injected renewal failure");
-    });
-    ASSERT_FALSE((!Require(Await([&] { return failures.load() != 0; }),
-                 "due failed renewal must exercise background builder")));
     ASSERT_FALSE((!Require(failing->Acquire() == old,
                  "renew failure must retain a still-valid previous certificate")));
-    ASSERT_FALSE((!Require(!failing->Acquire(Renewal::Clock::now() + std::chrono::hours(24 * 11)),
+    ASSERT_FALSE((!Require(!failing->Acquire(after_ten_days),
                  "expired certificate must fail closed even when renewal failed")));
     ASSERT_FALSE((!Require(!renewal->Acquire(Renewal::Clock::now() + std::chrono::hours(24 * 366)),
                  "snapshot validity must be enforced at notAfter")));

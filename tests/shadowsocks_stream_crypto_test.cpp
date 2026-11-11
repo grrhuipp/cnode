@@ -185,7 +185,7 @@ void TestLargeRecord(size_t payload_size, ss::SsCipherType cipher_type) {
     ss::SsAeadCipher cipher(
         cipher_type,
         key.data(),
-        key.size(), proxy::AeadDirection::Encrypt);
+        key.size());
     std::vector<uint8_t> ciphertext(
         payload_size + ss::SsAeadCipher::kTagSize);
     Check(cipher.Encrypt(
@@ -195,7 +195,7 @@ void TestLargeRecord(size_t payload_size, ss::SsCipherType cipher_type) {
               ciphertext.data()),
           "large Shadowsocks record encryption failed");
 
-    ss::SsAeadCipher decryptor(cipher_type, key.data(), key.size(), proxy::AeadDirection::Decrypt);
+    ss::SsAeadCipher decryptor(cipher_type, key.data(), key.size());
     buf::MultiBuffer encrypted;
     Check(buf::AppendSpanToMultiBuffer(ciphertext, encrypted),
           "encrypted fixture allocation failed");
@@ -220,7 +220,7 @@ void TestInvalidTagDoesNotPublishPartialPlaintext() {
     ss::SsAeadCipher cipher(
         ss::SsCipherType::AES_256_GCM,
         key.data(),
-        key.size(), proxy::AeadDirection::Encrypt);
+        key.size());
     Check(cipher.Encrypt(
               nonce.data(),
               plaintext.data(),
@@ -229,8 +229,7 @@ void TestInvalidTagDoesNotPublishPartialPlaintext() {
           "invalid-tag fixture encryption failed");
     ciphertext.back() ^= 0x80;
 
-    ss::SsAeadCipher decryptor(ss::SsCipherType::AES_256_GCM, key.data(), key.size(),
-                               proxy::AeadDirection::Decrypt);
+    ss::SsAeadCipher decryptor(ss::SsCipherType::AES_256_GCM, key.data(), key.size());
     buf::MultiBuffer encrypted;
     Check(buf::AppendSpanToMultiBuffer(ciphertext, encrypted),
           "encrypted fixture allocation failed");
@@ -321,7 +320,7 @@ void AppendRecord(ss::SsAeadCipher& cipher, uint64_t& counter,
 
 void TestReaderResume(ss::SsCipherType type, uint64_t initial_nonce, bool empty_on_cancel,
                       size_t fragment = 137) {
-    ss::SsAeadCipher encoder(type, kRecordKey.data(), RecordKeySize(type), proxy::AeadDirection::Encrypt);
+    ss::SsAeadCipher encoder(type, kRecordKey.data(), RecordKeySize(type));
     uint64_t nonce = initial_nonce;
     std::vector<uint8_t> wire;
     const std::vector<uint8_t> first{0x01, 0x02, 0x03};
@@ -341,7 +340,7 @@ void TestReaderResume(ss::SsCipherType type, uint64_t initial_nonce, bool empty_
     source.cuts = {boundary, boundary, boundary + 1, boundary + 17, boundary + 18,
                    data + 1, data + 17, data + 18, data + 19, data + 4100, wire.size() - 1};
     ss::detail::BodyReader reader(
-        ss::SsAeadCipher(type, kRecordKey.data(), RecordKeySize(type), proxy::AeadDirection::Decrypt),
+        ss::SsAeadCipher(type, kRecordKey.data(), RecordKeySize(type)),
         initial_nonce, source, max_payload);
     const auto exercise = [&]() -> net::awaitable<void> {
         Check(Flatten(co_await reader.ReadMultiBuffer()) == first, "first real record changed");
@@ -376,7 +375,7 @@ void CheckReaderFailure(const std::vector<uint8_t>& wire, ss::SsCipherType type,
     WireReader source(wire);
     source.fail_at_eof = source_fault;
     ss::detail::BodyReader reader(
-        ss::SsAeadCipher(type, kRecordKey.data(), RecordKeySize(type), proxy::AeadDirection::Decrypt),
+        ss::SsAeadCipher(type, kRecordKey.data(), RecordKeySize(type)),
         nonce, source);
     const auto exercise = [&]() -> net::awaitable<void> {
         if (preceding_record)
@@ -395,7 +394,7 @@ void CheckReaderFailure(const std::vector<uint8_t>& wire, ss::SsCipherType type,
 }
 
 void TestReaderFailures(ss::SsCipherType type, uint64_t initial_nonce) {
-    ss::SsAeadCipher encoder(type, kRecordKey.data(), RecordKeySize(type), proxy::AeadDirection::Encrypt);
+    ss::SsAeadCipher encoder(type, kRecordKey.data(), RecordKeySize(type));
     uint64_t nonce = initial_nonce;
     std::vector<uint8_t> wire;
     const std::array<uint8_t, 3> plain{7, 8, 9};
@@ -428,13 +427,11 @@ void TestContextLifetime() {
     const std::array<uint8_t, 12> nonce{};
     const std::array<uint8_t, 3> plain{17, 31, 91};
     std::array<uint8_t, 19> ciphertext{};
-    ss::SsAeadCipher encoder(ss::SsCipherType::AES_256_GCM, kRecordKey.data(), 32,
-                              proxy::AeadDirection::Encrypt);
+    ss::SsAeadCipher encoder(ss::SsCipherType::AES_256_GCM, kRecordKey.data(), 32);
     Check(encoder.Encrypt(nonce.data(), plain.data(), plain.size(), ciphertext.data()),
           "trial fixture encryption failed");
     std::array<uint8_t, 32> wrong{};
-    ss::SsAeadCipher trials(ss::SsCipherType::AES_256_GCM, wrong.data(), 32,
-                             proxy::AeadDirection::Decrypt);
+    ss::SsAeadCipher trials(ss::SsCipherType::AES_256_GCM, wrong.data(), 32);
     std::array<uint8_t, 3> decoded{};
     Check(!trials.Decrypt(nonce.data(), ciphertext.data(), ciphertext.size(), decoded.data()),
           "wrong trial key authenticated");
@@ -450,8 +447,7 @@ void TestContextLifetime() {
     fail_cipher_context = true;
     bool failed = false;
     try {
-        ss::SsAeadCipher unavailable(ss::SsCipherType::AES_256_GCM, kRecordKey.data(), 32,
-                                     proxy::AeadDirection::Decrypt);
+        ss::SsAeadCipher unavailable(ss::SsCipherType::AES_256_GCM, kRecordKey.data(), 32);
     } catch (const std::bad_alloc&) { failed = true; }
     fail_cipher_context = false;
     Check(failed, "EVP allocation failure created usable SS state");
@@ -465,8 +461,7 @@ void TestContextLifetime() {
     WireReader source(wire);
     source.fail_payload_allocation = true;
     ss::detail::BodyReader reader(
-        ss::SsAeadCipher(ss::SsCipherType::AES_256_GCM, kRecordKey.data(), 32,
-                         proxy::AeadDirection::Decrypt), 0, source);
+        ss::SsAeadCipher(ss::SsCipherType::AES_256_GCM, kRecordKey.data(), 32), 0, source);
     const auto exercise = [&]() -> net::awaitable<void> {
         for (int retry = 0; retry < 2; ++retry) {
             bool failed = false;

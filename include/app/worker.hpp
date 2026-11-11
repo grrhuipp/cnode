@@ -6,13 +6,11 @@
 #include "infra/config_types.hpp"
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
-#include "common/hash_container_shrink.hpp"
-#include "common/string_hash.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 
 #include <cstdint>
 #include <atomic>
-#include <functional>
+#include <exception>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -53,65 +51,6 @@ namespace rule {
 struct DetectRule;
 }
 
-namespace worker_detail {
-
-// Worker-private owner for one inbound tag's TCP acceptors.
-class TcpListenerOwner final {
-public:
-    // Handles remain Worker-local; accept loops retain them only until a
-    // close/cancel completion has resumed and observed owner-map retirement.
-    using AcceptorPtr = std::shared_ptr<tcp::acceptor>;
-
-    TcpListenerOwner() = default;
-    ~TcpListenerOwner() noexcept { Close(); }
-
-    TcpListenerOwner(const TcpListenerOwner&) = delete;
-    TcpListenerOwner& operator=(const TcpListenerOwner&) = delete;
-
-    void Close() noexcept {
-        while (!acceptors_.empty()) {
-            CloseAcceptor(acceptors_.begin()->first);
-        }
-    }
-
-    // listener_key is unique for the lifetime of its AcceptLoop. Duplicate
-    // creation is rejected instead of replacing the object at a stable address.
-    [[nodiscard]] AcceptorPtr CreateAcceptor(std::string_view listener_key,
-                                             net::io_context& io_context) {
-        if (acceptors_.contains(listener_key)) return nullptr;
-        auto acceptor = std::make_shared<tcp::acceptor>(io_context);
-        acceptors_.try_emplace(memory::String(listener_key), acceptor);
-        return acceptor;
-    }
-
-    [[nodiscard]] bool OwnsAcceptor(
-        std::string_view listener_key,
-        const tcp::acceptor* acceptor) const noexcept {
-        const auto it = acceptors_.find(listener_key);
-        return acceptor && it != acceptors_.end() && it->second.get() == acceptor;
-    }
-
-    void CloseAcceptor(std::string_view listener_key) noexcept {
-        auto it = acceptors_.find(listener_key);
-        if (it == acceptors_.end()) {
-            return;
-        }
-
-        auto acceptor = std::move(it->second);
-        acceptors_.erase(it);
-        MaybeShrinkHashContainer(acceptors_, 8);
-
-        IoErrorCode ec;
-        acceptor->close(ec);
-    }
-
-private:
-    memory::UnorderedMap<memory::String, AcceptorPtr,
-                                   TransparentStringHash, TransparentStringEq> acceptors_;
-};
-
-}  // namespace worker_detail
-
 // ============================================================================
 // Worker - 同构运行时边界（SO_REUSEPORT：每 Worker 独立 accept）
 //
@@ -120,14 +59,16 @@ private:
 // ============================================================================
 class Worker {
 public:
+    // coordinator 是整个 Worker 池共享的有界全局准入协调器，必须由调用方提供
+    // （运行在主控事件循环上）；构造即完成本 Worker 的路由登记。
     Worker(uint32_t id, net::io_context& io_context,
            const WorkerRuntimeConfig& runtime_config, StatsShard& stats,
            app::dns::DNSWorker& dns_worker,
+           std::shared_ptr<GroupCoordinator> coordinator,
            geo::GeoDatabase* geo_database = nullptr);
     ~Worker();
 
-    // Shared, bounded control directory for this pool; installed before startup.
-    void SetGroupCoordinator(std::shared_ptr<GroupCoordinator> coordinator);
+    // 停机收尾前供运行时 owner 取得协调器；StopRuntime 完成后释放。
     [[nodiscard]] std::shared_ptr<GroupCoordinator> Coordinator() const noexcept {
         return group_coordinator_;
     }
@@ -162,7 +103,10 @@ public:
     // After RequestStop, one observer awaits all accepted work and live state.
     // Repeated joins after completion are harmless.
     net::awaitable<void> AsyncJoin();
-    void SetFailureHandler(std::function<void(std::exception_ptr)> handler);
+    // 运行时故障通知：无捕获函数指针 + context，与 UdpAssociationReclaimer 同一风格。
+    // 必须在数据线程启动前安装；context 由调用方保证覆盖 Worker 运行期。
+    using FailureHandler = void (*)(void*, std::exception_ptr) noexcept;
+    void SetFailureHandler(void* context, FailureHandler handler) noexcept;
     // Called exactly once on the data thread; catches loop failures, requests
     // global cancellation, and keeps driving completion until live teardown.
     void RunEventLoop() noexcept;
@@ -197,9 +141,9 @@ public:
     // ── 数据收集（在所属 Worker 线程执行，无竞争）──
 
     // Snapshot on this Worker; acknowledge only after off-thread durable storage.
-    [[nodiscard]] app::UserTrafficSnapshot SnapshotTraffic(std::string_view tag);
-    void CommitTraffic(std::string_view tag, const app::UserTrafficSnapshot& snapshot);
-    void RollbackTraffic(std::string_view tag, const app::UserTrafficSnapshot& snapshot);
+    [[nodiscard]] app::UserTrafficCounters SnapshotTraffic(std::string_view tag);
+    void CommitTraffic(std::string_view tag, const app::UserTrafficCounters& snapshot);
+    void RollbackTraffic(std::string_view tag, const app::UserTrafficCounters& snapshot);
 
     // 协议类型由 inbound handler 的 ReceiverSettings 自动判断，无需外部传入。
     [[nodiscard]] std::vector<OnlineDevice> GetOnlineDevices(std::string_view tag) const;
@@ -211,6 +155,10 @@ private:
     struct ListenerSlot;
     struct ListenerState;
     struct RuntimeState;
+    class ColdMutation;
+    // 冷路径变更统一前导：停机/排空中拒绝（operation_aborted），并独占冷变更槽位。
+    void ThrowIfStopping() const;
+    [[nodiscard]] ColdMutation BeginColdMutation();
     void BeginStopOnWorker() noexcept;
     net::awaitable<void> StopRuntimeTask();
     net::awaitable<void> DrainRuntimeTask();
@@ -224,11 +172,10 @@ private:
     std::atomic<bool> drain_requested_{false};
     std::atomic<bool> joined_{false};
     bool stop_notification_delivered_ = false; // owner executor only
-    std::function<void(std::exception_ptr)> failure_handler_;
+    void* failure_context_ = nullptr;
+    FailureHandler failure_handler_ = nullptr;
     std::unique_ptr<RuntimeState> runtime_;
     std::unique_ptr<WorkerMailbox> mailbox_;
     std::shared_ptr<GroupCoordinator> group_coordinator_;
-    bool owns_group_coordinator_ = false;
-
 };
 

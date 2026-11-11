@@ -1,4 +1,5 @@
 #include "app/router/router.hpp"
+#include "features/routing/sniffed_protocol.hpp"
 
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
@@ -65,22 +66,6 @@ void SortUniqueStrings(StringVector& values) {
 
 namespace detail {
 
-constexpr uint8_t CompoundRoutingRule::ProtocolBit(std::string_view protocol) noexcept {
-    if (protocol == constants::protocol::kTls) {
-        return kProtocolTls;
-    }
-    if (protocol == constants::protocol::kHttp) {
-        return kProtocolHttp;
-    }
-    if (protocol == constants::protocol::kBitTorrent) {
-        return kProtocolBittorrent;
-    }
-    if (protocol == constants::protocol::kQuic) {
-        return kProtocolQuic;
-    }
-    return 0;
-}
-
 void CompoundRoutingRule::SetNetworkCondition(const std::vector<std::string>& networks) {
     network_mask = 0;
     for (const auto& network : networks) {
@@ -99,7 +84,7 @@ void CompoundRoutingRule::SetProtocolCondition(const std::vector<std::string>& p
     protocol_mask = 0;
     protocol_values.clear();
     for (const auto& protocol : protocols) {
-        if (const uint8_t bit = ProtocolBit(protocol); bit != 0) {
+        if (const uint8_t bit = routing::SniffedProtocolBit(protocol); bit != 0) {
             protocol_mask |= bit;
         } else {
             protocol_values.emplace_back(protocol);
@@ -190,7 +175,7 @@ bool CompoundRoutingRule::MatchNetwork(const session::Context& ctx) const noexce
 bool CompoundRoutingRule::MatchProtocol(const session::Context& ctx) const {
     if (ctx.content.protocol.empty()) return false;
 
-    const uint8_t bit = ProtocolBit(ctx.content.protocol);
+    const uint8_t bit = routing::SniffedProtocolBit(ctx.content.protocol);
     if (bit != 0) {
         return (protocol_mask & bit) != 0;
     }

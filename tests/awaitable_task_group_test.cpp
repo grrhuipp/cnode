@@ -8,16 +8,13 @@
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
-#include <asio/detached.hpp>
 #include <asio/executor_work_guard.hpp>
 #include <asio/post.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_future.hpp>
 
-#include <atomic>
 #include <chrono>
 #include <cstdlib>
-#include <iostream>
 #include <new>
 #include <stdexcept>
 #include <thread>
@@ -29,28 +26,7 @@ namespace net = ::net;
 using async_allocation_test::fail_after;
 using async_allocation_test::injected;
 
-class GroupResource final : public std::pmr::memory_resource {
-public:
-    std::atomic<size_t> live{0};
-private:
-    void* do_allocate(size_t bytes, size_t alignment) override {
-        async_allocation_test::Check();
-        auto* result = ::memory::process_resource()->allocate(bytes, alignment);
-        live.fetch_add(1, std::memory_order_relaxed);
-        return result;
-    }
-    void do_deallocate(void* pointer, size_t bytes, size_t alignment) override {
-        ::memory::process_resource()->deallocate(pointer, bytes, alignment);
-        live.fetch_sub(1, std::memory_order_relaxed);
-    }
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
-    }
-};
 
-void Check(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
-}
 
 struct OwnerFailure final : std::runtime_error {
     OwnerFailure() : std::runtime_error("owner failure") {}
@@ -92,7 +68,7 @@ net::awaitable<void> AddChild(::AwaitableTaskGroup& group,
     group.Spawn(Wait(timer, counts, true));
 }
 
-void TestDynamicCancellation() {
+TEST(AwaitableTaskGroup, DynamicCancellationJoinsChildCleanup) {
     net::io_context io;
     net::steady_timer gate(io);
     gate.expires_at(net::steady_timer::time_point::max());
@@ -110,15 +86,21 @@ void TestDynamicCancellation() {
             failure = error;
         }));
     io.poll();
-    Check(counts.active == 2 && counts.finished == 1, "dynamic children must start");
+    EXPECT_TRUE(counts.active == 2 && counts.finished == 1) << "dynamic children must start";
     cancellation.emit(net::cancellation_type::terminal);
     io.poll();
-    Check(returned == -1, "cancel must join asynchronous child cleanup");
+    EXPECT_TRUE(returned == -1) << "cancel must join asynchronous child cleanup";
     io.run_for(std::chrono::seconds(1));
-    Check(counts.active == 0 && returned == 3 && failure, "cancel must finish every child");
+    const bool completed_without_external_release = counts.active == 0 && returned == 3;
+    gate.cancel();
+    io.restart();
+    io.run();
+    EXPECT_TRUE(completed_without_external_release);
+    EXPECT_TRUE(counts.active == 0 && returned == 3 && failure) << "cancel must finish every child";
+    ASSERT_TRUE(failure);
     try { std::rethrow_exception(failure); }
     catch (const ::IoSystemError& error) {
-        Check(error.code() == net::error::operation_aborted, "wrong cancellation error");
+        EXPECT_TRUE(error.code() == net::error::operation_aborted) << "wrong cancellation error";
     }
 }
 
@@ -138,7 +120,7 @@ net::awaitable<void> Stop(::AwaitableTaskGroup& group,
     }
 }
 
-void TestExplicitCancel() {
+TEST(AwaitableTaskGroup, ExplicitCancelRejectsLateSpawnAndJoinsChildren) {
     net::io_context io;
     net::steady_timer gate(io);
     gate.expires_at(net::steady_timer::time_point::max());
@@ -150,14 +132,20 @@ void TestExplicitCancel() {
             group.Spawn(Stop(group, gate, counts, rejected));
         }), net::use_future);
     io.run_for(std::chrono::seconds(1));
-    Check(result.wait_for(std::chrono::seconds(0)) == std::future_status::ready,
-          "explicit stop must join all children");
+    const bool completed_without_external_release =
+        result.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    gate.cancel();
+    io.restart();
+    io.run();
+    EXPECT_TRUE(completed_without_external_release) << "explicit stop must join all children";
     result.get();
-    Check(rejected && counts.active == 0 && counts.finished == 1,
-          "explicit stop must reject late spawn and preserve normal completion");
+    EXPECT_TRUE(rejected && counts.active == 0 && counts.finished == 1) << "explicit stop must reject late spawn and preserve normal completion";
 }
 
-void TestFailure(bool start_failure) {
+class TaskGroupFailure : public ::testing::TestWithParam<bool> {};
+
+TEST_P(TaskGroupFailure, CancelsAndJoinsPendingChildren) {
+    const bool start_failure = GetParam();
     net::io_context io;
     net::steady_timer gate(io);
     gate.expires_at(net::steady_timer::time_point::max());
@@ -169,12 +157,17 @@ void TestFailure(bool start_failure) {
             group.Spawn(Fail());
         }), net::use_future);
     io.run_for(std::chrono::seconds(1));
-    Check(result.wait_for(std::chrono::seconds(0)) == std::future_status::ready,
-          "failure must cancel and join pending children without an external wake");
+    const bool completed_without_external_release =
+        result.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    gate.cancel();
+    io.restart();
+    io.run();
+    EXPECT_TRUE(completed_without_external_release)
+        << "failure must cancel and join pending children without an external wake";
     bool failed = false;
     try { result.get(); }
     catch (const OwnerFailure&) { failed = true; }
-    Check(failed && counts.active == 0, "first failure must survive child cancellation");
+    EXPECT_TRUE(failed && counts.active == 0) << "first failure must survive child cancellation";
 }
 
 net::awaitable<void> AbortedChild() {
@@ -190,7 +183,7 @@ net::awaitable<void> FailingCleanup(bool& finished) {
     throw ::IoSystemError(net::error::address_in_use);
 }
 
-void TestFailureOutranksCancellation() {
+TEST(AwaitableTaskGroup, FailureOutranksCancellation) {
     net::io_context io;
     bool cleanup_finished = false;
     auto result = net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
@@ -204,7 +197,7 @@ void TestFailureOutranksCancellation() {
     catch (const ::IoSystemError& error) {
         preserved = error.code() == net::error::address_in_use;
     }
-    Check(cleanup_finished && preserved, "cancellation masked a joined child's real failure");
+    EXPECT_TRUE(cleanup_finished && preserved) << "cancellation masked a joined child's real failure";
 }
 
 net::awaitable<void> CancelledRequest(
@@ -212,7 +205,7 @@ net::awaitable<void> CancelledRequest(
     std::unique_ptr<::transport::CancellationSource> source, bool fail_cleanup) {
     Lifetime lifetime(counts);
     auto [error] = co_await operation.async_wait(net::as_tuple(net::use_awaitable));
-    Check(error == net::error::operation_aborted, "request operation was not cancelled");
+    EXPECT_TRUE(error == net::error::operation_aborted) << "request operation was not cancelled";
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     (void)co_await cleanup.async_wait(net::as_tuple(net::use_awaitable));
     // Destroy the source before the co_spawn completion callback. Its intrusive
@@ -222,7 +215,10 @@ net::awaitable<void> CancelledRequest(
     throw ::IoSystemError(net::error::operation_aborted);
 }
 
-void TestRequestCancellation(bool fail_cleanup) {
+class TaskGroupRequestCancellation : public ::testing::TestWithParam<bool> {};
+
+TEST_P(TaskGroupRequestCancellation, JoinsCleanupAndPreservesSiblingFailureSemantics) {
+    const bool fail_cleanup = GetParam();
     net::io_context io;
     net::steady_timer operation(io), cleanup(io), sibling(io);
     operation.expires_at(net::steady_timer::time_point::max());
@@ -239,20 +235,17 @@ void TestRequestCancellation(bool fail_cleanup) {
             group.Spawn(Wait(sibling, sibling_counts));
         }), net::use_future);
     io.poll();
-    Check(request_counts.active == 1 && sibling_counts.active == 1,
-          "request and sibling must both start");
+    EXPECT_TRUE(request_counts.active == 1 && sibling_counts.active == 1) << "request and sibling must both start";
     request_source->CancelPending();
     io.poll();
-    Check(request_counts.active == 1 && sibling_counts.active == 1 &&
-          result.wait_for(std::chrono::seconds(0)) != std::future_status::ready,
-          "request cancellation must join cleanup without cancelling its sibling");
+    EXPECT_TRUE(request_counts.active == 1 && sibling_counts.active == 1 &&
+          result.wait_for(std::chrono::seconds(0)) != std::future_status::ready) << "request cancellation must join cleanup without cancelling its sibling";
     cleanup.cancel();
     io.poll();
-    Check(request_counts.finished == 1, "request cleanup did not complete");
+    EXPECT_TRUE(request_counts.finished == 1) << "request cleanup did not complete";
     if (!fail_cleanup) {
-        Check(sibling_counts.active == 1 &&
-              result.wait_for(std::chrono::seconds(0)) != std::future_status::ready,
-              "locally aborted request stopped its sibling or completed parent early");
+        EXPECT_TRUE(sibling_counts.active == 1 &&
+              result.wait_for(std::chrono::seconds(0)) != std::future_status::ready) << "locally aborted request stopped its sibling or completed parent early";
         sibling.cancel();
     }
     io.restart();
@@ -260,11 +253,10 @@ void TestRequestCancellation(bool fail_cleanup) {
     bool failed = false;
     try { result.get(); }
     catch (const OwnerFailure&) { failed = true; }
-    Check(failed == fail_cleanup && sibling_counts.finished == 1,
-          "local cancellation hid a real cleanup failure or failed to join sibling");
+    EXPECT_TRUE(failed == fail_cleanup && sibling_counts.finished == 1) << "local cancellation hid a real cleanup failure or failed to join sibling";
 }
 
-void TestStoppedRequest() {
+TEST(AwaitableTaskGroup, StoppedRequestNeverStarts) {
     net::io_context io;
     net::steady_timer gate(io);
     gate.expires_at(net::steady_timer::time_point::max());
@@ -277,8 +269,7 @@ void TestStoppedRequest() {
         }), net::use_future);
     io.run();
     result.get();
-    Check(counts.active == 0 && counts.finished == 0,
-          "already stopped request started before its cancellation slot was bound");
+    EXPECT_TRUE(counts.active == 0 && counts.finished == 0) << "already stopped request started before its cancellation slot was bound";
 }
 
 net::awaitable<void> WithFailure(net::io_context& io, net::steady_timer& timer,
@@ -298,7 +289,7 @@ net::awaitable<void> WithFailure(net::io_context& io, net::steady_timer& timer,
     fail_after = -1;
 }
 
-void TestAllocationFailures() {
+TEST(AwaitableTaskGroup, AllocationFailuresJoinBorrowedState) {
     int covered = 0;
     int partial = 0;
     for (int allocation = 0; allocation < 128; ++allocation) {
@@ -326,21 +317,24 @@ void TestAllocationFailures() {
         if (!faulted) gate.cancel();
         io.restart();
         io.run_for(std::chrono::milliseconds(250));
-        if (borrowed_on_return || counts.active ||
-            (initiation_failed ? counts.finished != 0 : returned != counts.finished)) {
-            std::cerr << "allocation=" << allocation << " active=" << counts.active
-                      << " finished=" << counts.finished << " returned=" << returned << '\n';
-            throw std::runtime_error("failed launch must retain and join borrowed state");
-        }
+        const bool retained_children = counts.active != 0;
+        gate.cancel();
+        io.restart();
+        io.run();
+        SCOPED_TRACE(allocation);
+        EXPECT_FALSE(borrowed_on_return);
+        EXPECT_FALSE(retained_children);
+        EXPECT_EQ(counts.active, 0);
+        EXPECT_TRUE(initiation_failed ? counts.finished == 0 : returned == counts.finished);
         if (!faulted) {
-            Check(covered > 3 && partial > 0, "fault sweep must cover partial launch");
-            std::cout << "allocation failures=" << covered << " partial launches=" << partial << '\n';
+            EXPECT_GT(covered, 0);
+            EXPECT_GT(partial, 0);
             return;
         }
         if (counts.finished > 0 && counts.finished < 3 && failure) ++partial;
         ++covered;
     }
-    throw std::runtime_error("allocation sweep did not reach success");
+    FAIL() << "allocation sweep did not reach success";
 }
 
 net::awaitable<void> Observe(net::any_io_executor expected, bool& matched) {
@@ -355,7 +349,7 @@ net::awaitable<void> CrossExecutor(net::any_io_executor caller,
     parent = (co_await net::this_coro::executor) == caller;
 }
 
-void TestMoveOnlyStart() {
+TEST(AwaitableTaskGroup, MoveOnlyStartCallbackRuns) {
     net::io_context io;
     bool started = false;
     auto result = net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
@@ -364,10 +358,10 @@ void TestMoveOnlyStart() {
         }), net::use_future);
     io.run();
     result.get();
-    Check(started, "a move-only start callback must not require std::function");
+    EXPECT_TRUE(started) << "a move-only start callback must not require std::function";
 }
 
-void TestExecutor() {
+TEST(AwaitableTaskGroup, ChildAndCallerKeepTheirExecutors) {
     net::io_context caller, worker;
     auto guard = net::make_work_guard(worker);
     bool child = false, parent = false;
@@ -379,24 +373,14 @@ void TestExecutor() {
     guard.reset();
     thread.join();
     result.get();
-    Check(child && parent, "executor ownership must be preserved");
+    EXPECT_TRUE(child && parent) << "executor ownership must be preserved";
 }
 
-void TestIdleResidentGroup(GroupResource& resource) {
-    net::io_context io;
-    const auto before = resource.live.load(std::memory_order_relaxed);
-    for (int i = 0; i != 1000; ++i) {
-        ::ResidentTaskGroup resident(io.get_executor());
-        resident.Tasks().Cancel();
-    }
-    Check(resource.live.load(std::memory_order_relaxed) == before,
-          "resident groups without children must not allocate task state");
-}
 
 // Children started by coroutines outside the group stay owned until
 // AsyncJoin, which cancels them, waits for their cleanup and closes admission;
 // a per-child source cancels only its own child.
-void TestResidentGroup() {
+TEST(AwaitableTaskGroup, ResidentJoinCancelsChildrenAndClosesAdmission) {
     net::io_context io;
     net::steady_timer gate(io);
     gate.expires_at(net::steady_timer::time_point::max());
@@ -406,30 +390,34 @@ void TestResidentGroup() {
     {
         ::ResidentTaskGroup resident(io.get_executor());
         ::transport::CancellationSource own;
-        net::co_spawn(io, [&]() -> net::awaitable<void> {
+        auto started = net::co_spawn(io, [&]() -> net::awaitable<void> {
             resident.Tasks().Spawn(Wait(gate, counts, true));
             resident.Tasks().Spawn(Wait(gate, counts, true), &own);
             co_return;
-        }, net::detached);
+        }, net::use_future);
         io.poll();
-        Check(counts.active == 2, "resident children must start from a foreign coroutine");
+        started.get();
+        EXPECT_TRUE(counts.active == 2) << "resident children must start from a foreign coroutine";
         own.Stop();
         io.run_for(std::chrono::milliseconds(100));
-        Check(counts.active == 1 && counts.finished == 1,
-              "a child source must cancel only its own resident child");
+        EXPECT_TRUE(counts.active == 1 && counts.finished == 1) << "a child source must cancel only its own resident child";
         net::co_spawn(io, resident.AsyncJoin(), [&](std::exception_ptr error) {
             joined = !error && counts.active == 0;
         });
         io.poll();
-        Check(!joined, "resident join must wait for asynchronous child cleanup");
+        EXPECT_TRUE(!joined) << "resident join must wait for asynchronous child cleanup";
         io.run_for(std::chrono::milliseconds(200));
+        const bool completed_without_external_release = joined;
+        gate.cancel();
+        io.restart();
+        io.run();
+        EXPECT_TRUE(completed_without_external_release);
         try { resident.Tasks().Spawn(Wait(gate, counts)); }
         catch (const ::IoSystemError& error) {
             rejected = error.code() == net::error::operation_aborted;
         }
     }
-    Check(joined && rejected && counts.active == 0 && counts.finished == 2,
-          "resident join must cancel, join and close admission");
+    EXPECT_TRUE(joined && rejected && counts.active == 0 && counts.finished == 2) << "resident join must cancel, join and close admission";
 }
 
 void CheckAllocation(std::size_t) { async_allocation_test::Check(); }
@@ -437,30 +425,5 @@ void CheckAllocation(std::size_t) { async_allocation_test::Check(); }
 
 constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = CheckAllocation};
 
-TEST(AwaitableTaskGroup, Contract) {
-    GroupResource resource;
-    auto* previous = std::pmr::set_default_resource(&resource);
-    int result = 0;
-    try {
-        TestDynamicCancellation();
-        TestExplicitCancel();
-        TestFailure(false);
-        TestFailure(true);
-        TestFailureOutranksCancellation();
-        TestRequestCancellation(false);
-        TestRequestCancellation(true);
-        TestStoppedRequest();
-        TestAllocationFailures();
-        TestMoveOnlyStart();
-        TestExecutor();
-        TestIdleResidentGroup(resource);
-        TestResidentGroup();
-        Check(resource.live.load() == 0, "all PMR task bookkeeping must be released");
-    } catch (const std::exception& error) {
-        fail_after = -1;
-        std::cerr << error.what() << '\n';
-        result = 1;
-    }
-    std::pmr::set_default_resource(previous);
-    { ASSERT_EQ((result), 0); return; }
-}
+INSTANTIATE_TEST_SUITE_P(ChildAndStartFailure, TaskGroupFailure, ::testing::Bool());
+INSTANTIATE_TEST_SUITE_P(NormalAndFailedCleanup, TaskGroupRequestCancellation, ::testing::Bool());

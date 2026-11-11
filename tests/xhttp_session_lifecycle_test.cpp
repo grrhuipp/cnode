@@ -125,7 +125,7 @@ net::awaitable<void> BoundedReplayWindow(net::io_context& io) {
 
 net::awaitable<void> DomainsJoinBySession(net::io_context& io) {
     auto coordinator = std::make_shared<::GroupCoordinator>(io);
-    coordinator->RegisterWorker(1, io);
+    coordinator->RegisterWorker(io);
     auto scenario = [&]() -> net::awaitable<void> {
         auto first = co_await GetXHttpPacketSession(
             io, "group", "session-a", XHttpSessionAccess::Open);
@@ -258,8 +258,8 @@ void CrossWorkerUploadHandoffDoesNotEscapeOriginSink() {
     auto work_0 = std::make_optional(net::make_work_guard(*worker0));
     auto work_1 = std::make_optional(net::make_work_guard(*worker1));
     auto coordinator = std::make_shared<::GroupCoordinator>(control);
-    coordinator->RegisterWorker(0, *worker0);
-    coordinator->RegisterWorker(1, *worker1);
+    coordinator->RegisterWorker(*worker0);
+    coordinator->RegisterWorker(*worker1);
 
     std::thread thread_c([&] { control.run(); });
     std::thread thread_0([&] {

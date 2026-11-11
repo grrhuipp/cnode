@@ -3,7 +3,6 @@
 #include "service/controller/node_transaction.hpp"
 
 namespace {
-
 using ::api::NodeInfo;
 using ::controller::NodeTransitionMode;
 
@@ -16,56 +15,57 @@ NodeInfo MakeNode() {
     return node;
 }
 
-bool HasMode(const NodeInfo* current,
-             bool current_started,
-             const NodeInfo& candidate,
-             NodeTransitionMode mode) {
+struct TransitionCase {
+    const char* name;
+    bool exists;
+    bool started;
+    int change;
+    NodeTransitionMode mode;
+};
+class NodeTransition : public ::testing::TestWithParam<TransitionCase> {};
+TEST_P(NodeTransition, PlansRequiredLifecycleActions) {
+    const auto& scenario = GetParam();
+    const auto current = MakeNode();
+    auto candidate = current;
+    switch (scenario.change) {
+    case 1: candidate.Port = 8443; break;
+    case 2: candidate.EnableTLS = true; break;
+    case 3: candidate.NodeType = "shadowsocks"; break;
+    }
     const auto plan = ::controller::PlanNodeTransition(
-        current, current_started, candidate);
-    return plan.mode == mode
-        && plan.Transitioning() == (mode != NodeTransitionMode::Refresh)
-        && plan.DestructiveSwap() == (mode == NodeTransitionMode::SwapSameEndpoint)
-        && plan.RetireOldInboundBeforeCommit()
-            == (mode == NodeTransitionMode::StageNewEndpoint);
+        scenario.exists ? &current : nullptr, scenario.started, candidate);
+    EXPECT_EQ(plan.mode, scenario.mode);
+    EXPECT_EQ(plan.Transitioning(), scenario.mode != NodeTransitionMode::Refresh);
+    EXPECT_EQ(plan.DestructiveSwap(), scenario.mode == NodeTransitionMode::SwapSameEndpoint);
+    EXPECT_EQ(plan.RetireOldInboundBeforeCommit(), scenario.mode == NodeTransitionMode::StageNewEndpoint);
 }
+INSTANTIATE_TEST_SUITE_P(Lifecycle, NodeTransition, ::testing::Values(
+    TransitionCase{"Create", false, false, 0, NodeTransitionMode::Create},
+    TransitionCase{"Recover", true, false, 0, NodeTransitionMode::Recover},
+    TransitionCase{"Refresh", true, true, 0, NodeTransitionMode::Refresh},
+    TransitionCase{"StageNewEndpoint", true, true, 1, NodeTransitionMode::StageNewEndpoint},
+    TransitionCase{"ReplaceInPlace", true, true, 2, NodeTransitionMode::ReplaceInPlace},
+    TransitionCase{"SwapSameEndpoint", true, true, 3, NodeTransitionMode::SwapSameEndpoint}),
+    [](const ::testing::TestParamInfo<TransitionCase>& info) { return info.param.name; });
 
-}  // namespace
-
-TEST(NodeTransition, Contract) {
-    const NodeInfo current = MakeNode();
-
-    ASSERT_FALSE((!HasMode(nullptr, false, current, NodeTransitionMode::Create)
-        || !HasMode(&current, false, current, NodeTransitionMode::Recover)
-        || !HasMode(&current, true, current, NodeTransitionMode::Refresh)));
-
-    NodeInfo different_port = current;
-    different_port.Port = 8443;
-    ASSERT_FALSE((!HasMode(&current, true, different_port,
-                 NodeTransitionMode::StageNewEndpoint)));
-
-    NodeInfo same_port_changed = current;
-    same_port_changed.EnableTLS = true;
-    ASSERT_FALSE((!HasMode(&current, true, same_port_changed,
-                 NodeTransitionMode::ReplaceInPlace)));
-
-    NodeInfo same_port_new_protocol = current;
-    same_port_new_protocol.NodeType = "shadowsocks";
-    ASSERT_FALSE((!HasMode(&current, true, same_port_new_protocol,
-                 NodeTransitionMode::SwapSameEndpoint)));
-
-    NodeInfo changed = current;
+TEST(NodeConfigChanged, DetectsTransportPathAndProtocolChanges) {
+    const auto current = MakeNode();
+    auto changed = current;
     changed.TransportProtocol = "ws";
-    ASSERT_FALSE((!::controller::NodeConfigChanged(current, changed)));
+    EXPECT_TRUE(::controller::NodeConfigChanged(current, changed));
     changed = current;
     changed.Path = "/proxy";
-    ASSERT_FALSE((!::controller::NodeConfigChanged(current, changed)));
+    EXPECT_TRUE(::controller::NodeConfigChanged(current, changed));
     changed = current;
     changed.NodeType = "shadowsocks";
-    ASSERT_FALSE((!::controller::NodeConfigChanged(current, changed)));
+    EXPECT_TRUE(::controller::NodeConfigChanged(current, changed));
+}
 
-    changed = current;
+TEST(NodeConfigChanged, ScheduleOnlyChangesDoNotReplaceInbound) {
+    const auto current = MakeNode();
+    auto changed = current;
     changed.PullInterval = current.PullInterval + 1;
     changed.PushInterval = current.PushInterval + 2;
-    ASSERT_FALSE((::controller::NodeConfigChanged(current, changed)));
-
+    EXPECT_FALSE(::controller::NodeConfigChanged(current, changed));
 }
+}  // namespace

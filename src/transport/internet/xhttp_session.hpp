@@ -374,6 +374,33 @@ struct XHttpRequestMeta {
     uint64_t seq = 0;
 };
 
+[[nodiscard]] inline bool XHttpKindAllowed(
+    XHttpRequestMeta::Kind kind, const XHttpConfig& config) noexcept {
+    switch (kind) {
+    case XHttpRequestMeta::Kind::StreamOne: return config.AcceptsStreamOne();
+    case XHttpRequestMeta::Kind::PacketDown:
+        return config.AcceptsPacketUp() || config.AcceptsStreamUp();
+    case XHttpRequestMeta::Kind::PacketUp: return config.AcceptsPacketUp();
+    case XHttpRequestMeta::Kind::StreamUp: return config.AcceptsStreamUp();
+    case XHttpRequestMeta::Kind::Unknown: return false;
+    }
+    return false;
+}
+
+// 成功占用下行后，直到组合流接管前任何失败都必须关闭会话。
+class XHttpDownlinkClaim final {
+public:
+    explicit XHttpDownlinkClaim(XHttpPacketUpSession& session) noexcept
+        : session_(session.AttachDownlink() ? &session : nullptr) {}
+    ~XHttpDownlinkClaim() { if (session_) session_->Close(); }
+    XHttpDownlinkClaim(const XHttpDownlinkClaim&) = delete;
+    XHttpDownlinkClaim& operator=(const XHttpDownlinkClaim&) = delete;
+    [[nodiscard]] explicit operator bool() const noexcept { return session_ != nullptr; }
+    void Release() noexcept { session_ = nullptr; }
+private:
+    XHttpPacketUpSession* session_;
+};
+
 [[nodiscard]] XHttpRequestMeta ParseXHttpRequestMeta(std::string_view base_path,
                                                      std::string_view request_path,
                                                      std::string_view method);

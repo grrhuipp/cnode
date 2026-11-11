@@ -185,6 +185,7 @@ geosite.dat
 - 所有本地配置键（含侧车、`panels` 和嵌套 `settings`）不区分 ASCII 大小写，示例采用 camelCase：`APIHost`、`apiHost`、`apihost` 等价。大小写归一化后重复的键直接报错。`api_host` 等下划线别名不被识别。
 - 语义上大小写无关的值统一按小写处理：协议、`nodeType`、面板 `type`、`network`、`security`、日志级别、加密方法、`flow`、`decryption`/`encryption`、`packetEncoding`、`auto`、`sendThroughStrategy`、`domainStrategy`、`dnsType`、Blackhole 响应类型、Host/SNI/`serverName`/gRPC `authority`。路径、gRPC `serviceName`、Header 值、标签、邮箱、UUID、密码、密钥与 padding 方案区分大小写。
 - 未知枚举、空值、错误类型拒绝加载；路由引用不存在的 outbound 直接报错。
+- 主配置、日志、DNS、限额、超时、面板、入站和路由对象中的未知键拒绝加载。例如连接空闲超时必须写 `timeouts.connIdle`，`timeouts.idle` 不再被静默忽略。
 - IP 字段必须是完整地址：IPv4 四段无前导零，IPv6 可带数字 scope ID（如 `fe80::1%3`），不接受接口名 scope。单独的 host、listen、sendThrough 字段不接受端口、方括号或尾随内容；方括号只用于 endpoint/URL 中的 IPv6。出站服务器字段可使用 DNS 主机名。
 
 ### config.json
@@ -193,7 +194,7 @@ geosite.dat
 
 | 字段 | 默认值与说明 |
 | --- | --- |
-| `log.loglevel` | `none`、`trace`、`debug`、`info`（默认）、`warning`/`warn`、`error`，其他值拒绝启动 |
+| `log.loglevel` | `none`、`trace`、`debug`、`info`（默认）、`warning`、`error`，其他值拒绝启动 |
 | `log.logDir`、`log.access`、`log.error` | 日志目录与基础文件名；显式空字符串报错；access 与 error 不能指向同一文件 |
 | `log.rotateDaily`、`log.gzip`、`log.maxDays` | 默认均开启按日轮转与 gzip 压缩；`maxDays` 默认 15 天 |
 | `workers` | 数据 Worker 数，`0` 为自动 |
@@ -251,7 +252,9 @@ geosite.dat
 - 未写 `inboundTag` 的路由规则匹配所有入站。`network`、`inboundTag`、`user`、`source`、`protocol` 写成空字符串或空数组时拒绝启动。
 - 启动时只加载路由实际引用的 geoip/geosite 分类；数据文件缺失、损坏或引用的分类不存在时拒绝启动；geosite 的 regexp 条目不加载。
 - `proxyProtocol`（静态入站与面板）：`"off"` 不探测，`"auto"`（默认）自动识别 PROXY v1/v2 或普通字节，`"on"` 强制要求。自动识别不验证来源，只应让可信前置代理访问。
+- 传输名称保留 [Xray 的公开拼写](https://github.com/XTLS/Xray-core/blob/main/infra/conf/transport_internet.go)：`raw`/`tcp`、`ws`/`websocket`、`xhttp`/`splithttp` 分别表示同一种传输；本实现另支持用 `h2` 强制 HTTP/2。
 - WebSocket 入站默认取 `X-Forwarded-For` 首个 IP 作为客户端地址；`wsSettings.realIpHeader` 可改用其他头，设为 `""` 关闭。该头可被伪造，仅应经可信代理访问，源端口记为 `:0`。
+- WebSocket 与 HTTPUpgrade 入站按 URL 路径精确匹配配置（包括 `/`），查询字符串不参与路径匹配；Host 比较前去除首尾空白。
 - `tlsSettings` 的 `certificateFile`/`certFile`、`keyFile`、`caFile` 与面板 `tlsCert`/`tlsKey` 在加载配置时读入，文件缺失、为空或超过 1 MiB 时拒绝加载；证书更新需重新加载配置。autosign 只为配置的名称签发证书并在到期前自动更新。
 - XHTTP `mode` 只接受 `auto`（或省略）、`packet-up`、`stream-up`、`stream-one`。
 - REALITY 服务端支持 `dest`、`xver`（0/1/2）、`serverNames`、`shortIds`、`privateKey`、`minClientVer`、`maxClientVer`、`maxTimeDiff`、`mldsa65Seed`；客户端支持 `serverName`、`publicKey`、`shortId`、`fingerprint`（`chrome`/`firefox`/`safari`/`ios`/`android`/`edge`/`360`/`qq`/`random`）、`spiderX`、`mldsa65Verify`。`show`、`type`、`masterKeyLog` 会被拒绝。未认证连接透明回落到 `dest`，使用 `timeouts.dial`、`connIdle`、`write`、`uplinkOnly`、`downlinkOnly`。V2Board `tls=2` 节点自动同步为 REALITY。
@@ -319,7 +322,7 @@ build/musl/cnode_traffic_journal '/path/to/traffic-journal/<身份哈希>' resol
 
 ### 停机
 
-收到停机信号后先关闭新连接准入、取消面板与监控，再收束请求并持久化最终流量，最后停止各 Worker；不等待代理流量自然排空。
+收到停机信号后先关闭新连接准入、取消面板与监控，再收束请求并持久化最终流量，最后停止各 Worker；数据面的在途操作结束后才收束主控协调器，不等待代理流量自然排空。转发载荷只按成功写出的字节计入流量。
 
 ## 日志格式
 

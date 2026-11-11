@@ -1,17 +1,16 @@
 #include "proxy/uot/uot.hpp"
 #include "app/relay.hpp"
 #include "proxy/inbound_admission.hpp"
+#include "proxy/udp_datagram_frame.hpp"
+#include "proxy/buffered_stream_reader.hpp"
 #include "common/byte_reader.hpp"
 #include "common/address_codec.hpp"
 
-#include "common/const_buffer_span.hpp"
 #include "common/eof_cancellation.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
 
-#include <algorithm>
 #include <array>
 #include <cstring>
-#include <limits>
 #include <memory>
 #include <new>
 #include <utility>
@@ -19,31 +18,8 @@
 namespace proxy::uot {
 namespace {
 
-enum class PendingStatus : uint8_t {
-    Ready,
-    Eof,
-};
-
-
-
-net::awaitable<PendingStatus> EnsurePending(
-    transport::MultiBufferReader& reader,
-    buf::MultiBuffer& pending,
-    size_t required) {
-    while (pending.byte_size() < required) {
-        auto next = co_await reader.ReadMultiBuffer();
-        if (next.byte_size() == 0) {
-            co_await ThrowIfCancelledOnEof();
-            co_return PendingStatus::Eof;
-        }
-        buf::AppendPacketStreamInput(pending, std::move(next));
-    }
-    co_return PendingStatus::Ready;
-}
-
-
 [[noreturn]] void ThrowDecodeFailure() {
-    throw IoSystemError(io_error::connection_reset, "invalid UoT stream");
+    throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
 }
 
 using PacketHeader = std::array<uint8_t, kMaxBaseEncodedAddressSize + 2>;
@@ -58,11 +34,64 @@ size_t EncodePacketHeader(bool is_connect,
         header_size = EncodeAddressTo(
             destination, header.data(), header.size() - 2, AddressWireFormat::Uot);
         if (header_size == 0) {
-            ThrowDecodeFailure();
+            throw transport::LinkError(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
     }
     StoreU16BE(header.data() + header_size, payload_size);
     return header_size + 2;
+}
+
+// V2: an explicit request precedes the packet stream.
+net::awaitable<tl::expected<PreparedRequest, ErrorCode>> ReadV2Request(
+    transport::MultiBufferReader& reader,
+    buf::MultiBuffer pending) {
+    if (!co_await BufferedStreamReader::EnsureBufferedFrom(reader, pending, 1, buf::kPacketStreamPendingLimit)) {
+        co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+    }
+    std::array<uint8_t, 1> first{};
+    if (pending.CopyPrefixTo(first) != first.size() || first[0] > 1) {
+        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+
+    auto address = co_await ::ReadAddress(
+        reader, pending, AddressWireFormat::Socks5, 1,
+        {.require_non_empty_domain = true, .allow_metadata = true});
+    if (!address || !address->target.IsValid()) {
+        co_return tl::unexpected(address
+            ? ErrorCode::PROTOCOL_INVALID_ADDRESS
+            : address.error());
+    }
+
+    PreparedRequest out;
+    out.is_connect = first[0] != 0;
+    out.destination = std::move(address->target);
+    out.forwarded = std::move(address->forwarded);
+    pending.DropPrefixBytes(1 + address->consumed);
+    pending.ReleaseIfIdle();
+    out.pending = std::move(pending);
+    co_return out;
+}
+
+// V1: the first packet's target is the request target.
+net::awaitable<tl::expected<PreparedRequest, ErrorCode>> ReadV1Request(
+    transport::MultiBufferReader& reader,
+    buf::MultiBuffer pending) {
+    PacketReader packet_reader(reader, false, TargetAddress{}, std::move(pending));
+    auto first_packet = co_await packet_reader.ReadMultiBuffer();
+    if (first_packet.empty()) {
+        co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+    }
+    PreparedRequest out;
+    const auto datagram = buf::InspectUdpDatagram(first_packet);
+    if (datagram.Valid()) {
+        out.destination = *datagram.target;
+    }
+    if (!out.destination.IsValid()) {
+        co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    }
+    out.pending = packet_reader.TakePending();
+    out.initial_decoded = std::move(first_packet);
+    co_return out;
 }
 
 }  // namespace
@@ -99,77 +128,14 @@ tl::expected<EncodedRequest, ErrorCode> EncodeRequest(
     return out;
 }
 
-net::awaitable<tl::expected<Request, ErrorCode>> ReadRequest(
-    transport::MultiBufferReader& reader,
-    buf::MultiBuffer& pending) {
-    if (co_await EnsurePending(reader, pending, 1) != PendingStatus::Ready) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-    std::array<uint8_t, 1> first{};
-    if (pending.CopyPrefixTo(first) != first.size() || first[0] > 1) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-
-    auto address = co_await ::ReadAddress(
-        reader, pending, AddressWireFormat::Socks5, 1,
-        {.require_non_empty_domain = true, .allow_metadata = true});
-    if (!address || !address->target.IsValid()) {
-        co_return tl::unexpected(address
-            ? ErrorCode::PROTOCOL_INVALID_ADDRESS
-            : address.error());
-    }
-
-    Request request;
-    request.is_connect = first[0] != 0;
-    request.destination = std::move(address->target);
-    request.forwarded = std::move(address->forwarded);
-    pending.DropPrefixBytes(1 + address->consumed);
-    pending.ReleaseIfIdle();
-    co_return request;
-}
-
 net::awaitable<tl::expected<PreparedRequest, ErrorCode>> ReadUotRequestHeader(
     Version version,
     transport::MultiBufferReader& reader,
-    buf::MultiBuffer pending,
-    ErrorCode v1_eof_error) {
-    PreparedRequest out;
-    if (version == Version::V2) {
-        try {
-            auto request = co_await ReadRequest(reader, pending);
-            if (!request || !request->destination.IsValid()) {
-                co_return tl::unexpected(request
-                    ? ErrorCode::PROTOCOL_INVALID_ADDRESS
-                    : request.error());
-            }
-            out.is_connect = request->is_connect;
-            out.destination = std::move(request->destination);
-            out.forwarded = std::move(request->forwarded);
-            out.pending = std::move(pending);
-            co_return out;
-        } catch (const transport::LinkError& e) {
-            co_return tl::unexpected(e.code());
-        } catch (const IoSystemError& e) {
-            co_return tl::unexpected(MapAsioError(e.code()));
-        }
-    }
-
-    PacketReader packet_reader(reader, false, TargetAddress{}, std::move(pending));
+    buf::MultiBuffer pending) {
     try {
-        auto first_packet = co_await packet_reader.ReadMultiBuffer();
-        if (first_packet.empty()) {
-            co_return tl::unexpected(v1_eof_error);
-        }
-        const auto datagram = buf::InspectUdpDatagram(first_packet);
-        if (datagram.Valid()) {
-            out.destination = *datagram.target;
-        }
-        if (!out.destination.IsValid()) {
-            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-        }
-        out.pending = packet_reader.TakePending();
-        out.initial_decoded = std::move(first_packet);
-        co_return out;
+        co_return version == Version::V2
+            ? co_await ReadV2Request(reader, std::move(pending))
+            : co_await ReadV1Request(reader, std::move(pending));
     } catch (const transport::LinkError& e) {
         co_return tl::unexpected(e.code());
     } catch (const IoSystemError& e) {
@@ -232,7 +198,7 @@ buf::MultiBuffer PacketReader::TakePending() noexcept {
 }
 net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
     if (pending_.byte_size() < 1 &&
-        co_await EnsurePending(reader_, pending_, 1) != PendingStatus::Ready)
+        !co_await BufferedStreamReader::EnsureBufferedFrom(reader_, pending_, 1, buf::kPacketStreamPendingLimit))
         co_return buf::MultiBuffer{};
     TargetAddress packet_target;
     if (!is_connect_) {
@@ -246,7 +212,7 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
         (void)pending_.DropPrefixBytes(address->consumed);
     }
     if (pending_.byte_size() < 2 &&
-        co_await EnsurePending(reader_, pending_, 2) != PendingStatus::Ready) {
+        !co_await BufferedStreamReader::EnsureBufferedFrom(reader_, pending_, 2, buf::kPacketStreamPendingLimit)) {
         ThrowDecodeFailure();
     }
 
@@ -257,8 +223,7 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
     const size_t payload_size = LoadU16BE(len_bytes.data());
     (void)pending_.DropPrefixBytes(len_bytes.size());
     if (pending_.byte_size() < payload_size &&
-        co_await EnsurePending(reader_, pending_, payload_size) !=
-            PendingStatus::Ready) {
+        !co_await BufferedStreamReader::EnsureBufferedFrom(reader_, pending_, payload_size, buf::kPacketStreamPendingLimit)) {
         ThrowDecodeFailure();
     }
     buf::MultiBuffer packet;
@@ -280,54 +245,34 @@ PacketWriter::PacketWriter(transport::MultiBufferWriter& writer,
     , destination_(std::move(destination)) {}
 
 net::awaitable<void> PacketWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
-    const auto datagram = buf::InspectUdpDatagram(mb);
-    if (datagram.status == buf::UdpDatagramStatus::Empty) {
+    // Connect mode frames carry no address: the response is bound to the
+    // session destination whatever endpoint the datagram reports.
+    const auto datagram = RequireUdpDatagram(mb, nullptr);
+    if (!datagram) {
         co_return;
     }
-    if (!datagram.Valid() || !datagram.target->IsValid()) {
-        ThrowDecodeFailure();
+    if (is_connect_ && !destination_.IsValid()) {
+        throw transport::LinkError(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
-    const TargetAddress* target = nullptr;
-    if (is_connect_) {
-        if (!destination_.IsValid()) {
-            ThrowDecodeFailure();
-        }
-        target = std::addressof(destination_);
-    } else {
-        target = datagram.target;
-    }
-
-    if (datagram.payload_size > std::numeric_limits<uint16_t>::max()) {
-        ThrowDecodeFailure();
-    }
-
     PacketHeader header{};
     const size_t header_size = EncodePacketHeader(
-        is_connect_, *target, static_cast<uint16_t>(datagram.payload_size), header);
-    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity + 1> buffers;
-    buffers.Append(net::buffer(header.data(), header_size));
-    buffers.AppendMultiBuffer(mb);
-    co_await writer_.WriteBuffers(buffers.Span());
+        is_connect_, is_connect_ ? destination_ : *datagram->target,
+        static_cast<uint16_t>(datagram->payload_size), header);
+    co_await WriteFramedDatagram(
+        writer_, std::span<const uint8_t>(header.data(), header_size), mb);
 }
 
 net::awaitable<void> PacketWriter::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
     if (!destination_.IsValid()) {
-        ThrowDecodeFailure();
+        throw transport::LinkError(ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
-    const auto payload_size = buf::TrySumBufferSizes(
-        buffers, std::numeric_limits<uint16_t>::max());
-    if (!payload_size) {
-        ThrowDecodeFailure();
-    }
-
+    const size_t payload_size = RequireUdpPayloadSize(buffers);
     PacketHeader header{};
     const size_t header_size = EncodePacketHeader(
-        is_connect_, destination_, static_cast<uint16_t>(*payload_size), header);
-    ConstBufferSpanBuilder<8> framed;
-    framed.Append(net::buffer(header.data(), header_size));
-    framed.AppendBuffers(buffers);
-    co_await writer_.WriteBuffers(framed.Span());
+        is_connect_, destination_, static_cast<uint16_t>(payload_size), header);
+    co_await WriteFramedDatagram(
+        writer_, std::span<const uint8_t>(header.data(), header_size), buffers);
 }
 
 net::awaitable<void> PacketWriter::AsyncShutdownWrite() {

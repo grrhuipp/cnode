@@ -114,7 +114,7 @@ TEST(ProxyProtocolLiteral, Contract) {
             const auto addr = ::net::ip::make_address(ip_text);
             const ::tcp::endpoint src(addr, 45678);
             const ::tcp::endpoint dst(addr, 443);
-            std::array<uint8_t, 108> encoded{};
+            std::array<uint8_t, ::kProxyProtocolMaxHeaderSize> encoded{};
             const size_t n = ::EncodeProxyProtocolHeader(
                 version, src, dst, encoded);
             const auto parsed = ::ParseProxyProtocolHeader(

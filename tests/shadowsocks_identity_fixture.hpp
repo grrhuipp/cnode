@@ -2,6 +2,7 @@
 
 #include "app/proxyman/inbound/user_store.hpp"
 #include "proxy/shadowsocks/ss_udp.hpp"
+#include "proxy/shadowsocks/ss_stream.hpp"
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/use_future.hpp>

@@ -6,6 +6,7 @@
 #include "app/proxyman/outbound/handler.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
+#include "worker_coordinator_fixture.hpp"
 #include "infra/config_types.hpp"
 
 #include <asio/co_spawn.hpp>
@@ -33,7 +34,8 @@ class Fixture final {
 public:
     explicit Fixture(std::string_view protocol = "vless")
         : dns(io, app::dns::Config{.servers = {{net::ip::address_v4::loopback(), 53}}}, 8),
-          worker(0, io, Configuration(), totals, dns),
+          coordinator(io),
+          worker(0, io, Configuration(), totals, dns, coordinator.Get()),
           destination(io, {net::ip::address_v4::loopback(), 0}), protocol_(protocol) {}
 
     void Start() {
@@ -120,6 +122,9 @@ public:
     net::awaitable<void> Stop() {
         worker.RequestStop();
         co_await worker.AsyncJoin();
+        // This fixture shares one reactor for data and control. Its resident
+        // coordinator wait must join after the Worker before io.run can end.
+        co_await coordinator.Finish();
         clients.clear();
         peers.clear();
         destination.close();
@@ -144,6 +149,7 @@ public:
     net::io_context io;
     app::dns::DNSWorker dns;
     StatsShard totals;
+    WorkerCoordinatorFixture coordinator;
     Worker worker;
     tcp::acceptor destination;
     std::vector<tcp::socket> clients;

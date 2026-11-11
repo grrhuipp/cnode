@@ -1,11 +1,8 @@
 #include <gtest/gtest.h>
 
 #include "app/proxyman/inbound/user_store.hpp"
-#include <array>
-#include <iostream>
+
 #include <stdexcept>
-#include <type_traits>
-#include <variant>
 
 namespace {
 using namespace ::proxyman::inbound;
@@ -34,79 +31,87 @@ PreparedHysteriaUser Hysteria(uint8_t hash_byte, int64_t id) {
     return user;
 }
 
-bool TestTypedUpdatesStayProtocolLocal() {
+class UserStoreTypedPayload : public ::testing::Test {
+protected:
+    void SetUp() override { previous_ = UserStore::CaptureSnapshot(); }
+    void TearDown() override {
+        UserStore::ClearWorkerView();
+        UserStore::CommitSnapshot(std::move(previous_));
+    }
+private:
+    UserStore::PublishedSnapshot previous_;
+};
+
+TEST_F(UserStoreTypedPayload, ReplacingOneProtocolPreservesOtherProtocolAndOldView) {
     constexpr std::string_view tag = "shared-tag";
     Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess(1)}}));
     Commit(UserStore::PrepareUsers(tag, UserSet{PreparedTrojanUsers{Trojan("hash-1", 2)}}));
-    if (UserStore::VmessUsers(tag).size() != 1 || !UserStore::FindTrojanUser(tag, "hash-1")) return false;
-
-    auto old = UserStore::VmessUsers(tag);
+    ASSERT_EQ(UserStore::VmessUsers(tag).size(), 1);
+    ASSERT_TRUE(UserStore::FindTrojanUser(tag, "hash-1"));
+    const auto old = UserStore::VmessUsers(tag);
     Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess(3)}}));
-    if (UserStore::VmessUsers(tag).size() != 1 ||
-        UserStore::VmessUsers(tag)[0].profile.user_id != 3 ||
-        old.size() != 1 || old[0].profile.user_id != 1 || !UserStore::FindTrojanUser(tag, "hash-1")) return false;
-
-    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedTrojanUsers{}}));
-    if (UserStore::FindTrojanUser(tag, "hash-1") || UserStore::VmessUsers(tag).size() != 1) return false;
-    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{}}));
-    return UserStore::VmessUsers(tag).empty();
+    const auto current = UserStore::VmessUsers(tag);
+    ASSERT_EQ(current.size(), 1);
+    EXPECT_EQ(current[0].profile.user_id, 3);
+    ASSERT_EQ(old.size(), 1);
+    EXPECT_EQ(old[0].profile.user_id, 1);
+    const auto trojan = UserStore::FindTrojanUser(tag, "hash-1");
+    ASSERT_TRUE(trojan);
+    EXPECT_EQ(trojan->profile.user_id, 2);
 }
 
-bool TestTypedClearStaysProtocolLocal() {
+TEST_F(UserStoreTypedPayload, EmptyReplacementClearsOnlyItsProtocol) {
+    constexpr std::string_view tag = "empty-tag";
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess(1)}}));
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedTrojanUsers{Trojan("hash-1", 2)}}));
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedTrojanUsers{}}));
+    EXPECT_FALSE(UserStore::FindTrojanUser(tag, "hash-1"));
+    EXPECT_EQ(UserStore::VmessUsers(tag).size(), 1);
+    Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{}}));
+    EXPECT_TRUE(UserStore::VmessUsers(tag).empty());
+}
+
+TEST_F(UserStoreTypedPayload, TypedClearPreservesOtherProtocol) {
     constexpr std::string_view tag = "clear-tag";
     Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess(1)}}));
     Commit(UserStore::PrepareUsers(tag, UserSet{PreparedTrojanUsers{Trojan("hash", 2)}}));
     Commit(UserStore::PrepareClearUsers(UserProtocol::Vmess, tag));
-    return UserStore::VmessUsers(tag).empty() && UserStore::FindTrojanUser(tag, "hash");
+    EXPECT_TRUE(UserStore::VmessUsers(tag).empty());
+    const auto other = UserStore::FindTrojanUser(tag, "hash");
+    ASSERT_TRUE(other);
+    EXPECT_EQ(other->profile.user_id, 2);
 }
 
-// Two users deriving the same credential are ambiguous even when their source
-// text differs (VMess/VLESS parse UUIDs case- and hyphen-insensitively); the
-// update must fail before any snapshot is published.
-bool TestAmbiguousCredentialsRejected() {
+class AmbiguousUserCredentials : public UserStoreTypedPayload,
+                                 public ::testing::WithParamInterface<int> {};
+TEST_P(AmbiguousUserCredentials, RejectsBeforePublishingAnyState) {
     constexpr std::string_view tag = "ambiguous-tag";
     Commit(UserStore::PrepareUsers(tag, UserSet{PreparedVmessUsers{Vmess(1)}}));
     const auto before = UserStore::CaptureSnapshot();
-    auto upper = Vmess(2);
-    auto lower = Vmess(3);
-    upper.uuid_bytes.fill(0x6b);
-    lower.uuid_bytes.fill(0x6b);
-    PreparedVlessUser vless_a;
-    PreparedVlessUser vless_b;
-    const std::array<UserSet, 4> ambiguous{
-        UserSet{PreparedVmessUsers{upper, lower}},
-        UserSet{PreparedVlessUsers{vless_a, vless_b}},
-        UserSet{PreparedTrojanUsers{
-            Trojan("same-hash", 4), Trojan("same-hash", 5)}},
-        UserSet{PreparedHysteriaUsers{
-            Hysteria(0x42, 6), Hysteria(0x42, 7)}}};
-    for (const auto& users : ambiguous) {
-        try {
-            static_cast<void>(UserStore::PrepareUsers(tag, users));
-            return false;
-        } catch (const std::invalid_argument&) {
-        }
+    UserSet users;
+    switch (GetParam()) {
+    case 0: {
+        auto first = Vmess(2);
+        auto second = Vmess(3);
+        first.uuid_bytes.fill(0x6b);
+        second.uuid_bytes.fill(0x6b);
+        users = PreparedVmessUsers{first, second};
+        break;
     }
-    return UserStore::CaptureSnapshot() == before &&
-           UserStore::VmessUsers(tag).size() == 1 &&
-           UserStore::VmessUsers(tag)[0].profile.user_id == 1 &&
-           [&] {
-               const auto credential =
-                   UserStore::FindHysteriaUser(
-                       tag, Hysteria(0x42, 0).credential_hash);
-               return !credential;
-           }();
+    case 1: users = PreparedVlessUsers{PreparedVlessUser{}, PreparedVlessUser{}}; break;
+    case 2: users = PreparedTrojanUsers{Trojan("same-hash", 4), Trojan("same-hash", 5)}; break;
+    case 3: users = PreparedHysteriaUsers{Hysteria(0x42, 6), Hysteria(0x42, 7)}; break;
+    }
+    EXPECT_THROW(static_cast<void>(UserStore::PrepareUsers(tag, users)), std::invalid_argument);
+    EXPECT_EQ(UserStore::CaptureSnapshot(), before);
+    const auto existing = UserStore::VmessUsers(tag);
+    ASSERT_EQ(existing.size(), 1);
+    EXPECT_EQ(existing[0].profile.user_id, 1);
+    EXPECT_FALSE(UserStore::FindHysteriaUser(tag, Hysteria(0x42, 0).credential_hash));
 }
+INSTANTIATE_TEST_SUITE_P(Authentication, AmbiguousUserCredentials,
+    ::testing::Values(0, 1, 2, 3), ([](const ::testing::TestParamInfo<int>& info) {
+        constexpr const char* names[]{"Vmess", "Vless", "Trojan", "Hysteria"};
+        return names[info.param];
+    }));
 }  // namespace
-
-TEST(UserStoreTypedPayload, Contract) {
-    if (!TestTypedUpdatesStayProtocolLocal() || !TestTypedClearStaysProtocolLocal()) {
-        std::cerr << "typed replacement/clear crossed protocol storage boundaries\n";
-        FAIL() << "typed replacement/clear crossed protocol storage boundaries";
-    }
-    if (!TestAmbiguousCredentialsRejected()) {
-        std::cerr << "ambiguous credentials were published or silently merged\n";
-        FAIL() << "ambiguous credentials were published or silently merged";
-    }
-    UserStore::ClearWorkerView();
-}

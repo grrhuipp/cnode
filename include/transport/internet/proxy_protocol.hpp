@@ -70,10 +70,14 @@ struct ProxyProtocolReadResult {
 // header yield NotProxy; a valid prefix of one yields Incomplete.
 [[nodiscard]] ProxyProtocolResult ParseProxyProtocolHeader(std::span<const uint8_t> data);
 
+// PROXY v1 规范规定整行（含 CRLF）最长 107 字节，108 字节可容纳整行与结尾 NUL；
+// v2 的 IPv6 头只需 52 字节。编码缓冲统一按此上限分配。
+inline constexpr size_t kProxyProtocolMaxHeaderSize = 108;
+
 // Encodes a v1 (version=1) or v2 (version=2) header; 0 for other versions.
 [[nodiscard]] size_t EncodeProxyProtocolHeader(
     uint8_t version,
     const tcp::endpoint& src,
     const tcp::endpoint& dst,
-    std::span<uint8_t, 108> out) noexcept;
+    std::span<uint8_t, kProxyProtocolMaxHeaderSize> out) noexcept;
 

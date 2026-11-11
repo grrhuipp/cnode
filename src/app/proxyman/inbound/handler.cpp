@@ -159,6 +159,11 @@ public:
         session::Context ctx;
         ctx.InitSubstreamFrom(base_ctx_);
         ApplyHttpRealIp(ctx, metadata.real_ip);
+        // 传输层已识别的原生 UDP 会话（Hysteria）在入站处理前即确定网络与首个目标。
+        if (metadata.udp_session_target) {
+            ctx.content.network = Network::UDP;
+            ctx.outbound.target = std::move(*metadata.udp_session_target);
+        }
 
         Handler& handler = *handler_;
         const inbound::ReceiverSettings& listener = handler.receiver_;
@@ -180,8 +185,8 @@ public:
         (void)stream->StartPhaseDeadline(timeouts_.HandshakeTimeout());
 
         LOG_CONN_DEBUG(ctx, "logical transport stream ready security={} network={}",
-                       listener.stream_settings.security,
-                       listener.stream_settings.network);
+                       SecurityModeName(listener.stream_settings.security_mode),
+                       listener.stream_settings.NetworkName());
 
         Inbound& proxy = handler.Proxy();
         try {
@@ -316,8 +321,8 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     (void)raw_conn->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
     LOG_CONN_DEBUG(ctx, "building transport security={} network={}",
-                   listener.stream_settings.security,
-                   listener.stream_settings.network);
+                   SecurityModeName(listener.stream_settings.security_mode),
+                   listener.stream_settings.NetworkName());
 
     InboundTransportMetadata local_metadata;
     std::shared_ptr<LogicalTransportStreamSink> logical_stream_handler;
@@ -350,16 +355,16 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         &fallback);
     if (!build_result) {
         LOG_CONN_DEBUG(ctx, "transport handshake failed security={} network={}",
-                       listener.stream_settings.security,
-                       listener.stream_settings.network);
+                       SecurityModeName(listener.stream_settings.security_mode),
+                       listener.stream_settings.NetworkName());
         stats.OnError();
         co_return;
     }
     auto stream = std::move(*build_result);
     if (!stream) {
         LOG_CONN_DEBUG(ctx, "transport consumed connection security={} network={}",
-                       listener.stream_settings.security,
-                       listener.stream_settings.network);
+                       SecurityModeName(listener.stream_settings.security_mode),
+                       listener.stream_settings.NetworkName());
         co_return;
     }
 
@@ -379,8 +384,8 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     auto ip_limit = std::move(ip_admission.reservation);
 
     LOG_CONN_DEBUG(ctx, "transport ready security={} network={}",
-                   listener.stream_settings.security,
-                   listener.stream_settings.network);
+                   SecurityModeName(listener.stream_settings.security_mode),
+                   listener.stream_settings.NetworkName());
 
     Inbound& proxy = Proxy();
     try {
@@ -390,6 +395,108 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     } catch (...) {
         CountEscapedInboundFailure(ctx, stats);
     }
+}
+
+// ============================================================================
+// Inbound Factory Registration
+// ============================================================================
+
+namespace {
+
+using RegistrationMap = std::map<std::string, ProxyRegistration, std::less<>>;
+
+RegistrationMap& Registrations() noexcept {
+    static RegistrationMap registrations;
+    return registrations;
+}
+
+// 注册表在静态初始化后只读；所有按协议名的查询都经此唯一入口。
+[[nodiscard]] const ProxyRegistration* FindRegistration(std::string_view protocol) noexcept {
+    auto& registrations = Registrations();
+    const auto it = registrations.find(protocol);
+    return it == registrations.end() ? nullptr : &it->second;
+}
+
+}  // namespace
+
+void RegisterProxy(
+    std::string_view protocol,
+    ProxyRegistration registration) {
+    const bool has_user_builders = registration.build_users != nullptr;
+    const bool has_tcp = registration.create_tcp_handler != nullptr;
+    const bool has_packet_datagrams =
+        registration.create_datagram_handler != nullptr;
+    const bool transport_consistent =
+        (registration.datagram_transport == DatagramTransport::Packet) ==
+            has_packet_datagrams;
+    if (protocol.empty() || !registration.create_runtime ||
+        !has_tcp ||
+        !transport_consistent ||
+        has_user_builders != registration.user_protocol.has_value()) {
+        throw std::invalid_argument(
+            "invalid inbound protocol registration for '" +
+            std::string(protocol) + "'");
+    }
+    if (!Registrations().try_emplace(
+            std::string(protocol), std::move(registration)).second) {
+        throw std::logic_error(
+            "duplicate inbound protocol registration for '" +
+            std::string(protocol) + "'");
+    }
+}
+
+bool HasProxy(std::string_view protocol) {
+    return FindRegistration(protocol) != nullptr;
+}
+
+std::optional<UserProtocol> RegisteredUserProtocol(
+    std::string_view protocol) {
+    const auto* registration = FindRegistration(protocol);
+    return registration ? registration->user_protocol : std::nullopt;
+}
+
+DatagramTransport RegisteredDatagramTransport(
+    std::string_view protocol) {
+    const auto* registration = FindRegistration(protocol);
+    return registration ? registration->datagram_transport : DatagramTransport::None;
+}
+
+std::optional<BuildRequest> PrepareBuildRequest(
+    std::string_view protocol,
+    std::string_view tag,
+    const ::InboundProtocolSettings& settings) {
+    const auto* registration = FindRegistration(protocol);
+    if (!registration) {
+        return std::nullopt;
+    }
+
+    BuildRequest request{
+        .tag = std::string(tag),
+        .protocol = std::string(protocol),
+        .settings = {},
+    };
+    if (registration->prepare_settings) {
+        auto prepared = registration->prepare_settings(tag, settings);
+        if (!prepared) {
+            return std::nullopt;
+        }
+        request.settings = std::move(*prepared);
+    }
+    return request;
+}
+
+std::optional<UserSet> BuildUsers(
+    const BuildRequest& req,
+    std::span<const ::InboundUserSpec> users) {
+    const auto* registration = FindRegistration(req.protocol);
+    if (!registration || !registration->build_users) {
+        return std::nullopt;
+    }
+    auto result = registration->build_users(req, users);
+    if (result && UserProtocolOf(*result) != *registration->user_protocol) {
+        return std::nullopt;
+    }
+    return result;
 }
 
 // ============================================================================
@@ -413,8 +520,9 @@ std::unique_ptr<::Inbound> HandlerRegistry::NewHandler(
     if (!runtime) {
         return nullptr;
     }
-    return ::proxyman::inbound::NewHandler(
-        req.protocol, *runtime, stats_, limiter, req);
+    // GetOrCreateRuntime 成功即保证注册项存在，且注册时已校验 create_tcp_handler。
+    return FindRegistration(req.protocol)->create_tcp_handler(
+        *runtime, stats_, limiter, req);
 }
 
 DatagramHandlerBuildResult HandlerRegistry::NewDatagramHandler(
@@ -424,8 +532,16 @@ DatagramHandlerBuildResult HandlerRegistry::NewDatagramHandler(
     if (!runtime) {
         return {DatagramHandlerBuildStatus::Failed, nullptr};
     }
-    return ::proxyman::inbound::NewDatagramHandler(
-        req.protocol, *runtime, stats_, limiter, req);
+    const auto* registration = FindRegistration(req.protocol);
+    if (!registration->create_datagram_handler) {
+        return {DatagramHandlerBuildStatus::Unsupported, nullptr};
+    }
+    auto handler = registration->create_datagram_handler(
+        *runtime, stats_, limiter, req);
+    if (!handler) {
+        return {DatagramHandlerBuildStatus::Failed, nullptr};
+    }
+    return {DatagramHandlerBuildStatus::Ready, std::move(handler)};
 }
 
 ProtocolRuntime* HandlerRegistry::GetOrCreateRuntime(
@@ -433,7 +549,9 @@ ProtocolRuntime* HandlerRegistry::GetOrCreateRuntime(
     if (auto it = runtimes_.find(protocol); it != runtimes_.end()) {
         return it->second.get();
     }
-    auto runtime = NewProtocolRuntime(protocol);
+    const auto* registration = FindRegistration(protocol);
+    if (!registration) return nullptr;
+    auto runtime = registration->create_runtime();
     if (!runtime) return nullptr;
     auto result = runtimes_.emplace(
         memory::String(protocol), std::move(runtime));
@@ -475,153 +593,6 @@ HandlerRegistry::GetOnlineDevices(std::string_view protocol, std::string_view ta
         }
     }
     return {};
-}
-
-// ============================================================================
-// Inbound Factory Registration
-// ============================================================================
-
-namespace {
-
-using RegistrationMap = std::map<std::string, ProxyRegistration, std::less<>>;
-
-RegistrationMap& Registrations() noexcept {
-    static RegistrationMap registrations;
-    return registrations;
-}
-
-}  // namespace
-
-void RegisterProxy(
-    std::string_view protocol,
-    ProxyRegistration registration) {
-    const bool has_user_builders = registration.build_users != nullptr;
-    const bool has_tcp = registration.create_tcp_handler != nullptr;
-    const bool has_packet_datagrams =
-        registration.create_datagram_handler != nullptr;
-    const bool transport_consistent =
-        (registration.datagram_transport == DatagramTransport::Packet) ==
-            has_packet_datagrams;
-    if (protocol.empty() || !registration.create_runtime ||
-        !has_tcp ||
-        !transport_consistent ||
-        has_user_builders != registration.user_protocol.has_value()) {
-        throw std::invalid_argument(
-            "invalid inbound protocol registration for '" +
-            std::string(protocol) + "'");
-    }
-    if (!Registrations().try_emplace(
-            std::string(protocol), std::move(registration)).second) {
-        throw std::logic_error(
-            "duplicate inbound protocol registration for '" +
-            std::string(protocol) + "'");
-    }
-}
-
-bool HasProxy(std::string_view protocol) {
-    return Registrations().contains(protocol);
-}
-
-std::optional<UserProtocol> RegisteredUserProtocol(
-    std::string_view protocol) {
-    auto& registrations = Registrations();
-    auto it = registrations.find(protocol);
-    return it == registrations.end() ? std::nullopt : it->second.user_protocol;
-}
-
-DatagramTransport RegisteredDatagramTransport(
-    std::string_view protocol) {
-    auto& registrations = Registrations();
-    auto it = registrations.find(protocol);
-    return it == registrations.end()
-        ? DatagramTransport::None
-        : it->second.datagram_transport;
-}
-
-std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(
-    std::string_view protocol) {
-    auto& registrations = Registrations();
-    auto it = registrations.find(protocol);
-    if (it == registrations.end() || !it->second.create_runtime) {
-        return nullptr;
-    }
-    return it->second.create_runtime();
-}
-
-std::unique_ptr<::Inbound> NewHandler(
-    std::string_view protocol,
-    ProtocolRuntime& runtime,
-    ::StatsShard& stats,
-    ::ConnectionLimiter* limiter,
-    const BuildRequest& req) {
-    auto& registrations = Registrations();
-    auto it = registrations.find(protocol);
-    if (it == registrations.end() || !it->second.create_tcp_handler) {
-        return nullptr;
-    }
-    return it->second.create_tcp_handler(runtime, stats, limiter, req);
-}
-
-DatagramHandlerBuildResult NewDatagramHandler(
-    std::string_view protocol,
-    ProtocolRuntime& runtime,
-    ::StatsShard& stats,
-    ::ConnectionLimiter* limiter,
-    const BuildRequest& req) {
-    auto& registrations = Registrations();
-    auto it = registrations.find(protocol);
-    if (it == registrations.end()) {
-        return {DatagramHandlerBuildStatus::Failed, nullptr};
-    }
-    if (!it->second.create_datagram_handler) {
-        return {DatagramHandlerBuildStatus::Unsupported, nullptr};
-    }
-    auto handler =
-        it->second.create_datagram_handler(runtime, stats, limiter, req);
-    if (!handler) {
-        return {DatagramHandlerBuildStatus::Failed, nullptr};
-    }
-    return {DatagramHandlerBuildStatus::Ready, std::move(handler)};
-}
-
-std::optional<BuildRequest> PrepareBuildRequest(
-    std::string_view protocol,
-    std::string_view tag,
-    const ::InboundProtocolSettings& settings) {
-    auto& registrations = Registrations();
-    auto it = registrations.find(protocol);
-    if (it == registrations.end()) {
-        return std::nullopt;
-    }
-
-    BuildRequest request{
-        .tag = std::string(tag),
-        .protocol = std::string(protocol),
-        .settings = {},
-    };
-    if (it->second.prepare_settings) {
-        auto prepared = it->second.prepare_settings(tag, settings);
-        if (!prepared) {
-            return std::nullopt;
-        }
-        request.settings = std::move(*prepared);
-    }
-    return request;
-}
-
-std::optional<UserSet> BuildUsers(
-    const BuildRequest& req,
-    std::span<const ::InboundUserSpec> users) {
-    auto& registrations = Registrations();
-    auto it = registrations.find(req.protocol);
-    if (it == registrations.end() || !it->second.build_users) {
-        return std::nullopt;
-    }
-    auto result = it->second.build_users(req, users);
-    if (result && UserProtocolOf(*result) != *it->second.user_protocol) {
-        return std::nullopt;
-    }
-    return result;
 }
 
 }  // namespace proxyman::inbound

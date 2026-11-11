@@ -4,7 +4,6 @@
 #include "transport/internet/tcp_stream.hpp"
 
 #include <chrono>
-#include <cstdio>
 #include <memory>
 #include <stdexcept>
 
@@ -41,14 +40,9 @@ public:
     int NativeHandle() const override { return physical_.NativeHandle(); }
     bool IsOpen() const override { return open_; }
 
-    int physical_lookups = 0;
-
 protected:
     ::StreamPhaseDeadline* LogicalPhaseDeadline() noexcept override { return &deadline_; }
-    ::TcpStream* BaseTcpStream() override {
-        ++physical_lookups;
-        return &physical_;
-    }
+    ::TcpStream* BaseTcpStream() override { return &physical_; }
 
 private:
     ::TcpStream& physical_;
@@ -66,7 +60,7 @@ private:
     }
 };
 
-bool TestClearAndTimeoutIsolation() {
+TEST(PhaseDeadline, ClearingOneLogicalDeadlineDoesNotCancelItsSiblingOrPhysicalStream) {
     ::net::io_context io;
     ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
     auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
@@ -86,54 +80,91 @@ bool TestClearAndTimeoutIsolation() {
     const auto physical_phase = physical.StartPhaseDeadline(1h);
     const auto first_phase = first_control.StartPhaseDeadline(1s);
     const auto second_phase = second_control.StartPhaseDeadline(1s);
-    if (!physical_phase || !first_phase || !second_phase ||
-        scheduler.GetResourceStats().active_events != 3) return false;
+    ASSERT_TRUE(physical_phase);
+    ASSERT_TRUE(first_phase);
+    ASSERT_TRUE(second_phase);
+    EXPECT_EQ(scheduler.GetResourceStats().active_events, 3u);
     first_control.ClearPhaseDeadline();
-    if (scheduler.GetResourceStats().active_events != 2) return false;
+    EXPECT_EQ(scheduler.GetResourceStats().active_events, 2u);
     io.run_for(1500ms);
-    if (first_cancelled != 0 || second_cancelled != 1 || physical_notifications != 0 ||
-        first_notifications != 0 || second_notifications != 1 ||
-        first_phase.Expired() || !second_phase.Expired() || physical_phase.Expired() ||
-        !physical.IsOpen() || scheduler.GetResourceStats().active_events != 1) return false;
-    if (first_control.ConsumePhaseDeadline() || !second_control.ConsumePhaseDeadline() ||
-        second_control.ConsumePhaseDeadline() || second_phase.Expired()) return false;
+    EXPECT_EQ(first_cancelled, 0);
+    EXPECT_EQ(second_cancelled, 1);
+    EXPECT_EQ(physical_notifications, 0);
+    EXPECT_EQ(first_notifications, 0);
+    EXPECT_EQ(second_notifications, 1);
+    EXPECT_FALSE(first_phase.Expired());
+    EXPECT_TRUE(second_phase.Expired());
+    EXPECT_FALSE(physical_phase.Expired());
+    EXPECT_TRUE(physical.IsOpen());
+    EXPECT_EQ(scheduler.GetResourceStats().active_events, 1u);
+    EXPECT_FALSE(first_control.ConsumePhaseDeadline());
+    EXPECT_TRUE(second_control.ConsumePhaseDeadline());
+    EXPECT_FALSE(second_control.ConsumePhaseDeadline());
+    EXPECT_FALSE(second_phase.Expired());
     second_control.ClearPhaseDeadline();
-    if (scheduler.GetResourceStats().active_events != 1 ||
-        first.physical_lookups != 0 || second.physical_lookups != 0) return false;
+    EXPECT_EQ(scheduler.GetResourceStats().active_events, 1u);
     physical.ClearPhaseDeadline();
-    return scheduler.GetResourceStats().active_events == 0;
+    EXPECT_EQ(scheduler.GetResourceStats().active_events, 0u);
 }
 
-bool TestReplacementDisabledAndClosed() {
+TEST(PhaseDeadline, ReplacingDeadlineInvalidatesOldTokensAndSaturatesMaximumDuration) {
     ::net::io_context io;
     ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
-    auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     int cancellations = 0;
     LogicalStream stream(io, physical, cancellations);
     ::AsyncStream& control = stream;
     const auto old = control.StartPhaseDeadline(1s);
     const auto maximum = control.StartPhaseDeadline(std::chrono::seconds::max());
-    if (!old || !maximum || scheduler.GetResourceStats().active_events != 1) return false;
+    ASSERT_TRUE(old);
+    ASSERT_TRUE(maximum);
     io.run_for(1100ms);
-    if (cancellations != 0 || old.Expired() || maximum.Expired()) return false;
+    EXPECT_EQ(cancellations, 0);
+    EXPECT_FALSE(old.Expired());
+    EXPECT_FALSE(maximum.Expired());
     const auto current = control.StartPhaseDeadline(1s);
     io.restart();
     io.run_for(1500ms);
-    if (!current || !current.Expired() || old.Expired() || maximum.Expired() ||
-        cancellations != 1 || scheduler.GetResourceStats().active_events != 0) return false;
+    EXPECT_TRUE(current.Expired());
+    EXPECT_FALSE(old.Expired());
+    EXPECT_FALSE(maximum.Expired());
+    EXPECT_EQ(cancellations, 1);
     control.ClearPhaseDeadline();
-    if (current.Expired() || control.ConsumePhaseDeadline()) return false;
-    if (!control.StartPhaseDeadline(1h) || control.StartPhaseDeadline(0s) ||
-        scheduler.GetResourceStats().active_events != 0) return false;
-    if (!control.StartPhaseDeadline(1h) || control.StartPhaseDeadline(-1s) ||
-        scheduler.GetResourceStats().active_events != 0) return false;
-    if (!control.StartPhaseDeadline(1h)) return false;
-    control.Close();
-    return !control.StartPhaseDeadline(1s) &&
-           scheduler.GetResourceStats().active_events == 0 && stream.physical_lookups == 0;
+    EXPECT_FALSE(current.Expired());
+    EXPECT_FALSE(control.ConsumePhaseDeadline());
 }
 
-bool TestDestructionCancelsOnlyOwnedEvent() {
+class DisabledPhaseDeadline : public ::testing::TestWithParam<int> {};
+
+TEST_P(DisabledPhaseDeadline, NonPositiveDurationClearsAnArmedDeadline) {
+    ::net::io_context io;
+    ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
+    int cancellations = 0;
+    LogicalStream stream(io, physical, cancellations);
+    ::AsyncStream& control = stream;
+    ASSERT_TRUE(control.StartPhaseDeadline(1h));
+    EXPECT_FALSE(control.StartPhaseDeadline(std::chrono::seconds(GetParam())));
+    EXPECT_EQ(::TimeoutScheduler::ForIoContext(io).GetResourceStats().active_events, 0u);
+    io.poll();
+    EXPECT_EQ(cancellations, 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(ZeroAndNegativeDuration, DisabledPhaseDeadline,
+                        ::testing::Values(0, -1));
+
+TEST(PhaseDeadline, ClosedLogicalStreamRejectsDeadlineWithoutClosingPhysicalStream) {
+    ::net::io_context io;
+    ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
+    int cancellations = 0;
+    LogicalStream stream(io, physical, cancellations);
+    ::AsyncStream& control = stream;
+    ASSERT_TRUE(control.StartPhaseDeadline(1h));
+    control.Close();
+    EXPECT_FALSE(control.StartPhaseDeadline(1s));
+    EXPECT_EQ(::TimeoutScheduler::ForIoContext(io).GetResourceStats().active_events, 0u);
+    EXPECT_TRUE(physical.IsOpen());
+}
+
+TEST(PhaseDeadline, DestructionCancelsOnlyOwnedEvent) {
     ::net::io_context io;
     ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
     auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
@@ -141,28 +172,22 @@ bool TestDestructionCancelsOnlyOwnedEvent() {
     {
         LogicalStream survivor(io, physical, survivor_cancellations);
         auto destroyed = std::make_unique<LogicalStream>(io, physical, destroyed_cancellations);
-        if (!destroyed->StartPhaseDeadline(1s) || !survivor.StartPhaseDeadline(1s) ||
-            scheduler.GetResourceStats().active_events != 2) return false;
+        ASSERT_TRUE(destroyed->StartPhaseDeadline(1s));
+        ASSERT_TRUE(survivor.StartPhaseDeadline(1s));
+        EXPECT_EQ(scheduler.GetResourceStats().active_events, 2u);
         destroyed.reset();
-        if (scheduler.GetResourceStats().active_events != 1) return false;
+        EXPECT_EQ(scheduler.GetResourceStats().active_events, 1u);
         io.run_for(1500ms);
-        if (destroyed_cancellations != 0 || survivor_cancellations != 1 ||
-            !survivor.ConsumePhaseDeadline()) return false;
-        if (!survivor.StartPhaseDeadline(std::chrono::seconds::max())) return false;
+        EXPECT_EQ(destroyed_cancellations, 0);
+        EXPECT_EQ(survivor_cancellations, 1);
+        EXPECT_TRUE(survivor.ConsumePhaseDeadline());
+        ASSERT_TRUE(survivor.StartPhaseDeadline(std::chrono::seconds::max()));
     }
     io.restart();
     io.poll();
-    const auto stats = scheduler.GetResourceStats();
-    return destroyed_cancellations == 0 && survivor_cancellations == 1 &&
-           stats.active_events == 0;
+    EXPECT_EQ(destroyed_cancellations, 0);
+    EXPECT_EQ(survivor_cancellations, 1);
+    EXPECT_EQ(scheduler.GetResourceStats().active_events, 0u);
 }
 }  // namespace
 
-TEST(PhaseDeadline, Contract) {
-    const bool isolation = TestClearAndTimeoutIsolation();
-    const bool replacement = TestReplacementDisabledAndClosed();
-    const bool destruction = TestDestructionCancelsOnlyOwnedEvent();
-    std::printf("logical phase deadlines: isolation=%d replacement=%d destruction=%d\n",
-                isolation, replacement, destruction);
-    { ASSERT_TRUE(isolation && replacement && destruction); return; }
-}

@@ -35,11 +35,6 @@ enum class Version : uint8_t {
     return version == Version::V1 ? kV1MagicAddress : kMagicAddress;
 }
 
-struct Request {
-    bool is_connect = false;
-    TargetAddress destination;
-    std::optional<ForwardedMetadata> forwarded;
-};
 struct EncodedRequest {
     std::array<uint8_t, kMaxRequestSize> bytes{};
     size_t size = 0;
@@ -57,11 +52,8 @@ struct EncodedRequest {
     const TargetAddress& destination,
     ForwardedMetadataView forwarded = {});
 
-[[nodiscard]] net::awaitable<tl::expected<Request, ErrorCode>> ReadRequest(
-    transport::MultiBufferReader& reader,
-    buf::MultiBuffer& pending);
-
-
+// One UoT request header: the V2 request or, for V1, the first packet's
+// target with that packet already decoded.
 struct PreparedRequest {
     bool is_connect = false;
     TargetAddress destination;
@@ -70,12 +62,13 @@ struct PreparedRequest {
     buf::MultiBuffer initial_decoded;
 };
 
+// EOF before the first UoT byte is the peer's normal close → SOCKET_EOF;
+// EOF or malformed bytes after it → PROTOCOL_DECODE_FAILED.
 [[nodiscard]] net::awaitable<tl::expected<PreparedRequest, ErrorCode>>
 ReadUotRequestHeader(
     Version version,
     transport::MultiBufferReader& reader,
-    buf::MultiBuffer pending,
-    ErrorCode v1_eof_error);
+    buf::MultiBuffer pending);
 
 [[nodiscard]] net::awaitable<RelayResult> DispatchPreparedUotRequest(
     PreparedRequest prepared,

@@ -97,9 +97,12 @@ buf::MultiBuffer MakeInput(std::span<const uint8_t> bytes) {
 }
 
 template <typename Fn>
-void CheckRejected(Fn&& fn, std::string_view message) {
+void CheckRejected(Fn&& fn, std::string_view message,
+                   ErrorCode expected = ErrorCode::PROTOCOL_DECODE_FAILED) {
     bool rejected = false;
-    try { fn(); } catch (const IoSystemError&) { rejected = true; }
+    try { fn(); } catch (const transport::LinkError& error) {
+        rejected = error.code() == expected;
+    }
     Check(rejected, message);
 }
 
@@ -183,6 +186,11 @@ void CheckFrameBoundaries() {
     trojan::UdpFramer bounded;
     const std::vector<uint8_t> excess(buf::kPacketStreamPendingLimit + 1, 0);
     CheckRejected([&] { bounded.Feed(MakeInput(excess)); }, "unbounded Trojan input");
+    trojan::FramedUdpPacket bounded_packet;
+    CheckRejected([&] { (void)bounded.Next(bounded_packet); },
+                  "overflow Trojan stream recovered");
+    CheckRejected([&] { bounded.Feed({}); }, "overflow Trojan stream accepted more input");
+    CheckRejected([&] { bounded.Finish(); }, "overflow Trojan stream accepted clean EOF");
 
     std::vector<uint8_t> maximum{
         1, 127, 0, 0, 1, 0, 53, 0xff, 0xff, '\r', '\n'};
@@ -309,7 +317,7 @@ TEST(TrojanUdpFraming, Contract) {
             co_await trojan::WriteUdpDatagram(
                 rejected_capture, target, oversized_buffers);
         });
-    }, "oversized Trojan datagram accepted");
+    }, "oversized Trojan datagram accepted", ErrorCode::PROTOCOL_ENCODE_FAILED);
     Check(rejected_capture.bytes.empty(), "oversized Trojan datagram partially written");
 
 }
@@ -363,10 +371,10 @@ TEST(TrojanUdpFraming, TruncatedEofCannotResume) {
         framer.Feed(MakeInput(std::span(wire).first(cut)));
         trojan::FramedUdpPacket packet;
         ASSERT_FALSE(framer.Next(packet));
-        EXPECT_THROW(framer.Finish(), IoSystemError);
-        EXPECT_THROW(framer.Feed(MakeInput(std::span(wire).subspan(cut))), IoSystemError);
-        EXPECT_THROW((void)framer.Next(packet), IoSystemError);
-        EXPECT_THROW(framer.Finish(), IoSystemError);
+        EXPECT_THROW(framer.Finish(), transport::LinkError);
+        EXPECT_THROW(framer.Feed(MakeInput(std::span(wire).subspan(cut))), transport::LinkError);
+        EXPECT_THROW((void)framer.Next(packet), transport::LinkError);
+        EXPECT_THROW(framer.Finish(), transport::LinkError);
     }
 }
 
@@ -380,8 +388,8 @@ TEST(TrojanUdpFraming, CleanEofRejectsFurtherInput) {
     EXPECT_EQ(Flatten(packet.payload), std::vector<uint8_t>({0x73}));
     framer.Finish();
     framer.Finish();
-    EXPECT_THROW(framer.Feed({}), IoSystemError);
-    EXPECT_THROW(framer.Feed(MakeInput(wire)), IoSystemError);
+    EXPECT_THROW(framer.Feed({}), transport::LinkError);
+    EXPECT_THROW(framer.Feed(MakeInput(wire)), transport::LinkError);
     EXPECT_FALSE(framer.Next(packet));
     EXPECT_TRUE(packet.payload.empty());
 }

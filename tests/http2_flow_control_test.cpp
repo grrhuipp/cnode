@@ -100,7 +100,7 @@ void Settle(net::io_context& io) {
 
 ::StreamSettings GrpcSettings() {
     ::StreamSettings settings;
-    settings.network = "grpc";
+    settings.network_mode = NetworkMode::Grpc;
     settings.grpc.service_name = "fixture";
     return ::NormalizeStreamSettings(settings);
 }

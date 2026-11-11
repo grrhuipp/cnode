@@ -4,6 +4,7 @@
 #include "common/asio_types.hpp"
 
 #include <openssl/rand.h>
+#include <ngtcp2/ngtcp2.h>
 #include <sys/socket.h>
 #include <array>
 #include <stdexcept>

@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include "app/worker/udp_ingress.hpp"
+#include "udp_ingress_fixture.hpp"
 #include "app/relay.hpp"
 #include "app/proxyman/inbound/handler.hpp"
 #include "app/stats.hpp"
@@ -9,7 +10,7 @@
 #include "features/routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "transport/async_stream.hpp"
-#include "app/worker/udp_receive_loop.hpp"
+#include "transport/internet/datagram_socket.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
@@ -100,23 +101,24 @@ public:
 private:
 };
 
-struct RecordingReplySink final : ::worker_detail::UdpReplySink {
-    bool EnqueueUdpReply(::worker_detail::UdpIngress&, std::string_view,
-                         const std::shared_ptr<::udp::socket>&, ::udp::endpoint peer,
-                         ::buf::MultiBuffer payload, uint32_t) override {
-        ++calls;
-        endpoint = peer;
-        bytes.clear();
-        for (const auto* buffer : payload) {
-            const auto part = buffer->Bytes();
-            bytes.insert(bytes.end(), part.begin(), part.end());
-        }
-        return !reject;
+struct UdpReplyPeer final {
+    explicit UdpReplyPeer(::net::io_context& io)
+        : socket(io, ::udp::endpoint(::net::ip::address_v4::loopback(), 0)) {
+        socket.non_blocking(true);
     }
+    void Read() {
+        std::vector<uint8_t> packet(65536);
+        ::udp::endpoint sender;
+        ::IoErrorCode ec;
+        const auto size = socket.receive_from(::net::buffer(packet), sender, 0, ec);
+        if (ec) return;
+        packet.resize(size);
+        bytes = std::move(packet);
+        ++calls;
+    }
+    ::udp::socket socket;
     size_t calls = 0;
-    ::udp::endpoint endpoint;
     std::vector<uint8_t> bytes;
-    bool reject = false;
 };
 
 // Uplink fixtures deliver only to pre-created rows; starting a job is a failure.
@@ -211,6 +213,7 @@ void VerifyWorkerBudget() {
     using Ingress = ::worker_detail::UdpIngress;
     using Result = Ingress::ReplyEnqueueResult;
     ::net::io_context io;
+    UdpSocketFixtures sockets(io);
     auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     ::worker_detail::UdpAssociationReclaimer reclaimer(
         scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
@@ -240,7 +243,7 @@ void VerifyWorkerBudget() {
         Fail("typed UDP identity lost normalization, endpoint port or zero-session distinction");
     const ::TargetAddress target(endpoint.address(), 53);
     const auto create = [&](Ingress& ingress, uint64_t id) {
-        return ingress.CreateClientSession("socket", key(id), io,
+        return ingress.CreateClientSession(sockets.Get(ingress, "socket"), key(id), io,
             {}, endpoint, owner,
             std::chrono::steady_clock::now(), std::chrono::seconds::zero());
     };
@@ -272,7 +275,7 @@ void VerifyWorkerBudget() {
     auto two = create(second, 2);
     if (!one || !two || create(first, 3) || budget.GetUsage().associations != 2)
         Fail("association admission was not shared across ingresses");
-    first.CleanupClientSessions("socket");
+    first.CleanupClientSessions(*sockets.Get(first, "socket"));
     if (!one->Closed() || create(second, 3) || budget.GetUsage().associations != 2)
         Fail("map removal bypassed the live association budget");
     one.reset();
@@ -281,12 +284,12 @@ void VerifyWorkerBudget() {
         !two->Push(target, payload()))
         Fail("association release failed to restore admission or existing request");
 
-    if (first.EnqueueReply("reply", endpoint, payload()) != Result::StartSend)
+    if (first.EnqueueReply(sockets.Get(first, "reply"), endpoint, payload()) != Result::StartSend)
         Fail("failed to reserve a shared reply payload");
 #ifdef CNODE_TEST_ALLOCATOR
     ::memory::reject_next_process_allocation = true;
 #endif
-    auto active = first.BeginReplySend("reply");
+    auto active = first.BeginReplySend(*sockets.Get(first, "reply"));
 #ifdef CNODE_TEST_ALLOCATOR
     const bool allocated = !::memory::reject_next_process_allocation;
     ::memory::reject_next_process_allocation = false;
@@ -294,15 +297,15 @@ void VerifyWorkerBudget() {
 #endif
     if (!active || budget.GetUsage().datagrams != 2 ||
         budget.GetUsage().payload_capacity != 2 * ::buf::Buffer::kSize ||
-        second.EnqueueReply("reply", endpoint, payload(2)) != Result::Rejected)
+        second.EnqueueReply(sockets.Get(second, "reply"), endpoint, payload(2)) != Result::Rejected)
         Fail("payload capacity did not include in-flight reply buffers");
     if (three->Push(target, payload(2)) || three->Closed() ||
         budget.GetUsage().datagrams != 2)
         Fail("shared payload rejection closed an existing association or leaked a reservation");
-    if (second.EnqueueReply("reply", endpoint, payload()) != Result::StartSend ||
+    if (second.EnqueueReply(sockets.Get(second, "reply"), endpoint, payload()) != Result::StartSend ||
         three->Push(target, payload()) || three->Closed())
         Fail("global datagram saturation was not isolated to the incoming packet");
-    first.ClearReplyQueue("reply");
+    first.ClearReplyQueue(*sockets.Get(first, "reply"));
     if (budget.GetUsage().datagrams != 3)
         Fail("clearing the reply map prematurely released an in-flight send");
     active.reset();
@@ -320,7 +323,7 @@ void VerifyWorkerBudget() {
     io.restart();
     if (!read || two->Closed() || !two->Push(target, payload()))
         Fail("a saturated Worker stopped serving an existing association");
-    second.ClearReplyQueue("reply");
+    second.ClearReplyQueue(*sockets.Get(second, "reply"));
     first.RequestStop();
     second.RequestStop();
     three.reset();
@@ -335,8 +338,8 @@ void VerifyWorkerBudget() {
     Ingress counted("counted", std::make_unique<DummyDatagramHandler>(),
                     reclaimer,
                     count_budget, io);
-    if (counted.EnqueueReply("count", endpoint, payload()) != Result::StartSend ||
-        counted.EnqueueReply("count", endpoint, payload()) != Result::Rejected ||
+    if (counted.EnqueueReply(sockets.Get(counted, "count"), endpoint, payload()) != Result::StartSend ||
+        counted.EnqueueReply(sockets.Get(counted, "count"), endpoint, payload()) != Result::Rejected ||
         count_budget.GetUsage().datagrams != 1)
         Fail("shared datagram count limit was not enforced independently");
     counted.RequestStop();
@@ -389,16 +392,15 @@ TEST(UdpSocketOwner, Contract) {
     std::array<uint8_t, 1> callback_payload{0x5a};
 
     ::net::io_context io_context;
+    UdpSocketFixtures sockets(io_context);
+    UdpReplyPeer large_sink(io_context), moved_sink(io_context);
     ::worker_detail::UdpResourceBudget udp_budget;
     ::IoErrorCode ec;
-    const ::udp::endpoint reply_endpoint_a(
-        ::net::ip::address_v4::loopback(), 10001);
-    const ::udp::endpoint reply_endpoint_b(
-        ::net::ip::address_v4::loopback(), 10002);
+    const auto reply_endpoint_a = large_sink.socket.local_endpoint();
+    const auto reply_endpoint_b = moved_sink.socket.local_endpoint();
     ::InboundDatagramOwner default_owner;
     const std::array<uint8_t, 1> default_owner_bytes{1};
     if (!default_owner.Assign(default_owner_bytes)) Fail("failed to prepare owner");
-    RecordingReplySink failed_sink, raw_sink, large_sink, snapshot_sink;
     const auto failing_response = std::make_shared<CountingUdpResponseContext>();
     failing_response->fail = true;
 
@@ -409,10 +411,11 @@ TEST(UdpSocketOwner, Contract) {
     uplink_script.target = callback_source;
     ::worker_detail::UdpIngress worker("test-inbound", std::make_unique<DummyDatagramHandler>(&uplink_script),
         udp_reclaimer, udp_budget, io_context);
+    auto callback_state = worker.AttachSocket(
+        std::make_shared<::udp::socket>(io_context, ::udp::v4()));
 
     ::worker_detail::UdpIngress::ClientSession failing_reply_session(io_context,
-        {.socket_key = {}, .socket = {}, .response = failing_response, .sink = &failed_sink, .worker_id = 0,
-         .owner = &worker},
+        {.socket = callback_state, .response = failing_response, .owner = &worker},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     ::buf::BufferGuard reply_buffer{::buf::Buffer::New()};
@@ -433,10 +436,10 @@ TEST(UdpSocketOwner, Contract) {
         Fail("UDP client reply callback failure was silently ignored");
     }
     io_context.restart();
+    auto raw_response = std::make_shared<CountingUdpResponseContext>();
 
     ::worker_detail::UdpIngress::ClientSession raw_reply_session(io_context,
-        {.socket_key = {}, .socket = {}, .response = std::make_shared<CountingUdpResponseContext>(),
-         .sink = &raw_sink, .worker_id = 0, .owner = &worker},
+        {.socket = callback_state, .response = raw_response, .owner = &worker},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     std::array<::net::const_buffer, 1> raw_reply_buffers{
@@ -449,7 +452,7 @@ TEST(UdpSocketOwner, Contract) {
             raw_reply_rejected = error != nullptr;
         });
     io_context.run();
-    if (!raw_reply_rejected || raw_sink.calls != 0) {
+    if (!raw_reply_rejected || raw_response->calls != 0) {
         Fail("UDP raw scatter write was silently reported as delivered");
     }
     io_context.restart();
@@ -468,8 +471,8 @@ TEST(UdpSocketOwner, Contract) {
     }
 
     ::worker_detail::UdpIngress::ClientSession large_reply_session(io_context,
-        {.socket_key = {}, .socket = {}, .response = std::make_shared<CountingUdpResponseContext>(),
-         .sink = &large_sink, .worker_id = 0, .owner = &worker},
+        {.socket = callback_state, .response = std::make_shared<CountingUdpResponseContext>(),
+         .owner = &worker},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     bool large_reply_failed = false;
@@ -480,8 +483,9 @@ TEST(UdpSocketOwner, Contract) {
             large_reply_failed = error != nullptr;
         });
     io_context.run();
+    large_sink.Read();
     if (large_reply_failed || large_sink.calls != 1 ||
-        large_sink.bytes != callback_large_payload || large_sink.endpoint != reply_endpoint_a) {
+        large_sink.bytes != callback_large_payload) {
         Fail("multi-buffer UDP reply was split into multiple datagrams");
     }
     io_context.restart();
@@ -504,8 +508,9 @@ TEST(UdpSocketOwner, Contract) {
             large_reply_failed = error != nullptr;
         });
     io_context.run();
-    if (large_reply_failed || large_sink.calls != 2 ||
-        large_sink.bytes != callback_large_payload || large_sink.endpoint != reply_endpoint_b) {
+    moved_sink.Read();
+    if (large_reply_failed || moved_sink.calls != 1 ||
+        moved_sink.bytes != callback_large_payload) {
         Fail("UDP client session kept replying to its stale endpoint");
     }
     io_context.restart();
@@ -588,7 +593,7 @@ TEST(UdpSocketOwner, Contract) {
             ::IoErrorCode available_ec;
             const size_t available = large_receiver.available(available_ec);
             if (available_ec) co_return;
-            ::detail::UdpReceiveBuffer receive_buffer;
+            ::transport::internet::UdpReceiveBuffer receive_buffer;
             const auto storage = receive_buffer.Prepare(available);
             ::udp::endpoint sender_endpoint;
             auto [receive_ec, bytes] = co_await large_receiver.async_receive_from(
@@ -630,10 +635,8 @@ TEST(UdpSocketOwner, Contract) {
         .dispatch_policy = {
             .sniffing = {}, .outbound = ::routing::ForceOutbound{"direct"}},
         .proxy_protocol = ::ProxyProtocolMode::Auto};
-    RecordingReplySink uplink_sink;
     const auto attach_uplink_socket = [&](std::string_view socket_key) {
-        auto socket = worker.AttachSocket(
-            socket_key, ::worker_detail::UdpIngress::MakeSocket(io_context));
+        auto socket = sockets.Attach(worker, socket_key, ::worker_detail::UdpIngress::MakeSocket(io_context));
         if (!socket) Fail("failed to attach UDP uplink test socket");
         return socket;
     };
@@ -645,14 +648,12 @@ TEST(UdpSocketOwner, Contract) {
         uplink_script.session_id = session_id;
         const std::array<uint8_t, 1> datagram{marker};
         worker.ProcessDatagram(::worker_detail::UdpDatagramContext{
-            .socket_key = socket_key,
-            .sock = socket.get(),
+            .socket = sockets.Find(worker, socket.get()).get(),
             .client_endpoint = reply_endpoint_b,
             .payload = datagram,
             .receiver = &uplink_receiver,
             .io_context = io_context,
             .worker_id = 0,
-            .reply_sink = uplink_sink,
             .environment = uplink_environment,
         });
     };
@@ -673,8 +674,7 @@ TEST(UdpSocketOwner, Contract) {
     };
 
     for (size_t i = 0; i < 512; ++i) {
-        (void)worker.EnqueueReply(
-            "bounded-replies", reply_endpoint_a, make_tiny_payload());
+        (void)worker.EnqueueReply(sockets.Get(worker, "bounded-replies"), reply_endpoint_a, make_tiny_payload());
     }
     size_t drained_replies = 0;
     auto reply_stats = worker.GetResourceStats();
@@ -682,14 +682,14 @@ TEST(UdpSocketOwner, Contract) {
         reply_stats.active_reply_senders != 0) {
         Fail("UDP reply stats did not report queued resource occupancy");
     }
-    auto first_bounded_reply = worker.BeginReplySend("bounded-replies");
+    auto first_bounded_reply = worker.BeginReplySend(*sockets.Get(worker, "bounded-replies"));
     reply_stats = worker.GetResourceStats();
     if (!first_bounded_reply || reply_stats.reply_datagrams != 256 ||
         reply_stats.reply_bytes != 256 || reply_stats.active_reply_senders != 1) {
         Fail("UDP reply stats omitted the active sender");
     }
     ++drained_replies;
-    auto bounded_reply = worker.CompleteReplySend("bounded-replies", first_bounded_reply->id);
+    auto bounded_reply = worker.CompleteReplySend(*sockets.Get(worker, "bounded-replies"), first_bounded_reply->id);
     reply_stats = worker.GetResourceStats();
     if (!bounded_reply || reply_stats.reply_datagrams != 255 ||
         reply_stats.reply_bytes != 255 || reply_stats.active_reply_senders != 1) {
@@ -697,12 +697,12 @@ TEST(UdpSocketOwner, Contract) {
     }
     while (bounded_reply) {
         ++drained_replies;
-        bounded_reply = worker.CompleteReplySend("bounded-replies", bounded_reply->id);
+        bounded_reply = worker.CompleteReplySend(*sockets.Get(worker, "bounded-replies"), bounded_reply->id);
     }
     if (drained_replies != 256) {
         Fail("UDP reply queue exceeded or undershot its datagram bound");
     }
-    worker.ClearReplyQueue("bounded-replies");
+    worker.ClearReplyQueue(*sockets.Get(worker, "bounded-replies"));
     reply_stats = worker.GetResourceStats();
     if (reply_stats.reply_datagrams != 0 || reply_stats.reply_bytes != 0 ||
         reply_stats.active_reply_senders != 0) {
@@ -713,21 +713,19 @@ TEST(UdpSocketOwner, Contract) {
     auto exercise_reply_oom = [&](const std::string& socket_key) {
         const auto budget_before = udp_budget.GetUsage();
         auto enqueue_one = [&]() {
-            return worker.EnqueueReply(
-                socket_key, reply_endpoint_a, make_tiny_payload());
+            return worker.EnqueueReply(sockets.Get(worker, socket_key), reply_endpoint_a, make_tiny_payload());
         };
         auto enqueue_with_fault = [&]() {
             auto payload = make_tiny_payload();
             // The reply deque grows through the process resource.
             ::memory::reject_next_process_allocation = true;
-            return worker.EnqueueReply(
-                socket_key, reply_endpoint_a, std::move(payload));
+            return worker.EnqueueReply(sockets.Get(worker, socket_key), reply_endpoint_a, std::move(payload));
         };
         if (enqueue_one() !=
             ::worker_detail::UdpIngress::ReplyEnqueueResult::StartSend) {
             Fail("failed to prime UDP reply OOM queue");
         }
-        auto active = worker.BeginReplySend(socket_key);
+        auto active = worker.BeginReplySend(*sockets.Get(worker, socket_key));
         if (!active || enqueue_one() !=
                 ::worker_detail::UdpIngress::ReplyEnqueueResult::Queued) {
             Fail("failed to retain pending and active UDP replies before OOM");
@@ -776,10 +774,10 @@ TEST(UdpSocketOwner, Contract) {
             Fail("UDP reply queue did not recover after injected OOM");
         }
         size_t handed_off = 0;
-        auto next = worker.CompleteReplySend(socket_key, active->id);
+        auto next = worker.CompleteReplySend(*sockets.Get(worker, socket_key), active->id);
         while (next) {
             ++handed_off;
-            next = worker.CompleteReplySend(socket_key, next->id);
+            next = worker.CompleteReplySend(*sockets.Get(worker, socket_key), next->id);
         }
         if (handed_off != pending_before_failure + 1)
             Fail("UDP reply queue lost a pending packet after OOM");
@@ -789,7 +787,7 @@ TEST(UdpSocketOwner, Contract) {
             drained_stats.active_reply_senders != 0) {
             Fail("UDP reply OOM recovery did not drain to zero");
         }
-        worker.ClearReplyQueue(socket_key);
+        worker.ClearReplyQueue(*sockets.Get(worker, socket_key));
         if (udp_budget.GetUsage().datagrams != budget_before.datagrams ||
             udp_budget.GetUsage().payload_capacity != budget_before.payload_capacity)
             Fail("reply OOM recovery did not return its shared budget");
@@ -797,42 +795,39 @@ TEST(UdpSocketOwner, Contract) {
     exercise_reply_oom("oom-reply");
 #endif
 
-    if (worker.EnqueueReply(
-            "reply-generation", reply_endpoint_a, make_tiny_payload()) !=
+    if (worker.EnqueueReply(sockets.Get(worker, "reply-generation"), reply_endpoint_a, make_tiny_payload()) !=
         ::worker_detail::UdpIngress::ReplyEnqueueResult::StartSend) {
         Fail("failed to start the first UDP reply generation");
     }
-    auto stale_reply = worker.BeginReplySend("reply-generation");
+    auto stale_reply = worker.BeginReplySend(*sockets.Get(worker, "reply-generation"));
     if (!stale_reply) {
         Fail("failed to acquire the first UDP reply generation");
     }
-    worker.ClearReplyQueue("reply-generation");
+    worker.ClearReplyQueue(*sockets.Get(worker, "reply-generation"));
 
-    if (worker.EnqueueReply(
-            "reply-generation", reply_endpoint_a, make_tiny_payload()) !=
+    if (worker.EnqueueReply(sockets.Get(worker, "reply-generation"), reply_endpoint_a, make_tiny_payload()) !=
         ::worker_detail::UdpIngress::ReplyEnqueueResult::StartSend) {
         Fail("failed to start the replacement UDP reply generation");
     }
-    auto active_reply = worker.BeginReplySend("reply-generation");
+    auto active_reply = worker.BeginReplySend(*sockets.Get(worker, "reply-generation"));
     if (!active_reply) {
         Fail("failed to acquire the replacement UDP reply generation");
     }
-    if (worker.CompleteReplySend("reply-generation", stale_reply->id)) {
+    if (worker.CompleteReplySend(*sockets.Get(worker, "reply-generation"), stale_reply->id)) {
         Fail("stale UDP reply completion matched a replacement queue");
     }
-    if (worker.EnqueueReply(
-            "reply-generation", reply_endpoint_a, make_tiny_payload()) !=
+    if (worker.EnqueueReply(sockets.Get(worker, "reply-generation"), reply_endpoint_a, make_tiny_payload()) !=
         ::worker_detail::UdpIngress::ReplyEnqueueResult::Queued) {
         Fail("stale UDP reply completion released a replacement queue");
     }
-    auto queued_reply = worker.CompleteReplySend("reply-generation", active_reply->id);
+    auto queued_reply = worker.CompleteReplySend(*sockets.Get(worker, "reply-generation"), active_reply->id);
     if (!queued_reply) {
         Fail("replacement UDP reply queue lost its pending datagram");
     }
-    if (worker.CompleteReplySend("reply-generation", queued_reply->id)) {
+    if (worker.CompleteReplySend(*sockets.Get(worker, "reply-generation"), queued_reply->id)) {
         Fail("drained UDP reply queue still reported pending datagrams");
     }
-    worker.ClearReplyQueue("reply-generation");
+    worker.ClearReplyQueue(*sockets.Get(worker, "reply-generation"));
 
     ::InboundDatagramOwner owner_a;
     ::InboundDatagramOwner owner_b;
@@ -849,15 +844,13 @@ TEST(UdpSocketOwner, Contract) {
         Fail("UDP protocol session key was not scoped by authenticated owner");
     }
     const auto owner_socket = attach_uplink_socket("owner-socket");
-    const auto owner_session = worker.CreateClientSession(
-        "owner-socket",
-        owner_a_session_key,
-        io_context,
-        {},
-        reply_endpoint_a,
-        owner_a,
-        std::chrono::steady_clock::now(),
-        std::chrono::seconds(60));
+    const auto owner_session = worker.CreateClientSession(sockets.Get(worker, "owner-socket"), owner_a_session_key,
+    io_context,
+    {},
+    reply_endpoint_a,
+    owner_a,
+    std::chrono::steady_clock::now(),
+    std::chrono::seconds(60));
     if (!owner_session) Fail("failed to create the first UDP owner session");
     // The same protocol session id authenticated as owner_b keys a different
     // row. None exists yet and this handler prepares no response, so the
@@ -873,15 +866,13 @@ TEST(UdpSocketOwner, Contract) {
     if (input_stats.input_datagrams != 1 || input_stats.input_bytes != 1) {
         Fail("UDP session rejected its authenticated owner");
     }
-    const auto second_owner_session = worker.CreateClientSession(
-        "owner-socket",
-        owner_b_session_key,
-        io_context,
-        {},
-        reply_endpoint_a,
-        owner_b,
-        std::chrono::steady_clock::now(),
-        std::chrono::seconds(60));
+    const auto second_owner_session = worker.CreateClientSession(sockets.Get(worker, "owner-socket"), owner_b_session_key,
+    io_context,
+    {},
+    reply_endpoint_a,
+    owner_b,
+    std::chrono::steady_clock::now(),
+    std::chrono::seconds(60));
     if (!second_owner_session || second_owner_session == owner_session ||
         worker.GetResourceStats().associations != 2) {
         Fail("UDP session ID collision blocked a different authenticated owner");
@@ -911,15 +902,13 @@ TEST(UdpSocketOwner, Contract) {
     const auto input_budget_baseline = udp_budget.GetUsage();
     const std::string oom_input_socket = "oom-input-socket";
     const auto oom_socket = attach_uplink_socket(oom_input_socket);
-    auto oom_input_session = worker.CreateClientSession(
-        oom_input_socket,
-        ::worker_detail::ClientSessionKey{default_owner, 9},
-        io_context,
-        {},
-        reply_endpoint_a,
-        default_owner,
-        std::chrono::steady_clock::now(),
-        std::chrono::seconds(60));
+    auto oom_input_session = worker.CreateClientSession(sockets.Get(worker, oom_input_socket), ::worker_detail::ClientSessionKey{default_owner, 9},
+    io_context,
+    {},
+    reply_endpoint_a,
+    default_owner,
+    std::chrono::steady_clock::now(),
+    std::chrono::seconds(60));
     if (!oom_input_session) Fail("failed to create UDP input OOM session");
     const auto deliver_oom_input = [&]() {
         deliver_uplink(oom_input_socket, oom_socket, default_owner, 9, 0x44);
@@ -983,7 +972,7 @@ TEST(UdpSocketOwner, Contract) {
         --input_oom_items;
     }
     oom_input_session->Close();
-    worker.CloseSocket(oom_input_socket);
+    worker.CloseSocket(*sockets.Get(worker, oom_input_socket));
     oom_input_session.reset();
     input_stats = worker.GetResourceStats();
     if (input_stats.input_datagrams != input_baseline.input_datagrams ||
@@ -1032,9 +1021,9 @@ TEST(UdpSocketOwner, Contract) {
     }
     io_context.restart();
 
-    auto attached = worker.AttachSocket("stable-socket", std::move(second));
-    if (!attached || worker.FindSocket("stable-socket") != attached ||
-        !worker.OwnsSocket("stable-socket", attached.get()) ||
+    auto attached = sockets.Attach(worker, "stable-socket", std::move(second));
+    if (!attached || sockets.Find(worker, "stable-socket") != attached ||
+        !sockets.Owns(worker, "stable-socket", attached.get()) ||
         !attached->is_open()) {
         Fail("failed to attach initial UDP socket");
     }
@@ -1042,17 +1031,16 @@ TEST(UdpSocketOwner, Contract) {
     auto duplicate = ::worker_detail::UdpIngress::MakeSocket(io_context);
     duplicate->open(::udp::v4(), ec);
     if (ec) Fail("failed to open duplicate UDP socket");
-    if (worker.AttachSocket("stable-socket", std::move(duplicate)) != nullptr) {
+    if (sockets.Attach(worker, "stable-socket", std::move(duplicate)) != nullptr) {
         Fail("duplicate UDP socket attachment was accepted");
     }
-    if (worker.FindSocket("stable-socket") != attached || !attached->is_open()) {
+    if (sockets.Find(worker, "stable-socket") != attached || !attached->is_open()) {
         Fail("duplicate attachment replaced the live UDP socket");
     }
 
     auto response_context = std::make_shared<CountingUdpResponseContext>();
     ::worker_detail::UdpIngress::ClientSession snapshot_reply_session(io_context,
-        {.socket_key = {}, .socket = {}, .response = response_context, .sink = &snapshot_sink, .worker_id = 0,
-         .owner = &worker},
+        {.socket = callback_state, .response = response_context, .owner = &worker},
         reply_endpoint_a,
         default_owner, udp_budget, udp_budget.AcquireAssociation());
     if (!worker.ReplaceHandler(
@@ -1081,13 +1069,13 @@ TEST(UdpSocketOwner, Contract) {
         Fail("UDP handler replacement changed a live response context");
     }
     io_context.restart();
-    if (worker.FindSocket("stable-socket") != attached || !attached->is_open()) {
+    if (sockets.Find(worker, "stable-socket") != attached || !attached->is_open()) {
         Fail("UDP handler replacement disturbed the live socket");
     }
     if (worker.ReplaceHandler(nullptr)) {
         Fail("null UDP handler replacement was accepted");
     }
-    if (worker.FindSocket("stable-socket") != attached || !attached->is_open()) {
+    if (sockets.Find(worker, "stable-socket") != attached || !attached->is_open()) {
         Fail("rejected UDP handler replacement disturbed the live socket");
     }
 
@@ -1097,7 +1085,7 @@ TEST(UdpSocketOwner, Contract) {
         association_stats.closed_associations != 1) {
         Fail("UDP association stats did not count live and closed sessions");
     }
-    worker.CloseSocket("owner-socket");
+    worker.CloseSocket(*sockets.Get(worker, "owner-socket"));
     association_stats = worker.GetResourceStats();
     if (association_stats.associations != 0) {
         Fail("UDP association cleanup retained resource stats");
@@ -1107,15 +1095,13 @@ TEST(UdpSocketOwner, Contract) {
     const auto long_socket = attach_uplink_socket(long_socket_key);
     for (size_t cycle = 0; cycle < 1000; ++cycle) {
         const ::worker_detail::ClientSessionKey long_client_key{default_owner, cycle};
-        auto cycle_session = worker.CreateClientSession(
-            long_socket_key,
-            long_client_key,
-            io_context,
-            {},
-            reply_endpoint_a,
-            default_owner,
-            std::chrono::steady_clock::now(),
-            std::chrono::seconds(60));
+        auto cycle_session = worker.CreateClientSession(sockets.Get(worker, long_socket_key), long_client_key,
+        io_context,
+        {},
+        reply_endpoint_a,
+        default_owner,
+        std::chrono::steady_clock::now(),
+        std::chrono::seconds(60));
         if (!cycle_session) {
             Fail("failed to create a long-key UDP session");
         }
@@ -1132,21 +1118,20 @@ TEST(UdpSocketOwner, Contract) {
         if (worker.GetResourceStats().input_datagrams != 1) {
             Fail("long UDP keys failed heterogeneous session lookup");
         }
-        if (worker.EnqueueReply(
-                long_socket_key, reply_endpoint_a, make_tiny_payload()) !=
+        if (worker.EnqueueReply(sockets.Get(worker, long_socket_key), reply_endpoint_a, make_tiny_payload()) !=
             ::worker_detail::UdpIngress::ReplyEnqueueResult::StartSend) {
             Fail("long UDP socket key failed reply queue insertion");
         }
-        auto long_reply = worker.BeginReplySend(long_socket_key);
+        auto long_reply = worker.BeginReplySend(*sockets.Get(worker, long_socket_key));
         if (!long_reply || worker.GetResourceStats().active_reply_senders != 1) {
             Fail("long UDP reply queue was absent from resource stats");
         }
-        (void)worker.CompleteReplySend(long_socket_key, long_reply->id);
+        (void)worker.CompleteReplySend(*sockets.Get(worker, long_socket_key), long_reply->id);
         long_reply.reset();
-        worker.ClearReplyQueue(long_socket_key);
+        worker.ClearReplyQueue(*sockets.Get(worker, long_socket_key));
         std::weak_ptr<::worker_detail::UdpIngress::ClientSession> cycle_weak = cycle_session;
         cycle_session->Close();
-        worker.CleanupClientSessions(long_socket_key);
+        worker.CleanupClientSessions(*sockets.Get(worker, long_socket_key));
         cycle_session.reset();
         if (!cycle_weak.expired()) Fail("long-key UDP session remained alive after cleanup");
         const auto cycle_stats = worker.GetResourceStats();
@@ -1161,7 +1146,7 @@ TEST(UdpSocketOwner, Contract) {
             io_context.restart();
         }
     }
-    worker.CloseSocket(long_socket_key);
+    worker.CloseSocket(*sockets.Get(worker, long_socket_key));
 
     bool attached_wait_cancelled = false;
     attached->async_wait(
@@ -1170,12 +1155,12 @@ TEST(UdpSocketOwner, Contract) {
             attached_wait_cancelled =
                 wait_ec == ::io_error::operation_aborted;
         });
-    worker.CloseSocket("stable-socket");
-    if (worker.FindSocket("stable-socket") != nullptr) {
+    worker.CloseSocket(*sockets.Get(worker, "stable-socket"));
+    if (sockets.Find(worker, "stable-socket") != nullptr) {
         Fail("closed UDP socket remained registered");
     }
     if (!attached || attached->is_open() ||
-        worker.OwnsSocket("stable-socket", attached.get())) {
+        sockets.Owns(worker, "stable-socket", attached.get())) {
         Fail("retired UDP socket lifetime handle did not observe closure");
     }
     io_context.run();
@@ -1194,15 +1179,13 @@ TEST(UdpSocketOwner, Contract) {
     };
     auto make_session = [&](uint64_t id, auto last_active,
                             std::chrono::seconds idle_timeout) {
-        return worker.CreateClientSession(
-            std::string(idle_cleanup_socket),
-            typed_key(id),
-            io_context,
-            {},
-            reply_endpoint_a,
-            default_owner,
-            last_active,
-            idle_timeout);
+        return worker.CreateClientSession(sockets.Get(worker, std::string(idle_cleanup_socket)), typed_key(id),
+        io_context,
+        {},
+        reply_endpoint_a,
+        default_owner,
+        last_active,
+        idle_timeout);
     };
     auto closed_disabled = make_session(
         1, session_now, std::chrono::seconds::zero());
@@ -1249,6 +1232,37 @@ TEST(UdpSocketOwner, Contract) {
     if (idle_stats.associations != 2 || idle_stats.closed_associations != 0) {
         Fail("distinct closed UDP session key remained retained with idle timeout disabled");
     }
-    worker.CleanupClientSessions(idle_cleanup_socket);
+    worker.CleanupClientSessions(*sockets.Get(worker, idle_cleanup_socket));
 
+}
+
+TEST(UdpSocketOwner, ReplySenderDrain) {
+    ::net::io_context io;
+    auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
+    ::worker_detail::UdpAssociationReclaimer reclaimer(
+        scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
+    ::worker_detail::UdpResourceBudget budget;
+    ::worker_detail::UdpIngress ingress(
+        "sender-drain", std::make_unique<DummyDatagramHandler>(), reclaimer, budget, io);
+    auto socket = ingress.AttachSocket(std::make_shared<::udp::socket>(io, ::udp::v4()));
+    ::udp::socket peer(io, {::net::ip::address_v4::loopback(), 0});
+    ::buf::MultiBuffer payload;
+    const std::array<uint8_t, 1> bytes{0x31};
+    ASSERT_TRUE(::buf::AppendSpanToMultiBuffer(bytes, payload));
+    ASSERT_TRUE(ingress.SendReply(socket, peer.local_endpoint(), std::move(payload), 0));
+    ASSERT_EQ(budget.GetUsage().datagrams, 1u);
+    io.poll_one();
+    io.restart();
+    ingress.RequestStop();
+    bool joined = false;
+    ::net::co_spawn(io, ingress.AsyncJoin(), [&](std::exception_ptr failure) {
+        EXPECT_FALSE(failure);
+        EXPECT_EQ(budget.GetUsage().datagrams, 0u);
+        EXPECT_EQ(budget.GetUsage().payload_capacity, 0u);
+        joined = true;
+    });
+    io.run();
+    EXPECT_TRUE(joined);
+    EXPECT_FALSE(socket->socket->is_open());
+    EXPECT_EQ(socket->owner, nullptr);
 }

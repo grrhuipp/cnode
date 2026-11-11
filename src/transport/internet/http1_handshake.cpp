@@ -470,10 +470,6 @@ private:
     bool closed_ = false;
 };
 
-[[nodiscard]] bool IsHostHeader(std::string_view key) {
-    return EqualsAsciiCI(key, "Host");
-}
-
 [[nodiscard]] bool IsReservedUpgradeHeader(std::string_view key) noexcept {
     return EqualsAsciiCI(key, "Host") ||
            EqualsAsciiCI(key, "Upgrade") ||
@@ -495,6 +491,16 @@ void LogHeadReadFailure(std::string_view scope, uint64_t conn_id, ErrorCode erro
     }
 }
 
+// HTTPUpgrade 与 WebSocket（RFC 6455 4.2.2）共用的 101 响应；WebSocket 在结束
+// 空行之前追加 Sec-WebSocket-Accept。
+constexpr std::string_view kSwitchingProtocolsResponse =
+    "HTTP/1.1 101 Switching Protocols\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    "\r\n";
+constexpr std::string_view kSwitchingProtocolsFields =
+    kSwitchingProtocolsResponse.substr(0, kSwitchingProtocolsResponse.size() - 2);
+
 // Reads the response head of a client handshake and requires `status_code`.
 // Read-ahead belongs to the established byte stream.
 net::awaitable<tl::expected<void, ErrorCode>> ReadClientResponse(
@@ -512,11 +518,7 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadClientResponse(
         LOG_CONN_DEBUG(conn_id, "{} client request rejected", scope);
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    // HTTP handshakes run directly on TCP or TLS. Read-ahead returns to that
-    // exact byte layer: TLS plaintext never enters the TCP ciphertext queue.
-    if (auto read_ahead = head->TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
-        stream.PrependReadMultiBuffer(std::move(read_ahead));
-    }
+    MoveReadAhead(stream, *head);
     co_return tl::expected<void, ErrorCode>{};
 }
 
@@ -900,8 +902,50 @@ void AppendHeaderLine(memory::String& out,
     out.append("\r\n");
 }
 
-std::string_view ExpectedHttpHost(const HttpConfig& cfg) {
-    return ResolveConfiguredHttpHost(cfg.host, &cfg.headers);
+net::awaitable<tl::expected<Http1Request, ErrorCode>> ReadHttp1Request(
+    AsyncStream& stream,
+    std::string_view scope,
+    uint64_t conn_id,
+    std::span<const uint8_t> initial) {
+    Http1Request request;
+    if (auto read = co_await ReadHttp1MessageHead(stream, request.head, initial); !read) {
+        LogHeadReadFailure(scope, conn_id, read.error());
+        co_return tl::unexpected(read.error());
+    }
+    const std::string_view text = request.head.Text();
+    request.start_line = ExtractStartLine(text);
+    request.line = ParseHttp1RequestLine(request.start_line);
+    request.host = TrimAscii(ExtractHeaderValueCI(text, "Host"));
+    LOG_CONN_TRACE(conn_id,
+        "{} request line='{}' method='{}' path='{}' host='{}' bytes={}",
+        scope,
+        SanitizeHttpRequestLineForLog(request.line),
+        PublicHttpMethodForLog(request.line.method),
+        PublicHttpTargetForLog(request.line.target),
+        PublicHttpTargetForLog(request.host),
+        request.head.size);
+    co_return std::move(request);
+}
+
+bool RejectHostMismatch(std::string_view scope,
+                        uint64_t conn_id,
+                        std::string_view expected_host,
+                        std::string_view host) {
+    if (expected_host.empty() || EqualsAsciiCI(host, expected_host)) {
+        return false;
+    }
+    LOG_CONN_DEBUG(conn_id,
+        "{} host mismatch expected='{}' actual='{}'",
+        scope,
+        PublicHttpTargetForLog(expected_host),
+        PublicHttpTargetForLog(host));
+    return true;
+}
+
+void MoveReadAhead(AsyncStream& stream, Http1MessageHead& head) {
+    if (auto read_ahead = head.TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
+        stream.PrependReadMultiBuffer(std::move(read_ahead));
+    }
 }
 
 net::awaitable<tl::expected<Http1MessageHead, ErrorCode>>
@@ -979,6 +1023,19 @@ net::awaitable<bool> WriteFullToStream(AsyncStream& stream, std::string_view byt
     co_return true;
 }
 
+net::awaitable<bool> ReadFullFromStream(AsyncStream& stream, std::span<uint8_t> out) {
+    size_t done = 0;
+    while (done < out.size()) {
+        const size_t n = co_await stream.AsyncRead(
+            net::buffer(out.data() + done, out.size() - done));
+        if (n == 0) {
+            co_return false;
+        }
+        done += n;
+    }
+    co_return true;
+}
+
 std::unique_ptr<AsyncStream> MakeHttp1BodyStream(
     std::unique_ptr<AsyncStream> inner,
     Http1ReadFraming read_framing,
@@ -989,57 +1046,51 @@ std::unique_ptr<AsyncStream> MakeHttp1BodyStream(
     return body;
 }
 
+namespace {
+
+void LogPathMismatch(std::string_view scope,
+                     uint64_t conn_id,
+                     std::string_view configured_path,
+                     std::string_view target) {
+    LOG_CONN_DEBUG(conn_id,
+        "{} path mismatch expected='{}' actual='{}'",
+        scope,
+        PublicHttpTargetForLog(EffectiveHttpPath(configured_path)),
+        PublicHttpTargetForLog(target));
+}
+
+}  // namespace
+
 net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     std::unique_ptr<AsyncStream> stream,
     const HttpConfig& cfg,
     uint64_t conn_id,
     InboundTransportMetadata* transport_metadata,
     std::span<const uint8_t> initial) {
-    auto head = co_await ReadHttp1MessageHead(*stream, initial);
-    if (!head) {
-        LogHeadReadFailure("HTTP", conn_id, head.error());
-        co_return tl::unexpected(head.error());
+    constexpr std::string_view kScope = "HTTP server";
+    auto request = co_await ReadHttp1Request(*stream, kScope, conn_id, initial);
+    if (!request) {
+        co_return tl::unexpected(request.error());
     }
-
-    const std::string_view request = head->Text();
-    const std::string_view request_line = ExtractStartLine(request);
-    const auto parsed_line = ParseHttp1RequestLine(request_line);
-    const auto method = parsed_line.method;
-    const auto request_path = parsed_line.target;
-    const std::string_view host = TrimAscii(ExtractHeaderValueCI(request, "Host"));
-
-    LOG_CONN_TRACE(conn_id,
-        "HTTP server request line='{}' method='{}' path='{}' host='{}' bytes={}",
-        SanitizeHttpRequestLineForLog(parsed_line),
-        PublicHttpMethodForLog(method),
-        PublicHttpTargetForLog(request_path),
-        PublicHttpTargetForLog(host),
-        head->size);
-
-    if (method.empty() || !detail::PathPrefixMatchesSegment(cfg.path, request_path)) {
-        LOG_CONN_DEBUG(conn_id,
-            "HTTP server path mismatch expected='{}' actual='{}'",
-            PublicHttpTargetForLog(EffectiveHttpPath(cfg.path)),
-            PublicHttpTargetForLog(request_path));
+    const Http1RequestLine& line = request->line;
+    if (line.method.empty() || !detail::PathPrefixMatchesSegment(cfg.path, line.target)) {
+        LogPathMismatch(kScope, conn_id, cfg.path, line.target);
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    if (!cfg.method.empty() && !EqualsAsciiCI(method, cfg.method)) {
+    if (!cfg.method.empty() && !EqualsAsciiCI(line.method, cfg.method)) {
         LOG_CONN_DEBUG(conn_id,
             "HTTP server method mismatch expected='{}' actual='{}'",
             PublicHttpMethodForLog(cfg.method),
-            PublicHttpMethodForLog(method));
+            PublicHttpMethodForLog(line.method));
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    if (const std::string_view expected_host = ExpectedHttpHost(cfg);
-        !expected_host.empty() && !EqualsAsciiCI(host, expected_host)) {
-        LOG_CONN_DEBUG(conn_id,
-            "HTTP server host mismatch expected='{}' actual='{}'",
-            PublicHttpTargetForLog(expected_host),
-            PublicHttpTargetForLog(host));
+    if (RejectHostMismatch(kScope, conn_id,
+                           ResolveConfiguredHttpHost(cfg.host, &cfg.headers),
+                           request->host)) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    RecordExtractedRealIp(request, cfg.real_ip_header, transport_metadata);
+    RecordExtractedRealIp(request->head.Text(), cfg.real_ip_header, transport_metadata);
 
     memory::String response;
     response.reserve(96 + cfg.headers.size() * 32);
@@ -1057,9 +1108,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    if (auto read_ahead = head->TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
-        stream->PrependReadMultiBuffer(std::move(read_ahead));
-    }
+    MoveReadAhead(*stream, request->head);
     LOG_CONN_DEBUG(conn_id, "HTTP server handshake completed (path={})",
                    PublicHttpTargetForLog(EffectiveHttpPath(cfg.path)));
     co_return std::move(stream);
@@ -1075,7 +1124,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
         ? std::string_view("PUT") : std::string_view(cfg.method);
     size_t reserve_size = 192 + method.size() + req_path.size() + host.size();
     for (const auto& [key, value] : cfg.headers) {
-        if (!key.empty() && !IsHostHeader(key)) {
+        if (!key.empty() && !EqualsAsciiCI(key, "Host")) {
             reserve_size += key.size() + value.size() + 4;
         }
     }
@@ -1084,7 +1133,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
     request.reserve(reserve_size);
     AppendRequestStart(request, method, req_path, host);
     for (const auto& [key, value] : cfg.headers) {
-        if (!key.empty() && !IsHostHeader(key)) {
+        if (!key.empty() && !EqualsAsciiCI(key, "Host")) {
             AppendHeaderLine(request, key, value);
         }
     }
@@ -1109,64 +1158,34 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
     const HttpUpgradeConfig& cfg,
     uint64_t conn_id,
     InboundTransportMetadata* transport_metadata) {
-    auto head = co_await ReadHttp1MessageHead(*stream);
-    if (!head) {
-        LogHeadReadFailure("HTTPUpgrade", conn_id, head.error());
-        co_return tl::unexpected(head.error());
+    constexpr std::string_view kScope = "HTTPUpgrade server";
+    auto request = co_await ReadHttp1Request(*stream, kScope, conn_id);
+    if (!request) {
+        co_return tl::unexpected(request.error());
     }
-
-    const std::string_view request = head->Text();
-    const std::string_view request_line = ExtractStartLine(request);
-    const auto parsed_line = ParseHttp1RequestLine(request_line);
-    const auto request_path = parsed_line.target;
-    const std::string_view host = TrimAscii(ExtractHeaderValueCI(request, "Host"));
-
-    LOG_CONN_TRACE(conn_id,
-        "HTTPUpgrade server request line='{}' path='{}' host='{}' bytes={}",
-        SanitizeHttpRequestLineForLog(parsed_line),
-        PublicHttpTargetForLog(request_path),
-        PublicHttpTargetForLog(host),
-        head->size);
-
-    if (!request_line.starts_with("GET ") ||
-        !detail::PathMatchesExactly(cfg.path, request_path)) {
-        LOG_CONN_DEBUG(conn_id,
-            "HTTPUpgrade server path mismatch expected='{}' actual='{}'",
-            PublicHttpTargetForLog(EffectiveHttpPath(cfg.path)),
-            PublicHttpTargetForLog(request_path));
+    if (!request->start_line.starts_with("GET ") ||
+        !detail::PathMatchesExactly(cfg.path, request->line.target)) {
+        LogPathMismatch(kScope, conn_id, cfg.path, request->line.target);
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-
-    if (!HasWebSocketUpgradeHeaders(request)) {
+    if (!HasWebSocketUpgradeHeaders(request->head.Text())) {
         LOG_CONN_DEBUG(conn_id, "HTTPUpgrade server received invalid upgrade headers");
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-
-    if (const std::string_view expected_host =
-            ResolveConfiguredHttpHost(cfg.host, &cfg.headers);
-        !expected_host.empty() && !EqualsAsciiCI(host, expected_host)) {
-        LOG_CONN_DEBUG(conn_id,
-            "HTTPUpgrade server host mismatch expected='{}' actual='{}'",
-            PublicHttpTargetForLog(expected_host),
-            PublicHttpTargetForLog(host));
+    if (RejectHostMismatch(kScope, conn_id,
+                           ResolveConfiguredHttpHost(cfg.host, &cfg.headers),
+                           request->host)) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    RecordExtractedRealIp(request, cfg.real_ip_header, transport_metadata);
+    RecordExtractedRealIp(request->head.Text(), cfg.real_ip_header, transport_metadata);
 
-    constexpr std::string_view kResponse =
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "\r\n";
-    if (!co_await WriteFullToStream(*stream, kResponse)) {
+    if (!co_await WriteFullToStream(*stream, kSwitchingProtocolsResponse)) {
         LOG_CONN_DEBUG(conn_id, "HTTPUpgrade server failed to send 101 response");
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    if (auto read_ahead = head->TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
-        stream->PrependReadMultiBuffer(std::move(read_ahead));
-    }
+    MoveReadAhead(*stream, request->head);
     LOG_CONN_DEBUG(conn_id, "HTTPUpgrade server handshake completed (path={})",
                    PublicHttpTargetForLog(EffectiveHttpPath(cfg.path)));
     co_return std::move(stream);
@@ -1185,84 +1204,57 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeClientHandshake(
     if (!head) {
         co_return tl::unexpected(head.error());
     }
-    if (auto read_ahead = head->TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
-        stream->PrependReadMultiBuffer(std::move(read_ahead));
-    }
+    MoveReadAhead(*stream, *head);
     LOG_CONN_DEBUG(conn_id, "HTTPUpgrade client handshake completed (host={} path={})",
                    PublicHttpTargetForLog(effective_host), PublicHttpTargetForLog(req_path));
     co_return std::move(stream);
 }
 
+// 路径语义与 HTTPUpgrade 及 Xray websocket hub 一致：忽略 query 后与配置路径
+// （未配置即 "/"）严格相等，根路径不放行其他路径。
 net::awaitable<TransportBuildResult> DoWsServerHandshake(
     std::unique_ptr<AsyncStream> stream,
     const WsConfig& ws_cfg,
     uint64_t conn_id,
     InboundTransportMetadata* transport_metadata) {
-    auto head = co_await ReadHttp1MessageHead(*stream);
-    if (!head) {
-        LogHeadReadFailure("WS", conn_id, head.error());
-        co_return tl::unexpected(head.error());
+    constexpr std::string_view kScope = "WebSocket server";
+    auto request = co_await ReadHttp1Request(*stream, kScope, conn_id);
+    if (!request) {
+        co_return tl::unexpected(request.error());
     }
-
-    const std::string_view request = head->Text();
-    const std::string_view request_line = ExtractStartLine(request);
-    const auto parsed_line = ParseHttp1RequestLine(request_line);
-    const auto request_path = parsed_line.target;
-    const std::string_view host = ExtractHeaderValueCI(request, "Host");
-    const std::string_view version = ExtractHeaderValueCI(request, "Sec-WebSocket-Version");
-
-    LOG_CONN_TRACE(conn_id, "WebSocket server received HTTP upgrade bytes={}", head->size);
-
-    if (!HasWebSocketUpgradeHeaders(request)) {
+    const std::string_view text = request->head.Text();
+    if (!HasWebSocketUpgradeHeaders(text)) {
         LOG_CONN_DEBUG(conn_id, "WebSocket server missing 'Upgrade: websocket' header");
-        LOG_CONN_TRACE(conn_id, "WebSocket server rejected missing upgrade line='{}' host='{}'",
-                      SanitizeHttpRequestLineForLog(parsed_line),
-                      PublicHttpTargetForLog(host));
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    if (!request_line.starts_with("GET ") || !request_line.ends_with(" HTTP/1.1") ||
-        TrimAscii(version) != "13") {
+    if (!request->start_line.starts_with("GET ") ||
+        !request->start_line.ends_with(" HTTP/1.1") ||
+        TrimAscii(ExtractHeaderValueCI(text, "Sec-WebSocket-Version")) != "13") {
         LOG_CONN_DEBUG(conn_id, "WebSocket server received invalid upgrade request");
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-
-    // 仅在配置了非根路径时校验路径
-    const std::string_view expected_path = EffectiveHttpPath(ws_cfg.path);
-    if (expected_path != "/" && request_path != expected_path) {
-        LOG_CONN_DEBUG(conn_id, "WebSocket server path mismatch expected='{}'",
-                       PublicHttpTargetForLog(expected_path));
-        LOG_CONN_TRACE(conn_id, "WebSocket server rejected path mismatch expected='{}' actual='{}' line='{}'",
-                      PublicHttpTargetForLog(expected_path),
-                      PublicHttpTargetForLog(request_path),
-                      SanitizeHttpRequestLineForLog(parsed_line));
+    if (!detail::PathMatchesExactly(ws_cfg.path, request->line.target)) {
+        LogPathMismatch(kScope, conn_id, ws_cfg.path, request->line.target);
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     // RFC 6455 4.2.1: the key is a base64-encoded 16-byte nonce.
-    const std::string_view ws_key = TrimAscii(
-        ExtractHeaderValueCI(request, "Sec-WebSocket-Key"));
+    const std::string_view ws_key = TrimAscii(ExtractHeaderValueCI(text, "Sec-WebSocket-Key"));
     std::array<uint8_t, 18> decoded_key;
     if (ws_key.size() != 24 || ws_key[22] != '=' || ws_key[23] != '=' ||
         EVP_DecodeBlock(decoded_key.data(),
             reinterpret_cast<const uint8_t*>(ws_key.data()), 24) != 18) {
         LOG_CONN_DEBUG(conn_id, "WebSocket server received invalid Sec-WebSocket-Key header");
-        LOG_CONN_TRACE(conn_id, "WebSocket server rejected invalid key line='{}' host='{}' version='{}'",
-                      SanitizeHttpRequestLineForLog(parsed_line),
-                      PublicHttpTargetForLog(host),
-                      TrimAscii(version));
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
-    // 提取真实客户端 IP（CDN 透传头）
-    RecordExtractedRealIp(request, ws_cfg.real_ip_header, transport_metadata);
+    RecordExtractedRealIp(text, ws_cfg.real_ip_header, transport_metadata);
 
-    memory::String response;
-    response.reserve(128);
-    response.append("HTTP/1.1 101 Switching Protocols\r\n"
-                    "Upgrade: websocket\r\n"
-                    "Connection: Upgrade\r\n"
-                    "Sec-WebSocket-Accept: ");
     const auto ws_accept = ws::EncodeWsAccept(ws_key);
+    memory::String response;
+    response.reserve(kSwitchingProtocolsResponse.size() + 32 + ws_accept.size());
+    response.append(kSwitchingProtocolsFields);
+    response.append("Sec-WebSocket-Accept: ");
     response.append(ws_accept.data(), ws_accept.size());
     response.append("\r\n\r\n");
     if (!co_await WriteFullToStream(*stream, response)) {
@@ -1270,19 +1262,15 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    // HTTP 头之后已读到的字节属于 WebSocket 帧流
+    // Bytes read past the request head belong to the WebSocket frame stream.
     auto ws = std::make_unique<BaseWsStream>(std::move(stream), false);
-    const size_t pending_bytes = head->ReadAhead().size();
-    if (auto read_ahead = head->TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
+    const size_t pending_bytes = request->head.ReadAhead().size();
+    if (auto read_ahead = request->head.TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
         ws->SetPendingMultiBuffer(std::move(read_ahead));
     }
-    LOG_CONN_TRACE(conn_id,
-        "WebSocket server handshake accepted path='{}' host='{}' pending={}",
-        PublicHttpTargetForLog(expected_path),
-        PublicHttpTargetForLog(host),
-        pending_bytes);
-    LOG_CONN_DEBUG(conn_id, "WebSocket server handshake completed (path={})",
-                   PublicHttpTargetForLog(expected_path));
+    LOG_CONN_DEBUG(conn_id, "WebSocket server handshake completed (path={} pending={})",
+                   PublicHttpTargetForLog(EffectiveHttpPath(ws_cfg.path)),
+                   pending_bytes);
     co_return std::unique_ptr<AsyncStream>(std::move(ws));
 }
 

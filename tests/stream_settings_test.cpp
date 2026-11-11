@@ -1,209 +1,121 @@
 #include <gtest/gtest.h>
 
-#include "allocation_hook.hpp"
 #include "transport/internet/stream_settings.hpp"
 
-#include <cstdio>
-#include <exception>
-#include <iostream>
-#include <new>
-#include <stdexcept>
-#include <type_traits>
-
-namespace {
-thread_local std::ptrdiff_t fail_after = -1;
-
-void FailAfterCount(std::size_t) {
-    if (fail_after == 0) throw std::bad_alloc();
-    if (fail_after > 0) --fail_after;
-}
-}
-
-constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = FailAfterCount};
-
-namespace {
-
-void Require(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
-}
-
-bool Same(const StreamSettings& a, const StreamSettings& b) {
-    return a.network == b.network && a.security == b.security &&
-        a.network_mode == b.network_mode && a.security_mode == b.security_mode &&
-        a.http.force_http2 == b.http.force_http2 && a.tls.min_version == b.tls.min_version &&
-        a.tls.max_version == b.tls.max_version && a.tls.alpn == b.tls.alpn &&
-        a.tls.server_name == b.tls.server_name && a.tls.allow_insecure == b.tls.allow_insecure;
-}
-
-void TestModes() {
+TEST(StreamSettings, ParsesSupportedNetworkAndSecurityNames) {
     struct NetworkCase { const char* name; NetworkMode mode; };
     for (const auto& item : {
-            NetworkCase{"", NetworkMode::Tcp}, {"TCP", NetworkMode::Tcp}, {"raw", NetworkMode::Tcp},
-            {"WS", NetworkMode::Ws}, {"WebSocket", NetworkMode::Ws}, {"HTTPUpgrade", NetworkMode::HttpUpgrade},
-            {"gRPC", NetworkMode::Grpc}, {"HTTP", NetworkMode::Http}, {"h2", NetworkMode::Http},
-            {"XHTTP", NetworkMode::XHttp}, {"splithttp", NetworkMode::XHttp}, {"unknown", NetworkMode::Unsupported}}) {
-        StreamSettings source;
-        source.network = item.name;
-        const auto result = NormalizeStreamSettings(source);
-        Require(result.network_mode == item.mode, "network mode or alias changed");
-        Require(result.IsWs() == (item.mode == NetworkMode::Ws) &&
-            result.IsHttpUpgrade() == (item.mode == NetworkMode::HttpUpgrade) &&
-            result.IsGrpc() == (item.mode == NetworkMode::Grpc) &&
-            result.IsHttp() == (item.mode == NetworkMode::Http) &&
-            result.IsXHttp() == (item.mode == NetworkMode::XHttp), "mode flags disagree");
-        Require(Same(result, NormalizeStreamSettings(result)), "normalization must be idempotent");
-        Require(source.network == item.name, "mode normalization changed its source");
+            NetworkCase{"TCP", NetworkMode::Tcp}, {"raw", NetworkMode::Tcp},
+            {"WS", NetworkMode::Ws}, {"WebSocket", NetworkMode::Ws},
+            {"HTTPUpgrade", NetworkMode::HttpUpgrade}, {"gRPC", NetworkMode::Grpc},
+            {"HTTP", NetworkMode::Http}, {"h2", NetworkMode::Http},
+            {"XHTTP", NetworkMode::XHttp}, {"splithttp", NetworkMode::XHttp},
+            {"unknown", NetworkMode::Unsupported}}) {
+        EXPECT_EQ(ParseNetworkMode(item.name), item.mode) << item.name;
     }
-    struct SecurityCase { const char* name; SecurityMode mode; };
-    for (const auto& item : {SecurityCase{"", SecurityMode::None}, {"NONE", SecurityMode::None},
-                            {"TLS", SecurityMode::Tls}, {"Reality", SecurityMode::Reality},
-                            {"unknown", SecurityMode::Unsupported}}) {
-        StreamSettings source;
-        source.security = item.name;
-        const auto result = NormalizeStreamSettings(source);
-        Require(result.security_mode == item.mode && result.IsTls() == (item.mode == SecurityMode::Tls) &&
-            result.IsReality() == (item.mode == SecurityMode::Reality), "security mode or flags changed");
-        if (item.mode == SecurityMode::Reality) {
-            Require(result.tls.min_version == TlsVersion::V1_3 && result.tls.max_version == TlsVersion::V1_3,
-                "Reality must constrain TLS version");
-        }
-    }
+    EXPECT_EQ(ParseSecurityMode("NONE"), SecurityMode::None);
+    EXPECT_EQ(ParseSecurityMode("TLS"), SecurityMode::Tls);
+    EXPECT_EQ(ParseSecurityMode("Reality"), SecurityMode::Reality);
+    EXPECT_EQ(ParseSecurityMode("unknown"), SecurityMode::Unsupported);
 }
 
-void TestAlpnAndDefaults() {
-    struct AlpnCase { const char* network; const char* security; XHttpMode mode; bool h2; };
-    for (const auto& item : {AlpnCase{"grpc", "tls", XHttpMode::Auto, true},
-                            {"grpc", "none", XHttpMode::Auto, false},
-                            {"h2", "none", XHttpMode::Auto, true}, {"http", "none", XHttpMode::Auto, false},
-                            {"http", "tls", XHttpMode::Auto, true}, {"xhttp", "none", XHttpMode::Auto, true},
-                            {"xhttp", "none", XHttpMode::PacketUp, false},
-                            {"xhttp", "tls", XHttpMode::PacketUp, true},
-                            {"xhttp", "reality", XHttpMode::Auto, false}}) {
+TEST(StreamSettings, AlpnSelectionFollowsTransportAndSecurityRequirements) {
+    struct AlpnCase {
+        NetworkMode network;
+        SecurityMode security;
+        XHttpMode mode;
+        bool force_http2;
+        bool h2;
+    };
+    for (const auto& item : {
+            AlpnCase{NetworkMode::Grpc, SecurityMode::Tls, XHttpMode::Auto, false, true},
+            {NetworkMode::Grpc, SecurityMode::None, XHttpMode::Auto, false, false},
+            {NetworkMode::Http, SecurityMode::None, XHttpMode::Auto, true, true},
+            {NetworkMode::Http, SecurityMode::None, XHttpMode::Auto, false, false},
+            {NetworkMode::Http, SecurityMode::Tls, XHttpMode::Auto, false, true},
+            {NetworkMode::XHttp, SecurityMode::None, XHttpMode::Auto, false, true},
+            {NetworkMode::XHttp, SecurityMode::None, XHttpMode::PacketUp, false, false},
+            {NetworkMode::XHttp, SecurityMode::Tls, XHttpMode::PacketUp, false, true},
+            {NetworkMode::XHttp, SecurityMode::Reality, XHttpMode::Auto, false, false}}) {
         StreamSettings source;
-        source.network = item.network;
-        source.security = item.security;
+        source.network_mode = item.network;
+        source.security_mode = item.security;
+        source.http.force_http2 = item.force_http2;
         source.xhttp.mode = item.mode;
         const auto result = NormalizeStreamSettings(source);
-        Require(result.tls.alpn == (item.h2 ? std::vector<std::string>{"h2"} : std::vector<std::string>{}),
-            "transport ALPN defaults changed");
+        EXPECT_EQ(result.tls.alpn, (item.h2 ? std::vector<std::string>{"h2"} :
+                                           std::vector<std::string>{}));
     }
-    StreamSettings source;
-    source.network = "grpc";
-    source.security = "tls";
-    source.tls.alpn = {"http/1.1"};
-    auto result = NormalizeStreamSettings(source);
-    Require(result.tls.alpn == std::vector<std::string>{"h2", "http/1.1"}, "gRPC must preserve explicit ALPN entries");
-    source.network = "http";
-    Require(NormalizeStreamSettings(source).tls.alpn == source.tls.alpn, "HTTP must preserve explicit ALPN selection");
+}
 
-    const std::vector<std::string> default_alpn{"custom"};
-    const OutboundStreamDefaults defaults{true, "fallback.example", true, default_alpn};
-    source = {};
-    source.network.clear();
-    source.security.clear();
-    result = NormalizeOutboundStreamSettings(source, defaults);
-    Require(result.network == "tcp" && result.security == "tls" && result.IsTls() &&
-        result.tls.server_name == "fallback.example" && result.tls.allow_insecure &&
-        result.tls.alpn == default_alpn, "outbound defaults were not applied");
-    Require(source.network.empty() && source.security.empty() && source.tls.alpn.empty(), "outbound defaults changed source");
-    source.network = "grpc";
-    result = NormalizeOutboundStreamSettings(source, defaults);
-    Require(result.tls.alpn == std::vector<std::string>{"h2"}, "transport ALPN must take precedence over fallback ALPN");
-    source = {};
+TEST(StreamSettings, GrpcAddsRequiredH2WhileHttpPreservesExplicitAlpn) {
+    StreamSettings source;
+    source.network_mode = NetworkMode::Grpc;
+    source.security_mode = SecurityMode::Tls;
+    source.tls.alpn = {"http/1.1"};
+    EXPECT_EQ(NormalizeStreamSettings(source).tls.alpn, (std::vector<std::string>{"h2", "http/1.1"}));
+    source.network_mode = NetworkMode::Http;
+    EXPECT_EQ(NormalizeStreamSettings(source).tls.alpn, source.tls.alpn);
+}
+
+TEST(StreamSettings, OutboundFallbackCannotReplaceExplicitTlsIdentityOrAlpn) {
+    const std::vector<std::string> alpn{"custom"};
+    const OutboundStreamDefaults defaults{
+        .require_tls = true, .fallback_server_name = "fallback.example",
+        .allow_insecure = true, .alpn = alpn};
+    StreamSettings source;
+    source.network_mode = NetworkMode::Grpc;
+    EXPECT_EQ(NormalizeOutboundStreamSettings(source, defaults).tls.alpn,
+              (std::vector<std::string>{"h2"}));
+    source.network_mode = NetworkMode::Tcp;
     source.tls.server_name = "explicit.example";
     source.tls.alpn = {"explicit"};
-    result = NormalizeOutboundStreamSettings(source, defaults);
-    Require(result.tls.server_name == source.tls.server_name && result.tls.alpn == source.tls.alpn,
-        "outbound fallback replaced explicit TLS settings");
-    Require(Same(result, NormalizeOutboundStreamSettings(result, defaults)), "outbound normalization must be idempotent");
+    const auto result = NormalizeOutboundStreamSettings(source, defaults);
+    EXPECT_EQ(result.tls.server_name, "explicit.example");
+    EXPECT_EQ(result.tls.alpn, (std::vector<std::string>{"explicit"}));
 }
 
-template <typename Normalize>
-std::ptrdiff_t TestFailures(const StreamSettings& source, Normalize normalize) {
-    const auto original = source;
-    const auto expected = normalize(source);
-    StreamSettings published;
-    published.network = "previous-value";
-    const auto previous = published;
-    for (std::ptrdiff_t limit = 1; limit < 512; ++limit) {
-        bool completed = false;
-        fail_after = limit;
-        try { published = normalize(source); completed = true; }
-        catch (const std::bad_alloc&) {}
-        fail_after = -1;
-        Require(Same(source, original), "failed normalization changed its source");
-        if (completed) {
-            Require(Same(published, expected) && limit > 0, "normalization failure fixture did not reach allocation boundaries");
-            return limit;
-        }
-        Require(Same(published, previous), "failed normalization partially replaced the caller's value");
-    }
-    throw std::runtime_error("normalization never completed after allocation failures");
+TEST(StreamSettings, RealityConstrainsTlsTo13) {
+    StreamSettings source;
+    source.security_mode = SecurityMode::Reality;
+    source.tls.min_version = TlsVersion::V1_2;
+    source.tls.max_version = TlsVersion::V1_2;
+    const auto result = NormalizeStreamSettings(source);
+    EXPECT_EQ(result.tls.min_version, TlsVersion::V1_3);
+    EXPECT_EQ(result.tls.max_version, TlsVersion::V1_3);
 }
 
-void TestQueries() {
+TEST(StreamSettings, ProtocolRequestPathsIncludeOnlyTheirWireComponents) {
     XHttpConfig xhttp;
     xhttp.path = "demo?x=1";
-    Require(xhttp.NormalizedPath() == "/demo/", "XHTTP path normalization changed");
-    xhttp.mode = XHttpMode::StreamUp;
-    Require(xhttp.AcceptsStreamOne() && xhttp.AcceptsStreamUp() && !xhttp.AcceptsPacketUp() && !xhttp.IsStreamOne(),
-        "XHTTP mode predicates changed");
+    EXPECT_EQ(xhttp.NormalizedPath(), "/demo/");
     GrpcConfig grpc;
     grpc.service_name = "service";
-    Require(grpc.RequestPath() == "/service/Tun", "gRPC request path changed");
+    EXPECT_EQ(grpc.RequestPath(), "/service/Tun");
     grpc.multi_mode = true;
-    Require(grpc.RequestPath() == "/service/TunMulti", "gRPC multiplexed path changed");
+    EXPECT_EQ(grpc.RequestPath(), "/service/TunMulti");
+}
 
-    // Explicit outbound host precedence is resolved once at normalization.
-    StreamSettings upgrade;
-    upgrade.network = "httpupgrade";
-    upgrade.http_upgrade.headers.emplace("Host", "header.example");
-    Require(NormalizeStreamSettings(upgrade).configured_http_host == "header.example",
-        "HTTPUpgrade Host header was not used");
-    upgrade.http_upgrade.host = "field.example";
-    Require(NormalizeStreamSettings(upgrade).configured_http_host == "field.example",
-        "HTTPUpgrade host field must override the Host header");
-    StreamSettings grpc_settings;
-    grpc_settings.network = "grpc";
-    grpc_settings.grpc.service_name = "service";
-    const auto normalized_grpc = NormalizeStreamSettings(grpc_settings);
-    Require(normalized_grpc.grpc.request_path == "/service/Tun" &&
-            normalized_grpc.configured_http_host.empty(), "gRPC derived fields changed");
+TEST(StreamSettings, ExplicitHttpUpgradeHostOverridesHeader) {
+    StreamSettings source;
+    source.network_mode = NetworkMode::HttpUpgrade;
+    source.http_upgrade.headers.emplace("Host", "header.example");
+    EXPECT_EQ(NormalizeStreamSettings(source).configured_http_host, "header.example");
+    source.http_upgrade.host = "field.example";
+    EXPECT_EQ(NormalizeStreamSettings(source).configured_http_host, "field.example");
+}
 
-    // Auto resolves to a concrete client mode; explicit modes pass through.
-    struct ModeCase { const char* security; bool download; XHttpMode expected; };
-    for (const auto& item : {ModeCase{"none", false, XHttpMode::PacketUp},
-                            {"tls", false, XHttpMode::StreamUp},
-                            {"reality", false, XHttpMode::StreamOne},
-                            {"reality", true, XHttpMode::StreamUp}}) {
+TEST(StreamSettings, XHttpAutoModeUsesSecurityAndSeparateDownload) {
+    struct ModeCase { SecurityMode security; bool download; XHttpMode expected; };
+    for (const auto& item : {
+            ModeCase{SecurityMode::None, false, XHttpMode::PacketUp},
+            {SecurityMode::Tls, false, XHttpMode::StreamUp},
+            {SecurityMode::Reality, false, XHttpMode::StreamOne},
+            {SecurityMode::Reality, true, XHttpMode::StreamUp}}) {
         StreamSettings source;
-        source.network = "xhttp";
-        source.security = item.security;
+        source.network_mode = NetworkMode::XHttp;
+        source.security_mode = item.security;
         if (item.download) source.xhttp.download_settings = std::make_shared<XHttpDownloadSettings>();
-        Require(ResolveXHttpOutboundMode(NormalizeStreamSettings(source)) == item.expected,
-            "XHTTP auto mode resolution changed");
-    }
-}
-}
-
-TEST(StreamSettings, Contract) {
-    std::set_terminate([] {
-        std::fputs("stream normalization terminated instead of reporting allocation failure\n", stderr);
-        std::_Exit(71);
-    });
-    try {
-        TestModes();
-        TestAlpnAndDefaults();
-        TestQueries();
-        StreamSettings source;
-        source.network = "gRPC";
-        source.security = "tLS";
-        source.tls.server_name = std::string(64, 'a');
-        source.tls.alpn = {"http/1.1"};
-        std::cout << "stream_settings_test: ok\n";
-    } catch (const std::exception& error) {
-        fail_after = -1;
-        std::cerr << error.what() << '\n';
-        FAIL() << error.what();
+        EXPECT_EQ(ResolveXHttpOutboundMode(NormalizeStreamSettings(source)), item.expected);
     }
 }

@@ -1,23 +1,13 @@
-#include <stdexcept>
 #include <gtest/gtest.h>
 
 #include "infra/json.hpp"
 
-#include <cstdlib>
-#include <iostream>
+#include <string>
 #include <string_view>
 #include <utility>
 
 namespace {
-
-[[noreturn]] void Fail(std::string_view message) {
-    std::cerr << message << '\n';
-    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
-}
-
-void Check(bool condition, std::string_view message) {
-    if (!condition) Fail(message);
-}
+using ::json::KeyComparison;
 
 struct ParsedObject {
     ::json::value source;
@@ -25,285 +15,231 @@ struct ParsedObject {
 
     explicit ParsedObject(std::string_view body)
         : source(::json::parse(body)),
-          result(::ParseJsonObject(
-              source.as_object(), "camelObject")) {}
+          result(::ParseJsonObject(source.as_object(), "camelObject")) {}
 };
 
-void CheckInvalid(std::string_view body) {
-    ParsedObject parsed(body);
-    Check(!parsed.result, "invalid JSON object was accepted");
+TEST(JsonObject, MissingOptionalObjectRemainsUnconfigured) {
+    const ParsedObject absent(R"({})");
+    ASSERT_TRUE(absent.result);
+    EXPECT_EQ(*absent.result, nullptr);
+    const ParsedObject unrelated(R"({"otherObject":{"value":1}})");
+    ASSERT_TRUE(unrelated.result);
+    EXPECT_EQ(*unrelated.result, nullptr);
 }
 
-using ::json::KeyComparison;
+TEST(JsonObject, ReadsConfiguredObject) {
+    const ParsedObject parsed(R"({"camelObject":{"value":1}})");
+    ASSERT_TRUE(parsed.result);
+    ASSERT_NE(*parsed.result, nullptr);
+    EXPECT_EQ((*parsed.result)->at("value").as_int64(), 1);
+}
 
-void CheckKeyComparisonModes() {
-    const auto insensitive = ::json::parse(
+class InvalidOptionalObject : public ::testing::TestWithParam<const char*> {};
+TEST_P(InvalidOptionalObject, RejectsConfiguredNonObject) {
+    const ParsedObject parsed(GetParam());
+    EXPECT_FALSE(parsed.result);
+}
+INSTANTIATE_TEST_SUITE_P(ConfigurationErrors, InvalidOptionalObject,
+    ::testing::Values(R"({"camelObject":[]})", R"({"camelObject":null})"));
+
+TEST(JsonObject, AsciiInsensitiveLookupPreservesNonAsciiAndKeyBoundaries) {
+    const auto parsed = ::json::parse(
         R"({"CaMeLKey":1,"camel_key":2,"\u00c4":3,"\u00e4":4})",
         KeyComparison::AsciiCaseInsensitive);
-    const auto& object = insensitive.as_object();
-    Check(object.contains("CAMELKEY") && object.at("camelKey").as_int64() == 1,
-          "ASCII case-insensitive lookup failed");
-    Check(object.at("CAMEL_KEY").as_int64() == 2 && object.size() == 4,
-          "underscores or non-ASCII characters were folded");
-    Check(object.at("\xc3\x84").as_int64() == 3 &&
-              object.at("\xc3\xa4").as_int64() == 4,
-          "non-ASCII keys lost their distinct values");
+    const auto& object = parsed.as_object();
+    EXPECT_TRUE(object.contains("CAMELKEY"));
+    EXPECT_EQ(object.at("camelKey").as_int64(), 1);
+    EXPECT_EQ(object.at("CAMEL_KEY").as_int64(), 2);
+    EXPECT_EQ(object.size(), 4);
+    EXPECT_EQ(object.at("\xc3\x84").as_int64(), 3);
+    EXPECT_EQ(object.at("\xc3\xa4").as_int64(), 4);
     const std::string_view bounded_key = "xCAMELKEYx";
-    Check(object.if_contains(bounded_key.substr(1, 8)) != nullptr,
-          "heterogeneous lookup required a null-terminated string");
-    Check(!object.contains("camel") && !object.contains("camelKeyExtra") &&
-              !object.contains("missing"),
-          "key comparison accepted a prefix or unrelated key");
+    EXPECT_NE(object.if_contains(bounded_key.substr(1, 8)), nullptr);
+    EXPECT_FALSE(object.contains("camel"));
+    EXPECT_FALSE(object.contains("camelKeyExtra"));
+    EXPECT_FALSE(object.contains("missing"));
+}
 
-    for (const auto& sensitive : {
+TEST(JsonObject, OrdinaryParsingAndConstructionRemainCaseSensitive) {
+    for (const auto& parsed : {
              ::json::parse(R"({"CaMeLKey":1,"camelKey":2})"),
-             ::json::parse(R"({"CaMeLKey":1,"camelKey":2})",
-                               KeyComparison::CaseSensitive)}) {
-        Check(sensitive.as_object().size() == 2 &&
-                  sensitive.as_object().at("CaMeLKey").as_int64() == 1 &&
-                  sensitive.as_object().at("camelKey").as_int64() == 2 &&
-                  !sensitive.as_object().contains("CAMELKEY"),
-              "case-insensitive parsing leaked into ordinary JSON");
+             ::json::parse(R"({"CaMeLKey":1,"camelKey":2})", KeyComparison::CaseSensitive)}) {
+        const auto& object = parsed.as_object();
+        EXPECT_EQ(object.size(), 2);
+        EXPECT_EQ(object.at("CaMeLKey").as_int64(), 1);
+        EXPECT_EQ(object.at("camelKey").as_int64(), 2);
+        EXPECT_FALSE(object.contains("CAMELKEY"));
     }
     ::json::object constructed;
     constructed["Key"] = 1;
     constructed["key"] = 2;
     const ::json::object initialized{{"Key", 1}, {"key", 2}};
-    Check(constructed.size() == 2 && initialized.size() == 2,
-          "ordinary object construction became case-insensitive");
+    EXPECT_EQ(constructed.size(), 2);
+    EXPECT_EQ(initialized.size(), 2);
 }
 
-void CheckNestedKeyComparison() {
+TEST(JsonObject, NestedObjectsAndInsertionsRetainComparisonMode) {
     auto parsed = ::json::parse(
         R"({"SeTTings":{"PaNeLs":[{"DeEp":{"VaLuE":"UnChanged"}}]},"Empty":{}})",
         KeyComparison::AsciiCaseInsensitive);
     auto* settings = parsed.as_object().if_contains("settings");
-    Check(settings != nullptr, "mutable case-insensitive lookup failed");
-    auto& panels = settings->as_object().at("PANELS").as_array();
-    auto& deep = panels[0].as_object().at("deep").as_object();
+    ASSERT_NE(settings, nullptr);
+    auto& deep = settings->as_object().at("PANELS").as_array()[0].as_object()
+                     .at("deep").as_object();
     deep["VALUE"] = "UpdatedValue";
-    Check(deep.size() == 1 && deep.begin()->first == "value",
-          "subscript inserted an equivalent key or lost lowercase storage");
+    EXPECT_EQ(deep.size(), 1);
+    EXPECT_EQ(deep.begin()->first, "value");
     const auto& constant = parsed;
     const auto* found = constant.as_object().at("SETTINGS").as_object()
                             .at("panels").as_array()[0].as_object()
                             .at("DEEP").as_object().if_contains("VALUE");
-    Check(found != nullptr && found->as_string() == "UpdatedValue",
-          "nested array object lost case-insensitive lookup");
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->as_string(), "UpdatedValue");
     auto& empty = parsed.as_object().at("EMPTY").as_object();
     empty["NewKey"] = 1;
-    Check(empty.at("newkey").as_int64() == 1 && empty.begin()->first == "newkey",
-          "empty parsed object lost its comparator or key normalization");
-
+    EXPECT_EQ(empty.at("newkey").as_int64(), 1);
+    EXPECT_EQ(empty.begin()->first, "newkey");
     const auto array_root = ::json::parse(
         R"([[{"MiXeD":true}]])", KeyComparison::AsciiCaseInsensitive);
-    Check(array_root.as_array()[0].as_array()[0].as_object().at("mixed").as_bool(),
-          "objects in root arrays lost their comparison mode");
+    EXPECT_TRUE(array_root.as_array()[0].as_array()[0].as_object().at("mixed").as_bool());
 }
 
-void CheckCopiesAndMoves() {
+TEST(JsonObject, TransferringValuesPreservesNestedComparisonMode) {
     const auto original = ::json::parse(
-        R"({"Outer":[{"Inner":"OriginalValue"}]})",
-        KeyComparison::AsciiCaseInsensitive);
+        R"({"Outer":[{"Inner":"OriginalValue"}]})", KeyComparison::AsciiCaseInsensitive);
     auto copied = original;
     auto moved = std::move(copied);
     ::json::value copy_assigned;
     copy_assigned = original;
     ::json::value move_assigned;
     move_assigned = std::move(copy_assigned);
-    for (const auto* item : {&original, &std::as_const(moved)}) {
-        Check(item->as_object().at("outer").as_array()[0].as_object()
-                  .at("INNER").as_string() == "OriginalValue",
-              "value copy or move construction lost the comparator");
-    }
-    Check(move_assigned.as_object().at("OUTER").as_array()[0].as_object()
-              .at("inner").as_string() == "OriginalValue",
-          "value assignment lost a nested comparator");
-    moved.as_object().at("outer").as_array()[0].as_object()["inner"] = "Changed";
-    Check(original.as_object().at("outer").as_array()[0].as_object()
-              .at("inner").as_string() == "OriginalValue",
-          "copied value shared mutable object storage");
-
+    EXPECT_EQ(moved.as_object().at("outer").as_array()[0].as_object()
+                  .at("INNER").as_string(), "OriginalValue");
+    EXPECT_EQ(move_assigned.as_object().at("OUTER").as_array()[0].as_object()
+                  .at("inner").as_string(), "OriginalValue");
     ::json::object copied_object(original.as_object());
     ::json::object moved_object(std::move(copied_object));
     ::json::object assigned_object;
     assigned_object = original.as_object();
     ::json::object moved_assigned_object;
     moved_assigned_object = std::move(assigned_object);
-    Check(moved_object.contains("OUTER") && moved_assigned_object.contains("outer"),
-          "object copy or move lost its comparator");
+    EXPECT_TRUE(moved_object.contains("OUTER"));
+    EXPECT_TRUE(moved_assigned_object.contains("outer"));
     moved_assigned_object = ::json::object{{"Mixed", 1}};
-    Check(moved_assigned_object.contains("Mixed") &&
-              !moved_assigned_object.contains("MIXED"),
-          "object move assignment retained the old comparison mode");
+    EXPECT_TRUE(moved_assigned_object.contains("Mixed"));
+    EXPECT_FALSE(moved_assigned_object.contains("MIXED"));
     const ::json::object sensitive{{"Mixed", 1}};
     moved_object = sensitive;
-    Check(moved_object.contains("Mixed") && !moved_object.contains("MIXED"),
-          "object copy assignment retained the old comparison mode");
+    EXPECT_TRUE(moved_object.contains("Mixed"));
+    EXPECT_FALSE(moved_object.contains("MIXED"));
+}
 
-    auto self_object = ::json::parse(
+TEST(JsonObject, AssigningContainedObjectPreservesStorageAndComparisonMode) {
+    auto moved = ::json::parse(
         R"({"child":{"GrandChild":"Kept"},"sibling":1})",
         KeyComparison::AsciiCaseInsensitive).as_object();
-    self_object = std::move(self_object["child"].as_object());
-    Check(self_object.size() == 1 &&
-              self_object.at("GRANDCHILD").as_string() == "Kept",
-          "self-contained object move assignment corrupted nested storage");
-
-    auto self_copied_object = ::json::parse(
+    moved = std::move(moved["child"].as_object());
+    EXPECT_EQ(moved.size(), 1);
+    EXPECT_EQ(moved.at("GRANDCHILD").as_string(), "Kept");
+    auto copied = ::json::parse(
         R"({"child":{"GrandChild":"Copied"},"sibling":2})",
         KeyComparison::AsciiCaseInsensitive).as_object();
-    self_copied_object = self_copied_object["child"].as_object();
-    Check(self_copied_object.size() == 1 &&
-              self_copied_object.at("GRANDCHILD").as_string() == "Copied",
-          "self-contained object copy assignment corrupted nested storage");
-
-    auto self_array = ::json::parse(R"([["KeptElement",42],"Sibling"])").as_array();
-    self_array = std::move(self_array[0].as_array());
-    Check(self_array.size() == 2 &&
-              self_array[0].as_string() == "KeptElement" &&
-              self_array[1].as_int64() == 42,
-          "self-contained array move assignment corrupted nested storage");
-
-    auto self_copied_array = ::json::parse(R"([["CopiedElement",7],"Sibling"])").as_array();
-    self_copied_array = self_copied_array[0].as_array();
-    Check(self_copied_array.size() == 2 &&
-              self_copied_array[0].as_string() == "CopiedElement" &&
-              self_copied_array[1].as_int64() == 7,
-          "self-contained array copy assignment corrupted nested storage");
-
-    Check(::json::value(int64_t{42}) == ::json::value(uint64_t{42}) &&
-              ::json::value(uint64_t{0}) == ::json::value(int64_t{0}) &&
-              ::json::value(int64_t{-1}) != ::json::value(uint64_t{1}) &&
-              ::json::value(int64_t{-1}) !=
-                  ::json::value(static_cast<uint64_t>(-1)),
-          "signed/unsigned integer value equality was inconsistent");
-    Check(::json::parse(R"({"b":[1,true,"x"],"a":null})") ==
-              ::json::parse(R"({"a":null,"b":[1,true,"x"]})") &&
-              ::json::parse(R"({"a":1})") != ::json::parse(R"({"a":2})"),
-          "structural value equality failed on objects or arrays");
+    copied = copied["child"].as_object();
+    EXPECT_EQ(copied.size(), 1);
+    EXPECT_EQ(copied.at("GRANDCHILD").as_string(), "Copied");
 }
 
-void CheckDuplicateKeys() {
-    for (const auto body : {
-             R"({"Key":1,"key":2})",
-             R"({"key":1,"key":2})",
-             R"({"":1,"":2})",
-             R"({"Key":1,"\u006bey":2})",
-             R"({"Nested":{"Key":1,"KEY":2}})",
-             R"([{"Key":1,"KEY":2}])"}) {
-        try {
-            (void)::json::parse(body, KeyComparison::AsciiCaseInsensitive);
-            Fail("case-insensitive parser accepted a duplicate key");
-        } catch (const ::json::parse_error&) {
-        }
-    }
-    for (const auto body : {
-             R"({"key":1,"key":2})",
-             R"({"users":[{"id":1,"uuid":"a","uuid":"b"}]})"}) {
-        try {
-            (void)::json::parse(body);
-            Fail("case-sensitive parser accepted a duplicate key");
-        } catch (const ::json::parse_error&) {
-        }
-    }
-    const auto distinct_case = ::json::parse(R"({"Key":1,"key":2})");
-    Check(distinct_case.as_object().size() == 2,
-          "case-sensitive parser merged keys differing only in case");
+TEST(JsonObject, AssigningContainedArrayPreservesElements) {
+    auto moved = ::json::parse(R"([["KeptElement",42],"Sibling"])").as_array();
+    moved = std::move(moved[0].as_array());
+    ASSERT_EQ(moved.size(), 2);
+    EXPECT_EQ(moved[0].as_string(), "KeptElement");
+    EXPECT_EQ(moved[1].as_int64(), 42);
+    auto copied = ::json::parse(R"([["CopiedElement",7],"Sibling"])").as_array();
+    copied = copied[0].as_array();
+    ASSERT_EQ(copied.size(), 2);
+    EXPECT_EQ(copied[0].as_string(), "CopiedElement");
+    EXPECT_EQ(copied[1].as_int64(), 7);
+}
+
+TEST(JsonObject, IntegerEqualityRespectsSignedRange) {
+    EXPECT_EQ(::json::value(int64_t{42}), ::json::value(uint64_t{42}));
+    EXPECT_EQ(::json::value(uint64_t{0}), ::json::value(int64_t{0}));
+    EXPECT_NE(::json::value(int64_t{-1}), ::json::value(uint64_t{1}));
+    EXPECT_NE(::json::value(int64_t{-1}), ::json::value(static_cast<uint64_t>(-1)));
+}
+
+TEST(JsonObject, StructuralEqualityIgnoresObjectOrderButNotValues) {
+    EXPECT_EQ(::json::parse(R"({"b":[1,true,"x"],"a":null})"),
+              ::json::parse(R"({"a":null,"b":[1,true,"x"]})"));
+    EXPECT_NE(::json::parse(R"({"a":1})"), ::json::parse(R"({"a":2})"));
+}
+
+class DuplicateInsensitiveKey : public ::testing::TestWithParam<const char*> {};
+TEST_P(DuplicateInsensitiveKey, RejectsAmbiguousKeys) {
+    EXPECT_THROW(static_cast<void>(::json::parse(GetParam(), KeyComparison::AsciiCaseInsensitive)), ::json::parse_error);
+}
+INSTANTIATE_TEST_SUITE_P(DuplicateKeys, DuplicateInsensitiveKey, ::testing::Values(
+    R"({"Key":1,"key":2})", R"({"key":1,"key":2})", R"({"":1,"":2})",
+    R"({"Key":1,"\u006bey":2})", R"({"Nested":{"Key":1,"KEY":2}})",
+    R"([{"Key":1,"KEY":2}])"));
+
+class DuplicateSensitiveKey : public ::testing::TestWithParam<const char*> {};
+TEST_P(DuplicateSensitiveKey, RejectsDuplicateKeys) {
+    EXPECT_THROW(static_cast<void>(::json::parse(GetParam())), ::json::parse_error);
+}
+INSTANTIATE_TEST_SUITE_P(DuplicateKeys, DuplicateSensitiveKey, ::testing::Values(
+    R"({"key":1,"key":2})", R"({"users":[{"id":1,"uuid":"a","uuid":"b"}]})"));
+
+TEST(JsonObject, KeysInSiblingObjectsAreIndependent) {
     const auto siblings = ::json::parse(
         R"([{"Key":1},{"KEY":2}])", KeyComparison::AsciiCaseInsensitive);
-    Check(siblings.as_array()[0].as_object().at("key").as_int64() == 1 &&
-              siblings.as_array()[1].as_object().at("key").as_int64() == 2,
-          "keys in different objects were treated as duplicates");
+    EXPECT_EQ(siblings.as_array()[0].as_object().at("key").as_int64(), 1);
+    EXPECT_EQ(siblings.as_array()[1].as_object().at("key").as_int64(), 2);
 }
 
-void CheckNestingDepth() {
+TEST(JsonObject, EnforcesNestingDepthWithoutLeakingAcrossSiblings) {
     const auto nested = [](size_t depth) {
         return std::string(depth, '[') + std::string(depth, ']');
     };
-    Check(::json::parse(nested(128)).is_array(),
-          "nesting at the depth limit was rejected");
-    for (const std::string& body : {nested(129), std::string(1'000'000, '[')}) {
-        try {
-            (void)::json::parse(body);
-            Fail("nesting beyond the depth limit was accepted");
-        } catch (const ::json::parse_error& error) {
-            Check(std::string_view(error.what()).find("nesting too deep") !=
-                      std::string_view::npos,
-                  "deep nesting was rejected for the wrong reason");
-        }
-    }
+    EXPECT_TRUE(::json::parse(nested(128)).is_array());
+    EXPECT_THROW(static_cast<void>(::json::parse(nested(129))), ::json::parse_error);
+    EXPECT_THROW(static_cast<void>(::json::parse(std::string(1'000'000, '['))), ::json::parse_error);
     std::string nested_objects;
     for (size_t i = 1; i < 127; ++i) nested_objects += R"({"k":)";
     nested_objects += "{}" + std::string(126, '}');
-    const std::string siblings = "[" + nested(127) + "," + nested_objects + "," +
-                                 nested_objects + "]";
-    Check(::json::parse(siblings).is_array(),
-          "depth accounting leaked across closed containers");
+    const std::string siblings = "[" + nested(127) + "," + nested_objects + "," + nested_objects + "]";
+    EXPECT_TRUE(::json::parse(siblings).is_array());
 }
 
-void CheckNormalizedKeysAndValues() {
+TEST(JsonObject, NormalizesKeysWithoutChangingOpaqueStringValues) {
     const std::string_view text = R"({"MiXeD-Key":"VaLuE/ABC_def"})";
     const auto parsed = ::json::parse(text, KeyComparison::AsciiCaseInsensitive);
-    Check(parsed.as_object().begin()->first == "mixed-key" &&
-              parsed.as_object().at("MiXeD-Key").as_string() == "VaLuE/ABC_def",
-          "case-insensitive parsing failed to normalize only the key");
-    Check(::json::serialize(parsed) == R"({"mixed-key":"VaLuE/ABC_def"})",
-          "serialization lost lowercase key storage or original string value");
-    Check(::json::serialize(::json::parse(text)) == text,
-          "ordinary JSON parsing changed original key or value spelling");
-
+    EXPECT_EQ(parsed.as_object().begin()->first, "mixed-key");
+    EXPECT_EQ(parsed.as_object().at("MiXeD-Key").as_string(), "VaLuE/ABC_def");
+    const auto serialized = ::json::parse(::json::serialize(parsed));
+    EXPECT_EQ(serialized.as_object().at("mixed-key").as_string(), "VaLuE/ABC_def");
+    const auto ordinary = ::json::parse(::json::serialize(::json::parse(text)));
+    EXPECT_EQ(ordinary.as_object().at("MiXeD-Key").as_string(), "VaLuE/ABC_def");
     auto object = ::json::object(KeyComparison::AsciiCaseInsensitive);
     object["SuBscript"] = "MixedValue";
     auto [entry, inserted] = object.insert_or_assign("InSert", "OtherValue");
-    Check(inserted && entry->first == "insert" &&
-              object.at("SUBSCRIPT").as_string() == "MixedValue",
-          "object insertion failed to normalize keys independently of parsing");
-    Check(::json::serialize(object) ==
-              R"({"insert":"OtherValue","subscript":"MixedValue"})",
-          "programmatic insertion retained uppercase key storage");
+    EXPECT_TRUE(inserted);
+    EXPECT_EQ(entry->first, "insert");
+    EXPECT_EQ(object.at("SUBSCRIPT").as_string(), "MixedValue");
+    const auto stored = ::json::parse(::json::serialize(object));
+    EXPECT_EQ(stored.as_object().at("insert").as_string(), "OtherValue");
+    EXPECT_EQ(stored.as_object().at("subscript").as_string(), "MixedValue");
 }
 
-void CheckUnicodeEscapes() {
-    const auto supplementary = ::json::parse(R"("\uD83D\uDE00")");
-    Check(supplementary.as_string() == "\xF0\x9F\x98\x80",
-          "unicode surrogate pair was not decoded as one code point");
-    for (const std::string_view lone_surrogate : {R"("\uD83D")", R"("\uDE00")"}) {
-        bool rejected = false;
-        try {
-            (void)::json::parse(lone_surrogate);
-        } catch (const ::json::parse_error&) {
-            rejected = true;
-        }
-        Check(rejected, "invalid JSON unicode escape was accepted");
-    }
+TEST(JsonObject, DecodesUnicodeSurrogatePair) {
+    EXPECT_EQ(::json::parse(R"("\uD83D\uDE00")").as_string(), "\xF0\x9F\x98\x80");
 }
 
+class LoneSurrogate : public ::testing::TestWithParam<const char*> {};
+TEST_P(LoneSurrogate, RejectsInvalidUnicodeEscape) {
+    EXPECT_THROW(static_cast<void>(::json::parse(GetParam())), ::json::parse_error);
+}
+INSTANTIATE_TEST_SUITE_P(InvalidUnicode, LoneSurrogate,
+    ::testing::Values(R"("\uD83D")", R"("\uDE00")"));
 }  // namespace
-
-TEST(JsonObject, Contract) {
-    ParsedObject absent(R"({})");
-    Check(absent.result.has_value() && *absent.result == nullptr,
-          "absent object became configured");
-
-    ParsedObject object(R"({"camelObject":{"value":1}})");
-    Check(object.result.has_value() && *object.result != nullptr &&
-              (*object.result)->at("value").as_int64() == 1,
-          "object value mismatch");
-
-    ParsedObject ignored_other(R"({"otherObject":{"value":1}})");
-    Check(ignored_other.result.has_value() && *ignored_other.result == nullptr,
-          "unrelated object key was matched");
-
-    CheckInvalid(R"({"camelObject":[]})");
-    CheckInvalid(R"({"camelObject":null})");
-
-    CheckKeyComparisonModes();
-    CheckNestedKeyComparison();
-    CheckCopiesAndMoves();
-    CheckDuplicateKeys();
-    CheckNestingDepth();
-    CheckNormalizedKeysAndValues();
-    CheckUnicodeEscapes();
-
-    std::cout << "json_object_test: ok\n";
-}

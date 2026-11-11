@@ -8,6 +8,7 @@
 #include "app/session_group_executor.hpp"
 #include "common/allocator.hpp"
 #include "common/mux/mux_codec.hpp"
+#include "proxy/mux/mux_server.hpp"
 #include "common/session.hpp"
 #include "features/routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
@@ -45,7 +46,7 @@ public:
         : io_(io),
           coordinator_(std::make_shared<GroupCoordinator>(io)) {
         UserStore::ClearWorkerView();
-        coordinator_->RegisterWorker(0, io);
+        coordinator_->RegisterWorker(io);
     }
     ~DomainFixture() {
         Shutdown();
@@ -257,7 +258,7 @@ public:
 net::awaitable<RelayResult> RunMux(std::unique_ptr<AsyncStream> stream,
     routing::Dispatcher& dispatcher, const proxyman::inbound::ReceiverSettings& receiver,
     net::io_context& io, session::Context& context, StatsShard& stats, const TimeoutsConfig& timeouts) {
-    co_return co_await mux::ProcessInbound(io, {stream.get(), stream.get(), stream.get()},
+    co_return co_await proxy::ServeMuxInbound(io, {stream.get(), stream.get(), stream.get()},
         *stream, dispatcher, receiver.dispatch_policy, nullptr, context, stats, timeouts, 0);
 }
 
@@ -291,9 +292,9 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
     domain.InstallUsers(updates);
     std::weak_ptr<const UserStore::AnyTlsCredential> old_table =
         UserStore::FindAnyTlsUser("lifecycle", hash);
-    UserOnlineTracker validator;
+    UserOnlineTracker tracker;
     StatsShard stats;
-    proxy::anytls::inbound::Handler handler(validator, stats, {});
+    proxy::anytls::inbound::Handler handler(tracker, stats, {});
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
@@ -357,18 +358,12 @@ bool RunCase(int mode, bool baseline, bool blocked_writes = false, bool mux = fa
     Check(dispatcher.active == 0, "fixture must join remaining old children");
     if (!baseline) {
         Check(joined, "container parent must cancel and join every dynamic request");
-        Check(validator.OnlineDeviceCount("lifecycle", 1) == 0, "online lease must be released after join");
+        Check(tracker.OnlineDeviceCount("lifecycle", 1) == 0, "online lease must be released after join");
         if (mode == 0) {
-            if (mux) Check(!failure && returned_error == ErrorCode::CANCELLED, "Mux cancellation must be reported");
-            else {
-                Check(bool(failure), "parent cancellation must be reported");
-                try { std::rethrow_exception(failure); }
-                catch (const IoSystemError& error) { Check(error.code() == io_error::operation_aborted, "cancel error changed"); }
-            }
+            Check(!failure && returned_error == ErrorCode::CANCELLED, "parent cancellation must be classified");
         } else if (mode == 3) {
-            Check(bool(failure), "physical-read-allocation-failure must propagate the original exception");
-            try { std::rethrow_exception(failure); }
-            catch (const std::bad_alloc&) {}
+            Check(!failure && returned_error == ErrorCode::RESOURCE_EXHAUSTED,
+                  "physical read allocation failure must retain its classification");
         } else {
             const auto expected = mode == 1
                 ? (mux ? ErrorCode::PROTOCOL_DECODE_FAILED : ErrorCode::PROTOCOL_INVALID_COMMAND) : ErrorCode::OK;
@@ -423,9 +418,9 @@ void RunHandshakeCase(int mode, bool baseline = false) {
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"handshake", users}};
     domain.InstallUsers(updates);
-    UserOnlineTracker validator;
+    UserOnlineTracker tracker;
     StatsShard stats;
-    proxy::anytls::inbound::Handler handler(validator, stats, {});
+    proxy::anytls::inbound::Handler handler(tracker, stats, {});
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
@@ -533,9 +528,9 @@ void RunIdentityCase(int mode, bool baseline) {
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"identity", users}};
     domain.InstallUsers(updates);
-    UserOnlineTracker validator;
+    UserOnlineTracker tracker;
     StatsShard stats;
-    proxy::anytls::inbound::Handler handler(validator, stats, {});
+    proxy::anytls::inbound::Handler handler(tracker, stats, {});
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
@@ -673,9 +668,9 @@ void RunParsingCase(int mode) {
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"parsing", users}};
     execution.InstallUsers(updates);
-    UserOnlineTracker validator;
+    UserOnlineTracker tracker;
     StatsShard stats;
-    proxy::anytls::inbound::Handler handler(validator, stats, {});
+    proxy::anytls::inbound::Handler handler(tracker, stats, {});
     ParsingDispatcher dispatcher;
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
@@ -685,9 +680,14 @@ void RunParsingCase(int mode) {
     net::cancellation_signal cancellation;
     bool returned = false;
     std::exception_ptr failure;
+    ErrorCode result_error = ErrorCode::INTERNAL;
     net::co_spawn(execution.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
         receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
-        [&](std::exception_ptr error, RelayResult) { returned = true; failure = error; }));
+        [&](std::exception_ptr error, RelayResult result) {
+            returned = true;
+            failure = error;
+            result_error = result.error;
+        }));
     io.poll();
     Check(!returned && stream.pending_reads == 1, "logical parsing must leave the session reader alive");
     if (mode < 4) {
@@ -701,7 +701,8 @@ void RunParsingCase(int mode) {
     io.run_for(500ms);
     Check(returned && stream.destroyed && stream.pending_reads == 0 && stream.pending_writes == 0,
           "parsing tasks must join before transport destruction");
-    Check(mode != 8 || bool(failure), "pending parser must propagate parent cancellation");
+    Check(mode != 8 || (!failure && result_error == ErrorCode::CANCELLED),
+          "pending parser must report parent cancellation through the session result");
     std::cout << "parsing-" << names[mode] << " calls=" << dispatcher.calls
               << " bytes=" << dispatcher.bytes.size() << " joined=1\n";
 }
@@ -764,9 +765,9 @@ void RunQueueCase(int mode, bool baseline = false, uint32_t seed = 0) {
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"queue", users}};
     domain.InstallUsers(updates);
-    UserOnlineTracker validator;
+    UserOnlineTracker tracker;
     StatsShard stats;
-    proxy::anytls::inbound::Handler handler(validator, stats, {});
+    proxy::anytls::inbound::Handler handler(tracker, stats, {});
     QueueDispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};

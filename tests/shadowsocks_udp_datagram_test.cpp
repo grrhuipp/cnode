@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include "proxy/shadowsocks/ss_udp.hpp"
+#include "proxy/shadowsocks/ss_stream.hpp"
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -125,8 +126,7 @@ void CheckClassic(const TargetAddress& target,
     std::array<uint8_t, 12> nonce{};
     Check(ss::DeriveSubkey(key.data(), key.size, encoded.data(), cipher.salt_size,
                           subkey.data()), "reference subkey derivation failed");
-    ss::SsAeadCipher reference(cipher.type, subkey.data(), cipher.key_size,
-                               proxy::AeadDirection::Decrypt);
+    ss::SsAeadCipher reference(cipher.type, subkey.data(), cipher.key_size);
     const auto body = std::span<const uint8_t>(encoded).subspan(cipher.salt_size);
     std::vector<uint8_t> plaintext(body.size() - ss::SsAeadCipher::kTagSize);
     Check(reference.Decrypt(nonce.data(), body.data(), body.size(), plaintext.data()),
@@ -134,8 +134,7 @@ void CheckClassic(const TargetAddress& target,
     Check(std::equal(source.begin(), source.end(), plaintext.end() - source.size()),
           "reference AEAD plaintext mismatch");
     std::vector<uint8_t> reference_ciphertext(body.size());
-    ss::SsAeadCipher encoder(cipher.type, subkey.data(), cipher.key_size,
-                             proxy::AeadDirection::Encrypt);
+    ss::SsAeadCipher encoder(cipher.type, subkey.data(), cipher.key_size);
     Check(encoder.Encrypt(nonce.data(), plaintext.data(), plaintext.size(), reference_ciphertext.data()) &&
           std::equal(body.begin(), body.end(), reference_ciphertext.begin()),
           "AEAD ciphertext/tag differ from streaming EVP");
@@ -566,12 +565,12 @@ net::awaitable<std::unique_ptr<transport::MultiBufferWriter>> CreateTcpWriter(
         Check(request_salt.assign(key.span()), "TCP request salt fixture failed");
         auto result = ss::WriteTCPResponse(user, cipher, request_salt, stream);
         Check(bool(result), "public TCP response writer creation failed");
-        co_return std::make_unique<ss::ResponseBodyWriter>(std::move(*result));
+        co_return std::make_unique<ss::SsStreamWriter>(std::move(*result));
     }
     auto result = co_await ss::WriteTCPRequest(
         TargetAddress("1.1.1.1", 443), cipher, key, {}, stream);
     Check(bool(result), "public TCP request writer creation failed");
-    co_return std::make_unique<ss::RequestBodyWriter>(std::move(result->request_writer));
+    co_return std::make_unique<ss::SsStreamWriter>(std::move(result->request_writer));
 }
 
 void CheckTcpWriterFailure(const ss::SsCipherInfo& cipher, bool response, bool scatter,
@@ -649,7 +648,7 @@ void CheckTcpCancellationBeforeEncryption(const ss::SsCipherInfo& cipher, bool r
         const auto derive = ss::Is2022Cipher(cipher.type) ? ss::Derive2022Subkey : ss::DeriveSubkey;
         Check(derive(key.data(), key.size, stream.wire.data(), cipher.salt_size, subkey.data()),
               "retry decryption subkey derivation failed");
-        ss::SsAeadCipher decryptor(cipher.type, subkey.data(), cipher.key_size, proxy::AeadDirection::Decrypt);
+        ss::SsAeadCipher decryptor(cipher.type, subkey.data(), cipher.key_size);
         std::array<uint8_t, 12> nonce{};
         nonce[0] = response ? 2 : 4;
         Check(stream.wire.size() - wire.size() == 37, "retry did not publish one complete encrypted frame");

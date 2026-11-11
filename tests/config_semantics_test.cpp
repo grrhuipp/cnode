@@ -152,3 +152,55 @@ TEST(ConfigSemantics, Contract) {
     ASSERT_FALSE((!::ValidateOutboundSelectionSemantics(outbounds, {}, inbounds).Ok()));
 
 }
+
+TEST(ConfigSemantics, ConnectionIdleUsesCanonicalKeyAndRejectsMisspelling) {
+    const auto canonical = json::parse(
+        R"({"connIdle":17})", json::KeyComparison::AsciiCaseInsensitive);
+    EXPECT_EQ(TimeoutsConfig::FromJson(canonical.as_object()).IdleTimeout(),
+              std::chrono::seconds(17));
+    const auto misspelled = json::parse(
+        R"({"idle":17})", json::KeyComparison::AsciiCaseInsensitive);
+    EXPECT_THROW(TimeoutsConfig::FromJson(misspelled.as_object()), std::invalid_argument);
+}
+
+TEST(ConfigSemantics, UnknownNestedKeysCannotSilentlySelectDefaults) {
+    const auto config = [](std::string_view text) {
+        return json::parse(text, json::KeyComparison::AsciiCaseInsensitive).as_object();
+    };
+    EXPECT_FALSE(ParseConfig(config(R"({"worker":1})")));
+    EXPECT_FALSE(ParseConfig(config(R"({"timeouts":{"connIdel":17}})")));
+    EXPECT_THROW(DnsConfig::FromJson(config(R"({"cacheSzie":64})")), std::invalid_argument);
+    EXPECT_THROW(LimitsConfig::FromJson(config(R"({"ipBan":{"enable":true}})")),
+                 std::invalid_argument);
+    EXPECT_THROW(StaticInboundConfig::FromJson(config(
+        R"({"port":1080,"protocol":"vmess","settings":{"client":[]}})")),
+                 std::invalid_argument);
+    EXPECT_THROW(PanelConfig::FromJson(config(R"({"apiHots":"https://example.com"})")),
+                 std::invalid_argument);
+}
+
+TEST(ConfigSemantics, LogSeverityIsNormalizedBeforeRuntimeInitialization) {
+    const auto accepted = json::parse(
+        R"({"loglevel":"WARNING"})", json::KeyComparison::AsciiCaseInsensitive);
+    EXPECT_EQ(LogConfig::FromJson(accepted.as_object()).level, LogLevel::WARN);
+    const auto alias = json::parse(
+        R"({"loglevel":"warn"})", json::KeyComparison::AsciiCaseInsensitive);
+    EXPECT_THROW(LogConfig::FromJson(alias.as_object()), std::invalid_argument);
+}
+
+TEST(ConfigSemantics, DownloadEndpointKeysAreNotAcceptedAsOrdinaryStreamSettings) {
+    const auto ordinary = json::parse(
+        R"({"network":"xhttp","address":"example.com","port":443})",
+        json::KeyComparison::AsciiCaseInsensitive);
+    EXPECT_THROW((void)infra::ParseStreamSettings(ordinary.as_object(), StreamEndpointRole::Outbound),
+                 std::invalid_argument);
+    const auto split = json::parse(
+        R"({"network":"xhttp","xhttpSettings":{"mode":"stream-up","downloadSettings":{
+            "address":"example.com","port":443,"network":"xhttp",
+            "xhttpSettings":{"path":"/download","mode":"stream-up"}}}})",
+        json::KeyComparison::AsciiCaseInsensitive);
+    const auto settings = infra::ParseStreamSettings(split.as_object(), StreamEndpointRole::Outbound);
+    ASSERT_TRUE(settings.xhttp.download_settings);
+    EXPECT_TRUE(settings.xhttp.download_settings->stream_settings.IsXHttp());
+    EXPECT_EQ(settings.xhttp.download_settings->stream_settings.xhttp.normalized_path, "/download/");
+}

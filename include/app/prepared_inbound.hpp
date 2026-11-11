@@ -75,7 +75,7 @@ enum class InboundInstallFailure : uint8_t {
     Worker& worker, const PreparedInbound& inbound);
 
 // ============================================================================
-// User publication — shared by static startup and panel nodes.
+// 用户发布：静态启动与面板共用候选准备、提交及回滚凭据。
 // ============================================================================
 
 // Rollback credentials of one publication, allocated before any Worker can
@@ -85,12 +85,25 @@ struct UserPublicationRollback {
     std::vector<proxyman::inbound::UserStore::WorkerView> worker_views;
 };
 
-// Prepares one candidate and one rollback view per Worker, records the
-// rollback in `rollback`, installs the candidate on every Worker (joining every
-// started install), commits the candidate and clears `rollback`. A failure
-// leaves `rollback` set for RollbackUsers. Workers constructed after the commit
-// capture the committed snapshot themselves, so static startup publishes with
-// no Workers. `stopping` aborts before each Worker mutation and the commit.
+// 一次发布的候选与回滚凭据。全部在任何 Worker 变更与提交之前分配完成。
+struct PreparedUserPublication {
+    proxyman::inbound::UserStore::PublishedSnapshot candidate;
+    std::vector<proxyman::inbound::UserStore::WorkerView> candidate_views;
+    UserPublicationRollback rollback;
+    void Commit();
+};
+
+// 捕获当前已提交快照作为回滚点，并为候选与回滚各准备 `worker_count` 份 Worker
+// 视图；只分配，不改动 UserStore 或任何 Worker。静态启动在 Worker 构造前以
+// worker_count = 0 调用并经 Commit 提交候选，之后 Worker 捕获已提交快照；
+// 启动失败时由调用方重新提交 `rollback.previous`。
+[[nodiscard]] PreparedUserPublication PrepareUserPublication(
+    proxyman::inbound::UserStore::PublishedSnapshot candidate, size_t worker_count);
+
+// 面板节点：经 PrepareUserPublication 准备后把回滚凭据记入 `rollback`，在每个
+// Worker 安装候选视图（等待全部已启动的安装结束），提交候选并清空 `rollback`。
+// 失败时 `rollback` 保持待补偿状态，交给 RollbackUsers。`stopping` 在每次 Worker
+// 变更与提交前中止发布。
 net::awaitable<void> PublishUsers(
     net::any_io_executor executor,
     std::span<const std::unique_ptr<Worker>> workers,
@@ -104,5 +117,3 @@ net::awaitable<void> RollbackUsers(
     std::span<const std::unique_ptr<Worker>> workers,
     std::optional<UserPublicationRollback>& rollback,
     const bool& stopping);
-
-int RunFromCommandLine(int argc, char* argv[]);

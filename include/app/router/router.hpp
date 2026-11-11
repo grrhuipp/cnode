@@ -48,10 +48,6 @@ struct CompoundRoutingRule {
 private:
     static constexpr uint8_t kNetworkTcp = 1u << 0;
     static constexpr uint8_t kNetworkUdp = 1u << 1;
-    static constexpr uint8_t kProtocolTls = 1u << 0;
-    static constexpr uint8_t kProtocolHttp = 1u << 1;
-    static constexpr uint8_t kProtocolBittorrent = 1u << 2;
-    static constexpr uint8_t kProtocolQuic = 1u << 3;
 
     [[nodiscard]] bool MatchNetwork(const session::Context& ctx) const noexcept;
     [[nodiscard]] bool MatchProtocol(const session::Context& ctx) const;
@@ -60,7 +56,6 @@ private:
     [[nodiscard]] static bool MatchPortRanges(
         const std::vector<RoutingPortRange>& ranges,
         uint16_t port) noexcept;
-    [[nodiscard]] static constexpr uint8_t ProtocolBit(std::string_view protocol) noexcept;
 };
 
 }  // namespace detail

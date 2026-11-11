@@ -225,12 +225,8 @@ TEST_P(ProtocolDomainTest, VmessAuthenticatedRequestHeader) {
     const auto payload_key = vmess::RequestHeaderPayloadKey(users.user.cmd_key, auth_id, nonce);
     const std::array<uint8_t, 2> length{
         static_cast<uint8_t>(plain.size() >> 8), static_cast<uint8_t>(plain.size())};
-    ASSERT_TRUE(vmess::AES128GCMEncrypt(length_key.key.data(), length_key.nonce.data(),
-        auth_id.data(), auth_id.size(), length.data(), length.size(),
-        wire.data() + 16, wire.data() + 18));
-    ASSERT_TRUE(vmess::AES128GCMEncrypt(payload_key.key.data(), payload_key.nonce.data(),
-        auth_id.data(), auth_id.size(), plain.data(), plain.size(),
-        wire.data() + 42, wire.data() + 42 + plain.size()));
+    ASSERT_TRUE(proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {length_key.key.data(), 16}, {length_key.nonce.data(), 12}, {length.data(), length.size()}, {auth_id.data(), auth_id.size()}, wire.data() + 16, {wire.data() + 18, 16}));
+    ASSERT_TRUE(proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {payload_key.key.data(), 16}, {payload_key.nonce.data(), 12}, {plain.data(), plain.size()}, {auth_id.data(), auth_id.size()}, wire.data() + 42, {wire.data() + 42 + plain.size(), 16}));
     const size_t header_size = wire.size();
     wire.insert(wire.end(), kPayload.begin(), kPayload.end());
 

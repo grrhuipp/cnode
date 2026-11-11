@@ -6,6 +6,7 @@
 #include "features/routing/dispatcher.hpp"
 #include "features/routing/router.hpp"
 #include "infra/json.hpp"
+#include "infra/log.hpp"
 #include "transport/internet/inbound_listen.hpp"
 #include "transport/internet/proxy_protocol.hpp"
 #include "transport/internet/stream_settings.hpp"
@@ -22,6 +23,12 @@
 // ============================================================================
 // 资源限制配置
 // ============================================================================
+struct AuthFailureLimitConfig {
+    bool enabled = false;
+    uint32_t failure_limit = 10;
+    uint32_t window_seconds = 60;
+    uint32_t ban_seconds = 180;
+};
 struct LimitsConfig {
     uint32_t max_connections = defaults::kMaxConnections;
     uint32_t max_connections_per_ip = defaults::kMaxConnectionsPerIP;
@@ -133,7 +140,7 @@ struct RoutingConfig {
 // 日志配置
 // ============================================================================
 struct LogConfig {
-    std::string level = std::string(constants::logging::kDefaultLevel);  // none/trace/debug/info/warning(warn)/error
+    LogLevel level = LogLevel::INFO;
     std::filesystem::path log_dir = std::filesystem::path(constants::paths::kDefaultLogDir);
     std::filesystem::path access_path;
     std::filesystem::path error_path;

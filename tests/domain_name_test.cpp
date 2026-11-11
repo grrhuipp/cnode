@@ -2,51 +2,29 @@
 
 #include "common/domain_name.hpp"
 
-#include <cstdio>
 #include <string>
 
-namespace {
+using domain::DnsHostnamesEqual;
+using domain::IsValidDnsHostname;
+using domain::NormalizeDnsHostnameInPlace;
+using domain::TrailingDotPolicy;
 
-bool Require(bool condition, const char* message) {
-    if (!condition) std::fprintf(stderr, "%s\n", message);
-    return condition;
+TEST(DomainName, EnforcesLabelLengthAndHostCharacters) {
+    EXPECT_TRUE(IsValidDnsHostname("example.com", TrailingDotPolicy::Forbid));
+    EXPECT_TRUE(IsValidDnsHostname(std::string(63, 'a') + ".example", TrailingDotPolicy::Forbid));
+    EXPECT_FALSE(IsValidDnsHostname(std::string(64, 'a') + ".example", TrailingDotPolicy::Forbid));
+    EXPECT_FALSE(IsValidDnsHostname("bad-.example", TrailingDotPolicy::Forbid));
+    EXPECT_FALSE(IsValidDnsHostname("bad_name.example", TrailingDotPolicy::Forbid));
 }
 
-}  // namespace
+TEST(DomainName, AppliesExplicitTrailingRootPolicy) {
+    EXPECT_TRUE(IsValidDnsHostname("example.com.", TrailingDotPolicy::Allow));
+    EXPECT_FALSE(IsValidDnsHostname("example.com.", TrailingDotPolicy::Forbid));
+}
 
-TEST(DomainName, Contract) {
-    using ::domain::IsValidDnsHostname;
-    using ::domain::DnsHostnamesEqual;
-    using ::domain::NormalizeDnsHostnameInPlace;
-    using ::domain::TrailingDotPolicy;
-
-    ASSERT_FALSE((!Require(IsValidDnsHostname("example.com", TrailingDotPolicy::Forbid),
-                 "a canonical DNS hostname must be valid")));
-    ASSERT_FALSE((!Require(IsValidDnsHostname(
-                     std::string(63, 'a') + ".example",
-                     TrailingDotPolicy::Forbid),
-                 "a 63-octet DNS label must be valid")));
-    ASSERT_FALSE((!Require(!IsValidDnsHostname(
-                     std::string(64, 'a') + ".example",
-                     TrailingDotPolicy::Forbid),
-                 "a DNS label longer than 63 octets must be rejected")));
-    ASSERT_FALSE((!Require(IsValidDnsHostname(
-                     "example.com.", TrailingDotPolicy::Allow),
-                 "an allowed absolute DNS name must be valid")));
-    ASSERT_FALSE((!Require(!IsValidDnsHostname(
-                     "example.com.", TrailingDotPolicy::Forbid),
-                 "a forbidden trailing dot must be rejected")));
-    ASSERT_FALSE((!Require(!IsValidDnsHostname(
-                     "bad-.example", TrailingDotPolicy::Forbid),
-                 "a DNS label must not end with a hyphen")));
-    ASSERT_FALSE((!Require(!IsValidDnsHostname(
-                     "bad_name.example", TrailingDotPolicy::Forbid),
-                 "non-hostname DNS label bytes must be rejected")));
-
-    ASSERT_FALSE((!Require(DnsHostnamesEqual("Example.COM.", "example.com"),
-                 "DNS hostname equality must ignore case and the root dot")));
+TEST(DomainName, ComparisonAndStorageNormalizeCaseAndRootDot) {
+    EXPECT_TRUE(DnsHostnamesEqual("Example.COM.", "example.com"));
     std::string canonical = "Example.COM.";
     NormalizeDnsHostnameInPlace(canonical);
-    ASSERT_FALSE((!Require(canonical == "example.com",
-                 "DNS hostname storage must use one canonical form")));
+    EXPECT_EQ(canonical, "example.com");
 }

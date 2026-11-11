@@ -18,10 +18,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
-#include <optional>
-#include <algorithm>
 #include <cstddef>
-#include <limits>
 #include <utility>
 
 // ============================================================================
@@ -43,129 +40,29 @@ struct RelayResult : ResultStatus {
     bool close_side_known = false;
 };
 
-// Worker-local byte reservations. Initial credit is one second of traffic;
-// idle credit is capped at two seconds. Waiting cannot earn reserved bytes again.
-class TokenBucket {
-public:
-    using Clock = std::chrono::steady_clock;
-
-    explicit TokenBucket(uint64_t rate, Clock::time_point now = Clock::now()) noexcept
-        : rate_(rate), tokens_(rate), last_ms_(Millis(now)) {}
-
-    TokenBucket(const TokenBucket&) = delete;
-    TokenBucket& operator=(const TokenBucket&) = delete;
-
-    [[nodiscard]] std::chrono::milliseconds Consume(
-        size_t bytes, Clock::time_point now = Clock::now()) noexcept {
-        if (rate_ == 0 || bytes == 0) return std::chrono::milliseconds::zero();
-        const int64_t now_ms = Millis(now);
-        if (now_ms > last_ms_) {
-            Refill(static_cast<uint64_t>(now_ms) - static_cast<uint64_t>(last_ms_));
-            last_ms_ = now_ms;
-        }
-        if (tokens_ >= bytes) {
-            tokens_ -= bytes;
-            return DelayFrom(now_ms);
-        }
-
-        const uint64_t deficit = bytes - tokens_;
-        // Whole seconds plus a remainder in [1, rate] avoid deficit * 1000.
-        const uint64_t seconds = (deficit - 1) / rate_;
-        const uint64_t remainder = (deficit - 1) % rate_ + 1;
-        uint32_t low = 1, high = 1000;
-        while (low < high) {
-            const uint32_t mid = low + (high - low) / 2;
-            if (Credit(mid) >= remainder) high = mid;
-            else low = mid + 1;
-        }
-        tokens_ = Credit(low) - remainder;
-        fraction_ = ((rate_ % 1000) * low + fraction_) % 1000;
-
-        constexpr uint64_t maximum = std::numeric_limits<int64_t>::max();
-        const bool overflow = seconds > (maximum - low) / 1000;
-        const uint64_t wait = overflow
-            ? maximum : seconds * 1000 + low;
-        const uint64_t room = maximum - static_cast<uint64_t>(last_ms_);
-        if (overflow || wait > room) {
-            last_ms_ = std::numeric_limits<int64_t>::max();
-            tokens_ = fraction_ = 0;
-        } else {
-            last_ms_ += static_cast<int64_t>(wait);
-        }
-        return DelayFrom(now_ms);
-    }
-
-private:
-    static int64_t Millis(Clock::time_point now) noexcept {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-    }
-
-    // elapsed <= 1000: the result never exceeds rate_, even at UINT64_MAX.
-    uint64_t Credit(uint32_t elapsed) const noexcept {
-        return (rate_ / 1000) * elapsed + ((rate_ % 1000) * elapsed + fraction_) / 1000;
-    }
-
-    void Refill(uint64_t elapsed) noexcept {
-        constexpr uint64_t maximum = std::numeric_limits<uint64_t>::max();
-        const uint64_t capacity = rate_ > maximum / 2 ? maximum : rate_ * 2;
-        if (elapsed >= 2000) {
-            tokens_ = capacity;
-            fraction_ = 0;
-            return;
-        }
-        if (elapsed >= 1000) {
-            if (rate_ >= capacity - tokens_) {
-                tokens_ = capacity;
-                fraction_ = 0;
-                return;
-            }
-            tokens_ += rate_;
-            elapsed -= 1000;
-        }
-        const uint64_t credit = Credit(static_cast<uint32_t>(elapsed));
-        if (credit >= capacity - tokens_) {
-            tokens_ = capacity;
-            fraction_ = 0;
-        } else {
-            tokens_ += credit;
-            fraction_ = ((rate_ % 1000) * elapsed + fraction_) % 1000;
-        }
-    }
-
-    std::chrono::milliseconds DelayFrom(int64_t now) const noexcept {
-        if (last_ms_ <= now) return std::chrono::milliseconds::zero();
-        const uint64_t delay = static_cast<uint64_t>(last_ms_) - static_cast<uint64_t>(now);
-        return std::chrono::milliseconds{static_cast<int64_t>(std::min<uint64_t>(
-            delay, std::numeric_limits<int64_t>::max()))};
-    }
-
-    uint64_t rate_;
-    uint64_t tokens_;
-    uint64_t fraction_ = 0; // Thousandths of one byte, not yet spendable.
-    int64_t last_ms_;      // Includes credit reserved in future waits.
-};
-
 namespace relay_detail {
 
 inline constexpr uint64_t kRelayStatsFlushBytes = 64 * 1024;
 inline constexpr auto kRelayCloseGraceTimeout = std::chrono::seconds(1);
 
-// All state and subscriptions live until both directions and the watchdog join.
-// Allocated only for speed-limited relays so unlimited frames do not carry it.
-struct RelayRateLimits {
-    TokenBucket up;
-    TokenBucket down;
-    AsyncDelay up_wait;
-    AsyncDelay down_wait;
-
-    RelayRateLimits(net::io_context& io, uint64_t rate)
-        : up(rate), down(rate), up_wait(io), down_wait(io) {}
-
-    void Cancel() noexcept {
-        up_wait.Cancel();
-        down_wait.Cancel();
-    }
+// 两个方向的令牌桶与等待事件；只为限速转发分配，不限速的转发帧不携带它。
+// 全部状态与订阅存活到两个方向和看门狗汇合之后。定义见 src/app/relay.cpp。
+struct RelayRateLimits;
+struct RelayRateLimitsDelete {
+    void operator()(RelayRateLimits* limits) const noexcept;
 };
+using RelayRateLimitsPtr = std::unique_ptr<RelayRateLimits, RelayRateLimitsDelete>;
+
+// rate 为 0（不限速）时返回空指针。
+RelayRateLimitsPtr AllocateRelayRateLimits(net::io_context& io, uint64_t rate);
+void CancelRelayRateWaits(RelayRateLimits& limits) noexcept;
+// 预留本方向的字节额度并返回需要等待的时长；为零时调用方不得发起等待，
+// 预算内的包不承担等待协程。
+[[nodiscard]] std::chrono::milliseconds ReserveRelayBytes(
+    RelayRateLimits& limits, bool upload, size_t bytes) noexcept;
+// 每个方向同一时刻至多一个等待；取消经 CancelRelayRateWaits 投递。
+[[nodiscard]] net::awaitable<void> WaitRelayRate(
+    RelayRateLimits& limits, bool upload, std::chrono::milliseconds delay);
 
 template <typename Endpoint>
 void CloseIfSupported(Endpoint& endpoint) noexcept {
@@ -233,11 +130,7 @@ bool WriteShutdownClosesLink(const Writer& writer) noexcept {
     else return false;
 }
 
-inline void FlushRelayStats(StatsShard& stats, LocalStatsAccumulator& acc) {
-    if (acc.bytes_in == 0 && acc.bytes_out == 0) return;
-    stats.CommitAccumulator(acc);
-    acc.Reset();
-}
+void FlushRelayStats(StatsShard& stats, LocalStatsAccumulator& acc);
 
 template <typename Control>
 bool ConsumeTimeoutSignals(Control& control) {
@@ -256,26 +149,11 @@ struct RelayDirectionState {
 };
 
 struct RelayState {
-    explicit RelayState(net::io_context& io)
-        : wake(net::any_io_executor(io.get_executor()), 1) {}
+    explicit RelayState(net::io_context& io);
 
-    void Mark(bool client_side) noexcept {
-        if (!close_side_known && !local_failure) {
-            close_side_known = true;
-            client_closed_first = client_side;
-        }
-    }
-    void Stop(ErrorCode error) noexcept {
-        if (reason == ErrorCode::OK || (reason == ErrorCode::CANCELLED && error != ErrorCode::CANCELLED))
-            reason = error;
-        phase = RelayPhase::Stopping;
-        wake.close();
-    }
-    void Complete() noexcept {
-        if (reason != ErrorCode::OK) return;
-        phase = RelayPhase::Completing;
-        wake.close();
-    }
+    void Mark(bool client_side) noexcept;
+    void Stop(ErrorCode error) noexcept;
+    void Complete() noexcept;
     bool Ending() const noexcept {
         return phase == RelayPhase::Completing || phase == RelayPhase::Stopping;
     }
@@ -295,12 +173,12 @@ struct RelayState {
 // A null client control denotes split/logical input. It changes only the
 // available transport controls, never EOF, error, accounting or join semantics.
 // The reader cancellation source and the joined watchdog cover this case too.
-template <typename ClientReader, typename ClientWriter, typename ClientControl, typename TargetEndpoint>
+template <typename TargetEndpoint>
 net::awaitable<RelayResult> DoRelayLink(
     net::io_context& io_context,
-    ClientReader& client_reader,
-    ClientWriter& client_writer,
-    ClientControl* client_control,
+    transport::MultiBufferReader& client_reader,
+    transport::MultiBufferWriter& client_writer,
+    AsyncStream* client_control,
     TargetEndpoint& target,
     session::Context& ctx,
     StatsShard& stats,
@@ -310,11 +188,7 @@ net::awaitable<RelayResult> DoRelayLink(
     using namespace net::experimental::awaitable_operators;
     using relay_detail::RelayPhase;
     relay_detail::RelayState state(io_context);
-    std::unique_ptr<relay_detail::RelayRateLimits> limits;
-    if (config.speed_limit != 0) {
-        limits = std::make_unique<relay_detail::RelayRateLimits>(
-            io_context, config.speed_limit);
-    }
+    const auto limits = relay_detail::AllocateRelayRateLimits(io_context, config.speed_limit);
     ctx.traffic.bytes_up = ctx.traffic.bytes_down = 0;
     const auto parent_cancellation = co_await net::this_coro::cancellation_state;
 
@@ -327,7 +201,7 @@ net::awaitable<RelayResult> DoRelayLink(
                 owner.Stop(cancellation.reason);
             }
         };
-        ClientControl* client;
+        AsyncStream* client;
         TargetEndpoint& target;
         relay_detail::RelayState& state;
         relay_detail::RelayRateLimits* limits;
@@ -335,7 +209,7 @@ net::awaitable<RelayResult> DoRelayLink(
         Subscription client_cancel{*this};
         Subscription target_cancel{*this};
 
-        CancellationContext(ClientControl* client, TargetEndpoint& target,
+        CancellationContext(AsyncStream* client, TargetEndpoint& target,
                             relay_detail::RelayState& state, relay_detail::RelayRateLimits* limits)
             : client(client), target(target), state(state), limits(limits) {}
 
@@ -349,7 +223,7 @@ net::awaitable<RelayResult> DoRelayLink(
             notifying = true;
             if (ConsumeTimeout()) reason = ErrorCode::RELAY_TIMEOUT;
             state.Stop(reason);
-            if (limits) limits->Cancel();
+            if (limits) relay_detail::CancelRelayRateWaits(*limits);
             if (client) relay_detail::CancelIfSupported(*client);
             relay_detail::CancelIfSupported(target);
             notifying = false;
@@ -421,12 +295,10 @@ net::awaitable<RelayResult> DoRelayLink(
                 }
                 const auto count = payload.byte_size();
                 if (limits) {
-                    auto& bucket = upload ? limits->up : limits->down;
-                    auto& wait = upload ? limits->up_wait : limits->down_wait;
                     // An under-budget packet must not pay for a wait coroutine.
-                    if (const auto delay = bucket.Consume(count);
+                    if (const auto delay = relay_detail::ReserveRelayBytes(*limits, upload, count);
                         delay > std::chrono::milliseconds::zero()) {
-                        co_await wait.WaitFor(delay);
+                        co_await relay_detail::WaitRelayRate(*limits, upload, delay);
                     }
                 }
                 if (state.Ending()) break;

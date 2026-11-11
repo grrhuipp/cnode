@@ -2,7 +2,8 @@
 #include <gtest/gtest.h>
 
 #include "app/worker/udp_ingress.hpp"
-#include "proxy/shadowsocks/ss_udp.hpp"
+#include "udp_ingress_fixture.hpp"
+#include "proxy/shadowsocks/ss_inbound.hpp"
 #include "app/relay.hpp"
 
 #include "app/proxyman/inbound/handler.hpp"
@@ -156,15 +157,6 @@ public:
     bool stop_reentered = false;
 };
 
-class ReplySink final : public ::worker_detail::UdpReplySink {
-public:
-    bool EnqueueUdpReply(::worker_detail::UdpIngress&, std::string_view,
-                         const std::shared_ptr<::udp::socket>&,
-                         ::udp::endpoint, ::buf::MultiBuffer,
-                         uint32_t) override {
-        return true;
-    }
-};
 
 ::net::awaitable<void> ObserveJoin(Ingress& ingress, bool& returned) {
     co_await ingress.AsyncJoin();
@@ -197,7 +189,7 @@ public:
         .dispatch_policy = {
             .sniffing = {},
             .outbound = ::routing::ForceOutbound{"loopback"}}};
-    receiver.stream_settings.security = "tls";
+    receiver.stream_settings.security_mode = ::SecurityMode::Tls;
     return receiver;
 }
 
@@ -205,6 +197,7 @@ public:
 void VerifySocketIdentityRecycle(
     ::net::io_context& io, Reclaimer& reclaimer) {
     io.restart();
+    UdpSocketFixtures sockets(io);
     ::worker_detail::UdpResourceBudget budget({
         .associations = 2, .datagrams = 8, .payload_capacity = 64 * 1024});
     Ingress ingress("native-reuse", std::make_unique<NativeInbound>(), reclaimer, budget, io);
@@ -214,26 +207,23 @@ void VerifySocketIdentityRecycle(
     old_socket->open(::udp::v4(), ec);
     if (ec) Fail("failed to open old socket identity test socket");
     old_socket->bind({::net::ip::address_v4::loopback(), 0}, ec);
-    if (ec || !ingress.AttachSocket("identity-socket", old_socket))
+    if (ec || !sockets.Attach(ingress, "identity-socket", old_socket))
         Fail("failed to attach old socket identity");
     GateDispatcher dispatcher(io);
     ::StatsShard stats;
     ::TimeoutsConfig timeouts;
-    ReplySink reply_sink;
     auto receiver = MakeReceiver();
     const ::app::DatagramSessionEnvironment environment{
         .timeouts = timeouts, .dispatcher = &dispatcher, .stats = &stats};
     constexpr std::array<uint8_t, 1> packet{0x62};
     auto process = [&](const Ingress::SocketPtr& current) {
         ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
-            .socket_key = "identity-socket",
-            .sock = current.get(),
+            .socket = sockets.Find(ingress, current.get()).get(),
             .client_endpoint = {::net::ip::address_v4::loopback(), 47123},
             .payload = packet,
             .receiver = &receiver,
             .io_context = io,
             .worker_id = 6,
-            .reply_sink = reply_sink,
             .environment = environment,
         });
     };
@@ -249,18 +239,18 @@ void VerifySocketIdentityRecycle(
     auto* const old_session = dispatcher.sessions[0];
     if (!old_session || ingress.GetResourceStats().associations != 1)
         Fail("old socket session was not created");
-    ingress.CloseSocket("identity-socket");
+    ingress.CloseSocket(*sockets.Get(ingress, "identity-socket"));
 
     auto replacement_socket = Ingress::MakeSocket(io);
     replacement_socket->open(::udp::v4(), ec);
     if (ec) Fail("failed to open replacement socket identity");
     replacement_socket->bind({::net::ip::address_v4::loopback(), 0}, ec);
-    if (ec || !ingress.AttachSocket("identity-socket", replacement_socket))
+    if (ec || !sockets.Attach(ingress, "identity-socket", replacement_socket))
         Fail("failed to attach replacement socket identity");
     process(old_socket);
     if (ingress.GetResourceStats().associations != 0 ||
         ingress.GetResourceStats().native_dispatches != 1 ||
-        !ingress.OwnsSocket("identity-socket", replacement_socket.get()))
+        !sockets.Owns(ingress, "identity-socket", replacement_socket.get()))
         Fail("stale socket datagram crossed into its replacement identity");
     process(replacement_socket);
     io.poll();
@@ -272,7 +262,7 @@ void VerifySocketIdentityRecycle(
         ingress.GetResourceStats().native_dispatches != 2)
         Fail("replacement socket did not create an independent native job");
     const auto create_other = [&] {
-        return other.CreateClientSession("other-socket", client_key, io,
+        return other.CreateClientSession(sockets.Get(other, "other-socket"), client_key, io,
             {},
             {::net::ip::address_v4::loopback(), 47124}, owner,
             std::chrono::steady_clock::now(), 0s);
@@ -286,7 +276,7 @@ void VerifySocketIdentityRecycle(
     dispatcher.gate.cancel();
     io.run();
     if (!joined || ingress.GetResourceStats().native_dispatches != 0 ||
-        !ingress.OwnsSocket("identity-socket", replacement_socket.get()) ||
+        !sockets.Owns(ingress, "identity-socket", replacement_socket.get()) ||
         !replacement_socket->is_open())
         Fail("old job completion damaged the replacement socket identity");
     auto recovered = create_other();
@@ -300,6 +290,7 @@ void VerifySocketIdentityRecycle(
 
 void VerifyUplinkRefresh(::net::io_context& io, Reclaimer& reclaimer) {
     io.restart();
+    UdpSocketFixtures sockets(io);
     ::worker_detail::UdpResourceBudget budget;
     Ingress ingress("native-refresh", std::make_unique<NativeInbound>(), reclaimer, budget, io);
     auto socket = Ingress::MakeSocket(io);
@@ -307,28 +298,25 @@ void VerifyUplinkRefresh(::net::io_context& io, Reclaimer& reclaimer) {
     socket->open(::udp::v4(), ec);
     if (ec) Fail("failed to open UDP refresh test socket");
     socket->bind({::net::ip::address_v4::loopback(), 0}, ec);
-    if (ec || !ingress.AttachSocket("refresh-socket", socket))
+    if (ec || !sockets.Attach(ingress, "refresh-socket", socket))
         Fail("failed to attach UDP refresh test socket");
 
     GateDispatcher dispatcher(io);
     ::StatsShard stats;
     ::TimeoutsConfig timeouts;
     timeouts.idle = 1;
-    ReplySink reply_sink;
     auto receiver = MakeReceiver();
     const ::app::DatagramSessionEnvironment environment{
         .timeouts = timeouts, .dispatcher = &dispatcher, .stats = &stats};
     constexpr std::array<uint8_t, 1> packet{0x62};
     auto process_packet = [&]() {
         ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
-            .socket_key = "refresh-socket",
-            .sock = socket.get(),
+            .socket = sockets.Find(ingress, socket.get()).get(),
             .client_endpoint = {::net::ip::address_v4::loopback(), 45123},
             .payload = packet,
             .receiver = &receiver,
             .io_context = io,
             .worker_id = 4,
-            .reply_sink = reply_sink,
             .environment = environment,
         });
     };
@@ -465,14 +453,15 @@ void VerifyHandoffDirectoryNamespaces() {
     const auto& policy = ::ss::Ss2022UdpAssociation::Policy();
     auto configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
     auto other_configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
+    UdpSocketState listener_state, other_listener_state;
     ::InboundDatagramOwner owner;
     std::array<uint8_t, 32> credential{};
     for (size_t i = 0; i < credential.size(); ++i)
         credential[i] = static_cast<uint8_t>(i + 1);
     if (!owner.Assign(credential)) Fail("failed to prepare directory credential");
     UdpHandoffIdentity key{
-        .listener = "listener", .tag = "inbound", .configuration = configuration.get(),
-        .client = ClientSessionKey{owner, 0x00123456789abcdeULL}};
+        .socket = &listener_state,
+        .client = ClientSessionKey{owner, 0x00123456789abcdeULL, {}, configuration.get()}};
     const ::udp::endpoint endpoint{::net::ip::address_v4::loopback(), 48234};
     auto record = directory.Claim(key, configuration, policy);
     if (!record || !record->association->claimed ||
@@ -511,18 +500,16 @@ void VerifyHandoffDirectoryNamespaces() {
     session.client.session_id = *key.client.session_id + 1;
     expect_isolated(session, configuration);
     auto listener = key;
-    listener.listener += "-other";
+    listener.socket = &other_listener_state;
     expect_isolated(listener, configuration);
-    auto tag = key;
-    tag.tag += "-other";
-    expect_isolated(tag, configuration);
     auto settings = key;
-    settings.configuration = other_configuration.get();
+    settings.client.configuration = other_configuration.get();
     expect_isolated(settings, other_configuration);
 }
 
 void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer) {
     using namespace ::worker_detail;
+    UdpSocketFixtures sockets(io);
     UdpHandoffDirectory directory;
     const auto& policy = ::ss::Ss2022UdpAssociation::Policy();
     auto configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
@@ -531,21 +518,21 @@ void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer
     constexpr std::array<uint8_t, 32> credential{0x71};
     if (!owner.Assign(credential)) Fail("failed to prepare tombstone credential");
     UdpHandoffIdentity key{
-        .listener = "closed-listener", .tag = "closed-inbound",
-        .configuration = configuration.get(), .client = ClientSessionKey{owner, 9}};
+        .socket = nullptr, .client = ClientSessionKey{owner, 9, {}, configuration.get()}};
     UdpResourceBudget budget;
     const ::udp::endpoint endpoint{::net::ip::address_v4::loopback(), 48234};
     Ingress ingress("directory-tombstone", std::make_unique<NativeInbound>(),
                     reclaimer, budget, io);
+    auto socket = sockets.Get(ingress, "closed-listener");
+    key.socket = socket.get();
     auto record = directory.Claim(key, configuration, policy);
-    auto session = ingress.CreateClientSession(
-        key.listener, key.client, io, {},
-        {::net::ip::address_v4::loopback(), 48234},
-        owner, std::chrono::steady_clock::now(), 0s, record);
+    auto session = ingress.CreateClientSession(socket, key.client, io, {},
+    {::net::ip::address_v4::loopback(), 48234},
+    owner, std::chrono::steady_clock::now(), 0s, record);
     if (!session || !record || !record->association->Check(31, 0, endpoint, ::InboundDatagramCheck::Commit))
         Fail("failed to prepare live directory association");
     record->association->claimed = false;
-    ingress.CleanupClientSessions(key.listener);
+    ingress.CleanupClientSessions(*socket);
     if (!session->Closed() || record->session.expired())
         Fail("closed association did not retain its outstanding session owner");
     session.reset();
@@ -555,18 +542,16 @@ void VerifyHandoffDirectoryTombstone(::net::io_context& io, Reclaimer& reclaimer
     if (record->session.owner_before(empty_session) ||
         empty_session.owner_before(record->session))
         Fail("replay tombstone retained the closed session allocation");
-    auto previous = ingress.CreateClientSession(
-        key.listener, key.client, io, {}, endpoint, owner,
-        std::chrono::steady_clock::now(), 0s, record);
-    auto replacement = ingress.CreateClientSession(
-        key.listener, key.client, io, {}, endpoint, owner,
-        std::chrono::steady_clock::now(), 0s, record);
+    auto previous = ingress.CreateClientSession(socket, key.client, io, {}, endpoint, owner,
+    std::chrono::steady_clock::now(), 0s, record);
+    auto replacement = ingress.CreateClientSession(socket, key.client, io, {}, endpoint, owner,
+    std::chrono::steady_clock::now(), 0s, record);
     if (!previous || !replacement || !previous->Closed())
         Fail("failed to replace a retained session owner");
     previous.reset();
     if (record->session.lock() != replacement)
         Fail("old session destruction detached its live replacement");
-    ingress.CleanupClientSessions(key.listener);
+    ingress.CleanupClientSessions(*socket);
     replacement.reset();
     if (record->session.owner_before(empty_session) ||
         empty_session.owner_before(record->session))
@@ -594,8 +579,7 @@ void VerifyHandoffDirectoryCapacity() {
     constexpr std::array<uint8_t, 32> credential{0x63};
     if (!owner.Assign(credential)) Fail("failed to prepare capacity credential");
     UdpHandoffIdentity key{
-        .listener = "capacity-listener", .tag = "capacity-inbound",
-        .configuration = configuration.get(), .client = ClientSessionKey{owner, 0}};
+        .socket = nullptr, .client = ClientSessionKey{owner, 0, {}, configuration.get()}};
     const ::udp::endpoint endpoint{::net::ip::address_v4::loopback(), 48234};
     std::shared_ptr<UdpHandoffRecord> first;
     for (size_t i = 0; i < ::ss::Ss2022UdpReplayCache::kMaxSessions; ++i) {
@@ -621,7 +605,9 @@ void VerifyHandoffDirectoryCapacity() {
     if (directory.Claim(key, configuration, policy))
         Fail("directory reclaimed a still-claimed expired tombstone");
     first->association->claimed = false;
-    auto replacement = directory.Claim(key, configuration, policy);
+    std::shared_ptr<UdpHandoffRecord> replacement;
+    for (size_t attempts = 0; !replacement && attempts <= policy.capacity / 64; ++attempts)
+        replacement = directory.Claim(key, configuration, policy);
     if (!replacement || replacement == first || !replacement->association->Check(11, 0, endpoint, ::InboundDatagramCheck::Commit))
         Fail("directory did not reclaim an expired unclaimed tombstone");
     replacement->association->claimed = false;
@@ -663,10 +649,7 @@ struct SessionAllocationCounter {
 
 TEST(UdpNativeLifecycle, ReplayTombstoneAllocationChurn) {
     constexpr size_t count = 4096;
-    // The baseline reproduces the previous split binding: the directory owns
-    // a weak reference, but the session is not given the record at construction.
-    // Include final tombstone destruction in both timings; only the point at
-    // which the session's allocation is released differs.
+    // 断言回放墓碑不会延长已关闭会话分配的生命周期。
     for (size_t round = 0; round != 6; ++round) {
         const bool bound_record = round % 2 != 0;
         ::net::io_context io;
@@ -674,7 +657,6 @@ TEST(UdpNativeLifecycle, ReplayTombstoneAllocationChurn) {
         SessionAllocationCounts counts;
         std::vector<std::shared_ptr<::worker_detail::UdpHandoffRecord>> records;
         records.reserve(count);
-        const auto started = std::chrono::steady_clock::now();
         for (size_t index = 0; index != count; ++index) {
             auto record = std::make_shared<::worker_detail::UdpHandoffRecord>(
                 ::ss::Ss2022UdpAssociation::Policy());
@@ -693,15 +675,6 @@ TEST(UdpNativeLifecycle, ReplayTombstoneAllocationChurn) {
         else EXPECT_GT(retained_bytes, 0u);
         records.clear();
         EXPECT_EQ(counts.live_bytes, 0u);
-        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - started).count();
-        std::cout << "udp-session-churn round=" << round
-                  << " bound_record=" << bound_record
-                  << " operations=" << count
-                  << " allocations=" << counts.allocations
-                  << " peak_bytes=" << counts.peak_bytes
-                  << " retained_bytes=" << retained_bytes
-                  << " ns_per_operation=" << elapsed / count << '\n';
     }
 }
 
@@ -718,6 +691,7 @@ TEST(UdpNativeLifecycle, Contract) {
         std::_Exit(99);
     });
     ::net::io_context io;
+    UdpSocketFixtures sockets(io);
     auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
     Reclaimer reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
     VerifyHandoffDirectoryNamespaces();
@@ -731,7 +705,7 @@ TEST(UdpNativeLifecycle, Contract) {
     socket->open(::udp::v4(), ec);
     if (ec) Fail("failed to open native UDP test socket");
     socket->bind({::net::ip::address_v4::loopback(), 0}, ec);
-    if (ec || !ingress.AttachSocket("native-socket", socket))
+    if (ec || !sockets.Attach(ingress, "native-socket", socket))
         Fail("failed to attach native UDP test socket");
 
     GateDispatcher dispatcher(io);
@@ -739,38 +713,32 @@ TEST(UdpNativeLifecycle, Contract) {
     dispatcher.reenter_stop = true;
     ::StatsShard stats;
     ::TimeoutsConfig timeouts;
-    ReplySink reply_sink;
     auto receiver = MakeReceiver();
     const ::app::DatagramSessionEnvironment environment{
         .timeouts = timeouts, .dispatcher = &dispatcher, .stats = &stats};
     constexpr std::array<uint8_t, 1> datagram{0x62};
     ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
-        .socket_key = "native-socket",
-        .sock = socket.get(),
+        .socket = sockets.Find(ingress, socket.get()).get(),
         .client_endpoint = {::net::ip::address_v4::loopback(), 43123},
         .payload = datagram,
         .receiver = &receiver,
         .io_context = io,
         .worker_id = 3,
-        .reply_sink = reply_sink,
         .environment = environment,
     });
     constexpr std::array<uint8_t, 1> second_datagram{0x63};
     ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
-        .socket_key = "native-socket",
-        .sock = socket.get(),
+        .socket = sockets.Find(ingress, socket.get()).get(),
         .client_endpoint = {::net::ip::address_v4::loopback(), 43124},
         .payload = second_datagram,
         .receiver = &receiver,
         .io_context = io,
         .worker_id = 3,
-        .reply_sink = reply_sink,
         .environment = environment,
     });
     receiver.inbound_tag.assign(256, 'x');
     receiver.inbound_tags.front().assign(256, 'y');
     receiver.protocol.assign(256, 'z');
-    receiver.stream_settings.security.assign(256, 'q');
     std::get<::routing::ForceOutbound>(receiver.dispatch_policy.outbound)
         .outbound_tag.assign(256, 'r');
 
@@ -790,14 +758,12 @@ TEST(UdpNativeLifecycle, Contract) {
     // A datagram decoded by the replacement handler must reach the existing
     // row's queue instead of starting a new job.
     ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
-        .socket_key = "native-socket",
-        .sock = socket.get(),
+        .socket = sockets.Find(ingress, socket.get()).get(),
         .client_endpoint = {::net::ip::address_v4::loopback(), 43123},
         .payload = datagram,
         .receiver = &receiver,
         .io_context = io,
         .worker_id = 3,
-        .reply_sink = reply_sink,
         .environment = environment,
     });
     const auto replaced = ingress.GetResourceStats();
@@ -808,7 +774,7 @@ TEST(UdpNativeLifecycle, Contract) {
         dispatcher.dispatches != 2)
         Fail("same-socket handler replacement disturbed active native jobs");
 
-    ingress.CloseSocket("native-socket");
+    ingress.CloseSocket(*sockets.Get(ingress, "native-socket"));
     auto stats_after_close = ingress.GetResourceStats();
     if (dispatcher.cancellations != 2 || stats_after_close.associations != 0 ||
         stats_after_close.native_dispatches != 2)

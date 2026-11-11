@@ -3,6 +3,7 @@
 #include "transport/async_stream.hpp"
 #include "transport/internet/proxy_protocol.hpp"
 #include "transport/internet/stream_settings.hpp"
+#include "transport/internet/transport_build_result.hpp"
 #include <tl/expected.hpp>
 #include <memory>
 #include <span>
@@ -18,12 +19,6 @@ namespace session {
 struct Context;
 }  // namespace session
 
-
-using TransportBuildResult = tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>;
-
-struct InboundTransportMetadata {
-    memory::String real_ip;
-};
 class InboundTransportStreamHandler {
 public:
     virtual ~InboundTransportStreamHandler() noexcept = default;

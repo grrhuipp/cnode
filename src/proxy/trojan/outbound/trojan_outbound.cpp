@@ -4,7 +4,7 @@
 #include <openssl/mem.h>
 #include "proxy/outbound.hpp"
 #include "proxy/trojan/trojan_codec.hpp"
-#include "proxy/inbound_admission.hpp"
+#include "proxy/handshake_errors.hpp"
 #include "proxy/outbound_stream_endpoint.hpp"
 #include "app/relay.hpp"
 #include "app/proxyman/outbound/handler.hpp"

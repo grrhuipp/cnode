@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <limits>
 
 namespace {
 enum class Fault { None, Memory, Link, Cancelled, Timeout, Reset, Unexpected, NonStandard };
@@ -33,6 +34,7 @@ public:
     Fault fault = Fault::None;
     size_t threshold = 0;
     size_t transferred = 0;
+    size_t eof_after = std::numeric_limits<size_t>::max();
     size_t failures = 0;
     bool closed = false;
     net::awaitable<void> Fail() {
@@ -42,7 +44,9 @@ public:
     }
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
         if (fault != Fault::None && transferred >= threshold) co_await Fail();
-        const size_t count = fault == Fault::None ? buffer.size() : std::min(buffer.size(), threshold - transferred);
+        const size_t count = fault == Fault::None
+            ? std::min(buffer.size(), eof_after - transferred)
+            : std::min(buffer.size(), threshold - transferred);
         std::memset(buffer.data(), 0, count);
         transferred += count;
         co_return count;
@@ -183,9 +187,12 @@ bool Run(int operation, Fault fault, size_t threshold) {
         catch (...) {}
     });
     io.run();
+    const bool read = operation < 4;
     const ErrorCode expected = fault == Fault::Cancelled ? ErrorCode::CANCELLED
-        : fault == Fault::Timeout ? ErrorCode::TIMEOUT : fault == Fault::Reset ? ErrorCode::SOCKET_CLOSED : ErrorCode::OK;
-    const bool exceptional = fault == Fault::Memory || fault == Fault::Link || fault == Fault::Unexpected || fault == Fault::NonStandard;
+        : fault == Fault::Timeout ? ErrorCode::TIMEOUT
+        : fault == Fault::Reset ? (read ? ErrorCode::SOCKET_READ_FAILED : ErrorCode::SOCKET_CLOSED)
+        : read && fault == Fault::Memory ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::OK;
+    const bool exceptional = (!read && fault == Fault::Memory) || fault == Fault::Link || fault == Fault::Unexpected || fault == Fault::NonStandard;
     bool passed = returned && !stream.closed && (exceptional ? observed == fault : observed == Fault::None && code == expected);
     passed &= fault == Fault::None || (stream.failures == 1 && stream.transferred == threshold);
     passed &= memory::detail::test_buffers_live == 0;
@@ -212,4 +219,22 @@ TEST(AnytlsCodecErrors, Contract) {
     }
     std::printf("codec cases=%zu passed=%zu failed=%zu released=%d\n", total, passed, total - passed, memory::detail::test_buffers_live == 0);
     { ASSERT_TRUE(passed == total); return; }
+}
+
+TEST(AnytlsCodecErrors, HandshakeEofDistinguishesCloseFromTruncation) {
+    for (size_t prefix = 0; prefix < anytls::kFrameHeaderSize; ++prefix) {
+        net::io_context io;
+        Stream stream;
+        stream.eof_after = prefix;
+        ErrorCode result = ErrorCode::INTERNAL;
+        net::co_spawn(io, anytls::ReadFrameHeader(stream),
+            [&](std::exception_ptr failure, tl::expected<anytls::FrameHeader, ErrorCode> header) {
+                EXPECT_FALSE(failure);
+                ASSERT_FALSE(header);
+                result = header.error();
+            });
+        io.run();
+        EXPECT_EQ(result, prefix == 0 ? ErrorCode::SOCKET_EOF
+                                     : ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
 }

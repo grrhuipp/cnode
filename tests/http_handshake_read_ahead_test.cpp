@@ -2,10 +2,12 @@
 
 #include "common/allocator.hpp"
 #include "infra/log.hpp"
+#include "infra/config_types.hpp"
 #include "transport/internet/tcp_stream.hpp"
 #include "transport/internet/tls_stream.hpp"
 #include "transport/internet/transport_stack.hpp"
 #include "transport/internet/stream_settings.hpp"
+#include "transport/internet/transport_security.hpp"
 #include "transport/internet/ws_stream.hpp"
 #include "transport/internet/http1_handshake.hpp"
 
@@ -66,11 +68,11 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
 
     const auto fixtures = std::filesystem::path(CNODE_TEST_SOURCE_DIR) / "tests/fixtures/anytls-pool";
     ::StreamSettings settings;
-    settings.network = upgrade ? "httpupgrade" : "http";
+    settings.network_mode = upgrade ? ::NetworkMode::HttpUpgrade : ::NetworkMode::Http;
     settings.http.path = settings.http_upgrade.path = "/up";
     settings.http.host = settings.http_upgrade.host = "localhost";
     settings.http.method = "GET";
-    settings.security = tls ? "tls" : "none";
+    settings.security_mode = tls ? ::SecurityMode::Tls : ::SecurityMode::None;
     settings.tls.alpn = {"http/1.1"};
     settings.tls.allow_insecure = true;
     settings.tls.server_name = "localhost";
@@ -826,9 +828,9 @@ void UpgradeHeaderTokens(bool outbound, bool websocket,
     auto raw = std::make_unique<::TcpStream>(std::move(socket));
     raw->SetIdleTimeout(2s);
     ::StreamSettings settings;
-    settings.network = websocket ? "ws" : "httpupgrade";
+    settings.network_mode = websocket ? ::NetworkMode::Ws : ::NetworkMode::HttpUpgrade;
     settings.ws.path = settings.http_upgrade.path = "/up";
-    settings.security = "none";
+    settings.security_mode = ::SecurityMode::None;
     settings = ::NormalizeStreamSettings(settings);
     std::exception_ptr error;
     size_t completed = 0;
@@ -988,7 +990,8 @@ void HttpLogHandshake(std::string_view network, bool outbound,
     auto raw = std::make_unique<::TcpStream>(std::move(socket));
     raw->SetIdleTimeout(2s);
     ::StreamSettings settings;
-    settings.network = network;
+    settings.network_mode = ParseNetworkMode(network);
+    settings.http.force_http2 = EqualsAsciiCI(network, "h2");
     settings.http.path = settings.http_upgrade.path = settings.ws.path =
         settings.xhttp.path = path;
     settings.http.method = "GET";
@@ -1070,7 +1073,9 @@ void HttpLogRedaction() {
     Require(::mkdtemp(name.data()) != nullptr, "HTTP log test directory creation failed");
     const std::filesystem::path directory(name);
     try {
-        Require(::Log::Init("trace", directory, 1, {}, "error.log", false, false),
+        Require(::Log::Init({.level = LogLevel::TRACE, .log_dir = directory,
+                            .access_path = {}, .error_path = "error.log", .max_days = 1,
+                            .rotate_daily = false, .gzip = false}),
                 "HTTP log test initialization failed");
         constexpr std::string_view secret_url =
             "http://user:review_password@example.com/?token=review_token#review_fragment";
@@ -1092,7 +1097,7 @@ void HttpLogRedaction() {
             HttpLogHandshake(network, false,
                 start + " HTTP/1.review_password?review_token#review_fragment", network != "ws");
             HttpLogHandshake(network, false,
-                start + "?token=review_token#review_fragment HTTP/1.1", network != "ws");
+                start + "?token=review_token#review_fragment HTTP/1.1", true);
             HttpLogHandshake(network, false,
                 start + " HTTP/1.1", true, "/up", secret_url);
             for (const std::string_view invalid_target : {
@@ -1134,7 +1139,7 @@ void HttpLogRedaction() {
             Require(diagnostics.find(secret) == std::string::npos, "HTTP diagnostics leaked untrusted input");
         for (const std::string_view marker : {
                 "HTTPUpgrade server request line='GET /up HTTP/1.1'",
-                "WebSocket server rejected path mismatch",
+                "WebSocket server path mismatch",
                 "XHTTP server H1 request line='POST /up/ HTTP/1.1'",
                 "XHTTP server split downlink ready session=session ",
                 "client request rejected", "WebSocket client upgrade rejected",
@@ -1148,6 +1153,20 @@ void HttpLogRedaction() {
     }
     std::filesystem::remove_all(directory);
 }
+
+// D4：WebSocket 与 HTTPUpgrade 共用路径语义（同 Xray hub 比较 URL.Path）：忽略
+// query，未配置或配置为根路径时不放行其他路径。
+void UpgradePathMatching() {
+    for (const std::string_view network : {"ws", "httpupgrade"}) {
+        HttpLogHandshake(network, false, "GET /up?ed=2048 HTTP/1.1", true);
+        HttpLogHandshake(network, false, "GET /down HTTP/1.1", false);
+        HttpLogHandshake(network, false, "GET /up/child HTTP/1.1", false);
+        HttpLogHandshake(network, false, "GET /?ed=2048 HTTP/1.1", true, "/");
+        HttpLogHandshake(network, false, "GET /up HTTP/1.1", false, "/");
+        HttpLogHandshake(network, false, "GET /up?ed=2048 HTTP/1.1", false, "/");
+    }
+}
+
 }  // namespace
 
 TEST(HttpHandshakeReadAhead, Contract) {
@@ -1163,6 +1182,7 @@ TEST(HttpHandshakeReadAhead, Contract) {
         WsProtocolBoundaries();
         HttpBoundaryCases();
         HttpLogRedaction();
+        UpgradePathMatching();
         for (bool outbound : {false, true})
             for (bool tls : {false, true})
                 for (bool upgrade : {false, true})
@@ -1175,4 +1195,8 @@ TEST(HttpHandshakeReadAhead, Contract) {
         passed = false;
     }
     { ASSERT_TRUE(passed); return; }
+}
+
+TEST(HttpHandshakeReadAhead, UpgradePathIgnoresQueryAndMatchesExactly) {
+    UpgradePathMatching();
 }

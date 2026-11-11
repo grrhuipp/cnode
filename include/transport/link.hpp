@@ -4,6 +4,8 @@
 #include "common/buf/multi_buffer.hpp"
 #include "common/error.hpp"
 
+#include <asio/cancellation_signal.hpp>
+
 #include <cstdint>
 #include <exception>
 #include <new>
@@ -110,6 +112,43 @@ inline void CancellationSource::Notify(Cancellation cancellation) noexcept {
         subscription->OnCancellation(cancellation);
     }
 }
+
+// 把父协程取消槽与可选的连接取消源合流为一个本地信号，供单次异步等待绑定。
+// 驻留在等待协程帧内的稳定地址；析构先解除父槽，再由基类退订取消源。已停止的
+// 取消源在构造期间同步投递，调用方须在开始等待前检查 Cancelled()。
+class CancellationBridge final : private CancellationSubscription {
+public:
+    explicit CancellationBridge(net::cancellation_slot parent) : parent_(parent) {
+        if (parent_.is_connected()) {
+            parent_.assign([this](net::cancellation_type type) {
+                cancelled_ = true;
+                signal_.emit(type);
+            });
+        }
+    }
+    CancellationBridge(net::cancellation_slot parent, CancellationSource& source)
+        : CancellationBridge(parent) {
+        Resubscribe(source);
+    }
+    ~CancellationBridge() {
+        if (parent_.is_connected()) parent_.clear();
+    }
+
+    [[nodiscard]] net::cancellation_slot Slot() noexcept { return signal_.slot(); }
+    [[nodiscard]] bool Cancelled() const noexcept { return cancelled_; }
+    // 只唤醒本地等待，由调用方按自身状态决定重试；不记为取消。
+    void Interrupt() noexcept { signal_.emit(net::cancellation_type::terminal); }
+
+private:
+    void OnCancellation(Cancellation) noexcept override {
+        cancelled_ = true;
+        signal_.emit(net::cancellation_type::all);
+    }
+
+    net::cancellation_slot parent_;
+    net::cancellation_signal signal_;
+    bool cancelled_ = false;
+};
 
 // Logical I/O failures retain their application code across reader/writer
 // boundaries. They are not fabricated operating-system socket errors.

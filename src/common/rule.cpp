@@ -50,7 +50,9 @@ bool DetectRulePolicy::Blocked(const session::Context& ctx) {
         char* out = buf;
         const bool bracket_ipv6 = iputil::NeedsIpv6Brackets(host);
         const std::size_t max_host_len = sizeof(buf) - (bracket_ipv6 ? 2 : 0) - 6;
-        const std::size_t host_len = std::min(host.size(), max_host_len);
+        // 合法目标受 DNS/IP 长度边界约束；未来扩展若超出预算，也不能匹配截断后的目标。
+        if (host.size() > max_host_len) return true;
+        const std::size_t host_len = host.size();
         if (bracket_ipv6) {
             *out++ = '[';
         }

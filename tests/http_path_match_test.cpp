@@ -35,3 +35,17 @@ TEST(HttpPathMatch, Contract) {
     Require(PathPrefixMatchesSegment({}, "/anything"), "empty root path rejected");
     Require(!PathPrefixMatchesSegment("/", "relative"), "relative root path accepted");
 }
+
+TEST(HttpPathMatch, ExactIgnoresQueryWithoutRootWildcard) {
+    using ::transport::internet::detail::PathMatchesExactly;
+
+    EXPECT_TRUE(PathMatchesExactly("/up", "/up"));
+    EXPECT_TRUE(PathMatchesExactly("/up", "/up?ed=2048"));
+    EXPECT_FALSE(PathMatchesExactly("/up", "/down"));
+    EXPECT_FALSE(PathMatchesExactly("/up", "/up/"));
+    EXPECT_FALSE(PathMatchesExactly("/up", "/up/child?ed=2048"));
+    EXPECT_TRUE(PathMatchesExactly("/", "/?ed=2048"));
+    EXPECT_TRUE(PathMatchesExactly({}, "/"));
+    EXPECT_FALSE(PathMatchesExactly("/", "/up"));
+    EXPECT_FALSE(PathMatchesExactly({}, "/up?ed=2048"));
+}

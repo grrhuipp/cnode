@@ -1,4 +1,5 @@
 #include "proxy/inbound_admission.hpp"
+#include "proxy/handshake_errors.hpp"
 #include "app/relay.hpp"
 #include "common/scoped_cleanse.hpp"
 #include "proxy/inbound.hpp"
@@ -40,9 +41,7 @@ struct TrojanHandshakeResult {
 net::awaitable<tl::expected<TrojanHandshakeResult, ErrorCode>>
 ParseTrojanRequest(AsyncStream& stream,
                    session::Context& ctx,
-                   ConnectionLimiter* limiter,
-                   std::string_view tag,
-                   std::string_view client_ip) {
+                   ConnectionLimiter* limiter) {
     std::array<uint8_t, kMaxTrojanHandshakeBytes> handshake_buf{};
     size_t total_read = 0;
     size_t required = ::trojan::kRequestPrefixSize;
@@ -52,21 +51,15 @@ ParseTrojanRequest(AsyncStream& stream,
         if (required > kMaxTrojanHandshakeBytes) {
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
-        while (total_read < required) {
-            size_t n = 0;
-            try {
-                n = co_await stream.AsyncRead(net::buffer(
-                    handshake_buf.data() + total_read, required - total_read));
-            } catch (const IoSystemError& error) {
-                co_return tl::unexpected(
-                    proxy::ClassifyHandshakeReadException(stream, error));
-            }
-            if (n == 0) {
-                co_return tl::unexpected(
-                    proxy::ResolveHandshakeReadFailure(
-                        stream, ErrorCode::PROTOCOL_DECODE_FAILED));
-            }
-            total_read += n;
+        if (total_read < required) {
+            const auto progress = total_read == 0 ? proxy::HandshakeProgress::NotStarted
+                                                  : proxy::HandshakeProgress::Started;
+            auto read = co_await proxy::ReadHandshakeExact(
+                stream,
+                std::span<uint8_t>(handshake_buf.data() + total_read, required - total_read),
+                progress);
+            if (!read) co_return tl::unexpected(read.error());
+            total_read = required;
         }
         decoded = ::trojan::DecodeRequest(
             std::span<const uint8_t>(handshake_buf.data(), total_read));
@@ -74,14 +67,11 @@ ParseTrojanRequest(AsyncStream& stream,
             break;
         }
         if (decoded.status == ::trojan::RequestDecodeStatus::InvalidAddress) {
-            LOG_CONN_WARN(ctx, "request rejected from {}:{} > invalid target address",
-                          client_ip, ctx.inbound.source_port);
-            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid target address"));
+            proxy::LogInboundRequestRejected(ctx, "invalid target address");
             co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
         if (decoded.status == ::trojan::RequestDecodeStatus::InvalidHeader) {
-            LOG_CONN_WARN(ctx, "invalid request header from {}:{}", client_ip, ctx.inbound.source_port);
-            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid request header"));
+            proxy::LogInboundRequestRejected(ctx, "invalid request header");
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         required = decoded.required;
@@ -95,7 +85,7 @@ ParseTrojanRequest(AsyncStream& stream,
          request.password_hash.size()});
     if (credential.error != ErrorCode::OK) co_return tl::unexpected(credential.error);
     auto user_info = proxyman::inbound::UserStore::FindTrojanUser(
-        tag, request.PasswordHashView());
+        ctx.inbound.tag, request.PasswordHashView());
     if (!user_info) {
         co_await proxy::RecordInboundAuthFailure(
             limiter, ctx, "no matching credential", credential.key);
@@ -116,7 +106,7 @@ namespace proxy::trojan::inbound {
 
 class Handler final : public ::Inbound {
 public:
-    Handler(::UserOnlineTracker& validator,
+    Handler(::UserOnlineTracker& tracker,
             ::StatsShard& stats,
             ::ConnectionLimiter* limiter);
 
@@ -130,7 +120,7 @@ public:
         uint32_t pressure_idle_timeout) override;
 
 private:
-    ::UserOnlineTracker& validator_;
+    ::UserOnlineTracker& tracker_;
     ::StatsShard& stats_;
     ::ConnectionLimiter* limiter_;
 };
@@ -142,10 +132,10 @@ private:
 // ============================================================================
 
 proxy::trojan::inbound::Handler::Handler(
-    ::UserOnlineTracker& validator,
+    ::UserOnlineTracker& tracker,
     StatsShard& stats,
     ConnectionLimiter* limiter)
-    : validator_(validator)
+    : tracker_(tracker)
     , stats_(stats)
     , limiter_(limiter)
 {}
@@ -160,10 +150,8 @@ proxy::trojan::inbound::Handler::Process(
     const TimeoutsConfig& timeouts,
     uint32_t /*pressure_idle_timeout*/)
 {
-    const std::string_view tag   = ctx.inbound.tag;
-    const std::string_view client_ip = ctx.inbound.source_ip;
-
-    LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
+    LOG_CONN_DEBUG(ctx, "processing connection from {}:{}",
+                   ctx.inbound.source_ip, ctx.inbound.source_port);
 
     if (proxy::BeginInboundAuthentication(limiter_, ctx) &&
         co_await proxy::CheckInboundIpBanned(*limiter_, ctx)) {
@@ -172,8 +160,7 @@ proxy::trojan::inbound::Handler::Process(
     std::optional<UserOnlineSessionGuard> user_session;
     Network net = Network::TCP;
     {
-        auto handshake = co_await ParseTrojanRequest(
-            *stream, ctx, limiter_, tag, client_ip);
+        auto handshake = co_await ParseTrojanRequest(*stream, ctx, limiter_);
         if (!handshake) {
             co_return proxy::RejectInbound(stats_, stream.get(), handshake.error());
         }
@@ -186,7 +173,7 @@ proxy::trojan::inbound::Handler::Process(
                 std::move(handshake->target),
                 std::move(handshake->forwarded)});
         user_session = co_await proxy::AdmitAuthenticatedInbound(
-            validator_, ctx, handshake->user->profile);
+            tracker_, ctx, handshake->user->profile);
         if (!user_session) {
             co_return proxy::RejectInbound(
                 stats_, stream.get(), ErrorCode::PERMISSION_DENIED);

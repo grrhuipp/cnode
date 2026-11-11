@@ -1,4 +1,5 @@
 #pragma once
+#include "proxy/handshake_errors.hpp"
 
 #include "app/proxyman/inbound/user_store.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
@@ -86,10 +87,9 @@ using KeyBytes = ::proxyman::inbound::PreparedKeyBytes;
 // 每次 Encrypt/Decrypt 后由调用方自增 nonce 计数器。
 class SsAeadCipher {
 public:
-    // Authentication trials bind the first candidate key through ResetKey.
-    SsAeadCipher(SsCipherType type, proxy::AeadDirection direction);
-    SsAeadCipher(SsCipherType type, const uint8_t* key, size_t key_size,
-                 proxy::AeadDirection direction);
+    // 认证试探通过 ResetKey 绑定候选密钥，记录层方向由 Seal/Open 表达。
+    explicit SsAeadCipher(SsCipherType type);
+    SsAeadCipher(SsCipherType type, const uint8_t* key, size_t key_size);
     ~SsAeadCipher() = default;
 
     SsAeadCipher(const SsAeadCipher&) = delete;
@@ -113,7 +113,7 @@ public:
 
 private:
     SsCipherType type_;
-    std::variant<proxy::AeadEncryptor, proxy::AeadDecryptor> context_;
+    proxy::AeadContext context_;
 };
 
 static constexpr size_t kMaxChunkPayload = 0x3FFF;
@@ -179,19 +179,6 @@ inline constexpr size_t kStreamChunkPayloadSize =
 
 [[noreturn]] inline void ThrowSsWriteError(const char* what) {
     throw IoSystemError(io_error::connection_reset, what);
-}
-
-// Returns false on EOF before len bytes arrived.
-inline net::awaitable<bool> ReadFull(AsyncStream& stream, uint8_t* buf, size_t len) {
-    size_t got = 0;
-    while (got < len) {
-        const size_t r = co_await stream.AsyncRead(net::buffer(buf + got, len - got));
-        if (r == 0) {
-            co_return false;
-        }
-        got += r;
-    }
-    co_return true;
 }
 
 inline std::array<uint8_t, 12> MakeNonce(uint64_t counter) noexcept {
@@ -300,15 +287,17 @@ ReadAndDecryptStreamPayload(
         buf::BufferGuard block{buf::Buffer::New()};
         if (!block) co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         const size_t count = std::min(remaining, size_t(block->Available()));
-        if (!co_await ReadFull(stream, block->Tail().data(), count))
-            co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
+        if (auto read = co_await proxy::ReadHandshakeExact(stream,
+                {block->Tail().data(), count}, proxy::HandshakeProgress::Started); !read)
+            co_return tl::unexpected(read.error());
         block->Produce(static_cast<uint32_t>(count));
         ciphertext.push_back(std::move(block));
         remaining -= count;
     }
     std::array<uint8_t, SsAeadCipher::kTagSize> tag{};
-    if (!co_await ReadFull(stream, tag.data(), tag.size()))
-        co_return tl::unexpected(ErrorCode::SOCKET_READ_FAILED);
+    if (auto read = co_await proxy::ReadHandshakeExact(stream, tag,
+            proxy::HandshakeProgress::Started); !read)
+        co_return tl::unexpected(read.error());
     if (!buf::AppendSpanToMultiBuffer(tag, ciphertext))
         co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     if (!DecryptStreamPayload(cipher, nonce, std::move(ciphertext), output))

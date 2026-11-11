@@ -310,45 +310,35 @@ const EVP_AEAD* AeadAlgorithm(SsCipherType type) noexcept {
     }
 }
 
-SsAeadCipher::SsAeadCipher(SsCipherType type, proxy::AeadDirection direction)
-    : type_(type) {
-    if (direction == proxy::AeadDirection::Decrypt)
-        context_.emplace<proxy::AeadDecryptor>();
-}
+SsAeadCipher::SsAeadCipher(SsCipherType type) : type_(type) {}
 
-SsAeadCipher::SsAeadCipher(SsCipherType type, const uint8_t* key, size_t key_size,
-                         proxy::AeadDirection direction)
-    : SsAeadCipher(type, direction) {
+SsAeadCipher::SsAeadCipher(SsCipherType type, const uint8_t* key, size_t key_size)
+    : SsAeadCipher(type) {
     if (!ResetKey(key, key_size))
         throw std::runtime_error("Shadowsocks AEAD initialization failed");
 }
 
 bool SsAeadCipher::ResetKey(const uint8_t* key, size_t key_size) {
-    const auto configure = [&](auto& context) {
-        return context.Configure(AeadAlgorithm(type_),
-                                  key ? std::span<const uint8_t>(key, key_size) : std::span<const uint8_t>{});
-    };
-    return std::visit(configure, context_);
+    return context_.Configure(AeadAlgorithm(type_),
+        key ? std::span<const uint8_t>(key, key_size) : std::span<const uint8_t>{});
 }
 
 bool SsAeadCipher::Encrypt(const uint8_t* nonce, const uint8_t* plaintext,
                           size_t plaintext_len, uint8_t* output) noexcept {
-    auto* context = std::get_if<proxy::AeadEncryptor>(&context_);
-    return context && nonce && output && (plaintext || plaintext_len == 0) &&
+    return nonce && output && (plaintext || plaintext_len == 0) &&
         plaintext_len <= static_cast<size_t>(INT_MAX) &&
-        context->Process(std::span<const uint8_t, 12>(nonce, 12),
-                         {plaintext, plaintext_len}, {},
-                         {output, plaintext_len + kTagSize}).has_value();
+        context_.Seal(std::span<const uint8_t, 12>(nonce, 12),
+                      {plaintext, plaintext_len}, {},
+                      {output, plaintext_len + kTagSize}).has_value();
 }
 
 bool SsAeadCipher::Decrypt(const uint8_t* nonce, const uint8_t* ciphertext,
                           size_t ciphertext_len, uint8_t* output) noexcept {
-    auto* context = std::get_if<proxy::AeadDecryptor>(&context_);
-    return context && nonce && ciphertext && ciphertext_len >= kTagSize &&
+    return nonce && ciphertext && ciphertext_len >= kTagSize &&
         (output || ciphertext_len == kTagSize) &&
-        context->Process(std::span<const uint8_t, 12>(nonce, 12),
-                         {ciphertext, ciphertext_len}, {},
-                         {output, ciphertext_len - kTagSize}).has_value();
+        context_.Open(std::span<const uint8_t, 12>(nonce, 12),
+                      {ciphertext, ciphertext_len}, {},
+                      {output, ciphertext_len - kTagSize}).has_value();
 }
 
 }  // namespace ss

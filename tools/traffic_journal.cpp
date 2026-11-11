@@ -1,4 +1,5 @@
 #include "infra/json.hpp"
+#include "service/controller/traffic_journal_format.hpp"
 
 #include <openssl/sha.h>
 
@@ -21,10 +22,11 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace {
-constexpr size_t MaxRecordBytes = 64 * 1024 * 1024;
+namespace format = ::controller::traffic_journal;
 constexpr size_t MaxAuditBytes = 1024 * 1024;
 
 [[noreturn]] void FailSystem(const char* operation) {
@@ -46,47 +48,6 @@ void Sync(int fd) {
     if (::fsync(fd) != 0) FailSystem("fsync");
 }
 
-bool RecordName(std::string_view name) {
-    if (!name.starts_with("batch-") || name.size() < 18) return false;
-    for (char character : name.substr(6, 6)) {
-        if (!((character >= 'a' && character <= 'z') ||
-              (character >= 'A' && character <= 'Z') ||
-              (character >= '0' && character <= '9'))) return false;
-    }
-    return name.substr(12) == ".ready" || name.substr(12) == ".unknown";
-}
-
-std::string ReadRecord(int directory, const std::string& name) {
-    File file(::openat(directory, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
-    struct stat info {};
-    if (::fstat(file.Get(), &info) != 0) FailSystem("fstat");
-    if (!S_ISREG(info.st_mode) || info.st_size < 0 ||
-        static_cast<uint64_t>(info.st_size) > MaxRecordBytes)
-        throw std::runtime_error("invalid record type or size");
-    std::string raw;
-    std::array<char, 8192> buffer {};
-    for (;;) {
-        const auto count = ::read(file.Get(), buffer.data(), buffer.size());
-        if (count == 0) break;
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            FailSystem("read");
-        }
-        if (static_cast<size_t>(count) > MaxRecordBytes - raw.size())
-            throw std::runtime_error("record size limit exceeded");
-        raw.append(buffer.data(), static_cast<size_t>(count));
-    }
-    return raw;
-}
-
-uint64_t Counter(const ::json::value& value) {
-    if (value.is_int64() && value.as_int64() >= 0)
-        return static_cast<uint64_t>(value.as_int64());
-    if (value.is_uint64() && value.as_uint64() <= static_cast<uint64_t>(INT64_MAX))
-        return value.as_uint64();
-    throw std::runtime_error("invalid record counters");
-}
-
 struct Summary {
     size_t users = 0;
     __uint128_t upload = 0;
@@ -94,18 +55,12 @@ struct Summary {
 };
 
 Summary Summarize(std::string_view raw) {
-    const auto value = ::json::parse(raw);
-    if (!value.is_array()) throw std::runtime_error("record must contain a row array");
     Summary summary;
-    for (const auto& row : value.as_array()) {
-        if (!row.is_array() || row.as_array().size() != 3)
-            throw std::runtime_error("invalid record row");
-        const auto& fields = row.as_array();
-        if (Counter(fields[0]) == 0) throw std::runtime_error("invalid user id");
-        summary.upload += Counter(fields[1]);
-        summary.download += Counter(fields[2]);
+    format::VisitRecordRows(raw, [&summary](const format::RecordRow& row) {
+        summary.upload += static_cast<uint64_t>(row.upload);
+        summary.download += static_cast<uint64_t>(row.download);
         ++summary.users;
-    }
+    });
     return summary;
 }
 
@@ -171,7 +126,7 @@ void List(int directory) {
     if (!raw_directory) { ::close(copy); FailSystem("fdopendir"); }
     const auto close_directory = [](DIR* value) { ::closedir(value); };
     std::unique_ptr<DIR, decltype(close_directory)> entries(raw_directory, close_directory);
-    std::vector<std::string> names;
+    std::vector<std::pair<std::string, format::RecordState>> records;
     for (;;) {
         errno = 0;
         const auto* entry = ::readdir(entries.get());
@@ -179,26 +134,28 @@ void List(int directory) {
             if (errno != 0) FailSystem("readdir");
             break;
         }
-        if (RecordName(entry->d_name)) names.emplace_back(entry->d_name);
+        if (const auto state = format::ParseRecordName(entry->d_name))
+            records.emplace_back(entry->d_name, *state);
     }
-    std::sort(names.begin(), names.end());
-    for (const auto& name : names) {
-        const auto summary = Summarize(ReadRecord(directory, name));
-        std::cout << "{\"record\":" << Quote(name) << ",\"state\":" << Quote(name.substr(13))
+    std::sort(records.begin(), records.end());
+    for (const auto& [name, state] : records) {
+        const auto summary = Summarize(format::ReadRecord(directory, name.c_str()));
+        std::cout << "{\"record\":" << Quote(name)
+                  << ",\"state\":" << Quote(format::RecordSuffix(state).substr(1))
                   << ",\"users\":" << summary.users << ",\"upload\":" << Decimal(summary.upload)
                   << ",\"download\":" << Decimal(summary.download) << "}\n";
     }
 }
 
 void Resolve(int directory, const std::string& record, std::string_view decision, std::string_view evidence) {
-    if (!RecordName(record) || !record.ends_with(".unknown"))
+    if (format::ParseRecordName(record) != format::RecordState::Unknown)
         throw std::runtime_error("resolve requires one exact unknown record filename");
     if (decision != "confirmed-applied" && decision != "confirmed-not-applied")
         throw std::runtime_error("decision must be confirmed-applied or confirmed-not-applied");
     if (!ValidEvidence(evidence)) throw std::runtime_error("evidence must contain 1..512 UTF-8 characters");
-    const auto raw = ReadRecord(directory, record);
+    const auto raw = format::ReadRecord(directory, record.c_str());
     const auto summary = Summarize(raw);
-    const auto ready = record.substr(0, 12) + ".ready";
+    const auto ready = format::RecordNameWithState(record, format::RecordState::Ready);
     if (decision == "confirmed-not-applied") {
         struct stat destination {};
         if (::fstatat(directory, ready.c_str(), &destination, AT_SYMLINK_NOFOLLOW) == 0)

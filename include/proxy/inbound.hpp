@@ -5,6 +5,7 @@
 #include "common/asio_types.hpp"
 #include "common/error.hpp"
 #include "common/buf/multi_buffer.hpp"
+#include "common/hash.hpp"
 #include "common/target_address.hpp"
 #include <openssl/mem.h>
 
@@ -137,12 +138,11 @@ struct InboundDatagramAssociationKey {
 
 struct InboundDatagramAssociationKeyHash {
     [[nodiscard]] size_t operator()(const InboundDatagramAssociationKey& key) const noexcept {
-        size_t hash = 2166136261u;
-        for (size_t i = 0; i < key.owner.size; ++i)
-            hash = (hash ^ key.owner.bytes[i]) * 16777619u;
-        hash = (hash ^ key.owner.size) * 16777619u;
-        hash ^= std::hash<uint64_t>{}(key.session_id) + (hash << 6) + (hash >> 2);
-        return hash ^ std::hash<const proxyman::inbound::ProtocolSettings*>{}(key.configuration);
+        uint64_t hash = Fnv1a64(std::span<const uint8_t>(key.owner.bytes.data(), key.owner.size));
+        hash = Fnv1a64Step(hash, key.owner.size);
+        hash = Mix64(hash ^ key.session_id);
+        hash = Mix64(hash ^ reinterpret_cast<uintptr_t>(key.configuration));
+        return static_cast<size_t>(hash);
     }
 };
 

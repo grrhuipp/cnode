@@ -1,4 +1,5 @@
 #include "infra/log.hpp"
+#include "infra/config_types.hpp"
 
 #include "common/clock.hpp"
 
@@ -1367,34 +1368,23 @@ std::optional<LogLevel> ParseLogLevel(std::string_view name) noexcept {
     if (name == "trace") return LogLevel::TRACE;
     if (name == "debug") return LogLevel::DEBUG;
     if (name == "info") return LogLevel::INFO;
-    if (name == "warning" || name == "warn") return LogLevel::WARN;
+    if (name == "warning") return LogLevel::WARN;
     if (name == "error") return LogLevel::ERROR;
     return std::nullopt;
 }
 
-bool Log::Init(const std::string& level,
-               const std::filesystem::path& log_dir,
-               uint16_t max_days,
-               const std::filesystem::path& access_path,
-               const std::filesystem::path& error_path,
-               bool rotate_daily,
-               bool gzip) {
+bool Log::Init(const LogConfig& config) {
     {
         std::lock_guard lock(g_lifecycle_mutex);
         if (initialized_.load(std::memory_order_acquire)) return true;
 
-        const auto min_level = ParseLogLevel(level);
-        if (!min_level) {
-            WriteConsole(LogLevel::ERROR,
-                         std::format("Failed to initialize logging > unsupported level '{}'", level));
-            return false;
-        }
-        min_level_.store(*min_level, std::memory_order_release);
+        min_level_.store(config.level, std::memory_order_release);
 
         try {
             g_console.Start();
             if (!g_async_log_backend.Start(
-                    log_dir, error_path, access_path, max_days, rotate_daily, gzip)) {
+                    config.log_dir, config.error_path, config.access_path, config.max_days,
+                    config.rotate_daily, config.gzip)) {
                 WriteConsole(LogLevel::ERROR,
                              "Failed to initialize logging > cannot open access/error log files");
                 g_console.Stop();
@@ -1403,15 +1393,15 @@ bool Log::Init(const std::string& level,
 
             const auto resolved_error_path = g_async_log_backend.ErrorPath();
             const auto resolved_access_path = g_async_log_backend.AccessPath();
-            const auto rotation = rotate_daily ? "daily" : "fixed";
-            const auto compression = (rotate_daily && gzip) ? "gzip" : "none";
+            const auto rotation = config.rotate_daily ? "daily" : "fixed";
+            const auto compression = (config.rotate_daily && config.gzip) ? "gzip" : "none";
 
             initialized_.store(true, std::memory_order_release);
             WriteConsole(LogLevel::INFO, std::format(
                 "Logging initialized: level {}; access {}; error {}; directory {}; "
                 "{} rotation; compression {}; retention {} days",
-                level, resolved_access_path.string(), resolved_error_path.string(),
-                log_dir.string(), rotation, compression, max_days));
+                ConsoleLevelName(config.level), resolved_access_path.string(), resolved_error_path.string(),
+                config.log_dir.string(), rotation, compression, config.max_days));
         } catch (const std::exception& e) {
             WriteConsole(LogLevel::ERROR,
                          std::format("Failed to initialize logging > {}", e.what()));

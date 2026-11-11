@@ -6,6 +6,10 @@
 #include "common/buf/multi_buffer.hpp"
 #include "common/error.hpp"
 #include "transport/link.hpp"
+#include "proxy/buffered_stream_reader.hpp"
+#include "proxy/aead.hpp"
+#include "proxy/expiring_keyed_map.hpp"
+#include "proxy/vless/vless_encryption_config.hpp"
 #include <tl/expected.hpp>
 
 #include <openssl/aead.h>
@@ -30,97 +34,6 @@
 #include <utility>
 #include <vector>
 namespace vless {
-
-enum class VlessEncryptionMode : uint8_t {
-    Native,
-    XorPub,
-    Random,
-};
-
-enum class VlessEncryptionRole : uint8_t {
-    Client,
-    Server,
-};
-
-enum class VlessEncryptionParseError : uint8_t {
-    None,
-    UnsupportedName,
-    TooFewParts,
-    InvalidMode,
-    InvalidRtt,
-    InvalidSeconds,
-    InvalidBase64,
-    InvalidKeyLength,
-    InvalidKeyMaterial,
-    EmptyKeys,
-    InvalidPadding,
-    PaddingTooLarge,
-};
-
-struct VlessEncryptionPadding {
-    int probability = 0;
-    int from = 0;
-    int to = 0;
-};
-
-struct VlessClientPfsKey {
-    std::vector<uint8_t> public_key;
-    std::shared_ptr<EVP_PKEY> mlkem_key;
-};
-
-struct VlessServerPfsKey {
-    std::vector<uint8_t> private_key;
-    std::vector<uint8_t> public_key;
-    std::shared_ptr<EVP_PKEY> mlkem_key;
-
-    VlessServerPfsKey() = default;
-    VlessServerPfsKey(std::vector<uint8_t> priv,
-                      std::vector<uint8_t> pub,
-                      std::shared_ptr<EVP_PKEY> mlkem) noexcept
-        : private_key(std::move(priv))
-        , public_key(std::move(pub))
-        , mlkem_key(std::move(mlkem)) {}
-    VlessServerPfsKey(const VlessServerPfsKey&) = default;
-    VlessServerPfsKey& operator=(const VlessServerPfsKey&) = default;
-    VlessServerPfsKey(VlessServerPfsKey&&) noexcept = default;
-    VlessServerPfsKey& operator=(VlessServerPfsKey&&) noexcept = default;
-    ~VlessServerPfsKey() noexcept {
-        if (!private_key.empty()) {
-            OPENSSL_cleanse(private_key.data(), private_key.size());
-        }
-    }
-};
-
-struct VlessEncryptionConfig {
-    VlessEncryptionRole role = VlessEncryptionRole::Client;
-    VlessEncryptionMode mode = VlessEncryptionMode::Native;
-    bool zero_rtt = false;
-    int64_t seconds_from = 0;
-    int64_t seconds_to = 0;
-    std::vector<VlessClientPfsKey> client_keys;
-    std::vector<VlessServerPfsKey> server_keys;
-    std::vector<VlessEncryptionPadding> padding_lens;
-};
-
-struct VlessEncryptionParseResult {
-    std::optional<VlessEncryptionConfig> config;
-    VlessEncryptionParseError error = VlessEncryptionParseError::None;
-
-    [[nodiscard]] explicit operator bool() const noexcept {
-        return config.has_value() && error == VlessEncryptionParseError::None;
-    }
-};
-
-[[nodiscard]] bool IsNoVlessEncryption(std::string_view value) noexcept;
-
-[[nodiscard]] VlessEncryptionParseResult ParseVlessClientEncryption(
-    std::string_view encryption);
-
-[[nodiscard]] VlessEncryptionParseResult ParseVlessServerDecryption(
-    std::string_view decryption);
-
-[[nodiscard]] std::string_view VlessEncryptionParseErrorMessage(
-    VlessEncryptionParseError error) noexcept;
 
 
 // ============================================================================
@@ -297,8 +210,7 @@ public:
 private:
     VlessEncryptionNonce nonce_{};
     VlessEncryptionAeadCipher cipher_ = VlessEncryptionAeadCipher::Aes256Gcm;
-    // Allocated once on creation; moves transfer ownership without copying keys.
-    bssl::UniquePtr<EVP_AEAD_CTX> aead_ctx_;
+    proxy::AeadContext aead_;
 };
 
 [[nodiscard]] std::optional<size_t> SealVlessEncryptionRecord(
@@ -503,93 +415,6 @@ AcceptVlessEncryptionClientZeroRtt(
 // Runtime Handshake, Record I/O & 0-RTT Ticket Store
 // ============================================================================
 
-class VlessBufferedReader final : public transport::MultiBufferReader {
-public:
-    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
-    transport::EofAction ReadEofAction() const noexcept override { return src_.ReadEofAction(); }
-    [[nodiscard]] bool EnableRawRead() noexcept override { return src_.EnableRawRead(); }
-
-    explicit VlessBufferedReader(transport::MultiBufferReader& src) noexcept
-        : src_(src) {}
-
-    // Drains already buffered bytes only; true once `done` reaches `len`.
-    [[nodiscard]] bool ReadBuffered(uint8_t* data, size_t len, size_t& done) noexcept {
-        while (done < len && pending_.byte_size() != 0) {
-            const size_t n = pending_.ConsumePrefixTo(
-                std::span<uint8_t>(data + done, len - done));
-            if (n == 0) {
-                break;
-            }
-            done += n;
-        }
-        return done >= len;
-    }
-
-    net::awaitable<bool> ReadExact(uint8_t* data,
-                                   size_t len,
-                                   bool eof_ok_at_start = false,
-                                   size_t* progress = nullptr) {
-        size_t local_done = 0;
-        size_t& done = progress ? *progress : local_done;
-        while (!ReadBuffered(data, len, done)) {
-            buf::MultiBuffer mb = co_await src_.ReadMultiBuffer();
-            const bool received = mb.byte_size() != 0;
-            if (received) mb.MoveTo(pending_);
-            // Retain concurrently received bytes before observing cancellation.
-            if ((co_await net::this_coro::cancellation_state).cancelled() !=
-                net::cancellation_type::none) {
-                throw IoSystemError(io_error::operation_aborted);
-            }
-            if (!received) {
-                co_return done == 0 && eof_ok_at_start ? false : done == len;
-            }
-        }
-        co_return true;
-    }
-
-    net::awaitable<bool> DiscardExact(size_t len, size_t* progress = nullptr) {
-        size_t local_done = 0;
-        size_t& done = progress ? *progress : local_done;
-        while (done < len) {
-            if (pending_.byte_size() != 0) {
-                const size_t n = pending_.DropPrefixBytes(len - done);
-                done += n;
-                if (n > 0) {
-                    continue;
-                }
-            }
-
-            buf::MultiBuffer mb = co_await src_.ReadMultiBuffer();
-            const bool received = mb.byte_size() != 0;
-            if (received) mb.MoveTo(pending_);
-            // Retain concurrently received bytes before observing cancellation.
-            if ((co_await net::this_coro::cancellation_state).cancelled() !=
-                net::cancellation_type::none) {
-                throw IoSystemError(io_error::operation_aborted);
-            }
-            if (!received) {
-                co_return done == len;
-            }
-        }
-        co_return true;
-    }
-
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (pending_.byte_size() != 0) {
-            return TakePending();
-        }
-        return src_.ReadMultiBuffer();
-    }
-
-private:
-    net::awaitable<buf::MultiBuffer> TakePending() {
-        co_return std::move(pending_);
-    }
-
-    transport::MultiBufferReader& src_;
-    buf::MultiBuffer pending_;
-};
-
 inline net::awaitable<void> WriteVlessBytes(
     transport::MultiBufferWriter& writer,
     std::span<const uint8_t> data) {
@@ -636,10 +461,14 @@ public:
     void RejectDeferredTicket() noexcept;
 
 private:
+    net::awaitable<buf::MultiBuffer> ReadRawBytes();
+    net::awaitable<bool> ReadRecordHeader();
+    size_t OpenRecord(VlessEncryptionAead& aead, std::span<uint8_t> encrypted);
+
     [[nodiscard]] VlessEncryptionAead& KeyDeferredRead(
         const VlessEncryptionDeferredRead& deferred);
 
-    VlessBufferedReader src_;
+    proxy::BufferedStreamReader src_;
     VlessEncryptionReadKeys keys_;
     VlessEncryptionUnitedKey united_key_;
     std::optional<VlessEncryptionHeaderXor> header_xor_;
@@ -679,6 +508,7 @@ private:
     enum class State : uint8_t { Active, Finished, Failed };
 
     void CheckWritable() const;
+    net::awaitable<void> WriteRecord(std::span<const uint8_t> plain, std::span<uint8_t> frame);
     // By value: the range must stay in this frame until the write completes.
     template <typename BufferRange>
     net::awaitable<void> WriteEncrypted(BufferRange source);
@@ -722,8 +552,13 @@ using VlessEncryptionHandshakeResult =
 // Record layer installed over the raw connection after a completed handshake.
 // `plain_reader` borrows `reader` and both borrow the raw endpoints, so the
 // owner is address-stable and must outlive every borrowed raw endpoint use.
+struct VlessActiveIo {
+    proxy::BufferedStreamReader* reader = nullptr;
+    transport::MultiBufferWriter* writer = nullptr;
+};
+
 struct VlessEncryptedIo {
-    VlessEncryptedIo(VlessBufferedReader& raw_reader,
+    VlessEncryptedIo(proxy::BufferedStreamReader& raw_reader,
                      transport::MultiBufferWriter& raw_writer,
                      VlessEncryptionRuntime runtime);
 
@@ -734,7 +569,7 @@ struct VlessEncryptedIo {
 
     VlessEncryptionReader reader;
     VlessEncryptionWriter writer;
-    VlessBufferedReader plain_reader;
+    proxy::BufferedStreamReader plain_reader;
 };
 
 struct VlessEncryptionClientTicketCache {
@@ -790,46 +625,27 @@ private:
     // Replay keys are BLAKE3 digests so no NFS secret outlives its handshake.
     using NfsKeyDigest = std::array<uint8_t, 32>;
 
-    struct KeyedHash {
-        std::array<uint64_t, 2> key{};
-
-        template <size_t N>
-        [[nodiscard]] size_t operator()(const std::array<uint8_t, N>& value) const noexcept {
-            return static_cast<size_t>(SIPHASH_24(key.data(), value.data(), N));
-        }
-    };
-
-    struct TimingSafeEq {
-        template <size_t N>
-        [[nodiscard]] bool operator()(const std::array<uint8_t, N>& a,
-                                      const std::array<uint8_t, N>& b) const noexcept {
-            return CRYPTO_memcmp(a.data(), b.data(), N) == 0;
-        }
-    };
 
     struct Session {
         VlessEncryptionPfsKey pfs_key;
-        std::chrono::steady_clock::time_point expires_at{};
         std::optional<std::array<uint8_t, 16>> identity;
-        memory::UnorderedSet<NfsKeyDigest, KeyedHash, TimingSafeEq>
+        memory::UnorderedSet<NfsKeyDigest, proxy::SecretKeyedHash, proxy::TimingSafeEqual>
             seen_nfs_keys;
     };
 
-    using SessionMap =
-        memory::UnorderedMap<TicketArray, Session, KeyedHash, TimingSafeEq>;
+    using SessionMap = proxy::ExpiringKeyedMap<kVlessEncryptionTicketSize, Session,
+        std::chrono::steady_clock::time_point>;
 
     void Prune(std::chrono::steady_clock::time_point now);
     void EraseOldest();
-    void Erase(SessionMap::iterator it) noexcept;
 
     SessionMap sessions_;
-    memory::RingDeque<std::pair<TicketArray, std::chrono::steady_clock::time_point>> order_;
     size_t seen_nfs_keys_ = 0;
 };
 
 [[nodiscard]] net::awaitable<VlessEncryptionHandshakeResult>
 RunVlessEncryptionClientHandshake(
-    VlessBufferedReader& raw_reader,
+    proxy::BufferedStreamReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
     const VlessEncryptionConfig& config,
     VlessEncryptionClientTicketCache* ticket_cache,
@@ -837,7 +653,7 @@ RunVlessEncryptionClientHandshake(
 
 [[nodiscard]] net::awaitable<VlessEncryptionHandshakeResult>
 RunVlessEncryptionServerHandshake(
-    VlessBufferedReader& raw_reader,
+    proxy::BufferedStreamReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
     std::shared_ptr<const VlessEncryptionConfig> config,
     std::string_view inbound_tag);

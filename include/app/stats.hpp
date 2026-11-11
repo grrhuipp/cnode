@@ -38,10 +38,6 @@ struct StatsSnapshot {
     double bytes_out_rate = 0;
 };
 
-struct WorkerMemoryStats {
-    size_t udp_sockets = 0;
-};
-
 // Sampled only on the owning Worker; passed to the control plane by value.
 struct WorkerResourceStats {
     size_t udp_listeners = 0;
@@ -61,7 +57,7 @@ struct WorkerResourceStats {
 };
 
 struct WorkerRuntimeStatsSnapshot {
-    WorkerMemoryStats memory;
+    size_t udp_sockets = 0;
     std::optional<WorkerResourceStats> resources;
     StatsSnapshot stats;
     uint32_t worker_id = 0;
@@ -283,7 +279,6 @@ struct UserTrafficCounters {
     auto end() const noexcept { return users.end(); }
 };
 
-using UserTrafficSnapshot = UserTrafficCounters;
 
 class SessionTrackingState {
     struct Account {

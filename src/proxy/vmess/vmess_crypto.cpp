@@ -5,7 +5,6 @@
 #include "common/unsafe.hpp"
 
 #include <openssl/aead.h>
-#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/mem.h>
@@ -74,46 +73,6 @@ void GenerateAuthID(const AES_KEY& auth_id_key, int64_t timestamp, uint8_t* out_
     plaintext[15] = static_cast<uint8_t>(crc);
 
     AES_encrypt(plaintext, out_auth_id, &auth_id_key);
-}
-
-bool AES128GCMDecryptTo(
-    const uint8_t* key, const uint8_t* nonce, size_t nonce_len,
-    const uint8_t* ciphertext, size_t len,
-    const uint8_t* aad, size_t aad_len,
-    uint8_t* plaintext, size_t plaintext_capacity,
-    size_t& plaintext_len) {
-    if (!proxy::OpenOneShotAead(
-            EVP_aead_aes_128_gcm(),
-            {key, 16},
-            {nonce, nonce_len},
-            {ciphertext, len},
-            {aad, aad_len},
-            {plaintext, plaintext_capacity},
-            plaintext_len,
-            GCM_TAG_SIZE)) {
-        ERR_clear_error();
-        return false;
-    }
-    return true;
-}
-
-bool AES128GCMEncrypt(
-    const uint8_t* key, const uint8_t* nonce,
-    const uint8_t* aad, size_t aad_len,
-    const uint8_t* plaintext, size_t len,
-    uint8_t* ciphertext, uint8_t* tag) {
-    if (!proxy::SealScatterOneShotAead(
-            EVP_aead_aes_128_gcm(),
-            {key, 16},
-            {nonce, 12},
-            {plaintext, len},
-            {aad, aad_len},
-            ciphertext,
-            {tag, GCM_TAG_SIZE})) {
-        ERR_clear_error();
-        return false;
-    }
-    return true;
 }
 
 namespace {
@@ -295,8 +254,7 @@ std::optional<MemoryAccount> MemoryAccount::FromUUID(std::string_view uuid_str) 
 // VMessCipher 实现
 // ============================================================================
 
-VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* iv,
-                         proxy::AeadDirection direction)
+VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* iv)
     : security_(security) {
     std::memcpy(iv_.data(), iv, iv_.size());
     if (security == Security::NONE || security == Security::ZERO) {
@@ -319,9 +277,7 @@ VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* i
         actual_key = expanded;
         algorithm = EVP_aead_chacha20_poly1305();
     }
-    const bool ok = direction == proxy::AeadDirection::Encrypt
-        ? cipher_.emplace<proxy::AeadEncryptor>().Configure(algorithm, actual_key)
-        : cipher_.emplace<proxy::AeadDecryptor>().Configure(algorithm, actual_key);
+    const bool ok = aead_.Configure(algorithm, actual_key);
     OPENSSL_cleanse(expanded.data(), expanded.size());
     if (!ok) {
         throw std::runtime_error("VMess AEAD initialization failed");
@@ -336,10 +292,7 @@ ssize_t VMessCipher::Encrypt(const uint8_t* plaintext, size_t len, uint8_t* ciph
 
     std::array<uint8_t, 12> nonce{};
     BuildNonce(count_++, nonce.data());
-    auto* enc = std::get_if<proxy::AeadEncryptor>(&cipher_);
-    if (!enc) return -1;
-    const auto result = enc->Process(nonce, {plaintext, len}, {},
-                                     {ciphertext, len + GCM_TAG_SIZE});
+    const auto result = aead_.Seal(nonce, {plaintext, len}, {}, {ciphertext, len + GCM_TAG_SIZE});
     return result ? static_cast<ssize_t>(*result) : -1;
 }
 
@@ -352,10 +305,7 @@ ssize_t VMessCipher::Decrypt(const uint8_t* ciphertext, size_t len, uint8_t* pla
     if (len < GCM_TAG_SIZE) return -1;
     std::array<uint8_t, 12> nonce{};
     BuildNonce(count_++, nonce.data());
-    auto* dec = std::get_if<proxy::AeadDecryptor>(&cipher_);
-    if (!dec) return -1;
-    const auto result = dec->Process(nonce, {ciphertext, len}, {},
-                                     {plaintext, len - GCM_TAG_SIZE});
+    const auto result = aead_.Open(nonce, {ciphertext, len}, {}, {plaintext, len - GCM_TAG_SIZE});
     return result ? static_cast<ssize_t>(*result) : -1;
 }
 

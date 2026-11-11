@@ -356,7 +356,7 @@ TEST(UotSs2022, V1FirstEmptyDatagramSurvivesPreparation) {
     FragmentReader source(capture.bytes, {1, 2, 3, 1});
     ::Run([&]() -> net::awaitable<void> {
         auto prepared = co_await proxy::uot::ReadUotRequestHeader(
-            proxy::uot::Version::V1, source, {}, ErrorCode::PROTOCOL_DECODE_FAILED);
+            proxy::uot::Version::V1, source, {});
         Check(prepared.has_value() && prepared->destination.SameEndpoint(target),
               "UoT v1 first empty UDP message was mistaken for EOF");
         auto empty = std::move(prepared->initial_decoded);
@@ -452,16 +452,16 @@ TEST(UotSs2022, NonConnectRequestAndPackets) {
     });
 
     FragmentReader source(capture.bytes, {1, 2, 1, 3, 2, 5, 1, 4});
-    buf::MultiBuffer pending;
     ::Run([&]() -> net::awaitable<void> {
-        auto decoded_request = co_await proxy::uot::ReadRequest(source, pending);
+        auto decoded_request = co_await proxy::uot::ReadUotRequestHeader(
+            proxy::uot::Version::V2, source, {});
         Check(decoded_request.has_value(), "fragmented UoT request decode failed");
         Check(!decoded_request->is_connect &&
               decoded_request->destination.host == "dns.example" &&
               decoded_request->destination.port == 53,
               "fragmented UoT request target mismatch");
 
-        proxy::uot::PacketReader reader(source, false, decoded_request->destination, std::move(pending));
+        proxy::uot::PacketReader reader(source, std::move(*decoded_request));
         auto first = co_await reader.ReadMultiBuffer();
         auto next = co_await reader.ReadMultiBuffer();
         Check(Flatten(first) == std::vector<uint8_t>({'o','n','e'}),
@@ -666,7 +666,9 @@ TEST(UotSs2022, PacketEofBoundaries) {
                     auto eof = co_await reader.ReadMultiBuffer();
                     Check(eof.byte_size() == 0, "UoT boundary EOF returned data");
                 });
-            } catch (const IoSystemError&) {
+            } catch (const transport::LinkError& error) {
+                Check(error.code() == ErrorCode::PROTOCOL_DECODE_FAILED,
+                      "UoT truncated framing changed its error code");
                 failed = true;
             }
             Check(failed == (length != 0 && length != capture.bytes.size()),

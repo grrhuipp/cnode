@@ -1,4 +1,9 @@
 #include "transport/internet/hysteria/hysteria_ingress.hpp"
+#include "transport/internet/hysteria/hysteria_connection.hpp"
+#include "transport/internet/tls_stream.hpp"
+#include "transport/failure.hpp"
+#include <linux/filter.h>
+#include <sys/socket.h>
 #include "common/scoped_cleanse.hpp"
 
 #include "app/proxyman/inbound/user_store.hpp"
@@ -16,10 +21,8 @@
 #include "infra/log.hpp"
 #include "transport/internet/transport_stack.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
-#include "transport/internet/reality_tls.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "common/awaitable_task_group.hpp"
-#include "app/worker/udp_receive_loop.hpp"
 #include "transport/internet/datagram_socket.hpp"
 
 #include <nghttp3/nghttp3.h>
@@ -50,6 +53,46 @@
 
 namespace transport::internet::hysteria {
 
+ConnectionId::ConnectionId(const ngtcp2_cid& cid) noexcept
+    : ConnectionId(cid.data, cid.datalen) {}
+
+void EncodeWorkerServerCid(ngtcp2_cid& cid, size_t length, uint32_t worker_id) noexcept {
+    cid.datalen = length;
+    if (length >= 3) {
+        cid.data[0] = kServerCidMagic0;
+        cid.data[1] = kServerCidMagic1;
+        cid.data[2] = static_cast<uint8_t>(worker_id);
+    }
+}
+
+bool AttachQuicReuseportBpf(int fd, uint32_t worker_count) noexcept {
+    const uint32_t count = std::max<uint32_t>(1, worker_count);
+    // 长短头均识别签发的 DCID；其他 Initial 按随机 DCID 前缀散列。
+    std::array<sock_filter, 15> instructions{{
+        {BPF_LD | BPF_B | BPF_ABS, 0, 0, 0},
+        {BPF_JMP | BPF_JSET | BPF_K, 4, 0, 0x80},
+        {BPF_LD | BPF_H | BPF_ABS, 0, 0, 1},
+        {BPF_JMP | BPF_JEQ | BPF_K, 0, 8, kServerCidMagicWord},
+        {BPF_LD | BPF_B | BPF_ABS, 0, 0, 3},
+        {BPF_JMP | BPF_JA, 0, 0, 5},
+        {BPF_LD | BPF_B | BPF_ABS, 0, 0, 5},
+        {BPF_JMP | BPF_JEQ | BPF_K, 0, 4, static_cast<uint32_t>(kServerConnectionIdLength)},
+        {BPF_LD | BPF_H | BPF_ABS, 0, 0, 6},
+        {BPF_JMP | BPF_JEQ | BPF_K, 0, 2, kServerCidMagicWord},
+        {BPF_LD | BPF_B | BPF_ABS, 0, 0, 8},
+        {BPF_JMP | BPF_JGE | BPF_K, 0, 2, count},
+        {BPF_LD | BPF_W | BPF_ABS, 0, 0, 6},
+        {BPF_ALU | BPF_MOD | BPF_K, 0, 0, count},
+        {BPF_RET | BPF_A, 0, 0, 0},
+    }};
+    sock_fprog program{
+        .len = static_cast<unsigned short>(instructions.size()),
+        .filter = instructions.data(),
+    };
+    return ::setsockopt(fd, SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF,
+                        &program, sizeof(program)) == 0;
+}
+
 namespace {
 
 
@@ -79,7 +122,6 @@ const ngtcp2_mem kQuicMemory{
     nullptr, &AllocateQuicMemory, &FreeQuicMemory, &CallocateQuicMemory, &ReallocateQuicMemory};
 const nghttp3_mem kHttp3Memory{
     nullptr, &AllocateQuicMemory, &FreeQuicMemory, &CallocateQuicMemory, &ReallocateQuicMemory};
-constexpr size_t kMaxPacketSize = 64 * 1024;
 constexpr size_t kMaxQueuedSocketPackets = 1024;
 constexpr size_t kMaxConnections = 65536;
 constexpr size_t kMaxStreamHeaderBytes = 8192;
@@ -110,58 +152,6 @@ constexpr uint64_t kMaxStreams = 1024;
     return maximum - now < delay ? maximum : now + delay;
 }
 
-[[nodiscard]] std::chrono::steady_clock::time_point ExpiryTimePoint(
-    ngtcp2_tstamp timestamp) noexcept {
-    constexpr auto kMaxNanoseconds = static_cast<ngtcp2_tstamp>(
-        std::chrono::steady_clock::time_point::max().time_since_epoch().count());
-    if (timestamp >= kMaxNanoseconds)
-        return std::chrono::steady_clock::time_point::max();
-    return std::chrono::steady_clock::time_point(
-        std::chrono::nanoseconds(static_cast<std::chrono::nanoseconds::rep>(timestamp)));
-}
-
-int SelectAlpn(SSL*, const uint8_t** out, uint8_t* outlen,
-               const uint8_t* input, unsigned input_length, void* argument) {
-    const auto expected = *static_cast<const std::string_view*>(argument);
-    const uint8_t* current = input;
-    const uint8_t* end = input + input_length;
-    while (current < end) {
-        const size_t length = *current++;
-        if (static_cast<size_t>(end - current) < length) return SSL_TLSEXT_ERR_ALERT_FATAL;
-        if (length == expected.size() &&
-            std::memcmp(current, expected.data(), length) == 0) {
-            *out = current;
-            *outlen = static_cast<uint8_t>(length);
-            return SSL_TLSEXT_ERR_OK;
-        }
-        current += length;
-    }
-    return SSL_TLSEXT_ERR_ALERT_FATAL;
-}
-
-[[nodiscard]] SslContextPtr BuildSslContext(
-    const StreamSettings& stream_settings, Version version) {
-    if (!stream_settings.IsTls() || !stream_settings.tls.pem ||
-        !stream_settings.tls.HasCertificatePair()) {
-        LOG_ERROR("Hysteria requires a prepared TLS certificate and private key");
-        return {};
-    }
-    SslContextPtr context{SSL_CTX_new(TLS_server_method())};
-    if (!context ||
-        ngtcp2_crypto_boringssl_configure_server_context(context.get()) != 0 ||
-        !ConfigureTlsCertificatePem(
-            context.get(), *stream_settings.tls.pem)) {
-        LOG_ERROR("failed to build Hysteria QUIC TLS context");
-        return {};
-    }
-    SSL_CTX_set_min_proto_version(context.get(), TLS1_3_VERSION);
-    static constexpr std::string_view kV1Alpn = "hysteria";
-    static constexpr std::string_view kV2Alpn = "h3";
-    auto* alpn = const_cast<std::string_view*>(
-        version == Version::V1 ? &kV1Alpn : &kV2Alpn);
-    SSL_CTX_set_alpn_select_cb(context.get(), &SelectAlpn, alpn);
-    return context;
-}
 
 [[nodiscard]] ngtcp2_addr MakeAddress(const udp::endpoint& endpoint) noexcept {
     return ngtcp2_addr{
@@ -188,136 +178,6 @@ int SelectAlpn(SSL*, const uint8_t** out, uint8_t* outlen,
     return output;
 }
 
-void AppendU16(memory::ByteVector& output, uint16_t value) {
-    std::array<uint8_t, 2> bytes{};
-    StoreU16BE(bytes.data(), value);
-    output.insert(output.end(), bytes.begin(), bytes.end());
-}
-
-void AppendU32(memory::ByteVector& output, uint32_t value) {
-    std::array<uint8_t, 4> bytes{};
-    StoreU32BE(bytes.data(), value);
-    output.insert(output.end(), bytes.begin(), bytes.end());
-}
-
-void AppendU64(memory::ByteVector& output, uint64_t value) {
-    std::array<uint8_t, 8> bytes{};
-    StoreU64BE(bytes.data(), value);
-    output.insert(output.end(), bytes.begin(), bytes.end());
-}
-
-bool AppendVarint(memory::ByteVector& output, uint64_t value) {
-    const size_t width = QuicVarintSize(value);
-    if (width == 0) return false;
-    const uint8_t prefix = static_cast<uint8_t>(
-        (width == 1 ? 0 : width == 2 ? 1 : width == 4 ? 2 : 3) << 6);
-    output.push_back(static_cast<uint8_t>((value >> ((width - 1) * 8)) | prefix));
-    for (size_t i = 1; i < width; ++i)
-        output.push_back(static_cast<uint8_t>(value >> ((width - 1 - i) * 8)));
-    return true;
-}
-
-[[nodiscard]] std::string_view TargetHost(
-    const TargetAddress& target, std::optional<iputil::AddressText>& storage) {
-    if (target.IsDomain()) return {target.host.data(), target.host.size()};
-    if (!target.resolved_addr) return {};
-    storage.emplace(*target.resolved_addr);
-    return storage->View();
-}
-
-[[nodiscard]] tl::expected<TargetAddress, ProtocolError>
-ParseV1Target(std::span<const uint8_t> host, uint16_t port) {
-    if (host.empty() || host.size() > kMaxAddressLength || port == 0)
-        return tl::unexpected(ProtocolError::Invalid);
-    TargetAddress target(
-        std::string_view(reinterpret_cast<const char*>(host.data()), host.size()), port);
-    if (!target.IsValid()) return tl::unexpected(ProtocolError::Invalid);
-    return target;
-}
-
-[[nodiscard]] bool ValidFragmentIndex(Version version, uint8_t index, uint8_t count) noexcept {
-    // HY2 declares Fragment ID irrelevant for an unfragmented packet.
-    return count != 0 && ((version == Version::V2 && count == 1) || index < count);
-}
-
-[[nodiscard]] bool RequiresUdpTarget(Version version, uint8_t index, uint8_t count) noexcept {
-    return version == Version::V1 || count == 1 || index == 0;
-}
-
-struct UdpTargetText {
-    // host 借用调用方的 target 或 address_storage，只用于同步计长与编码。
-    std::string_view host;
-    std::array<char, 5> port{};
-    size_t port_size = 0;
-    size_t authority_size = 0;
-    bool bracket_v6 = false;
-};
-
-[[nodiscard]] tl::expected<UdpTargetText, ProtocolError> PrepareUdpTargetText(
-    Version version, const TargetAddress& target,
-    std::optional<iputil::AddressText>& address_storage) {
-    UdpTargetText text;
-    if (target.IsValid()) text.host = TargetHost(target, address_storage);
-    if (version == Version::V1) {
-        if (text.host.empty() || text.host.size() > kMaxAddressLength)
-            return tl::unexpected(ProtocolError::Invalid);
-        return text;
-    }
-    if (text.host.empty()) return text;
-    const auto [end, error] = std::to_chars(
-        text.port.data(), text.port.data() + text.port.size(), target.port);
-    if (error != std::errc{}) return tl::unexpected(ProtocolError::Invalid);
-    text.port_size = static_cast<size_t>(end - text.port.data());
-    text.bracket_v6 = text.host.find(':') != std::string_view::npos;
-    const size_t suffix = (text.bracket_v6 ? 2 : 0) + 1 + text.port_size;
-    if (text.host.size() > std::numeric_limits<size_t>::max() - suffix)
-        return tl::unexpected(ProtocolError::TooLarge);
-    text.authority_size = text.host.size() + suffix;
-    return text;
-}
-
-[[nodiscard]] tl::expected<size_t, ProtocolError> UdpHeaderSize(
-    Version version, const UdpTargetText& text) {
-    if (version == Version::V1) return 14 + text.host.size();
-    const size_t width = QuicVarintSize(text.authority_size);
-    if (width == 0 ||
-        text.authority_size > std::numeric_limits<size_t>::max() - 8 - width)
-        return tl::unexpected(ProtocolError::TooLarge);
-    return 8 + width + text.authority_size;
-}
-
-// |message.target| is not read: |text| and |port| carry the destination.
-[[nodiscard]] tl::expected<memory::ByteVector, ProtocolError> EncodeUdpMessageTo(
-    Version version, const UdpMessage& message, const UdpTargetText& text,
-    uint16_t port, size_t header_size) {
-    memory::ByteVector output;
-    output.reserve(header_size + message.payload.size());
-    AppendU32(output, message.session_id);
-    if (version == Version::V1) {
-        AppendU16(output, static_cast<uint16_t>(text.host.size()));
-        output.insert(output.end(), text.host.begin(), text.host.end());
-        AppendU16(output, port);
-        AppendU16(output, message.packet_id);
-        output.push_back(message.fragment_id);
-        output.push_back(message.fragment_count);
-        AppendU16(output, static_cast<uint16_t>(message.payload.size()));
-    } else {
-        AppendU16(output, message.packet_id);
-        output.push_back(message.fragment_id);
-        output.push_back(message.fragment_count);
-        if (!AppendVarint(output, text.authority_size))
-            return tl::unexpected(ProtocolError::TooLarge);
-        if (!text.host.empty()) {
-            if (text.bracket_v6) output.push_back('[');
-            output.insert(output.end(), text.host.begin(), text.host.end());
-            if (text.bracket_v6) output.push_back(']');
-            output.push_back(':');
-            output.insert(output.end(), text.port.data(), text.port.data() + text.port_size);
-        }
-    }
-    output.insert(output.end(), message.payload.begin(), message.payload.end());
-    return output;
-}
 
 }  // namespace
 
@@ -344,7 +204,8 @@ const proxyman::inbound::ReceiverSettings& HysteriaIngress::Receiver() const noe
 
 Connection::Connection(
     HysteriaIngress& listener, SocketState& socket, const udp::endpoint& remote)
-    : listener_(&listener)
+    : TimeoutEvent(listener.io)
+    , listener_(&listener)
     , closed_signal_(listener.io.get_executor(), 1)
     , core_(std::in_place)
     , physical_ready_(listener.io.get_executor(), 1) {
@@ -378,10 +239,6 @@ std::shared_ptr<Connection> Connection::Create(
                 connection->Close();
                 owner->sessions.erase(connection.get());
                 MaybeShrinkHashContainer(owner->sessions);
-                if (owner->sessions.empty()) {
-                    owner->armed_expiry = std::numeric_limits<ngtcp2_tstamp>::max();
-                    owner->expiry.cancel();
-                }
                 --owner->tasks;
                 owner->changed.cancel();
                 if (error && !IsOperationCancelled(error))
@@ -539,7 +396,7 @@ bool Connection::Initialize(const ngtcp2_pkt_hd& header) {
         return false;
 
     core_->conn_ref = {&GetConn, this};
-    core_->ssl = SSL_new(listener_->ssl_context.get());
+    core_->ssl = SSL_new(listener_->ssl_context->Native());
     if (!core_->ssl) return false;
     SSL_set_app_data(core_->ssl, &core_->conn_ref);
     SSL_set_accept_state(core_->ssl);
@@ -595,9 +452,39 @@ SocketState* Connection::OutputSocket(const ngtcp2_path& path) const noexcept {
 }
 
 void Connection::PublishExpiry() noexcept {
-    expiry_ = Expiry();
-    if (expiry_ < listener_->armed_expiry) {
-        listener_->ArmExpiryAt(expiry_);
+    if (closed_) return;
+    const auto deadline = Expiry();
+    if (deadline == std::numeric_limits<ngtcp2_tstamp>::max()) {
+        TimeoutEvent::Cancel();
+        return;
+    }
+    const auto now = Timestamp();
+    const auto remaining = std::min<ngtcp2_tstamp>(
+        deadline > now ? deadline - now : 0,
+        std::chrono::nanoseconds::max().count());
+    const auto delay = std::chrono::ceil<std::chrono::milliseconds>(
+        std::chrono::nanoseconds(remaining));
+    try {
+        if (!ScheduleAfter(delay)) Close();
+    } catch (...) {
+        Close();
+    }
+}
+
+void Connection::OnTimeout() {
+    // 到期回调可能关闭连接，整个回调期间固定其寿命。
+    auto keep_alive = shared_from_this();
+    try {
+        OnExpiry();
+    } catch (...) {
+        const auto reason = transport::ClassifyFailure(
+            std::current_exception(), ErrorCode::INTERNAL);
+        Close();
+        listener_->environment.stats->OnError();
+        try {
+            LOG_ERROR("Hysteria expiry failed worker={} > {}",
+                      listener_->worker_id, ErrorCodeToString(reason));
+        } catch (...) {}
     }
 }
 
@@ -1080,6 +967,7 @@ void Connection::Flush() {
 void Connection::Close() noexcept {
     if (closed_) return;
     closed_ = true;
+    TimeoutEvent::Cancel();
     ExpireUdpFragments(std::numeric_limits<ngtcp2_tstamp>::max());
     if (core_) {
         // Native QUIC still borrows output until Run drains I/O and destroys
@@ -1274,7 +1162,7 @@ void Connection::StartRawStream(int64_t stream_id, StreamRecord& stream) {
         }
     }
     stream.delivered = true;
-    SpawnOwned(DeliverStream(std::make_unique<QuicStream>(stream.state)));
+    SpawnOwned(DeliverStream(std::make_unique<QuicStream>(stream.state), {}));
 }
 
 void Connection::OpenV1UdpSession(
@@ -1293,10 +1181,11 @@ void Connection::OpenV1UdpSession(
     Flush();
 }
 
-net::awaitable<void> Connection::DeliverStream(std::unique_ptr<AsyncStream> stream) {
+net::awaitable<void> Connection::DeliverStream(
+    std::unique_ptr<AsyncStream> stream, InboundTransportMetadata metadata) {
     auto sink = stream_sink_;
     if (!sink) co_return;
-    co_await sink->OnInboundTransportStream(std::move(stream), InboundTransportMetadata{});
+    co_await sink->OnInboundTransportStream(std::move(stream), std::move(metadata));
 }
 
 net::awaitable<void> Connection::RunV1Control(int64_t stream_id) {
@@ -1551,10 +1440,11 @@ void Connection::DeliverUdpPacket(
     }
     if (core_->udp_sessions.size() >= kMaxUdpSessions) return;
     auto session = std::make_unique<UdpSessionStream>(
-        Reactor(), session_id, target, weak_from_this());
+        Reactor(), session_id, weak_from_this());
     if (!session->Push(target, payload)) return;
     core_->udp_sessions.emplace(session_id, session.get());
-    SpawnOwned(DeliverStream(std::move(session)));
+    SpawnOwned(DeliverStream(std::move(session),
+        InboundTransportMetadata{.real_ip = {}, .udp_session_target = target}));
 }
 
 bool Connection::SendUdpMessage(
@@ -1575,7 +1465,7 @@ bool Connection::SendUdpMessage(
     std::optional<iputil::AddressText> address_storage;
     const auto text = PrepareUdpTargetText(version, target, address_storage);
     if (!text) return false;
-    const auto header_size = UdpHeaderSize(version, *text);
+    const auto header_size = UdpTargetHeaderSize(version, *text);
     if (!header_size || *header_size > message_budget) return false;
     const size_t fragment_payload = message_budget - *header_size;
     if (!payload.empty() && fragment_payload == 0) return false;
@@ -1600,8 +1490,7 @@ bool Connection::SendUdpMessage(
             message.fragment_id = static_cast<uint8_t>(index);
             message.payload = payload.subspan(
                 offset, std::min(fragment_payload, payload.size() - offset));
-            auto encoded = EncodeUdpMessageTo(
-                version, message, *text, target.port, *header_size);
+            auto encoded = EncodeUdpFragment(version, message, *text, *header_size);
             if (!encoded) {
                 while (core_->datagrams.size() > initial_datagrams)
                     core_->datagrams.pop_back();
@@ -1630,14 +1519,23 @@ HysteriaIngress::HysteriaIngress(
     app::DatagramSessionEnvironment environment_value)
     : environment(std::move(environment_value)),
       worker_id(worker_id_value), io(io_value),
-      changed(io, std::chrono::steady_clock::time_point::max()), expiry(io) {
+      changed(io, std::chrono::steady_clock::time_point::max()) {
     const auto* settings = GetSettings(*environment.prepared);
     if (!settings) throw std::invalid_argument("missing Hysteria settings");
     version = settings->version;
     upload_bytes_per_second = settings->upload_bytes_per_second;
     download_bytes_per_second = settings->download_bytes_per_second;
-    ssl_context = BuildSslContext(Receiver().stream_settings, version);
-    if (!ssl_context) throw std::invalid_argument("invalid Hysteria TLS settings");
+    const auto& stream_settings = Receiver().stream_settings;
+    const std::vector<std::string> default_alpn{
+        version == Version::V2 ? "h3" : "hysteria"};
+    const auto& alpn = version == Version::V2 || stream_settings.tls.alpn.empty()
+        ? default_alpn : stream_settings.tls.alpn;
+    if (!stream_settings.IsTls())
+        throw std::invalid_argument("Hysteria requires TLS");
+    ssl_context = SslContext::CreateQuicServer(stream_settings.tls, alpn);
+    if (!ssl_context ||
+        ngtcp2_crypto_boringssl_configure_server_context(ssl_context->Native()) != 0)
+        throw std::invalid_argument("invalid Hysteria TLS settings");
 }
 
 HysteriaIngress::~HysteriaIngress() noexcept { RequestStop(); }
@@ -1721,77 +1619,39 @@ SocketState* HysteriaIngress::Resolve(const udp::endpoint& local) noexcept {
 
 
 net::awaitable<void> HysteriaIngress::ReceiveLoop(std::shared_ptr<SocketState> socket) {
-    ::detail::UdpReceiveBuffer receive_buffer;
-    while (!stopping && socket->socket && socket->socket->is_open()) {
-        receive_buffer.Release();
-        auto [wait_error] = co_await socket->socket->async_wait(
-            udp::socket::wait_read, net::as_tuple(net::use_awaitable));
-        if (wait_error == net::error::operation_aborted || stopping ||
-            !socket->socket || !socket->socket->is_open()) {
-            co_return;
+    return RunUdpReceiveLoop(socket->socket,
+        [this, socket](const std::shared_ptr<udp::socket>& current) noexcept {
+            return !stopping && socket->socket == current && current && current->is_open();
+        },
+        [this, socket](const udp::endpoint& remote, std::span<const uint8_t> packet) {
+            ProcessPacket(*socket, remote, packet);
+        },
+        [this]() noexcept { environment.stats->OnError(); });
+}
+
+void HysteriaIngress::ProcessPacket(
+    SocketState& socket, const udp::endpoint& remote, std::span<const uint8_t> packet) {
+    if (packet.empty()) return;
+    ngtcp2_version_cid version_cid{};
+    if (ngtcp2_pkt_decode_version_cid(&version_cid, packet.data(), packet.size(),
+                                     kServerConnectionIdLength) != 0 ||
+        version_cid.dcidlen > NGTCP2_MAX_CIDLEN) return;
+    const ConnectionId cid(version_cid.dcid, version_cid.dcidlen);
+    auto found = connections.find(cid);
+    auto connection = found == connections.end() ? nullptr : found->second;
+    if (!connection) {
+        if ((packet[0] & 0x80) == 0) return;
+        if (connections.size() >= kMaxConnections) {
+            LOG_DEBUG("Hysteria listener connection capacity reached worker={}", worker_id);
+            return;
         }
-        if (wait_error) continue;
-        try {
-            IoErrorCode error;
-            const size_t datagram_size = PeekDatagramSize(*socket->socket, error);
-            // A probe error is either an empty queue or a pending socket error
-            // that the probe has already reported and cleared.
-            if (error) continue;
-            if (datagram_size == 0 || datagram_size > kMaxPacketSize) {
-                std::array<uint8_t, 1> discard{};
-                (void)socket->socket->receive_from(
-                    net::buffer(discard), socket->remote, 0, error);
-                if (error == net::error::operation_aborted) co_return;
-                continue;
-            }
-            const auto storage = receive_buffer.Prepare(datagram_size);
-            if (storage.size() == 0) {
-                std::array<uint8_t, 1> discard{};
-                (void)socket->socket->receive_from(
-                    net::buffer(discard), socket->remote, 0, error);
-                if (error == net::error::operation_aborted) co_return;
-                continue;
-            }
-            const size_t bytes = socket->socket->receive_from(
-                storage, socket->remote, MSG_TRUNC, error);
-            if (error == net::error::operation_aborted) co_return;
-            if (error || bytes == 0 || bytes > storage.size()) continue;
-            const auto packet = receive_buffer.Data(bytes);
-            ngtcp2_version_cid version_cid{};
-            if (ngtcp2_pkt_decode_version_cid(
-                    &version_cid, packet.data(), packet.size(),
-                    kServerConnectionIdLength) != 0)
-                continue;
-            if (version_cid.dcidlen > NGTCP2_MAX_CIDLEN) continue;
-            const ConnectionId cid(version_cid.dcid, version_cid.dcidlen);
-            auto found = connections.find(cid);
-            std::shared_ptr<Connection> connection =
-                found == connections.end() ? nullptr : found->second;
-            if (!connection) {
-                if ((packet[0] & 0x80) == 0) continue;
-                if (connections.size() >= kMaxConnections) {
-                    LOG_DEBUG("Hysteria listener connection capacity reached worker={}", worker_id);
-                    continue;
-                }
-                ngtcp2_pkt_hd header{};
-                if (ngtcp2_accept(&header, packet.data(), packet.size()) != 0) continue;
-                connection = Connection::Create(*this, *socket, socket->remote, header);
-                if (!connection) continue;
-            }
-            if (connection->core_ && connection->core_->quic &&
-                !connection->Closed()) {
-                connection->Feed(*socket, socket->remote, packet);
-            }
-        } catch (const std::bad_alloc&) {
-            if (stopping) co_return;
-        } catch (const std::exception& failure) {
-            if (stopping) co_return;
-            try { LOG_DEBUG("Hysteria packet dropped worker={} reason={}", worker_id, failure.what()); }
-            catch (...) {}
-        } catch (...) {
-            if (stopping) co_return;
-        }
+        ngtcp2_pkt_hd header{};
+        if (ngtcp2_accept(&header, packet.data(), packet.size()) != 0) return;
+        connection = Connection::Create(*this, socket, remote, header);
+        if (!connection) return;
     }
+    if (connection->core_ && connection->core_->quic && !connection->Closed())
+        connection->Feed(socket, remote, packet);
 }
 
 net::awaitable<void> HysteriaIngress::SendLoop(std::shared_ptr<SocketState> socket) {
@@ -1815,55 +1675,6 @@ net::awaitable<void> HysteriaIngress::SendLoop(std::shared_ptr<SocketState> sock
     }
 }
 
-void HysteriaIngress::ArmExpiryAt(ngtcp2_tstamp deadline) {
-    const auto expiry_time = ExpiryTimePoint(deadline);
-    if (expiry_time == std::chrono::steady_clock::time_point::max()) {
-        return;
-    }
-    armed_expiry = deadline;
-    expiry.expires_at(expiry_time);
-    if (!expiry_running) {
-        expiry_running = true;
-        Spawn(ExpiryLoop());
-    }
-}
-
-net::awaitable<void> HysteriaIngress::ExpiryLoop() {
-    while (!stopping && !sessions.empty()) {
-        auto [error] = co_await expiry.async_wait(
-            net::as_tuple(net::use_awaitable));
-        if (error == net::error::operation_aborted) {
-            if (stopping || sessions.empty()) break;
-            continue;
-        }
-        const auto now = Timestamp();
-        armed_expiry = now;
-        memory::Vector<std::shared_ptr<Connection>> due;
-        for (const auto& [raw, connection] : sessions) {
-            (void)raw;
-            if (!connection->Closed() && connection->expiry_ <= now)
-                due.push_back(connection);
-        }
-        for (auto& connection : due) {
-            connection->expiry_ = std::numeric_limits<ngtcp2_tstamp>::max();
-            connection->OnExpiry();
-        }
-
-        ngtcp2_tstamp nearest =
-            std::numeric_limits<ngtcp2_tstamp>::max();
-        for (const auto& [raw, connection] : sessions) {
-            (void)raw;
-            if (!connection->Closed())
-                nearest = std::min(nearest, connection->expiry_);
-        }
-        const auto expiry_time = ExpiryTimePoint(nearest);
-        if (expiry_time == std::chrono::steady_clock::time_point::max()) break;
-        armed_expiry = nearest;
-        expiry.expires_at(expiry_time);
-    }
-    armed_expiry = std::numeric_limits<ngtcp2_tstamp>::max();
-    expiry_running = false;
-}
 
 HysteriaIngress::SocketPtr HysteriaIngress::MakeSocket() {
     return std::make_shared<udp::socket>(io);
@@ -1902,7 +1713,6 @@ void HysteriaIngress::RequestStop() noexcept {
     if (stopping) return;
     stopping = true;
     IoErrorCode ignored;
-    expiry.cancel();
     changed.cancel();
     for (auto& [key, socket] : sockets) {
         (void)key;
@@ -2163,9 +1973,8 @@ bool QuicStream::IsOpen() const {
 
 UdpSessionStream::UdpSessionStream(
     net::io_context& io_context, uint32_t session_id,
-    TargetAddress first_target, std::weak_ptr<Connection> owner)
+    std::weak_ptr<Connection> owner)
     : session_id_(session_id)
-    , first_target_(std::move(first_target))
     , owner_(std::move(owner))
     , signal_(io_context.get_executor(), 1)
     , deadline_(io_context, *this) {}
@@ -2280,199 +2089,5 @@ void UdpSessionStream::WakeReader() noexcept {
     (void)signal_.try_send(IoErrorCode{});
 }
 
-tl::expected<V1ClientHello, ProtocolError>
-ParseV1ClientHello(std::span<const uint8_t> input) {
-    ByteReader reader(input);
-    const uint8_t version = reader.ReadU8();
-    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-    if (version != kV1ProtocolVersion)
-        return tl::unexpected(ProtocolError::UnsupportedVersion);
-    const uint64_t send_bps = reader.ReadU64BE();
-    const uint64_t receive_bps = reader.ReadU64BE();
-    const uint16_t auth_size = reader.ReadU16BE();
-    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-    if (auth_size > kMaxAuthLength) return tl::unexpected(ProtocolError::TooLarge);
-    const auto auth = reader.ReadBytes(auth_size);
-    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-    if (!reader.Empty()) return tl::unexpected(ProtocolError::Invalid);
-    V1ClientHello hello;
-    hello.send_bps = send_bps;
-    hello.receive_bps = receive_bps;
-    hello.auth.assign(reinterpret_cast<const char*>(auth.data()), auth.size());
-    return hello;
-}
-
-memory::ByteVector EncodeV1ServerHello(
-    bool accepted, uint64_t send_bps, uint64_t receive_bps, std::string_view message) {
-    message = message.substr(0, std::min(message.size(), kMaxMessageLength));
-    memory::ByteVector output;
-    output.reserve(19 + message.size());
-    output.push_back(accepted ? 1 : 0);
-    AppendU64(output, send_bps);
-    AppendU64(output, receive_bps);
-    AppendU16(output, static_cast<uint16_t>(message.size()));
-    output.insert(output.end(), message.begin(), message.end());
-    return output;
-}
-
-tl::expected<V1Request, ProtocolError>
-ParseV1Request(std::span<const uint8_t> input) {
-    ByteReader reader(input);
-    const uint8_t udp = reader.ReadU8();
-    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-    if (udp > 1) return tl::unexpected(ProtocolError::Invalid);
-    const uint16_t host_size = reader.ReadU16BE();
-    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-    if (host_size > kMaxAddressLength)
-        return tl::unexpected(ProtocolError::TooLarge);
-    const auto host = reader.ReadBytes(host_size);
-    const uint16_t port = reader.ReadU16BE();
-    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-    if (udp != 0 && host.empty() && port == 0)
-        return V1Request{true, {}, reader.Position()};
-    if (host.empty()) return tl::unexpected(ProtocolError::Invalid);
-    auto target = ParseV1Target(host, port);
-    if (!target) return tl::unexpected(target.error());
-    return V1Request{udp != 0, std::move(*target), reader.Position()};
-}
-
-memory::ByteVector EncodeV1Response(
-    bool accepted, uint32_t udp_session_id, std::string_view message) {
-    message = message.substr(0, std::min(message.size(), kMaxMessageLength));
-    memory::ByteVector output;
-    output.reserve(7 + message.size());
-    output.push_back(accepted ? 1 : 0);
-    AppendU32(output, udp_session_id);
-    AppendU16(output, static_cast<uint16_t>(message.size()));
-    output.insert(output.end(), message.begin(), message.end());
-    return output;
-}
-
-tl::expected<V2TcpRequest, ProtocolError>
-ParseV2TcpRequest(std::span<const uint8_t> input) {
-    ByteReader reader(input);
-    const auto request_type = reader.ReadQuicVarint();
-    if (!request_type) return tl::unexpected(ProtocolError::Incomplete);
-    if (*request_type != kV2TcpRequestType) return tl::unexpected(ProtocolError::Invalid);
-    const auto address_size = reader.ReadQuicVarint();
-    if (!address_size) return tl::unexpected(ProtocolError::Incomplete);
-    if (*address_size == 0 || *address_size > kMaxAddressLength)
-        return tl::unexpected(ProtocolError::TooLarge);
-    const auto address = reader.ReadBytes(static_cast<size_t>(*address_size));
-    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-    const auto padding_size = reader.ReadQuicVarint();
-    if (!padding_size) return tl::unexpected(ProtocolError::Incomplete);
-    if (*padding_size > kMaxPaddingLength) return tl::unexpected(ProtocolError::TooLarge);
-    if (!reader.Skip(static_cast<size_t>(*padding_size)))
-        return tl::unexpected(ProtocolError::Incomplete);
-    const auto text = std::string_view(
-        reinterpret_cast<const char*>(address.data()), address.size());
-    auto target = TargetAddress::Parse(text);
-    if (!target) return tl::unexpected(ProtocolError::Invalid);
-    return V2TcpRequest{std::move(*target), reader.Position()};
-}
-
-tl::expected<UdpMessage, ProtocolError>
-ParseUdpMessage(Version version, std::span<const uint8_t> input) {
-    ByteReader reader(input);
-    const uint32_t session_id = reader.ReadU32BE();
-    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-
-    UdpMessage result;
-    result.session_id = session_id;
-    if (version == Version::V1) {
-        const uint16_t host_size = reader.ReadU16BE();
-        if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-        if (host_size == 0 || host_size > kMaxAddressLength)
-            return tl::unexpected(ProtocolError::TooLarge);
-        const auto host = reader.ReadBytes(host_size);
-        const uint16_t port = reader.ReadU16BE();
-        if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-        auto target = ParseV1Target(host, port);
-        if (!target) return tl::unexpected(target.error());
-        result.target = std::move(*target);
-        const uint16_t packet_id = reader.ReadU16BE();
-        const uint8_t fragment_id = reader.ReadU8();
-        const uint8_t fragment_count = reader.ReadU8();
-        const uint16_t payload_size = reader.ReadU16BE();
-        if (!reader.Ok())
-            return tl::unexpected(ProtocolError::Incomplete);
-        if (!ValidFragmentIndex(version, fragment_id, fragment_count))
-            return tl::unexpected(ProtocolError::Invalid);
-        if (payload_size > kMaxUdpPayloadLength)
-            return tl::unexpected(ProtocolError::TooLarge);
-        const auto payload = reader.ReadBytes(payload_size);
-        if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-        if (!reader.Empty()) return tl::unexpected(ProtocolError::Invalid);
-        result.packet_id = packet_id;
-        result.fragment_id = fragment_id;
-        result.fragment_count = fragment_count;
-        result.payload = payload;
-        return result;
-    }
-
-    const uint16_t packet_id = reader.ReadU16BE();
-    const uint8_t fragment_id = reader.ReadU8();
-    const uint8_t fragment_count = reader.ReadU8();
-    const auto address_size = reader.ReadQuicVarint();
-    if (!reader.Ok() || !address_size)
-        return tl::unexpected(ProtocolError::Incomplete);
-    if (!ValidFragmentIndex(version, fragment_id, fragment_count))
-        return tl::unexpected(ProtocolError::Invalid);
-    if (*address_size > kMaxAddressLength)
-        return tl::unexpected(ProtocolError::TooLarge);
-    const auto address = reader.ReadBytes(static_cast<size_t>(*address_size));
-    if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
-    if (!address.empty()) {
-        const auto text = std::string_view(
-            reinterpret_cast<const char*>(address.data()), address.size());
-        auto target = TargetAddress::Parse(text);
-        if (!target) return tl::unexpected(ProtocolError::Invalid);
-        result.target = std::move(*target);
-    } else if (RequiresUdpTarget(version, fragment_id, fragment_count)) {
-        return tl::unexpected(ProtocolError::Invalid);
-    }
-    if (reader.Remaining() > kMaxUdpPayloadLength)
-        return tl::unexpected(ProtocolError::TooLarge);
-    result.packet_id = packet_id;
-    result.fragment_id = fragment_id;
-    result.fragment_count = fragment_count;
-    result.payload = reader.ReadBytes(reader.Remaining());
-    return result;
-}
-
-tl::expected<size_t, ProtocolError>
-UdpMessageHeaderSize(Version version, const TargetAddress& target) {
-    std::optional<iputil::AddressText> address_storage;
-    const auto text = PrepareUdpTargetText(version, target, address_storage);
-    if (!text) return tl::unexpected(text.error());
-    return UdpHeaderSize(version, *text);
-}
-
-tl::expected<memory::ByteVector, ProtocolError>
-EncodeUdpMessage(Version version, const UdpMessage& message) {
-    if (!ValidFragmentIndex(version, message.fragment_id, message.fragment_count) ||
-        message.payload.size() > kMaxUdpPayloadLength)
-        return tl::unexpected(ProtocolError::Invalid);
-
-    std::optional<iputil::AddressText> address_storage;
-    const auto text = PrepareUdpTargetText(version, message.target, address_storage);
-    if (!text) return tl::unexpected(text.error());
-    if (text->host.empty() && RequiresUdpTarget(
-            version, message.fragment_id, message.fragment_count))
-        return tl::unexpected(ProtocolError::Invalid);
-    const auto header_size = UdpHeaderSize(version, *text);
-    if (!header_size) return tl::unexpected(header_size.error());
-    if (message.payload.size() > std::numeric_limits<size_t>::max() - *header_size)
-        return tl::unexpected(ProtocolError::TooLarge);
-    return EncodeUdpMessageTo(
-        version, message, *text, message.target.port, *header_size);
-}
-
-std::array<uint8_t, 32> HashCredential(std::string_view credential) noexcept {
-    std::array<uint8_t, 32> digest{};
-    SHA256(reinterpret_cast<const uint8_t*>(credential.data()), credential.size(), digest.data());
-    return digest;
-}
 
 }  // namespace transport::internet::hysteria

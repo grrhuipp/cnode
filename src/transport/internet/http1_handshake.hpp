@@ -1,9 +1,12 @@
 #pragma once
 
+#include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/const_buffer_span.hpp"
 #include "common/unsafe.hpp"
-#include "transport/internet/transport_stack.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/internet/stream_settings.hpp"
+#include "transport/internet/transport_build_result.hpp"
 
 #include <tl/expected.hpp>
 
@@ -96,7 +99,37 @@ void RecordExtractedRealIp(std::string_view head,
 [[nodiscard]] std::string_view PublicHttpTargetForLog(std::string_view value);
 [[nodiscard]] std::string_view PublicHttpMethodForLog(std::string_view value);
 [[nodiscard]] std::string SanitizeHttpRequestLineForLog(const Http1RequestLine& line);
-[[nodiscard]] std::string_view ExpectedHttpHost(const HttpConfig& cfg);
+
+// 服务端收到的一个 HTTP/1 请求头。视图借用 head 的存储块（地址固定），在该块
+// 存活期间有效，包括经 TakeReadAheadMultiBuffer 移交给后续读取方之后。
+struct Http1Request {
+    Http1MessageHead head;
+    std::string_view start_line;
+    Http1RequestLine line;
+    // Host 字段值，已去除首尾空白。
+    std::string_view host;
+};
+
+// HTTP、HTTPUpgrade、WebSocket 与 XHTTP 服务端共用的请求头前导：读取请求头、解析
+// 请求行与 Host，并以 `scope`（如 "HTTP server"）为日志前缀记录读失败原因与脱敏后的
+// 请求行。失败语义同 ReadHttp1MessageHead。
+[[nodiscard]] net::awaitable<tl::expected<Http1Request, ErrorCode>> ReadHttp1Request(
+    AsyncStream& stream,
+    std::string_view scope,
+    uint64_t conn_id,
+    std::span<const uint8_t> initial = {});
+
+// 配置了 `expected_host` 时，请求 Host 必须与之 ASCII 大小写无关相等；不符时记录
+// DEBUG 并返回 true。
+[[nodiscard]] bool RejectHostMismatch(std::string_view scope,
+                                      uint64_t conn_id,
+                                      std::string_view expected_host,
+                                      std::string_view host);
+
+// 握手直接运行在 TCP 或 TLS 之上：头部之后已读到的字节按序退回同一字节层，
+// TLS 明文绝不进入 TCP 密文队列。
+void MoveReadAhead(AsyncStream& stream, Http1MessageHead& head);
+
 void AppendRequestStart(memory::String& request,
                         std::string_view method,
                         std::string_view path,
@@ -139,9 +172,13 @@ ExecuteHttp1UpgradeClientHandshake(
     const HttpHeaders* headers = nullptr,
     std::string_view ws_key = {});
 
-// Returns false instead of throwing; the caller maps it to SOCKET_WRITE_FAILED.
+// Writes all of `bytes`. False when the write fails; the caller maps it to
+// SOCKET_WRITE_FAILED.
 [[nodiscard]] net::awaitable<bool> WriteFullToStream(AsyncStream& stream,
                                                      std::string_view bytes);
+// Fills `out` completely. False when the peer closes first; I/O errors throw.
+[[nodiscard]] net::awaitable<bool> ReadFullFromStream(AsyncStream& stream,
+                                                      std::span<uint8_t> out);
 
 // How a received HTTP/1 message body ends (RFC 9112 6.3).
 struct Http1BodyUntilClose {};

@@ -5,9 +5,6 @@
 #include "app/session_group_executor.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/executor_work_guard.hpp>
-#include <asio/post.hpp>
-#include <asio/redirect_error.hpp>
-#include <asio/steady_timer.hpp>
 #include <asio/use_future.hpp>
 #include <array>
 #include <future>
@@ -34,12 +31,6 @@ net::awaitable<bool> Seed(std::shared_ptr<const VlessEncryptionConfig> config,
         (expired ? std::chrono::seconds(61) : std::chrono::seconds(0));
     co_return co_await AuthenticateVlessTicket(std::move(config), "ticket-in", issued, identity);
 }
-net::awaitable<bool> HoldSlot(net::steady_timer& gate, std::promise<void>& entered) {
-    entered.set_value();
-    IoErrorCode error;
-    co_await gate.async_wait(net::redirect_error(net::use_awaitable, error));
-    co_return error == io_error::operation_aborted;
-}
 net::awaitable<void> StopCoordinator(std::shared_ptr<GroupCoordinator> coordinator) {
     co_await coordinator->AsyncJoin();
     coordinator->ReleaseServices();
@@ -51,8 +42,8 @@ TEST(VlessTicketService, Contract) {
     auto work1 = net::make_work_guard(io1);
     auto workc = net::make_work_guard(control);
     auto coordinator = std::make_shared<GroupCoordinator>(control, 1);
-    coordinator->RegisterWorker(0, io0);
-    coordinator->RegisterWorker(1, io1);
+    coordinator->RegisterWorker(io0);
+    coordinator->RegisterWorker(io1);
     std::thread worker0([&] { io0.run(); });
     std::thread worker1([&] { io1.run(); });
     std::thread manager([&] { control.run(); });
@@ -85,19 +76,25 @@ TEST(VlessTicketService, Contract) {
     ticket[0] = 1;
     auto expired = net::co_spawn(io1, Seed(config, ticket, identity, true), net::use_future);
     Check(!expired.get(), "expired ticket published");
-    net::steady_timer gate(control);
-    gate.expires_at(std::chrono::steady_clock::time_point::max());
+    // Holding the only coordinator slot blocks the control thread inside one
+    // accepted synchronous call until the test releases it.
     std::promise<void> entered;
+    std::promise<void> release;
     auto entered_future = entered.get_future();
+    auto released = release.get_future();
     auto holder = net::co_spawn(io1,
-        coordinator->Post(HoldSlot(gate, entered)), net::use_future);
+        coordinator->PostCall([&entered, &released] {
+            entered.set_value();
+            released.wait();
+            return true;
+        }), net::use_future);
     entered_future.get();
     auto overflow = net::co_spawn(io0,
         LookupVlessTicket(config, "ticket-in", ticket, nfs), net::use_future);
     bool full = false;
     try { (void)overflow.get(); } catch (const WorkerMailboxFull&) { full = true; }
     Check(full, "full authentication mailbox did not reject immediately");
-    net::post(control, [&] { gate.cancel(); });
+    release.set_value();
     Check(holder.get(), "held mailbox operation failed to join");
     coordinator->CloseAdmission();
     auto stopped = net::co_spawn(io1,

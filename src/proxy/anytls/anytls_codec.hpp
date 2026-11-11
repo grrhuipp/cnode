@@ -1,6 +1,7 @@
 #pragma once
 
-#include "proxy/outbound_stream_endpoint.hpp"
+#include "proxy/outbound_endpoint_base.hpp"
+#include "transport/internet/outbound_target_builder.hpp"
 #include "app/relay.hpp"
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
@@ -49,6 +50,8 @@ inline constexpr uint8_t kCmdHeartResponse = 9;
 inline constexpr uint8_t kCmdServerSettings = 10;
 
 inline constexpr size_t kFrameHeaderSize = 7;
+inline constexpr size_t kAuthHashSize = 32;
+inline constexpr size_t kAuthPrefixSize = kAuthHashSize + sizeof(uint16_t);
 
 inline constexpr uint32_t kProtocolVersion = 2;
 
@@ -173,7 +176,7 @@ namespace proxy::anytls::inbound {
 // ============================================================================
 class Handler final : public Inbound {
 public:
-    Handler(UserOnlineTracker& validator,
+    Handler(UserOnlineTracker& tracker,
             StatsShard& stats,
             ConnectionLimiter* limiter,
             std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme = {});
@@ -188,7 +191,7 @@ public:
         uint32_t pressure_idle_timeout) override;
 
 private:
-    UserOnlineTracker& validator_;
+    UserOnlineTracker& tracker_;
     StatsShard& stats_;
     ConnectionLimiter* limiter_;
     std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme_;

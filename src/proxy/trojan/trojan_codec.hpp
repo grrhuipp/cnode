@@ -6,7 +6,7 @@
 // 职责：协议常量、请求结构体、握手结果、编解码逻辑（TCP + UDP）
 // ============================================================================
 
-#include "proxy/outbound_stream_endpoint.hpp"
+#include "proxy/outbound_endpoint_base.hpp"
 #include "common/address_codec.hpp"
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"
@@ -64,6 +64,10 @@ struct TrojanRequest {
 inline constexpr size_t kPasswordHashSize = std::tuple_size_v<PasswordHash>;
 // hash + CRLF + command; the SOCKS5 address and a final CRLF follow.
 inline constexpr size_t kRequestPrefixSize = kPasswordHashSize + 3;
+// UDP 包头：不带元数据的 SOCKS5 地址之后是 2 字节长度与 CRLF。
+inline constexpr size_t kUdpPacketTrailerSize = 2 + 2;
+inline constexpr size_t kMaxUdpPacketHeaderSize =
+    kMaxBaseEncodedAddressSize + kUdpPacketTrailerSize;
 
 enum class RequestDecodeStatus : uint8_t { Complete, Incomplete, InvalidHeader, InvalidAddress };
 
@@ -103,6 +107,8 @@ struct FramedUdpPacket {
 
 // Owns stream fragments until one complete tagged datagram, including an empty
 // payload, can be transferred. An empty container is reserved for stream EOF.
+// Malformed/truncated input, budget overflow and use after EOF/failure throw
+// LinkError(PROTOCOL_DECODE_FAILED); source I/O errors are propagated unchanged.
 class UdpFramer {
 public:
     void Feed(buf::MultiBuffer input);

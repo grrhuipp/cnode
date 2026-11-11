@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "service/controller/node_transaction.hpp"
+#include "service/controller/traffic_journal.hpp"
+#include "service/controller/traffic_journal_format.hpp"
 #include "infra/json.hpp"
 
 #include <sys/wait.h>
@@ -10,6 +11,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <format>
 #include <iostream>
 #include <stdexcept>
 
@@ -18,8 +20,9 @@ void Check(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 using ::controller::TrafficJournal;
-::app::UserTrafficSnapshot Sample() {
-    ::app::UserTrafficSnapshot result;
+namespace journal_format = ::controller::traffic_journal;
+::app::UserTrafficCounters Sample() {
+    ::app::UserTrafficCounters result;
     result.users.emplace(42, ::app::UserTraffic{17, 29});
     return result;
 }
@@ -94,14 +97,14 @@ TEST(TrafficJournal, Contract) {
             }
             const auto huge = directory / "batch-limit0.unknown";
             const int fd = ::open(huge.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
-            Check(fd >= 0 && ::ftruncate(fd, TrafficJournal::kMaxBytes) == 0, "limit fixture failed");
+            Check(fd >= 0 && ::ftruncate(fd, journal_format::kMaxBytes) == 0, "limit fixture failed");
             ::close(fd);
             bool rejected = false;
             try { journal.Append(Sample()); } catch (const std::exception&) { rejected = true; }
             Check(rejected && journal.Prepare().traffic.empty(), "full journal silently accepted or discarded a delta");
             std::filesystem::remove(huge);
-            for (size_t i = 0; i < TrafficJournal::kMaxRecords; ++i) {
-                std::ofstream(directory / (std::to_string(i) + ".unknown")) << "[]";
+            for (size_t i = 0; i < journal_format::kMaxRecords; ++i) {
+                std::ofstream(directory / std::format("batch-{:06}.unknown", i)) << "[]";
             }
             rejected = false;
             try { journal.Append(Sample()); } catch (const std::exception&) { rejected = true; }
@@ -112,7 +115,7 @@ TEST(TrafficJournal, Contract) {
             TrafficJournal isolated(config);
             Check(isolated.Directory() != directory && isolated.UnknownCount() == 0,
                   "different panel identity reused accounting state");
-            ::app::UserTrafficSnapshot first, second;
+            ::app::UserTrafficCounters first, second;
             first.users.emplace(42, ::app::UserTraffic{5, 8});
             second.users.emplace(42, ::app::UserTraffic{12, 21});
             Check(!first.empty() && !second.empty(), "traffic snapshot was mistaken for empty");

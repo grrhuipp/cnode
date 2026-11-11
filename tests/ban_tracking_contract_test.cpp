@@ -1,19 +1,26 @@
 #include <gtest/gtest.h>
 
 #include "app/rate_limiter.hpp"
+#include "app/connection_limiter_core.hpp"
 #include <asio/co_spawn.hpp>
 #include <exception>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace {
 using Core = ConnectionLimiterCore;
-using Reason = Core::RejectReason;
+using Reason = ConnectionLimiter::RejectReason;
 constexpr std::string_view kTag = "panel|vless|443";
 constexpr std::string_view kOtherTag = "panel|vless|8443";
 constexpr std::string_view kIP = "192.0.2.1";
+
+// 封禁键与生产协调器一致：未启用 IP 封禁或来源为空时没有键，也就不会被封禁。
+bool IsIPBanned(const Core& core, const std::optional<AuthCredentialKey>& ip_key, uint64_t now) {
+    return ip_key && core.CheckIPBan(*ip_key, now) == Reason::IP_BANNED;
+}
 
 AuthCredentialKey Key(uint64_t value) {
     AuthCredentialKey key{};
@@ -29,28 +36,30 @@ TEST(BanTrackingContract, FixedWindowResetsAtBoundaryForBothRules) {
                      .window_seconds = 60, .ban_seconds = 180};
     Core limiter(config);
     const auto key = Key(1);
+    const auto ip_key = limiter.ComputeIpBanKey(kTag, kIP);
+    ASSERT_TRUE(ip_key);
     // Nine failures spread across the first window must not slide its start.
     for (unsigned i = 0; i < 5; ++i)
-        limiter.OnAuthFailTracked(kTag, kIP, key, 100);
+        limiter.OnAuthFailTracked(ip_key, key, 100);
     for (unsigned i = 0; i < 4; ++i)
-        limiter.OnAuthFailTracked(kTag, kIP, key, 159);
-    EXPECT_FALSE(limiter.IsBanned(kTag, kIP, 159));
+        limiter.OnAuthFailTracked(ip_key, key, 159);
+    EXPECT_FALSE(IsIPBanned(limiter, ip_key, 159));
     EXPECT_EQ(limiter.CheckCredential(key, 159), Reason::NONE);
 
-    limiter.OnAuthFailTracked(kTag, kIP, key, 160); // exact window boundary
-    EXPECT_FALSE(limiter.IsBanned(kTag, kIP, 160));
+    limiter.OnAuthFailTracked(ip_key, key, 160); // exact window boundary
+    EXPECT_FALSE(IsIPBanned(limiter, ip_key, 160));
     EXPECT_EQ(limiter.CheckCredential(key, 160), Reason::NONE);
     for (unsigned i = 0; i < 8; ++i)
-        limiter.OnAuthFailTracked(kTag, kIP, key, 219);
-    EXPECT_FALSE(limiter.IsBanned(kTag, kIP, 219));
+        limiter.OnAuthFailTracked(ip_key, key, 219);
+    EXPECT_FALSE(IsIPBanned(limiter, ip_key, 219));
     EXPECT_EQ(limiter.CheckCredential(key, 219), Reason::NONE);
-    limiter.OnAuthFailTracked(kTag, kIP, key, 219);
-    EXPECT_TRUE(limiter.IsBanned(kTag, kIP, 219));
+    limiter.OnAuthFailTracked(ip_key, key, 219);
+    EXPECT_TRUE(IsIPBanned(limiter, ip_key, 219));
     EXPECT_EQ(limiter.CheckCredential(key, 219), Reason::CREDENTIAL_BANNED);
-    EXPECT_EQ(limiter.TryAcceptIP(kTag, kIP, true, 219), Reason::IP_BANNED);
-    EXPECT_TRUE(limiter.IsBanned(kTag, kIP, 398));
+    EXPECT_EQ(limiter.TryAcceptIP(Core::IpHash(kIP), ip_key, 219), Reason::IP_BANNED);
+    EXPECT_TRUE(IsIPBanned(limiter, ip_key, 398));
     EXPECT_EQ(limiter.CheckCredential(key, 398), Reason::CREDENTIAL_BANNED);
-    EXPECT_FALSE(limiter.IsBanned(kTag, kIP, 399));
+    EXPECT_FALSE(IsIPBanned(limiter, ip_key, 399));
     EXPECT_EQ(limiter.CheckCredential(key, 399), Reason::NONE);
 }
 
@@ -60,20 +69,22 @@ TEST(BanTrackingContract, BannedFailuresNeverExtendExpiryOrAccumulate) {
                      .window_seconds = 60, .ban_seconds = 180};
     Core limiter(config);
     const auto key = Key(2);
+    const auto ip_key = limiter.ComputeIpBanKey(kTag, kIP);
+    ASSERT_TRUE(ip_key);
     for (unsigned i = 0; i < 10; ++i)
-        limiter.OnAuthFailTracked(kTag, kIP, key, 0); // epoch zero is a valid start
+        limiter.OnAuthFailTracked(ip_key, key, 0); // epoch zero is a valid start
     for (unsigned i = 0; i < 20; ++i)
-        limiter.OnAuthFailTracked(kTag, kIP, key, 179);
-    EXPECT_TRUE(limiter.IsBanned(kTag, kIP, 179));
+        limiter.OnAuthFailTracked(ip_key, key, 179);
+    EXPECT_TRUE(IsIPBanned(limiter, ip_key, 179));
     EXPECT_EQ(limiter.CheckCredential(key, 179), Reason::CREDENTIAL_BANNED);
-    EXPECT_FALSE(limiter.IsBanned(kTag, kIP, 180));
+    EXPECT_FALSE(IsIPBanned(limiter, ip_key, 180));
     EXPECT_EQ(limiter.CheckCredential(key, 180), Reason::NONE);
     for (unsigned i = 0; i < 9; ++i)
-        limiter.OnAuthFailTracked(kTag, kIP, key, 180);
-    EXPECT_FALSE(limiter.IsBanned(kTag, kIP, 180));
+        limiter.OnAuthFailTracked(ip_key, key, 180);
+    EXPECT_FALSE(IsIPBanned(limiter, ip_key, 180));
     EXPECT_EQ(limiter.CheckCredential(key, 180), Reason::NONE);
-    limiter.OnAuthFailTracked(kTag, kIP, key, 180);
-    EXPECT_TRUE(limiter.IsBanned(kTag, kIP, 180));
+    limiter.OnAuthFailTracked(ip_key, key, 180);
+    EXPECT_TRUE(IsIPBanned(limiter, ip_key, 180));
     EXPECT_EQ(limiter.CheckCredential(key, 180), Reason::CREDENTIAL_BANNED);
 }
 
@@ -83,12 +94,14 @@ TEST(BanTrackingContract, MonotonicSecondsDoNotWrapAtUint32Boundary) {
                      .window_seconds = 60, .ban_seconds = 180};
     Core limiter(config);
     const auto key = Key(3);
+    const auto ip_key = limiter.ComputeIpBanKey(kTag, kIP);
+    ASSERT_TRUE(ip_key);
     constexpr uint64_t now = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) - 2;
     for (unsigned i = 0; i < 10; ++i)
-        limiter.OnAuthFailTracked(kTag, kIP, key, now);
-    EXPECT_TRUE(limiter.IsBanned(kTag, kIP, now + 179));
+        limiter.OnAuthFailTracked(ip_key, key, now);
+    EXPECT_TRUE(IsIPBanned(limiter, ip_key, now + 179));
     EXPECT_EQ(limiter.CheckCredential(key, now + 179), Reason::CREDENTIAL_BANNED);
-    EXPECT_FALSE(limiter.IsBanned(kTag, kIP, now + 180));
+    EXPECT_FALSE(IsIPBanned(limiter, ip_key, now + 180));
     EXPECT_EQ(limiter.CheckCredential(key, now + 180), Reason::NONE);
 }
 
@@ -99,21 +112,28 @@ TEST(BanTrackingContract, TagsCredentialsAndIPRulesAreIndependent) {
     Core limiter(config);
     const auto key = Key(4);
     const auto other = Key(5);
+    const auto ip_key = limiter.ComputeIpBanKey(kTag, kIP);
+    const auto other_tag_ip_key = limiter.ComputeIpBanKey(kOtherTag, kIP);
+    ASSERT_TRUE(ip_key && other_tag_ip_key);
     // One failed credential across ten source IPs reaches the credential limit;
     // no individual source reaches the independently configured IP threshold.
-    for (unsigned i = 0; i < 10; ++i)
-        limiter.OnAuthFailTracked(kTag, "192.0.2." + std::to_string(i + 1), key, 100);
+    for (unsigned i = 0; i < 10; ++i) {
+        limiter.OnAuthFailTracked(
+            limiter.ComputeIpBanKey(kTag, "192.0.2." + std::to_string(i + 1)), key, 100);
+    }
     EXPECT_EQ(limiter.CheckCredential(key, 100), Reason::CREDENTIAL_BANNED);
     EXPECT_EQ(limiter.CheckCredential(other, 100), Reason::NONE);
-    EXPECT_FALSE(limiter.IsBanned(kTag, kIP, 100));
-    limiter.OnAuthFailTracked(kTag, kIP, std::nullopt, 100);
-    EXPECT_TRUE(limiter.IsBanned(kTag, kIP, 100));
-    EXPECT_FALSE(limiter.IsBanned(kOtherTag, kIP, 100));
+    EXPECT_FALSE(IsIPBanned(limiter, ip_key, 100));
+    limiter.OnAuthFailTracked(ip_key, std::nullopt, 100);
+    EXPECT_TRUE(IsIPBanned(limiter, ip_key, 100));
+    EXPECT_FALSE(IsIPBanned(limiter, other_tag_ip_key, 100));
     EXPECT_EQ(limiter.CheckCredential(other, 100), Reason::NONE);
     // An empty source must not consume an IP-ban slot or create an empty-IP ban.
+    const auto empty_source_key = limiter.ComputeIpBanKey(kTag, {});
+    EXPECT_FALSE(empty_source_key);
     for (unsigned i = 0; i < 10; ++i)
-        limiter.OnAuthFailTracked(kTag, {}, other, 100);
-    EXPECT_FALSE(limiter.IsBanned(kTag, {}, 100));
+        limiter.OnAuthFailTracked(empty_source_key, other, 100);
+    EXPECT_FALSE(IsIPBanned(limiter, empty_source_key, 100));
     EXPECT_EQ(limiter.CheckCredential(other, 100), Reason::CREDENTIAL_BANNED);
 }
 
@@ -125,11 +145,11 @@ TEST(BanTrackingContract, ExactCredentialKeysHaveIndependentFailureCounters) {
     AuthCredentialKey second{};
     second.back() = 1; // Identical prefixes are not sufficient to identify a key.
     for (unsigned i = 0; i < 9; ++i)
-        limiter.OnAuthFailTracked(kTag, {}, first, 100);
-    limiter.OnAuthFailTracked(kTag, {}, second, 100);
+        limiter.OnAuthFailTracked(std::nullopt, first, 100);
+    limiter.OnAuthFailTracked(std::nullopt, second, 100);
     EXPECT_EQ(limiter.CheckCredential(first, 100), Reason::NONE);
     EXPECT_EQ(limiter.CheckCredential(second, 100), Reason::NONE);
-    limiter.OnAuthFailTracked(kTag, {}, first, 100);
+    limiter.OnAuthFailTracked(std::nullopt, first, 100);
     EXPECT_EQ(limiter.CheckCredential(first, 100), Reason::CREDENTIAL_BANNED);
     EXPECT_EQ(limiter.CheckCredential(second, 100), Reason::NONE);
 }
@@ -146,7 +166,7 @@ TEST(BanTrackingContract, CredentialFingerprintUsesTagBinaryInputAndPrivateSalt)
 
     Core core(config);
     for (unsigned i = 0; i < 10; ++i)
-        core.OnAuthFailTracked(kTag, {}, key, 100);
+        core.OnAuthFailTracked(std::nullopt, key, 100);
     EXPECT_EQ(core.CheckCredential(key, 100), Reason::CREDENTIAL_BANNED);
     EXPECT_EQ(core.CheckCredential(
         limiter->FingerprintCredential(kTag, std::span(credential).first(1), 1), 100),
@@ -157,7 +177,7 @@ TEST(BanTrackingContract, CredentialFingerprintUsesTagBinaryInputAndPrivateSalt)
     const std::array<uint8_t, 1> c{'c'};
     const auto first_split = limiter->FingerprintCredential("a", bc, 1);
     for (unsigned i = 0; i < 10; ++i)
-        core.OnAuthFailTracked("a", {}, first_split, 100);
+        core.OnAuthFailTracked(std::nullopt, first_split, 100);
     EXPECT_EQ(core.CheckCredential(
         limiter->FingerprintCredential("ab", c, 1), 100), Reason::NONE);
     EXPECT_EQ(core.CheckCredential(limiter->FingerprintCredential(kOtherTag, credential, 1), 100),
@@ -166,7 +186,7 @@ TEST(BanTrackingContract, CredentialFingerprintUsesTagBinaryInputAndPrivateSalt)
     // while the old snapshot's key remains banned until its own expiry.
     const auto updated_key = limiter->FingerprintCredential(kTag, credential, 2);
     EXPECT_EQ(core.CheckCredential(updated_key, 100), Reason::NONE);
-    core.OnAuthFailTracked(kTag, {}, updated_key, 100);
+    core.OnAuthFailTracked(std::nullopt, updated_key, 100);
     EXPECT_EQ(core.CheckCredential(updated_key, 100), Reason::NONE);
     EXPECT_EQ(core.CheckCredential(key, 100), Reason::CREDENTIAL_BANNED);
 }
@@ -179,18 +199,21 @@ TEST(BanTrackingContract, DisabledIPBanDoesNotAffectConnectionQuotas) {
                      .window_seconds = 60, .ban_seconds = 180};
     Core limiter(config);
     EXPECT_FALSE(limiter.TracksAuthBan());
+    const auto ip_key = limiter.ComputeIpBanKey(kTag, kIP);
+    EXPECT_FALSE(ip_key);
+    const auto ip_hash = Core::IpHash(kIP);
     for (unsigned i = 0; i < 10; ++i)
-        limiter.OnAuthFailTracked(kTag, kIP, Key(6), 100);
-    EXPECT_FALSE(limiter.IsBanned(kTag, kIP, 100));
+        limiter.OnAuthFailTracked(ip_key, Key(6), 100);
+    EXPECT_FALSE(IsIPBanned(limiter, ip_key, 100));
     EXPECT_EQ(limiter.CheckCredential(Key(6), 100), Reason::CREDENTIAL_BANNED);
     EXPECT_EQ(limiter.TryAcceptGlobal(), Reason::NONE);
-    EXPECT_EQ(limiter.TryAcceptIP(kTag, kIP, true, 100), Reason::NONE);
-    EXPECT_EQ(limiter.TryAcceptIP(kTag, kIP, true, 100), Reason::MAX_CONNECTIONS_PER_IP);
+    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100), Reason::NONE);
+    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100), Reason::MAX_CONNECTIONS_PER_IP);
     EXPECT_EQ(limiter.TryAcceptGlobal(), Reason::MAX_CONNECTIONS);
-    limiter.ReleaseHash(Core::IpHash(kIP));
+    limiter.ReleaseHash(ip_hash);
     EXPECT_EQ(limiter.TryAcceptGlobal(), Reason::MAX_CONNECTIONS);
-    EXPECT_EQ(limiter.TryAcceptIP(kTag, kIP, true, 100), Reason::NONE);
-    limiter.ReleaseHash(Core::IpHash(kIP));
+    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100), Reason::NONE);
+    limiter.ReleaseHash(ip_hash);
     limiter.ReleaseGlobal();
     EXPECT_EQ(limiter.TryAcceptGlobal(), Reason::NONE);
     limiter.ReleaseGlobal();
@@ -202,11 +225,14 @@ TEST(BanTrackingContract, ExplicitIPBanBypassStillEnforcesConnectionQuota) {
     config.ip_ban = {.enabled = true, .failure_limit = 1,
                      .window_seconds = 60, .ban_seconds = 180};
     Core limiter(config);
-    limiter.OnAuthFailTracked(kTag, kIP, std::nullopt, 100);
-    EXPECT_EQ(limiter.TryAcceptIP(kTag, kIP, true, 100), Reason::IP_BANNED);
-    EXPECT_EQ(limiter.TryAcceptIP(kTag, kIP, false, 100), Reason::NONE);
-    EXPECT_EQ(limiter.TryAcceptIP(kTag, kIP, false, 100), Reason::MAX_CONNECTIONS_PER_IP);
-    limiter.ReleaseHash(Core::IpHash(kIP));
+    const auto ip_key = limiter.ComputeIpBanKey(kTag, kIP);
+    ASSERT_TRUE(ip_key);
+    const auto ip_hash = Core::IpHash(kIP);
+    limiter.OnAuthFailTracked(ip_key, std::nullopt, 100);
+    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100), Reason::IP_BANNED);
+    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, std::nullopt, 100), Reason::NONE);
+    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, std::nullopt, 100), Reason::MAX_CONNECTIONS_PER_IP);
+    limiter.ReleaseHash(ip_hash);
 }
 
 TEST(BanTrackingContract, DisabledIPOnlyOperationsSkipClosedMailbox) {
@@ -239,7 +265,7 @@ TEST(BanTrackingContract, ConnectionCapacityRejectsAndReclaimsReleasedSlots) {
     for (unsigned value = 0; value <= Core::kSlotCount; ++value) {
         auto address = "198.18." + std::to_string(value >> 8) + "." +
                        std::to_string(value & 255);
-        const auto reason = limiter.TryAcceptIP(kTag, address, true, 100);
+        const auto reason = limiter.TryAcceptIP(Core::IpHash(address), std::nullopt, 100);
         if (reason != Reason::NONE) {
             ASSERT_EQ(reason, Reason::TRACKING_CAPACITY);
             rejected = std::move(address);
@@ -249,9 +275,11 @@ TEST(BanTrackingContract, ConnectionCapacityRejectsAndReclaimsReleasedSlots) {
     }
     ASSERT_FALSE(rejected.empty());
     for (const auto& address : admitted) limiter.ReleaseHash(Core::IpHash(address));
-    EXPECT_EQ(limiter.TryAcceptIP(kTag, rejected, true, 100), Reason::NONE);
-    EXPECT_EQ(limiter.TryAcceptIP(kTag, rejected, true, 100), Reason::MAX_CONNECTIONS_PER_IP);
-    limiter.ReleaseHash(Core::IpHash(rejected));
+    const auto rejected_hash = Core::IpHash(rejected);
+    EXPECT_EQ(limiter.TryAcceptIP(rejected_hash, std::nullopt, 100), Reason::NONE);
+    EXPECT_EQ(limiter.TryAcceptIP(rejected_hash, std::nullopt, 100),
+              Reason::MAX_CONNECTIONS_PER_IP);
+    limiter.ReleaseHash(rejected_hash);
 }
 
 TEST(BanTrackingContract, CredentialQueriesDoNotInsertAndSaturationFailsClosedUntilExpiry) {
@@ -271,16 +299,16 @@ TEST(BanTrackingContract, CredentialQueriesDoNotInsertAndSaturationFailsClosedUn
             break;
         }
         ASSERT_EQ(reason, Reason::NONE); // distinct keys must not share counters/bans
-        limiter.OnAuthFailTracked(kTag, {}, Key(value), 100);
+        limiter.OnAuthFailTracked(std::nullopt, Key(value), 100);
         ASSERT_EQ(limiter.CheckCredential(Key(value), 100), Reason::NONE);
     }
     ASSERT_LE(rejected, Core::kSlotCount);
     EXPECT_EQ(limiter.CheckCredential(Key(rejected), 159), Reason::TRACKING_CAPACITY);
-    EXPECT_EQ(limiter.TryAcceptIP(kTag, kIP, true, 159), Reason::NONE);
+    EXPECT_EQ(limiter.TryAcceptIP(Core::IpHash(kIP), std::nullopt, 159), Reason::NONE);
     limiter.ReleaseHash(Core::IpHash(kIP)); // failure-table saturation consumes no quota
     EXPECT_EQ(limiter.CheckCredential(Key(rejected), 160), Reason::NONE);
     for (unsigned i = 0; i < 10; ++i)
-        limiter.OnAuthFailTracked(kTag, {}, Key(rejected), 160);
+        limiter.OnAuthFailTracked(std::nullopt, Key(rejected), 160);
     EXPECT_EQ(limiter.CheckCredential(Key(rejected), 160), Reason::CREDENTIAL_BANNED);
     EXPECT_EQ(limiter.CheckCredential(Key(rejected), 339), Reason::CREDENTIAL_BANNED);
     EXPECT_EQ(limiter.CheckCredential(Key(rejected), 340), Reason::NONE);
@@ -296,26 +324,30 @@ TEST(BanTrackingContract, IPFailureCapacityIsIndependentAndExpiredSlotsAreReusab
     for (unsigned value = 0; value <= Core::kSlotCount; ++value) {
         auto address = "198.19." + std::to_string(value >> 8) + "." +
                        std::to_string(value & 255);
-        const auto reason = limiter.CheckIPBan(kTag, address, 100);
+        const auto address_key = limiter.ComputeIpBanKey(kTag, address);
+        ASSERT_TRUE(address_key);
+        const auto reason = limiter.CheckIPBan(*address_key, 100);
         if (reason == Reason::TRACKING_CAPACITY) {
             rejected = std::move(address);
             break;
         }
         ASSERT_EQ(reason, Reason::NONE);
-        limiter.OnAuthFailTracked(kTag, address, std::nullopt, 100);
-        ASSERT_TRUE(limiter.IsBanned(kTag, address, 100));
+        limiter.OnAuthFailTracked(address_key, std::nullopt, 100);
+        ASSERT_TRUE(IsIPBanned(limiter, address_key, 100));
     }
     ASSERT_FALSE(rejected.empty());
-    EXPECT_EQ(limiter.TryAcceptIP(kTag, rejected, true, 279), Reason::TRACKING_CAPACITY);
+    const auto rejected_key = limiter.ComputeIpBanKey(kTag, rejected);
+    const auto rejected_hash = Core::IpHash(rejected);
+    EXPECT_EQ(limiter.TryAcceptIP(rejected_hash, rejected_key, 279), Reason::TRACKING_CAPACITY);
     EXPECT_EQ(limiter.CheckCredential(Key(7), 279), Reason::NONE);
     for (unsigned i = 0; i < 10; ++i)
-        limiter.OnAuthFailTracked(kTag, {}, Key(7), 279);
+        limiter.OnAuthFailTracked(std::nullopt, Key(7), 279);
     EXPECT_EQ(limiter.CheckCredential(Key(7), 279), Reason::CREDENTIAL_BANNED);
-    EXPECT_EQ(limiter.TryAcceptIP(kTag, rejected, false, 279), Reason::NONE);
-    limiter.ReleaseHash(Core::IpHash(rejected));
-    EXPECT_EQ(limiter.CheckIPBan(kTag, rejected, 280), Reason::NONE);
-    limiter.OnAuthFailTracked(kTag, rejected, std::nullopt, 280);
-    EXPECT_EQ(limiter.TryAcceptIP(kTag, rejected, true, 280), Reason::IP_BANNED);
+    EXPECT_EQ(limiter.TryAcceptIP(rejected_hash, std::nullopt, 279), Reason::NONE);
+    limiter.ReleaseHash(rejected_hash);
+    EXPECT_EQ(limiter.CheckIPBan(*rejected_key, 280), Reason::NONE);
+    limiter.OnAuthFailTracked(rejected_key, std::nullopt, 280);
+    EXPECT_EQ(limiter.TryAcceptIP(rejected_hash, rejected_key, 280), Reason::IP_BANNED);
 }
 
 TEST(BanTrackingContract, ReconstructedLimiterStartsWithoutQuotasOrBans) {
@@ -325,17 +357,20 @@ TEST(BanTrackingContract, ReconstructedLimiterStartsWithoutQuotasOrBans) {
     config.ip_ban = {.enabled = true, .failure_limit = 1,
                      .window_seconds = 60, .ban_seconds = 180};
     const auto credential = Key(42);
+    const auto ip_hash = Core::IpHash(kIP);
     for (unsigned cycle = 0; cycle < 3; ++cycle) {
         Core limiter(config);
-        EXPECT_EQ(limiter.CheckIPBan(kTag, kIP, 100), Reason::NONE);
+        const auto ip_key = limiter.ComputeIpBanKey(kTag, kIP);
+        ASSERT_TRUE(ip_key);
+        EXPECT_EQ(limiter.CheckIPBan(*ip_key, 100), Reason::NONE);
         EXPECT_EQ(limiter.CheckCredential(credential, 100), Reason::NONE);
         EXPECT_EQ(limiter.TryAcceptGlobal(), Reason::NONE);
         EXPECT_EQ(limiter.TryAcceptGlobal(), Reason::MAX_CONNECTIONS);
-        EXPECT_EQ(limiter.TryAcceptIP(kTag, kIP, true, 100), Reason::NONE);
-        EXPECT_EQ(limiter.TryAcceptIP(kTag, kIP, true, 100), Reason::MAX_CONNECTIONS_PER_IP);
+        EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100), Reason::NONE);
+        EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100), Reason::MAX_CONNECTIONS_PER_IP);
         for (unsigned failure = 0; failure < 10; ++failure)
-            limiter.OnAuthFailTracked(kTag, kIP, credential, 100);
-        EXPECT_EQ(limiter.CheckIPBan(kTag, kIP, 100), Reason::IP_BANNED);
+            limiter.OnAuthFailTracked(ip_key, credential, 100);
+        EXPECT_EQ(limiter.CheckIPBan(*ip_key, 100), Reason::IP_BANNED);
         EXPECT_EQ(limiter.CheckCredential(credential, 100), Reason::CREDENTIAL_BANNED);
     }
 }

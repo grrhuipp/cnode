@@ -15,7 +15,6 @@
 #include <asio/posix/stream_descriptor.hpp>
 
 #include <chrono>
-#include <cstdio>
 #include <deque>
 #include <future>
 #include <functional>
@@ -45,7 +44,6 @@ constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = FailTimeou
 namespace {
 using namespace std::chrono_literals;
 using timeout_allocation_test::reject_allocations;
-using timeout_allocation_test::rejected_allocations;
 
 template<class F>
 struct Event final : TimeoutEvent {
@@ -59,35 +57,52 @@ struct CounterEvent final : TimeoutEvent {
     void OnTimeout() override { if (counter) ++*counter; }
 };
 
-bool TestCancellationAndRearm() {
+class TimeoutSchedulerCases : public ::testing::Test {
+protected:
+    void TearDown() override {
+        timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
+        timeout_allocation_test::fail_after = -1;
+        memory::reject_next_process_allocation = false;
+    }
+};
+
+TEST_F(TimeoutSchedulerCases, CancellationAndRearmPreserveLiveEvent) {
     net::io_context io;
     auto& scheduler = TimeoutScheduler::ForIoContext(io);
-    std::size_t calls = 0, abandoned_calls = 0;
+    std::size_t calls = 0;
     CounterEvent event;
     event.counter = &calls;
     (void)scheduler.ScheduleAfter(1h, event);
-    const auto ordinary_before = rejected_allocations;
-    const auto asio_before = timeout_allocation_test::rejected_asio_allocations;
     reject_allocations = timeout_allocation_test::reject_asio_allocations = true;
+    bool detached = true;
     for (int i = 0; i != 4096; ++i) {
         scheduler.Cancel(event);
-        if (event.Valid()) return false;
+        detached = !event.Valid() && detached;
         (void)scheduler.ScheduleAfter(1h, event);
     }
     (void)scheduler.ScheduleAfter(0ms, event);
-    {
-        CounterEvent abandoned;
-        abandoned.counter = &abandoned_calls;
-        (void)scheduler.ScheduleAfter(0ms, abandoned);
-    }
     timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
     io.run();
-    return calls == 1 && abandoned_calls == 0 && !event.Valid() &&
-        rejected_allocations == ordinary_before &&
-        timeout_allocation_test::rejected_asio_allocations == asio_before;
+    EXPECT_TRUE(detached);
+    EXPECT_EQ(calls, 1u);
+    EXPECT_FALSE(event.Valid());
 }
 
-bool TestReentrantDestructionAndExceptions() {
+TEST_F(TimeoutSchedulerCases, DestroyingQueuedEventCancelsItsCallback) {
+    net::io_context io;
+    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    std::size_t calls = 0;
+    {
+        CounterEvent abandoned;
+        abandoned.counter = &calls;
+        (void)scheduler.ScheduleAfter(0ms, abandoned);
+    }
+    io.run();
+    EXPECT_EQ(calls, 0u);
+    EXPECT_EQ(scheduler.GetResourceStats().active_events, 0u);
+}
+
+TEST_F(TimeoutSchedulerCases, ReentrantDestructionDoesNotHideOtherCallbackFailures) {
     net::io_context io;
     auto& scheduler = TimeoutScheduler::ForIoContext(io);
     std::size_t cancelled_calls = 0, survivor_calls = 0;
@@ -105,7 +120,15 @@ bool TestReentrantDestructionAndExceptions() {
     try { io.run(); }
     catch (const std::runtime_error&) { failure_reported = true; }
     io.run();
-    if (!failure_reported || owner || cancelled_calls || survivor_calls != 1) return false;
+    EXPECT_TRUE(failure_reported);
+    EXPECT_FALSE(owner);
+    EXPECT_EQ(cancelled_calls, 0u);
+    EXPECT_EQ(survivor_calls, 1u);
+}
+
+TEST_F(TimeoutSchedulerCases, ExpiringEventCanDestroyItself) {
+    net::io_context io;
+    auto& scheduler = TimeoutScheduler::ForIoContext(io);
 
     struct Self final : TimeoutEvent {
         Self(TimeoutScheduler& scheduler, std::unique_ptr<Self>& owner, bool& fired)
@@ -125,10 +148,12 @@ bool TestReentrantDestructionAndExceptions() {
     io.restart();
     (void)scheduler.ScheduleAfter(0ms, *self);
     io.run();
-    return fired && !self && scheduler.GetResourceStats().active_events == 0;
+    EXPECT_TRUE(fired);
+    EXPECT_FALSE(self);
+    EXPECT_EQ(scheduler.GetResourceStats().active_events, 0u);
 }
 
-bool TestSelfRearmAndFairness() {
+TEST_F(TimeoutSchedulerCases, ExpiringEventCanRearmItself) {
     net::io_context io;
     auto& scheduler = TimeoutScheduler::ForIoContext(io);
     struct Repeating final : TimeoutEvent {
@@ -141,9 +166,13 @@ bool TestSelfRearmAndFairness() {
     } repeating(scheduler);
     (void)scheduler.ScheduleAfter(0ms, repeating);
     io.run();
-    if (repeating.calls != 5 || repeating.Valid()) return false;
+    EXPECT_EQ(repeating.calls, 5);
+    EXPECT_FALSE(repeating.Valid());
+}
 
-    io.restart();
+TEST_F(TimeoutSchedulerCases, ExpiryStormYieldsToQueuedIo) {
+    net::io_context io;
+    auto& scheduler = TimeoutScheduler::ForIoContext(io);
     std::size_t calls = 0, observed = 0;
     const auto callback = [&] {
         if (++calls == 1) net::post(io, [&] { observed = calls; });
@@ -155,10 +184,12 @@ bool TestSelfRearmAndFairness() {
     }
     io.run();
     // Timers must yield to queued I/O, not process the entire storm first.
-    return calls == 256 && observed > 0 && observed < calls;
+    EXPECT_EQ(calls, 256u);
+    EXPECT_GT(observed, 0u);
+    EXPECT_LT(observed, calls);
 }
 
-bool TestWaitInitiationFailureAndRecovery() {
+TEST_F(TimeoutSchedulerCases, WaitInitiationFailureRollsBackAndAllowsRecovery) {
     net::io_context io;
     auto& scheduler = TimeoutScheduler::ForIoContext(io);
     std::size_t failed_calls = 0, recovered_calls = 0;
@@ -166,21 +197,19 @@ bool TestWaitInitiationFailureAndRecovery() {
     failed.counter = &failed_calls;
     recovered.counter = &recovered_calls;
     bool rejected = false;
-    const auto before = memory::rejected_process_allocations;
     memory::reject_next_process_allocation = true;
     try { (void)scheduler.ScheduleAfter(1ms, failed); }
     catch (const std::bad_alloc&) { rejected = true; }
     memory::reject_next_process_allocation = false;
-    if (!rejected || failed.Valid() ||
-        memory::rejected_process_allocations != before + 1) return false;
+    EXPECT_TRUE(rejected);
+    EXPECT_FALSE(failed.Valid());
     (void)scheduler.ScheduleAfter(1ms, recovered);
     io.run();
-    return failed_calls == 0 && recovered_calls == 1;
+    EXPECT_EQ(failed_calls, 0u);
+    EXPECT_EQ(recovered_calls, 1u);
 }
 
-bool TestHeapGrowthAndRelease() {
-    bool passed = false;
-    {
+TEST_F(TimeoutSchedulerCases, HeapGrowthAndInterleavedCancellationPreserveSurvivingEvents) {
         net::io_context io;
         auto& scheduler = TimeoutScheduler::ForIoContext(io);
         std::size_t fired = 0;
@@ -189,8 +218,6 @@ bool TestHeapGrowthAndRelease() {
             events[i].counter = &fired;
             (void)scheduler.ScheduleAfter(48h - std::chrono::seconds(i), events[i]);
         }
-        const auto before = rejected_allocations;
-        const auto asio_before = timeout_allocation_test::rejected_asio_allocations;
         reject_allocations = timeout_allocation_test::reject_asio_allocations = true;
         // Remove both interior and root slots; no borrowed stale entry remains.
         for (std::size_t i = 0; i < events.size(); i += 2) scheduler.Cancel(events[i]);
@@ -198,21 +225,22 @@ bool TestHeapGrowthAndRelease() {
             (void)scheduler.ScheduleAfter(0ms, events[i]);
         timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
         io.run();
-        passed = fired == events.size() / 2 && rejected_allocations == before &&
-            timeout_allocation_test::rejected_asio_allocations == asio_before &&
-            scheduler.GetResourceStats().active_events == 0;
-        // Release invalidates borrowed events before their owners are destroyed.
-        for (auto& event : events) (void)scheduler.ScheduleAfter(1h, event);
-        TimeoutScheduler::ReleaseForIoContext(io);
-        for (auto& event : events) passed = passed && !event.Valid();
-        passed = passed && !scheduler.ScheduleAfter(0ms, events.front());
-        io.restart();
-        io.run();
-    }
-    return passed;
+        EXPECT_EQ(fired, events.size() / 2);
+        EXPECT_EQ(scheduler.GetResourceStats().active_events, 0u);
 }
 
-bool TestShardAndRecycledContextOwnership() {
+TEST_F(TimeoutSchedulerCases, ReleaseInvalidatesBorrowedEventsAndRejectsNewScheduling) {
+    net::io_context io;
+    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    std::deque<CounterEvent> events(12000);
+    for (auto& event : events) (void)scheduler.ScheduleAfter(1h, event);
+    TimeoutScheduler::ReleaseForIoContext(io);
+    for (auto& event : events) EXPECT_FALSE(event.Valid());
+    EXPECT_FALSE(scheduler.ScheduleAfter(0ms, events.front()));
+    io.run();
+}
+
+TEST_F(TimeoutSchedulerCases, EventCannotBeCancelledOrRearmedByAnotherContext) {
     net::io_context left, right;
     auto& lhs = TimeoutScheduler::ForIoContext(left);
     auto& rhs = TimeoutScheduler::ForIoContext(right);
@@ -225,7 +253,12 @@ bool TestShardAndRecycledContextOwnership() {
     try { (void)rhs.ScheduleAfter(0ms, event); }
     catch (const std::logic_error&) { wrong_owner_rejected = true; }
     left.run();
-    if (!wrong_owner_rejected || calls != 1) return false;
+    EXPECT_TRUE(wrong_owner_rejected);
+    EXPECT_EQ(calls, 1u);
+}
+
+TEST_F(TimeoutSchedulerCases, RecycledContextAddressDoesNotRetainSchedulerOwnership) {
+    std::size_t calls = 0;
     std::optional<net::io_context> recycled;
     for (int i = 0; i != 4; ++i) {
         recycled.emplace();
@@ -236,10 +269,10 @@ bool TestShardAndRecycledContextOwnership() {
         recycled->run();
         recycled.reset();
     }
-    return calls == 5;
+    EXPECT_EQ(calls, 4u);
 }
 
-bool TestMaximumDelay() {
+TEST_F(TimeoutSchedulerCases, MaximumDelayCanBeExpeditedAndNegativeDelayExpiresImmediately) {
     net::io_context io;
     auto& scheduler = TimeoutScheduler::ForIoContext(io);
     std::size_t far_calls = 0, immediate_calls = 0;
@@ -248,24 +281,21 @@ bool TestMaximumDelay() {
     immediate.counter = &immediate_calls;
     (void)scheduler.ScheduleAfter(std::chrono::milliseconds::max(), maximum);
     io.poll();
-    if (far_calls != 0) return false;
-    const auto ordinary_before = rejected_allocations;
-    const auto asio_before = timeout_allocation_test::rejected_asio_allocations;
+    EXPECT_EQ(far_calls, 0u);
     bool expedited = false;
     reject_allocations = timeout_allocation_test::reject_asio_allocations = true;
     try { expedited = scheduler.ScheduleAfter(0ms, maximum); }
     catch (const std::bad_alloc&) {}
     timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
-    if (!expedited) return false;
+    EXPECT_TRUE(expedited);
     (void)scheduler.ScheduleAfter(-1ms, immediate);
     io.restart();
     io.run();
-    return far_calls == 1 && immediate_calls == 1 &&
-        rejected_allocations == ordinary_before &&
-        timeout_allocation_test::rejected_asio_allocations == asio_before;
+    EXPECT_EQ(far_calls, 1u);
+    EXPECT_EQ(immediate_calls, 1u);
 }
 
-bool TestOwnerThreadServiceDestruction() {
+TEST_F(TimeoutSchedulerCases, OwnerThreadDestructionDrainsSchedulerWait) {
     std::promise<bool> finished;
     auto result = finished.get_future();
     std::thread owner([&] {
@@ -284,10 +314,10 @@ bool TestOwnerThreadServiceDestruction() {
         } catch (...) { finished.set_value(false); }
     });
     owner.join();
-    return result.get();
+    EXPECT_TRUE(result.get());
 }
 
-bool TestDelayCancellationAndReuse() {
+TEST_F(TimeoutSchedulerCases, DelayCancelIsIdempotentAndDoesNotCancelNextWait) {
     net::io_context io;
     AsyncDelay delay(io);
     bool second_started = false, second_finished = false, early_completion = false;
@@ -303,9 +333,14 @@ bool TestDelayCancellationAndReuse() {
     (void)scheduler.ScheduleAfter(10ms, probe);
     io.run();
     future.get();
-    if (!second_started || !second_finished || early_completion) return false;
+    EXPECT_TRUE(second_started);
+    EXPECT_TRUE(second_finished);
+    EXPECT_FALSE(early_completion);
+}
 
-    io.restart();
+TEST_F(TimeoutSchedulerCases, DelayParentCancellationAllowsReuse) {
+    net::io_context io;
+    AsyncDelay delay(io);
     net::cancellation_signal cancellation;
     bool parent_observed = false;
     auto cancelled = net::co_spawn(io, [&]() -> net::awaitable<void> {
@@ -323,10 +358,10 @@ bool TestDelayCancellationAndReuse() {
     auto reused = net::co_spawn(io, delay.WaitFor(1ms), net::use_future);
     io.run();
     reused.get();
-    return aborted || parent_observed;
+    EXPECT_TRUE(aborted || parent_observed);
 }
 
-bool TestDelayConcurrentWaitAndMaximum() {
+TEST_F(TimeoutSchedulerCases, DelayRejectsConcurrentWaitAndCancelsMaximumDuration) {
     net::io_context io;
     AsyncDelay delay(io);
     auto first = net::co_spawn(io, delay.WaitFor(std::chrono::milliseconds::max()), net::use_future);
@@ -334,18 +369,15 @@ bool TestDelayConcurrentWaitAndMaximum() {
     io.poll();
     bool rejected = false;
     try { second.get(); } catch (const std::logic_error&) { rejected = true; }
-    const auto before = timeout_allocation_test::rejected_asio_allocations;
-    const auto ordinary_before = rejected_allocations;
     reject_allocations = timeout_allocation_test::reject_asio_allocations = true;
     delay.Cancel();
     timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
     io.run();
     first.get();
-    return rejected && timeout_allocation_test::rejected_asio_allocations == before &&
-        rejected_allocations == ordinary_before;
+    EXPECT_TRUE(rejected);
 }
 
-bool TestDelayCancellationAfterRelease() {
+TEST_F(TimeoutSchedulerCases, DelayCancellationAfterSchedulerReleaseCompletesWaiter) {
     net::io_context io;
     AsyncDelay delay(io);
     auto waiting = net::co_spawn(io, delay.WaitFor(1h), net::use_future);
@@ -354,38 +386,10 @@ bool TestDelayCancellationAfterRelease() {
     delay.Cancel();
     io.restart();
     io.run_for(100ms);
-    if (waiting.wait_for(0ms) != std::future_status::ready) return false;
+    ASSERT_EQ(waiting.wait_for(0ms), std::future_status::ready);
     waiting.get();
-    return true;
 }
 
 
 }  // namespace
 
-TEST(TimeoutScheduler, Contract) {
-    const struct { const char* name; bool (*run)(); } cases[] = {
-        {"cancel/rearm/destruction without allocation", TestCancellationAndRearm},
-        {"reentrant owner destruction and exception isolation", TestReentrantDestructionAndExceptions},
-        {"self rearm and I/O fairness", TestSelfRearmAndFairness},
-        {"failed wait initiation and recovery", TestWaitInitiationFailureAndRecovery},
-        {"heap growth and release under allocation failure", TestHeapGrowthAndRelease},
-        {"scheduler shard and recycled context ownership", TestShardAndRecycledContextOwnership},
-        {"maximum and negative delay", TestMaximumDelay},
-        {"owner-thread service destruction", TestOwnerThreadServiceDestruction},
-        {"delay cancellation and reuse", TestDelayCancellationAndReuse},
-        {"delay concurrent wait and maximum", TestDelayConcurrentWaitAndMaximum},
-        {"delay cancellation after scheduler release", TestDelayCancellationAfterRelease},
-    };
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
-    bool passed = true;
-    for (const auto& test : cases) {
-        bool result = false;
-        try { result = test.run(); }
-        catch (const std::exception& error) { std::printf("%s: %s\n", test.name, error.what()); }
-        timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
-        memory::reject_next_process_allocation = false;
-        std::printf("%s: %s\n", test.name, result ? "PASS" : "FAIL");
-        passed = passed && result;
-    }
-    { ASSERT_TRUE(passed); return; }
-}

@@ -20,8 +20,7 @@
 
 namespace {
 
-using ::proxyman::outbound::HandlerLookup;
-using ::proxyman::outbound::OutboundConfiguration;
+using ::proxyman::outbound::HandlerRegistry;
 using ::proxyman::outbound::PreparedOutboundConfig;
 
 struct Probe {
@@ -64,8 +63,6 @@ PreparedOutboundConfig MakeConfig(std::string tag, Probe& probe) {
     };
 }
 
-using InboundRegistry = ::proxyman::inbound::HandlerRegistry;
-
 int Run() {
     ::net::io_context io;
     // Lookup tests never resolve names; one inert endpoint satisfies DNSWorker.
@@ -74,18 +71,17 @@ int Run() {
     ::app::dns::DNSWorker dns_worker(io, dns_config, 8);
     ::app::dns::DNS dns(dns_worker);
     ::ResidentTaskGroup tasks(io.get_executor());
-
     Probe first_probe;
     Probe second_probe;
-    OutboundConfiguration configuration({MakeConfig("direct", first_probe)});
-    HandlerLookup lookup(configuration, io, dns, std::chrono::seconds(1), tasks.Tasks());
+    HandlerRegistry registry({MakeConfig("direct", first_probe)}, io, dns,
+                             std::chrono::seconds(1), tasks.Tasks());
 
-    // Lazy per-domain instantiation, memoized until the tag is republished.
-    if (first_probe.created != 0) return 1;
-    auto first = lookup.GetHandler("direct");
-    if (!first || first->Tag() != "direct" || first_probe.created != 1) return 2;
-    if (lookup.GetHandler("direct") != first || first_probe.created != 1) return 3;
-    if (lookup.GetHandler("") || lookup.GetHandler("missing")) return 4;
+    // Publication instantiates on the owning Worker; lookups never construct.
+    if (first_probe.created != 1) return 1;
+    auto first = registry.GetHandler("direct");
+    if (!first || first->Tag() != "direct") return 2;
+    if (registry.GetHandler("direct") != first || first_probe.created != 1) return 3;
+    if (registry.GetHandler("") || registry.GetHandler("missing")) return 4;
 
     // Dispatch reaches the protocol exactly once, with the handler's dialer.
     ::session::Context ctx;
@@ -105,34 +101,47 @@ int Run() {
     }
     if (!dispatched || first_probe.processed != 1 || !first_probe.last_dialer) return 5;
 
-    // A failed publication leaves the published snapshot untouched.
-    const auto generation = configuration.Generation();
+    // A failed publication leaves the published handler untouched.
     PreparedOutboundConfig missing_creator;
     missing_creator.tag = "direct";
     bool rejected = false;
     try {
-        configuration.Replace(missing_creator);
+        registry.Replace(missing_creator);
     } catch (const std::logic_error&) {
         rejected = true;
     }
-    if (!rejected || configuration.Generation() != generation) return 6;
-    if (lookup.GetHandler("direct") != first) return 7;
+    if (!rejected) return 6;
+    if (registry.GetHandler("direct") != first) return 7;
 
     // Replacement: new handler for new requests; in-flight handles survive.
-    configuration.Replace(MakeConfig("direct", second_probe));
-    auto second = lookup.GetHandler("direct");
+    registry.Replace(MakeConfig("direct", second_probe));
+    auto second = registry.GetHandler("direct");
     if (!second || second == first || second_probe.created != 1) return 8;
     if (first_probe.destroyed != 0) return 9;
     first.reset();
     if (first_probe.destroyed != 1) return 10;
 
-    // Removal: Refresh releases the cached handler before the next lookup.
-    configuration.Remove("direct");
-    lookup.Refresh();
+    // Removal releases the registry's handle; the request handle survives.
+    registry.Remove("direct");
     if (second_probe.destroyed != 0) return 11;
     second.reset();
     if (second_probe.destroyed != 1) return 12;
-    if (lookup.GetHandler("direct")) return 13;
+    if (registry.GetHandler("direct")) return 13;
+
+    // Duplicate tags never publish a partial registry.
+    Probe duplicate_probe;
+    bool duplicate_rejected = false;
+    try {
+        HandlerRegistry duplicate({MakeConfig("same", duplicate_probe),
+                                   MakeConfig("same", duplicate_probe)},
+                                  io, dns, std::chrono::seconds(1), tasks.Tasks());
+    } catch (const std::logic_error&) {
+        duplicate_rejected = true;
+    }
+    if (!duplicate_rejected || duplicate_probe.created != 2 ||
+        duplicate_probe.destroyed != 2) {
+        return 14;
+    }
     return 0;
 }
 

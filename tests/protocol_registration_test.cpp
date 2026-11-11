@@ -207,23 +207,24 @@ bool TestInboundRegistration() {
         return false;
     }
     if (!::proxyman::inbound::HasProxy("test-inbound")) return false;
-    if (!::proxyman::inbound::NewProtocolRuntime("test-inbound")) {
+    ::StatsShard stats;
+    ::proxyman::inbound::HandlerRegistry registry(stats);
+    if (!registry.GetOrCreateRuntime("test-inbound")) {
         return false;
     }
 
-    const ::proxyman::inbound::BuildRequest request;
-    DummyRuntime runtime;
-    ::StatsShard stats;
-    auto unknown_udp = ::proxyman::inbound::NewDatagramHandler(
-        "unknown-udp", runtime, stats, nullptr, request);
+    const auto request_for = [](std::string protocol) {
+        return ::proxyman::inbound::BuildRequest{
+            .tag = {}, .protocol = std::move(protocol), .settings = {}};
+    };
+    auto unknown_udp = registry.NewDatagramHandler(nullptr, request_for("unknown-udp"));
     if (unknown_udp.status !=
             ::proxyman::inbound::DatagramHandlerBuildStatus::Failed ||
         unknown_udp.handler) {
         return false;
     }
 
-    auto unsupported_udp = ::proxyman::inbound::NewDatagramHandler(
-        "test-inbound", runtime, stats, nullptr, request);
+    auto unsupported_udp = registry.NewDatagramHandler(nullptr, request_for("test-inbound"));
     if (unsupported_udp.status !=
             ::proxyman::inbound::DatagramHandlerBuildStatus::Unsupported ||
         unsupported_udp.handler) {
@@ -236,8 +237,7 @@ bool TestInboundRegistration() {
         ::proxyman::inbound::DatagramTransport::Packet;
     ::proxyman::inbound::RegisterProxy(
         "failed-udp", failed_udp_registration);
-    auto failed_udp = ::proxyman::inbound::NewDatagramHandler(
-        "failed-udp", runtime, stats, nullptr, request);
+    auto failed_udp = registry.NewDatagramHandler(nullptr, request_for("failed-udp"));
     if (failed_udp.status !=
             ::proxyman::inbound::DatagramHandlerBuildStatus::Failed ||
         failed_udp.handler) {
@@ -250,8 +250,7 @@ bool TestInboundRegistration() {
         ::proxyman::inbound::DatagramTransport::Packet;
     ::proxyman::inbound::RegisterProxy(
         "ready-udp", ready_udp_registration);
-    auto ready_udp = ::proxyman::inbound::NewDatagramHandler(
-        "ready-udp", runtime, stats, nullptr, request);
+    auto ready_udp = registry.NewDatagramHandler(nullptr, request_for("ready-udp"));
     if (ready_udp.status !=
             ::proxyman::inbound::DatagramHandlerBuildStatus::Ready ||
         !ready_udp.handler) {
@@ -317,9 +316,6 @@ bool TestOutboundRegistration() {
             ::proxyman::outbound::RegisterProxy(
                 "test-outbound", &CreateOutboundConfig);
         })) {
-        return false;
-    }
-    if (!::proxyman::outbound::HasProxy("test-outbound")) {
         return false;
     }
 

@@ -7,7 +7,6 @@
 #include <asio/post.hpp>
 #include <asio/use_awaitable.hpp>
 
-#include <iostream>
 #include <stdexcept>
 #include <vector>
 
@@ -16,9 +15,6 @@ namespace {
 namespace net = ::net;
 using ::MonitorLoop;
 
-void Require(bool condition, const char* message) {
-    if (!condition) throw std::runtime_error(message);
-}
 
 struct Lifetime {
     explicit Lifetime(bool& destroyed) : destroyed(destroyed) {}
@@ -42,7 +38,7 @@ struct Exit {
     std::exception_ptr failure;
 };
 
-void TestIndependentCompletionAndOwnership() {
+TEST(MonitorLoop, IndependentCompletionAndOwnership) {
     net::io_context io;
     net::steady_timer gate(io);
     gate.expires_at(net::steady_timer::time_point::max());
@@ -77,25 +73,23 @@ void TestIndependentCompletionAndOwnership() {
     gate.cancel();
     io.run();
 
-    Require(failure_reported_while_waiting,
-            "a failed monitor must report without waiting for another loop's exit");
-    Require(context_retained && context_destroyed && waiting_owner.expired(),
-            "the task must own its factory context until completion and then release it");
-    Require(only_failed_loop_restarted,
-            "starting monitors again must not duplicate an active loop");
-    Require(exits.size() == 3 && exits[1].failure && exits[2].name == "waiting" &&
-                !exits[2].failure,
-            "each exit must retain its own name and failure status");
+    EXPECT_TRUE(failure_reported_while_waiting) << "a failed monitor must report without waiting for another loop's exit";
+    EXPECT_TRUE(context_retained && context_destroyed && waiting_owner.expired()) << "the task must own its factory context until completion and then release it";
+    EXPECT_TRUE(only_failed_loop_restarted) << "starting monitors again must not duplicate an active loop";
+    EXPECT_TRUE(exits.size() == 3 && exits[1].failure && exits[2].name == "waiting" &&
+                !exits[2].failure) << "each exit must retain its own name and failure status";
+    ASSERT_FALSE(exits.empty());
+    ASSERT_TRUE(exits[0].failure);
     bool original_type = false;
     try {
         std::rethrow_exception(exits[0].failure);
     } catch (const std::runtime_error&) {
         original_type = true;
     }
-    Require(original_type, "monitor completion must preserve the original error type");
+    EXPECT_TRUE(original_type) << "monitor completion must preserve the original error type";
 }
 
-void TestFactoryFailure() {
+TEST(MonitorLoop, FactoryFailureAllowsRestart) {
     net::io_context io;
     int reports = 0;
     auto loop = std::make_shared<MonitorLoop>(io.get_executor(), "factory",
@@ -108,10 +102,10 @@ void TestFactoryFailure() {
     io.restart();
     loop->Start();
     io.run();
-    Require(reports == 2, "factory failure must report and clear the active state");
+    EXPECT_TRUE(reports == 2) << "factory failure must report and clear the active state";
 }
 
-void TestOwnerWithWeakLoopSlots() {
+TEST(MonitorLoop, WeakLoopSlotsPreserveOwnerUntilLastExit) {
     struct Owner {
         explicit Owner(bool& destroyed) : destroyed(destroyed) {}
         ~Owner() { destroyed = true; }
@@ -132,7 +126,7 @@ void TestOwnerWithWeakLoopSlots() {
                 return i == 0 ? FailLoop(starts[i]) : WaitLoop(gate, starts[i]);
             },
             [owner, &exits](std::string_view name, std::exception_ptr failure) {
-                Require(!owner->destroyed, "owner must survive its loop's exit callback");
+                EXPECT_TRUE(!owner->destroyed) << "owner must survive its loop's exit callback";
                 exits.push_back({std::string(name), failure});
             });
         owner->loops[i] = loop;
@@ -150,24 +144,22 @@ void TestOwnerWithWeakLoopSlots() {
     gate.cancel();
     io.run();
 
-    Require(retained_before_execution && independent_exit,
-            "weak loop slots must preserve owner lifetime without joining unrelated loops");
-    Require(destroyed && waiting_loop.expired() && exits.size() == 2 && !exits[1].failure,
-            "owner and loops must be reclaimed after the last exit without a reference cycle");
+    EXPECT_TRUE(retained_before_execution && independent_exit) << "weak loop slots must preserve owner lifetime without joining unrelated loops";
+    EXPECT_TRUE(destroyed && waiting_loop.expired() && exits.size() == 2 && !exits[1].failure) << "owner and loops must be reclaimed after the last exit without a reference cycle";
 }
 
 net::awaitable<void> CleanupLoop(net::steady_timer& work, net::steady_timer& cleanup,
                                 int& starts, bool& cleaning, bool& cleaned) {
     ++starts;
     const auto [error] = co_await work.async_wait(net::as_tuple(net::use_awaitable));
-    Require(error == net::error::operation_aborted, "stop must cancel active work");
+    EXPECT_TRUE(error == net::error::operation_aborted) << "stop must cancel active work";
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     cleaning = true;
     (void)co_await cleanup.async_wait(net::as_tuple(net::use_awaitable));
     cleaned = true;
 }
 
-void TestStopJoinsActualCleanup() {
+TEST(MonitorLoop, StopJoinsActualCleanup) {
     net::io_context io;
     net::steady_timer work(io, net::steady_timer::time_point::max());
     net::steady_timer cleanup(io, net::steady_timer::time_point::max());
@@ -181,34 +173,33 @@ void TestStopJoinsActualCleanup() {
         [&](std::string_view, std::exception_ptr) { ++reports; });
     loop->Start();
     io.poll();
-    Require(starts == 1 && !cleaning, "loop must enter active work");
+    EXPECT_TRUE(starts == 1 && !cleaning) << "loop must enter active work";
     loop->RequestStop();
     loop->RequestStop();
     loop->Start();
     net::cancellation_signal join_cancel;
     net::co_spawn(io, loop->AsyncJoin(),
         net::bind_cancellation_slot(join_cancel.slot(), [&](std::exception_ptr error) {
-            Require(!error && cleaned, "join must complete only after cleanup");
+            EXPECT_TRUE(!error && cleaned) << "join must complete only after cleanup";
             joined = true;
         }));
     io.poll();
     join_cancel.emit(net::cancellation_type::all);
     io.poll();
-    Require(cleaning && !cleaned && !joined && starts == 1,
-            "cancellation and repeated stop must not bypass actual cleanup");
+    EXPECT_TRUE(cleaning && !cleaned && !joined && starts == 1) << "cancellation and repeated stop must not bypass actual cleanup";
     cleanup.cancel();
     io.run();
-    Require(joined && reports == 0, "intentional shutdown must not report a monitor failure");
+    EXPECT_TRUE(joined && reports == 0) << "intentional shutdown must not report a monitor failure";
     io.restart();
     loop->Start();
     net::co_spawn(io, loop->AsyncJoin(), [&](std::exception_ptr error) {
-        Require(!error, "joining an already completed loop must succeed");
+        EXPECT_TRUE(!error) << "joining an already completed loop must succeed";
     });
     io.run();
-    Require(starts == 1, "stopping is terminal and must reject restart");
+    EXPECT_TRUE(starts == 1) << "stopping is terminal and must reject restart";
 }
 
-void TestStopBeforeExecution() {
+TEST(MonitorLoop, StopBeforeExecutionPreventsWork) {
     net::io_context io;
     int starts = 0;
     int reports = 0;
@@ -219,15 +210,14 @@ void TestStopBeforeExecution() {
     loop->RequestStop();
     bool joined = false;
     net::co_spawn(io, loop->AsyncJoin(), [&](std::exception_ptr error) {
-        Require(!error, "queued stop must join successfully");
+        EXPECT_TRUE(!error) << "queued stop must join successfully";
         joined = true;
     });
     io.run();
-    Require(joined && starts == 0 && reports == 0,
-            "a stopped queued loop must not begin new work");
+    EXPECT_TRUE(joined && starts == 0 && reports == 0) << "a stopped queued loop must not begin new work";
 }
 
-void TestPartialStartFailure() {
+TEST(MonitorLoop, PartialStartFailureLeavesStartedLoopsJoinable) {
     struct FailingFactory {
         FailingFactory() = default;
         FailingFactory(const FailingFactory&) { throw std::bad_alloc(); }
@@ -254,15 +244,14 @@ void TestPartialStartFailure() {
     first->RequestStop();
     bool joined = false;
     net::co_spawn(io, first->AsyncJoin(), [&](std::exception_ptr error) {
-        Require(!error, "partial start failure must leave earlier loops joinable");
+        EXPECT_TRUE(!error) << "partial start failure must leave earlier loops joinable";
         joined = true;
     });
     io.run();
-    Require(start_failed && starts == 1 && joined,
-            "partial startup must retain a completion boundary for started loops");
+    EXPECT_TRUE(start_failed && starts == 1 && joined) << "partial startup must retain a completion boundary for started loops";
 }
 
-void TestStopJoinsAcceptedBatch() {
+TEST(MonitorLoop, StopJoinsEveryAcceptedBatchChild) {
     net::io_context io;
     net::steady_timer first(io, net::steady_timer::time_point::max());
     net::steady_timer second(io, net::steady_timer::time_point::max());
@@ -279,37 +268,22 @@ void TestStopJoinsAcceptedBatch() {
         [&](std::string_view, std::exception_ptr) { ++reports; });
     loop->Start();
     io.poll();
-    Require(first_starts == 1 && second_starts == 1, "batch must start both accepted tasks");
+    EXPECT_TRUE(first_starts == 1 && second_starts == 1) << "batch must start both accepted tasks";
     loop->RequestStop();
     bool joined = false;
     net::co_spawn(io, loop->AsyncJoin(), [&](std::exception_ptr error) {
-        Require(!error, "stopped batch owner must join successfully");
+        EXPECT_TRUE(!error) << "stopped batch owner must join successfully";
         joined = true;
     });
     io.poll();
-    Require(!joined, "stop must not abandon an accepted batch");
+    EXPECT_TRUE(!joined) << "stop must not abandon an accepted batch";
     first.cancel();
     io.poll();
-    Require(!joined, "one completed child must not release the batch owner");
+    EXPECT_TRUE(!joined) << "one completed child must not release the batch owner";
     second.cancel();
     io.run();
-    Require(joined && reports == 0 && first_starts == 1 && second_starts == 1,
-            "join must cover every accepted child without starting another batch");
+    EXPECT_TRUE(joined && reports == 0 && first_starts == 1 && second_starts == 1) << "join must cover every accepted child without starting another batch";
 }
 
 }  // namespace
 
-TEST(MonitorLoop, Contract) {
-    try {
-        TestIndependentCompletionAndOwnership();
-        TestFactoryFailure();
-        TestOwnerWithWeakLoopSlots();
-        TestStopJoinsActualCleanup();
-        TestStopBeforeExecution();
-        TestPartialStartFailure();
-        TestStopJoinsAcceptedBatch();
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        FAIL() << error.what();
-    }
-}

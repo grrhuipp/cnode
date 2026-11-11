@@ -4,8 +4,7 @@
 #include "common/awaitable_task_group.hpp"
 
 #include "app/stats.hpp"
-#include "common/hash_container_shrink.hpp"
-#include "app/proxyman/inbound/handler.hpp"
+#include "app/request_load.hpp"
 #include "app/dns/dns.hpp"
 #include "common/session.hpp"
 #include "common/rule.hpp"
@@ -16,6 +15,7 @@
 #include "sniff/sniffer.hpp"
 #include "transport/link.hpp"
 #include "transport/async_stream.hpp"
+#include "transport/failure.hpp"
 #include "common/buf/multi_buffer.hpp"
 
 #include <algorithm>
@@ -74,6 +74,21 @@ void ApplySniffOverride(
     RelayResult result;
     result.error = error;
     return result;
+}
+
+// Dispatch 顶层唯一的失败收尾，必须在 catch 处理块内调用：错误码只经
+// ClassifyFailure 分类；请求取消且已有更具体的结果时保留原结果。
+void FinishDispatchFailure(session::Context& ctx, StatsShard& stats,
+                           RelayResult& result, const char* detail) noexcept {
+    const ErrorCode error = transport::ClassifyFailure(
+        std::current_exception(), ErrorCode::INTERNAL);
+    if (error != ErrorCode::CANCELLED || result.error == ErrorCode::OK) {
+        stats.OnError();
+        result = MakeRelayError(error);
+    }
+    if (error == ErrorCode::CANCELLED || error == ErrorCode::SOCKET_EOF) return;
+    try { LOG_CONN_WARN(ctx, "failed to process outbound traffic > {}", detail); }
+    catch (...) {} // 日志不得越过分配失败边界。
 }
 
 std::chrono::seconds ResolveRelayIdleTimeout(
@@ -246,29 +261,21 @@ net::awaitable<bool> SniffInitialPayload(
         if (!sniff_payload.empty()) {
             outbound_first_payload.Push(std::move(sniff_payload));
         }
-    } catch (const std::bad_alloc&) {
-        throw;
-    } catch (const transport::LinkError& e) {
-        stats.OnError();
-        result = MakeRelayError(e.code());
-        co_return false;
-    } catch (const IoSystemError& e) {
+    } catch (...) {
+        // 分配失败交给 Dispatch 的统一收尾；其余失败经唯一分类入口取得错误码，
+        // 再叠加本阶段的超时与请求取消语义。
+        ErrorCode error = transport::ClassifyFailure(
+            std::current_exception(), ErrorCode::SOCKET_READ_FAILED);
+        if (error == ErrorCode::RESOURCE_EXHAUSTED) throw;
         if (read_timed_out || consume_inbound_timeout()) {
-            stats.OnError();
-            result = MakeRelayError(ErrorCode::TIMEOUT);
-            co_return false;
-        }
-        if (e.code() == net::error::operation_aborted &&
-            (cancellation_reason != ErrorCode::OK ||
-             sniff_cancellation.cancelled() != net::cancellation_type::none)) {
+            error = ErrorCode::TIMEOUT;
+        } else if (error == ErrorCode::CANCELLED &&
+                   (cancellation_reason != ErrorCode::OK ||
+                    sniff_cancellation.cancelled() != net::cancellation_type::none)) {
             throw;
         }
         stats.OnError();
-        result = MakeRelayError(MapAsioError(e.code()));
-        co_return false;
-    } catch (...) {
-        stats.OnError();
-        result = MakeRelayError(ErrorCode::SOCKET_READ_FAILED);
+        result = MakeRelayError(error);
         co_return false;
     }
     co_return true;
@@ -299,7 +306,7 @@ struct ActiveSessionScope {
 
 DefaultDispatcher::DefaultDispatcher(
     const routing::Router& router,
-    proxyman::outbound::HandlerLookup& outbound_handlers,
+    const proxyman::outbound::HandlerRegistry& outbound_handlers,
     rule::DetectRulePolicy& request_policy,
     app::SessionTrackingState& session_tracking,
     app::dns::DNS& dns_service,
@@ -331,26 +338,10 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
                 first_packet, ctx, stats, timeouts, pressure_idle_timeout,
                 result, group, cancellation_reason));
         });
-    } catch (const std::bad_alloc&) {
-        stats.OnError();
-        result = MakeRelayError(ErrorCode::RESOURCE_EXHAUSTED);
-        try { LOG_CONN_WARN(ctx, "failed to process outbound traffic > out of memory"); }
-        catch (...) {} // Logging must not escape the allocation-failure boundary.
-    } catch (const IoSystemError& e) {
-        if (e.code() != net::error::operation_aborted || result.error == ErrorCode::OK) {
-            stats.OnError();
-            result = MakeRelayError(MapAsioError(e.code()));
-        }
-        if (e.code() != net::error::operation_aborted && e.code() != net::error::eof)
-            LOG_CONN_WARN(ctx, "failed to process outbound traffic > {}", e.what());
     } catch (const std::exception& e) {
-        stats.OnError();
-        result = MakeRelayError(ErrorCode::INTERNAL);
-        LOG_CONN_WARN(ctx, "failed to process outbound traffic > {}", e.what());
+        FinishDispatchFailure(ctx, stats, result, e.what());
     } catch (...) {
-        stats.OnError();
-        result = MakeRelayError(ErrorCode::INTERNAL);
-        LOG_CONN_WARN(ctx, "failed to process outbound traffic > unknown error");
+        FinishDispatchFailure(ctx, stats, result, "unknown error");
     }
     if (result.error == ErrorCode::CANCELLED && cancellation_reason != ErrorCode::OK) {
         result.error = cancellation_reason;
@@ -663,152 +654,3 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
 }
 
 }  // namespace app::dispatcher
-
-namespace app {
-
-SessionTrackingState::SessionTrackingState() = default;
-SessionTrackingState::~SessionTrackingState() = default;
-
-void SessionTrackingState::RegisterActiveSession(
-    ActiveSession& node,
-    std::string_view accounting_key,
-    int64_t user_id,
-    session::Traffic& traffic) {
-    if (accounting_key.empty() || user_id <= 0 || node.bucket) return;
-    auto entry = accounts_.find(accounting_key);
-    const bool inserted = entry == accounts_.end();
-    if (inserted) {
-        entry = accounts_.try_emplace(std::string{accounting_key}).first;
-        entry->second.key = entry->first;
-    }
-    AccountBucket& bucket = entry->second;
-    try {
-        auto& account = bucket.traffic.try_emplace(user_id).first->second;
-        node.account = &account;
-        ++account.active;
-    } catch (...) {
-        if (inserted) accounts_.erase(entry);
-        throw;
-    }
-    node.bucket = &bucket;
-    node.user_id = user_id;
-    node.traffic = &traffic;
-    node.last_reported_up = 0;
-    node.last_reported_down = 0;
-    node.prev = nullptr;
-    node.next = bucket.active_head;
-    if (node.next) node.next->prev = &node;
-    bucket.active_head = &node;
-}
-
-void SessionTrackingState::UnregisterActiveSession(ActiveSession& node) noexcept {
-    if (!node.bucket) return;
-    auto* bucket = node.bucket;
-    if (node.prev) node.prev->next = node.next;
-    else bucket->active_head = node.next;
-    if (node.next) node.next->prev = node.prev;
-    auto& account = *node.account;
-    account.completed.upload += node.traffic->bytes_up - node.last_reported_up;
-    account.completed.download += node.traffic->bytes_down - node.last_reported_down;
-    --account.active;
-    if (account.active == 0 && account.completed.upload == 0 &&
-        account.completed.download == 0) {
-        bucket->traffic.erase(node.user_id);
-        if (bucket->traffic.empty()) {
-            if (const auto entry = accounts_.find(bucket->key); entry != accounts_.end()) {
-                accounts_.erase(entry);
-                MaybeShrinkHashContainer(accounts_, 8);
-            }
-        } else {
-            MaybeShrinkHashContainer(bucket->traffic);
-        }
-    }
-    node = {};
-}
-
-UserTrafficCounters SessionTrackingState::SnapshotTraffic(std::string_view accounting_key) {
-    UserTrafficCounters result;
-    const auto entry = accounts_.find(accounting_key);
-    if (entry == accounts_.end()) return result;
-
-    AccountBucket& bucket = entry->second;
-    for (auto* node = bucket.active_head; node; node = node->next) {
-        const auto up = node->traffic->bytes_up - node->last_reported_up;
-        const auto down = node->traffic->bytes_down - node->last_reported_down;
-        node->last_reported_up = node->traffic->bytes_up;
-        node->last_reported_down = node->traffic->bytes_down;
-        node->account->completed.upload += up;
-        node->account->completed.download += down;
-    }
-
-    result.users.reserve(bucket.traffic.size());
-    for (auto& [user_id, account] : bucket.traffic) {
-        if (account.completed.upload || account.completed.download) {
-            result.users.emplace(user_id, account.completed);
-            account.snapshotted = account.completed;
-        }
-    }
-    return result;
-}
-
-void SessionTrackingState::CommitTraffic(
-    std::string_view accounting_key, const UserTrafficCounters& snapshot) {
-    if (snapshot.empty()) return;
-    const auto entry = accounts_.find(accounting_key);
-    if (entry == accounts_.end()) {
-        throw std::logic_error("traffic snapshot account disappeared before commit");
-    }
-    auto& bucket = entry->second;
-    for (const auto& [uid, value] : snapshot) {
-        const auto it = bucket.traffic.find(uid);
-        if (it == bucket.traffic.end() ||
-            it->second.completed.upload < value.upload ||
-            it->second.completed.download < value.download ||
-            it->second.snapshotted.upload < value.upload ||
-            it->second.snapshotted.download < value.download) {
-            throw std::logic_error("traffic snapshot exceeds in-flight counters");
-        }
-    }
-    for (const auto& [uid, value] : snapshot) {
-        auto it = bucket.traffic.find(uid);
-        it->second.completed.upload -= value.upload;
-        it->second.completed.download -= value.download;
-        it->second.snapshotted.upload -= value.upload;
-        it->second.snapshotted.download -= value.download;
-        if (it->second.active == 0 && it->second.completed.upload == 0 &&
-            it->second.completed.download == 0) {
-            bucket.traffic.erase(it);
-        }
-    }
-    if (bucket.traffic.empty()) {
-        accounts_.erase(entry);
-        MaybeShrinkHashContainer(accounts_, 8);
-    } else {
-        MaybeShrinkHashContainer(bucket.traffic);
-    }
-}
-
-void SessionTrackingState::RollbackTraffic(
-    std::string_view accounting_key, const UserTrafficCounters& snapshot) {
-    if (snapshot.empty()) return;
-    const auto entry = accounts_.find(accounting_key);
-    if (entry == accounts_.end()) {
-        throw std::logic_error("traffic snapshot account disappeared before rollback");
-    }
-    auto& bucket = entry->second;
-    for (const auto& [uid, value] : snapshot) {
-        const auto it = bucket.traffic.find(uid);
-        if (it == bucket.traffic.end() ||
-            it->second.snapshotted.upload < value.upload ||
-            it->second.snapshotted.download < value.download) {
-            throw std::logic_error("traffic rollback exceeds in-flight counters");
-        }
-    }
-    for (const auto& [uid, value] : snapshot) {
-        auto& account = bucket.traffic.find(uid)->second;
-        account.snapshotted.upload -= value.upload;
-        account.snapshotted.download -= value.download;
-    }
-}
-
-}  // namespace app

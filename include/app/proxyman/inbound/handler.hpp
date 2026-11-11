@@ -5,6 +5,7 @@
 #include "common/string_hash.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
+#include "app/request_load.hpp"
 #include "app/stats.hpp"
 #include "features/routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
@@ -12,6 +13,7 @@
 #include "transport/async_stream.hpp"
 #include "transport/internet/proxy_protocol.hpp"
 #include "transport/internet/stream_settings.hpp"
+#include "transport/internet/transport_security.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -27,71 +29,6 @@ struct InboundProtocolSettings;
 struct InboundUserSpec;
 struct OnlineDevice;
 namespace app {
-// Worker-local request pressure; physical and dispatch counts are not added together.
-class RequestLoadState final {
-public:
-    RequestLoadState(uint32_t pressure_threshold,
-                     uint32_t pressure_idle_timeout) noexcept
-        : pressure_threshold_(std::max<uint32_t>(pressure_threshold, 1)),
-          pressure_idle_timeout_(pressure_idle_timeout) {}
-
-    [[nodiscard]] uint32_t ActiveConnections() const noexcept {
-        return std::max(physical_connections_, active_dispatches_);
-    }
-
-    [[nodiscard]] uint32_t PressureIdleTimeout() const noexcept {
-        return ActiveConnections() >= pressure_threshold_
-            ? pressure_idle_timeout_
-            : 0;
-    }
-
-    class PhysicalConnectionScope final {
-    public:
-        explicit PhysicalConnectionScope(RequestLoadState& state) noexcept
-            : state_(&state) {
-            ++state_->physical_connections_;
-        }
-
-        ~PhysicalConnectionScope() noexcept {
-            --state_->physical_connections_;
-        }
-
-        PhysicalConnectionScope(const PhysicalConnectionScope&) = delete;
-        PhysicalConnectionScope& operator=(const PhysicalConnectionScope&) = delete;
-        PhysicalConnectionScope(PhysicalConnectionScope&&) = delete;
-        PhysicalConnectionScope& operator=(PhysicalConnectionScope&&) = delete;
-
-    private:
-        RequestLoadState* state_;
-    };
-
-    class DispatchScope final {
-    public:
-        explicit DispatchScope(RequestLoadState& state) noexcept
-            : state_(state) {
-            ++state_.active_dispatches_;
-        }
-
-        ~DispatchScope() noexcept {
-            --state_.active_dispatches_;
-        }
-
-        DispatchScope(const DispatchScope&) = delete;
-        DispatchScope& operator=(const DispatchScope&) = delete;
-        DispatchScope(DispatchScope&&) = delete;
-        DispatchScope& operator=(DispatchScope&&) = delete;
-
-    private:
-        RequestLoadState& state_;
-    };
-
-private:
-    uint32_t physical_connections_ = 0;
-    uint32_t active_dispatches_ = 0;
-    const uint32_t pressure_threshold_;
-    const uint32_t pressure_idle_timeout_;
-};
-
 namespace dns {
 class DNS;
 }  // namespace dns
@@ -227,22 +164,6 @@ void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
 
 [[nodiscard]] DatagramTransport RegisteredDatagramTransport(
     std::string_view protocol);
-[[nodiscard]] std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(
-    std::string_view protocol);
-
-[[nodiscard]] std::unique_ptr<::Inbound> NewHandler(
-    std::string_view protocol,
-    ProtocolRuntime& runtime,
-    ::StatsShard& stats,
-    ::ConnectionLimiter* limiter,
-    const BuildRequest& req);
-
-[[nodiscard]] DatagramHandlerBuildResult NewDatagramHandler(
-    std::string_view protocol,
-    ProtocolRuntime& runtime,
-    ::StatsShard& stats,
-    ::ConnectionLimiter* limiter,
-    const BuildRequest& req);
 
 [[nodiscard]] std::optional<BuildRequest> PrepareBuildRequest(
     std::string_view protocol,
@@ -372,19 +293,3 @@ private:
 
 }  // namespace proxyman::inbound
 
-class UserOnlineTracker;
-namespace app {
-
-struct DatagramSessionEnvironment final {
-    TimeoutsConfig timeouts;
-    routing::Dispatcher* dispatcher = nullptr;
-    StatsShard* stats = nullptr;
-    ConnectionLimiter* limiter = nullptr;
-    RequestLoadState* request_load = nullptr;
-    UserOnlineTracker* tracker = nullptr;
-    uint32_t* active_sessions = nullptr;
-    std::shared_ptr<proxyman::inbound::Handler> handler{};
-    std::shared_ptr<const proxyman::inbound::BuildRequest> prepared{};
-};
-
-} // namespace app

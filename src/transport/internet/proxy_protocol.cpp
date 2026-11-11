@@ -255,7 +255,7 @@ size_t EncodeProxyProtocolHeader(
     uint8_t version,
     const tcp::endpoint& src,
     const tcp::endpoint& dst,
-    std::span<uint8_t, 108> out) noexcept {
+    std::span<uint8_t, kProxyProtocolMaxHeaderSize> out) noexcept {
     const auto src_addr = iputil::NormalizeAddress(src.address());
     const auto dst_addr = iputil::NormalizeAddress(dst.address());
     const uint16_t src_port = src.port();

@@ -1,4 +1,6 @@
 #include "common/mux/mux_codec.hpp"
+#include "proxy/handshake_errors.hpp"
+#include "proxy/mux/mux_server.hpp"
 #include "app/relay.hpp"
 #include "common/scoped_cleanse.hpp"
 #include "proxy/inbound_admission.hpp"
@@ -34,7 +36,7 @@
 
 namespace {
 
-using ::vless::VlessBufferedReader;
+using proxy::BufferedStreamReader;
 
 // Coalesces the fixed response header into the first downstream write.
 class VlessResponseHeaderWriter final : public transport::MultiBufferWriter {
@@ -104,10 +106,10 @@ private:
 
 
 net::awaitable<tl::expected<::vless::RequestHeader, ErrorCode>>
-ReadVlessRequestHeader(VlessBufferedReader& active_reader,
+ReadVlessRequestHeader(proxy::BufferedStreamReader& active_reader,
                        AsyncStream& stream,
-                       session::Context& ctx,
-                       std::string_view client_ip) {
+                       session::Context& ctx) {
+    const auto& client_ip = ctx.inbound.source_ip;
     using ::vless::RequestHeaderDecodeStatus;
     std::array<uint8_t, ::vless::kMaxRequestHeaderSize> handshake{};
     size_t total_read = 0;
@@ -123,9 +125,7 @@ ReadVlessRequestHeader(VlessBufferedReader& active_reader,
                           step_read) ||
                       co_await active_reader.ReadExact(
                           handshake.data() + total_read,
-                          required - total_read,
-                          false,
-                          &step_read);
+                          required - total_read, &step_read);
         } catch (const IoSystemError& error) {
             const ErrorCode classified =
                 proxy::ClassifyHandshakeReadException(stream, error);
@@ -154,21 +154,16 @@ ReadVlessRequestHeader(VlessBufferedReader& active_reader,
             required = decoded.required;
             continue;
         case RequestHeaderDecodeStatus::InvalidVersion:
-            LOG_CONN_WARN(ctx, "request rejected from {}:{} > invalid protocol version",
-                          client_ip, ctx.inbound.source_port);
-            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid protocol version"));
+            proxy::LogInboundRequestRejected(ctx, "invalid protocol version");
             co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_VERSION);
         case RequestHeaderDecodeStatus::InvalidAddress:
-            LOG_CONN_WARN(ctx, "request rejected from {}:{} > invalid target address",
-                          client_ip, ctx.inbound.source_port);
-            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid target address"));
+            proxy::LogInboundRequestRejected(ctx, "invalid target address");
             co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
         case RequestHeaderDecodeStatus::InvalidCommand:
         case RequestHeaderDecodeStatus::InvalidAddons:
             break;
         }
-        LOG_CONN_WARN(ctx, "invalid request header from {}:{}", client_ip, ctx.inbound.source_port);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid request header"));
+        proxy::LogInboundRequestRejected(ctx, "invalid request header");
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 }
@@ -179,23 +174,24 @@ struct VlessHandshakeOutcome {
     bool packet_addr_udp = false;
     bool use_vision = false;
     std::array<uint8_t, 16> request_uuid{};
+    ::vless::VlessActiveIo active;
 };
 
 net::awaitable<tl::expected<VlessHandshakeOutcome, ErrorCode>>
 CompleteVlessInboundHandshake(
     AsyncStream& stream,
     const std::shared_ptr<const ::vless::VlessEncryptionConfig>& decryption,
-    VlessBufferedReader& protocol_reader,
+    proxy::BufferedStreamReader& protocol_reader,
     transport::MultiBufferWriter& protocol_writer,
     std::optional<::vless::VlessEncryptedIo>& encrypted_io,
-    VlessBufferedReader*& active_reader,
-    transport::MultiBufferWriter*& active_writer,
-    ::UserOnlineTracker& validator,
+    ::UserOnlineTracker& tracker,
     ConnectionLimiter* limiter,
     const proxyman::inbound::ReceiverSettings& receiver,
-    session::Context& ctx,
-    std::string_view tag,
-    std::string_view client_ip) {
+    session::Context& ctx) {
+    const auto tag = ctx.inbound.tag;
+    const auto& client_ip = ctx.inbound.source_ip;
+    auto* active_reader = &protocol_reader;
+    auto* active_writer = &protocol_writer;
     std::optional<::vless::VlessEncryptionIssuedTicket> issued_ticket;
     std::optional<std::array<uint8_t, 16>> resumed_identity;
     if (decryption) {
@@ -219,9 +215,10 @@ CompleteVlessInboundHandshake(
                     runtime.error() == ::vless::VlessEncryptionHandshakeFailure::Truncated;
                 const auto reason = truncated
                     ? "encryption handshake truncated" : "encryption handshake rejected";
-                LOG_CONN_WARN(ctx, "{} from {}:{}", reason, client_ip, ctx.inbound.source_port);
-                if (!truncated) {
-                    LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+                if (truncated) {
+                    LOG_CONN_WARN(ctx, "{} from {}:{}", reason, client_ip, ctx.inbound.source_port);
+                } else {
+                    proxy::LogInboundRequestRejected(ctx, reason);
                 }
                 co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
             }
@@ -246,15 +243,13 @@ CompleteVlessInboundHandshake(
         } catch (const WorkerMailboxFull&) {
             co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         } catch (...) {
-            LOG_CONN_WARN(ctx, "encryption handshake failed from {}:{} > handshake exception",
-                          client_ip, ctx.inbound.source_port);
-            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "encryption handshake exception"));
+            proxy::LogInboundRequestRejected(ctx, "encryption handshake exception");
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
     }
 
     auto parsed_request = co_await ReadVlessRequestHeader(
-        *active_reader, stream, ctx, client_ip);
+        *active_reader, stream, ctx);
     if (!parsed_request) {
         co_return tl::unexpected(parsed_request.error());
     }
@@ -294,47 +289,35 @@ CompleteVlessInboundHandshake(
     const bool use_vision = ::vless::IsVisionFlow(request.flow);
     if (!request.flow.empty()) {
         if (std::string_view(request.flow) != user_info->flow) {
-            LOG_CONN_WARN(ctx, "request rejected from {}:{} > flow '{}' not allowed",
-                          client_ip, ctx.inbound.source_port, request.flow);
-            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "request flow not allowed"));
+            proxy::LogInboundRequestRejected(ctx, "request flow not allowed");
             co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
         }
         if (!use_vision) {
-            LOG_CONN_WARN(ctx, "request rejected from {}:{} > unknown flow '{}'",
-                          client_ip, ctx.inbound.source_port, request.flow);
-            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "unknown request flow"));
+            proxy::LogInboundRequestRejected(ctx, "unknown request flow");
             co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
         }
     }
     if (!user_info->flow.empty() && !::vless::IsVisionFlow(user_info->flow)) {
-        LOG_CONN_WARN(ctx, "request rejected from {}:{} > unsupported configured flow '{}'",
-                      client_ip, ctx.inbound.source_port, user_info->flow);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "unsupported configured flow"));
+        proxy::LogInboundRequestRejected(ctx, "unsupported configured flow");
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     if (request.flow.empty() && ::vless::IsVisionFlow(user_info->flow)) {
-        LOG_CONN_WARN(ctx, "request rejected from {}:{} > missing required flow '{}'",
-                      client_ip, ctx.inbound.source_port, user_info->flow);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "missing required flow"));
+        proxy::LogInboundRequestRejected(ctx, "missing required flow");
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     if (use_vision && request.command != ::vless::Command::TCP) {
-        LOG_CONN_WARN(ctx, "request rejected from {}:{} > flow '{}' only supports TCP",
-                      client_ip, ctx.inbound.source_port, request.flow);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "flow only supports TCP"));
+        proxy::LogInboundRequestRejected(ctx, "flow only supports TCP");
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
     if (use_vision &&
         (!(receiver.stream_settings.IsTlsLike() || decryption != nullptr) ||
          receiver.stream_settings.network_mode != NetworkMode::Tcp)) {
-        LOG_CONN_WARN(ctx, "request rejected from {}:{} > flow '{}' requires raw TCP TLS-like transport",
-                      client_ip, ctx.inbound.source_port, request.flow);
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "flow requires raw TCP TLS-like transport"));
+        proxy::LogInboundRequestRejected(ctx, "flow requires raw TCP TLS-like transport");
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
     auto user_session = co_await proxy::AdmitAuthenticatedInbound(
-        validator, ctx, user_info->profile);
+        tracker, ctx, user_info->profile);
     if (!user_session) {
         co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
     }
@@ -360,6 +343,7 @@ CompleteVlessInboundHandshake(
         .packet_addr_udp = packet_addr_udp,
         .use_vision = use_vision,
         .request_uuid = request.uuid,
+        .active = {active_reader, active_writer},
     };
 }
 }  // namespace
@@ -368,7 +352,7 @@ namespace proxy::vless::inbound {
 
 class Handler final : public ::Inbound {
 public:
-    Handler(::UserOnlineTracker& validator,
+    Handler(::UserOnlineTracker& tracker,
             ::StatsShard& stats,
             ::ConnectionLimiter* limiter,
             std::shared_ptr<
@@ -385,7 +369,7 @@ public:
         uint32_t pressure_idle_timeout) override;
 
 private:
-    ::UserOnlineTracker& validator_;
+    ::UserOnlineTracker& tracker_;
     ::StatsShard& stats_;
     ::ConnectionLimiter* limiter_;
     std::shared_ptr<const ::vless::VlessEncryptionConfig> decryption_;
@@ -394,11 +378,11 @@ private:
 }  // namespace proxy::vless::inbound
 
 proxy::vless::inbound::Handler::Handler(
-    ::UserOnlineTracker& validator,
+    ::UserOnlineTracker& tracker,
     StatsShard& stats,
     ConnectionLimiter* limiter,
     std::shared_ptr<const ::vless::VlessEncryptionConfig> decryption)
-    : validator_(validator)
+    : tracker_(tracker)
     , stats_(stats)
     , limiter_(limiter)
     , decryption_(std::move(decryption)) {}
@@ -414,8 +398,8 @@ proxy::vless::inbound::Handler::Process(
     session::Context& ctx,
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
-    const std::string_view tag = ctx.inbound.tag;
-    const std::string_view client_ip = ctx.inbound.source_ip;
+
+
     auto fail_abortive = [&](ErrorCode error) {
         return proxy::RejectInbound(stats_, stream.get(), error);
     };
@@ -425,9 +409,9 @@ proxy::vless::inbound::Handler::Process(
         co_return fail_abortive(ErrorCode::BLOCKED);
     }
 
-    VlessBufferedReader protocol_reader(*stream);
+    proxy::BufferedStreamReader protocol_reader(*stream);
     transport::MultiBufferWriter& protocol_writer = *stream;
-    VlessBufferedReader* active_reader = &protocol_reader;
+    proxy::BufferedStreamReader* active_reader = &protocol_reader;
     transport::MultiBufferWriter* active_writer = &protocol_writer;
     std::optional<::vless::VlessEncryptedIo> encrypted_io;
 
@@ -443,17 +427,15 @@ proxy::vless::inbound::Handler::Process(
             protocol_reader,
             protocol_writer,
             encrypted_io,
-            active_reader,
-            active_writer,
-            validator_,
+            tracker_,
             limiter_,
             receiver,
-            ctx,
-            tag,
-            client_ip);
+            ctx);
         if (!handshake) {
             co_return fail_abortive(handshake.error());
         }
+        active_reader = handshake->active.reader;
+        active_writer = handshake->active.writer;
         user_session = std::move(handshake->user_session);
         net = handshake->net;
         packet_addr_udp = handshake->packet_addr_udp;
@@ -467,7 +449,7 @@ proxy::vless::inbound::Handler::Process(
     active_writer = &response_writer;
 
     if (net == Network::MUX) {
-        co_return co_await mux::ProcessInbound(
+        co_return co_await proxy::ServeMuxInbound(
             io_context,
             transport::Link{active_reader, active_writer},
             *stream,
@@ -591,20 +573,18 @@ const bool kVlessInboundRegistered = [] {
             -> std::optional<std::shared_ptr<
                 const ::proxyman::inbound::ProtocolSettings>> {
             auto settings = std::make_shared<VlessSettings>();
-            if (!::vless::IsNoVlessEncryption(config.vless_decryption)) {
                 auto parsed = ::vless::ParseVlessServerDecryption(
                     config.vless_decryption);
                 if (!parsed) {
                     LOG_WARN("VLESS inbound '{}': invalid decryption: {}",
                              tag,
                              ::vless::VlessEncryptionParseErrorMessage(
-                                 parsed.error));
+                                 parsed.error()));
                     return std::nullopt;
                 }
-                settings->decryption =
+                if (*parsed) settings->decryption =
                     std::make_shared<::vless::VlessEncryptionConfig>(
-                        std::move(*parsed.config));
-            }
+                        std::move(**parsed));
             return settings;
         };
 

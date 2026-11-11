@@ -47,7 +47,7 @@ TEST_P(QuicUdpCancellation, ReturnsUnreadBuffersBeforeNotifyingSubscribers) {
     RunInDomain([destroy_host](net::io_context& io) -> net::awaitable<void> {
         const auto baseline = memory::detail::test_buffers_live;
         const TargetAddress target("127.0.0.1", 12345);
-        auto stream = std::make_unique<UdpSessionStream>(io, 7, target,
+        auto stream = std::make_unique<UdpSessionStream>(io, 7,
             std::weak_ptr<transport::internet::hysteria::Connection>{});
         constexpr std::array<std::string_view, 3> input{
             "delivered-first", "discard-second", "discard-third"};
@@ -103,7 +103,7 @@ TEST(QuicUdpQueue, BoundsBufferCapacityAndReturnsAdmissionOnRead) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
         const auto baseline = memory::detail::test_buffers_live;
         const TargetAddress target("127.0.0.1", 12345);
-        UdpSessionStream stream(io, 9, target, {});
+        UdpSessionStream stream(io, 9, {});
         constexpr size_t limit = UdpSessionStream::kMaxQueuedBytes / buf::Buffer::kSize;
         size_t accepted = 0;
         for (size_t index = 0; index < 2 * limit; ++index) {
@@ -180,7 +180,7 @@ TEST(QuicUdpQueue, EmptyMessagesConsumeBufferAdmissionAndRemainReadable) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
         const auto baseline = memory::detail::test_buffers_live;
         const TargetAddress target("127.0.0.1", 12345);
-        UdpSessionStream stream(io, 10, target, {});
+        UdpSessionStream stream(io, 10, {});
         constexpr size_t limit = UdpSessionStream::kMaxQueuedBytes / buf::Buffer::kSize;
         size_t admitted = 0;
         for (size_t index = 0; index <= limit; ++index)

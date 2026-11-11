@@ -52,12 +52,13 @@ buf::BufferGuard MakeBuffer(size_t size,
 }
 
 template <typename Factory>
-void CheckRejected(Factory&& factory, std::string_view message) {
+void CheckRejected(Factory&& factory, std::string_view message,
+                   ErrorCode expected = ErrorCode::PROTOCOL_INVALID_ADDRESS) {
     bool rejected = false;
     try {
         factory();
-    } catch (const IoSystemError&) {
-        rejected = true;
+    } catch (const transport::LinkError& error) {
+        rejected = error.code() == expected;
     }
     Check(rejected, message);
 }
@@ -81,14 +82,12 @@ vmess::VMessRequest MakeRequest(vmess::Security security, uint8_t options,
 class RequestEncoder {
 public:
     explicit RequestEncoder(const vmess::VMessRequest& request)
-        : cipher_(request.security, request.body_key.data(), request.body_iv.data(),
-                  proxy::AeadDirection::Encrypt)
+        : cipher_(request.security, request.body_key.data(), request.body_iv.data())
         , padding_((request.options & vmess::Option::GLOBAL_PADDING) != 0) {
         if ((request.options & vmess::Option::AUTHENTICATED_LENGTH) != 0) {
             const std::array<std::string_view, 1> path{"auth_len"};
             auto key = vmess::KDF16(request.body_key.data(), request.body_key.size(), path);
-            length_cipher_.emplace(request.security, key.data(), request.body_iv.data(),
-                                   proxy::AeadDirection::Encrypt);
+            length_cipher_.emplace(request.security, key.data(), request.body_iv.data());
         }
         if ((request.options & vmess::Option::CHUNK_MASKING) != 0) {
             mask_.emplace(request.body_iv.data());
@@ -141,13 +140,12 @@ public:
     explicit ResponseDecoder(const vmess::VMessRequest& request)
         : key_(Sha256(request.body_key))
         , iv_(Sha256(request.body_iv))
-        , cipher_(request.security, key_.data(), iv_.data(), proxy::AeadDirection::Decrypt)
+        , cipher_(request.security, key_.data(), iv_.data())
         , padding_((request.options & vmess::Option::GLOBAL_PADDING) != 0) {
         if ((request.options & vmess::Option::AUTHENTICATED_LENGTH) != 0) {
             const std::array<std::string_view, 1> path{"auth_len"};
             length_key_ = vmess::KDF16(request.body_key.data(), request.body_key.size(), path);
-            length_cipher_.emplace(request.security, length_key_.data(), request.body_iv.data(),
-                                   proxy::AeadDirection::Decrypt);
+            length_cipher_.emplace(request.security, length_key_.data(), request.body_iv.data());
         }
         if ((request.options & vmess::Option::CHUNK_MASKING) != 0) {
             mask_.emplace(iv_.data());
@@ -747,12 +745,8 @@ void TestAuthenticatedHeaderFailure() {
         const auto length_key = vmess::RequestHeaderLengthKey(user.cmd_key, auth_id, nonce);
         const auto payload_key = vmess::RequestHeaderPayloadKey(user.cmd_key, auth_id, nonce);
         const std::array<uint8_t, 2> length{0, static_cast<uint8_t>(plain.size())};
-        Check(vmess::AES128GCMEncrypt(length_key.key.data(), length_key.nonce.data(),
-                  auth_id.data(), auth_id.size(), length.data(), length.size(),
-                  wire.data() + 16, wire.data() + 18), "failed to seal header length");
-        Check(vmess::AES128GCMEncrypt(payload_key.key.data(), payload_key.nonce.data(),
-                  auth_id.data(), auth_id.size(), plain.data(), plain.size(),
-                  wire.data() + 42, wire.data() + 42 + plain.size()), "failed to seal header");
+        Check(proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {length_key.key.data(), 16}, {length_key.nonce.data(), 12}, {length.data(), length.size()}, {auth_id.data(), auth_id.size()}, wire.data() + 16, {wire.data() + 18, 16}), "failed to seal header length");
+        Check(proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {payload_key.key.data(), 16}, {payload_key.nonce.data(), 12}, {plain.data(), plain.size()}, {auth_id.data(), auth_id.size()}, wire.data() + 42, {wire.data() + 42 + plain.size(), 16}), "failed to seal header");
         if (fault == 2) wire.back() ^= 1;
         vmess::encoding::ServerSession session(tag);
         auto [request, consumed] = session.DecodeRequestHeader(wire.data(), wire.size());
@@ -1185,12 +1179,14 @@ TEST(VmessUdpDatagram, BodyEncoderRejectsAliasBeforeAdvancing) {
     vmess::encoding::BodyEncoder encoder({request.security, request.options, request.command}, key, key);
     buf::MultiBuffer payload{MakeBuffer(19, &request.target, 0x31)};
     CheckRejected([&] { encoder.Encode(payload, payload); },
-                  "VMess BodyEncoder accepted the same input/output object");
+                  "VMess BodyEncoder accepted the same input/output object",
+                  ErrorCode::INVALID_ARGUMENT);
     const buf::ContiguousBufferView original(payload);
     Check(original.Bytes().size() == 19 &&
               std::all_of(original.Bytes().begin(), original.Bytes().end(),
                           [](uint8_t byte) { return byte == 0x31; }),
           "VMess alias rejection modified its input");
+    Check(!encoder.Failed(), "VMess alias rejection retired the encoder");
     buf::MultiBuffer encoded;
     encoder.Encode(payload, encoded);
     RequestEncoder reference(request);
@@ -1244,7 +1240,26 @@ TEST(VmessUdpDatagram, BodyInputRejectionPreservesNextRecord) {
     const auto oversized = MakePayload(vmess::MAX_CHUNK_SIZE + 1, 0x21);
     const std::array<net::const_buffer, 1> large{net::buffer(oversized)};
     CheckRejected([&] { encoder.Encode(large, encoded); },
-                  "VMess accepted an oversized UDP record");
+                  "VMess accepted an oversized UDP record",
+                  ErrorCode::PROTOCOL_ENCODE_FAILED);
+    const auto one_over = MakePayload(
+        vmess::MAX_CHUNK_SIZE - vmess::GCM_TAG_SIZE + 1, 0x19);
+    const std::array<net::const_buffer, 1> one_over_buffers{net::buffer(one_over)};
+    CheckRejected([&] { encoder.Encode(one_over_buffers, encoded); },
+                  "VMess accepted one byte beyond its authenticated payload limit",
+                  ErrorCode::PROTOCOL_ENCODE_FAILED);
+    buf::MultiBuffer large_packet;
+    Check(buf::AppendSpanToMultiBuffer(oversized, large_packet),
+          "VMess oversized test packet allocation failed");
+    CheckRejected([&] { encoder.Encode(large_packet, encoded); },
+                  "VMess accepted oversized multi-buffer UDP",
+                  ErrorCode::PROTOCOL_ENCODE_FAILED);
+    const std::array<net::const_buffer, 1> null_input{
+        net::const_buffer(nullptr, 1)};
+    CheckRejected([&] { encoder.Encode(null_input, encoded); },
+                  "VMess accepted non-empty null input", ErrorCode::INVALID_ARGUMENT);
+    Check(encoded.empty() && !encoder.Failed(),
+          "VMess input rejection published bytes or retired the encoder");
     const auto payload = MakePayload(113, 0x47);
     const std::array<net::const_buffer, 1> legal{net::buffer(payload)};
     encoder.Encode(legal, encoded);
@@ -1254,6 +1269,17 @@ TEST(VmessUdpDatagram, BodyInputRejectionPreservesNextRecord) {
     Check(std::equal(actual.Bytes().begin(), actual.Bytes().end(),
                      expected.begin(), expected.end()),
           "VMess input rejection advanced the next record's framing state");
+    encoded.clear();
+    const auto maximum = MakePayload(vmess::MAX_CHUNK_SIZE - vmess::GCM_TAG_SIZE, 0x61);
+    const std::array<net::const_buffer, 2> maximum_buffers{
+        net::buffer(maximum.data(), 17),
+        net::buffer(maximum.data() + 17, maximum.size() - 17)};
+    encoder.Encode(maximum_buffers, encoded);
+    const auto expected_maximum = reference.Encode(maximum);
+    const buf::ContiguousBufferView actual_maximum(encoded);
+    Check(std::equal(actual_maximum.Bytes().begin(), actual_maximum.Bytes().end(),
+                     expected_maximum.begin(), expected_maximum.end()),
+          "VMess maximum UDP payload damaged the next authenticated record");
 }
 
 TEST(VmessUdpDatagram, LowerWriteClosedPreservesReverseRead) {

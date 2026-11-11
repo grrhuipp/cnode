@@ -9,7 +9,6 @@
 #include <openssl/base64.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
-#include <asio/bind_cancellation_slot.hpp>
 #include <algorithm>
 #include <limits>
 #include <string_view>
@@ -40,37 +39,6 @@ std::array<char, 28> EncodeWsAccept(std::string_view ws_key) noexcept {
 
 namespace {
 using transport::internet::detail::EffectiveHttpPath;
-
-class WriteGateWait final : private transport::CancellationSubscription {
-public:
-    WriteGateWait(transport::CancellationSource& source, net::cancellation_slot parent)
-        : parent_(parent) {
-        if (parent_.is_connected()) {
-            parent_.assign([this](net::cancellation_type type) {
-                cancelled_ = true;
-                signal_.emit(type);
-            });
-        }
-        Resubscribe(source);
-    }
-
-    ~WriteGateWait() {
-        if (parent_.is_connected()) parent_.clear();
-    }
-
-    net::cancellation_slot Slot() noexcept { return signal_.slot(); }
-    bool Cancelled() const noexcept { return cancelled_; }
-
-private:
-    void OnCancellation(transport::Cancellation) noexcept override {
-        cancelled_ = true;
-        signal_.emit(net::cancellation_type::all);
-    }
-
-    net::cancellation_slot parent_;
-    net::cancellation_signal signal_;
-    bool cancelled_ = false;
-};
 
 void AddPayloadSize(size_t& total, size_t size) {
     if (size > BaseWsStream::kMaxFrameSize - total)
@@ -392,7 +360,7 @@ net::awaitable<BaseWsStream::WriteGate::Lease> BaseWsStream::AcquireWrite(
     net::cancellation_slot cancellation) {
     // Cancel() is reusable, so only this acquisition is cancelled. Closing the
     // shared gate is reserved for terminal shutdown, not a sniff deadline.
-    WriteGateWait wait(Cancellation(), cancellation);
+    transport::CancellationBridge wait(cancellation, Cancellation());
     if (wait.Cancelled()) throw IoSystemError(io_error::operation_aborted);
     auto lease = co_await write_gate_.Acquire(false, wait.Slot());
     if (!lease || wait.Cancelled()) throw IoSystemError(io_error::operation_aborted);

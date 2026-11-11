@@ -2,6 +2,7 @@
 #include "app/relay.hpp"
 
 #include "app/dns/dns.hpp"
+#include "common/hash_container_shrink.hpp"
 #include <map>
 #include <stdexcept>
 #include <utility>
@@ -12,14 +13,13 @@ namespace proxyman::outbound {
 // Handler
 // ============================================================================
 
-Handler::Handler(OutboundConfiguration::Entry config, net::io_context& io_context,
+Handler::Handler(PreparedOutboundConfig config, net::io_context& io_context,
                  app::dns::DNS& dns, std::chrono::seconds dial_timeout,
                  AwaitableTaskGroup& tasks)
     : config_(std::move(config))
-    , dialer_(io_context, dns, config_->sender, dial_timeout)
-    , proxy_(NewProxy(*config_, io_context, tasks)) {
+    , dialer_(io_context, dns, config_.sender, dial_timeout)
+    , proxy_(NewProxy(config_, io_context, tasks)) {
 }
-
 
 Handler::~Handler() = default;
 
@@ -39,104 +39,56 @@ net::awaitable<OutboundProcessResult> Handler::Dispatch(
 }
 
 // ============================================================================
-// HandlerLookup
+// HandlerRegistry
 // ============================================================================
 
-HandlerLookup::HandlerLookup(const OutboundConfiguration& configuration,
-                             net::io_context& io_context, app::dns::DNS& dns,
-                             std::chrono::seconds dial_timeout, AwaitableTaskGroup& tasks)
-    : configuration_(configuration), io_context_(io_context), dns_(dns),
-      dial_timeout_(dial_timeout), tasks_(tasks) {}
-
-std::shared_ptr<Handler> HandlerLookup::GetHandler(std::string_view tag) {
-    if (const auto generation = configuration_.Generation(); generation != generation_) {
-        Sync(generation);
-    }
-    for (auto& entry : entries_) {
-        if (entry.config->tag != tag) continue;
-        if (!entry.handler) entry.handler = Instantiate(entry.config);
-        return entry.handler;
-    }
-    return {};
-}
-
-void HandlerLookup::Refresh() noexcept {
-    try {
-        Sync(configuration_.Generation());
-    } catch (...) {
-        // Only allocation can fail; clearing releases every retired handler.
-        Clear();
-    }
-}
-
-void HandlerLookup::Sync(uint64_t generation) {
-    const auto& snapshot = configuration_.Entries();
-    memory::Vector<Entry> next;
-    next.reserve(snapshot.size());
-    for (const auto& config : snapshot) {
-        std::shared_ptr<Handler> handler;
-        for (auto& entry : entries_) {
-            if (entry.config == config) {
-                handler = std::move(entry.handler);
-                break;
-            }
+HandlerRegistry::HandlerRegistry(
+    const std::vector<PreparedOutboundConfig>& configurations,
+    net::io_context& io_context, app::dns::DNS& dns,
+    std::chrono::seconds dial_timeout, AwaitableTaskGroup& tasks)
+    : io_context_(io_context), dns_(dns), dial_timeout_(dial_timeout), tasks_(tasks) {
+    handlers_.reserve(configurations.size());
+    for (const auto& configuration : configurations) {
+        auto handler = Instantiate(configuration);
+        if (!handlers_.try_emplace(memory::String(configuration.tag), std::move(handler)).second) {
+            throw std::logic_error(
+                "duplicate prepared outbound tag '" + configuration.tag + "'");
         }
-        next.push_back(Entry{config, std::move(handler)});
     }
-    // In-flight requests keep retired handlers through their own handles.
-    entries_.swap(next);
-    generation_ = generation;
 }
 
-std::shared_ptr<Handler> HandlerLookup::Instantiate(const OutboundConfiguration::Entry& config) {
-    return std::make_shared<Handler>(
-        config, io_context_, dns_, dial_timeout_, tasks_);
+HandlerRegistry::~HandlerRegistry() = default;
+
+std::shared_ptr<Handler> HandlerRegistry::GetHandler(std::string_view tag) const noexcept {
+    const auto it = handlers_.find(tag);
+    return it == handlers_.end() ? nullptr : it->second;
 }
 
-// ============================================================================
-// OutboundConfiguration
-// ============================================================================
-
-OutboundConfiguration::OutboundConfiguration(
-    const std::vector<PreparedOutboundConfig>& configurations) {
-    entries_.reserve(configurations.size());
-    for (const auto& config : configurations)
-        entries_.push_back(Prepare(config));
-    generation_ = 1;
+void HandlerRegistry::Replace(const PreparedOutboundConfig& configuration) {
+    auto handler = Instantiate(configuration);
+    if (const auto it = handlers_.find(configuration.tag); it != handlers_.end()) {
+        // In-flight requests keep the retired handler through their own handles.
+        it->second = std::move(handler);
+        return;
+    }
+    handlers_.try_emplace(memory::String(configuration.tag), std::move(handler));
 }
 
-OutboundConfiguration::~OutboundConfiguration() = default;
+void HandlerRegistry::Remove(std::string_view tag) {
+    const auto it = handlers_.find(tag);
+    if (it == handlers_.end()) return;
+    handlers_.erase(it);
+    MaybeShrinkHashContainer(handlers_, 8);
+}
 
-OutboundConfiguration::Entry OutboundConfiguration::Prepare(
-    const PreparedOutboundConfig& configuration) {
+std::shared_ptr<Handler> HandlerRegistry::Instantiate(
+    const PreparedOutboundConfig& configuration) const {
     if (configuration.tag.empty() || !configuration.create) {
         throw std::logic_error(
             "prepared outbound '" + configuration.tag + "' has no tag or creator");
     }
-    return std::make_shared<const PreparedOutboundConfig>(configuration);
-}
-
-uint64_t OutboundConfiguration::Generation() const noexcept {
-    return generation_;
-}
-
-void OutboundConfiguration::Replace(const PreparedOutboundConfig& configuration) {
-    auto candidate = Prepare(configuration);
-    for (auto& entry : entries_) {
-        if (entry->tag != configuration.tag) continue;
-        entry = std::move(candidate);
-        ++generation_;
-        return;
-    }
-    entries_.push_back(std::move(candidate));
-    ++generation_;
-}
-
-void OutboundConfiguration::Remove(std::string_view tag) {
-    std::erase_if(entries_, [tag](const Entry& entry) {
-        return entry->tag == tag;
-    });
-    ++generation_;
+    return std::make_shared<Handler>(
+        configuration, io_context_, dns_, dial_timeout_, tasks_);
 }
 
 // ============================================================================
@@ -212,10 +164,6 @@ std::unique_ptr<::Outbound> NewProxy(
             "prepared outbound '" + config.tag + "' creator returned null");
     }
     return proxy;
-}
-
-bool HasProxy(std::string_view protocol) {
-    return Proxies().contains(protocol);
 }
 
 }  // namespace proxyman::outbound

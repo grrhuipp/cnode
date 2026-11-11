@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "proxy/shadowsocks/ss_udp.hpp"
+#include "proxy/shadowsocks/ss_outbound.hpp"
 #include "app/dns/dns.hpp"
 
 #include <asio/co_spawn.hpp>

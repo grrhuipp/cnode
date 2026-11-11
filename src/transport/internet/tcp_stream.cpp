@@ -562,32 +562,32 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
     std::chrono::seconds timeout) {
     SetIdleTimeout(timeout);
     auto deadline = StartPhaseDeadline(timeout);
+    // 每个出口（含异常）都结束本阶段截止时间；返回值在析构前已求值。
+    struct PhaseDeadlineScope {
+        TcpStream& stream;
+        ~PhaseDeadlineScope() { stream.ClearPhaseDeadline(); }
+    } phase_scope{*this};
 
-    auto timed_out = [&]() noexcept {
+    // 读失败或 EOF：区分截止时间到期与对端截断。
+    auto read_failed = [&](ProxyProtocolResult result) {
         const bool expired = deadline.Expired();
         const bool phase = ConsumePhaseDeadline();
         const bool idle = ConsumeIdleTimeout();
-        return expired || phase || idle;
+        return ProxyReadResult(expired || phase || idle
+            ? ProxyProtocolReadStatus::TimedOut
+            : ProxyProtocolReadStatus::Truncated, std::move(result));
     };
 
     std::array<uint8_t, kProxyProbeBytes> probe;
     auto [peek_ec, probe_len] = co_await AsyncReceiveSome(
         net::buffer(probe), true);
-
-    if (peek_ec || probe_len == 0) {
-        auto out = timed_out()
-            ? ProxyReadResult(ProxyProtocolReadStatus::TimedOut)
-            : ProxyReadResult(ProxyProtocolReadStatus::Truncated);
-        ClearPhaseDeadline();
-        co_return out;
-    }
+    if (peek_ec || probe_len == 0) co_return read_failed({});
 
     auto result = ParseProxyProtocolHeader(
         std::span<const uint8_t>(probe.data(), probe_len));
 
     if (!result.incomplete()) {
         if (result.status == ProxyProtocolParseStatus::Invalid) {
-            ClearPhaseDeadline();
             co_return ProxyReadResult(ProxyProtocolReadStatus::Invalid, std::move(result));
         }
 
@@ -596,17 +596,9 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
             const size_t want = std::min(remaining, probe.size());
             auto [read_ec, n] = co_await AsyncReceiveSome(
                 net::buffer(probe.data(), want));
-            if (read_ec || n == 0) {
-                auto out = timed_out()
-                    ? ProxyReadResult(ProxyProtocolReadStatus::TimedOut, std::move(result))
-                    : ProxyReadResult(ProxyProtocolReadStatus::Truncated, std::move(result));
-                ClearPhaseDeadline();
-                co_return out;
-            }
+            if (read_ec || n == 0) co_return read_failed(std::move(result));
             remaining -= n;
         }
-
-        ClearPhaseDeadline();
         co_return ProxyReadResult(ProxyProtocolReadStatus::Ok, std::move(result));
     }
 
@@ -614,15 +606,9 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
 
     while (buf.size() < kProxyHeaderMaxBytes) {
         auto [read_ec, n] = co_await AsyncReceiveSome(net::buffer(probe));
-        if (read_ec || n == 0) {
-            // Only an incomplete header reaches this loop: whatever arrived
-            // so far cannot complete it any more.
-            auto out = timed_out()
-                ? ProxyReadResult(ProxyProtocolReadStatus::TimedOut, std::move(result))
-                : ProxyReadResult(ProxyProtocolReadStatus::Truncated, std::move(result));
-            ClearPhaseDeadline();
-            co_return out;
-        }
+        // Only an incomplete header reaches this loop: whatever arrived so far
+        // cannot complete it any more.
+        if (read_ec || n == 0) co_return read_failed(std::move(result));
         const size_t required = buf.size() + n;
         if (required > buf.capacity()) {
             buf.reserve(std::min<size_t>(
@@ -637,12 +623,10 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
         }
 
         if (result.status == ProxyProtocolParseStatus::Invalid) {
-            ClearPhaseDeadline();
             co_return ProxyReadResult(ProxyProtocolReadStatus::Invalid, std::move(result));
         }
         // The limit bounds the header itself, not payload read along with it.
         if (result.consumed > kProxyHeaderMaxBytes) {
-            ClearPhaseDeadline();
             co_return ProxyReadResult(ProxyProtocolReadStatus::TooLarge, std::move(result));
         }
         if (result.consumed < buf.size()) {
@@ -653,12 +637,9 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
                 throw std::bad_alloc();
             }
         }
-
-        ClearPhaseDeadline();
         co_return ProxyReadResult(ProxyProtocolReadStatus::Ok, std::move(result));
     }
 
-    ClearPhaseDeadline();
     co_return ProxyReadResult(ProxyProtocolReadStatus::TooLarge, std::move(result));
 }
 

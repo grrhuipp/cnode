@@ -4,7 +4,6 @@
 
 #include <array>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -17,13 +16,6 @@ namespace {
 
 using ::geo::GeoDatabase;
 namespace fs = std::filesystem;
-
-void Require(bool condition, const char* message) {
-    if (!condition) {
-        std::fprintf(stderr, "FAIL: %s\n", message);
-        ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
-    }
-}
 
 void AppendVarint(std::string& out, uint64_t value) {
     while (value >= 0x80) {
@@ -80,10 +72,11 @@ const std::string kV6Net{"\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x
 
 class TempDir {
 public:
-    TempDir()
-        : path_(fs::temp_directory_path() /
-                ("cnode_geodata_test_" + std::to_string(std::rand()))) {
-        fs::create_directories(path_);
+    TempDir() {
+        std::string pattern = (fs::temp_directory_path() / "cnode_geodata_test_XXXXXX").string();
+        const char* created = ::mkdtemp(pattern.data());
+        if (!created) throw std::runtime_error("cannot create geodata test directory");
+        path_ = created;
     }
     ~TempDir() {
         std::error_code ignored;
@@ -103,105 +96,82 @@ private:
     fs::path path_;
 };
 
-template <class Fn>
-bool ThrowsRuntimeError(Fn&& fn) {
-    try {
-        fn();
-    } catch (const std::runtime_error&) {
-        return true;
-    }
-    return false;
-}
-
-void TestLoadsRequestedCategories(const TempDir& dir) {
+TEST(Geodata, LoadsOnlyRequestedIpCategoriesAndMatchesBothFamilies) {
+    const TempDir dir;
     const auto geoip = dir.Write("geoip.dat", List({
         Entry("CN", {Cidr(kV4Net, 24), Cidr(kV6Net, 32)}),
         Entry("US", {Cidr(std::string("\x08\x08\x08\x08", 4), 32)}),
     }));
+    const GeoDatabase db(geoip, std::vector<std::string>{"cn"},
+                         dir.Write("empty.dat", ""), std::vector<std::string>{});
+    EXPECT_EQ(db.GetStats().geoip_tags_loaded, 1);
+    EXPECT_EQ(db.FindGeoIP("us"), nullptr);
+    const auto* cn = db.FindGeoIP("CN");
+    ASSERT_NE(cn, nullptr);
+    EXPECT_TRUE(cn->Match(asio::ip::make_address("1.2.3.200")));
+    EXPECT_FALSE(cn->Match(asio::ip::make_address("1.2.4.1")));
+    EXPECT_TRUE(cn->Match(asio::ip::make_address("2001:db8:1::1")));
+    EXPECT_FALSE(cn->Match(asio::ip::make_address("2001:db9::1")));
+}
+
+TEST(Geodata, MatchesDomainCategoriesWithLabelBoundaries) {
+    const TempDir dir;
     const auto geosite = dir.Write("geosite.dat", List({
         Entry("TEST", {Domain(2, "Example.com"), Domain(3, "full.org"),
                        Domain(0, "kw"), Domain(1, "^re")}),
     }));
-    const std::vector<std::string> ip_tags{"cn"};
-    const std::vector<std::string> site_tags{"Test"};
-    const GeoDatabase db(geoip, ip_tags, geosite, site_tags);
-
-    Require(db.GetStats().geoip_tags_loaded == 1 && db.GetStats().geosite_tags_loaded == 1,
-            "only requested categories are loaded");
-    Require(db.FindGeoIP("us") == nullptr, "unrequested geoip tags stay unloaded");
-
-    const auto* cn = db.FindGeoIP("CN");
-    Require(cn != nullptr, "geoip tags resolve case-insensitively");
-    Require(cn->Match(asio::ip::make_address("1.2.3.200")), "IPv4 prefix matches");
-    Require(!cn->Match(asio::ip::make_address("1.2.4.1")), "IPv4 outside prefix misses");
-    Require(cn->Match(asio::ip::make_address("2001:db8:1::1")), "IPv6 prefix matches");
-    Require(!cn->Match(asio::ip::make_address("2001:db9::1")), "IPv6 outside prefix misses");
-
+    const GeoDatabase db(dir.Write("empty.dat", ""), std::vector<std::string>{},
+                         geosite, std::vector<std::string>{"Test"});
+    EXPECT_EQ(db.GetStats().geosite_tags_loaded, 1);
     const auto* site = db.FindGeoSite("TEST");
-    Require(site != nullptr, "geosite tags resolve case-insensitively");
-    Require(site->Match("a.example.com") && site->Match("EXAMPLE.com."),
-            "domain entries match the name and its subdomains");
-    Require(!site->Match("badexample.com"), "domain entries respect label boundaries");
-    Require(site->Match("FULL.org") && !site->Match("x.full.org"),
-            "full entries match exactly");
-    Require(site->Match("abkwcd.net"), "plain entries match as keywords");
-    Require(!site->Match("re.net"), "regexp entries are not loaded");
+    ASSERT_NE(site, nullptr);
+    EXPECT_TRUE(site->Match("a.example.com"));
+    EXPECT_TRUE(site->Match("EXAMPLE.com."));
+    EXPECT_FALSE(site->Match("badexample.com"));
+    EXPECT_TRUE(site->Match("FULL.org"));
+    EXPECT_FALSE(site->Match("x.full.org"));
+    EXPECT_TRUE(site->Match("abkwcd.net"));
+    EXPECT_FALSE(site->Match("re.net"));
 }
 
-void TestRejectsCorruptOrIncompleteData(const TempDir& dir) {
+class InvalidGeodata : public ::testing::TestWithParam<int> {};
+TEST_P(InvalidGeodata, RejectsCorruptOrIncompleteRequestedData) {
+    const TempDir dir;
     const std::vector<std::string> cn{"cn"};
     const std::vector<std::string> none;
     const auto empty_site = dir.Write("empty_site.dat", "");
-    const auto valid = List({Entry("CN", {Cidr(kV4Net, 24)})});
-
-    Require(ThrowsRuntimeError([&] {
-                GeoDatabase db(dir.Write("missing_tag.dat", valid),
-                               std::vector<std::string>{"jp"}, empty_site, none);
-            }),
-            "a requested tag absent from the file is rejected");
-    Require(ThrowsRuntimeError([&] {
-                GeoDatabase db(dir.Write("truncated.dat", valid.substr(0, valid.size() - 1)),
-                               cn, empty_site, none);
-            }),
-            "a truncated file is rejected");
-
-    std::string overlong;
-    AppendVarint(overlong, (1 << 3) | 2);
-    AppendVarint(overlong, 1000);
-    overlong.append("CN");
-    Require(ThrowsRuntimeError([&] {
-                GeoDatabase db(dir.Write("overlong.dat", overlong), cn, empty_site, none);
-            }),
-            "a declared length beyond the file is rejected");
-    Require(ThrowsRuntimeError([&] {
-                GeoDatabase db(dir.Write("prefix.dat", List({Entry("CN", {Cidr(kV4Net, 33)})})),
-                               cn, empty_site, none);
-            }),
-            "a CIDR prefix wider than its address is rejected");
-    Require(ThrowsRuntimeError([&] {
-                GeoDatabase db(dir.Write("address.dat",
-                                         List({Entry("CN", {Cidr(std::string("\x01\x02\x03", 3), 8)})})),
-                               cn, empty_site, none);
-            }),
-            "a CIDR address of invalid length is rejected");
-    Require(ThrowsRuntimeError([&] {
-                GeoDatabase db(dir.Write("duplicate.dat",
-                                         List({Entry("CN", {Cidr(kV4Net, 24)}),
-                                               Entry("cn", {Cidr(kV4Net, 16)})})),
-                               cn, empty_site, none);
-            }),
-            "a duplicated requested tag is rejected");
-    Require(ThrowsRuntimeError([&] {
-                GeoDatabase db(dir.Write("unused.dat", valid), cn,
-                               dir.Path("absent.dat"), std::vector<std::string>{"cn"});
-            }),
-            "an unreadable geosite file is rejected when geosite tags are requested");
+    auto bytes = List({Entry("CN", {Cidr(kV4Net, 24)})});
+    auto requested = cn;
+    switch (GetParam()) {
+    case 0: requested = {"jp"}; break;
+    case 1: bytes.pop_back(); break;
+    case 2:
+        bytes.clear();
+        AppendVarint(bytes, (1 << 3) | 2);
+        AppendVarint(bytes, 1000);
+        bytes.append("CN");
+        break;
+    case 3: bytes = List({Entry("CN", {Cidr(kV4Net, 33)})}); break;
+    case 4: bytes = List({Entry("CN", {Cidr(std::string("\x01\x02\x03", 3), 8)})}); break;
+    case 5:
+        bytes = List({Entry("CN", {Cidr(kV4Net, 24)}),
+                      Entry("cn", {Cidr(kV4Net, 16)})});
+        break;
+    }
+    const auto file = dir.Write("geoip.dat", bytes);
+    EXPECT_THROW((GeoDatabase(file, requested, empty_site, none)), std::runtime_error);
 }
+INSTANTIATE_TEST_SUITE_P(FileErrors, InvalidGeodata, ::testing::Values(0, 1, 2, 3, 4, 5),
+    ([](const ::testing::TestParamInfo<int>& info) {
+        constexpr const char* names[]{"MissingTag", "Truncated", "OverlongField",
+                                     "WidePrefix", "InvalidAddressLength", "DuplicateTag"};
+        return names[info.param];
+    }));
 
-}  // namespace
-
-TEST(Geodata, Contract) {
+TEST(Geodata, RejectsUnreadableRequestedGeositeFile) {
     const TempDir dir;
-    TestLoadsRequestedCategories(dir);
-    TestRejectsCorruptOrIncompleteData(dir);
+    const auto geoip = dir.Write("geoip.dat", List({Entry("CN", {Cidr(kV4Net, 24)})}));
+    EXPECT_THROW((GeoDatabase(geoip, std::vector<std::string>{"cn"}, dir.Path("absent.dat"),
+                              std::vector<std::string>{"cn"})), std::runtime_error);
 }
+}  // namespace

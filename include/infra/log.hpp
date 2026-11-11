@@ -21,6 +21,8 @@ enum class LogLevel {
     NONE
 };
 
+struct LogConfig;
+
 struct ConnectionLogContext {
     uint64_t conn_id{0};
     std::string inbound_tag{};
@@ -50,13 +52,7 @@ struct PanelLogContext {
 // Failed file channels recover on later records with 1–30s bounded backoff.
 class Log {
 public:
-    [[nodiscard]] static bool Init(const std::string& level,
-                                   const std::filesystem::path& log_dir,
-                                   uint16_t max_days = 15,
-                                   const std::filesystem::path& access_path = {},
-                                   const std::filesystem::path& error_path = {},
-                                   bool rotate_daily = true,
-                                   bool gzip = true);
+    [[nodiscard]] static bool Init(const LogConfig& config);
 
     [[nodiscard]] static std::filesystem::path ResolveTargetPath(
         const std::filesystem::path& log_dir,

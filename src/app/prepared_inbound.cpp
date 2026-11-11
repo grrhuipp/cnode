@@ -1,11 +1,12 @@
 #include "app/prepared_inbound.hpp"
 
-#include "common/awaitable_batch.hpp"
+#include "app/worker_batch.hpp"
 #include "infra/config.hpp"
 #include "app/worker.hpp"
 #include "core/constants.hpp"
 #include "infra/config_types.hpp"
 #include "transport/internet/stream_settings.hpp"
+#include "transport/internet/transport_security.hpp"
 
 #include <stdexcept>
 #include <utility>
@@ -45,6 +46,10 @@ PreparedInbound PrepareInbound(const InboundSpec& spec) {
 
     StreamSettings stream_settings = spec.stream_settings;
     TransportSecurity::Prepare(stream_settings, StreamEndpointRole::Inbound);
+    // XHTTP 会话命名空间按入站 tag 隔离，配置准备期一次推导，Worker 只读。
+    if (stream_settings.IsXHttp()) {
+        stream_settings.xhttp.session_namespace.insert(0, spec.tag + std::string(1, '\0'));
+    }
 
     return PreparedInbound{
         .binding = PortBinding{
@@ -152,10 +157,6 @@ namespace {
 
 using Store = proxyman::inbound::UserStore;
 
-void ThrowIfStopping(const bool& stopping) {
-    if (stopping) throw IoSystemError(net::error::operation_aborted);
-}
-
 // Leases are copied per Worker so a failed install keeps the source views for
 // a later retry.
 net::awaitable<void> InstallUserViews(
@@ -163,15 +164,11 @@ net::awaitable<void> InstallUserViews(
     std::span<const std::unique_ptr<Worker>> workers,
     std::span<const Store::WorkerView> views,
     const bool& stopping) {
-    return RunWorkerBatch(std::move(executor), workers,
-        [views, &stopping](Worker& worker, size_t index) {
-            return [](Worker* current, Store::WorkerView view,
-                      const bool* stopping_flag) -> net::awaitable<void> {
-                ThrowIfStopping(*stopping_flag);
-                co_await current->PostCall([current, view = std::move(view)]() mutable {
-                    current->InstallUserView(std::move(view));
-                });
-            }(&worker, views[index], &stopping);
+    co_await PostToEachWorker(std::move(executor), workers, stopping,
+        [views](Worker& worker, size_t index) {
+            return worker.PostCall([&worker, view = views[index]]() mutable {
+                worker.InstallUserView(std::move(view));
+            });
         });
 }
 
@@ -204,6 +201,25 @@ net::awaitable<InboundInstallFailure> InstallInbound(
     co_return InboundInstallFailure::None;
 }
 
+PreparedUserPublication PrepareUserPublication(
+    Store::PublishedSnapshot candidate, size_t worker_count) {
+    PreparedUserPublication publication;
+    publication.rollback.previous = Store::CaptureSnapshot();
+    publication.rollback.worker_views.reserve(worker_count);
+    publication.candidate_views.reserve(worker_count);
+    for (size_t i = 0; i < worker_count; ++i) {
+        publication.rollback.worker_views.push_back(
+            Store::PrepareWorkerView(publication.rollback.previous));
+        publication.candidate_views.push_back(Store::PrepareWorkerView(candidate));
+    }
+    publication.candidate = std::move(candidate);
+    return publication;
+}
+
+void PreparedUserPublication::Commit() {
+    Store::CommitSnapshot(std::move(candidate));
+}
+
 net::awaitable<void> PublishUsers(
     net::any_io_executor executor,
     std::span<const std::unique_ptr<Worker>> workers,
@@ -214,20 +230,12 @@ net::awaitable<void> PublishUsers(
     if (rollback) {
         throw std::logic_error("user publication requires completed compensation");
     }
-    UserPublicationRollback prepared;
-    prepared.previous = Store::CaptureSnapshot();
-    prepared.worker_views.reserve(workers.size());
-    std::vector<Store::WorkerView> candidate_views;
-    candidate_views.reserve(workers.size());
-    for (size_t i = 0; i < workers.size(); ++i) {
-        prepared.worker_views.push_back(Store::PrepareWorkerView(prepared.previous));
-        candidate_views.push_back(Store::PrepareWorkerView(candidate));
-    }
+    auto publication = PrepareUserPublication(std::move(candidate), workers.size());
     // Retain rollback leases before any mailbox can install a candidate.
-    rollback = std::move(prepared);
-    co_await InstallUserViews(executor, workers, candidate_views, stopping);
+    rollback = std::move(publication.rollback);
+    co_await InstallUserViews(executor, workers, publication.candidate_views, stopping);
     ThrowIfStopping(stopping);
-    Store::CommitSnapshot(std::move(candidate));
+    publication.Commit();
     rollback.reset();
 }
 

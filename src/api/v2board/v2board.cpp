@@ -24,8 +24,10 @@
 #include <limits>
 #include <optional>
 #include <regex>
+#include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -197,6 +199,13 @@ private:
                  std::string body_text,
                  std::string if_none_match);
 
+    // 依次尝试候选地址。回退只发生在连接与 TLS 握手阶段：一旦开始发送，
+    // 失败也无法证明面板未处理请求（流量上报是累加的），因此不换地址重发。
+    template <typename Stream>
+    net::awaitable<HttpResponse>
+    ConnectAndExchange(std::span<const tcp::endpoint> endpoints,
+                       std::string_view request);
+
     template <typename FetchResult>
     net::awaitable<tl::expected<HttpResponse, FetchResult>>
     FetchConditionalResource(std::string_view endpoint,
@@ -318,48 +327,62 @@ APIClient::HttpExchange(HttpMethod method,
     request += "\r\n";
     request += body_text;
 
-    const auto cancellation = co_await net::this_coro::cancellation_state;
     if (url_parts_.use_ssl) {
-        std::string last_error;
-        for (const auto& endpoint : endpoints) {
-            ssl::stream<tcp::socket> stream(io_context_, *https_context_);
-            try {
+        co_return co_await ConnectAndExchange<ssl::stream<tcp::socket>>(endpoints, request);
+    }
+    co_return co_await ConnectAndExchange<tcp::socket>(endpoints, request);
+}
+
+template <typename Stream>
+net::awaitable<HttpResponse>
+APIClient::ConnectAndExchange(std::span<const tcp::endpoint> endpoints,
+                              std::string_view request) {
+    constexpr bool kTls = !std::is_same_v<Stream, tcp::socket>;
+    constexpr std::string_view kScheme = kTls ? "HTTPS" : "HTTP";
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    std::string last_error;
+    for (const auto& endpoint : endpoints) {
+        auto stream = [this] {
+            if constexpr (kTls) return Stream(io_context_, *https_context_);
+            else return Stream(io_context_);
+        }();
+        try {
+            if constexpr (kTls) {
                 if (literal_address_) {
                     auto* verify_param = SSL_get0_param(stream.native_handle());
                     if (!verify_param ||
                         X509_VERIFY_PARAM_set1_ip_asc(verify_param, url_parts_.host.c_str()) != 1) {
-                        result.status = -1;
-                        result.body = "SSL IP verify param error";
-                        co_return result;
+                        co_return HttpResponse{.status = -1, .body = "SSL IP verify param error",
+                                               .etag = {}, .not_modified = false};
                     }
                 } else {
                     stream.set_verify_callback(ssl::host_name_verification(url_parts_.host));
-
                     if (!SSL_set_tlsext_host_name(stream.native_handle(), url_parts_.host.c_str())) {
-                        result.status = -1;
-                        result.body = "SSL SNI error";
-                        co_return result;
+                        co_return HttpResponse{.status = -1, .body = "SSL SNI error",
+                                               .etag = {}, .not_modified = false};
                     }
                 }
-
-                co_await stream.lowest_layer().async_connect(endpoint, net::use_awaitable);
-                co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
-            } catch (const std::exception& e) {
-                if (cancellation.cancelled() != net::cancellation_type::none) {
-                    throw;
-                }
-                last_error = e.what();
-                LOG_PANEL_DEBUG(log_context_, "HTTPS endpoint connection failed: endpoint={} reason={}",
-                          iputil::FormatEndpointForLog(iputil::AddressText(endpoint.address()).View(), endpoint.port()),
-                          last_error);
-                continue;
             }
+            co_await stream.lowest_layer().async_connect(endpoint, net::use_awaitable);
+            if constexpr (kTls) {
+                co_await stream.async_handshake(ssl::stream_base::client, net::use_awaitable);
+            }
+        } catch (const std::exception& e) {
+            if (cancellation.cancelled() != net::cancellation_type::none) {
+                throw;
+            }
+            last_error = e.what();
+            LOG_PANEL_DEBUG(log_context_, "{} endpoint connection failed: endpoint={} reason={}",
+                      kScheme,
+                      iputil::FormatEndpointForLog(iputil::AddressText(endpoint.address()).View(), endpoint.port()),
+                      last_error);
+            continue;
+        }
 
-            // Only connection setup may try another address. Once HTTP
-            // transmission starts, a failure cannot prove the peer did not
-            // apply the request (in particular, an additive traffic POST).
-            result = co_await WriteRequestAndReadResponse(stream, request);
+        auto result = co_await WriteRequestAndReadResponse(stream, request);
 
+        IoErrorCode close_ec;
+        if constexpr (kTls) {
             // The HTTP response is complete. TLS close_notify is best effort
             // and must neither stall indefinitely nor invalidate that response.
             if (result.status > 0 && cancellation.cancelled() == net::cancellation_type::none) {
@@ -370,46 +393,18 @@ APIClient::HttpExchange(HttpMethod method,
                 } catch (const std::exception&) {
                 }
             }
-            IoErrorCode close_ec;
-            stream.lowest_layer().close(close_ec);
-            co_return result;
+        } else if (result.status > 0) {
+            stream.shutdown(tcp::socket::shutdown_both, close_ec);
         }
-        result.status = -1;
-        result.body = last_error.empty() ? "HTTPS connect failed" : last_error;
-
-    } else {
-        // HTTP
-        std::string last_error;
-        for (const auto& endpoint : endpoints) {
-            tcp::socket stream(io_context_);
-            try {
-                co_await stream.async_connect(endpoint, net::use_awaitable);
-            } catch (const std::exception& e) {
-                if (cancellation.cancelled() != net::cancellation_type::none) {
-                    throw;
-                }
-                last_error = e.what();
-                LOG_PANEL_DEBUG(log_context_, "HTTP endpoint connection failed: endpoint={} reason={}",
-                          iputil::FormatEndpointForLog(iputil::AddressText(endpoint.address()).View(), endpoint.port()),
-                          last_error);
-                continue;
-            }
-
-            result = co_await WriteRequestAndReadResponse(stream, request);
-
-            IoErrorCode ec;
-            if (result.status > 0) {
-                stream.shutdown(tcp::socket::shutdown_both, ec);
-            }
-            stream.close(ec);
-            co_return result;
-        }
-        result.status = -1;
-        result.body = last_error.empty() ? "HTTP connect failed" : last_error;
+        stream.lowest_layer().close(close_ec);
+        co_return result;
     }
-
-    co_return result;
-
+    co_return HttpResponse{
+        .status = -1,
+        .body = last_error.empty() ? std::format("{} connect failed", kScheme) : last_error,
+        .etag = {},
+        .not_modified = false,
+    };
 }
 
 template <typename FetchResult>

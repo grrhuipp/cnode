@@ -673,22 +673,31 @@ ParseJsonObject(const json::object& source, std::string_view key) {
 
 std::string JsonStringOr(
     const json::object& source, std::string_view key, std::string_view fallback) {
-    auto parsed = ParseJsonString(source, key);
-    if (!parsed) {
-        throw std::invalid_argument(std::move(parsed.error()));
-    }
-    if (!*parsed) {
-        return std::string(fallback);
-    }
-    return std::move(**parsed);
+    auto parsed = RequireJson(ParseJsonString(source, key));
+    if (parsed) return std::move(*parsed);
+    return std::string(fallback);
 }
 
 bool JsonBoolOr(const json::object& source, std::string_view key, bool fallback) {
-    auto parsed = ParseJsonBool(source, key);
-    if (!parsed) {
-        throw std::invalid_argument(std::move(parsed.error()));
+    return RequireJson(ParseJsonBool(source, key)).value_or(fallback);
+}
+
+void RequireJsonKeys(
+    const json::object& source,
+    std::initializer_list<std::string_view> allowed,
+    std::string_view path,
+    std::initializer_list<std::string_view> additional) {
+    for (const auto& [key, value] : source) {
+        const auto contains = [&key](std::initializer_list<std::string_view> names) {
+            for (const auto name : names) {
+                if (EqualsAsciiCI(key, name)) return true;
+            }
+            return false;
+        };
+        if (!contains(allowed) && !contains(additional)) {
+            throw std::invalid_argument(std::format("{}: unknown key '{}'", path, key));
+        }
     }
-    return parsed->value_or(fallback);
 }
 
 JsonPortResult ReadJsonPort(

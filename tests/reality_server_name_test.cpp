@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "transport/internet/stream_settings.hpp"
+#include "transport/internet/tls_server_name.hpp"
 
 #include <array>
 #include <cstdio>

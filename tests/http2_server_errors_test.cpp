@@ -104,7 +104,8 @@ void RunUntil(net::io_context& io, Predicate predicate, const char* message) {
 
 ::StreamSettings FixtureSettings(std::string_view network) {
     ::StreamSettings settings;
-    settings.network = network;
+    settings.network_mode = ParseNetworkMode(network);
+    settings.http.force_http2 = EqualsAsciiCI(network, "h2");
     settings.grpc.service_name = "fixture";
     settings.http.path = "/fixture";
     settings.http.method = "POST";

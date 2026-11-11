@@ -4,6 +4,7 @@
 #include "transport/internet/tcp_stream.hpp"
 #include <openssl/ssl.h>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -39,6 +40,12 @@ public:
     // 创建服务端上下文（启动时为配置域名生成固定自签证书）
     static std::unique_ptr<SslContext> CreateServerAutoSign(const TlsConfig& config);
 
+    // 创建 QUIC 服务端上下文：证书来自 config.pem；版本按 config 的 min/max 收敛到
+    // QUIC 强制的 TLS 1.3（max 低于 1.3 时失败）；ALPN 只在 |alpn|（非空）中按服务端
+    // 偏好选择，无交集时以致命告警拒绝。QUIC 库回调由调用方在返回的 Native() 上安装。
+    static std::unique_ptr<SslContext> CreateQuicServer(
+        const TlsConfig& config, std::span<const std::string> alpn);
+
     // 创建 REALITY 服务端上下文
     static std::unique_ptr<SslContext> CreateServerReality(
         const RealityConfig& reality,
@@ -63,10 +70,10 @@ public:
     SslContext& operator=(const SslContext&) = delete;
 
 private:
-    static std::unique_ptr<SslContext> CreateAutoSignSnapshot(const TlsConfig& config);
-    explicit SslContext(SSL_CTX* ctx) noexcept : native_owner_(ctx, SSL_CTX_free) {}
-    [[nodiscard]] bool ConfigureServerAlpn(
-        const std::vector<std::string>& protocols);
+    explicit SslContext(bssl::UniquePtr<SSL_CTX> context) : native_owner_(std::move(context)) {}
+    // Auto-sign: Native() stays null; handshakes pin the renewal's current snapshot.
+    explicit SslContext(std::shared_ptr<AutoSignContextRenewal> renewal) noexcept
+        : renewal_(std::move(renewal)) {}
 
     std::shared_ptr<SSL_CTX> native_owner_;
     std::shared_ptr<AutoSignContextRenewal> renewal_;

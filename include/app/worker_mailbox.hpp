@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <variant>
 
 
 class WorkerMailboxFull : public std::runtime_error {
@@ -81,50 +82,38 @@ public:
         requires std::invocable<Fn&>
     net::awaitable<std::invoke_result_t<Fn&>> PostCall(Fn fn) {
         using R = std::invoke_result_t<Fn&>;
+        // void 结果以 monostate 走同一条完成路径，调用方仍得到 awaitable<void>。
+        using Value = std::conditional_t<std::is_void_v<R>, std::monostate, R>;
         Slot slot = Acquire();
         auto caller_exec = co_await net::this_coro::executor;
-        if constexpr (std::is_void_v<R>) {
-            co_await net::async_initiate<const net::use_awaitable_t<>&, void(std::exception_ptr)>(
-                [this, caller_exec, slot = std::move(slot), fn = std::move(fn)](auto handler) mutable {
-                    net::post(io_context_, [caller_exec, slot = std::move(slot), fn = std::move(fn),
-                                            handler = std::move(handler)]() mutable {
-                        std::exception_ptr err;
-                        try {
+        [[maybe_unused]] auto value = co_await net::async_initiate<const net::use_awaitable_t<>&,
+                                                  void(std::exception_ptr, Value)>(
+            [this, caller_exec, slot = std::move(slot), fn = std::move(fn)](auto handler) mutable {
+                net::post(io_context_, [caller_exec, slot = std::move(slot), fn = std::move(fn),
+                                        handler = std::move(handler)]() mutable {
+                    std::optional<Value> result;
+                    std::exception_ptr err;
+                    try {
+                        if constexpr (std::is_void_v<R>) {
                             std::invoke(fn);
-                        } catch (...) {
-                            err = std::current_exception();
-                        }
-                        slot.ReleaseOnOwner();
-                        net::dispatch(caller_exec,
-                            [handler = std::move(handler), err = std::move(err)]() mutable {
-                                std::move(handler)(std::move(err));
-                            });
-                    });
-                },
-                net::use_awaitable);
-        } else {
-            co_return co_await net::async_initiate<const net::use_awaitable_t<>&, void(std::exception_ptr, R)>(
-                [this, caller_exec, slot = std::move(slot), fn = std::move(fn)](auto handler) mutable {
-                    net::post(io_context_, [caller_exec, slot = std::move(slot), fn = std::move(fn),
-                                            handler = std::move(handler)]() mutable {
-                        std::optional<R> result;
-                        std::exception_ptr err;
-                        try {
+                            result.emplace();
+                        } else {
                             result.emplace(std::invoke(fn));
-                        } catch (...) {
-                            err = std::current_exception();
                         }
-                        slot.ReleaseOnOwner();
-                        net::dispatch(caller_exec,
-                            [handler = std::move(handler), err = std::move(err),
-                             result = std::move(result)]() mutable {
-                                std::move(handler)(std::move(err),
-                                    result ? std::move(*result) : R{});
-                            });
-                    });
-                },
-                net::use_awaitable);
-        }
+                    } catch (...) {
+                        err = std::current_exception();
+                    }
+                    slot.ReleaseOnOwner();
+                    net::dispatch(caller_exec,
+                        [handler = std::move(handler), err = std::move(err),
+                         result = std::move(result)]() mutable {
+                            std::move(handler)(std::move(err),
+                                result ? std::move(*result) : Value{});
+                        });
+                });
+            },
+            net::use_awaitable);
+        if constexpr (!std::is_void_v<R>) co_return std::move(value);
     }
 
 private:

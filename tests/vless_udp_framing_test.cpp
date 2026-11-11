@@ -1,4 +1,5 @@
 #include <stdexcept>
+#include <limits>
 #include <gtest/gtest.h>
 
 #include "proxy/vless/vless_codec.hpp"
@@ -100,9 +101,12 @@ buf::MultiBuffer MakeInput(std::span<const uint8_t> bytes) {
 }
 
 template <typename Fn>
-void CheckRejected(Fn&& fn, std::string_view message) {
+void CheckRejected(Fn&& fn, std::string_view message,
+                   ErrorCode expected = ErrorCode::PROTOCOL_DECODE_FAILED) {
     bool rejected = false;
-    try { fn(); } catch (const IoSystemError&) { rejected = true; }
+    try { fn(); } catch (const transport::LinkError& error) {
+        rejected = error.code() == expected;
+    }
     Check(rejected, message);
 }
 
@@ -154,6 +158,8 @@ void CheckFrameBoundaries() {
     const std::vector<uint8_t> excess(buf::kPacketStreamPendingLimit + 1, 0);
     CheckRejected([&] { bounded.Feed(MakeInput(excess)); }, "unbounded retained input");
     CheckRejected([&] { (void)bounded.Next(packet); }, "overflow stream recovered");
+    CheckRejected([&] { bounded.Feed({}); }, "overflow stream accepted more input");
+    CheckRejected([&] { bounded.Finish(); }, "overflow stream accepted clean EOF");
 
     const std::vector<uint8_t> maximum(65535, 0x71);
     std::vector<uint8_t> large{0xff, 0xff};
@@ -334,7 +340,7 @@ TEST(VlessUdpFraming, Contract) {
             co_await vless::WriteUdpDatagram(
                 rejected_capture, target, false, oversized_buffers);
         });
-    }, "oversized VLESS datagram accepted");
+    }, "oversized VLESS datagram accepted", ErrorCode::PROTOCOL_ENCODE_FAILED);
     Check(rejected_capture.bytes.empty(), "oversized VLESS datagram partially written");
 
 }
@@ -347,10 +353,10 @@ TEST(VlessUdpFraming, TruncatedEofCannotResume) {
         framer.Feed(MakeInput(std::span(wire).first(cut)));
         vless::FramedUdpPacket packet;
         ASSERT_FALSE(framer.Next(packet));
-        EXPECT_THROW(framer.Finish(), IoSystemError);
-        EXPECT_THROW(framer.Feed(MakeInput(std::span(wire).subspan(cut))), IoSystemError);
-        EXPECT_THROW((void)framer.Next(packet), IoSystemError);
-        EXPECT_THROW(framer.Finish(), IoSystemError);
+        EXPECT_THROW(framer.Finish(), transport::LinkError);
+        EXPECT_THROW(framer.Feed(MakeInput(std::span(wire).subspan(cut))), transport::LinkError);
+        EXPECT_THROW((void)framer.Next(packet), transport::LinkError);
+        EXPECT_THROW(framer.Finish(), transport::LinkError);
     }
 }
 
@@ -363,8 +369,8 @@ TEST(VlessUdpFraming, CleanEofRejectsFurtherInput) {
     EXPECT_EQ(Flatten(packet.payload), std::vector<uint8_t>({0x73}));
     framer.Finish();
     framer.Finish();
-    EXPECT_THROW(framer.Feed({}), IoSystemError);
-    EXPECT_THROW(framer.Feed(MakeInput(wire)), IoSystemError);
+    EXPECT_THROW(framer.Feed({}), transport::LinkError);
+    EXPECT_THROW(framer.Feed(MakeInput(wire)), transport::LinkError);
     EXPECT_FALSE(framer.Next(packet));
     EXPECT_TRUE(packet.payload.empty());
 }
@@ -424,8 +430,33 @@ TEST(VlessUdpFraming, EmptyDatagramAllocationFailureRetiresFramer) {
         memory::reject_next_process_allocation = false;
         Check(failed, "empty VLESS datagram allocation failure was hidden");
     });
-    EXPECT_THROW(framer.Feed(MakeInput(next_wire)), IoSystemError);
+    EXPECT_THROW(framer.Feed(MakeInput(next_wire)), transport::LinkError);
     vless::FramedUdpPacket packet;
-    EXPECT_THROW((void)framer.Next(packet), IoSystemError);
-    EXPECT_THROW(framer.Finish(), IoSystemError);
+    EXPECT_THROW((void)framer.Next(packet), transport::LinkError);
+    EXPECT_THROW(framer.Finish(), transport::LinkError);
+}
+
+TEST(VlessUdpFraming, PacketAddressCountsTowardWireLength) {
+    const TargetAddress target("127.0.0.1", 53);
+    constexpr size_t kAddressSize = 1 + sizeof(net::ip::address_v4::bytes_type) + sizeof(uint16_t);
+    constexpr size_t kPayloadLimit = std::numeric_limits<uint16_t>::max() - kAddressSize;
+    CaptureWriter capture;
+    std::vector<uint8_t> payload(kPayloadLimit, 0x42);
+    ::Run([&]() -> net::awaitable<void> {
+        const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
+        co_await vless::WriteUdpDatagram(capture, target, true, buffers);
+    });
+    EXPECT_EQ(capture.bytes.size(), std::numeric_limits<uint16_t>::max() + sizeof(uint16_t));
+    payload.push_back(0x43);
+    CaptureWriter rejected;
+    try {
+        ::Run([&]() -> net::awaitable<void> {
+            const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
+            co_await vless::WriteUdpDatagram(rejected, target, true, buffers);
+        });
+        FAIL() << "packet-address framing exceeded its wire length";
+    } catch (const transport::LinkError& error) {
+        EXPECT_EQ(error.code(), ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
+    EXPECT_TRUE(rejected.bytes.empty());
 }

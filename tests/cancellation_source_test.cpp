@@ -223,3 +223,34 @@ TEST(CancellationSource, Contract) {
         passed ? "PASS" : "FAIL");
     { ASSERT_TRUE(passed); return; }
 }
+
+TEST(CancellationBridge, MergesSignalsAndUnsubscribesAtScopeEnd) {
+    net::cancellation_signal parent;
+    CancellationSource source;
+    size_t deliveries = 0;
+    {
+        transport::CancellationBridge bridge(parent.slot(), source);
+        bridge.Slot().assign([&](net::cancellation_type) { ++deliveries; });
+        bridge.Interrupt();
+        EXPECT_EQ(deliveries, 1);
+        EXPECT_FALSE(bridge.Cancelled());
+        parent.emit(net::cancellation_type::terminal);
+        EXPECT_TRUE(bridge.Cancelled());
+        EXPECT_EQ(deliveries, 2);
+        source.Stop(ErrorCode::TIMEOUT);
+        EXPECT_EQ(deliveries, 3);
+    }
+    parent.emit(net::cancellation_type::all);
+    source.Stop();
+    EXPECT_EQ(deliveries, 3);
+
+    transport::CancellationBridge stopped({}, source);
+    EXPECT_TRUE(stopped.Cancelled());
+    CancellationSource live;
+    {
+        transport::CancellationBridge removed({}, live);
+        removed.Slot().assign([&](net::cancellation_type) { ++deliveries; });
+    }
+    live.CancelPending();
+    EXPECT_EQ(deliveries, 3);
+}

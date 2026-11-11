@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "transport/internet/tls_stream.hpp"
-#include "transport/internet/reality_tls.hpp"
+#include "transport/internet/tls_context.hpp"
 
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
@@ -299,4 +299,74 @@ TEST(TlsClientCertificate, Contract) {
     const std::vector<std::string> duplicate_alpn = {"h2", "h2"};
     ASSERT_FALSE((!Require(!::EncodeTlsAlpnProtocols(duplicate_alpn, alpn_wire),
                  "duplicate ALPN protocol must be rejected")));
+}
+
+TEST(QuicTlsContext, EnforcesVersionsAndNegotiatesConfiguredAlpn) {
+    auto material = transport::internet::AutoSignCertificate::Create("quic.example");
+    ASSERT_NE(material, nullptr);
+    CertificateFiles files;
+    ASSERT_TRUE(WriteCertificateFiles(files, material->Certificate(), material->Key()));
+    TlsConfig config;
+    config.cert_file = files.cert.string();
+    config.key_file = files.key.string();
+    config.min_version = TlsVersion::V1_2;
+    config.max_version = TlsVersion::V1_3;
+    LoadTlsPemMaterial(config);
+    const std::vector<std::string> server_alpn{"h3"};
+    auto context = SslContext::CreateQuicServer(config, server_alpn);
+    ASSERT_NE(context, nullptr);
+    EXPECT_EQ(SSL_CTX_get_min_proto_version(context->Native()), TLS1_3_VERSION);
+    EXPECT_EQ(SSL_CTX_get_max_proto_version(context->Native()), TLS1_3_VERSION);
+    config.max_version = TlsVersion::V1_2;
+    EXPECT_EQ(SslContext::CreateQuicServer(config, server_alpn), nullptr);
+    config.max_version = TlsVersion::V1_3;
+    config.min_version = static_cast<TlsVersion>(255);
+    EXPECT_EQ(SslContext::CreateQuicServer(config, server_alpn), nullptr);
+    config.min_version = TlsVersion::V1_2;
+    EXPECT_EQ(SslContext::CreateQuicServer(config, {}), nullptr);
+    EXPECT_EQ(SslContext::CreateQuicServer(config, std::vector<std::string>{""}), nullptr);
+
+    // 通过真实 TLS 状态机验证服务端 ALPN 回调与其上下文拥有的配置寿命。
+    for (const bool common_protocol : {true, false}) {
+        TlsConfig client_config;
+        client_config.allow_insecure = true;
+        client_config.alpn = common_protocol
+            ? std::vector<std::string>{"unrelated", "h3"}
+            : std::vector<std::string>{"unrelated"};
+        auto client_context = SslContext::CreateClient(client_config);
+        ASSERT_NE(client_context, nullptr);
+        bssl::UniquePtr<SSL> client(SSL_new(client_context->Native()));
+        bssl::UniquePtr<SSL> server(SSL_new(context->Native()));
+        ASSERT_NE(client, nullptr);
+        ASSERT_NE(server, nullptr);
+        BIO* client_bio = nullptr;
+        BIO* server_bio = nullptr;
+        ASSERT_EQ(BIO_new_bio_pair(&client_bio, 0, &server_bio, 0), 1);
+        SSL_set_bio(client.get(), client_bio, client_bio);
+        SSL_set_bio(server.get(), server_bio, server_bio);
+        SSL_set_connect_state(client.get());
+        SSL_set_accept_state(server.get());
+        bool failed = false;
+        for (size_t round = 0; round < 16 && !failed &&
+             (!SSL_is_init_finished(client.get()) || !SSL_is_init_finished(server.get())); ++round) {
+            for (SSL* ssl : {client.get(), server.get()}) {
+                const int result = SSL_do_handshake(ssl);
+                if (result == 1) continue;
+                const int error = SSL_get_error(ssl, result);
+                if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        EXPECT_EQ(failed, !common_protocol);
+        if (common_protocol) {
+            ASSERT_TRUE(SSL_is_init_finished(client.get()));
+            ASSERT_TRUE(SSL_is_init_finished(server.get()));
+            const uint8_t* selected = nullptr;
+            unsigned int size = 0;
+            SSL_get0_alpn_selected(client.get(), &selected, &size);
+            EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(selected), size), "h3");
+        }
+    }
 }

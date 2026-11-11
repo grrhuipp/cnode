@@ -3,6 +3,7 @@
 #include "common/allocator.hpp"
 #include "app/relay.hpp"
 #include "common/asio_types.hpp"
+#include "common/string_hash.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/outbound.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
@@ -117,60 +118,25 @@ void RegisterProxy(
     ::net::io_context& io_context,
     ::AwaitableTaskGroup& tasks);
 
-[[nodiscard]] bool HasProxy(std::string_view protocol);
-
-// ============================================================================
-// OutboundConfiguration - the one outbound publication of a Worker
-//
-// Xray app/proxyman/outbound.Manager: prepared handler configs by tag. Worker-
-// level dispatch and every physical session read the same snapshot through
-// HandlerLookup; dynamic add/replace/remove updates only this publication.
-// Mutations and lookups run on the owning Worker; a lookup resynchronizes
-// its cached handlers only when the generation changed.
-// ============================================================================
-class OutboundConfiguration final {
-public:
-    using Entry = std::shared_ptr<const PreparedOutboundConfig>;
-    using Snapshot = std::vector<Entry>;
-
-    explicit OutboundConfiguration(
-        const std::vector<PreparedOutboundConfig>& configurations);
-    ~OutboundConfiguration();
-    OutboundConfiguration(const OutboundConfiguration&) = delete;
-    OutboundConfiguration& operator=(const OutboundConfiguration&) = delete;
-
-    [[nodiscard]] uint64_t Generation() const noexcept;
-    [[nodiscard]] const Snapshot& Entries() const noexcept { return entries_; }
-    // Transactional: a failed prepare leaves the published entries intact.
-    void Replace(const PreparedOutboundConfig& configuration);
-    void Remove(std::string_view tag);
-
-private:
-    Entry Prepare(const PreparedOutboundConfig& configuration);
-
-    Snapshot entries_;
-    uint64_t generation_ = 0;
-};
-
 // ============================================================================
 // Handler - Xray app/proxyman/outbound.Handler
 //
-// One concrete handler per outbound tag per executing domain. It owns the
-// prepared sender settings (through its configuration entry), the tag's
-// OutboundDialer and the protocol instance.
+// One concrete handler per outbound tag per Worker. It owns the prepared
+// configuration (sender settings), the tag's OutboundDialer and the protocol
+// instance.
 // ============================================================================
 class Handler final {
 public:
-    // Stateless tag: the protocol instance and dialer live in the requesting
-    // domain (reactor, DNS client and resident task group outlive the handler).
-    Handler(OutboundConfiguration::Entry config, net::io_context& io_context,
+    // The protocol instance and dialer live in the owning Worker (reactor, DNS
+    // client and resident task group outlive the handler).
+    Handler(PreparedOutboundConfig config, net::io_context& io_context,
             app::dns::DNS& dns, std::chrono::seconds dial_timeout,
             AwaitableTaskGroup& tasks);
     ~Handler();
     Handler(const Handler&) = delete;
     Handler& operator=(const Handler&) = delete;
 
-    [[nodiscard]] std::string_view Tag() const noexcept { return config_->tag; }
+    [[nodiscard]] std::string_view Tag() const noexcept { return config_.tag; }
 
     // The caller keeps this handler alive until the returned awaitable completes.
     [[nodiscard]] net::awaitable<OutboundProcessResult> Dispatch(
@@ -186,54 +152,45 @@ public:
 private:
     // Destroyed in reverse order: the protocol instance before the dialer,
     // the dialer before the sender settings it borrows from config_.
-    OutboundConfiguration::Entry config_;
+    const PreparedOutboundConfig config_;
     OutboundDialer dialer_;
     std::unique_ptr<::Outbound> proxy_;
 };
 
 // ============================================================================
-// HandlerLookup - per-domain view of the OutboundConfiguration publication
+// HandlerRegistry - Xray app/proxyman/outbound.Manager，每个 Worker 一份
 //
-// The dispatcher's only outbound lookup. Instantiates a tag's Handler lazily
-// in the owning domain and keeps it until the tag is replaced or removed;
-// returned handles keep the handler alive for the whole request.
+// 分发层唯一的出站查找入口，按 tag 持有已实例化的 Handler。发布只走冷路径：
+// 构造、Replace、Remove 在所属 Worker 上预先构造或撤销 Handler；请求路径只做
+// 一次哈希查找，不构造、不比较代次。返回的句柄让在途请求在 tag 被替换或删除
+// 后继续持有原 Handler 直至请求结束。所有成员只在所属 Worker 线程调用。
 // ============================================================================
-class HandlerLookup final {
+class HandlerRegistry final {
 public:
-    HandlerLookup(const OutboundConfiguration& configuration,
-                  net::io_context& io_context, app::dns::DNS& dns,
-                  std::chrono::seconds dial_timeout, AwaitableTaskGroup& tasks);
-    HandlerLookup(const HandlerLookup&) = delete;
-    HandlerLookup& operator=(const HandlerLookup&) = delete;
+    // 任一配置非法、tag 重复或协议构造失败都直接抛出，不留下部分发布。
+    HandlerRegistry(const std::vector<PreparedOutboundConfig>& configurations,
+                    net::io_context& io_context, app::dns::DNS& dns,
+                    std::chrono::seconds dial_timeout, AwaitableTaskGroup& tasks);
+    ~HandlerRegistry();
+    HandlerRegistry(const HandlerRegistry&) = delete;
+    HandlerRegistry& operator=(const HandlerRegistry&) = delete;
 
-    [[nodiscard]] std::shared_ptr<Handler> GetHandler(std::string_view tag);
+    [[nodiscard]] std::shared_ptr<Handler> GetHandler(std::string_view tag) const noexcept;
 
-    // Cold path after a publication: drop handlers of replaced or removed
-    // tags now instead of at the next lookup. Under allocation failure all
-    // cached handlers are dropped and the next lookup resynchronizes.
-    void Refresh() noexcept;
-    void Clear() noexcept {
-        entries_.clear();
-        generation_ = 0;
-    }
+    // 事务性：新 Handler 构造并入表成功后才替换同 tag 项，失败保留原发布。
+    void Replace(const PreparedOutboundConfig& configuration);
+    void Remove(std::string_view tag);
 
 private:
-    struct Entry {
-        OutboundConfiguration::Entry config;
-        std::shared_ptr<Handler> handler;
-    };
-
-    void Sync(uint64_t generation);
     [[nodiscard]] std::shared_ptr<Handler> Instantiate(
-        const OutboundConfiguration::Entry& config);
+        const PreparedOutboundConfig& configuration) const;
 
-    const OutboundConfiguration& configuration_;
     net::io_context& io_context_;
     app::dns::DNS& dns_;
     const std::chrono::seconds dial_timeout_;
     AwaitableTaskGroup& tasks_;
-    uint64_t generation_ = 0;  // Publications start at 1.
-    memory::Vector<Entry> entries_;
+    memory::UnorderedMap<memory::String, std::shared_ptr<Handler>,
+                         TransparentStringHash, TransparentStringEq> handlers_;
 };
 
 }  // namespace proxyman::outbound

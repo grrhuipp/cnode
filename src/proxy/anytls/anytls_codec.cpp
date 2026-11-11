@@ -1,4 +1,5 @@
 #include "proxy/anytls/anytls_codec.hpp"
+#include "proxy/handshake_errors.hpp"
 #include "proxy/anytls_padding.hpp"
 #include "common/byte_reader.hpp"
 #include "common/allocator.hpp"
@@ -463,31 +464,10 @@ WriteBuffersAsFramesWithPadding(AsyncStream& stream,
     return WritePaddedBufferFrames(stream, records, cmd, sid, buffers);
 }
 
-namespace {
-
-net::awaitable<tl::expected<void, ErrorCode>>
-ReadExact(AsyncStream& stream, std::span<uint8_t> out) {
-    while (!out.empty()) {
-        try {
-            const auto n = co_await stream.AsyncRead(
-                net::buffer(out.data(), out.size()));
-            if (n == 0) {
-                co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
-            }
-            out = out.subspan(n);
-        } catch (const IoSystemError& e) {
-            co_return tl::unexpected(MapAsioError(e.code()));
-        }
-    }
-    co_return tl::expected<void, ErrorCode>{};
-}
-
-}  // namespace
-
 net::awaitable<tl::expected<FrameHeader, ErrorCode>>
 ReadFrameHeader(AsyncStream& stream) {
     std::array<uint8_t, kFrameHeaderSize> header{};
-    if (auto ok = co_await ReadExact(stream, header); !ok) {
+    if (auto ok = co_await proxy::ReadHandshakeExact(stream, header, proxy::HandshakeProgress::NotStarted); !ok) {
         co_return tl::unexpected(ok.error());
     }
 
@@ -501,9 +481,10 @@ ReadFrameHeader(AsyncStream& stream) {
 net::awaitable<tl::expected<memory::String, ErrorCode>>
 ReadFrameText(AsyncStream& stream, uint16_t length) {
     memory::String text(length, '\0');
-    if (auto ok = co_await ReadExact(
+    if (auto ok = co_await proxy::ReadHandshakeExact(
             stream,
-            std::span<uint8_t>(reinterpret_cast<uint8_t*>(text.data()), length));
+            std::span<uint8_t>(reinterpret_cast<uint8_t*>(text.data()), length),
+            proxy::HandshakeProgress::Started);
         !ok) {
         co_return tl::unexpected(ok.error());
     }
@@ -516,8 +497,8 @@ DiscardFramePayload(AsyncStream& stream, uint16_t length) {
     size_t remaining = length;
     while (remaining > 0) {
         const size_t want = std::min(remaining, scratch.size());
-        if (auto ok = co_await ReadExact(
-                stream, std::span<uint8_t>(scratch.data(), want));
+        if (auto ok = co_await proxy::ReadHandshakeExact(
+                stream, std::span<uint8_t>(scratch.data(), want), proxy::HandshakeProgress::Started);
             !ok) {
             co_return tl::unexpected(ok.error());
         }
@@ -536,8 +517,8 @@ ReadFramePayload(AsyncStream& stream, uint16_t length) {
             co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
         }
         const size_t want = std::min<size_t>(remaining, buffer->Available());
-        if (auto ok = co_await ReadExact(
-                stream, std::span<uint8_t>(buffer->Tail().data(), want));
+        if (auto ok = co_await proxy::ReadHandshakeExact(
+                stream, std::span<uint8_t>(buffer->Tail().data(), want), proxy::HandshakeProgress::Started);
             !ok) {
             co_return tl::unexpected(ok.error());
         }

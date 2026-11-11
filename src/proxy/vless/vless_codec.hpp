@@ -123,6 +123,9 @@ class UdpFramer {
 public:
     explicit UdpFramer(bool packet_addr) noexcept : packet_addr_(packet_addr) {}
 
+    // Malformed/truncated input, budget overflow and use after EOF/failure
+    // throw LinkError(PROTOCOL_DECODE_FAILED); allocation and source I/O
+    // exceptions retain their original types.
     void Feed(buf::MultiBuffer input);
     [[nodiscard]] bool Next(FramedUdpPacket& out);
     void Finish();

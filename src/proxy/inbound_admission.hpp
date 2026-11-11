@@ -25,62 +25,6 @@
 
 namespace proxy {
 
-[[nodiscard]] inline bool ConsumeStreamReadTimeout(
-    AsyncStream& stream) noexcept {
-    return stream.ConsumePhaseDeadline() || stream.ConsumeIdleTimeout() ||
-           stream.ConsumeReadTimeout();
-}
-
-[[nodiscard]] inline ErrorCode ResolveHandshakeReadFailure(
-    AsyncStream& stream,
-    ErrorCode fallback = ErrorCode::SOCKET_READ_FAILED) noexcept {
-    return ConsumeStreamReadTimeout(stream) ? ErrorCode::TIMEOUT : fallback;
-}
-
-[[nodiscard]] inline bool ConsumeOutboundHandshakeTimeout(
-    AsyncStream& stream,
-    const PhaseDeadlineHandle& deadline) noexcept {
-    return deadline.Expired() || ConsumeStreamReadTimeout(stream) ||
-           stream.ConsumeWriteTimeout();
-}
-
-[[nodiscard]] inline ErrorCode ClassifyHandshakeReadException(
-    AsyncStream& stream,
-    const IoSystemError& error) noexcept {
-    if (ConsumeStreamReadTimeout(stream) || error.code() == io_error::timed_out) {
-        return ErrorCode::TIMEOUT;
-    }
-    if (error.code() == io_error::operation_aborted) {
-        return ErrorCode::CANCELLED;
-    }
-    return ErrorCode::SOCKET_READ_FAILED;
-}
-
-[[nodiscard]] inline ErrorCode ClassifyOutboundHandshakeException(
-    AsyncStream& stream,
-    const PhaseDeadlineHandle& deadline,
-    ErrorCode fallback = ErrorCode::SOCKET_WRITE_FAILED) noexcept {
-    try {
-        throw;
-    } catch (const IoSystemError& error) {
-        return (ConsumeOutboundHandshakeTimeout(stream, deadline) ||
-                error.code() == io_error::timed_out)
-            ? ErrorCode::TIMEOUT
-            : MapAsioError(error.code());
-    } catch (const transport::LinkError& error) {
-        return (ConsumeOutboundHandshakeTimeout(stream, deadline) ||
-                error.code() == ErrorCode::TIMEOUT)
-            ? ErrorCode::TIMEOUT
-            : error.code();
-    } catch (const std::bad_alloc&) {
-        return ErrorCode::RESOURCE_EXHAUSTED;
-    } catch (...) {
-        return ConsumeOutboundHandshakeTimeout(stream, deadline)
-            ? ErrorCode::TIMEOUT
-            : fallback;
-    }
-}
-
 // Start of every protocol's authentication: clears any inherited identity and
 // reports whether the client address needs the coordinator's ban lookup
 // (only PROXY-protocol addresses under an enabled auth-ban policy).
@@ -240,15 +184,9 @@ private:
     ConnectionLimiter::Reservation reservation_;
 };
 
-// Admission tracking off: callers build InboundSubstreamAdmission directly
-// instead of entering the AdmitInboundSubstream coroutine.
-[[nodiscard]] inline bool SubstreamAdmissionTracked(
-    const ConnectionLimiter* limiter) noexcept {
-    return limiter && limiter->TracksAdmission();
-}
-
 // The single substream admission entry. `ctx` is the child context inherited
 // from the session (InitSubstreamFrom), carrying the physical family lease.
+// Without admission tracking it only opens the connection statistics scope.
 // A rejection is logged and counted here; the caller closes only that child.
 [[nodiscard]] inline net::awaitable<std::optional<InboundSubstreamAdmission>>
 AdmitInboundSubstream(
@@ -279,6 +217,16 @@ inline void LogInboundAuthFailure(
     const session::Context& ctx,
     std::string_view reason) {
     LOG_CONN_WARN(ctx, "authentication failed from {}:{} > {}",
+                  ctx.inbound.source_ip, ctx.inbound.source_port, reason);
+    LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+}
+
+// The single request-rejection log shape for every protocol: the peer sent a
+// request (target, command, flow, replay) that the protocol refuses.
+inline void LogInboundRequestRejected(
+    const session::Context& ctx,
+    std::string_view reason) {
+    LOG_CONN_WARN(ctx, "request rejected from {}:{} > {}",
                   ctx.inbound.source_ip, ctx.inbound.source_port, reason);
     LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
 }
@@ -368,9 +316,9 @@ VerifyInboundCredential(
 class UserOnlineProtocolRuntime final : public ::proxyman::inbound::ProtocolRuntime {
 public:
     [[nodiscard]] ::UserOnlineTracker* OnlineTracker() noexcept override {
-        return &validator;
+        return &tracker;
     }
-    ::UserOnlineTracker validator;
+    ::UserOnlineTracker tracker;
 };
 
 [[nodiscard]] inline std::unique_ptr<::proxyman::inbound::ProtocolRuntime>

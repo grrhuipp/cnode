@@ -210,6 +210,24 @@ private:
 
 }  // namespace json
 
+// 配置加载器统一在此将值语义的字段错误转换为 invalid_argument。
+template <typename T>
+T RequireJson(tl::expected<T, std::string> result) {
+    if (!result) {
+        throw std::invalid_argument(std::move(result.error()));
+    }
+    if constexpr (!std::is_void_v<T>) {
+        return std::move(*result);
+    }
+}
+
+// 只用于本地配置；远端协议对象保留各自的扩展字段接收语义。
+void RequireJsonKeys(
+    const json::object& source,
+    std::initializer_list<std::string_view> allowed,
+    std::string_view path,
+    std::initializer_list<std::string_view> additional = {});
+
 // Typed readers for one object member. A missing key yields an empty optional
 // (or nullptr); a present key with the wrong type, including JSON null, is an
 // error, so callers apply defaults only to absent fields.

@@ -1,4 +1,7 @@
 #include "proxy/vmess/encoding/body.hpp"
+#include "proxy/buffered_stream_reader.hpp"
+#include "proxy/expiring_keyed_map.hpp"
+#include "transport/failure.hpp"
 #include "common/scoped_cleanse.hpp"
 
 #include "app/proxyman/inbound/user_store.hpp"
@@ -59,9 +62,8 @@ BodyKey ResponseBodyKey(const BodyKey& request) {
 
 BodyChunkCipher::BodyChunkCipher(const BodyOptions& options,
                                  const BodyKey& request_body,
-                                 const BodyKey& direction_key,
-                                 proxy::AeadDirection direction)
-    : payload_(options.security, direction_key.key.data(), direction_key.iv.data(), direction)
+                                 const BodyKey& direction_key)
+    : payload_(options.security, direction_key.key.data(), direction_key.iv.data())
     , global_padding_((options.options & Option::GLOBAL_PADDING) != 0 &&
                       !((options.security == Security::NONE ||
                          options.security == Security::ZERO) &&
@@ -72,7 +74,7 @@ BodyChunkCipher::BodyChunkCipher(const BodyOptions& options,
          options.security == Security::CHACHA20_POLY1305)) {
         const std::array<std::string_view, 1> path{"auth_len"};
         auto length_key = KDF16(request_body.key.data(), request_body.key.size(), path);
-        length_.emplace(options.security, length_key.data(), request_body.iv.data(), direction);
+        length_.emplace(options.security, length_key.data(), request_body.iv.data());
         OPENSSL_cleanse(length_key.data(), length_key.size());
     }
     if ((options.options & Option::CHUNK_MASKING) != 0) {
@@ -132,7 +134,7 @@ std::optional<size_t> BodyChunkCipher::DecodeLength(const uint8_t* in) {
 BodyEncoder::BodyEncoder(const BodyOptions& options,
                          const BodyKey& request_body,
                          const BodyKey& direction_key)
-    : cipher_(options, request_body, direction_key, proxy::AeadDirection::Encrypt) {
+    : cipher_(options, request_body, direction_key) {
     const size_t reserved =
         cipher_.LengthSize() + cipher_.Overhead() + cipher_.MaxPaddingSize();
     stream_chunk_size_ = std::min(MAX_CHUNK_SIZE - cipher_.Overhead(),
@@ -151,13 +153,13 @@ void BodyEncoder::CheckWritable() const {
 void BodyEncoder::Encode(const buf::MultiBuffer& payload, buf::MultiBuffer& out) {
     CheckWritable();
     if (&payload == &out) {
-        throw IoSystemError(io_error::invalid_argument,
-                            "VMess body input and output must be distinct");
+        throw transport::LinkError(ErrorCode::INVALID_ARGUMENT);
     }
     if (PacketMode() &&
         (payload.byte_size() != 0 || buf::InspectUdpDatagram(payload).Valid())) {
+        ValidatePacketSize(payload.byte_size());
         const buf::ContiguousBufferView packet(payload);
-        EncodePacket(packet.Bytes(), out);
+        EncodeChunk(packet.Bytes(), out);
         return;
     }
     if (payload.byte_size() == 0) {
@@ -173,8 +175,16 @@ void BodyEncoder::Encode(const buf::MultiBuffer& payload, buf::MultiBuffer& out)
 void BodyEncoder::Encode(std::span<const net::const_buffer> payload, buf::MultiBuffer& out) {
     CheckWritable();
     if (PacketMode()) {
+        const size_t size = proxy::RequireUdpPayloadSize(
+            payload, MAX_CHUNK_SIZE - cipher_.Overhead());
+        ValidatePacketSize(size);
+        for (const auto& buffer : payload) {
+            if (buffer.size() != 0 && !buffer.data()) {
+                throw transport::LinkError(ErrorCode::INVALID_ARGUMENT);
+            }
+        }
         const buf::ContiguousBufferView packet(payload);
-        EncodePacket(packet.Bytes(), out);
+        EncodeChunk(packet.Bytes(), out);
         return;
     }
     const bool has_data = std::any_of(payload.begin(), payload.end(),
@@ -332,17 +342,14 @@ net::awaitable<void> BodyEncoder::WriteEOF(
     }
 }
 
-void BodyEncoder::EncodePacket(std::span<const uint8_t> bytes, buf::MultiBuffer& out) {
+void BodyEncoder::ValidatePacketSize(size_t size) const {
     // Standard VMess framing uses an empty body exclusively as EOF.
-    if (bytes.empty()) {
+    if (size == 0) {
         throw transport::LinkError(ErrorCode::NOT_SUPPORTED);
     }
-    if (bytes.size() > MAX_CHUNK_SIZE - cipher_.Overhead()) {
-        throw IoSystemError(
-            io_error::message_size,
-            "VMess UDP datagram exceeds one authenticated chunk");
+    if (size > MAX_CHUNK_SIZE - cipher_.Overhead()) {
+        throw transport::LinkError(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
-    EncodeChunk(bytes, out);
 }
 
 size_t BodyEncoder::SealChunkTo(std::span<const uint8_t> bytes,
@@ -386,14 +393,7 @@ void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& 
 BodyDecoder::BodyDecoder(const BodyOptions& options,
                          const BodyKey& request_body,
                          const BodyKey& direction_key)
-    : cipher_(options, request_body, direction_key, proxy::AeadDirection::Decrypt) {}
-
-bool BodyDecoder::TryConsumePending(std::span<uint8_t> out, size_t& filled) noexcept {
-    if (filled < out.size() && pending_read_.byte_size() != 0) {
-        filled += pending_read_.ConsumePrefixTo(out.subspan(filled));
-    }
-    return filled == out.size();
-}
+    : cipher_(options, request_body, direction_key) {}
 
 net::awaitable<bool> BodyDecoder::ReadExact(transport::MultiBufferReader& src,
                                             std::span<uint8_t> out,
@@ -404,15 +404,8 @@ net::awaitable<bool> BodyDecoder::ReadExact(transport::MultiBufferReader& src,
     if (state_ == State::Finished) {
         co_return false;
     }
-    while (!TryConsumePending(out, filled)) {
-        pending_read_.ReleaseIfIdle();
-        pending_read_ = co_await src.ReadMultiBuffer();
-        if (pending_read_.byte_size() == 0) {
-            co_await ThrowIfCancelledOnEof("VMess read cancelled");
-            co_return false;
-        }
-    }
-    co_return true;
+    co_return co_await proxy::BufferedStreamReader::ReadExactFrom(
+        src, pending_read_, out.data(), out.size(), &filled);
 }
 
 net::awaitable<buf::MultiBuffer> BodyDecoder::Read(transport::MultiBufferReader& src) {
@@ -459,7 +452,7 @@ net::awaitable<buf::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferRe
     if (!header_decoded_) {
         const size_t length_size = cipher_.LengthSize();
         const auto header_span = std::span<uint8_t>(header_.data(), length_size);
-        if (!TryConsumePending(header_span, header_read_) &&
+        if (!proxy::BufferedStreamReader::ReadBufferedFrom(pending_read_, header_span.data(), header_span.size(), header_read_) &&
             !co_await ReadExact(src, header_span, header_read_)) {
             if (header_read_ != 0) {
                 Fail("VMess body length truncated");
@@ -488,7 +481,7 @@ net::awaitable<buf::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferRe
         // The EOF chunk is at most a tag plus 63 padding bytes; the decoded
         // length no longer needs the inline header storage.
         const auto eof_span = std::span<uint8_t>(header_.data(), chunk_len);
-        if (!TryConsumePending(eof_span, body_read_) &&
+        if (!proxy::BufferedStreamReader::ReadBufferedFrom(pending_read_, eof_span.data(), eof_span.size(), body_read_) &&
             !co_await ReadExact(src, eof_span, body_read_)) {
             Fail("VMess body EOF chunk truncated");
         }
@@ -518,7 +511,7 @@ net::awaitable<buf::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferRe
 
     uint8_t* sealed = read_buffer_.Data();
     const auto body_span = std::span<uint8_t>(sealed, chunk_len);
-    if (!TryConsumePending(body_span, body_read_) &&
+    if (!proxy::BufferedStreamReader::ReadBufferedFrom(pending_read_, body_span.data(), body_span.size(), body_read_) &&
         !co_await ReadExact(src, body_span, body_read_)) {
         Fail("VMess body chunk truncated");
     }
@@ -630,8 +623,8 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
         std::chrono::system_clock::now().time_since_epoch()).count();
     uint8_t* auth_id = packet.data();
     uint8_t* sealed_length = packet.data() + 16;
-    uint8_t* connection_nonce = packet.data() + 34;
-    uint8_t* sealed_header = packet.data() + 42;
+    uint8_t* connection_nonce = packet.data() + kConnectionNonceOffset;
+    uint8_t* sealed_header = packet.data() + kRequestHeaderPrefixSize;
     GenerateAuthID(auth_id_key, timestamp, auth_id);
     if (RAND_bytes(connection_nonce, 8) != 1) {
         return tl::unexpected(ErrorCode::INTERNAL);
@@ -644,21 +637,15 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
         static_cast<uint8_t>(header_len >> 8),
         static_cast<uint8_t>(header_len),
     };
-    if (!AES128GCMEncrypt(length_key.key.data(), length_key.nonce.data(),
-                          auth_id, 16,
-                          length_plain, sizeof(length_plain),
-                          sealed_length, sealed_length + 2)) {
+    if (!proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {length_key.key.data(), 16}, {length_key.nonce.data(), 12}, {length_plain, sizeof(length_plain)}, {auth_id, 16}, sealed_length, {sealed_length + 2, 16})) {
         return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
     const auto payload_key = RequestHeaderPayloadKey(user.cmd_key, auth_id_view, nonce_view);
-    if (!AES128GCMEncrypt(payload_key.key.data(), payload_key.nonce.data(),
-                          auth_id, 16,
-                          header.data(), header_len,
-                          sealed_header, sealed_header + header_len)) {
+    if (!proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {payload_key.key.data(), 16}, {payload_key.nonce.data(), 12}, {header.data(), header_len}, {auth_id, 16}, sealed_header, {sealed_header + header_len, 16})) {
         return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
-    return 42 + header_len + 16;
+    return kRequestHeaderPrefixSize + header_len + GCM_TAG_SIZE;
 }
 
 [[noreturn]] void ThrowResponseHeaderError() {
@@ -731,18 +718,10 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(
     } catch (const transport::WriteClosed&) {
         request_encoder_.Finish();
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
-    } catch (const transport::LinkError& e) {
-        fail_request();
-        co_return tl::unexpected(e.code());
-    } catch (const std::bad_alloc&) {
-        fail_request();
-        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
-    } catch (const IoSystemError& e) {
-        fail_request();
-        co_return tl::unexpected(MapAsioError(e.code()));
     } catch (...) {
         fail_request();
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return tl::unexpected(transport::ClassifyFailure(
+            std::current_exception(), ErrorCode::SOCKET_WRITE_FAILED));
     }
     request_header_sent_ = true;
     co_return VMessHandshakeResult{};
@@ -788,11 +767,7 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
             const auto length_key = ResponseHeaderLengthKey(keys_.response.key, keys_.response.iv);
             std::array<uint8_t, 2> length{};
             size_t length_size = 0;
-            if (!AES128GCMDecryptTo(length_key.key.data(), length_key.nonce.data(),
-                                    length_key.nonce.size(),
-                                    response_length_.data(), response_length_.size(),
-                                    nullptr, 0,
-                                    length.data(), length.size(), length_size) ||
+            if (!proxy::OpenOneShotAead(EVP_aead_aes_128_gcm(), {length_key.key.data(), 16}, {length_key.nonce.data(), length_key.nonce.size()}, {response_length_.data(), response_length_.size()}, {}, {length.data(), length.size()}, length_size) ||
                 length_size != length.size()) {
                 ThrowResponseHeaderError();
             }
@@ -810,11 +785,7 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
         const auto payload_key = ResponseHeaderPayloadKey(keys_.response.key, keys_.response.iv);
         const size_t header_len = response_header_sealed_.size() - 16;
         size_t opened = 0;
-        if (!AES128GCMDecryptTo(payload_key.key.data(), payload_key.nonce.data(),
-                                payload_key.nonce.size(),
-                                response_header_sealed_.data(), response_header_sealed_.size(),
-                                nullptr, 0,
-                                response_header_sealed_.data(), header_len, opened) ||
+        if (!proxy::OpenOneShotAead(EVP_aead_aes_128_gcm(), {payload_key.key.data(), 16}, {payload_key.nonce.data(), payload_key.nonce.size()}, {response_header_sealed_.data(), response_header_sealed_.size()}, {}, {response_header_sealed_.data(), header_len}, opened) ||
             opened != header_len ||
             response_header_sealed_[0] != keys_.response_header) {
             ThrowResponseHeaderError();
@@ -855,7 +826,6 @@ net::awaitable<buf::MultiBuffer> ClientSession::DecodeFirstResponse(AsyncStream&
 namespace {
 
 // AuthID (16) + sealed length (2 + 16) + connection nonce (8).
-constexpr size_t kRequestHeaderPrefixSize = 16 + 18 + 8;
 
 [[nodiscard]] bool IsSupportedSecurity(Security security) noexcept {
     switch (security) {
@@ -872,7 +842,7 @@ constexpr size_t kRequestHeaderPrefixSize = 16 + 18 + 8;
 bool ParseDecryptedHeader(const uint8_t* data, size_t len,
                           uint64_t trace_conn_id,
                           VMessRequest& request) {
-    static constexpr size_t kFixedHeaderSize = 38;
+    static constexpr size_t kFixedHeaderSize = kRequestHeaderFixedSize;
     if (len < kFixedHeaderSize + 4) {
         LOG_CONN_TRACE(trace_conn_id, "decrypted header too short len={} min={}",
                          len,
@@ -969,12 +939,10 @@ bool OpenRequestHeader(const uint8_t* packet,
     const auto key = RequestHeaderPayloadKey(
         user->cmd_key,
         std::span<const uint8_t, 16>(packet, 16),
-        std::span<const uint8_t, 8>(packet + 34, 8));
+        std::span<const uint8_t, 8>(packet + kConnectionNonceOffset, 8));
     ScopedCleanse cleanse_plain{plain};
     size_t written = 0;
-    if (!AES128GCMDecryptTo(key.key.data(), key.nonce.data(), key.nonce.size(),
-            packet + kRequestHeaderPrefixSize, header_len + 16, packet, 16,
-            plain.data(), header_len, written)) {
+    if (!proxy::OpenOneShotAead(EVP_aead_aes_128_gcm(), {key.key.data(), 16}, {key.nonce.data(), key.nonce.size()}, {packet + kRequestHeaderPrefixSize, header_len + 16}, {packet, 16}, {plain.data(), header_len}, written)) {
         failure_reason = "authentication failed: request header integrity check failed";
         LOG_CONN_DEBUG(trace_conn_id, "request header authentication failed");
         return false;
@@ -1003,13 +971,11 @@ bool BuildResponseHeader(const VMessRequest& request,
     const uint8_t length[2] = {0, sizeof(payload)};
 
     const auto length_key = ResponseHeaderLengthKey(response.key, response.iv);
-    if (!AES128GCMEncrypt(length_key.key.data(), length_key.nonce.data(), nullptr, 0,
-                          length, sizeof(length), out.data(), out.data() + 2)) {
+    if (!proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {length_key.key.data(), 16}, {length_key.nonce.data(), 12}, {length, sizeof(length)}, {}, out.data(), {out.data() + 2, 16})) {
         return false;
     }
     const auto payload_key = ResponseHeaderPayloadKey(response.key, response.iv);
-    return AES128GCMEncrypt(payload_key.key.data(), payload_key.nonce.data(), nullptr, 0,
-                            payload, sizeof(payload), out.data() + 18, out.data() + 22);
+    return proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {payload_key.key.data(), 16}, {payload_key.nonce.data(), 12}, {payload, sizeof(payload)}, {}, out.data() + 18, {out.data() + 22, 16});
 }
 
 }  // namespace
@@ -1041,56 +1007,60 @@ ResponseBodyWriter::ResponseBodyWriter(
     , response_header_(response_header) {}
 
 ServerSession::ServerSession(std::string_view tag)
-    : tag_(tag) {}
+    : tag_(tag), state_(Pending{}) {}
 
 std::pair<std::optional<VMessRequest>, size_t> ServerSession::DecodeRequestHeader(
     const uint8_t* data, size_t len, uint64_t trace_conn_id) {
+    auto* pending_ptr = std::get_if<Pending>(&state_);
+    if (!pending_ptr) return {std::nullopt, 0};
+    auto& pending = *pending_ptr;
     if (len < kRequestHeaderPrefixSize) {
         required_header_bytes_ = kRequestHeaderPrefixSize;
         return {std::nullopt, 0};
     }
     const std::span<const uint8_t, 16> auth_id(data, 16);
-    if (!header_user_) {
-        header_user_ = FindByAuthIDForTag(tag_, auth_id.data());
-        if (!header_user_) {
+    if (!pending.user) {
+        pending.user = FindByAuthIDForTag(tag_, auth_id.data());
+        if (!pending.user) {
             header_failure_reason_ = "authentication failed: no acceptable AuthID";
             required_header_bytes_ = 0;
             return {std::nullopt, 0};
         }
         const auto key = RequestHeaderLengthKey(
-            header_user_->cmd_key, auth_id, std::span<const uint8_t, 8>(data + 34, 8));
+            pending.user->cmd_key, auth_id, std::span<const uint8_t, 8>(data + kConnectionNonceOffset, 8));
         std::array<uint8_t, 2> plain{};
         size_t written = 0;
-        if (!AES128GCMDecryptTo(key.key.data(), key.nonce.data(), key.nonce.size(),
-                data + 16, 18, auth_id.data(), auth_id.size(),
-                plain.data(), plain.size(), written) ||
+        if (!proxy::OpenOneShotAead(EVP_aead_aes_128_gcm(), {key.key.data(), 16}, {key.nonce.data(), key.nonce.size()}, {data + 16, 18}, {auth_id.data(), auth_id.size()}, {plain.data(), plain.size()}, written) ||
             written != plain.size()) {
             header_failure_reason_ = "authentication failed: header length integrity check failed";
-            header_user_.reset();
+            pending.user.reset();
             required_header_bytes_ = 0;
             return {std::nullopt, 0};
         }
-        header_length_ = LoadU16BE(&plain[0]);
-        constexpr size_t kMinRequestHeaderLength = 38 + 4;
-        if (header_length_ < kMinRequestHeaderLength ||
-            header_length_ > kRequestHeaderMax) {
+        pending.header_length = LoadU16BE(&plain[0]);
+        constexpr size_t kMinRequestHeaderLength = kRequestHeaderFixedSize + kRequestHeaderChecksumSize;
+        if (pending.header_length < kMinRequestHeaderLength ||
+            pending.header_length > kRequestHeaderMax) {
             header_failure_reason_ = "invalid authenticated request header";
-            header_user_.reset();
+            pending.user.reset();
             required_header_bytes_ = 0;
             return {std::nullopt, 0};
         }
         required_header_bytes_ =
-            kRequestHeaderPrefixSize + static_cast<size_t>(header_length_) + 16;
+            kRequestHeaderPrefixSize + static_cast<size_t>(pending.header_length) + 16;
     }
     if (len < required_header_bytes_) return {std::nullopt, 0};
 
     VMessRequest request;
     const size_t consumed = required_header_bytes_;
     required_header_bytes_ = 0;
-    if (!OpenRequestHeader(data, header_user_, header_length_, trace_conn_id, request,
+    if (!OpenRequestHeader(data, pending.user, pending.header_length, trace_conn_id, request,
                            header_failure_reason_)) {
-        if (request.user) request_ = std::move(request);
-        header_user_.reset();
+        if (request.user) {
+            state_ = Rejected{std::move(request.user), request.command, std::move(request.target)};
+        } else {
+            pending.user.reset();
+        }
         LOG_CONN_DEBUG(trace_conn_id, "request rejected > {}", header_failure_reason_);
         return {std::nullopt, 0};
     }
@@ -1098,37 +1068,33 @@ std::pair<std::optional<VMessRequest>, size_t> ServerSession::DecodeRequestHeade
 }
 
 void ServerSession::SetRequest(VMessRequest request) {
-    request_ = std::move(request);
-    request_set_ = true;
+    state_ = Accepted{std::move(request)};
 }
 
-std::optional<RequestBodyReader> ServerSession::DecodeRequestBody(
+tl::expected<RequestBodyReader, ErrorCode> ServerSession::DecodeRequestBody(
     AsyncStream& stream) {
-    if (!request_set_) {
-        return std::nullopt;
-    }
+    const auto* accepted = std::get_if<Accepted>(&state_);
+    if (!accepted) return tl::unexpected(ErrorCode::INTERNAL);
     try {
-        return std::optional<RequestBodyReader>(std::in_place, request_, stream);
-    } catch (...) {
-        return std::nullopt;
+        return RequestBodyReader(accepted->request, stream);
+    } catch (const std::bad_alloc&) {
+        return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
 }
 
-std::optional<ResponseBodyWriter> ServerSession::EncodeResponseBodyWithHeader(
+tl::expected<ResponseBodyWriter, ErrorCode> ServerSession::EncodeResponseBodyWithHeader(
     AsyncStream& stream) {
-    if (!request_set_) {
-        return std::nullopt;
-    }
+    const auto* accepted = std::get_if<Accepted>(&state_);
+    if (!accepted) return tl::unexpected(ErrorCode::INTERNAL);
     try {
-        const BodyKey response = ResponseBodyKey(RequestBodyKey(request_));
+        const auto& request = accepted->request;
+        const BodyKey response = ResponseBodyKey(RequestBodyKey(request));
         std::array<uint8_t, kResponseHeaderSize> response_header{};
-        if (!BuildResponseHeader(request_, response, response_header)) {
-            return std::nullopt;
-        }
-        return std::optional<ResponseBodyWriter>(
-            std::in_place, request_, response, stream, response_header);
-    } catch (...) {
-        return std::nullopt;
+        if (!BuildResponseHeader(request, response, response_header))
+            return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return ResponseBodyWriter(request, response, stream, response_header);
+    } catch (const std::bad_alloc&) {
+        return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     }
 }
 }  // namespace vmess::encoding
@@ -1139,90 +1105,23 @@ namespace {
 
 using SessionKey = std::array<uint8_t, 32>;
 
-struct SessionKeyEqual {
-    [[nodiscard]] bool operator()(const SessionKey& a, const SessionKey& b) const noexcept {
-        return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
-    }
-};
-
-struct SessionKeyHash {
-    std::array<uint64_t, 2> key{};
-
-    [[nodiscard]] size_t operator()(const SessionKey& value) const noexcept {
-        return static_cast<size_t>(SIPHASH_24(key.data(), value.data(), value.size()));
-    }
-};
-
 struct SessionHistory {
     static constexpr int64_t kTtlSeconds = 180;
     static constexpr int64_t kCleanupIntervalSeconds = 30;
     static constexpr size_t kMaxEntries = 65536;
-
-    memory::UnorderedMap<SessionKey, int64_t, SessionKeyHash, SessionKeyEqual> entries;
-    memory::RingDeque<std::pair<const SessionKey*, int64_t>> order;
+    proxy::ExpiringKeyedMap<32, std::monostate, int64_t> entries{kMaxEntries};
     int64_t last_cleanup = 0;
 
-    SessionHistory()
-        : entries(0, [] {
-              SessionKeyHash hash;
-              if (RAND_bytes(reinterpret_cast<uint8_t*>(hash.key.data()),
-                             sizeof(hash.key)) != 1) {
-                  std::abort();
-              }
-              return hash;
-          }()) {}
-    void Cleanup(int64_t now) {
-        if (now - last_cleanup < kCleanupIntervalSeconds &&
-            entries.size() < kMaxEntries) {
-            return;
+    bool AddIfNew(const SessionKey& key, int64_t now) {
+        if (now - last_cleanup >= kCleanupIntervalSeconds || entries.size() >= kMaxEntries) {
+            last_cleanup = now;
+            entries.Prune(now);
         }
-        last_cleanup = now;
-        while (!order.empty()) {
-            const auto [key_ptr, expires_at] = order.front();
-            auto it = entries.find(*key_ptr);
-            if (it == entries.end() || it->second != expires_at) {
-                order.pop_front();
-                continue;
-            }
-            if (expires_at > now) {
-                break;
-            }
-            entries.erase(it);
-            order.pop_front();
-        }
-        MaybeShrinkHashContainer(entries);
-        order.shrink_to_fit();
-    }
-
-    bool AddIfNew(SessionKey key, int64_t now) {
-        Cleanup(now);
-        auto it = entries.find(key);
-        if (it != entries.end() && it->second > now) {
-            return false;
-        }
-        const int64_t expires_at = now + kTtlSeconds;
-        if (it != entries.end()) {
-            order.emplace_back(&it->first, expires_at);
-            it->second = expires_at;
-            return true;
-        }
-        while (entries.size() >= kMaxEntries && !order.empty()) {
-            const auto [oldest_key_ptr, oldest_expires] = order.front();
-            order.pop_front();
-            if (auto oldest_it = entries.find(*oldest_key_ptr);
-                oldest_it != entries.end() && oldest_it->second == oldest_expires) {
-                entries.erase(oldest_it);
-            }
-        }
-        auto [inserted_it, inserted] = entries.emplace(std::move(key), expires_at);
-        try {
-            order.emplace_back(&inserted_it->first, expires_at);
-        } catch (...) {
-            if (inserted) {
-                entries.erase(inserted_it);
-            }
-            throw;
-        }
+        auto* entry = entries.Find(key);
+        if (entry && entry->expires_at > now) return false;
+        const auto expires_at = now + kTtlSeconds;
+        if (entry) entries.Rearm(key, *entry, expires_at);
+        else entries.Insert(key, expires_at, std::monostate{});
         return true;
     }
 };

@@ -13,7 +13,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cstring>
 #include <limits>
 #include <span>
@@ -31,7 +30,7 @@ constexpr uint8_t kSs2022ServerPacket = 1;
 // SOCKS5 最短非空域名地址：ATYP、长度、一字节域名及两字节端口。
 constexpr size_t kMinSocks5AddressSize = 1 + 1 + 1 + 2;
 
-static std::array<uint8_t, 12> kZeroNonce{};
+constexpr std::array<uint8_t, 12> kZeroNonce{};
 
 struct Parsed2022Body {
     TargetAddress target;
@@ -178,12 +177,13 @@ struct Parsed2022Body {
     return parsed;
 }
 
-[[nodiscard]] bool AeadEncrypt(SsCipherType cipher_type,
+// 整包 AEAD：经典方法与 2022 AES 用 12 字节 nonce，2022 chacha 用 BoringSSL 的
+// XChaCha20-Poly1305（24 字节 nonce）。输出可与输入原地重叠。
+[[nodiscard]] bool AeadEncrypt(const EVP_AEAD* algorithm,
                                std::span<const uint8_t> key,
-                               std::span<const uint8_t, 12> nonce,
+                               std::span<const uint8_t> nonce,
                                std::span<const uint8_t> plaintext,
                                uint8_t* output) {
-    const auto* algorithm = AeadAlgorithm(cipher_type);
     if (!algorithm || plaintext.size() >
             std::numeric_limits<size_t>::max() - SsAeadCipher::kTagSize) return false;
     return proxy::SealOneShotAead(
@@ -192,12 +192,11 @@ struct Parsed2022Body {
         SsAeadCipher::kTagSize);
 }
 
-[[nodiscard]] bool AeadDecrypt(SsCipherType cipher_type,
+[[nodiscard]] bool AeadDecrypt(const EVP_AEAD* algorithm,
                                std::span<const uint8_t> key,
-                               std::span<const uint8_t, 12> nonce,
+                               std::span<const uint8_t> nonce,
                                std::span<const uint8_t> ciphertext,
                                uint8_t* output) {
-    const auto* algorithm = AeadAlgorithm(cipher_type);
     if (!algorithm || ciphertext.size() < SsAeadCipher::kTagSize) return false;
     const size_t capacity = ciphertext.size() - SsAeadCipher::kTagSize;
     size_t written = 0;
@@ -205,108 +204,6 @@ struct Parsed2022Body {
                algorithm, key, nonce, ciphertext, {},
                {output, capacity}, written, SsAeadCipher::kTagSize) &&
            written == capacity;
-}
-
-[[nodiscard]] uint32_t Load32LE(const uint8_t* data) noexcept {
-    return static_cast<uint32_t>(data[0]) |
-           (static_cast<uint32_t>(data[1]) << 8) |
-           (static_cast<uint32_t>(data[2]) << 16) |
-           (static_cast<uint32_t>(data[3]) << 24);
-}
-
-void Store32LE(uint8_t* out, uint32_t value) noexcept {
-    out[0] = static_cast<uint8_t>(value);
-    out[1] = static_cast<uint8_t>(value >> 8);
-    out[2] = static_cast<uint8_t>(value >> 16);
-    out[3] = static_cast<uint8_t>(value >> 24);
-}
-
-void ChaChaQuarterRound(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) noexcept {
-    a += b; d ^= a; d = std::rotl(d, 16);
-    c += d; b ^= c; b = std::rotl(b, 12);
-    a += b; d ^= a; d = std::rotl(d, 8);
-    c += d; b ^= c; b = std::rotl(b, 7);
-}
-
-[[nodiscard]] bool HChaCha20(std::span<const uint8_t> key,
-                             std::span<const uint8_t, 16> nonce,
-                             std::span<uint8_t, 32> out) {
-    if (key.size() != 32) {
-        return false;
-    }
-    std::array<uint32_t, 16> state{
-        0x61707865U, 0x3320646eU, 0x79622d32U, 0x6b206574U,
-        Load32LE(key.data() + 0),
-        Load32LE(key.data() + 4),
-        Load32LE(key.data() + 8),
-        Load32LE(key.data() + 12),
-        Load32LE(key.data() + 16),
-        Load32LE(key.data() + 20),
-        Load32LE(key.data() + 24),
-        Load32LE(key.data() + 28),
-        Load32LE(nonce.data() + 0),
-        Load32LE(nonce.data() + 4),
-        Load32LE(nonce.data() + 8),
-        Load32LE(nonce.data() + 12),
-    };
-
-    for (int i = 0; i < 10; ++i) {
-        ChaChaQuarterRound(state[0], state[4], state[8], state[12]);
-        ChaChaQuarterRound(state[1], state[5], state[9], state[13]);
-        ChaChaQuarterRound(state[2], state[6], state[10], state[14]);
-        ChaChaQuarterRound(state[3], state[7], state[11], state[15]);
-        ChaChaQuarterRound(state[0], state[5], state[10], state[15]);
-        ChaChaQuarterRound(state[1], state[6], state[11], state[12]);
-        ChaChaQuarterRound(state[2], state[7], state[8], state[13]);
-        ChaChaQuarterRound(state[3], state[4], state[9], state[14]);
-    }
-
-    Store32LE(out.data() + 0, state[0]);
-    Store32LE(out.data() + 4, state[1]);
-    Store32LE(out.data() + 8, state[2]);
-    Store32LE(out.data() + 12, state[3]);
-    Store32LE(out.data() + 16, state[12]);
-    Store32LE(out.data() + 20, state[13]);
-    Store32LE(out.data() + 24, state[14]);
-    Store32LE(out.data() + 28, state[15]);
-    OPENSSL_cleanse(state.data(), sizeof(state));
-    return true;
-}
-
-[[nodiscard]] bool XChaCha20Poly1305Crypt(bool encrypt,
-                                          std::span<const uint8_t> key,
-                                          std::span<const uint8_t, 24> nonce,
-                                          std::span<const uint8_t> input,
-                                          uint8_t* output) {
-    std::array<uint8_t, 32> subkey{};
-    std::array<uint8_t, 16> hnonce{};
-    std::memcpy(hnonce.data(), nonce.data(), hnonce.size());
-    if (!HChaCha20(key, hnonce, subkey)) {
-        OPENSSL_cleanse(subkey.data(), subkey.size());
-        return false;
-    }
-
-    std::array<uint8_t, 12> ietf_nonce{};
-    std::memcpy(ietf_nonce.data() + 4, nonce.data() + 16, 8);
-    const bool ok = encrypt
-        ? AeadEncrypt(SsCipherType::CHACHA20_POLY1305, subkey, ietf_nonce, input, output)
-        : AeadDecrypt(SsCipherType::CHACHA20_POLY1305, subkey, ietf_nonce, input, output);
-    OPENSSL_cleanse(subkey.data(), subkey.size());
-    return ok;
-}
-
-[[nodiscard]] bool XChaCha20Poly1305Encrypt(std::span<const uint8_t> key,
-                                            std::span<const uint8_t, 24> nonce,
-                                            std::span<const uint8_t> plaintext,
-                                            uint8_t* output) {
-    return XChaCha20Poly1305Crypt(true, key, nonce, plaintext, output);
-}
-
-[[nodiscard]] bool XChaCha20Poly1305Decrypt(std::span<const uint8_t> key,
-                                            std::span<const uint8_t, 24> nonce,
-                                            std::span<const uint8_t> ciphertext,
-                                            uint8_t* output) {
-    return XChaCha20Poly1305Crypt(false, key, nonce, ciphertext, output);
 }
 
 struct PlaintextScratch {
@@ -476,7 +373,7 @@ struct PlaintextScratch {
             std::array<uint8_t, 12> nonce{};
             std::memcpy(nonce.data(), separate.data() + 4, nonce.size());
             const bool decrypted = AeadDecrypt(
-                cipher_info.type,
+                AeadAlgorithm(cipher_info.type),
                 std::span<const uint8_t>(subkey.data(), cipher_info.key_size),
                 nonce,
                 std::span<const uint8_t>(datagram + body_offset, ciphertext_len),
@@ -534,7 +431,8 @@ struct PlaintextScratch {
         if (user.derived_key.size != 32) {
             continue;
         }
-        if (!XChaCha20Poly1305Decrypt(
+        if (!AeadDecrypt(
+                EVP_aead_xchacha20_poly1305(),
                 user.derived_key.span(), nonce,
                 std::span<const uint8_t>(ciphertext, ciphertext_len),
                 plain_dst)) {
@@ -609,7 +507,7 @@ struct PlaintextScratch {
     }
 
     const bool encrypted = AeadEncrypt(
-        cipher_type,
+        AeadAlgorithm(cipher_type),
         std::span<const uint8_t>(subkey.data(), key_size),
         kZeroNonce,
         std::span<const uint8_t>(ciphertext, plain_size),
@@ -723,7 +621,7 @@ struct PlaintextScratch {
     std::array<uint8_t, 12> nonce{};
     std::memcpy(nonce.data(), separate.data() + 4, nonce.size());
     const bool encrypted = AeadEncrypt(
-        state.cipher_info.type,
+        AeadAlgorithm(state.cipher_info.type),
         std::span<const uint8_t>(subkey.data(), state.cipher_info.key_size),
         nonce,
         std::span<const uint8_t>(body_out, body_plain_size),
@@ -788,7 +686,8 @@ struct PlaintextScratch {
         return 0;
     }
     std::memcpy(output, nonce.data(), nonce.size());
-    if (!XChaCha20Poly1305Encrypt(
+    if (!AeadEncrypt(
+            EVP_aead_xchacha20_poly1305(),
             state.key.span(),
             nonce,
             std::span<const uint8_t>(cipher_out, plain_size),
@@ -1004,7 +903,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
         }
 
         const bool decrypted = AeadDecrypt(
-            cipher_type,
+            AeadAlgorithm(cipher_type),
             std::span<const uint8_t>(subkey.data(), key_size),
             kZeroNonce,
             std::span<const uint8_t>(cipher, cipherlen),
@@ -1103,7 +1002,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
         return std::nullopt;
     }
     const bool decrypted = AeadDecrypt(
-        cipher_type,
+        AeadAlgorithm(cipher_type),
         std::span<const uint8_t>(subkey.data(), key_size),
         kZeroNonce,
         std::span<const uint8_t>(cipher, cipherlen),
@@ -1235,7 +1134,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
         std::array<uint8_t, 12> nonce{};
         std::memcpy(nonce.data(), separate.data() + 4, nonce.size());
         const bool decrypted = AeadDecrypt(
-            state.cipher_info.type,
+            AeadAlgorithm(state.cipher_info.type),
             std::span<const uint8_t>(subkey.data(), state.cipher_info.key_size),
             nonce,
             std::span<const uint8_t>(datagram + body_offset, ciphertext_len),
@@ -1259,7 +1158,8 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
         if (!plain_dst) {
             return std::nullopt;
         }
-        if (!XChaCha20Poly1305Decrypt(
+        if (!AeadDecrypt(
+                EVP_aead_xchacha20_poly1305(),
                 state.key.span(), nonce,
                 std::span<const uint8_t>(ciphertext, ciphertext_len),
                 plain_dst)) {

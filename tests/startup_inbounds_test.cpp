@@ -85,10 +85,6 @@ TEST(StartupInbounds, Contract) {
         prepared[1].binding.tag != constants::test::kTestInboundTag ||
         prepared[1].build_request.tag != constants::test::kTestInboundTag ||
         prepared[1].binding.port != constants::test::kTestPort ||
-        prepared[1].receiver.stream_settings.network != "tcp" ||
-        prepared[1].receiver.stream_settings.security != "none" ||
-        prepared[1].receiver.stream_settings.network_mode != NetworkMode::Tcp ||
-        prepared[1].receiver.stream_settings.security_mode != SecurityMode::None ||
         !prepared[1].receiver.dispatch_policy.sniffing.enabled || !prepared[1].binding.listen.IsAuto() ||
         std::get<PreparedVmessUsers>(*prepared[1].users).front().uuid_bytes !=
             CredentialMarker(constants::test::kTestVmessUuid) ||

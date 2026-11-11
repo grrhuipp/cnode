@@ -102,50 +102,26 @@ public:
     // 数据传输
     // ========================================================================
 
-    /**
-     * 异步读取数据
-     *
-     * @param buf 目标缓冲区
-     * @return 读取字节数；0 表示 EOF（对端关闭写端）
-     * @throws IoSystemError 网络错误或取消；取消不能伪装成 EOF
-     */
+    // 返回 0 表示 EOF（对端关闭写端）；网络错误或取消抛 IoSystemError，取消不能伪装成 EOF。
     virtual net::awaitable<std::size_t> AsyncRead(net::mutable_buffer buf) = 0;
 
-    /**
-     * 异步写入数据
-     *
-     * @param buf 源缓冲区
-     * @return 写入字节数
-     * @throws IoSystemError 网络错误
-     */
+    // 失败抛 IoSystemError。
     virtual net::awaitable<std::size_t> AsyncWrite(net::const_buffer buf) = 0;
 
     // ========================================================================
     // buf::MultiBuffer 流式接口（对应 Xray buf.Reader / buf.Writer）
     //
-    // 读路径由每个具体 stream 实现，以便先等待可读数据，再申请
-    // 唯一的 8KB payload Buffer；WriteMultiBuffer 默认将 MultiBuffer 展开为
-    // const_buffer 序列转发至 WriteBuffers（TcpStream scatter-write / TlsStream 聚帧）。
-    //   - VMessStream: 解密直写 pool Buffer，省去一次 memcpy
-    //
-    // 所有权规则：
-    //   ReadMultiBuffer()  - 返回的 buf::MultiBuffer 由调用方负责 Free
-    //   WriteMultiBuffer() - 接管 mb 所有权，完成后自动 Free
+    // 读路径由每个具体 stream 实现，以便先等待可读数据，再申请唯一的 8KB
+    // payload Buffer（VMessStream 解密直写 pool Buffer，省去一次 memcpy）；
+    // WriteMultiBuffer 默认将 MultiBuffer 展开为 const_buffer 序列转发至
+    // WriteBuffers（TcpStream scatter-write / TlsStream 聚帧）。MultiBuffer 按 RAII
+    // 持有 Buffer，读出的由调用方持有，写入的由流接管。
     // ========================================================================
 
-    /**
-     * 批量读取数据到 buf::MultiBuffer
-     *
-     * @return buf::MultiBuffer（无有效数据 = EOF）；返回值按 RAII 自动归还 Buffer
-     * @throws IoSystemError 网络错误或取消；内存不足抛出 std::bad_alloc
-     */
+    // 空 MultiBuffer 表示 EOF；网络错误或取消抛 IoSystemError，内存不足抛 std::bad_alloc。
     virtual net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override = 0;
 
-    /**
-     * 批量写入 buf::MultiBuffer（接管所有权，写完后自动 Free）
-     *
-     * @throws IoSystemError 网络错误
-     */
+    // 接管 mb，写完后归还 Buffer；失败抛 IoSystemError。
     virtual net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
 
     /**

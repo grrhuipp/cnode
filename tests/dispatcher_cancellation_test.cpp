@@ -105,12 +105,11 @@ struct OutboundProbe {
     State state;
     State target_state;
     bool relay = false;
-    int instantiated = 0;
 };
 
 class TestOutbound final : public Outbound {
 public:
-    explicit TestOutbound(OutboundProbe& probe) : probe_(probe) { ++probe_.instantiated; }
+    explicit TestOutbound(OutboundProbe& probe) : probe_(probe) {}
     net::awaitable<OutboundProcessResult> Process(
         session::Context& ctx, transport::Link inbound, OutboundDialer& dialer,
         const TimeoutsConfig&, StatsShard& stats, const RelayConfig& config,
@@ -147,24 +146,23 @@ proxyman::outbound::PreparedOutboundConfig ProbeConfig(std::string tag, Outbound
     };
 }
 
-// "direct" and "second" published through the real configuration/lookup pair.
+// "direct" and "second" published through the real outbound registry.
 struct OutboundProbes {
     OutboundProbe direct;
     OutboundProbe second;
-    [[nodiscard]] int Instantiated() const noexcept {
-        return direct.instantiated + second.instantiated;
+    [[nodiscard]] int Entered() const noexcept {
+        return direct.state.entered + second.state.entered;
     }
 };
 
 struct Outbounds {
     Outbounds(OutboundProbes& probes, net::io_context& io, app::dns::DNS& dns)
-        : configuration({ProbeConfig("direct", probes.direct),
-                         ProbeConfig("second", probes.second)}),
-          tasks(io.get_executor()),
-          lookup(configuration, io, dns, std::chrono::seconds(1), tasks.Tasks()) {}
-    proxyman::outbound::OutboundConfiguration configuration;
+        : tasks(io.get_executor()),
+          registry({ProbeConfig("direct", probes.direct),
+                    ProbeConfig("second", probes.second)},
+                   io, dns, std::chrono::seconds(1), tasks.Tasks()) {}
     ResidentTaskGroup tasks;
-    proxyman::outbound::HandlerLookup lookup;
+    proxyman::outbound::HandlerRegistry registry;
 };
 
 class Router final : public routing::Router {
@@ -255,7 +253,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
     }
     Outbounds outbound_handlers(outbounds, io, dns);
     app::dispatcher::DefaultDispatcher dispatcher(
-        router, outbound_handlers.lookup, request_policy, session_tracking, dns, load);
+        router, outbound_handlers.registry, request_policy, session_tracking, dns, load);
     if (which == Case::PreStopped) reader->Cancellation().Stop(reason);
     bool done = false;
     bool triggered = false;
@@ -301,7 +299,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         expected = ErrorCode::BLOCKED;
     passed &= result.error == expected;
     if (which == Case::PreStopped || which == Case::Sniff || which == Case::RoutingDns ||
-        which == Case::SniffMemory || which == Case::SniffLinkError) passed &= outbounds.Instantiated() == 0 && outbound.state.entered == 0;
+        which == Case::SniffMemory || which == Case::SniffLinkError) passed &= outbounds.Entered() == 0;
     if (source_state.block || outbound.state.block) {
         const auto& waiting = source_state.block ? source_state : outbound.state;
         passed &= triggered && waiting.cancelled == 1 && waiting.cleanup_has_owner && outbound.state.committed == 0;
@@ -318,7 +316,7 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
             outbounds.direct.state.entered == 0 && outbound.state.committed == 1;
     }
     if (which == Case::PolicyBlockedForce || which == Case::PolicyBlockedRoute) {
-        passed &= outbounds.Instantiated() == 0 && outbound.state.entered == 0 &&
+        passed &= outbounds.Entered() == 0 &&
             outbound.state.committed == 0;
     }
     if (which == Case::PolicyAllowed) {
@@ -344,9 +342,9 @@ bool Run(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
         reader->Cancellation().CancelPending();
         reader->Cancellation().Stop();
     }
-    std::printf("case=%d controlled=%d reason=%s result=%s timely=%d triggered=%d lookups=%d committed=%d joined=%d: %s\n",
+    std::printf("case=%d controlled=%d reason=%s result=%s timely=%d triggered=%d entered=%d committed=%d joined=%d: %s\n",
         int(which), controlled, ErrorCodeToString(reason).data(), ErrorCodeToString(result.error).data(),
-        completed_in_budget, triggered, outbounds.Instantiated(), outbound.state.committed,
+        completed_in_budget, triggered, outbounds.Entered(), outbound.state.committed,
         source_state.active + outbound.state.active == 0, passed ? "PASS" : "FAIL");
     return passed;
 }
@@ -372,7 +370,7 @@ bool SiblingIsolation(bool controlled) {
     app::dns::DNS dns(dns_worker);
     Outbounds outbound_handlers(outbounds, io, dns);
     app::dispatcher::DefaultDispatcher dispatcher(
-        router, outbound_handlers.lookup, request_policy, session_tracking, dns, load);
+        router, outbound_handlers.registry, request_policy, session_tracking, dns, load);
     routing::DispatchPolicy policy_a{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"direct"}};
     routing::DispatchPolicy policy_b{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"second"}};
     session::Context ctx_a, ctx_b;

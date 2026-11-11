@@ -20,7 +20,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
@@ -532,37 +531,5 @@ net::awaitable<void> ApplyNodeChange(
     co_await net::this_coro::reset_cancellation_state(net::enable_terminal_cancellation());
     std::rethrow_exception(failure);
 }
-
-// UniProxy is additive and has no idempotency token. Only ready records may be
-// sent. Unknown records require external reconciliation, never automatic retry.
-class TrafficJournal {
-public:
-    static constexpr size_t kMaxBytes = 64 * 1024 * 1024;
-    static constexpr size_t kMaxRecords = 1024;
-    struct Batch {
-        std::vector<api::UserTraffic> traffic;
-        std::vector<std::filesystem::path> records;
-    };
-
-    explicit TrafficJournal(const PanelConfig& config);
-    ~TrafficJournal();
-    TrafficJournal(const TrafficJournal&) = delete;
-    TrafficJournal& operator=(const TrafficJournal&) = delete;
-    void Suspend() noexcept;
-    void Append(const app::UserTrafficSnapshot& traffic);
-    [[nodiscard]] Batch Prepare();
-    void Begin(Batch& batch);
-    void Acknowledge(const Batch& batch);
-    [[nodiscard]] size_t UnknownCount();
-    [[nodiscard]] const std::filesystem::path& Directory() const noexcept { return directory_; }
-
-private:
-    void CheckHealthy() const;
-    void SyncDirectory();
-    std::filesystem::path directory_;
-    int lock_fd_ = -1;
-    int directory_fd_ = -1;
-    bool failed_ = false;
-};
 
 }  // namespace controller

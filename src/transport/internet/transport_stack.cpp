@@ -55,14 +55,9 @@ std::unique_ptr<TcpStream> TakeOwnedTcpStream(std::unique_ptr<AsyncStream>& stre
     return std::unique_ptr<TcpStream>(tcp_raw);
 }
 
-// A configured Host wins over the dial-derived authority.
-[[nodiscard]] std::string_view ResolveHttpAuthority(std::string_view fallback,
-                                                    const HttpConfig& http) {
-    return transport::internet::ResolveConfiguredHttpHost(
-        http.host,
-        &http.headers,
-        fallback.empty() ? std::string_view("www.example.com") : fallback);
-}
+// HTTP-based client layers name this authority when neither the transport
+// config nor the dial target supplies one.
+constexpr std::string_view kDefaultHttpAuthority = "www.example.com";
 
 [[nodiscard]] bool OffersHttp2(const StreamSettings& s) {
     return !(s.tls.alpn.size() == 1 && EqualsAsciiCI(s.tls.alpn.front(), "http/1.1"));
@@ -128,7 +123,7 @@ net::awaitable<void> RunRealityFallbackProxy(
     buf::MultiBuffer first;
     bool first_ok = true;
     if (reality.xver == 1 || reality.xver == 2) {
-        std::array<uint8_t, 108> proxy_header{};
+        std::array<uint8_t, kProxyProtocolMaxHeaderSize> proxy_header{};
         const size_t proxy_header_len = EncodeProxyProtocolHeader(
             reality.xver,
             client_tcp->RemoteEndpoint(),
@@ -398,8 +393,8 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
 
     if (s.IsUnsupported() || !ReceivesSupportedReality(s)) {
         LOG_CONN_ERROR(conn_id, "unsupported inbound transport combination network={} security={}",
-                  s.network,
-                  s.security);
+                  s.NetworkName(),
+                  SecurityModeName(s.security_mode));
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
@@ -503,8 +498,8 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
 
     if (s.IsUnsupported() || !ReceivesSupportedReality(s)) {
         LOG_CONN_ERROR(conn_id, "unsupported outbound transport combination network={} security={}",
-                  s.network,
-                  s.security);
+                  s.NetworkName(),
+                  SecurityModeName(s.security_mode));
         co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
@@ -513,6 +508,9 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
         : tls_server_name;
     // Host for HTTP-based layers unless the transport config names one.
     const std::string_view dial_host = ws_host.empty() ? sni : ws_host;
+    // A configured Host wins over the dial-derived authority.
+    const std::string_view authority_fallback =
+        dial_host.empty() ? kDefaultHttpAuthority : dial_host;
 
     // 1. TLS / REALITY 层（客户端）
     if (s.IsTlsLike()) {
@@ -543,7 +541,8 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
 
     // 3. HTTP / h2 层（客户端）
     if (s.IsHttp()) {
-        const std::string_view host = ResolveHttpAuthority(dial_host, s.http);
+        const std::string_view host = transport::internet::ResolveConfiguredHttpHost(
+            s.http.host, &s.http.headers, authority_fallback);
         auto http_result = ShouldUseHttp2ForHttp(s)
             ? co_await transport::internet::DoHttp2ClientHandshake(
                   std::move(stream), s.http, host, s.IsTlsLike(), conn_id)
@@ -567,7 +566,8 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
         auto xhttp_result = co_await transport::internet::DoHttp2ClientHandshake(
             std::move(stream),
             http,
-            ResolveHttpAuthority(dial_host, http),
+            transport::internet::ResolveConfiguredHttpHost(
+                http.host, &http.headers, authority_fallback),
             s.IsTlsLike(),
             conn_id);
         if (!xhttp_result) {
@@ -647,7 +647,8 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
             ? std::string_view(s.reality.server_name)
             : sni;
     }
-    const std::string_view authority = ResolveHttpAuthority(dial_host, http);
+    const std::string_view authority = transport::internet::ResolveConfiguredHttpHost(
+        http.host, &http.headers, dial_host.empty() ? kDefaultHttpAuthority : dial_host);
 
     if (!ShouldUseHttp2ForXHttp(s)) {
         co_return co_await transport::internet::DoXHttp1ClientRequest(
