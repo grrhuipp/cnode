@@ -13,7 +13,6 @@ vcpkg_cmake_configure(
     OPTIONS
         -DMI_USE_CXX=ON
         -DMI_OVERRIDE=ON
-        -DMI_LIBC_MUSL=ON
         # mimalloc itself sets PR_SET_THP_DISABLE for the process at startup.
         -DMI_NO_THP=ON
         -DMI_BUILD_STATIC=ON
