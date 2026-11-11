@@ -17,8 +17,6 @@
 #include <type_traits>
 #include <vector>
 #include <cstdlib>
-#include <sys/wait.h>
-#include <unistd.h>
 
 namespace {
 using namespace ::memory;
@@ -123,7 +121,7 @@ bool RunOwnershipAndPmr() {
     for (size_t alignment : {8u, 16u, 64u, 4096u}) {
         p = pool.Allocate(17408, alignment);
         if (!p || reinterpret_cast<uintptr_t>(p) % alignment) return false;
-        ReleaseWorkerBlock(p);
+        pool.Deallocate(p);
     }
     return pool.OutstandingAllocations() == 0 &&
         !pool.Allocate(std::numeric_limits<size_t>::max(), 16);
@@ -273,45 +271,6 @@ bool RunSessionContextAndIdleDeque() {
     return passed;
 }
 
-
-template <class Action>
-bool RejectsLeaseViolation(Action action) {
-    const auto child = ::fork();
-    if (child < 0) return false;
-    if (child == 0) {
-        std::set_terminate([] { std::_Exit(73); });
-        action();
-        std::_Exit(0);
-    }
-    int status = 0;
-    if (::waitpid(child, &status, 0) != child) return false;
-    return WIFEXITED(status) && WEXITSTATUS(status) == 73;
-}
-
-bool RunCrossThreadRejection() {
-    const bool cross_thread_allocate = RejectsLeaseViolation([] {
-        worker_memory pool;
-        void* block = pool.Allocate(256, 16);
-        if (!block) std::_Exit(1);
-        std::thread wrong([&] { (void)pool.Allocate(256, 16); });
-        wrong.join();
-    });
-    const bool cross_thread_free = RejectsLeaseViolation([] {
-        worker_memory pool;
-        void* block = pool.Allocate(256, 16);
-        if (!block) std::_Exit(1);
-        std::thread wrong([&pool, block] { pool.Deallocate(block); });
-        wrong.join();
-    });
-    const bool foreign_pool_free = RejectsLeaseViolation([] {
-        worker_memory owner, other;
-        void* block = owner.Allocate(256, 16);
-        if (!block || !other.Allocate(16, 16)) std::_Exit(1);
-        other.Deallocate(block);
-    });
-    return cross_thread_allocate && cross_thread_free && foreign_pool_free;
-}
-
 bool RunAll() {
     struct Case { const char* name; bool (*run)(); };
     for (const auto& test : std::array{
@@ -320,8 +279,7 @@ bool RunAll() {
         Case{"collect releases empty pages", RunCollectReleasesEmptyPages},
         Case{"ownership/PMR/OOM", RunOwnershipAndPmr}, Case{"Buffer", RunBuffer},
         Case{"shared allocation/alignment/exception", RunSharedAllocation},
-        Case{"session context and idle deque", RunSessionContextAndIdleDeque},
-        Case{"cross-thread and foreign-pool violations", RunCrossThreadRejection}}) {
+        Case{"session context and idle deque", RunSessionContextAndIdleDeque}}) {
         if (!test.run()) {
             std::fprintf(stderr, "pool case failed: %s\n", test.name);
             return false;

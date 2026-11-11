@@ -43,9 +43,8 @@ inline void OnBufferNew() noexcept {}
 inline void OnBufferFree() noexcept {}
 #endif
 
-// CNODE_TEST_ALLOCATOR: test-only allocator instrumentation (fault injection
-// and release-side ownership checks). It must be defined consistently for
-// every translation unit of one binary.
+// CNODE_TEST_ALLOCATOR: test-only allocation fault injection. It must be
+// defined consistently for every translation unit of one binary.
 #ifdef CNODE_TEST_ALLOCATOR
 inline thread_local bool reject_next_process_allocation = false;
 inline thread_local size_t rejected_process_allocations = 0;
@@ -54,13 +53,6 @@ inline thread_local size_t rejected_pmr_allocations = 0;
 #endif
 
 namespace detail {
-
-[[nodiscard]] inline std::uintptr_t CurrentThreadToken() noexcept {
-    thread_local std::uint8_t anchor = 0;
-    return reinterpret_cast<std::uintptr_t>(&anchor);
-}
-
-
 [[nodiscard]] inline void* AllocateProcessRaw(std::size_t bytes_value, std::size_t alignment) {
 #ifdef CNODE_TEST_ALLOCATOR
     if (reject_next_process_allocation) {
@@ -110,16 +102,13 @@ private:
 // blocks in pages of their own (never shared with another heap), segregated by
 // size class with page metadata outside the blocks. A page whose blocks are all
 // free returns to the shared arena and is purged after mi_option_purge_delay;
-// Collect() forces that for this heap's thread-local state.
+// Collect() forces that for the calling thread's part of this heap.
 //
 // The pool is owned explicitly (a Worker member, or a test-local object) and
 // passed to every allocation; nothing selects it from thread-local or default
-// PMR state. The first allocation binds the owner thread and the heap's
-// thread-bound theap, which only that thread may use: allocation and Collect()
-// on any other thread terminate. Release on the owner thread is an invariant;
-// mimalloc would accept a remote free, so the release-side thread and
-// owning-pool checks run in CNODE_TEST_ALLOCATOR builds only, keeping the
-// production free path to a single mi_free.
+// PMR state. It is a thin adapter over mimalloc's heap API, which resolves the
+// calling thread's heap state itself. Worker affinity is an ownership
+// invariant of the callers, not something this adapter enforces.
 class worker_memory final : public std::pmr::memory_resource {
 public:
     // Page-level view of this heap; computed by visiting its pages.
@@ -138,9 +127,6 @@ public:
     worker_memory& operator=(const worker_memory&) = delete;
 
     ~worker_memory() override {
-        // The owner thread's mimalloc state may already be torn down at thread
-        // exit; only the heap itself is touched here, never theap_.
-        if (GetFootprint().live_allocations != 0) std::terminate();
         mi_heap_delete(heap_);
     }
 
@@ -152,17 +138,14 @@ public:
         return footprint;
     }
 
-    // Exact for blocks released on the owner thread: mimalloc updates a page's
-    // use count on every local free.
     [[nodiscard]] std::size_t OutstandingAllocations() const noexcept {
         return GetFootprint().live_allocations;
     }
 
-    // Returns this heap's empty pages to the arena and purges them now.
+    // Returns the calling thread's empty pages of this heap to the arena and
+    // purges them now.
     void Collect() noexcept {
-        if (!theap_) return;
-        RequireOwnerThread();
-        mi_theap_collect(theap_, true);
+        mi_heap_collect(heap_, true);
     }
 
     [[nodiscard]] std::pmr::memory_resource* resource() & noexcept { return this; }
@@ -173,12 +156,6 @@ public:
     [[nodiscard]] std::pmr::memory_resource* resource() const&& = delete;
 
     [[nodiscard]] void* Allocate(std::size_t bytes, std::size_t alignment) noexcept {
-        const auto token = detail::CurrentThreadToken();
-        if (owner_token_ != token) {
-            if (owner_token_ != 0) std::terminate();
-            owner_token_ = token;
-        }
-        if (!theap_ && !(theap_ = mi_heap_theap(heap_))) return nullptr;
 #ifdef CNODE_TEST_ALLOCATOR
         if (reject_next_pmr_allocation) {
             reject_next_pmr_allocation = false;
@@ -186,15 +163,10 @@ public:
             return nullptr;
         }
 #endif
-        return mi_theap_malloc_aligned(theap_, bytes, alignment);
+        return mi_heap_malloc_aligned(heap_, bytes, alignment);
     }
 
     void Deallocate(void* pointer, std::size_t = 0, std::size_t = 0) noexcept {
-#ifdef CNODE_TEST_ALLOCATOR
-        if (!pointer) return;
-        RequireOwnerThread();
-        if (mi_heap_of(pointer) != heap_) std::terminate();
-#endif
         mi_free(pointer);
     }
 
@@ -221,26 +193,8 @@ private:
         return true;
     }
 
-    void RequireOwnerThread() const noexcept {
-        if (owner_token_ != detail::CurrentThreadToken()) std::terminate();
-    }
-
     mi_heap_t* const heap_;
-    mi_theap_t* theap_ = nullptr;
-    std::uintptr_t owner_token_ = 0;
 };
-
-// Releases a block whose owning Worker pool is not at hand (unsized object
-// delete). It must come from a Worker heap and be released on its owner
-// thread; CNODE_TEST_ALLOCATOR builds verify the former.
-inline void ReleaseWorkerBlock(void* p) noexcept {
-#ifdef CNODE_TEST_ALLOCATOR
-    if (!p) return;
-    const mi_heap_t* const heap = mi_heap_of(p);
-    if (!heap || heap == mi_heap_main()) std::terminate();
-#endif
-    mi_free(p);
-}
 
 // Native Asio operation storage can be allocated, delivered, cancelled, or
 // destroyed by different reactor threads. It never belongs to a session pool.
@@ -254,7 +208,7 @@ public:
 };
 
 // Objects allocated from an explicit Worker pool: `new (pool) T(...)`.
-// Deleting through a base pointer is fine: release does not need the pool.
+// mimalloc frees a block without knowing its heap, so delete needs no pool.
 struct WorkerAllocated {
     static void* operator new(std::size_t) = delete;
     static void* operator new(std::size_t, std::align_val_t) = delete;
@@ -268,12 +222,10 @@ struct WorkerAllocated {
     }
     static void* operator new(std::size_t, void* p) noexcept { return p; }
     static void operator delete(void*, void*) noexcept {}
-    static void operator delete(void* p, worker_memory&) noexcept { ReleaseWorkerBlock(p); }
-    static void operator delete(void* p, std::align_val_t, worker_memory&) noexcept {
-        ReleaseWorkerBlock(p);
-    }
-    static void operator delete(void* p) noexcept { ReleaseWorkerBlock(p); }
-    static void operator delete(void* p, std::align_val_t) noexcept { ReleaseWorkerBlock(p); }
+    static void operator delete(void* p, worker_memory&) noexcept { mi_free(p); }
+    static void operator delete(void* p, std::align_val_t, worker_memory&) noexcept { mi_free(p); }
+    static void operator delete(void* p) noexcept { mi_free(p); }
+    static void operator delete(void* p, std::align_val_t) noexcept { mi_free(p); }
 };
 
 template <class T, class... Args>
@@ -287,7 +239,7 @@ inline void CollectProcessHeap() noexcept {
     mi_collect(true);
 }
 
-// Owner thread of `pool` only: also collects the pool heap.
+// Called on the Worker thread that uses `pool`: also collects its pool pages.
 inline void CollectBurst(worker_memory& pool) noexcept {
     pool.Collect();
     CollectProcessHeap();
