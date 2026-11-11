@@ -23,7 +23,7 @@ struct ConnectionFamily;
 #include <string>
 #include <type_traits>
 #include <new>
-#include <sys/mman.h>
+#include <mimalloc.h>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -123,12 +123,12 @@ public:
 
     explicit ConnectionLimiterCore(const RateLimitConfig& cfg)
         : cfg_(cfg),
-          connections_(cfg.max_conn_per_ip ? MapZeroed<ConnectionSlots>() : nullptr),
-          ip_failures_(cfg.ip_ban.enabled ? MapZeroed<FailureTable>() : nullptr),
+          connections_(cfg.max_conn_per_ip ? AllocateZeroedTable<ConnectionSlots>() : nullptr),
+          ip_failures_(cfg.ip_ban.enabled ? AllocateZeroedTable<FailureTable>() : nullptr),
           ip_fingerprint_(cfg.ip_ban.enabled
               ? std::optional<auth_limit_detail::Fingerprint>(std::in_place, false)
               : std::nullopt),
-          credential_failures_(MapZeroed<FailureTable>()) {}
+          credential_failures_(AllocateZeroedTable<FailureTable>()) {}
 
     [[nodiscard]] bool TracksGlobalConnections() const noexcept {
         return cfg_.max_connections > 0;
@@ -254,7 +254,7 @@ private:
         return hash;
     }
 
-    // 以下表项类型的全零字节即空状态：大表直接承载于匿名零页映射，不再逐字节清零。
+    // 以下表项类型的全零字节即空状态。
     struct ConnectionSlot {
         uint64_t hash;
         uint32_t conns;
@@ -341,22 +341,20 @@ private:
         std::array<Slot, kSlotCount> slots_;
     };
 
-    // 匿名映射按需缺页：未触及的槽只映射内核零页，构造开销与表大小无关。
     template <class Table>
-    struct UnmapTable {
-        void operator()(Table* table) const noexcept { ::munmap(table, sizeof(Table)); }
+    struct FreeTable {
+        void operator()(Table* table) const noexcept { mi_free(table); }
     };
     template <class Table>
-    using ZeroMappedTable = std::unique_ptr<Table, UnmapTable<Table>>;
+    using ZeroedTable = std::unique_ptr<Table, FreeTable<Table>>;
     template <class Table>
-    [[nodiscard]] static ZeroMappedTable<Table> MapZeroed() {
+    [[nodiscard]] static ZeroedTable<Table> AllocateZeroedTable() {
         static_assert(std::is_trivially_default_constructible_v<Table> &&
                       std::is_trivially_destructible_v<Table>);
-        void* memory = ::mmap(nullptr, sizeof(Table), PROT_READ | PROT_WRITE,
-                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (memory == MAP_FAILED) throw std::bad_alloc();
-        // 平凡隐式生存期类型：映射提供的全零存储即其默认空状态。
-        return ZeroMappedTable<Table>(static_cast<Table*>(memory));
+        void* memory = mi_zalloc_aligned(sizeof(Table), alignof(Table));
+        if (!memory) throw std::bad_alloc();
+        // 平凡默认初始化只开始对象生命周期，不覆盖分配器保证的全零存储。
+        return ZeroedTable<Table>(::new (memory) Table);
     }
 
     [[nodiscard]] ConnectionSlot* FindOrCreateConnection(uint64_t hash) noexcept {
@@ -378,10 +376,10 @@ private:
 
     const RateLimitConfig cfg_;
     uint32_t total_ = 0;
-    ZeroMappedTable<ConnectionSlots> connections_;
-    ZeroMappedTable<FailureTable> ip_failures_;
+    ZeroedTable<ConnectionSlots> connections_;
+    ZeroedTable<FailureTable> ip_failures_;
     const std::optional<auth_limit_detail::Fingerprint> ip_fingerprint_;
-    ZeroMappedTable<FailureTable> credential_failures_;
+    ZeroedTable<FailureTable> credential_failures_;
 };
 
 // Lease shared by one physical connection and its logical children; carried in

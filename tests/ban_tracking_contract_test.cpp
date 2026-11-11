@@ -317,3 +317,25 @@ TEST(BanTrackingContract, IPFailureCapacityIsIndependentAndExpiredSlotsAreReusab
     limiter.OnAuthFailTracked(kTag, rejected, std::nullopt, 280);
     EXPECT_EQ(limiter.TryAcceptIP(kTag, rejected, true, 280), Reason::IP_BANNED);
 }
+
+TEST(BanTrackingContract, ReconstructedLimiterStartsWithoutQuotasOrBans) {
+    RateLimitConfig config;
+    config.max_connections = 1;
+    config.max_conn_per_ip = 1;
+    config.ip_ban = {.enabled = true, .failure_limit = 1,
+                     .window_seconds = 60, .ban_seconds = 180};
+    const auto credential = Key(42);
+    for (unsigned cycle = 0; cycle < 3; ++cycle) {
+        Core limiter(config);
+        EXPECT_EQ(limiter.CheckIPBan(kTag, kIP, 100), Reason::NONE);
+        EXPECT_EQ(limiter.CheckCredential(credential, 100), Reason::NONE);
+        EXPECT_EQ(limiter.TryAcceptGlobal(), Reason::NONE);
+        EXPECT_EQ(limiter.TryAcceptGlobal(), Reason::MAX_CONNECTIONS);
+        EXPECT_EQ(limiter.TryAcceptIP(kTag, kIP, true, 100), Reason::NONE);
+        EXPECT_EQ(limiter.TryAcceptIP(kTag, kIP, true, 100), Reason::MAX_CONNECTIONS_PER_IP);
+        for (unsigned failure = 0; failure < 10; ++failure)
+            limiter.OnAuthFailTracked(kTag, kIP, credential, 100);
+        EXPECT_EQ(limiter.CheckIPBan(kTag, kIP, 100), Reason::IP_BANNED);
+        EXPECT_EQ(limiter.CheckCredential(credential, 100), Reason::CREDENTIAL_BANNED);
+    }
+}

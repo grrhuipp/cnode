@@ -188,7 +188,7 @@ main
   -> Relay(TCP / UDP / Mux)
 ```
 
-每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口；连接与有状态会话一生固定在创建它的原 Worker（Origin Worker）上，由原生 `io_context` 直接驱动，不设虚拟执行域、跨线程 remote-free 队列或运行期跨 Worker 会话搬迁。内存统一由 mimalloc 的原生线程堆承载，默认 PMR 使用进程生命周期资源，不另建 Worker、连接或协议级内存池。数据面对象仍在所属 Worker 上使用、取消和销毁，工作集按需分配并在阶段结束或空闲时释放；空页由 mimalloc 原生回收机制管理。
+每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口；连接与有状态会话一生固定在创建它的原 Worker（Origin Worker）上，由原生 `io_context` 直接驱动，不设虚拟执行域、跨线程 remote-free 队列或运行期跨 Worker 会话搬迁。内存（含进程级准入跟踪表）统一由 mimalloc 的原生线程堆承载，默认 PMR 使用进程生命周期资源，不另建 Worker、连接或协议级内存池。数据面对象仍在所属 Worker 上使用、取消和销毁，工作集按需分配并在阶段结束或空闲时释放；空页由 mimalloc 原生回收机制管理。
 
 XHTTP 分离上行传输（Split-HTTP）由下行 `GET` 所在的原 Worker 唯一拥有完整会话、路由、出站连接与 Relay。当同 `session_id` 的独立上行连接（`stream-up` 或 `packet-up`）落到其他 Worker 时，收包 Worker 仅读取首个 HTTP 请求头识别 `session_id`，随即在该连接无在途 I/O、无出站与定时器的静止边界单次提取裸入站 `fd`（含 TLS 状态与预读字节）经有界控制入口移交原 Worker `assign` 接管；接管后该连接的所有后续请求与流字节均在原 Worker 本地原生读写，不跨 Worker 转发 `MultiBuffer` 载荷，也不跨 Worker 合组运行中的 HTTP/2 会话。短上传完成后事件驱动移除目录项，迟到上传由有界 tombstone 拒绝，不在满容量路径逐次扫描整张会话表。
 
