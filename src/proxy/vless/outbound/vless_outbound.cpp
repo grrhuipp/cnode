@@ -601,7 +601,7 @@ proxy::vless::outbound::Handler::Process(
         auto res = co_await DoRelayLink(
             dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
             target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-        if (encrypted_io && !res) {
+        if (encrypted_io && !res.Ok()) {
             encrypted_io->reader.RejectDeferredTicket();
         }
         co_return res;
@@ -619,7 +619,7 @@ proxy::vless::outbound::Handler::Process(
     auto res = co_await DoRelayLink(
         dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
         target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-    if (encrypted_io && !res) {
+    if (encrypted_io && !res.Ok()) {
         encrypted_io->reader.RejectDeferredTicket();
     }
     co_return res;

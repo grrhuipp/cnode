@@ -651,7 +651,7 @@ net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>> ReadTCPSession(
 
     uint64_t read_nonce = 1;  // nonce=0 was used for the length header.
 
-    const uint16_t payload_len = LoadU16BE(len_plain.data());
+    const uint16_t payload_len = LoadU16BE(len_plain);
     if (payload_len == 0 || payload_len > kMaxChunkPayload) {
         co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
     }
