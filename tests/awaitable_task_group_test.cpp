@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -430,15 +431,11 @@ void TestResidentGroup() {
     Check(joined && rejected && counts.active == 0 && counts.finished == 2,
           "resident join must cancel, join and close admission");
 }
+
+void CheckAllocation(std::size_t) { async_allocation_test::Check(); }
 }  // namespace
 
-void* operator new(std::size_t size) {
-    async_allocation_test::Check();
-    if (void* p = std::malloc(size ? size : 1)) return p;
-    throw std::bad_alloc();
-}
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = CheckAllocation};
 
 TEST(AwaitableTaskGroup, Contract) {
     GroupResource resource;

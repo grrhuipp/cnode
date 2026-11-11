@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "proxy/anytls/anytls_codec.hpp"
 #include "transport/async_stream.hpp"
 
@@ -15,29 +16,21 @@ namespace {
 std::array<void*, 128> allocations{};
 size_t live = 0;
 bool tracking = false;
-static_assert(alignof(buf::Buffer) <= alignof(std::max_align_t));
+
+void TrackBuffer(void* pointer, std::size_t size) noexcept {
+    if (!tracking || size != sizeof(buf::Buffer)) return;
+    if (live == allocations.size()) std::abort();
+    allocations[live++] = pointer;
 }
-void* operator new(std::size_t size) {
-    if (auto* result = std::malloc(size ? size : 1)) {
-        if (tracking && size == sizeof(buf::Buffer)) {
-            if (live == allocations.size()) std::abort();
-            allocations[live++] = result;
-        }
-        return result;
-    }
-    throw std::bad_alloc();
-}
-void operator delete(void* value) noexcept {
+
+void ForgetBuffer(void* pointer) noexcept {
     for (size_t i = 0; i < live; ++i) {
-        if (allocations[i] == value) { allocations[i] = allocations[--live]; break; }
+        if (allocations[i] == pointer) { allocations[i] = allocations[--live]; break; }
     }
-    std::free(value);
 }
-void operator delete(void* value, std::size_t) noexcept { ::operator delete(value); }
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
-    try { return ::operator new(size); } catch (...) { return nullptr; }
 }
-void operator delete(void* value, const std::nothrow_t&) noexcept { ::operator delete(value); }
+constinit allocation_hook::Hooks allocation_hook::hooks{
+    .after_new = TrackBuffer, .before_delete = ForgetBuffer};
 
 namespace {
 enum class Fault { None, Memory, Link, Cancelled, Timeout, Reset, Unexpected, NonStandard };

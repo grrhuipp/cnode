@@ -49,12 +49,19 @@ jobs:
         env:
           MISE_GITHUB_TOKEN: ${{ github.token }}
 
+      - name: resolve vcpkg
+        run: |
+          set -euo pipefail
+          commit="$(git ls-remote https://github.com/microsoft/vcpkg.git refs/heads/master | cut -f1)"
+          [[ "$commit" =~ ^[[:xdigit:]]{40}$ ]]
+          echo "CNODE_VCPKG_COMMIT=$commit" >> "$GITHUB_ENV"
+
       - name: restore vcpkg
         id: dependencies
         uses: actions/cache/restore@v6.1.0
         with:
           path: build/cache/vcpkg
-          key: vcpkg-musl-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'vcpkg.json', 'cmake/ports/**', 'cmake/triplets/**', 'cmake/musl.cmake', 'CMakeLists.txt') }}
+          key: vcpkg-musl-${{ runner.os }}-${{ runner.arch }}-${{ env.CNODE_VCPKG_COMMIT }}-${{ hashFiles('mise.toml', 'vcpkg.json', 'cmake/ports/**', 'cmake/triplets/**', 'cmake/musl.cmake', 'CMakeLists.txt') }}
           restore-keys: |
             vcpkg-musl-${{ runner.os }}-${{ runner.arch }}-
 

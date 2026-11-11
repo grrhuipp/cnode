@@ -80,7 +80,7 @@
 - **结构化惰性并发**：异步任务惰性启动（未启动可丢弃），所有已启动任务必须由明确 owner 跟踪并通过 `co_await` / `join` 收束（严禁销毁挂起帧或静默 `detach`），挂起与完成竞争由原子状态机裁决。
 - **代际取消代理与析构守卫**：异步作用域与投递闭包挂载析构守卫防排空挂起，跨线程取消经持有原子可分离指针与代际 ID 的轻量代理投递，等待槽在持锁期间完成结果转移、置零代际解链与唤醒。
 - **全双工协同与四阶段停机**：全双工会话单向通道线性互斥且任一方向出错或关闭立即协同唤醒并排空另一方向，停机严格按“封闭入口停接入 → 取消或有界排空在途工作 → 收束全部 I/O 与完成通知 → 按依赖逆序释放组件与阶段存储”推进（`join()` 前校验防自等待死锁）。
-- **原生线程堆与阶段内存**：底层统一使用 mimalloc，daemon 全局替换 malloc/new；`process_resource()` 是进程生命周期、线程安全的 PMR 适配器，分配直接落在调用线程的原生 mimalloc 堆，不另建 Worker、连接或协议级 heap/pool。尺寸类分页、页元数据、空闲块复用、对齐分配、空页回收与延迟 purge 全部交给 mimalloc，严禁在其上自建 slab、块缓存、空闲队列、回收线程、块头或对齐取整，也不开启 Asio 的 handler 小块与协程帧回收缓存（`ASIO_DISABLE_SMALL_BLOCK_RECYCLING`、`ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING`）。分配器行为优先采用原生默认值与构建选项（如 `MI_NO_THP`），不重复系统调用或运行期覆盖。单调 Arena 只承载请求、握手等明确阶段，或初始化后封存的同寿命结构；持续流量的 payload、Buffer、子流、队列与会话状态必须逐块释放，禁止连接级 monotonic arena 承载持续流量。
+- **原生线程堆与阶段内存**：底层统一使用 mimalloc，daemon 与测试统一全局替换 malloc/new（测试经链接期 `--wrap` 观察或注入 new/delete 失败，不另行替换全局分配函数）；`process_resource()` 是进程生命周期、线程安全的 PMR 适配器，分配直接落在调用线程的原生 mimalloc 堆，不另建 Worker、连接或协议级 heap/pool。尺寸类分页、页元数据、空闲块复用、对齐分配、空页回收与延迟 purge 全部交给 mimalloc，严禁在其上自建 slab、块缓存、空闲队列、回收线程、块头或对齐取整，也不开启 Asio 的 handler 小块与协程帧回收缓存（`ASIO_DISABLE_SMALL_BLOCK_RECYCLING`、`ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING`）。分配器行为优先采用原生默认值与构建选项（如 `MI_NO_THP`），不重复系统调用或运行期覆盖。单调 Arena 只承载请求、握手等明确阶段，或初始化后封存的同寿命结构；持续流量的 payload、Buffer、子流、队列与会话状态必须逐块释放，禁止连接级 monotonic arena 承载持续流量。
 - **统一默认资源与显式 PMR**：未指定资源的 `memory::*` 容器、`nullptr` 资源与控制面数据统一使用 `process_resource()`；普通对象使用标准 RAII 与智能指针工厂，daemon 的全局分配覆盖确保其使用同一 mimalloc 后端。接受调用方 PMR 的通用边界保留显式资源优先级，调用方保证资源覆盖对象寿命；不维护无状态选池包装器，不按 Worker、执行上下文或应用层 `thread_local` 隐式选池，也不替换全局默认 PMR 对象。
 - **QUIC 连接资源轻量化**：`ngtcp2` / `nghttp3` 与数据面统一使用 mimalloc 后端，连接只保存协议状态和有界队列，不维护独立分配域、heap/pool、`ResidentTaskGroup` 或 `TimeoutSchedulerService`。UDP 收发队列与超时最小堆按 Worker/监听入口共享，连接关闭后 ACK 保留、分片、流队列与路径状态必须可达地释放。
 - **对象单线程归属与原生回收**：进程资源允许跨线程释放控制面与共享完成状态，但这不放宽数据面所有权；容器、Buffer、会话及在途 I/O 仍在所属 Worker 上使用、取消与析构，严禁跨 Worker 传递业务载荷。不自建 remote-free 队列或执行域租约比对。静默回收复用既有运行时采样，在统计活动转入静默后仅收集一次，再次有活动才重新武装，不另建回收线程或轮询定时器。已提交统计不等于网络静止；显式强制收集在待收集线程上执行，只影响可回收空页而不影响存活对象，不将 purge 延迟当作 RSS 归还期限。停机先封闭准入并收束全部在途 I/O 与本地任务，再按依赖逆序释放运行态。
@@ -221,7 +221,7 @@
 | 纯文档 | 检查结构、引用、命令和规则一致性，不主动运行代码构建或测试 |
 
 - 项目自有源码不允许 Python/JavaScript 脚本；测试仅保留 C++ GoogleTest 单元测试与 E2E 测试，统一由 CTest 注册和调度。E2E 必须通过真实进程、客户端或可控网络对端验证，不以脚本外壳或 mock 回声替代。测试默认关闭且按需构建，普通测试复用生产库，特殊故障注入仅保留必要的共享测试变体。
-- 项目编译与测试规则只维护根 `CMakeLists.txt`，不拆自有 `.cmake` 模块；依赖清单、版本约束和 overlay 入口统一维护在 `vcpkg.json`。仅保留 vcpkg 必需的配方、triplet 与 musl 工具链文件。工具版本由 mise 管理，Linux 发布仅提供 musl 全静态构建；本地构建默认关闭 LTO（`CNODE_ENABLE_LTO=OFF`），仅 CI 构建开启 LTO（`-DCNODE_ENABLE_LTO=ON`）；TLS/QUIC 统一使用 BoringSSL，不混用其他 TLS 实现。
+- 项目编译与测试规则只维护根 `CMakeLists.txt`，不拆自有 `.cmake` 模块；依赖清单和 overlay 入口统一维护在 `vcpkg.json`，不设版本基线或固定版本覆盖，依赖跟随最新 vcpkg 端口，overlay 只承载上游端口缺失的补丁。仅保留 vcpkg 必需的配方、triplet 与 musl 工具链文件。工具版本由 mise 管理，Linux 发布仅提供 musl 全静态构建；本地构建默认关闭 LTO（`CNODE_ENABLE_LTO=OFF`），仅 CI 构建开启 LTO（`-DCNODE_ENABLE_LTO=ON`）；TLS/QUIC 统一使用 BoringSSL，不混用其他 TLS 实现。
 - 构建和测试命令以当前 CMake 配置与现有测试入口为准；涉及平台差异时在可用目标环境验证，不把单平台结果当作跨平台证明。交付区分已通过、失败、未运行和待外部环境验证。
 - `README.md` 只描述当前已实现且可验证的使用入口、配置、部署与架构概览，不写内部实现细节、工程规范、变更流水或排障记录；README 命令注明适用平台、shell 和必要前置条件。
 

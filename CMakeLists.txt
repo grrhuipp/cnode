@@ -51,12 +51,14 @@ find_package(concurrentqueue CONFIG REQUIRED)
 find_package(blake3 CONFIG REQUIRED)
 find_package(mimalloc CONFIG REQUIRED)
 
+# Every binary, tests included, replaces malloc/new with mimalloc like the
+# daemon; tests observe new/delete through cnode_allocation_hook instead.
 target_link_libraries(cnode_build_options INTERFACE
     asio::asio Threads::Threads tl::expected
     ngtcp2::ngtcp2_static ngtcp2::ngtcp2_crypto_boringssl_static
     nghttp3::nghttp3_static OpenSSL::SSL OpenSSL::Crypto
     ZLIB::ZLIBSTATIC concurrentqueue::concurrentqueue BLAKE3::blake3
-    mimalloc-static-no-override)
+    "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>")
 
 # Upstream installs these headers in moodycamel/, while cnode uses their bare names.
 get_target_property(cnode_queue_includes concurrentqueue::concurrentqueue INTERFACE_INCLUDE_DIRECTORIES)
@@ -183,10 +185,7 @@ set_property(SOURCE src/app/bootstrap.cpp
     BUILD_CHANNEL="$<IF:$<CONFIG:Debug>,debug,release>")
 
 add_executable(cnode src/main.cpp)
-# The daemon and allocation/executor/TCP send benchmarks override malloc/new.
-# Regression tests retain allocation-failure hooks; explicit mi_* calls use the same API.
-target_link_libraries(cnode PRIVATE
-    "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>")
+target_link_libraries(cnode PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core>")
 
 add_executable(cnode_traffic_journal EXCLUDE_FROM_ALL tools/traffic_journal.cpp)
 target_link_libraries(cnode_traffic_journal PRIVATE cnode_core)
@@ -216,6 +215,17 @@ target_compile_definitions(cnode_test_core PUBLIC
     CNODE_TEST_ALLOCATOR CNODE_TEST_BUFFER_STATS)
 # 宏定义与 cnode_core 不同，不能 REUSE_FROM，单独生成一份 PCH。
 target_precompile_headers(cnode_test_core PRIVATE src/pch.hpp)
+
+# Fixtures that observe or fail global new/delete wrap it at link time and
+# define allocation_hook::hooks; __real_* stays the overriding mimalloc.
+add_library(cnode_allocation_hook INTERFACE)
+target_sources(cnode_allocation_hook INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/tests/allocation_hook.cpp)
+target_include_directories(cnode_allocation_hook INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_options(cnode_allocation_hook INTERFACE
+    -Wl,--wrap=_Znwm -Wl,--wrap=_Znam
+    -Wl,--wrap=_ZnwmRKSt9nothrow_t -Wl,--wrap=_ZnamRKSt9nothrow_t
+    -Wl,--wrap=_ZdlPv -Wl,--wrap=_ZdaPv -Wl,--wrap=_ZdlPvm -Wl,--wrap=_ZdaPvm
+    -Wl,--wrap=_ZdlPvRKSt9nothrow_t -Wl,--wrap=_ZdaPvRKSt9nothrow_t)
 
 # tests/<name>_test.cpp → cnode_<name>_test。默认链接 cnode_core；LIBRARY 改链接目标，
 # SOURCES 追加独立编译的源文件。
@@ -247,7 +257,7 @@ endforeach()
 cnode_unit(awaitable_batch LIBRARY cnode_build_options)
 cnode_unit(awaitable_task_group LIBRARY cnode_build_options)
 cnode_unit(shadowsocks_stream_crypto LIBRARY cnode_build_options SOURCES src/proxy/shadowsocks/shadowsocks_protocol.cpp)
-cnode_unit(timeout_scheduler LIBRARY cnode_build_options SOURCES tests/timeout_scheduler_new.cpp src/transport/internet/timeout_scheduler.cpp src/app/session_group_executor.cpp src/infra/log.cpp)
+cnode_unit(timeout_scheduler LIBRARY cnode_build_options SOURCES src/transport/internet/timeout_scheduler.cpp src/app/session_group_executor.cpp src/infra/log.cpp)
 cnode_unit(vmess_cipher LIBRARY cnode_build_options SOURCES src/proxy/vmess/vmess_crypto.cpp)
 
 file(GLOB unit_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cpp")
@@ -277,6 +287,15 @@ target_compile_definitions(cnode_shadowsocks_stream_crypto_test PRIVATE
     CNODE_TEST_ALLOCATOR CNODE_WRAP_MALLOC)
 target_link_options(cnode_shadowsocks_stream_crypto_test PRIVATE
     -Wl,--wrap=malloc -Wl,--wrap=EVP_AEAD_CTX_new)
+foreach(target IN ITEMS cnode_anytls_codec_errors_test cnode_anytls_outbound_lifecycle_test
+                        cnode_anytls_padding_test
+                        cnode_awaitable_batch_test cnode_awaitable_task_group_test
+                        cnode_cancellation_source_test cnode_dns_inflight_test cnode_grpc_hunk_test
+                        cnode_session_access_log_test cnode_stream_settings_test
+                        cnode_timeout_scheduler_test cnode_trojan_request_test
+                        cnode_user_store_batch_test)
+    target_link_libraries(${target} PRIVATE cnode_allocation_hook)
+endforeach()
 
 # Independent wire peers exercise the real cnode process, not its core archive.
 find_package(nlohmann_json CONFIG REQUIRED)
@@ -333,21 +352,18 @@ if(BUILD_BENCHMARKS)
             TEST_PREFIX "benchmark." PROPERTIES LABELS benchmark RUN_SERIAL TRUE TIMEOUT 180)
     endfunction()
 
-    cnode_benchmark(allocator_append
-        LIBRARY cnode_build_options "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>")
+    cnode_benchmark(allocator_append LIBRARY cnode_build_options)
     cnode_benchmark(tls_throughput E2E)
     cnode_benchmark(hysteria_throughput E2E)
     cnode_benchmark(tcp_receive LIBRARY cnode_core)
     foreach(name IN ITEMS executor tcp_send)
-        cnode_benchmark(${name} LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>")
+        cnode_benchmark(${name} LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core>")
     endforeach()
     foreach(name IN ITEMS udp_send runtime_sampling)
-        cnode_benchmark(${name} COUNT_ALLOCATIONS
-            LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>")
+        cnode_benchmark(${name} COUNT_ALLOCATIONS LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core>")
     endforeach()
     foreach(name IN ITEMS shadowsocks_identity shadowsocks_udp_identity)
-        cnode_benchmark(${name} COUNT_ALLOCATIONS
-            LIBRARY cnode_core "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>")
+        cnode_benchmark(${name} COUNT_ALLOCATIONS LIBRARY cnode_core)
     endforeach()
 endif()
 
@@ -362,6 +378,8 @@ foreach(source IN LISTS e2e_sources)
         target_compile_definitions(cnode_e2e_${name} PRIVATE
             CNODE_TEST_JOURNAL_BINARY="$<TARGET_FILE:cnode_traffic_journal>")
         add_dependencies(cnode_e2e_${name} cnode_traffic_journal)
+    elseif(name STREQUAL "config_panel_failure")
+        target_link_libraries(cnode_e2e_${name} PRIVATE cnode_allocation_hook)
     endif()
 endforeach()
 

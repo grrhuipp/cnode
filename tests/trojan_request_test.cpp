@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "proxy/trojan/trojan_codec.hpp"
 
 #include <algorithm>
@@ -12,17 +13,13 @@
 #include <string>
 #include <vector>
 
-namespace { thread_local bool reject_allocation = false; }
-void* operator new(std::size_t size) {
+namespace {
+thread_local bool reject_allocation = false;
+void RejectWhenRequested(std::size_t) {
     if (reject_allocation) throw std::bad_alloc();
-    if (auto* p = std::malloc(size ? size : 1)) return p;
-    throw std::bad_alloc();
 }
-void* operator new[](std::size_t size) { return ::operator new(size); }
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+}
+constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = RejectWhenRequested};
 
 namespace {
 void Check(bool ok, const char* message) {

@@ -7,5 +7,6 @@ set(VCPKG_CHAINLOAD_TOOLCHAIN_FILE "${CMAKE_CURRENT_LIST_DIR}/../musl.cmake")
 set(VCPKG_ENV_PASSTHROUGH CNODE_MUSL_ROOT)
 set(VCPKG_MESON_CONFIGURE_OPTIONS "-Dc_link_args=-static" "-Dcpp_link_args=-static")
 if(PORT STREQUAL "mimalloc")
-    list(APPEND VCPKG_CMAKE_CONFIGURE_OPTIONS "-DMI_LIBC_MUSL=ON")
+    # mimalloc itself sets PR_SET_THP_DISABLE for the process at startup.
+    list(APPEND VCPKG_CMAKE_CONFIGURE_OPTIONS "-DMI_LIBC_MUSL=ON" "-DMI_NO_THP=ON")
 endif()
