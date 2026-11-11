@@ -6,7 +6,7 @@
 #include <stdexcept>
 
 TEST(PanelNodeIds, AcceptsPositiveIdsThroughIntMaximum) {
-    const auto ids = ::PanelNodeIds::Parse(::json::array{
+    const auto ids = ::infra::PanelNodeIds::Parse(::json::array{
         int64_t{1}, uint64_t{static_cast<uint64_t>(std::numeric_limits<int>::max())}});
     EXPECT_FALSE(ids.Empty());
     EXPECT_EQ(ids.Front(), 1);
@@ -15,7 +15,7 @@ TEST(PanelNodeIds, AcceptsPositiveIdsThroughIntMaximum) {
 }
 
 TEST(PanelNodeIds, ConstructsSinglePositiveId) {
-    const auto ids = ::PanelNodeIds::Single(7);
+    const auto ids = ::infra::PanelNodeIds::Single(7);
     ASSERT_EQ(ids.Values().size(), 1);
     EXPECT_EQ(ids.Front(), 7);
 }
@@ -33,7 +33,7 @@ TEST_P(InvalidPanelNodeIds, RejectsInvalidNodeSelection) {
     case 5: value = ::json::array{int64_t{1}, "2"}; break;
     case 6: value = ::json::array{int64_t{1}, int64_t{1}}; break;
     }
-    EXPECT_THROW(static_cast<void>(::PanelNodeIds::Parse(value)), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(::infra::PanelNodeIds::Parse(value)), std::invalid_argument);
 }
 INSTANTIATE_TEST_SUITE_P(ConfigurationErrors, InvalidPanelNodeIds,
     ::testing::Values(0, 1, 2, 3, 4, 5, 6), ([](const ::testing::TestParamInfo<int>& info) {
@@ -43,5 +43,5 @@ INSTANTIATE_TEST_SUITE_P(ConfigurationErrors, InvalidPanelNodeIds,
 }  // namespace
 
 TEST(PanelNodeIds, RejectsSingleZeroId) {
-    EXPECT_THROW(static_cast<void>(::PanelNodeIds::Single(0)), std::invalid_argument);
+    EXPECT_THROW(static_cast<void>(::infra::PanelNodeIds::Single(0)), std::invalid_argument);
 }

@@ -7,8 +7,8 @@
 #include <asio/use_future.hpp>
 
 namespace {
-std::optional<UserOnlineSessionGuard> RunDeviceAdmission(
-    net::io_context& worker, net::awaitable<std::optional<UserOnlineSessionGuard>> task) {
+std::optional<common::UserOnlineSessionGuard> RunDeviceAdmission(
+    net::io_context& worker, net::awaitable<std::optional<common::UserOnlineSessionGuard>> task) {
     worker.restart();
     auto result = net::co_spawn(worker, std::move(task), net::use_future);
     worker.run();
@@ -19,7 +19,7 @@ TEST(UserOnlineTracker, ExplicitCoordinatorSharesDeviceQuotaAndReturnsReservatio
     net::io_context first, second;
     TransportCoordinatorFixture control(first);
     control.Coordinator().RegisterWorker(second);
-    UserOnlineTracker first_users(control.Coordinator()), second_users(control.Coordinator());
+    common::UserOnlineTracker first_users(control.Coordinator()), second_users(control.Coordinator());
     auto first_lease = RunDeviceAdmission(first, first_users.TryConnectSession("tag", 42, "192.0.2.1", 1));
     ASSERT_TRUE(first_lease);
     auto same_device = RunDeviceAdmission(second, second_users.TryConnectSession("tag", 42, "192.0.2.1", 1));
@@ -33,13 +33,13 @@ TEST(UserOnlineTracker, ExplicitCoordinatorSharesDeviceQuotaAndReturnsReservatio
     auto new_device = RunDeviceAdmission(second, second_users.TryConnectSession("tag", 42, "192.0.2.2", 1));
     EXPECT_TRUE(new_device);
     EXPECT_EQ(first_users.OnlineDeviceCount("tag", 42), 0u);
-    EXPECT_EQ(second_users.GetOnlineDevices("tag"), (std::vector<OnlineDevice>{{42, "192.0.2.2"}}));
+    EXPECT_EQ(second_users.GetOnlineDevices("tag"), (std::vector<common::OnlineDevice>{{42, "192.0.2.2"}}));
 }
 
 TEST(UserOnlineTracker, ClosedCoordinatorDoesNotBecomeDeviceLimitRejection) {
     net::io_context worker;
     TransportCoordinatorFixture control(worker);
-    UserOnlineTracker users(control.Coordinator());
+    common::UserOnlineTracker users(control.Coordinator());
     control.Coordinator().CloseAdmission();
     try {
         (void)RunDeviceAdmission(worker, users.TryConnectSession("tag", 42, "192.0.2.1", 1));

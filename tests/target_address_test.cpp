@@ -6,7 +6,7 @@
 namespace {
 class InvalidTargetHost : public testing::TestWithParam<std::string_view> {};
 TEST_P(InvalidTargetHost, RejectsAndDiscardsUnroutableHostBytes) {
-    const ::TargetAddress target(std::string(GetParam()), 443);
+    const ::common::TargetAddress target(std::string(GetParam()), 443);
     EXPECT_FALSE(target.IsValid());
     EXPECT_TRUE(target.host.empty());
 }
@@ -17,7 +17,7 @@ INSTANTIATE_TEST_SUITE_P(Inputs, InvalidTargetHost, testing::Values(
 
 class InvalidTargetEndpoint : public testing::TestWithParam<const char*> {};
 TEST_P(InvalidTargetEndpoint, RejectsMalformedHostnameOrBracketSyntax) {
-    EXPECT_FALSE(::TargetAddress::Parse(GetParam()));
+    EXPECT_FALSE(::common::TargetAddress::Parse(GetParam()));
 }
 INSTANTIATE_TEST_SUITE_P(Inputs, InvalidTargetEndpoint, testing::Values(
     "bad..example:443", "[example.com]:443", "[127.0.0.1]:443", "[::1]:443junk"));
@@ -28,7 +28,7 @@ TEST_P(NumericTarget, FormatsCanonicalEndpointWithoutLosingScope) {
     const auto& item = GetParam();
     const ::iputil::AddressText text(item.address);
     EXPECT_EQ(text.View(), item.text);
-    const ::TargetAddress target(item.address, 65535);
+    const ::common::TargetAddress target(item.address, 65535);
     std::array<char, 128> logged;
     const auto end = std::format_to(logged.begin(), "{}", target);
     EXPECT_EQ(std::string_view(logged.data(), end - logged.begin()), item.endpoint);
@@ -47,28 +47,28 @@ INSTANTIATE_TEST_SUITE_P(Addresses, NumericTarget, testing::Values(
 }  // namespace
 
 TEST(TargetAddress, CanonicalDomainIdentityIncludesPort) {
-    const ::TargetAddress domain("example.com.", 443);
+    const ::common::TargetAddress domain("example.com.", 443);
     ASSERT_TRUE(domain.IsValid());
     EXPECT_TRUE(domain.IsDomain());
     EXPECT_EQ(domain.host, "example.com");
-    EXPECT_TRUE(domain.SameEndpoint(::TargetAddress("example.com", 443)));
-    EXPECT_FALSE(domain.SameEndpoint(::TargetAddress("example.com", 8443)));
+    EXPECT_TRUE(domain.SameEndpoint(::common::TargetAddress("example.com", 443)));
+    EXPECT_FALSE(domain.SameEndpoint(::common::TargetAddress("example.com", 8443)));
 }
 
 TEST(TargetAddress, ParsesBracketedIpv6Endpoint) {
-    const auto ipv6 = ::TargetAddress::Parse("[2001:db8::1]:443");
+    const auto ipv6 = ::common::TargetAddress::Parse("[2001:db8::1]:443");
     ASSERT_TRUE(ipv6);
     EXPECT_TRUE(ipv6->IsValid());
     EXPECT_TRUE(ipv6->IsIPv6());
 }
 
 TEST(TargetAddress, MappedIpv6SharesIpv4EndpointIdentity) {
-    const ::TargetAddress mapped("::ffff:192.0.2.1", 443);
+    const ::common::TargetAddress mapped("::ffff:192.0.2.1", 443);
     ASSERT_TRUE(mapped.IsValid());
     EXPECT_TRUE(mapped.IsIPv4());
     ASSERT_TRUE(mapped.resolved_addr);
     EXPECT_EQ(mapped.resolved_addr->to_string(), "192.0.2.1");
-    EXPECT_TRUE(mapped.SameEndpoint(::TargetAddress("192.0.2.1", 443)));
+    EXPECT_TRUE(mapped.SameEndpoint(::common::TargetAddress("192.0.2.1", 443)));
 }
 
 TEST(TargetAddress, FormatsNamedScopeUsingPlatformInterfaceName) {

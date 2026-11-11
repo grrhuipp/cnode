@@ -67,6 +67,8 @@
 #define BUILD_ID "dev"
 #endif
 
+namespace app {
+
 ProcessDescriptors ReadProcessDescriptors() noexcept {
     ProcessDescriptors result;
     rlimit limits{};
@@ -200,7 +202,7 @@ void PrintVersion(std::ostream& out) {
     out << BUILD_CHANNEL << ":" << BUILD_ID << "\n";
 }
 
-std::optional<Config> LoadConfigFromCli(
+std::optional<infra::Config> LoadConfigFromCli(
     const CommandLineOptions& cli,
     bool& error_reported) {
     const std::filesystem::path config_path(cli.config_path);
@@ -208,7 +210,7 @@ std::optional<Config> LoadConfigFromCli(
     if (cli.config_mode == ConfigPathMode::Directory) {
         std::error_code ec;
         if (!std::filesystem::is_directory(config_path, ec)) {
-            Log::WriteConsole(LogLevel::ERROR, std::format(
+            infra::Log::WriteConsole(infra::LogLevel::ERROR, std::format(
                 "--config-dir expects an existing directory: {}", cli.config_path));
             error_reported = true;
             return std::nullopt;
@@ -218,14 +220,14 @@ std::optional<Config> LoadConfigFromCli(
     if (cli.config_mode == ConfigPathMode::File) {
         std::error_code ec;
         if (std::filesystem::is_directory(config_path, ec)) {
-            Log::WriteConsole(LogLevel::ERROR, std::format(
+            infra::Log::WriteConsole(infra::LogLevel::ERROR, std::format(
                 "--config-file expects a file, got directory: {}", cli.config_path));
             error_reported = true;
             return std::nullopt;
         }
     }
 
-    return LoadConfig(config_path);
+    return infra::LoadConfig(config_path);
 }
 
 constexpr std::string_view IoBackendName() noexcept {
@@ -254,12 +256,12 @@ struct BootstrapEnvironment {
     std::unique_ptr<geo::GeoDatabase> geo_database;
     std::unique_ptr<ShardedStats> stats;
     WorkerPool worker_pool;
-    std::unique_ptr<Controller> controller;
+    std::unique_ptr<controller::Controller> controller;
     std::vector<PreparedInbound> inbound_startup;
     bool enable_controller = false;
 };
 
-::app::dns::Config MakeDnsServiceConfig(const Config& config) {
+::app::dns::Config MakeDnsServiceConfig(const infra::Config& config) {
     ::app::dns::Config dns_config;
     dns_config.servers     = config.dns.servers;
     dns_config.timeout_sec = config.dns.timeout;
@@ -270,9 +272,9 @@ struct BootstrapEnvironment {
 }
 
 // 只有路由实际引用 geo 分类时才加载数据；未引用时 Router 不需要 GeoDatabase。
-std::unique_ptr<geo::GeoDatabase> LoadGeoDatabase(const Config& config) {
-    const auto geoip_tags = GetUsedGeoIPTags(config.routing);
-    const auto geosite_tags = GetUsedGeoSiteTags(config.routing);
+std::unique_ptr<geo::GeoDatabase> LoadGeoDatabase(const infra::Config& config) {
+    const auto geoip_tags = infra::GetUsedGeoIPTags(config.routing);
+    const auto geosite_tags = infra::GetUsedGeoSiteTags(config.routing);
     if (geoip_tags.empty() && geosite_tags.empty()) {
         return nullptr;
     }
@@ -338,8 +340,8 @@ std::vector<proxyman::outbound::PreparedOutboundConfig> PrepareStartupOutbounds(
 }
 
 WorkerRuntimeConfig MakeWorkerRuntimeConfig(
-    const Config& config,
-    RoutingConfig routing,
+    const infra::Config& config,
+    infra::RoutingConfig routing,
     std::vector<proxyman::outbound::PreparedOutboundConfig> outbounds) {
     WorkerRuntimeConfig runtime_config;
     runtime_config.timeouts = config.timeouts;
@@ -353,8 +355,8 @@ WorkerRuntimeConfig MakeWorkerRuntimeConfig(
 }
 
 void SetupPanels(net::io_context& main_ctx,
-                 Controller& controller,
-                 const Config& config,
+                 controller::Controller& controller,
+                 const infra::Config& config,
                  app::dns::DNS& panel_dns_service) {
     if (config.panels.empty()) {
         return;
@@ -363,8 +365,8 @@ void SetupPanels(net::io_context& main_ctx,
     for (const auto& panel_config : config.panels) {
         for (int node_id : panel_config.NodeIDs.Values()) {
 
-            PanelConfig node_panel_config = panel_config;
-            node_panel_config.NodeIDs = PanelNodeIds::Single(node_id);
+            infra::PanelConfig node_panel_config = panel_config;
+            node_panel_config.NodeIDs = infra::PanelNodeIds::Single(node_id);
 
             auto panel = api::CreatePanelClient(main_ctx, {
                 .Name = panel_config.Name,
@@ -375,7 +377,7 @@ void SetupPanels(net::io_context& main_ctx,
                 .NodeType = panel_config.NodeType,
             }, panel_dns_service);
             controller.AddPanel(std::move(panel), node_panel_config);
-            const PanelLogContext log_context{panel_config.Name, panel_config.APIHost,
+            const infra::PanelLogContext log_context{panel_config.Name, panel_config.APIHost,
                 node_id, panel_config.NodeType};
             LOG_PANEL_INFO(log_context, "Panel node configured");
         }
@@ -413,9 +415,9 @@ void SetupPanels(net::io_context& main_ctx,
 // Takes the loaded configuration by value: every runtime owner copies or moves
 // what it keeps, so the source is released once startup preparation returns.
 [[nodiscard]] BootstrapEnvironment CreateBootstrapEnvironment(
-    Config config,
+    infra::Config config,
     bool test_mode) {
-    TlsStream::InitializeIo();
+    transport::internet::TlsStream::InitializeIo();
     BootstrapEnvironment env;
     const bool enable_test_mode =
         test_mode || (config.panels.empty() && config.static_inbounds.empty());
@@ -454,7 +456,7 @@ void SetupPanels(net::io_context& main_ctx,
         env.worker_pool = CreateWorkerPool(
             worker_runtime_config, *env.stats, env.geo_database.get(), *env.dns_worker,
             *env.main_ctx);
-        env.controller = std::make_unique<Controller>(
+        env.controller = std::make_unique<controller::Controller>(
             *env.main_ctx, env.worker_pool.workers);
 
         SetupPanels(*env.main_ctx, *env.controller, config, *env.panel_dns_service);
@@ -499,14 +501,14 @@ size_t ReadResidentMemoryBytes() noexcept {
 
 std::string FormatRate(double bytes_per_sec) {
     if (!std::isfinite(bytes_per_sec) || bytes_per_sec <= 0.0) {
-        return ::FormatBytes(0) + "/s";
+        return ::app::FormatBytes(0) + "/s";
     }
     constexpr double kMaxBytes =
         static_cast<double>(std::numeric_limits<uint64_t>::max());
     const uint64_t rate = bytes_per_sec >= kMaxBytes
         ? std::numeric_limits<uint64_t>::max()
         : static_cast<uint64_t>(bytes_per_sec);
-    return ::FormatBytes(rate) + "/s";
+    return ::app::FormatBytes(rate) + "/s";
 }
 
 StatsSnapshot AggregateWorkerStats(
@@ -577,10 +579,10 @@ public:
         : env(environment), main_work(net::make_work_guard(*env.main_ctx)),
           stop_event(*env.main_ctx, std::chrono::steady_clock::time_point::max()),
           monitor_loops{
-              std::make_shared<MonitorLoop>(
+              std::make_shared<common::MonitorLoop>(
                   env.main_ctx->get_executor(), "sampling",
                   [this] { return RuntimeSamplingLoop(); }, ReportMonitorExit),
-              std::make_shared<MonitorLoop>(
+              std::make_shared<common::MonitorLoop>(
                   env.main_ctx->get_executor(), "stats-output",
                   [this] { return RuntimeStatsOutputLoop(); }, ReportMonitorExit),
           } {}
@@ -612,9 +614,9 @@ public:
         try {
             if (error) std::rethrow_exception(error);
         } catch (const std::exception& failure) {
-            try { Log::WriteConsole(LogLevel::ERROR, std::format("Runtime failed: {}", failure.what())); } catch (...) {}
+            try { infra::Log::WriteConsole(infra::LogLevel::ERROR, std::format("Runtime failed: {}", failure.what())); } catch (...) {}
         } catch (...) {
-            try { Log::WriteConsole(LogLevel::ERROR, "Runtime failed: unknown exception"); } catch (...) {}
+            try { infra::Log::WriteConsole(infra::LogLevel::ERROR, "Runtime failed: unknown exception"); } catch (...) {}
         }
     }
 
@@ -623,7 +625,7 @@ public:
         try {
             net::post(*env.main_ctx, [this, error] { RecordFailure(error); });
         } catch (...) {
-            FailRuntime("runtime-failure", "cannot notify lifecycle owner");
+            common::FailRuntime("runtime-failure", "cannot notify lifecycle owner");
         }
     }
 
@@ -659,7 +661,7 @@ public:
         std::vector<IdleHeapState> heap_states(env.worker_pool.workers.size());
         std::vector<Worker*> idle_workers;
         idle_workers.reserve(env.worker_pool.workers.size());
-        auto last_log_flush_at = steady_clock::time_point{};
+        auto last_log_flush_at = common::steady_clock::time_point{};
         while (true) {
             auto worker_snapshots = co_await CollectWorkerRuntimeStats(false);
             auto aggregate_stats = AggregateWorkerStats(worker_snapshots);
@@ -703,10 +705,10 @@ public:
                 }
             }
             {
-                const auto flush_now = steady_clock::now();
+                const auto flush_now = common::steady_clock::now();
                 if (last_log_flush_at.time_since_epoch().count() == 0 ||
                     flush_now - last_log_flush_at >= kAsyncLogFlushInterval) {
-                    Log::Flush();
+                    infra::Log::Flush();
                     last_log_flush_at = flush_now;
                 }
             }
@@ -745,7 +747,7 @@ public:
                         total_conns, total_users, total_udp_sockets);
             LOG_CONSOLE("Runtime memory: resident={:.1f}MB", mem_mb);
             LOG_CONSOLE("Runtime traffic: traffic_in={} traffic_out={} rate_down={} rate_up={}",
-                        ::FormatBytes(snapshot.bytes_in), ::FormatBytes(snapshot.bytes_out),
+                        ::app::FormatBytes(snapshot.bytes_in), ::app::FormatBytes(snapshot.bytes_out),
                         FormatRate(snapshot.bytes_in_rate), FormatRate(snapshot.bytes_out_rate));
             LOG_CONSOLE("Runtime DNS cache: dns_hit={:.0f}% dns_cache={}/{}",
                         dns_hit_rate, dns_stats.entries, dns_stats.capacity);
@@ -779,22 +781,22 @@ public:
                     node_online += ns.online_users;
                     node_up += ns.bytes_up;
                     node_down += ns.bytes_down;
-                    const PanelLogContext log_context{ns.panel_name, ns.panel_host, ns.node_id, ns.node_type};
+                    const infra::PanelLogContext log_context{ns.panel_name, ns.panel_host, ns.node_id, ns.node_type};
                     LOG_PANEL_DEBUG(log_context,
                         "Node activity: port={} network={} users={} online={} upload={} download={}",
                         ns.port,
                         ns.network,
                         ns.total_users,
                         ns.online_users,
-                        ::FormatBytes(ns.bytes_up),
-                        ::FormatBytes(ns.bytes_down));
+                        ::app::FormatBytes(ns.bytes_up),
+                        ::app::FormatBytes(ns.bytes_down));
                 }
                 LOG_CONSOLE("Panel node totals: count={} users={} online={} upload={} download={}",
                          node_stats.size(),
                          node_users,
                          node_online,
-                         ::FormatBytes(node_up),
-                         ::FormatBytes(node_down));
+                         ::app::FormatBytes(node_up),
+                         ::app::FormatBytes(node_down));
             }
 
             timer.expires_after(std::chrono::seconds(defaults::kStatsOutputInterval));
@@ -900,7 +902,7 @@ public:
     BootstrapEnvironment& env;
     net::executor_work_guard<net::io_context::executor_type> main_work;
     net::steady_timer stop_event;
-    std::array<std::shared_ptr<MonitorLoop>, 2> monitor_loops;
+    std::array<std::shared_ptr<common::MonitorLoop>, 2> monitor_loops;
     std::unique_ptr<net::signal_set> signals;
     size_t started_threads = 0;
     int exit_code = EXIT_SUCCESS;
@@ -915,7 +917,7 @@ void RunDataThread(RuntimeOwner& owner, size_t index) noexcept {
     // Live state and maintenance have already joined. Release cancels the
     // scheduler's final timer; drain that completion before destroying its PMR
     // container capacity on this same thread.
-    TimeoutScheduler::ReleaseForIoContext(context);
+    transport::internet::TimeoutScheduler::ReleaseForIoContext(context);
     context.restart();
     for (;;) {
         try { context.run(); break; }
@@ -934,7 +936,7 @@ int RunApplicationRuntime(BootstrapEnvironment& env) noexcept {
         threads.reserve(workers.size());
         // The total lifecycle coroutine is owned before any data thread starts.
         net::co_spawn(main_ctx, owner.Run(), [&owner](std::exception_ptr error) {
-            if (error) FailRuntime("runtime-join", "lifecycle completion failed");
+            if (error) common::FailRuntime("runtime-join", "lifecycle completion failed");
             owner.completed = true;
             owner.main_work.reset();
         });
@@ -963,7 +965,7 @@ int RunApplicationRuntime(BootstrapEnvironment& env) noexcept {
         for (auto& thread : threads) thread.join();
         for (size_t i = owner.started_threads; i < env.worker_pool.work_guards.size(); ++i)
             env.worker_pool.work_guards[i].reset();
-        TimeoutScheduler::ReleaseForIoContext(main_ctx);
+        transport::internet::TimeoutScheduler::ReleaseForIoContext(main_ctx);
         main_ctx.restart();
         for (;;) {
             try { main_ctx.run(); break; }
@@ -974,7 +976,7 @@ int RunApplicationRuntime(BootstrapEnvironment& env) noexcept {
         // Before the pre-owned lifecycle exists there are no data threads or
         // accepted startup jobs. An exception after that boundary is corruption
         // of the lifecycle itself and cannot unwind live thread owners.
-        if (!threads.empty()) FailRuntime("runtime-owner", "lifecycle owner failed");
+        if (!threads.empty()) common::FailRuntime("runtime-owner", "lifecycle owner failed");
         return EXIT_FAILURE;
     }
 }
@@ -1003,14 +1005,14 @@ int RunFromCommandLine(int argc, char* argv[]) {
     auto config_opt = LoadConfigFromCli(cli, config_error_reported);
     if (!config_opt) {
         if (!config_error_reported) {
-            Log::WriteConsole(LogLevel::ERROR, std::format("Failed to load config from: {}", cli.config_path));
+            infra::Log::WriteConsole(infra::LogLevel::ERROR, std::format("Failed to load config from: {}", cli.config_path));
         }
         return 1;
     }
-    const Config& config = *config_opt;
+    const infra::Config& config = *config_opt;
 
-    if (!Log::Init(config.log)) {
-        Log::WriteConsole(LogLevel::ERROR, "Failed to initialize logging");
+    if (!infra::Log::Init(config.log)) {
+        infra::Log::WriteConsole(infra::LogLevel::ERROR, "Failed to initialize logging");
         return 1;
     }
     LOG_CONSOLE("Configuration loaded: workers={} inbounds={} outbounds={} rules={} panels={}",
@@ -1022,9 +1024,9 @@ int RunFromCommandLine(int argc, char* argv[]) {
     LOG_CONSOLE("Starting cnode v1.0.0: channel={} build={}", BUILD_CHANNEL, BUILD_ID);
     LOG_CONSOLE("Runtime configured: workers={} io={} accept=SO_REUSEPORT allocator=mimalloc-thread-heap",
                 config.workers, IoBackendName());
-    if (!ValidateConfig(config)) {
-        Log::WriteConsole(LogLevel::ERROR, "Invalid configuration");
-        Log::Shutdown();
+    if (!infra::ValidateConfig(config)) {
+        infra::Log::WriteConsole(infra::LogLevel::ERROR, "Invalid configuration");
+        infra::Log::Shutdown();
         return 1;
     }
 
@@ -1035,11 +1037,13 @@ int RunFromCommandLine(int argc, char* argv[]) {
         config_opt.reset();
         result = RunApplicationRuntime(env);
     } catch (const std::exception& e) {
-        Log::WriteConsole(LogLevel::ERROR, std::format("Failed to initialize runtime: {}", e.what()));
-        Log::Shutdown();
+        infra::Log::WriteConsole(infra::LogLevel::ERROR, std::format("Failed to initialize runtime: {}", e.what()));
+        infra::Log::Shutdown();
         return 1;
     }
-    Log::Shutdown();
+    infra::Log::Shutdown();
     return result;
 }
+
+}  // namespace app
 

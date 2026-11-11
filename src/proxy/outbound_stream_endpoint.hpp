@@ -33,29 +33,29 @@ namespace proxy {
 // Cold-path result for a proxy protocol with a next hop: the validated server
 // and the Handler's sender settings (sendThrough is applied by proxyman).
 struct PreparedNextHop {
-    OutboundServer server;
-    OutboundSenderSettings sender;
+    transport::internet::OutboundServer server;
+    transport::internet::OutboundSenderSettings sender;
 };
 
 // The one application of a protocol's stream defaults (TLS requirement,
 // fallback SNI, ALPN) to the source streamSettings. Without an explicit
 // fallback server name the next hop's address is used.
-[[nodiscard]] inline StreamSettings PrepareOutboundStream(
+[[nodiscard]] inline transport::internet::StreamSettings PrepareOutboundStream(
     const infra::OutboundSourceConfig& source,
-    const OutboundServer& server,
-    OutboundStreamDefaults defaults) {
+    const transport::internet::OutboundServer& server,
+    transport::internet::OutboundStreamDefaults defaults) {
     if (defaults.fallback_server_name.empty()) {
         defaults.fallback_server_name = server.address;
     }
-    auto settings = NormalizeOutboundStreamSettings(source.stream_settings, defaults);
-    TransportSecurity::Prepare(settings, StreamEndpointRole::Outbound);
+    auto settings = transport::internet::NormalizeOutboundStreamSettings(source.stream_settings, defaults);
+    transport::internet::TransportSecurity::Prepare(settings, transport::internet::StreamEndpointRole::Outbound);
     return settings;
 }
 
 [[nodiscard]] inline PreparedNextHop PrepareNextHop(
     const infra::OutboundSourceConfig& source,
-    const OutboundServer& server,
-    const OutboundStreamDefaults& defaults) {
+    const transport::internet::OutboundServer& server,
+    const transport::internet::OutboundStreamDefaults& defaults) {
     return PreparedNextHop{
         .server = server,
         .sender = {.stream_settings = PrepareOutboundStream(source, server, defaults),
@@ -68,28 +68,28 @@ struct PreparedNextHop {
 // Outbound-only endpoint preparation. A packet's target and payload remain
 // owned by its logical write until DNS and socket I/O have both finished.
 // The transport knows only the resulting IP endpoint, never DNS or routing.
-inline net::awaitable<tl::expected<udp::endpoint, ErrorCode>> ResolveUdpEndpoint(
+inline net::awaitable<tl::expected<udp::endpoint, common::ErrorCode>> ResolveUdpEndpoint(
     app::dns::DNS& dns,
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     transport::internet::DatagramSocket& socket,
     const transport::internet::DatagramSocket::WriteOperation& write) {
     const auto parent_cancellation = co_await net::this_coro::cancellation_state;
     if (write.Cancelled()) co_return tl::unexpected(write.CancellationReason());
     if (parent_cancellation.cancelled() != net::cancellation_type::none)
-        co_return tl::unexpected(ErrorCode::CANCELLED);
-    if (!target.IsValid()) co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+        co_return tl::unexpected(common::ErrorCode::CANCELLED);
+    if (!target.IsValid()) co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
     if (target.resolved_addr) {
         if (target.resolved_addr->is_v6() != socket.IsIPv6())
-            co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+            co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
         co_return udp::endpoint(*target.resolved_addr, target.port);
     }
-    if (!target.IsDomain()) co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+    if (!target.IsDomain()) co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
 
     struct CancellationWait final : transport::CancellationSubscription {
         explicit CancellationWait(net::any_io_executor executor)
             : wake(std::move(executor), 1) {}
-        SignalChannel wake;
-        ErrorCode reason = ErrorCode::OK;
+        common::SignalChannel wake;
+        common::ErrorCode reason = common::ErrorCode::OK;
 
     private:
         void OnCancellation(transport::Cancellation event) noexcept override {
@@ -98,12 +98,12 @@ inline net::awaitable<tl::expected<udp::endpoint, ErrorCode>> ResolveUdpEndpoint
         }
     } cancellation(co_await net::this_coro::executor);
     cancellation.Resubscribe(socket.Cancellation());
-    if (cancellation.reason != ErrorCode::OK)
+    if (cancellation.reason != common::ErrorCode::OK)
         co_return tl::unexpected(cancellation.reason);
 
     // Both race participants return values even on cancellation: operator||
     // cancels and joins the loser before this scope releases borrowed state.
-    auto resolve = [&]() -> net::awaitable<tl::expected<udp::endpoint, ErrorCode>> {
+    auto resolve = [&]() -> net::awaitable<tl::expected<udp::endpoint, common::ErrorCode>> {
         try {
             auto answer = co_await dns.Resolve(target.host);
             if (!answer.Ok()) co_return tl::unexpected(answer.error);
@@ -111,35 +111,35 @@ inline net::awaitable<tl::expected<udp::endpoint, ErrorCode>> ResolveUdpEndpoint
                 if (!address.is_unspecified() && address.is_v6() == socket.IsIPv6())
                     co_return udp::endpoint(address, target.port);
             }
-            co_return tl::unexpected(ErrorCode::DNS_NO_RECORD);
+            co_return tl::unexpected(common::ErrorCode::DNS_NO_RECORD);
         } catch (...) {
             co_return tl::unexpected(
-                transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL));
+                transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL));
         }
     };
-    auto cancelled = [&]() -> net::awaitable<ErrorCode> {
+    auto cancelled = [&]() -> net::awaitable<common::ErrorCode> {
         (void)co_await cancellation.wake.async_receive(net::as_tuple(net::use_awaitable));
-        co_return cancellation.reason == ErrorCode::OK ? ErrorCode::CANCELLED : cancellation.reason;
+        co_return cancellation.reason == common::ErrorCode::OK ? common::ErrorCode::CANCELLED : cancellation.reason;
     };
     using namespace net::experimental::awaitable_operators;
     try {
         auto result = co_await (resolve() || cancelled());
         if (write.Cancelled()) co_return tl::unexpected(write.CancellationReason());
-        if (cancellation.reason != ErrorCode::OK) co_return tl::unexpected(cancellation.reason);
+        if (cancellation.reason != common::ErrorCode::OK) co_return tl::unexpected(cancellation.reason);
         if (parent_cancellation.cancelled() != net::cancellation_type::none)
-            co_return tl::unexpected(ErrorCode::CANCELLED);
+            co_return tl::unexpected(common::ErrorCode::CANCELLED);
         if (result.index() == 1) co_return tl::unexpected(std::get<1>(result));
         co_return std::move(std::get<0>(result));
     } catch (...) {
         // 类型分类交给 ClassifyFailure；无法分类的异常可能来自父取消在任一
         // 参与者报告结果前中止竞争（竞争已先收束两者），按取消阶段解释。
         const auto failure =
-            transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL);
-        if (failure != ErrorCode::INTERNAL) co_return tl::unexpected(failure);
+            transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL);
+        if (failure != common::ErrorCode::INTERNAL) co_return tl::unexpected(failure);
         if (write.Cancelled()) co_return tl::unexpected(write.CancellationReason());
         if (parent_cancellation.cancelled() != net::cancellation_type::none)
-            co_return tl::unexpected(ErrorCode::CANCELLED);
-        co_return tl::unexpected(ErrorCode::INTERNAL);
+            co_return tl::unexpected(common::ErrorCode::CANCELLED);
+        co_return tl::unexpected(common::ErrorCode::INTERNAL);
     }
 }
 }  // namespace proxy

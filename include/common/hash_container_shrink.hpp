@@ -6,6 +6,8 @@
 
 // 当哈希容器在流量高峰后变得非常稀疏时，主动回缩 bucket，
 // 避免 burst 后长时间保留大块空桶内存。
+namespace common {
+
 template <typename HashContainer>
 inline void MaybeShrinkHashContainer(
     HashContainer& container,
@@ -39,4 +41,6 @@ inline void MaybeShrinkHashContainer(
         }
     }
 }
+
+}  // namespace common
 

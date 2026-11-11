@@ -28,16 +28,20 @@
 #include <openssl/aes.h>
 #include <memory>
 
+namespace proxy::vmess::outbound {
+
 struct VMessOutboundConfig {
-    OutboundServer server;
-    vmess::Security security = vmess::Security::AES_128_GCM;
+    transport::internet::OutboundServer server;
+    proxy::vmess::Security security = proxy::vmess::Security::AES_128_GCM;
 };
+
+}  // namespace proxy::vmess::outbound
 
 namespace proxy::vmess::outbound {
 
 struct PreparedSettings {
     VMessOutboundConfig config;
-    ::vmess::MemoryAccount user;
+    ::proxy::vmess::MemoryAccount user;
     AES_KEY auth_id_key{};  // Encrypt schedule of user.auth_key, built on prepare.
 
     ~PreparedSettings() noexcept {
@@ -45,17 +49,17 @@ struct PreparedSettings {
     }
 };
 
-class Handler final : public ::Outbound {
+class Handler final : public ::proxy::Outbound {
 public:
     explicit Handler(std::shared_ptr<const PreparedSettings> prepared);
 
-    ::net::awaitable<::OutboundProcessResult> Process(
+    ::net::awaitable<::proxy::OutboundProcessResult> Process(
         ::session::Context& ctx,
         ::transport::Link inbound,
-        ::OutboundDialer& dialer,
-        const ::TimeoutsConfig& timeouts,
-        ::StatsShard& stats,
-        const ::RelayConfig& relay_config,
+        ::transport::internet::OutboundDialer& dialer,
+        const ::infra::TimeoutsConfig& timeouts,
+        ::app::StatsShard& stats,
+        const ::app::RelayConfig& relay_config,
         ::buf::MultiBufferBatch first_payload) override;
 
 private:
@@ -64,14 +68,16 @@ private:
 
 }  // namespace proxy::vmess::outbound
 
+namespace proxy::vmess::outbound {
+
 namespace {
 
 class VMessOutboundEndpoint final : public proxy::OutboundStreamEndpointBase {
 public:
-    VMessOutboundEndpoint(vmess::encoding::ClientSession& session,
-                          AsyncStream& stream,
+    VMessOutboundEndpoint(proxy::vmess::encoding::ClientSession& session,
+                          transport::AsyncStream& stream,
                           bool is_udp,
-                          const TargetAddress& udp_target) noexcept
+                          const common::TargetAddress& udp_target) noexcept
         : OutboundStreamEndpointBase(stream)
         , session_(session)
         , is_udp_(is_udp)
@@ -85,7 +91,7 @@ public:
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
         if (is_udp_) {
-            ::vmess::ValidateFixedUdpDatagram(mb, udp_target_);
+            ::proxy::vmess::ValidateFixedUdpDatagram(mb, udp_target_);
         }
         return session_.EncodeRequestBody(stream_, std::move(mb));
     }
@@ -115,24 +121,24 @@ private:
         co_return mb;
     }
 
-    vmess::encoding::ClientSession& session_;
+    proxy::vmess::encoding::ClientSession& session_;
     bool is_udp_ = false;
-    const TargetAddress& udp_target_;
+    const common::TargetAddress& udp_target_;
 };
 
-net::awaitable<tl::expected<void, ErrorCode>>
+net::awaitable<tl::expected<void, common::ErrorCode>>
 SendVMessHandshake(
-    AsyncStream& stream,
-    ::vmess::encoding::ClientSession& vmess_session,
-    const ::vmess::MemoryAccount& user,
+    transport::AsyncStream& stream,
+    ::proxy::vmess::encoding::ClientSession& vmess_session,
+    const ::proxy::vmess::MemoryAccount& user,
     const AES_KEY& auth_id_key,
-    const TargetAddress& target,
-    ::vmess::Command command,
-    ForwardedMetadataView forwarded,
+    const common::TargetAddress& target,
+    ::proxy::vmess::Command command,
+    common::ForwardedMetadataView forwarded,
     std::chrono::seconds handshake_timeout,
     session::Context& ctx) {
     stream.SetIdleTimeout(handshake_timeout);
-    PhaseDeadlineHandle outbound_protocol_deadline =
+    transport::PhaseDeadlineHandle outbound_protocol_deadline =
         stream.StartPhaseDeadline(handshake_timeout);
 
     auto handshake_result = co_await vmess_session.EncodeRequestHeader(
@@ -140,16 +146,16 @@ SendVMessHandshake(
     if (!handshake_result) {
         const bool timed_out = proxy::ConsumeOutboundHandshakeTimeout(
             stream, outbound_protocol_deadline);
-        const ErrorCode code = timed_out ? ErrorCode::TIMEOUT : handshake_result.error();
-        if (code != ErrorCode::CANCELLED && code != ErrorCode::CONNECTION_CLOSED &&
-            code != ErrorCode::SOCKET_EOF) {
-            LOG_CONN_WARN(ctx, "protocol handshake failed > {}", ErrorCodeToString(code));
+        const common::ErrorCode code = timed_out ? common::ErrorCode::TIMEOUT : handshake_result.error();
+        if (code != common::ErrorCode::CANCELLED && code != common::ErrorCode::CONNECTION_CLOSED &&
+            code != common::ErrorCode::SOCKET_EOF) {
+            LOG_CONN_WARN(ctx, "protocol handshake failed > {}", common::ErrorCodeToString(code));
         }
         stream.Cancel();
         co_return tl::unexpected(code);
     }
     LOG_CONN_DEBUG(ctx, "protocol handshake succeeded");
-    co_return tl::expected<void, ErrorCode>{};
+    co_return tl::expected<void, common::ErrorCode>{};
 }
 
 }  // namespace
@@ -164,13 +170,13 @@ net::awaitable<OutboundProcessResult>
 proxy::vmess::outbound::Handler::Process(
     session::Context& ctx,
     transport::Link inbound,
-    OutboundDialer& dialer,
-    const TimeoutsConfig& timeouts,
-    StatsShard& stats,
-    const RelayConfig& relay_config,
+    transport::internet::OutboundDialer& dialer,
+    const infra::TimeoutsConfig& timeouts,
+    app::StatsShard& stats,
+    const app::RelayConfig& relay_config,
     buf::MultiBufferBatch first_payload) {
     if (!inbound.Valid()) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     const auto& target = ctx.outbound.target;
 
@@ -180,9 +186,9 @@ proxy::vmess::outbound::Handler::Process(
     }
     auto stream = std::move(*dialed);
 
-    const bool is_udp = ctx.content.network == Network::UDP;
-    const auto command = is_udp ? ::vmess::Command::UDP : ::vmess::Command::TCP;
-    ::vmess::encoding::ClientSession vmess_session(
+    const bool is_udp = ctx.content.network == common::Network::UDP;
+    const auto command = is_udp ? ::proxy::vmess::Command::UDP : ::proxy::vmess::Command::TCP;
+    ::proxy::vmess::encoding::ClientSession vmess_session(
         prepared_->config.security, command);
 
     if (auto ok = co_await SendVMessHandshake(
@@ -198,7 +204,7 @@ proxy::vmess::outbound::Handler::Process(
     stream->ClearPhaseDeadline();
 
     VMessOutboundEndpoint target_endpoint(vmess_session, *stream, is_udp, target);
-    co_return co_await DoRelayLink(
+    co_return co_await app::DoRelayLink(
         dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
         target_endpoint, ctx, stats, relay_config, std::move(first_payload));
 }
@@ -215,8 +221,8 @@ const bool kVMessRegistered = (::proxyman::outbound::RegisterProxy(
         -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
         const auto* settings = std::get_if<::infra::VmessSettings>(&cfg.settings);
         if (!settings) return std::nullopt;
-        auto user = ::vmess::MemoryAccount::FromUuidBytes(settings->id);
-        auto next_hop = ::proxy::PrepareNextHop(cfg, settings->server, ::OutboundStreamDefaults{});
+        auto user = ::proxy::vmess::MemoryAccount::FromUuidBytes(settings->id);
+        auto next_hop = ::proxy::PrepareNextHop(cfg, settings->server, ::transport::internet::OutboundStreamDefaults{});
 
         using PreparedSettings = ::proxy::vmess::outbound::PreparedSettings;
         return ::proxyman::outbound::PreparedOutboundProxy{
@@ -225,17 +231,19 @@ const bool kVMessRegistered = (::proxyman::outbound::RegisterProxy(
                 +[](std::string_view,
                     std::shared_ptr<const PreparedSettings> state,
                     ::net::io_context& /*io_context*/,
-                    ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
+                    ::common::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::proxy::Outbound> {
                     return std::make_unique<::proxy::vmess::outbound::Handler>(
                         std::move(state));
                 }>(PreparedSettings{
-                    ::VMessOutboundConfig{
+                    ::proxy::vmess::outbound::VMessOutboundConfig{
                         .server = std::move(next_hop.server),
                         .security = settings->security,
                     },
                     user,
-                    ::vmess::ExpandAuthIDEncryptKey(user.auth_key)}),
+                    ::proxy::vmess::ExpandAuthIDEncryptKey(user.auth_key)}),
             .sender = std::move(next_hop.sender),
         };
     }), true);
 }  // namespace
+
+}  // namespace proxy::vmess::outbound

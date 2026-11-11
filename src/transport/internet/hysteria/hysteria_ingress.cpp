@@ -196,7 +196,7 @@ struct SocketState final {
         bool terminal = false;
     };
     memory::RingDeque<Output> output;
-    SignalChannel changed;
+    common::SignalChannel changed;
 };
 
 const proxyman::inbound::ReceiverSettings& HysteriaIngress::Receiver() const noexcept {
@@ -239,16 +239,16 @@ std::shared_ptr<Connection> Connection::Create(
                 auto* owner = connection->listener_;
                 connection->Close();
                 owner->sessions.erase(connection.get());
-                MaybeShrinkHashContainer(owner->sessions);
+                common::MaybeShrinkHashContainer(owner->sessions);
                 --owner->tasks;
                 owner->changed.cancel();
-                if (error && !IsOperationCancelled(error))
+                if (error && !common::IsOperationCancelled(error))
                     LOG_ERROR("Hysteria connection task failed worker={}", owner->worker_id);
             });
     } catch (...) {
         connection->Close();
         listener.sessions.erase(connection.get());
-        MaybeShrinkHashContainer(listener.sessions);
+        common::MaybeShrinkHashContainer(listener.sessions);
         if (tracked) --listener.tasks;
         throw;
     }
@@ -423,7 +423,7 @@ net::awaitable<void> Connection::Run() {
     std::exception_ptr failure;
     app::RequestLoadState::PhysicalConnectionScope physical(*listener_->environment.request_load);
     try {
-        co_await RunAwaitableTaskGroup(Reactor().get_executor(), [&](AwaitableTaskGroup& tasks) {
+        co_await common::RunAwaitableTaskGroup(Reactor().get_executor(), [&](common::AwaitableTaskGroup& tasks) {
             tasks_ = &tasks;
             tasks.Spawn(WaitClosed());
             tasks.Spawn(ReservePhysicalAdmission());
@@ -478,12 +478,12 @@ void Connection::OnTimeout() {
         OnExpiry();
     } catch (...) {
         const auto reason = transport::ClassifyFailure(
-            std::current_exception(), ErrorCode::INTERNAL);
+            std::current_exception(), common::ErrorCode::INTERNAL);
         Close();
         listener_->environment.admission->stats.OnError();
         try {
             LOG_ERROR("Hysteria expiry failed worker={} > {}",
-                      listener_->worker_id, ErrorCodeToString(reason));
+                      listener_->worker_id, common::ErrorCodeToString(reason));
         } catch (...) {}
     }
 }
@@ -614,15 +614,15 @@ void Connection::UnscheduleStreamOutput(int64_t stream_id, StreamRecord& stream)
 std::shared_ptr<QuicStreamState> Connection::QueueStreamOutput(
     int64_t stream_id, buf::MultiBuffer& payload) {
     if (!core_ || closed_)
-        throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
+        throw transport::LinkError(common::ErrorCode::CONNECTION_CLOSED);
     auto it = core_->streams.find(stream_id);
     if (it == core_->streams.end())
-        throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
+        throw transport::LinkError(common::ErrorCode::CONNECTION_CLOSED);
     auto& stream = it->second;
     stream.state->CheckWriteOpen();
     const size_t bytes = payload.byte_size();
     if (bytes > kMaxStreamOutputBytes)
-        throw transport::LinkError(ErrorCode::RESOURCE_EXHAUSTED);
+        throw transport::LinkError(common::ErrorCode::RESOURCE_EXHAUSTED);
     if (stream.queued_bytes > kMaxStreamOutputBytes - bytes) return stream.state;
     if (bytes != 0) {
         stream.output.push_back(std::move(payload));
@@ -735,10 +735,10 @@ int Connection::CloseStream(ngtcp2_conn* conn, uint32_t flags, int64_t stream_id
         self.UnscheduleStreamOutput(stream_id, it->second);
         state = std::move(it->second.state);
         self.core_->streams.erase(it);
-        MaybeShrinkHashContainer(self.core_->streams, 8);
+        common::MaybeShrinkHashContainer(self.core_->streams, 8);
     }
     self.core_->h3_requests.erase(stream_id);
-    MaybeShrinkHashContainer(self.core_->h3_requests, 8);
+    common::MaybeShrinkHashContainer(self.core_->h3_requests, 8);
     if (state) {
         if (conn != nullptr &&
             (flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET) == 0) {
@@ -998,14 +998,14 @@ void Connection::Close() noexcept {
 }
 
 net::awaitable<void> Connection::ReservePhysicalAdmission() {
-    ConnectionLimiter::Admission admission;
+    app::ConnectionLimiter::Admission admission;
     if (auto pending = proxy::ReserveInboundConnection(
-            *listener_->environment.admission, ConnectionLimiter::ReservationScope::Physical, base_context_)) {
+            *listener_->environment.admission, app::ConnectionLimiter::ReservationScope::Physical, base_context_)) {
         admission = co_await std::move(*pending);
     }
     const auto reject = admission.reason;
     if (closed_) co_return;
-    if (reject != ConnectionLimiter::RejectReason::NONE) {
+    if (reject != app::ConnectionLimiter::RejectReason::NONE) {
         proxy::RejectInboundAdmission(base_context_, listener_->environment.admission->stats, reject);
         physical_ = PhysicalAdmission::Rejected;
         (void)physical_ready_.try_send(IoErrorCode{});
@@ -1055,7 +1055,7 @@ void Connection::Refuse() noexcept {
 net::awaitable<Connection::AdmitResult> Connection::AdmitConnection(
     std::string_view credential) {
     auto auth_hash = HashCredential(credential);
-    ScopedCleanse cleanse_auth_hash{auth_hash};
+    common::ScopedCleanse cleanse_auth_hash{auth_hash};
     while (physical_ == PhysicalAdmission::Pending && !closed_) {
         auto [error] = co_await physical_ready_.async_receive(
             net::as_tuple(net::use_awaitable));
@@ -1065,13 +1065,13 @@ net::awaitable<Connection::AdmitResult> Connection::AdmitConnection(
         co_return AdmitResult::Limited;
     auto authentication = co_await proxy::BeginInboundAuthentication(*listener_->environment.admission, base_context_);
     if (!authentication) {
-        if (authentication.error() != ErrorCode::CANCELLED && authentication.error() != ErrorCode::SOCKET_EOF)
+        if (authentication.error() != common::ErrorCode::CANCELLED && authentication.error() != common::ErrorCode::SOCKET_EOF)
             listener_->environment.admission->stats.OnError();
         co_return AdmitResult::Limited;
     }
     const auto credential_check = co_await authentication->VerifyCredential({proxy::KeyedInboundProtocol::Hysteria, auth_hash});
-    if (credential_check != ErrorCode::OK) {
-        if (credential_check != ErrorCode::CANCELLED && credential_check != ErrorCode::SOCKET_EOF)
+    if (credential_check != common::ErrorCode::OK) {
+        if (credential_check != common::ErrorCode::CANCELLED && credential_check != common::ErrorCode::SOCKET_EOF)
             listener_->environment.admission->stats.OnError();
         co_return AdmitResult::Limited;
     }
@@ -1079,15 +1079,15 @@ net::awaitable<Connection::AdmitResult> Connection::AdmitConnection(
     const auto& receiver = listener_->Receiver();
     auto user = proxyman::inbound::UserStore::FindHysteriaUser(
         receiver.inbound_tag, auth_hash);
-    const auto profile = user ? std::optional<UserProfile>(user->profile) : std::nullopt;
+    const auto profile = user ? std::optional<common::UserProfile>(user->profile) : std::nullopt;
     user.reset();
     auto session = co_await proxy::AuthenticateAndAdmit(
         std::move(*authentication), profile ? &*profile : nullptr, "no matching credential", std::nullopt);
     if (!session) {
-        if (session.error() != ErrorCode::CANCELLED && session.error() != ErrorCode::SOCKET_EOF)
+        if (session.error() != common::ErrorCode::CANCELLED && session.error() != common::ErrorCode::SOCKET_EOF)
             listener_->environment.admission->stats.OnError();
-        if (session.error() == ErrorCode::PROTOCOL_AUTH_FAILED) co_return AdmitResult::AuthFailed;
-        co_return session.error() == ErrorCode::PERMISSION_DENIED
+        if (session.error() == common::ErrorCode::PROTOCOL_AUTH_FAILED) co_return AdmitResult::AuthFailed;
+        co_return session.error() == common::ErrorCode::PERMISSION_DENIED
             ? AdmitResult::DeviceLimited : AdmitResult::Limited;
     }
     if (closed_) co_return AdmitResult::Limited;
@@ -1422,14 +1422,14 @@ void Connection::HandleUdpMessage(const UdpMessage& message) {
         const auto& fragment = pending.payloads[slot - 1];
         payload.insert(payload.end(), fragment.begin(), fragment.end());
     }
-    const TargetAddress target = std::move(pending.target);
+    const common::TargetAddress target = std::move(pending.target);
     fragments_.erase(it);
     ExpireUdpFragments(now);
     DeliverUdpPacket(message.session_id, target, payload);
 }
 
 void Connection::DeliverUdpPacket(
-    uint32_t session_id, const TargetAddress& target,
+    uint32_t session_id, const common::TargetAddress& target,
     std::span<const uint8_t> payload) {
     if (auto it = core_->udp_sessions.find(session_id);
         it != core_->udp_sessions.end()) {
@@ -1446,7 +1446,7 @@ void Connection::DeliverUdpPacket(
 }
 
 bool Connection::SendUdpMessage(
-    uint32_t session_id, const TargetAddress& target,
+    uint32_t session_id, const common::TargetAddress& target,
     std::span<const uint8_t> payload) {
     if (closed_ || !target.IsValid() ||
         payload.size() > kMaxUdpPayloadLength) return false;
@@ -1508,7 +1508,7 @@ bool Connection::SendUdpMessage(
 void Connection::CloseUdpSession(uint32_t session_id) noexcept {
     if (core_) {
         core_->udp_sessions.erase(session_id);
-        MaybeShrinkHashContainer(core_->udp_sessions, 8);
+        common::MaybeShrinkHashContainer(core_->udp_sessions, 8);
     }
 }
 
@@ -1599,7 +1599,7 @@ void HysteriaIngress::Associate(
 
 void HysteriaIngress::Dissociate(const ngtcp2_cid& cid) noexcept {
     connections.erase(ConnectionId(cid));
-    MaybeShrinkHashContainer(connections);
+    common::MaybeShrinkHashContainer(connections);
 }
 
 void HysteriaIngress::DissociateAll(Connection& connection) noexcept {
@@ -1607,7 +1607,7 @@ void HysteriaIngress::DissociateAll(Connection& connection) noexcept {
         connections.erase(id);
     }
     connection.connection_ids_.clear();
-    MaybeShrinkHashContainer(connections);
+    common::MaybeShrinkHashContainer(connections);
 }
 
 SocketState* HysteriaIngress::Resolve(const udp::endpoint& local) noexcept {
@@ -1813,7 +1813,7 @@ net::awaitable<size_t> QuicStreamState::Read(net::mutable_buffer buffer) {
             co_return bytes;
         }
         if (cancelled_)
-            throw transport::LinkError(ErrorCode::CANCELLED);
+            throw transport::LinkError(common::ErrorCode::CANCELLED);
         if (input_done_) co_return 0;
         auto [error] = co_await input_signal_.async_receive(
             net::as_tuple(net::use_awaitable));
@@ -1834,7 +1834,7 @@ net::awaitable<buf::MultiBuffer> QuicStreamState::ReadMultiBuffer() {
             co_return result;
         }
         if (cancelled_)
-            throw transport::LinkError(ErrorCode::CANCELLED);
+            throw transport::LinkError(common::ErrorCode::CANCELLED);
         if (input_done_) co_return buf::MultiBuffer{};
         auto [error] = co_await input_signal_.async_receive(
             net::as_tuple(net::use_awaitable));
@@ -1850,7 +1850,7 @@ net::awaitable<void> QuicStreamState::WriteMultiBuffer(buf::MultiBuffer payload)
     auto owner = owner_.lock();
     if (!owner) {
         payload.clear();
-        throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
+        throw transport::LinkError(common::ErrorCode::CONNECTION_CLOSED);
     }
     // Only the stable state survives suspension, never a map iterator or
     // this object. ACKs release retained buffers; packet transmission alone
@@ -1868,7 +1868,7 @@ void QuicStreamState::ShutdownWrite() noexcept {
 }
 
 void QuicStreamState::CheckWriteOpen() const {
-    if (cancelled_) throw transport::LinkError(ErrorCode::CANCELLED);
+    if (cancelled_) throw transport::LinkError(common::ErrorCode::CANCELLED);
     if (write_done_) throw transport::WriteClosed();
 }
 
@@ -1930,14 +1930,14 @@ net::awaitable<void> QuicStream::WriteMultiBuffer(buf::MultiBuffer payload) {
     if (!closed_) return state_->WriteMultiBuffer(std::move(payload));
     return [](buf::MultiBuffer rejected) -> net::awaitable<void> {
         rejected.clear();
-        throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
+        throw transport::LinkError(common::ErrorCode::CONNECTION_CLOSED);
         co_return;
     }(std::move(payload));
 }
 
 net::awaitable<void> QuicStream::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
-    if (closed_) throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
+    if (closed_) throw transport::LinkError(common::ErrorCode::CONNECTION_CLOSED);
     buf::MultiBuffer payload;
     for (const auto& buffer : buffers) {
         const auto bytes = std::span(
@@ -1984,7 +1984,7 @@ UdpSessionStream::~UdpSessionStream() noexcept {
 }
 
 bool UdpSessionStream::Push(
-    const TargetAddress& target, std::span<const uint8_t> payload) {
+    const common::TargetAddress& target, std::span<const uint8_t> payload) {
     if (closed_ || cancelled_) return false;
     // Datagrams cannot share a block. Count rounded capacity before allocating,
     // without subtracting an externally sized payload from the byte budget.
@@ -2007,16 +2007,16 @@ void UdpSessionStream::Detach() noexcept {
 }
 
 net::awaitable<size_t> UdpSessionStream::AsyncRead(net::mutable_buffer) {
-    throw transport::LinkError(ErrorCode::NOT_SUPPORTED);
+    throw transport::LinkError(common::ErrorCode::NOT_SUPPORTED);
 }
 
 net::awaitable<size_t> UdpSessionStream::AsyncWrite(net::const_buffer) {
-    throw transport::LinkError(ErrorCode::NOT_SUPPORTED);
+    throw transport::LinkError(common::ErrorCode::NOT_SUPPORTED);
 }
 
 net::awaitable<buf::MultiBuffer> UdpSessionStream::ReadMultiBuffer() {
     for (;;) {
-        if (cancelled_) throw transport::LinkError(ErrorCode::CANCELLED);
+        if (cancelled_) throw transport::LinkError(common::ErrorCode::CANCELLED);
         if (!input_.empty()) {
             auto packet = std::move(input_.front());
             input_.pop_front();
@@ -2038,12 +2038,12 @@ net::awaitable<void> UdpSessionStream::WriteMultiBuffer(buf::MultiBuffer packet)
     if (datagram.status == buf::UdpDatagramStatus::Empty) co_return;
     if (!datagram.Valid() || datagram.payload_size > kMaxUdpPayloadLength) {
         packet.clear();
-        throw transport::LinkError(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
     auto owner = owner_.lock();
     if (closed_ || !owner) {
         packet.clear();
-        throw transport::LinkError(ErrorCode::CONNECTION_CLOSED);
+        throw transport::LinkError(common::ErrorCode::CONNECTION_CLOSED);
     }
     bool sent = false;
     if (datagram.buffer_count == 1) {
@@ -2060,7 +2060,7 @@ net::awaitable<void> UdpSessionStream::WriteMultiBuffer(buf::MultiBuffer packet)
         sent = owner->SendUdpMessage(session_id_, *datagram.target, payload);
     }
     packet.clear();
-    if (!sent) throw transport::LinkError(ErrorCode::RESOURCE_EXHAUSTED);
+    if (!sent) throw transport::LinkError(common::ErrorCode::RESOURCE_EXHAUSTED);
 }
 
 void UdpSessionStream::Cancel() noexcept {

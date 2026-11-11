@@ -15,6 +15,8 @@
 
 // One borrowed embedded event per active delay; no per-connection timer.
 // The owner outlives WaitFor and joins it after cancellation.
+namespace transport::internet {
+
 class AsyncDelay final : private TimeoutEvent {
 public:
     explicit AsyncDelay(net::io_context& io_context)
@@ -69,7 +71,9 @@ private:
     // Runs on the Worker reactor. Dispatch completes the existing waiter
     // without a completion node.
     void OnTimeout() override { (void)wake_.try_send_via_dispatch(IoErrorCode{}); }
-    SignalChannel wake_;
+    common::SignalChannel wake_;
     bool waiting_ = false;
 };
+
+}  // namespace transport::internet
 

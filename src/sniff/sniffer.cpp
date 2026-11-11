@@ -21,6 +21,8 @@
 #include <span>
 #include <string_view>
 
+namespace sniff {
+
 namespace {
 
 constexpr uint8_t kContentTypeHandshake = 0x16;
@@ -35,7 +37,7 @@ constexpr size_t kMaxTlsSniffHandshakeBytes =
     kMaxTlsSniffWireBytes - kTlsRecordHeaderBytes;
 
 [[nodiscard]] size_t ClientHelloSize(std::span<const uint8_t> handshake) noexcept {
-    return 4 + LoadU24BE(handshake.data() + 1);
+    return 4 + common::LoadU24BE(handshake.data() + 1);
 }
 
 [[nodiscard]] bool FitsTlsSniffWireBudget(
@@ -71,7 +73,7 @@ constexpr size_t kMaxTlsSniffHandshakeBytes =
 [[nodiscard]] std::optional<std::string_view> ExtractServerName(
     std::span<const uint8_t> extensions) {
     std::optional<std::string_view> server_name;
-    ByteReader reader(extensions);
+    common::ByteReader reader(extensions);
     while (!reader.Empty()) {
         const uint16_t extension_type = reader.ReadU16BE();
         const auto extension = reader.ReadBytes(reader.ReadU16BE());
@@ -94,10 +96,10 @@ constexpr size_t kMaxTlsSniffHandshakeBytes =
 
 [[nodiscard]] std::optional<std::string_view> ParseClientHelloServerName(
     std::span<const uint8_t> handshake) {
-    ByteReader reader(handshake);
+    common::ByteReader reader(handshake);
     if (reader.ReadU8() != kHandshakeClientHello) return std::nullopt;
     const size_t body_size = reader.ReadU24BE();
-    ByteReader body(reader.ReadBytes(body_size));
+    common::ByteReader body(reader.ReadBytes(body_size));
     if (!reader.Ok()) return std::nullopt;
 
     // legacy_version + random, then legacy_session_id.
@@ -134,7 +136,7 @@ constexpr size_t kMaxTlsSniffHandshakeBytes =
 }
 
 [[nodiscard]] bool ReadRecordHeader(
-    ByteReader& reader,
+    common::ByteReader& reader,
     bool& version_supports_need_more,
     uint16_t& record_len,
     SniffResult& result) noexcept {
@@ -269,7 +271,7 @@ static constexpr std::array<std::string_view, 9> kHttpMethods{
         const std::string_view suffix = value.substr(close + 1);
         if (!suffix.empty() &&
             (suffix.front() != ':' ||
-             !TargetAddress::ParsePort(suffix.substr(1), parsed.port))) {
+             !common::TargetAddress::ParsePort(suffix.substr(1), parsed.port))) {
             return std::nullopt;
         }
         return parsed;
@@ -284,7 +286,7 @@ static constexpr std::array<std::string_view, 9> kHttpMethods{
         parsed.host = value;
     } else {
         if (value.rfind(':') != colon || colon == 0 ||
-            !TargetAddress::ParsePort(value.substr(colon + 1), parsed.port)) {
+            !common::TargetAddress::ParsePort(value.substr(colon + 1), parsed.port)) {
             return std::nullopt;
         }
         parsed.host = value.substr(0, colon);
@@ -479,7 +481,7 @@ bool AesGcmDecrypt(std::span<const uint8_t, 16> key,
 
 SniffResult SniffTls(std::span<const uint8_t> data) {
     SniffResult result;
-    ByteReader reader(data);
+    common::ByteReader reader(data);
     bool version_supports_need_more = true;
     uint16_t record_len = 0;
     if (!ReadRecordHeader(reader, version_supports_need_more, record_len, result) ||
@@ -621,7 +623,7 @@ SniffResult SniffHttp(std::span<const uint8_t> data) {
         if (!transport::internet::SplitAndValidateHttpHeaderLine(line, name, value)) {
             return result;
         }
-        if (!EqualsAsciiCI(name, "host")) continue;
+        if (!common::EqualsAsciiCI(name, "host")) continue;
         // RFC 9112 §3.2: more than one Host field is a bad request.
         if (host) return result;
         host = ParseHostValue(value);
@@ -669,7 +671,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
             return fail();
         }
         if (remaining.size() < 7) return fail();
-        ByteReader header(remaining);
+        common::ByteReader header(remaining);
         (void)header.Skip(1);
         const uint32_t version = header.ReadU32BE();
         const auto* spec = LookupVersion(version);
@@ -764,7 +766,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
         largest_pn_ = std::max(largest_pn_, packet_number);
         decrypted_initial = true;
 
-        ByteReader frames(decrypted);
+        common::ByteReader frames(decrypted);
         auto consume = [&](uint64_t& value) {
             const auto parsed = frames.ReadQuicVarint();
             if (!parsed) return false;
@@ -801,9 +803,9 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
                     if (!frames.Ok()) return fail();
                     if (length == 0) break;
                     if (contiguous_ == 0 && crypto_.empty() && start == 0 && chunk.size() >= 4 &&
-                        chunk[0] == 1 && 4 + LoadU24BE(chunk.data() + 1) <= chunk.size()) {
+                        chunk[0] == 1 && 4 + common::LoadU24BE(chunk.data() + 1) <= chunk.size()) {
                         auto sni = ParseClientHelloServerName(
-                            chunk.first(4 + LoadU24BE(chunk.data() + 1)));
+                            chunk.first(4 + common::LoadU24BE(chunk.data() + 1)));
                         if (!sni) return fail();
                         SniffResult result;
                         result.success = true;
@@ -814,7 +816,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
                     }
                     const size_t end = static_cast<size_t>(start + length);
                     if (contiguous_ >= 4 &&
-                        end > 4 + static_cast<size_t>(LoadU24BE(crypto_.data() + 1))) {
+                        end > 4 + static_cast<size_t>(common::LoadU24BE(crypto_.data() + 1))) {
                         return fail();
                     }
                     if (crypto_.size() < end) {
@@ -845,7 +847,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
 
         if (contiguous_ != 0 && crypto_[0] != 1) return fail();
         if (contiguous_ >= 4) {
-            const size_t handshake_size = LoadU24BE(crypto_.data() + 1);
+            const size_t handshake_size = common::LoadU24BE(crypto_.data() + 1);
             if (handshake_size > kMaxCrypto - 4 ||
                 crypto_.size() > handshake_size + 4) return fail();
             if (contiguous_ >= handshake_size + 4) {
@@ -871,3 +873,5 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
     result.protocol = constants::protocol::kQuic;
     return result;
 }
+
+}  // namespace sniff

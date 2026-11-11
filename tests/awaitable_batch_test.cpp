@@ -66,7 +66,7 @@ TEST(AwaitableBatch, FailureJoinsEveryChild) {
 
     auto result = ::net::co_spawn(
         io_context,
-        ::RunAwaitableBatch(
+        ::common::RunAwaitableBatch(
             io_context.get_executor(), std::move(tasks)),
         ::net::use_future);
     io_context.run();
@@ -101,7 +101,7 @@ TEST(AwaitableBatch, FailureOutranksCancellation) {
     tasks.push_back(OrderedFailure(true, failed_child_completed));
     tasks.push_back(OrderedFailure(false, failed_child_completed));
     auto result = ::net::co_spawn(io_context,
-        ::RunAwaitableBatch(io_context.get_executor(), std::move(tasks)),
+        ::common::RunAwaitableBatch(io_context.get_executor(), std::move(tasks)),
         ::net::use_future);
     io_context.run();
     ::IoErrorCode reported;
@@ -144,7 +144,7 @@ TEST(AwaitableBatch, CancellationJoinsEveryChild) {
     }
     ::net::co_spawn(
         io_context,
-        ::RunAwaitableBatch(io_context.get_executor(), std::move(tasks)),
+        ::common::RunAwaitableBatch(io_context.get_executor(), std::move(tasks)),
         ::net::bind_cancellation_slot(cancel.slot(), [&](std::exception_ptr error) {
             failure = error;
             completed_at_return = completed;
@@ -173,7 +173,7 @@ TEST(AwaitableBatch, CancellationJoinsEveryChild) {
     std::vector<::net::awaitable<void>> tasks, int allocation) {
     fail_after = allocation;
     try {
-        co_await ::RunAwaitableBatch(executor, std::move(tasks));
+        co_await ::common::RunAwaitableBatch(executor, std::move(tasks));
     } catch (...) {
         fail_after = -1;
         throw;
@@ -246,7 +246,7 @@ TEST(AwaitableBatch, AllocationFailureJoinsStartedChildren) {
     bool& child_matched, bool& caller_matched) {
     std::vector<::net::awaitable<void>> tasks;
     tasks.push_back(ObserveExecutor(worker, child_matched));
-    co_await ::RunAwaitableBatch(worker, std::move(tasks));
+    co_await ::common::RunAwaitableBatch(worker, std::move(tasks));
     caller_matched = (co_await ::net::this_coro::executor) == caller;
 }
 

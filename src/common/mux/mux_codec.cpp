@@ -22,27 +22,27 @@ namespace {
 
 // 元数据必须被完整消费，超出最大合法布局（含 GlobalID）的 MetaLen 无需等待数据即可判定非法；
 // Xray-core 解码端同样拒绝超长 metaLen。
-constexpr size_t kMaxFrameMetadataBytes = 4 + 1 + kMaxEncodedAddressSize + 8;
+constexpr size_t kMaxFrameMetadataBytes = 4 + 1 + common::kMaxEncodedAddressSize + 8;
 
 [[nodiscard]] bool ParsePortThenAddress(
-    ByteReader& reader,
-    TargetAddress& target,
-    std::optional<ForwardedMetadata>& forwarded,
+    common::ByteReader& reader,
+    common::TargetAddress& target,
+    std::optional<common::ForwardedMetadata>& forwarded,
     bool allow_metadata) {
     auto view = reader;
-    AddressDecodeOptions options;
+    common::AddressDecodeOptions options;
     options.allow_metadata = allow_metadata;
-    auto decoded = DecodeAddress(view.ReadBytes(view.Remaining()),
-                                 AddressWireFormat::PortFirst,
+    auto decoded = common::DecodeAddress(view.ReadBytes(view.Remaining()),
+                                 common::AddressWireFormat::PortFirst,
                                  options);
-    if (decoded.status != AddressDecodeStatus::Complete ||
+    if (decoded.status != common::AddressDecodeStatus::Complete ||
         !reader.Skip(decoded.consumed)) return false;
     target = std::move(decoded.target);
     forwarded = std::move(decoded.forwarded);
     return target.IsValid();
 }
 
-[[nodiscard]] bool DecodeFrameMetadata(ByteReader& meta, FrameHeader& out) {
+[[nodiscard]] bool DecodeFrameMetadata(common::ByteReader& meta, FrameHeader& out) {
     const uint16_t session_id = meta.ReadU16BE();
     const uint8_t status_raw = meta.ReadU8();
     const uint8_t option = meta.ReadU8();
@@ -101,7 +101,7 @@ constexpr size_t kMaxFrameMetadataBytes = 4 + 1 + kMaxEncodedAddressSize + 8;
         return std::nullopt;
     }
 
-    const uint16_t meta_len = LoadU16BE(prefix.data());
+    const uint16_t meta_len = common::LoadU16BE(prefix.data());
     if (meta_len < 4 || meta_len > kMaxFrameMetadataBytes) {
         return FrameHeader{};
     }
@@ -110,7 +110,7 @@ constexpr size_t kMaxFrameMetadataBytes = 4 + 1 + kMaxEncodedAddressSize + 8;
         return std::nullopt;
     }
 
-    ByteReader meta(prefix.data() + 2, meta_len);
+    common::ByteReader meta(prefix.data() + 2, meta_len);
     FrameHeader out;
     if (!DecodeFrameMetadata(meta, out)) {
         return FrameHeader{};
@@ -121,7 +121,7 @@ constexpr size_t kMaxFrameMetadataBytes = 4 + 1 + kMaxEncodedAddressSize + 8;
         if (prefix.size() < frame_size + 2) {
             return std::nullopt;
         }
-        const uint16_t data_len = LoadU16BE(prefix.data() + frame_size);
+        const uint16_t data_len = common::LoadU16BE(prefix.data() + frame_size);
         frame_size += 2 + static_cast<size_t>(data_len);
         if (total_len < frame_size) {
             return std::nullopt;
@@ -144,13 +144,13 @@ std::optional<FrameHeader> DecodeFrame(const buf::MultiBuffer& data) {
     const auto front = data.FrontSpan();
     uint16_t meta_len = 0;
     if (front.size() >= 2) {
-        meta_len = LoadU16BE(front.data());
+        meta_len = common::LoadU16BE(front.data());
     } else {
         std::array<uint8_t, 2> len_bytes{};
         if (data.CopyPrefixTo(len_bytes) < 2) {
             return std::nullopt;
         }
-        meta_len = LoadU16BE(len_bytes.data());
+        meta_len = common::LoadU16BE(len_bytes.data());
     }
     if (meta_len < 4 || meta_len > kMaxFrameMetadataBytes) {
         return FrameHeader{};
@@ -176,8 +176,8 @@ std::optional<FrameHeader> DecodeFrame(const buf::MultiBuffer& data) {
     if (out.size() < 6) {
         return 0;
     }
-    StoreU16BE(out.data(), 0);
-    StoreU16BE(out.data() + 2, session_id);
+    common::StoreU16BE(out.data(), 0);
+    common::StoreU16BE(out.data() + 2, session_id);
     out[4] = static_cast<uint8_t>(status);
     out[5] = option;
     return 6;
@@ -197,9 +197,9 @@ std::optional<FrameHeader> DecodeFrame(const buf::MultiBuffer& data) {
     if (out.size() < total_len) {
         return 0;
     }
-    StoreU16BE(out.data(), static_cast<uint16_t>(meta_end - 2));
+    common::StoreU16BE(out.data(), static_cast<uint16_t>(meta_end - 2));
     if (has_data) {
-        StoreU16BE(out.data() + meta_end, static_cast<uint16_t>(payload_len));
+        common::StoreU16BE(out.data() + meta_end, static_cast<uint16_t>(payload_len));
     }
     return total_len;
 }
@@ -223,10 +223,10 @@ size_t EncodeKeepAliveTo(std::span<uint8_t> out) noexcept {
 size_t EncodeNewHeaderTo(std::span<uint8_t> out,
                          uint16_t session_id,
                          NetworkType network,
-                         const TargetAddress& target,
+                         const common::TargetAddress& target,
                          size_t payload_len,
                          bool has_data,
-                         ForwardedMetadataView forwarded) noexcept {
+                         common::ForwardedMetadataView forwarded) noexcept {
     if ((network != NetworkType::TCP && network != NetworkType::UDP) ||
         payload_len > std::numeric_limits<uint16_t>::max() ||
         (!has_data && payload_len != 0) ||
@@ -242,11 +242,11 @@ size_t EncodeNewHeaderTo(std::span<uint8_t> out,
         return 0;
     }
     out[pos++] = static_cast<uint8_t>(network);
-    const size_t addr_len = EncodeAddressTo(
+    const size_t addr_len = common::EncodeAddressTo(
         target,
         out.data() + pos,
         out.size() - pos,
-        AddressWireFormat::PortFirst,
+        common::AddressWireFormat::PortFirst,
         forwarded);
     if (addr_len == 0) {
         return 0;
@@ -291,7 +291,7 @@ size_t EncodeKeepDataHeaderTo(std::span<uint8_t> out,
 // ============================================================================
 size_t EncodeKeepUDPHeaderTo(std::span<uint8_t> out,
                              uint16_t session_id,
-                             const TargetAddress& src,
+                             const common::TargetAddress& src,
                              size_t payload_len) noexcept {
     if (payload_len > std::numeric_limits<uint16_t>::max() ||
         !src.IsValid()) {
@@ -303,11 +303,11 @@ size_t EncodeKeepUDPHeaderTo(std::span<uint8_t> out,
         return 0;
     }
     out[pos++] = static_cast<uint8_t>(NetworkType::UDP);
-    const size_t addr_len = EncodeAddressTo(
+    const size_t addr_len = common::EncodeAddressTo(
         src,
         out.data() + pos,
         out.size() - pos,
-        AddressWireFormat::PortFirst);
+        common::AddressWireFormat::PortFirst);
     if (addr_len == 0) {
         return 0;
     }

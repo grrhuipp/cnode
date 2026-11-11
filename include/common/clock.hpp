@@ -6,6 +6,8 @@
 #include <string>
 
 
+namespace common {
+
 using steady_clock = std::chrono::steady_clock;
 using time_point = steady_clock::time_point;
 
@@ -33,5 +35,7 @@ inline std::string FormatLocalTime(
     const size_t written = std::strftime(buffer, sizeof(buffer), format, &tm);
     return written > 0 ? std::string(buffer, written) : std::string{};
 }
+
+}  // namespace common
 
 

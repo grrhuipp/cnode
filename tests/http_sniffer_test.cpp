@@ -6,8 +6,8 @@
 #include <string_view>
 
 namespace {
-::SniffResult SniffHttp(std::string_view request) {
-    return ::SniffHttp(std::span<const uint8_t>(
+::sniff::SniffResult SniffHttp(std::string_view request) {
+    return ::sniff::SniffHttp(std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(request.data()), request.size()));
 }
 

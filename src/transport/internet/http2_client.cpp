@@ -298,17 +298,17 @@ private:
     // The channel lives in this frame; `waiter` publishes it only while
     // suspended. Nothing suspends between the pumping_ check and publishing,
     // so the pump cannot finish unseen.
-    net::awaitable<void> AdvanceFrames(SignalChannel*& waiter) {
+    net::awaitable<void> AdvanceFrames(common::SignalChannel*& waiter) {
         if (pump_failure_) std::rethrow_exception(pump_failure_);
         if (!pumping_) {
             co_await PumpFrame();
             co_return;
         }
         const uint64_t epoch = abort_epoch_;
-        SignalChannel wake(co_await net::this_coro::executor, 1);
+        common::SignalChannel wake(co_await net::this_coro::executor, 1);
         waiter = &wake;
         struct WaitScope {
-            SignalChannel*& waiter;
+            common::SignalChannel*& waiter;
             ~WaitScope() noexcept { waiter = nullptr; }
         } scope{waiter};
         auto [ec] = co_await wake.async_receive(net::as_tuple(net::use_awaitable));
@@ -719,8 +719,8 @@ private:
     // channel in its own frame, published here only while it waits (one
     // reader and one writer at most). Abort bumps the epoch so pending waits
     // fail instead of re-checking a stream that Cancel()/Close() ended.
-    SignalChannel* reader_wake_ = nullptr;
-    SignalChannel* writer_wake_ = nullptr;
+    common::SignalChannel* reader_wake_ = nullptr;
+    common::SignalChannel* writer_wake_ = nullptr;
     std::exception_ptr pump_failure_;
     uint64_t abort_epoch_ = 0;
     bool pumping_ = false;
@@ -743,7 +743,7 @@ net::awaitable<bool> SendHttp2ClientRequest(AsyncStream& stream,
     co_await WriteH2Frame(stream, H2FrameType::SETTINGS, 0, 0, settings);
     if (conn_window > H2SendWindow::kDefault) {
         std::array<uint8_t, 4> connection_credit{};
-        StoreU32BE(connection_credit.data(),
+        common::StoreU32BE(connection_credit.data(),
                    conn_window - static_cast<uint32_t>(H2SendWindow::kDefault));
         co_await WriteH2Frame(
             stream, H2FrameType::WINDOW_UPDATE, 0, 0, connection_credit);
@@ -779,7 +779,7 @@ net::awaitable<TransportBuildResult> OpenHttp2ClientStream(
             conn_window,
             header_block,
             end_stream)) {
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
 
     LOG_CONN_DEBUG(conn_id,

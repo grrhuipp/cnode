@@ -14,7 +14,7 @@
 #include <string_view>
 #include <utility>
 
-namespace detail {
+namespace transport::internet::detail {
 
 struct XHttpPacketSessionKeyRef {
     std::string_view session_id;
@@ -344,12 +344,12 @@ private:
     void Wake() noexcept;
 
     net::io_context& io_context_;
-    SignalChannel input_signal_;
-    ::detail::XHttpPacketQueue packet_queue_;
-    ::detail::XHttpUploadStreamSlot stream_input_;
+    common::SignalChannel input_signal_;
+    ::transport::internet::detail::XHttpPacketQueue packet_queue_;
+    ::transport::internet::detail::XHttpUploadStreamSlot stream_input_;
     transport::CancellationSource cancellation_;
     // JoinAttachedUpload's frame-local channel, published only while it runs.
-    SignalChannel* upload_signal_ = nullptr;
+    common::SignalChannel* upload_signal_ = nullptr;
     // Event that AttachDownlink and Close broadcast to AwaitDownlink waiters.
     transport::CancellationSource downlink_ready_;
     size_t upload_reads_ = 0;
@@ -422,7 +422,7 @@ enum class XHttpSessionAccess : uint8_t {
 // Limits: 1024 live entries per Worker, 65536 live directory records per group,
 // and the most recent 1024 ended ids in each bounded FIFO replay window.
 [[nodiscard]] net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::string_view session_namespace,
     std::string_view session_id,
@@ -445,7 +445,7 @@ enum class XHttpSessionAccess : uint8_t {
                                                XHttpClientRequestKind kind);
 
 [[nodiscard]] net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> stream,
     const HttpConfig& cfg,

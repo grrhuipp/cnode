@@ -33,7 +33,7 @@ namespace api::v2board {
 
 [[nodiscard]] inline std::optional<uint64_t> PanelUnsignedInteger(
     const json::value& value) noexcept {
-    if (const auto parsed = JsonUnsignedInteger(value)) {
+    if (const auto parsed = infra::JsonUnsignedInteger(value)) {
         return parsed;
     }
     if (!value.is_string()) {
@@ -61,10 +61,10 @@ namespace api::v2board {
     }
     if (value.is_string()) {
         const std::string_view text = value.as_string();
-        if (EqualsAsciiCI(text, "true")) {
+        if (common::EqualsAsciiCI(text, "true")) {
             return true;
         }
-        if (EqualsAsciiCI(text, "false")) {
+        if (common::EqualsAsciiCI(text, "false")) {
             return false;
         }
     }

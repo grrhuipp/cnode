@@ -7,9 +7,9 @@ namespace transport::internet::h2 {
 net::awaitable<void> Http2ServerSubStreamState::JoinOwner(
     std::shared_ptr<Http2ServerSubStreamState> state,
     std::shared_ptr<XHttpPacketUpSession> upload_session) {
-    std::optional<SignalChannel> owner_signal;
+    std::optional<common::SignalChannel> owner_signal;
     struct Unpublish {
-        SignalChannel*& published;
+        common::SignalChannel*& published;
         ~Unpublish() noexcept { published = nullptr; }
     } unpublish{state->owner_signal_};
     const auto wait_owner = [&] {
@@ -467,7 +467,7 @@ const TcpStream* Http2ServerSubStream::BaseTcpStream() const {
 }
 
 net::awaitable<TransportBuildResult> StartHttp2ServerSession(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
     uint32_t initial_window,
     H2PayloadCodec payload_codec,
@@ -488,16 +488,16 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     std::copy(initial_window_setting.begin(), initial_window_setting.end(), settings.begin());
     settings[6] = 0;
     settings[7] = 3; // SETTINGS_MAX_CONCURRENT_STREAMS
-    StoreU32BE(settings.data() + 8, kHttp2MaxConcurrentStreams);
+    common::StoreU32BE(settings.data() + 8, kHttp2MaxConcurrentStreams);
     if (!co_await session->WriteFrameSerialized(H2FrameType::SETTINGS, 0, 0, settings)) {
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
     std::array<uint8_t, 4> connection_credit{};
-    StoreU32BE(connection_credit.data(),
+    common::StoreU32BE(connection_credit.data(),
                kHttp2ConnectionReceiveWindow - H2SendWindow::kDefault);
     if (!co_await session->WriteFrameSerialized(
             H2FrameType::WINDOW_UPDATE, 0, 0, connection_credit)) {
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
     co_await session->Run();
     co_return std::unique_ptr<AsyncStream>{};

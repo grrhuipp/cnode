@@ -128,7 +128,7 @@ TEST_P(BufferTransferFailure, PreservesBothContainersAndUdpMetadataOnFailure) {
                 auto source = Packet(source_bytes);
                 auto target = Packet(target_bytes);
                 auto* original = *source.begin();
-                const TargetAddress endpoint{"127.0.0.1", 1234};
+                const common::TargetAddress endpoint{"127.0.0.1", 1234};
                 original->SetUDP(endpoint);
                 const size_t bytes = prefix ? buf::Buffer::kSize + 17 : source_bytes.size();
                 const auto operation = [&] {
@@ -155,9 +155,9 @@ INSTANTIATE_TEST_SUITE_P(WholeAndPrefix, BufferTransferFailure, ::testing::Bool(
 class UdpPrefixDestination : public ::testing::TestWithParam<int> {};
 
 TEST_P(UdpPrefixDestination, PreservesTargetWithoutCoalescingAcrossPacketBoundary) {
-    const TargetAddress source_target{
+    const common::TargetAddress source_target{
         "split-copy-target-host-name-longer-than-sso.example.com", 14321};
-    const TargetAddress destination_target{
+    const common::TargetAddress destination_target{
         "different-destination-target-name-longer-than-sso.example.net", 14322};
     const auto source_bytes = Pattern(91);
     constexpr size_t prefix_bytes = 23;
@@ -209,7 +209,7 @@ TEST(BufferOwnership, UdpPrefixAllocationFailureRollsBackBothContainersAndCanRet
     constexpr size_t prefix_bytes = 23;
     FaultMatrix("UDP prefix buffer and target-copy failures roll back both containers",
         [&](int budget, bool& complete) {
-            const TargetAddress long_target{
+            const common::TargetAddress long_target{
                 "split-copy-target-host-name-longer-than-sso.example.com", 14321};
             auto source = Packet(source_bytes);
             auto* original = *source.begin();
@@ -258,7 +258,7 @@ TEST(BufferOwnership, InitialPayloadTransfersOwnedBlocksWhenAllocationIsUnavaila
     const auto* original_buffer = *owned.begin();
     buf::MultiBuffer transferred;
     EXPECT_TRUE(Inject(0, [&] {
-        InitialPayload from_stream{std::move(owned)};
+        common::InitialPayload from_stream{std::move(owned)};
         transferred = std::move(from_stream).MoveToMultiBuffer();
         return from_stream.empty();
     }) && owned.empty() && *transferred.begin() == original_buffer &&
@@ -297,7 +297,7 @@ TEST(BufferOwnership, PrefixCoalescingReusesConsumedDestinationTail) {
 
 TEST(BufferOwnership, SpanAppendDoesNotCoalesceAcrossUdpBoundary) {
     auto bytes = Pattern(100);
-    const TargetAddress endpoint{"127.0.0.1", 1234};
+    const common::TargetAddress endpoint{"127.0.0.1", 1234};
     auto udp = buf::MultiBuffer{Buffer(1)};
     udp.back()->SetUDP(endpoint);
     EXPECT_TRUE(buf::AppendSpanToMultiBuffer(bytes, udp) && udp.size() == 2 &&
@@ -327,7 +327,7 @@ TEST(BufferOwnership, PartialConsumptionReleasesConsumedBlocksWithoutCopyingPayl
     for (size_t i = 0; i < 4096; ++i)
         payload.push_back(Buffer(1, static_cast<uint8_t>(i)));
     auto* const last = payload.back();
-    const ::TargetAddress endpoint{"127.0.0.1", 1234};
+    const ::common::TargetAddress endpoint{"127.0.0.1", 1234};
     last->SetUDP(endpoint);
 
     EXPECT_EQ(payload.DropPrefixBytes(4096 - ::buf::MultiBuffer::kInlineCapacity),
@@ -437,7 +437,7 @@ TEST(BufferOwnership, CoalescingPreparesNewSlotsBeforeChangingBytesOrUdpBoundari
     for (uint8_t value = 0x80; value < 0x84; ++value)
         source.push_back(Buffer(value == 0x81 ? 0 : 1, value));
     auto* const datagram = *(source.begin() + 1);
-    const TargetAddress endpoint{"127.0.0.1", 4321};
+    const common::TargetAddress endpoint{"127.0.0.1", 4321};
     datagram->SetUDP(endpoint);
     const auto before = Flatten(target);
     const auto added = Flatten(source);
@@ -472,12 +472,12 @@ TEST(BufferOwnership, EmptyUdpMessageSurvivesTransfersAndChecksEveryTarget) {
     stream_empty.ReleaseIfIdle();
     EXPECT_TRUE(stream_empty.empty());
 
-    const TargetAddress first_target{"127.0.0.1", 1234};
-    const TargetAddress second_target{"127.0.0.1", 4321};
+    const common::TargetAddress first_target{"127.0.0.1", 1234};
+    const common::TargetAddress second_target{"127.0.0.1", 4321};
     buf::MultiBuffer packet;
     ASSERT_TRUE(buf::SetUdpTarget(packet, first_target));
     const auto* original = *packet.begin();
-    InitialPayload initial(std::move(packet));
+    common::InitialPayload initial(std::move(packet));
     EXPECT_FALSE(initial.empty());
     auto moved = std::move(initial).MoveToMultiBuffer();
     moved.ReleaseIfIdle();

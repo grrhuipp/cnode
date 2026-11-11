@@ -5,6 +5,8 @@
 #include <utility>
 
 
+namespace common {
+
 struct TransparentStringHash {
     using is_transparent = void;
 
@@ -31,4 +33,6 @@ template<class Map>
     using Key = typename Map::key_type;
     return map.try_emplace(Key{key});
 }
+
+}  // namespace common
 

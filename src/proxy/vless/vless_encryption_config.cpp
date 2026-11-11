@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-namespace vless {
+namespace proxy::vless {
 namespace {
 
 constexpr std::string_view kEncryptionName = "mlkem768x25519plus";
@@ -29,7 +29,7 @@ constexpr size_t kMinKeyPartLength = 20;
 using ParseStep = tl::expected<void, VlessEncryptionParseError>;
 
 [[nodiscard]] bool IsNoVlessEncryption(std::string_view value) noexcept {
-    return value.empty() || EqualsAsciiCI(value, "none");
+    return value.empty() || common::EqualsAsciiCI(value, "none");
 }
 
 [[nodiscard]] bool ParseInt(std::string_view value, int64_t& out) noexcept {
@@ -59,13 +59,13 @@ using ParseStep = tl::expected<void, VlessEncryptionParseError>;
 
 [[nodiscard]] std::optional<VlessEncryptionMode> ParseMode(
     std::string_view value) noexcept {
-    if (EqualsAsciiCI(value, "native")) {
+    if (common::EqualsAsciiCI(value, "native")) {
         return VlessEncryptionMode::Native;
     }
-    if (EqualsAsciiCI(value, "xorpub")) {
+    if (common::EqualsAsciiCI(value, "xorpub")) {
         return VlessEncryptionMode::XorPub;
     }
-    if (EqualsAsciiCI(value, "random")) {
+    if (common::EqualsAsciiCI(value, "random")) {
         return VlessEncryptionMode::Random;
     }
     return std::nullopt;
@@ -89,11 +89,11 @@ using ParseStep = tl::expected<void, VlessEncryptionParseError>;
 
 [[nodiscard]] ParseStep ParseRtt(std::string_view value,
                                  VlessEncryptionConfig& config) noexcept {
-    if (EqualsAsciiCI(value, "1rtt")) {
+    if (common::EqualsAsciiCI(value, "1rtt")) {
         config.zero_rtt = false;
         return {};
     }
-    if (EqualsAsciiCI(value, "0rtt")) {
+    if (common::EqualsAsciiCI(value, "0rtt")) {
         config.zero_rtt = true;
         return {};
     }
@@ -170,9 +170,9 @@ using ParseStep = tl::expected<void, VlessEncryptionParseError>;
 
 [[nodiscard]] ParseStep ParseKey(std::string_view part,
                                  VlessEncryptionConfig& config) {
-    std::vector<uint8_t> key(Base64UrlDecodedSize(part.size()));
-    ScopedCleanse cleanse_key{key};
-    if (!DecodeBase64Url(part, key)) {
+    std::vector<uint8_t> key(common::Base64UrlDecodedSize(part.size()));
+    common::ScopedCleanse cleanse_key{key};
+    if (!common::DecodeBase64Url(part, key)) {
         return tl::unexpected(VlessEncryptionParseError::InvalidBase64);
     }
     return config.role == VlessEncryptionRole::Client
@@ -229,7 +229,7 @@ using ParseStep = tl::expected<void, VlessEncryptionParseError>;
     if (parts.size() < 4) {
         return tl::unexpected(VlessEncryptionParseError::TooFewParts);
     }
-    if (!EqualsAsciiCI(parts[0], kEncryptionName)) {
+    if (!common::EqualsAsciiCI(parts[0], kEncryptionName)) {
         return tl::unexpected(VlessEncryptionParseError::UnsupportedName);
     }
 
@@ -312,4 +312,4 @@ std::string_view VlessEncryptionParseErrorMessage(
     return "unknown error";
 }
 
-}  // namespace vless
+}  // namespace proxy::vless

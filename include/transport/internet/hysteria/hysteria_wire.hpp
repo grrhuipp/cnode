@@ -45,12 +45,12 @@ struct V1ClientHello {
 
 struct V1Request {
     bool udp = false;
-    TargetAddress target;
+    common::TargetAddress target;
     size_t header_bytes = 0;
 };
 
 struct V2TcpRequest {
-    TargetAddress target;
+    common::TargetAddress target;
     size_t header_bytes = 0;
 };
 
@@ -59,7 +59,7 @@ struct UdpMessage {
     uint16_t packet_id = 0;
     uint8_t fragment_id = 0;
     uint8_t fragment_count = 1;
-    TargetAddress target;
+    common::TargetAddress target;
     std::span<const uint8_t> payload;
 };
 
@@ -84,7 +84,7 @@ ParseUdpMessage(Version version, std::span<const uint8_t> input);
 
 // V2 的空目标按无地址续片计长；是否必须带目标仍由报文语义校验决定。
 [[nodiscard]] tl::expected<size_t, ProtocolError>
-UdpMessageHeaderSize(Version version, const TargetAddress& target);
+UdpMessageHeaderSize(Version version, const common::TargetAddress& target);
 
 // 输出归属当前分配域，可直接移动到连接的待发送队列。
 [[nodiscard]] tl::expected<memory::ByteVector, ProtocolError>
@@ -102,7 +102,7 @@ struct UdpTargetText {
 };
 
 [[nodiscard]] tl::expected<UdpTargetText, ProtocolError> PrepareUdpTargetText(
-    Version version, const TargetAddress& target,
+    Version version, const common::TargetAddress& target,
     std::optional<iputil::AddressText>& address_storage);
 
 [[nodiscard]] tl::expected<size_t, ProtocolError>

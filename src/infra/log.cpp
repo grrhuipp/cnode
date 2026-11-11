@@ -36,6 +36,8 @@
 #include <vector>
 
 
+namespace infra {
+
 std::atomic<LogLevel> Log::min_level_{LogLevel::INFO};
 std::atomic_bool Log::initialized_{false};
 
@@ -103,7 +105,7 @@ std::string_view LevelName(LogLevel level) noexcept {
 }
 
 std::string FormatConsoleTimestamp(int64_t timestamp_us) {
-    const auto tm = LocalTime(static_cast<std::time_t>(timestamp_us / 1'000'000));
+    const auto tm = common::LocalTime(static_cast<std::time_t>(timestamp_us / 1'000'000));
     char buffer[48]{};
     const auto written = std::strftime(
         buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S%z", &tm);
@@ -354,7 +356,7 @@ private:
     void AppendTimestamp(int64_t timestamp_us) {
         const auto seconds = timestamp_us / 1'000'000;
         if (!has_cached_second_ || seconds != cached_second_) {
-            const auto tm = LocalTime(static_cast<std::time_t>(seconds));
+            const auto tm = common::LocalTime(static_cast<std::time_t>(seconds));
             second_prefix_size_ = std::strftime(
                 second_prefix_.data(), second_prefix_.size(), "%Y/%m/%d %H:%M:%S", &tm);
             cached_second_ = seconds;
@@ -381,7 +383,7 @@ private:
 };
 
 std::string DateString(std::chrono::system_clock::time_point now) {
-    return FormatLocalTime(now, "%Y-%m-%d");
+    return common::FormatLocalTime(now, "%Y-%m-%d");
 }
 
 // Next local day boundary; tm_isdst = -1 lets mktime resolve DST changes.
@@ -389,7 +391,7 @@ std::string DateString(std::chrono::system_clock::time_point now) {
 // clock step still rotates before the next record is written.
 std::chrono::system_clock::time_point NextLocalMidnight(
     std::chrono::system_clock::time_point now) {
-    auto tm = LocalTime(std::chrono::system_clock::to_time_t(now));
+    auto tm = common::LocalTime(std::chrono::system_clock::to_time_t(now));
     tm.tm_mday += 1;
     tm.tm_hour = 0;
     tm.tm_min = 0;
@@ -787,7 +789,7 @@ private:
             return;
         }
         if (output.fd >= 0) {
-            Send(output, FormatConsoleRecord(NowMicros(), LogLevel::ERROR, text) + '\n');
+            Send(output, FormatConsoleRecord(common::NowMicros(), LogLevel::ERROR, text) + '\n');
             ::close(output.fd);
         }
     }
@@ -813,7 +815,7 @@ private:
                 "console queue/write-failure dropped {} records; stdout_failed={} stderr_failed={} stdout_partial_record={} stderr_partial_record={}",
                 unreported_drops_, stdout_.failed, error_output_->failed,
                 stdout_.partial_write, error_output_->partial_write);
-            auto line = FormatConsoleRecord(NowMicros(), LogLevel::WARN, message) + '\n';
+            auto line = FormatConsoleRecord(common::NowMicros(), LogLevel::WARN, message) + '\n';
             if (Send(*error_output_, line)) unreported_drops_ = 0;
         }
     }
@@ -862,7 +864,7 @@ private:
 AsyncConsole g_console;
 
 void WriteStderrFallback(LogLevel level, std::string_view msg) {
-    g_console.Enqueue(FormatConsoleRecord(NowMicros(), level, msg), true);
+    g_console.Enqueue(FormatConsoleRecord(common::NowMicros(), level, msg), true);
 }
 
 class AsyncLogBackend {
@@ -1269,7 +1271,7 @@ private:
         LogRecord record{
             .channel = LogChannel::Error,
             .level = level,
-            .timestamp_us = NowMicros(),
+            .timestamp_us = common::NowMicros(),
             .message = std::move(msg),
             .source_file = "src/infra/log.cpp",
             .connection = std::nullopt,
@@ -1440,7 +1442,7 @@ void Log::WriteSystem(LogLevel level,
     g_async_log_backend.Enqueue(LogRecord{
         .channel = LogChannel::Error,
         .level = level,
-        .timestamp_us = NowMicros(),
+        .timestamp_us = common::NowMicros(),
         .message = std::move(message),
         .source_file = location.file_name(),
         .connection = std::nullopt,
@@ -1456,7 +1458,7 @@ void Log::WriteConnection(LogLevel level,
     g_async_log_backend.Enqueue(LogRecord{
         .channel = LogChannel::Error,
         .level = level,
-        .timestamp_us = NowMicros(),
+        .timestamp_us = common::NowMicros(),
         .message = std::move(message),
         .source_file = location.file_name(),
         .connection = std::nullopt,
@@ -1473,7 +1475,7 @@ void Log::WriteConnection(LogLevel level,
     g_async_log_backend.Enqueue(LogRecord{
         .channel = LogChannel::Error,
         .level = level,
-        .timestamp_us = NowMicros(),
+        .timestamp_us = common::NowMicros(),
         .message = std::move(message),
         .source_file = location.file_name(),
         .connection = std::move(context),
@@ -1485,7 +1487,7 @@ void Log::WriteAccess(std::string message) {
     g_async_log_backend.Enqueue(LogRecord{
         .channel = LogChannel::Access,
         .level = LogLevel::INFO,
-        .timestamp_us = NowMicros(),
+        .timestamp_us = common::NowMicros(),
         .message = std::move(message),
         .source_file = {},
         .connection = std::nullopt,
@@ -1499,7 +1501,7 @@ void Log::WriteConsole(LogLevel level,
     // ordinary diagnostic macros perform the configured severity check first.
     if (level != LogLevel::ERROR && !ShouldLog(level)) return;
     if (message.empty()) return;
-    const int64_t timestamp_us = NowMicros();
+    const int64_t timestamp_us = common::NowMicros();
     auto console_line = FormatConsoleRecord(timestamp_us, level, message);
     if (level >= LogLevel::WARN && ShouldLog(level) &&
         initialized_.load(std::memory_order_acquire)) {
@@ -1522,7 +1524,7 @@ void Log::WritePanel(LogLevel level,
     if (!ShouldLog(level)) return;
     const bool initialized = initialized_.load(std::memory_order_acquire);
     if (level < LogLevel::INFO && !initialized) return;
-    const int64_t timestamp_us = NowMicros();
+    const int64_t timestamp_us = common::NowMicros();
     if ((level < LogLevel::INFO || level >= LogLevel::WARN) && initialized) {
         auto diagnostic = context.node_id > 0
             ? std::format("[{}/{}] {}", context.name, context.node_id, message)
@@ -1563,4 +1565,6 @@ bool Log::ShouldLog(LogLevel level) noexcept {
     if (min_level == LogLevel::NONE) return false;
     return level >= min_level;
 }
+
+}  // namespace infra
 

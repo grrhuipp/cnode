@@ -2,19 +2,19 @@
 #include "proxy/shadowsocks/ss_stream.hpp"
 
 namespace proxy::shadowsocks::outbound {
-class Handler final : public ::Outbound {
+class Handler final : public ::proxy::Outbound {
 public:
     explicit Handler(std::shared_ptr<const PreparedSettings> prepared);
 
     ~Handler() noexcept override = default;
 
-    ::net::awaitable<::OutboundProcessResult> Process(
+    ::net::awaitable<::proxy::OutboundProcessResult> Process(
         ::session::Context& ctx,
         ::transport::Link inbound,
-        ::OutboundDialer& dialer,
-        const ::TimeoutsConfig& timeouts,
-        ::StatsShard& stats,
-        const ::RelayConfig& relay_config,
+        ::transport::internet::OutboundDialer& dialer,
+        const ::infra::TimeoutsConfig& timeouts,
+        ::app::StatsShard& stats,
+        const ::app::RelayConfig& relay_config,
         ::buf::MultiBufferBatch first_payload) override;
 
 private:
@@ -53,7 +53,7 @@ private:
 #include <format>
 
 
-namespace ss {
+namespace proxy::shadowsocks {
 
 namespace {
 
@@ -118,13 +118,13 @@ bool WriteIdentityHeadersTo(const SsCipherInfo& cipher_info,
     return true;
 }
 
-tl::expected<void, ErrorCode> AppendHandshakeRecord(
+tl::expected<void, common::ErrorCode> AppendHandshakeRecord(
     SsAeadCipher& cipher, uint64_t nonce, std::span<const uint8_t> plaintext, buf::Buffer& output) {
     if (output.Available() < plaintext.size() + SsAeadCipher::kTagSize)
-        return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
     const auto nonce_bytes = MakeNonce(nonce);
     if (!cipher.Encrypt(nonce_bytes.data(), plaintext.data(), plaintext.size(), output.Tail().data()))
-        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     output.Produce(static_cast<uint32_t>(plaintext.size() + SsAeadCipher::kTagSize));
     return {};
 }
@@ -135,62 +135,62 @@ struct PreparedTCPRequestHandshake {
     KeyBytes request_salt;
 };
 
-tl::expected<PreparedTCPRequestHandshake, ErrorCode>
-PrepareTCPRequest2022(const TargetAddress& target,
+tl::expected<PreparedTCPRequestHandshake, common::ErrorCode>
+PrepareTCPRequest2022(const common::TargetAddress& target,
                       const SsCipherInfo& cipher_info,
                       const KeyBytes& master_key,
                       std::span<const KeyBytes> psk_chain,
-                      ForwardedMetadataView forwarded) {
+                      common::ForwardedMetadataView forwarded) {
     if (cipher_info.salt_size > KeyBytes::kMaxSize ||
         cipher_info.key_size > KeyBytes::kMaxSize ||
         master_key.size < cipher_info.key_size) {
-        return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+        return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
     }
     if (psk_chain.empty()) {
         psk_chain = std::span<const KeyBytes>(&master_key, 1);
     }
 
-    std::array<uint8_t, kMaxEncodedAddressSize> addr_bytes{};
-    const size_t addr_size = EncodeAddressTo(
-        target, addr_bytes.data(), addr_bytes.size(), AddressWireFormat::Socks5, forwarded);
+    std::array<uint8_t, common::kMaxEncodedAddressSize> addr_bytes{};
+    const size_t addr_size = common::EncodeAddressTo(
+        target, addr_bytes.data(), addr_bytes.size(), common::AddressWireFormat::Socks5, forwarded);
     if (addr_size == 0) {
-        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
     constexpr size_t kPaddingLen = 1;
     const size_t variable_len = addr_size + 2 + kPaddingLen;
     if (variable_len > kSs2022MaxChunkPayload) {
-        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
     PreparedTCPRequestHandshake prepared;
     prepared.request_salt.size = cipher_info.salt_size;
     if (RAND_bytes(prepared.request_salt.data(),
                    static_cast<int>(prepared.request_salt.size)) != 1) {
-        return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
 
     std::array<uint8_t, 32> write_subkey{};
-    ScopedCleanse cleanse_write_subkey{write_subkey};
+    common::ScopedCleanse cleanse_write_subkey{write_subkey};
     if (!Derive2022Subkey(master_key.data(), cipher_info.key_size,
                           prepared.request_salt.data(), prepared.request_salt.size,
                           write_subkey.data())) {
-        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
     std::array<uint8_t, kSs2022RequestFixedHeaderSize> fixed_plain{};
     fixed_plain[0] = 0;
-    StoreU64BE(fixed_plain.data() + 1, UnixSecondsNow());
-    StoreU16BE(fixed_plain.data() + 9, static_cast<uint16_t>(variable_len));
+    common::StoreU64BE(fixed_plain.data() + 1, UnixSecondsNow());
+    common::StoreU16BE(fixed_plain.data() + 9, static_cast<uint16_t>(variable_len));
 
     constexpr size_t kMaxVariablePlain =
-        kMaxEncodedAddressSize + 2 + kPaddingLen;
+        common::kMaxEncodedAddressSize + 2 + kPaddingLen;
     std::array<uint8_t, kMaxVariablePlain> variable_plain{};
     std::memcpy(variable_plain.data(), addr_bytes.data(), addr_size);
-    StoreU16BE(variable_plain.data() + addr_size, static_cast<uint16_t>(kPaddingLen));
+    common::StoreU16BE(variable_plain.data() + addr_size, static_cast<uint16_t>(kPaddingLen));
     if (RAND_bytes(variable_plain.data() + addr_size + 2, static_cast<int>(kPaddingLen)) != 1) {
         OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
-        return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
 
     prepared.write_cipher.emplace(cipher_info.type, write_subkey.data(), cipher_info.key_size);
@@ -201,12 +201,12 @@ PrepareTCPRequest2022(const TargetAddress& target,
         fixed_plain.size() + SsAeadCipher::kTagSize +
         variable_len + SsAeadCipher::kTagSize;
     if (handshake_size > buf::Buffer::kSize) {
-        return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
     }
 
     buf::BufferGuard handshake{buf::Buffer::New()};
     if (!handshake) {
-        return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
     }
 
     std::memcpy(handshake->Tail().data(),
@@ -222,7 +222,7 @@ PrepareTCPRequest2022(const TargetAddress& target,
             handshake->Tail().data(),
             handshake->Available(),
             identity_len)) {
-        return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+        return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
     }
     handshake->Produce(static_cast<uint32_t>(identity_len));
 
@@ -236,39 +236,39 @@ PrepareTCPRequest2022(const TargetAddress& target,
     return prepared;
 }
 
-tl::expected<PreparedTCPRequestHandshake, ErrorCode>
-PrepareTCPRequestLegacy(const TargetAddress& target,
+tl::expected<PreparedTCPRequestHandshake, common::ErrorCode>
+PrepareTCPRequestLegacy(const common::TargetAddress& target,
                         const SsCipherInfo& cipher_info,
                         const KeyBytes& master_key,
-                        ForwardedMetadataView forwarded) {
+                        common::ForwardedMetadataView forwarded) {
     if (cipher_info.salt_size > KeyBytes::kMaxSize || cipher_info.key_size > KeyBytes::kMaxSize ||
         master_key.size < cipher_info.key_size) {
-        return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+        return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
     }
 
-    std::array<uint8_t, kMaxEncodedAddressSize> addr_bytes{};
-    const size_t addr_size = EncodeAddressTo(
-        target, addr_bytes.data(), addr_bytes.size(), AddressWireFormat::Socks5, forwarded);
+    std::array<uint8_t, common::kMaxEncodedAddressSize> addr_bytes{};
+    const size_t addr_size = common::EncodeAddressTo(
+        target, addr_bytes.data(), addr_bytes.size(), common::AddressWireFormat::Socks5, forwarded);
     if (addr_size == 0 || addr_size > kMaxChunkPayload) {
-        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
     std::array<uint8_t, 64> client_salt{};
     if (RAND_bytes(client_salt.data(), static_cast<int>(cipher_info.salt_size)) != 1) {
-        return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
 
     std::array<uint8_t, 64> write_subkey{};
-    ScopedCleanse cleanse_legacy{client_salt, write_subkey};
+    common::ScopedCleanse cleanse_legacy{client_salt, write_subkey};
     if (!DeriveSubkey(master_key.data(), cipher_info.key_size,
                       client_salt.data(), cipher_info.salt_size,
                       write_subkey.data())) {
-        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
     buf::BufferGuard out{buf::Buffer::New()};
     if (!out) {
-        return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
     }
 
     std::memcpy(out->Tail().data(), client_salt.data(), cipher_info.salt_size);
@@ -293,13 +293,13 @@ PrepareTCPRequestLegacy(const TargetAddress& target,
     return prepared;
 }
 
-net::awaitable<tl::expected<WriteTCPRequestResult, ErrorCode>>
-WriteTCPRequest2022(const TargetAddress& target,
+net::awaitable<tl::expected<WriteTCPRequestResult, common::ErrorCode>>
+WriteTCPRequest2022(const common::TargetAddress& target,
                     const SsCipherInfo& cipher_info,
                     const KeyBytes& master_key,
                     std::span<const KeyBytes> psk_chain,
-                    AsyncStream& stream,
-                    ForwardedMetadataView forwarded) {
+                    transport::AsyncStream& stream,
+                    common::ForwardedMetadataView forwarded) {
     buf::MultiBuffer handshake_mb;
     std::optional<SsAeadCipher> write_cipher;
     KeyBytes request_salt;
@@ -317,7 +317,7 @@ WriteTCPRequest2022(const TargetAddress& target,
         co_await stream.WriteMultiBuffer(std::move(handshake_mb));
     } catch (...) {
         co_return tl::unexpected(transport::ClassifyFailure(
-            std::current_exception(), ErrorCode::SOCKET_WRITE_FAILED));
+            std::current_exception(), common::ErrorCode::SOCKET_WRITE_FAILED));
     }
 
     co_return WriteTCPRequestResult{
@@ -328,13 +328,13 @@ WriteTCPRequest2022(const TargetAddress& target,
 
 }  // namespace
 
-net::awaitable<tl::expected<WriteTCPRequestResult, ErrorCode>>
-WriteTCPRequest(const TargetAddress& target,
+net::awaitable<tl::expected<WriteTCPRequestResult, common::ErrorCode>>
+WriteTCPRequest(const common::TargetAddress& target,
                 const SsCipherInfo& cipher_info,
                 const KeyBytes& master_key,
                 std::span<const KeyBytes> psk_chain,
-                AsyncStream& stream,
-                ForwardedMetadataView forwarded) {
+                transport::AsyncStream& stream,
+                common::ForwardedMetadataView forwarded) {
     if (Is2022Cipher(cipher_info.type)) {
         co_return co_await WriteTCPRequest2022(
             target, cipher_info, master_key, psk_chain, stream, forwarded);
@@ -357,7 +357,7 @@ WriteTCPRequest(const TargetAddress& target,
             co_await stream.WriteMultiBuffer(std::move(handshake_mb));
         } catch (...) {
             co_return tl::unexpected(transport::ClassifyFailure(
-                std::current_exception(), ErrorCode::SOCKET_WRITE_FAILED));
+                std::current_exception(), common::ErrorCode::SOCKET_WRITE_FAILED));
         }
 
         co_return WriteTCPRequestResult{
@@ -366,39 +366,39 @@ WriteTCPRequest(const TargetAddress& target,
         };
     } catch (...) {
         co_return tl::unexpected(transport::ClassifyFailure(
-            std::current_exception(), ErrorCode::SOCKET_WRITE_FAILED));
+            std::current_exception(), common::ErrorCode::SOCKET_WRITE_FAILED));
     }
 }
 
 namespace {
-net::awaitable<tl::expected<SsAeadCipher, ErrorCode>> ReadResponseCipher(
-    AsyncStream& stream, const SsCipherInfo& info, const KeyBytes& master_key) {
+net::awaitable<tl::expected<SsAeadCipher, common::ErrorCode>> ReadResponseCipher(
+    transport::AsyncStream& stream, const SsCipherInfo& info, const KeyBytes& master_key) {
     std::array<uint8_t, KeyBytes::kMaxSize> salt{}, key{};
-    ScopedCleanse cleanse{salt, key};
+    common::ScopedCleanse cleanse{salt, key};
     auto read = co_await proxy::ReadHandshakeExact(stream,
         std::span(salt).first(info.salt_size), proxy::HandshakeProgress::NotStarted);
     if (!read) co_return tl::unexpected(read.error());
     const auto derive = Is2022Cipher(info.type) ? Derive2022Subkey : DeriveSubkey;
     if (!derive(master_key.data(), info.key_size, salt.data(), info.salt_size, key.data()))
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     co_return SsAeadCipher(info.type, key.data(), info.key_size);
 }
 }  // namespace
 
-net::awaitable<tl::expected<ReadTCPResponseResult, ErrorCode>>
+net::awaitable<tl::expected<ReadTCPResponseResult, common::ErrorCode>>
 ReadTCPResponse(const SsCipherInfo& cipher_info,
                 const KeyBytes& master_key,
                 const KeyBytes& request_salt,
-                AsyncStream& stream) {
+                transport::AsyncStream& stream) {
     if (cipher_info.salt_size > 64 || cipher_info.key_size > 64 ||
         master_key.size < cipher_info.key_size) {
-        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+        co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
     }
 
     try {
         if (Is2022Cipher(cipher_info.type)) {
             if (request_salt.size != cipher_info.salt_size) {
-                co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+                co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
             }
 
             auto cipher = co_await ReadResponseCipher(stream, cipher_info, master_key);
@@ -409,7 +409,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
             constexpr size_t kFixedCipherMaxSize =
                 kFixedPlainMaxSize + SsAeadCipher::kTagSize;
             if (fixed_plain_size > kFixedPlainMaxSize) {
-                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
             }
             std::array<uint8_t, kFixedCipherMaxSize> fixed_cipher{};
             const size_t fixed_cipher_size = fixed_plain_size + SsAeadCipher::kTagSize;
@@ -419,22 +419,22 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
             }
 
             std::array<uint8_t, kFixedPlainMaxSize> fixed_plain{};
-            ScopedCleanse cleanse_fixed_plain{fixed_plain};
+            common::ScopedCleanse cleanse_fixed_plain{fixed_plain};
             auto nonce0 = MakeNonce(0);
             if (!read_cipher.Decrypt(nonce0.data(), fixed_cipher.data(), fixed_cipher_size,
                                      fixed_plain.data())) {
-                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
             }
             if (fixed_plain[0] != 1 ||
-                !TimestampFresh(LoadU64BE(fixed_plain.data() + 1), UnixSecondsNow()) ||
+                !TimestampFresh(common::LoadU64BE(fixed_plain.data() + 1), UnixSecondsNow()) ||
                 std::memcmp(fixed_plain.data() + 9,
                             request_salt.data(),
                             request_salt.size) != 0) {
-                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
             }
 
             const uint16_t payload_len =
-                LoadU16BE(fixed_plain.data() + 9 + cipher_info.salt_size);
+                common::LoadU16BE(fixed_plain.data() + 9 + cipher_info.salt_size);
             buf::MultiBuffer pending;
             uint64_t next_nonce = 1;
             if (payload_len > 0) {
@@ -459,42 +459,42 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
             detail::BodyReader(std::move(read_cipher), 0, stream), {}};
     } catch (...) {
         co_return tl::unexpected(transport::ClassifyFailure(
-            std::current_exception(), ErrorCode::SOCKET_READ_FAILED));
+            std::current_exception(), common::ErrorCode::SOCKET_READ_FAILED));
     }
 }
 
-}  // namespace ss
+}  // namespace proxy::shadowsocks
 
 namespace {
 
 class ShadowsocksOutboundEndpoint final : public proxy::OutboundStreamEndpointBase {
 public:
     struct PendingResponseState {
-        ss::SsCipherInfo cipher_info;
-        ss::KeyBytes master_key;
-        ss::KeyBytes request_salt;
+        proxy::shadowsocks::SsCipherInfo cipher_info;
+        proxy::shadowsocks::KeyBytes master_key;
+        proxy::shadowsocks::KeyBytes request_salt;
 
-        PendingResponseState(const ss::SsCipherInfo& info,
-                             const ss::KeyBytes& key,
-                             const ss::KeyBytes& salt)
+        PendingResponseState(const proxy::shadowsocks::SsCipherInfo& info,
+                             const proxy::shadowsocks::KeyBytes& key,
+                             const proxy::shadowsocks::KeyBytes& salt)
             : cipher_info(info), master_key(key), request_salt(salt) {}
 
         PendingResponseState(const PendingResponseState&) = delete;
         PendingResponseState& operator=(const PendingResponseState&) = delete;
     };
 
-    ShadowsocksOutboundEndpoint(ss::SsStreamWriter request_writer,
-                                const ss::SsCipherInfo& cipher_info,
-                                const ss::KeyBytes& master_key,
-                                const ss::KeyBytes& request_salt,
-                                AsyncStream& stream)
+    ShadowsocksOutboundEndpoint(proxy::shadowsocks::SsStreamWriter request_writer,
+                                const proxy::shadowsocks::SsCipherInfo& cipher_info,
+                                const proxy::shadowsocks::KeyBytes& master_key,
+                                const proxy::shadowsocks::KeyBytes& request_salt,
+                                transport::AsyncStream& stream)
         : OutboundStreamEndpointBase(stream)
         , request_writer_(std::move(request_writer))
         , response_state_(std::in_place_type<PendingResponseState>,
                           cipher_info, master_key, request_salt) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (auto* reader = std::get_if<ss::detail::BodyReader>(&response_state_)) {
+        if (auto* reader = std::get_if<proxy::shadowsocks::detail::BodyReader>(&response_state_)) {
             return reader->ReadMultiBuffer();
         }
         return ReadInitialMultiBuffer();
@@ -512,14 +512,14 @@ public:
         return request_writer_.AsyncShutdownWrite();
     }
 
-    operator AsyncStream&() noexcept {
+    operator transport::AsyncStream&() noexcept {
         return stream_;
     }
 
 private:
     net::awaitable<buf::MultiBuffer> ReadInitialMultiBuffer() {
         if (auto* pending = std::get_if<PendingResponseState>(&response_state_)) {
-            auto reader_result = co_await ss::ReadTCPResponse(
+            auto reader_result = co_await proxy::shadowsocks::ReadTCPResponse(
                 pending->cipher_info, pending->master_key, pending->request_salt, stream_);
             if (!reader_result) {
                 OPENSSL_cleanse(pending->master_key.bytes.data(), pending->master_key.bytes.size());
@@ -528,44 +528,44 @@ private:
                 pending->request_salt.size = 0;
                 throw transport::LinkError(reader_result.error());
             }
-            response_state_.emplace<ss::detail::BodyReader>(std::move(reader_result->reader));
+            response_state_.emplace<proxy::shadowsocks::detail::BodyReader>(std::move(reader_result->reader));
             if (reader_result->initial_payload.byte_size() != 0)
                 co_return std::move(reader_result->initial_payload);
         }
-        co_return co_await std::get<ss::detail::BodyReader>(response_state_).ReadMultiBuffer();
+        co_return co_await std::get<proxy::shadowsocks::detail::BodyReader>(response_state_).ReadMultiBuffer();
     }
 
-    ss::SsStreamWriter request_writer_;
-    std::variant<PendingResponseState, ss::detail::BodyReader> response_state_;
+    proxy::shadowsocks::SsStreamWriter request_writer_;
+    std::variant<PendingResponseState, proxy::shadowsocks::detail::BodyReader> response_state_;
 };
 
-TargetAddress MakeServerTarget(const OutboundServer& server) {
+common::TargetAddress MakeServerTarget(const transport::internet::OutboundServer& server) {
     if (server.literal_address) {
-        return TargetAddress(*server.literal_address, server.port);
+        return common::TargetAddress(*server.literal_address, server.port);
     }
-    return TargetAddress(std::string_view(server.address.data(), server.address.size()),
+    return common::TargetAddress(std::string_view(server.address.data(), server.address.size()),
                          server.port);
 }
 
 
-net::awaitable<tl::expected<ss::WriteTCPRequestResult, ErrorCode>>
+net::awaitable<tl::expected<proxy::shadowsocks::WriteTCPRequestResult, common::ErrorCode>>
 SendShadowsocksHandshake(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     const proxy::shadowsocks::outbound::PreparedSettings& prepared,
     bool use_uot,
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     std::chrono::seconds handshake_timeout,
-    const PhaseDeadlineHandle& outbound_protocol_deadline,
-    const OutboundDialer& dialer,
+    const transport::PhaseDeadlineHandle& outbound_protocol_deadline,
+    const transport::internet::OutboundDialer& dialer,
     const session::Context& ctx) {
-    const TargetAddress uot_magic_target = use_uot
-        ? TargetAddress(proxy::uot::MagicAddress(*prepared.config.uot_version), 0)
-        : TargetAddress{};
-    const TargetAddress& protocol_target = use_uot ? uot_magic_target : target;
+    const common::TargetAddress uot_magic_target = use_uot
+        ? common::TargetAddress(proxy::uot::MagicAddress(*prepared.config.uot_version), 0)
+        : common::TargetAddress{};
+    const common::TargetAddress& protocol_target = use_uot ? uot_magic_target : target;
 
     stream.SetIdleTimeout(handshake_timeout);
 
-    auto request_writer_result = co_await ss::WriteTCPRequest(
+    auto request_writer_result = co_await proxy::shadowsocks::WriteTCPRequest(
         protocol_target,
         prepared.credentials.Cipher(),
         prepared.credentials.MasterKey(),
@@ -577,18 +577,18 @@ SendShadowsocksHandshake(
             stream, outbound_protocol_deadline);
         stream.Cancel();
         co_return tl::unexpected(timed_out
-            ? ErrorCode::TIMEOUT
+            ? common::ErrorCode::TIMEOUT
             : request_writer_result.error());
     }
     co_return std::move(*request_writer_result);
 }
 
-net::awaitable<tl::expected<void, ErrorCode>>
+net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteUotRequest(
     ShadowsocksOutboundEndpoint& target_endpoint,
-    const TargetAddress& target,
-    const PhaseDeadlineHandle& outbound_protocol_deadline,
-    const OutboundDialer& dialer,
+    const common::TargetAddress& target,
+    const transport::PhaseDeadlineHandle& outbound_protocol_deadline,
+    const transport::internet::OutboundDialer& dialer,
     const session::Context& ctx) {
     auto request = proxy::uot::EncodeRequest(
         false, target, dialer.ForwardedMetadata(ctx));
@@ -601,40 +601,40 @@ WriteUotRequest(
     try {
         co_await target_endpoint.WriteBuffers(request_buffers);
     } catch (...) {
-        const ErrorCode code = proxy::ClassifyOutboundHandshakeException(
+        const common::ErrorCode code = proxy::ClassifyOutboundHandshakeException(
             target_endpoint, outbound_protocol_deadline);
         target_endpoint.Cancel();
         co_return tl::unexpected(code);
     }
-    co_return tl::expected<void, ErrorCode>{};
+    co_return tl::expected<void, common::ErrorCode>{};
 }
 }  // namespace
 
-net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Process(
+net::awaitable<proxy::OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Process(
     session::Context& ctx,
     transport::Link inbound,
-    OutboundDialer& dialer,
-    const TimeoutsConfig& timeouts,
-    StatsShard& stats,
-    const RelayConfig& relay_config,
+    transport::internet::OutboundDialer& dialer,
+    const infra::TimeoutsConfig& timeouts,
+    app::StatsShard& stats,
+    const app::RelayConfig& relay_config,
     buf::MultiBufferBatch first_payload) {
     if (!inbound.Valid()) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const auto& server = prepared_->config.server;
     const bool use_uot =
-        ctx.content.network == Network::UDP && prepared_->config.uot_version.has_value();
+        ctx.content.network == common::Network::UDP && prepared_->config.uot_version.has_value();
 
-    if (ctx.content.network == Network::UDP && !use_uot) {
+    if (ctx.content.network == common::Network::UDP && !use_uot) {
         auto server_target = MakeServerTarget(server);
         if (!server_target.IsValid()) {
-            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
         std::optional<UdpRequest> target_endpoint;
         if (auto opened = dialer.OpenDatagram(
                 ctx,
-                OutboundDialer::DatagramRemote{
+                transport::internet::OutboundDialer::DatagramRemote{
                     .address = server.literal_address,
                     .family_hint = {},
                     .family_policy = {},
@@ -650,7 +650,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
         }
         target_endpoint->SetIdleTimeout(relay_config.idle_timeout);
         target_endpoint->SetWriteTimeout(relay_config.write_timeout);
-        co_return co_await DoRelayLink(
+        co_return co_await app::DoRelayLink(
             dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
             *target_endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
@@ -662,7 +662,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     auto stream = std::move(*dialed);
     std::optional<ShadowsocksOutboundEndpoint> target_endpoint;
     {
-        PhaseDeadlineHandle outbound_protocol_deadline =
+        transport::PhaseDeadlineHandle outbound_protocol_deadline =
             stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
         auto request_session = co_await SendShadowsocksHandshake(
@@ -707,7 +707,7 @@ net::awaitable<OutboundProcessResult> proxy::shadowsocks::outbound::Handler::Pro
     stream->ClearPhaseDeadline();
 
     auto relay_endpoint = [&](auto& endpoint) {
-        return DoRelayLink(
+        return app::DoRelayLink(
             dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
             endpoint, ctx, stats, relay_config, std::move(first_payload));
     };
@@ -728,23 +728,23 @@ proxy::shadowsocks::outbound::Handler::Handler(
 namespace proxy::shadowsocks::outbound {
 
 std::optional<Credentials> Credentials::Prepare(
-    const ss::SsCipherInfo& cipher, std::string_view password) {
+    const proxy::shadowsocks::SsCipherInfo& cipher, std::string_view password) {
     if (password.empty()) return std::nullopt;
-    if (!ss::Is2022Cipher(cipher.type)) {
-        auto key = ss::DeriveKey(password, cipher.key_size);
+    if (!proxy::shadowsocks::Is2022Cipher(cipher.type)) {
+        auto key = proxy::shadowsocks::DeriveKey(password, cipher.key_size);
         if (key.size != cipher.key_size) return std::nullopt;
         return Credentials(cipher, key, {});
     }
 
-    std::vector<ss::KeyBytes> chain;
+    std::vector<proxy::shadowsocks::KeyBytes> chain;
     for (;;) {
         const auto separator = password.find(':');
-        const auto key = ss::Decode2022Psk(password.substr(0, separator), cipher.key_size);
+        const auto key = proxy::shadowsocks::Decode2022Psk(password.substr(0, separator), cipher.key_size);
         if (key.size != cipher.key_size) return std::nullopt;
         chain.push_back(key);
         if (separator == std::string_view::npos) break;
         // 生产 TCP/UDP 编码器仅支持 AES 身份链。
-        if (!ss::Is2022AesCipher(cipher.type)) return std::nullopt;
+        if (!proxy::shadowsocks::Is2022AesCipher(cipher.type)) return std::nullopt;
         password.remove_prefix(separator + 1);
     }
     const auto master_key = chain.back();
@@ -764,7 +764,7 @@ const bool kSsOutboundRegistered = (::proxyman::outbound::RegisterProxy(
         -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
         const auto* settings = std::get_if<::infra::ShadowsocksSettings>(&cfg.settings);
         if (!settings) return std::nullopt;
-        auto next_hop = ::proxy::PrepareNextHop(cfg, settings->server, ::OutboundStreamDefaults{});
+        auto next_hop = ::proxy::PrepareNextHop(cfg, settings->server, ::transport::internet::OutboundStreamDefaults{});
         auto credentials = ::proxy::shadowsocks::outbound::Credentials::Prepare(
             settings->cipher, settings->password);
         if (!credentials) {
@@ -778,11 +778,11 @@ const bool kSsOutboundRegistered = (::proxyman::outbound::RegisterProxy(
                 +[](std::string_view,
                     std::shared_ptr<const PreparedSettings> state,
                     ::net::io_context& /*io_context*/,
-                    ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
+                    ::common::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::proxy::Outbound> {
                     return std::make_unique<::proxy::shadowsocks::outbound::Handler>(
                         std::move(state));
                 }>(PreparedSettings{
-                    ::SsOutboundConfig{
+                    ::proxy::shadowsocks::outbound::SsOutboundConfig{
                         .server = std::move(next_hop.server),
                         .uot_version = settings->uot_version,
                     },

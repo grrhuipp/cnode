@@ -37,6 +37,8 @@ std::array<char, 28> EncodeWsAccept(std::string_view ws_key) noexcept {
 
 }  // namespace ws
 
+namespace transport::internet {
+
 namespace {
 using transport::internet::detail::EffectiveHttpPath;
 
@@ -165,7 +167,7 @@ void BaseWsStream::ValidateClose() {
     // RFC 6455 §§5.5.1, 7.4, 8.1: a Close is empty or status + UTF-8 reason.
     if (control_used_ == 1) ProtocolFailure("WebSocket invalid Close payload length");
     if (control_used_ < 2) return;
-    const unsigned status = LoadU16BE(control_payload_.data());
+    const unsigned status = common::LoadU16BE(control_payload_.data());
     const bool standard = status >= 1000 && status <= 1014 &&
                           status != 1004 && status != 1005 && status != 1006;
     if (!standard && !(status >= 3000 && status <= 4999))
@@ -222,8 +224,8 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
                 while (!TryFillHeaderFromPending())
                     if (!co_await EnsurePendingData()) co_return false;
                 const uint64_t length = header_required_ == 4
-                    ? LoadU16BE(header_.data() + 2)
-                    : LoadU64BE(header_.data() + 2);
+                    ? common::LoadU16BE(header_.data() + 2)
+                    : common::LoadU64BE(header_.data() + 2);
                 if ((header_required_ == 4 && length < 126) ||
                     (header_required_ == 10 && (length < 65536 || (header_[2] & 0x80))))
                     ProtocolFailure("WebSocket noncanonical payload length");
@@ -382,7 +384,7 @@ net::awaitable<void> BaseWsStream::WriteDataFrame(
     const auto header = ws::EncodeFrameHeader(size, ws::Opcode::BINARY, is_client_, mask);
     try {
         if (!is_client_) {
-            ConstBufferSpanBuilder<16> output;
+            common::ConstBufferSpanBuilder<16> output;
             output.Append(net::buffer(header.bytes.data(), header.size));
             output.AppendBuffers(buffers);
             co_await inner_->WriteBuffers(output.Span());
@@ -465,7 +467,7 @@ net::awaitable<void> BaseWsStream::WriteMultiBuffer(buf::MultiBuffer buffers) {
         throw IoSystemError(io_error::fault, "WebSocket mask generation failed");
     const auto header = ws::EncodeFrameHeader(size, ws::Opcode::BINARY, is_client_, mask);
     try {
-        ConstBufferSpanBuilder<16> output;
+        common::ConstBufferSpanBuilder<16> output;
         output.Append(net::buffer(header.bytes.data(), header.size));
         size_t offset = 0;
         for (auto* buffer : buffers) {
@@ -575,12 +577,12 @@ net::awaitable<WsHandshakeResult> BaseWsStream::Handshake(
     uint8_t raw_key[16];
     if (RAND_bytes(raw_key, sizeof(raw_key)) != 1) [[unlikely]] {
         LOG_CONN_DEBUG(conn_id, "WebSocket client failed to generate handshake nonce");
-        co_return tl::unexpected(ErrorCode::INTERNAL);
+        co_return tl::unexpected(common::ErrorCode::INTERNAL);
     }
     std::array<uint8_t, 25> ws_key_buf{};
     EVP_EncodeBlock(ws_key_buf.data(), raw_key, sizeof(raw_key));
     OPENSSL_cleanse(raw_key, sizeof(raw_key));
-    ScopedCleanse cleanse_ws_key{ws_key_buf};
+    common::ScopedCleanse cleanse_ws_key{ws_key_buf};
     const std::string_view ws_key(reinterpret_cast<const char*>(ws_key_buf.data()), 24);
     const std::string_view req_path = EffectiveHttpPath(path);
     host = transport::internet::ResolveConfiguredHttpHost({}, headers, host);
@@ -590,17 +592,17 @@ net::awaitable<WsHandshakeResult> BaseWsStream::Handshake(
         co_return tl::unexpected(head.error());
     }
 
-    const std::string_view accept = TrimAscii(
+    const std::string_view accept = common::TrimAscii(
         transport::internet::ExtractHeaderValueCI(head->Text(), "Sec-WebSocket-Accept"));
     if (accept.empty()) {
         LOG_CONN_DEBUG(conn_id, "WebSocket client missing Sec-WebSocket-Accept");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const auto expected_accept = ws::EncodeWsAccept(ws_key);
     if (accept != std::string_view(expected_accept.data(), expected_accept.size())) {
         LOG_CONN_DEBUG(conn_id, "WebSocket client received invalid Sec-WebSocket-Accept");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     if (auto read_ahead = head->TakeReadAheadMultiBuffer(); !read_ahead.empty()) {
@@ -612,4 +614,6 @@ net::awaitable<WsHandshakeResult> BaseWsStream::Handshake(
                    transport::internet::PublicHttpTargetForLog(req_path));
     co_return WsHandshakeResult{};
 }
+
+}  // namespace transport::internet
 

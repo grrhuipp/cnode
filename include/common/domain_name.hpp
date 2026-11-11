@@ -32,8 +32,8 @@ enum class TrailingDotPolicy {
         return false;
     }
     for (std::size_t i = 0; i < lhs.size(); ++i) {
-        if (ToLowerAscii(static_cast<unsigned char>(lhs[i])) !=
-            ToLowerAscii(static_cast<unsigned char>(rhs[i]))) {
+        if (common::ToLowerAscii(static_cast<unsigned char>(lhs[i])) !=
+            common::ToLowerAscii(static_cast<unsigned char>(rhs[i]))) {
             return false;
         }
     }
@@ -46,7 +46,7 @@ inline void NormalizeDnsHostnameInPlace(String& hostname) noexcept {
         hostname.pop_back();
     }
     for (char& ch : hostname) {
-        ch = ToLowerAscii(static_cast<unsigned char>(ch));
+        ch = common::ToLowerAscii(static_cast<unsigned char>(ch));
     }
 }
 

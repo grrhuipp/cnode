@@ -15,7 +15,7 @@ struct ParsedObject {
 
     explicit ParsedObject(std::string_view body)
         : source(::json::parse(body)),
-          result(::ParseJsonObject(source.as_object(), "camelObject")) {}
+          result(::infra::ParseJsonObject(source.as_object(), "camelObject")) {}
 };
 
 TEST(JsonObject, MissingOptionalObjectRemainsUnconfigured) {

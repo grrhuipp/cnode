@@ -18,33 +18,33 @@ namespace {
 using VmessTagMap =
     std::unordered_map<std::string,
                        std::shared_ptr<const UserStore::VmessUserMap>,
-                       TransparentStringHash,
-                       TransparentStringEq>;
+                       common::TransparentStringHash,
+                       common::TransparentStringEq>;
 using VlessTagMap =
     std::unordered_map<std::string,
                        std::shared_ptr<const UserStore::VlessUserMap>,
-                       TransparentStringHash,
-                       TransparentStringEq>;
+                       common::TransparentStringHash,
+                       common::TransparentStringEq>;
 using TrojanTagMap =
     std::unordered_map<std::string,
                        std::shared_ptr<const UserStore::TrojanUserMap>,
-                       TransparentStringHash,
-                       TransparentStringEq>;
+                       common::TransparentStringHash,
+                       common::TransparentStringEq>;
 using ShadowsocksTagMap =
     std::unordered_map<std::string,
                        std::shared_ptr<const UserStore::ShadowsocksUserList>,
-                       TransparentStringHash,
-                       TransparentStringEq>;
+                       common::TransparentStringHash,
+                       common::TransparentStringEq>;
 using AnyTlsTagMap =
     std::unordered_map<std::string,
                        std::shared_ptr<const UserStore::AnyTlsUserMap>,
-                       TransparentStringHash,
-                       TransparentStringEq>;
+                       common::TransparentStringHash,
+                       common::TransparentStringEq>;
 using HysteriaTagMap =
     std::unordered_map<std::string,
                        std::shared_ptr<const UserStore::HysteriaUserMap>,
-                       TransparentStringHash,
-                       TransparentStringEq>;
+                       common::TransparentStringHash,
+                       common::TransparentStringEq>;
 
 }  // namespace
 
@@ -56,7 +56,7 @@ struct UserStore::Snapshot {
     AnyTlsTagMap anytls;
     HysteriaTagMap hysteria;
     std::array<std::unordered_map<std::string, uint64_t,
-                                  TransparentStringHash, TransparentStringEq>,
+                                  common::TransparentStringHash, common::TransparentStringEq>,
                std::variant_size_v<UserSet>> credential_revisions;
 };
 

@@ -38,8 +38,8 @@ namespace {
 
 void ApplySniffOverride(
     session::Context& ctx,
-    const SniffConfig& sniffing,
-    const SniffResult& result) {
+    const routing::SniffConfig& sniffing,
+    const sniff::SniffResult& result) {
     if (!result.success) {
         return;
     }
@@ -57,7 +57,7 @@ void ApplySniffOverride(
     const uint16_t final_port = result.port > 0
         ? result.port
         : ctx.outbound.target.port;
-    TargetAddress sniffed(sniff_domain, final_port);
+    common::TargetAddress sniffed(sniff_domain, final_port);
     if (!sniffed.IsValid() || !sniffed.IsDomain()) {
         return;
     }
@@ -70,7 +70,7 @@ void ApplySniffOverride(
     }
 }
 
-[[nodiscard]] RelayResult MakeRelayError(ErrorCode error) noexcept {
+[[nodiscard]] RelayResult MakeRelayError(common::ErrorCode error) noexcept {
     RelayResult result;
     result.error = error;
     return result;
@@ -80,19 +80,19 @@ void ApplySniffOverride(
 // ClassifyFailure 分类；请求取消且已有更具体的结果时保留原结果。
 void FinishDispatchFailure(session::Context& ctx, StatsShard& stats,
                            RelayResult& result, const char* detail) noexcept {
-    const ErrorCode error = transport::ClassifyFailure(
-        std::current_exception(), ErrorCode::INTERNAL);
-    if (error != ErrorCode::CANCELLED || result.error == ErrorCode::OK) {
+    const common::ErrorCode error = transport::ClassifyFailure(
+        std::current_exception(), common::ErrorCode::INTERNAL);
+    if (error != common::ErrorCode::CANCELLED || result.error == common::ErrorCode::OK) {
         stats.OnError();
         result = MakeRelayError(error);
     }
-    if (error == ErrorCode::CANCELLED || error == ErrorCode::SOCKET_EOF) return;
+    if (error == common::ErrorCode::CANCELLED || error == common::ErrorCode::SOCKET_EOF) return;
     try { LOG_CONN_WARN(ctx, "failed to process outbound traffic > {}", detail); }
     catch (...) {} // 日志不得越过分配失败边界。
 }
 
 std::chrono::seconds ResolveRelayIdleTimeout(
-    const TimeoutsConfig& timeouts,
+    const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
     auto idle_timeout = timeouts.IdleTimeout();
     if (pressure_idle_timeout > 0) {
@@ -104,24 +104,24 @@ std::chrono::seconds ResolveRelayIdleTimeout(
 
 net::awaitable<bool> SniffInitialPayload(
     net::io_context& io_context,
-    const SniffConfig& sniffing,
+    const routing::SniffConfig& sniffing,
     transport::MultiBufferReader* inbound_reader,
-    AsyncStream* inbound_control,
-    InitialPayload& first_packet,
+    transport::AsyncStream* inbound_control,
+    common::InitialPayload& first_packet,
     session::Context& ctx,
     StatsShard& stats,
     buf::MultiBufferBatch& outbound_first_payload,
     RelayResult& result,
-    ErrorCode& cancellation_reason,
+    common::ErrorCode& cancellation_reason,
     const net::cancellation_state& sniff_cancellation) {
     using net::experimental::awaitable_operators::operator||;
-    const bool datagram = ctx.content.network == Network::UDP;
+    const bool datagram = ctx.content.network == common::Network::UDP;
     const size_t sniff_byte_limit = datagram ? 64 * 1024 : 4096;
     static constexpr size_t kSniffMaxDatagrams = 64;
     static constexpr auto kSniffWindow = std::chrono::milliseconds(200);
     buf::MultiBuffer sniff_payload;
     memory::ByteVector sniff_scratch;
-    Sniffer sniffer;
+    sniff::Sniffer sniffer;
     size_t cached_bytes = 0;
     size_t cached_datagrams = 0;
 
@@ -145,7 +145,7 @@ net::awaitable<bool> SniffInitialPayload(
     auto sniff_cached = [&]() {
         const auto sniff_data = copy_cached_bytes(sniff_payload);
         if (sniff_data.empty()) {
-            return SniffResult{};
+            return sniff::SniffResult{};
         }
         return sniffer.Sniff(sniff_data, ctx.content.network);
     };
@@ -239,7 +239,7 @@ net::awaitable<bool> SniffInitialPayload(
             }
             read = {};
             memory::ByteVector().swap(sniff_scratch);
-            AsyncDelay delay(io_context);
+            transport::internet::AsyncDelay delay(io_context);
             auto next = co_await (read_more() || delay.WaitFor(remaining));
             if (sniff_cancellation.cancelled() != net::cancellation_type::none) {
                 throw IoSystemError(net::error::operation_aborted);
@@ -264,13 +264,13 @@ net::awaitable<bool> SniffInitialPayload(
     } catch (...) {
         // 分配失败交给 Dispatch 的统一收尾；其余失败经唯一分类入口取得错误码，
         // 再叠加本阶段的超时与请求取消语义。
-        ErrorCode error = transport::ClassifyFailure(
-            std::current_exception(), ErrorCode::SOCKET_READ_FAILED);
-        if (error == ErrorCode::RESOURCE_EXHAUSTED) throw;
+        common::ErrorCode error = transport::ClassifyFailure(
+            std::current_exception(), common::ErrorCode::SOCKET_READ_FAILED);
+        if (error == common::ErrorCode::RESOURCE_EXHAUSTED) throw;
         if (read_timed_out || consume_inbound_timeout()) {
-            error = ErrorCode::TIMEOUT;
-        } else if (error == ErrorCode::CANCELLED &&
-                   (cancellation_reason != ErrorCode::OK ||
+            error = common::ErrorCode::TIMEOUT;
+        } else if (error == common::ErrorCode::CANCELLED &&
+                   (cancellation_reason != common::ErrorCode::OK ||
                     sniff_cancellation.cancelled() != net::cancellation_type::none)) {
             throw;
         }
@@ -321,18 +321,18 @@ DefaultDispatcher::DefaultDispatcher(
 net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     net::io_context& io_context,
     const routing::DispatchPolicy& policy,
-    std::unique_ptr<AsyncStream> inbound,
+    std::unique_ptr<transport::AsyncStream> inbound,
     transport::Link inbound_link,
-    InitialPayload first_packet,
+    common::InitialPayload first_packet,
     session::Context& ctx,
     StatsShard& stats,
-    const TimeoutsConfig& timeouts) {
+    const infra::TimeoutsConfig& timeouts) {
     app::RequestLoadState::DispatchScope load_scope(request_load_);
     const uint32_t pressure_idle_timeout = request_load_.PressureIdleTimeout();
     RelayResult result;
-    ErrorCode cancellation_reason = ErrorCode::OK;
+    common::ErrorCode cancellation_reason = common::ErrorCode::OK;
     try {
-        co_await RunAwaitableTaskGroup(co_await net::this_coro::executor, [&](AwaitableTaskGroup& group) {
+        co_await common::RunAwaitableTaskGroup(co_await net::this_coro::executor, [&](common::AwaitableTaskGroup& group) {
             group.Spawn(DispatchPreparedLink(
                 io_context, policy, std::move(inbound), inbound_link,
                 first_packet, ctx, stats, timeouts, pressure_idle_timeout,
@@ -343,7 +343,7 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     } catch (...) {
         FinishDispatchFailure(ctx, stats, result, "unknown error");
     }
-    if (result.error == ErrorCode::CANCELLED && cancellation_reason != ErrorCode::OK) {
+    if (result.error == common::ErrorCode::CANCELLED && cancellation_reason != common::ErrorCode::OK) {
         result.error = cancellation_reason;
     }
     co_return result;
@@ -352,26 +352,26 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
 net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     net::io_context& io_context,
     const routing::DispatchPolicy& policy,
-    std::unique_ptr<AsyncStream> inbound,
+    std::unique_ptr<transport::AsyncStream> inbound,
     transport::Link inbound_link,
-    InitialPayload& first_packet,
+    common::InitialPayload& first_packet,
     session::Context& ctx,
     StatsShard& stats,
-    const TimeoutsConfig& timeouts,
+    const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout,
     RelayResult& result,
-    AwaitableTaskGroup& request_group,
-    ErrorCode& cancellation_reason) {
+    common::AwaitableTaskGroup& request_group,
+    common::ErrorCode& cancellation_reason) {
 
     struct RequestCancellation final : transport::CancellationSubscription {
-        RequestCancellation(AwaitableTaskGroup& group, ErrorCode& reason) noexcept
+        RequestCancellation(common::AwaitableTaskGroup& group, common::ErrorCode& reason) noexcept
             : group(group), reason(reason) {}
-        AwaitableTaskGroup& group;
-        ErrorCode& reason;
+        common::AwaitableTaskGroup& group;
+        common::ErrorCode& reason;
 
     private:
         void OnCancellation(transport::Cancellation event) noexcept override {
-            reason = event.reason == ErrorCode::OK ? ErrorCode::CANCELLED : event.reason;
+            reason = event.reason == common::ErrorCode::OK ? common::ErrorCode::CANCELLED : event.reason;
             group.Cancel();
         }
     } cancellation(request_group, cancellation_reason);
@@ -379,7 +379,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     if (cancellation_reader) {
         cancellation.Resubscribe(cancellation_reader->Cancellation());
     }
-    if (cancellation_reason != ErrorCode::OK) {
+    if (cancellation_reason != common::ErrorCode::OK) {
         stats.OnError();
         result = MakeRelayError(cancellation_reason);
         co_return;
@@ -388,15 +388,15 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     const bool has_protocol_link = inbound_link.Valid();
     if (!inbound && !has_protocol_link) {
         stats.OnError();
-        result = MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
+        result = MakeRelayError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         co_return;
     }
-    AsyncStream* inbound_endpoint = inbound.get();
+    transport::AsyncStream* inbound_endpoint = inbound.get();
     transport::MultiBufferReader* inbound_reader =
         has_protocol_link ? inbound_link.reader : inbound_endpoint;
     transport::MultiBufferWriter* inbound_writer =
         has_protocol_link ? inbound_link.writer : inbound_endpoint;
-    AsyncStream* inbound_control =
+    transport::AsyncStream* inbound_control =
         inbound_link.control ? inbound_link.control : inbound_endpoint;
     if (inbound_control) {
         (void)inbound_control->ConsumePhaseDeadline();
@@ -406,7 +406,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     if (!ctx.outbound.target.IsValid()) {
         stats.OnError();
         LOG_CONN_DEBUG(ctx, "rejected outbound request > invalid target");
-        result = MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
+        result = MakeRelayError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         co_return;
     }
 
@@ -424,11 +424,11 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
         }
     }
     if (sniff_cancellation.cancelled() != net::cancellation_type::none ||
-        cancellation_reason != ErrorCode::OK) {
+        cancellation_reason != common::ErrorCode::OK) {
         throw IoSystemError(net::error::operation_aborted);
     }
 
-    const TargetAddress& route_target = ctx.outbound.route_target.IsValid()
+    const common::TargetAddress& route_target = ctx.outbound.route_target.IsValid()
         ? ctx.outbound.route_target
         : ctx.outbound.target;
     // Only an unresolved domain under a resolving strategy can need DNS, and
@@ -449,21 +449,21 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
             : co_await RouteAsync(ctx, policy, selection);
     auto outbound_handler = std::move(dispatch.handler);
     if (!outbound_handler) {
-        if (dispatch.error == ErrorCode::BLOCKED) {
+        if (dispatch.error == common::ErrorCode::BLOCKED) {
             LOG_CONN_WARN(ctx, "destination rejected source={}:{} target={} email={} > policy blocked",
                           ctx.inbound.source_ip, ctx.inbound.source_port,
                           ctx.outbound.target, ctx.inbound.user_email);
             if (ctx.inbound.user_id > 0 && ctx.outbound.target.IsValid()) {
-                LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "policy blocked"));
+                LOG_ACCESS(common::FormatAccessLog(ctx, common::AccessStatus::Rejected, "policy blocked"));
             }
             stats.OnError();
-            result = MakeRelayError(ErrorCode::BLOCKED);
+            result = MakeRelayError(common::ErrorCode::BLOCKED);
             co_return;
         }
         LOG_CONN_WARN(ctx, "failed to find outbound handler source={}:{} target={}",
                           ctx.inbound.source_ip, ctx.inbound.source_port, ctx.outbound.target);
         stats.OnError();
-        result = MakeRelayError(ErrorCode::ROUTER_OUTBOUND_NOT_FOUND);
+        result = MakeRelayError(common::ErrorCode::ROUTER_OUTBOUND_NOT_FOUND);
         co_return;
     }
 
@@ -519,15 +519,15 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
         relay_cfg,
         std::move(outbound_first_payload));
     if (!outbound_process) {
-        ErrorCode process_error = outbound_process.error();
-        if (process_error == ErrorCode::OK) {
-            process_error = ErrorCode::PROTOCOL_AUTH_FAILED;
+        common::ErrorCode process_error = outbound_process.error();
+        if (process_error == common::ErrorCode::OK) {
+            process_error = common::ErrorCode::PROTOCOL_AUTH_FAILED;
         }
-        if (process_error != ErrorCode::CANCELLED && process_error != ErrorCode::SOCKET_EOF &&
-            process_error != ErrorCode::SOCKET_CLOSED && process_error != ErrorCode::CONNECTION_CLOSED) {
+        if (process_error != common::ErrorCode::CANCELLED && process_error != common::ErrorCode::SOCKET_EOF &&
+            process_error != common::ErrorCode::SOCKET_CLOSED && process_error != common::ErrorCode::CONNECTION_CLOSED) {
             LOG_CONN_WARN(ctx, "failed to process outbound traffic source={}:{} target={} > {}",
                           ctx.inbound.source_ip, ctx.inbound.source_port,
-                          ctx.outbound.target, ErrorCodeToLogReason(process_error));
+                          ctx.outbound.target, common::ErrorCodeToLogReason(process_error));
         }
         stats.OnError();
         result = MakeRelayError(process_error);
@@ -535,9 +535,9 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     }
     RelayResult relay_result = std::move(*outbound_process);
 
-    if (relay_result.error != ErrorCode::OK) {
+    if (relay_result.error != common::ErrorCode::OK) {
         LOG_CONN_DEBUG(ctx, "relay ended > {} up={}B down={}B closer={} target={}",
-                       ErrorCodeToString(relay_result.error),
+                       common::ErrorCodeToString(relay_result.error),
                        ctx.traffic.bytes_up, ctx.traffic.bytes_down,
                        relay_result.client_closed_first ? "client" : "target",
                        ctx.outbound.target);
@@ -563,7 +563,7 @@ DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
     if (request_policy_.Blocked(ctx)) {
         return RouteResult{
             .handler = {},
-            .error = ErrorCode::BLOCKED,
+            .error = common::ErrorCode::BLOCKED,
         };
     }
 
@@ -571,13 +571,13 @@ DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
     if (!handler) {
         return RouteResult{
             .handler = {},
-            .error = ErrorCode::ROUTER_OUTBOUND_NOT_FOUND,
+            .error = common::ErrorCode::ROUTER_OUTBOUND_NOT_FOUND,
         };
     }
 
     return RouteResult{
         .handler = std::move(handler),
-        .error = ErrorCode::OK,
+        .error = common::ErrorCode::OK,
     };
 }
 
@@ -598,7 +598,7 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
     session::Context& ctx,
     const routing::DispatchPolicy& policy,
     std::optional<detail::OutboundSelection> initial_selection) {
-    TargetAddress& route_target = ctx.outbound.route_target.IsValid()
+    common::TargetAddress& route_target = ctx.outbound.route_target.IsValid()
         ? ctx.outbound.route_target
         : ctx.outbound.target;
     const bool sync_dial_target =
@@ -644,7 +644,7 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
         throw IoSystemError(net::error::operation_aborted);
     if (!dns_result.Ok()) {
         LOG_CONN_DEBUG(ctx, "routing DNS lookup failed target={} > {}: {}",
-                       route_target.host, ErrorCodeToString(dns_result.error), dns_result.error_msg);
+                       route_target.host, common::ErrorCodeToString(dns_result.error), dns_result.error_msg);
     } else if (!dns_result.addresses.empty()) {
         co_return FinishRoute(ctx, select_with_addresses(dns_result.addresses));
     }

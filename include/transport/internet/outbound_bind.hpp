@@ -10,6 +10,8 @@
 #include <vector>
 
 // 出站本地绑定地址策略（sendThrough）：冷路径解析为不可变快照，拨号时按远端地址族选址。
+namespace transport::internet {
+
 class OutboundBind {
 public:
     enum class Mode : uint8_t {
@@ -62,3 +64,5 @@ private:
     std::optional<net::ip::address> explicit_address_;
     std::shared_ptr<const std::vector<Entry>> entries_; // Immutable cold-path snapshot.
 };
+
+}  // namespace transport::internet

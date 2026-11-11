@@ -31,7 +31,7 @@ ParseRealityClientKeyShareExtension(
     constexpr std::size_t kX25519MlKem768ClientShareSize =
         kMlKem768PublicKeySize + kRealityKeySize;
 
-    ByteReader outer(extension);
+    common::ByteReader outer(extension);
     const auto list = outer.ReadBytes(outer.ReadU16BE());
     if (!outer.Ok() || !outer.Empty()) {
         return tl::unexpected(RealityKeyShareError::InvalidFormat);
@@ -39,7 +39,7 @@ ParseRealityClientKeyShareExtension(
 
     std::optional<RealityKey> x25519;
     std::optional<RealityKey> hybrid_x25519;
-    ByteReader reader(list);
+    common::ByteReader reader(list);
     while (!reader.Empty()) {
         const uint16_t group = reader.ReadU16BE();
         const uint16_t key_size = reader.ReadU16BE();
@@ -72,6 +72,8 @@ ParseRealityClientKeyShareExtension(
 }
 
 }  // namespace transport::internet
+
+namespace transport::internet {
 
 class SslContext;
 
@@ -142,3 +144,4 @@ private:
     memory::ByteVector wire_;
     memory::ByteVector hello_;
 };
+}  // namespace transport::internet

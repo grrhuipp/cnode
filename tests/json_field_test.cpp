@@ -18,7 +18,7 @@ namespace {
 
 TEST(JsonField, Bool) {
     const auto parse = [](std::string_view body) {
-        return ::ParseJsonBool(ParseObject(body), "camelFlag");
+        return ::infra::ParseJsonBool(ParseObject(body), "camelFlag");
     };
 
     auto absent = parse(R"({})");
@@ -38,10 +38,10 @@ TEST(JsonField, Bool) {
 
 TEST(JsonField, String) {
     const auto parse = [](std::string_view body) {
-        return ::ParseJsonString(ParseObject(body), "camelText");
+        return ::infra::ParseJsonString(ParseObject(body), "camelText");
     };
     const auto parse_array = [](std::string_view body) {
-        return ::ParseJsonStringArray(ParseObject(body), "camelList");
+        return ::infra::ParseJsonStringArray(ParseObject(body), "camelList");
     };
 
     auto absent = parse(R"({})");
@@ -75,7 +75,7 @@ TEST(JsonField, String) {
 TEST(JsonField, Unsigned) {
     const auto parse = [](std::string_view body,
                           uint64_t maximum = std::numeric_limits<uint64_t>::max()) {
-        return ::ParseJsonUint64(ParseObject(body), "camelValue", maximum);
+        return ::infra::ParseJsonUint64(ParseObject(body), "camelValue", maximum);
     };
 
     auto absent = parse(R"({})");
@@ -95,17 +95,17 @@ TEST(JsonField, Unsigned) {
 }
 
 TEST(JsonField, Port) {
-    using ::JsonPortError;
-    using ::ReadJsonPort;
+    using ::infra::JsonPortError;
+    using ::infra::ReadJsonPort;
     using ::json::object;
 
-    auto result = ReadJsonPort(object{}, "port");
-    ASSERT_TRUE((result.error == JsonPortError::Missing && result.value == 0)) << "absent port became configured";
+    auto result = infra::ReadJsonPort(object{}, "port");
+    ASSERT_TRUE((result.error == infra::JsonPortError::Missing && result.value == 0)) << "absent port became configured";
 
-    result = ReadJsonPort(object{{"port", int64_t{1}}}, "port");
+    result = infra::ReadJsonPort(object{{"port", int64_t{1}}}, "port");
     ASSERT_TRUE((result.Valid() && result.value == 1)) << "minimum port mismatch";
 
-    result = ReadJsonPort(object{{"port", uint64_t{65535}}}, "port");
+    result = infra::ReadJsonPort(object{{"port", uint64_t{65535}}}, "port");
     ASSERT_TRUE((result.Valid() && result.value == 65535)) << "maximum port mismatch";
 
     for (const auto& out_of_range : {
@@ -113,26 +113,26 @@ TEST(JsonField, Port) {
              object{{"port", int64_t{-1}}},
              object{{"port", uint64_t{65536}}},
              object{{"port", std::numeric_limits<uint64_t>::max()}}}) {
-        ASSERT_TRUE((ReadJsonPort(out_of_range, "port").error == JsonPortError::OutOfRange)) << "out-of-range port was not classified as OutOfRange";
+        ASSERT_TRUE((infra::ReadJsonPort(out_of_range, "port").error == infra::JsonPortError::OutOfRange)) << "out-of-range port was not classified as OutOfRange";
     }
 
-    ASSERT_TRUE((ReadJsonPort(object{{"port", 443.0}}, "port").error ==
-              JsonPortError::InvalidType)) << "fractional port was not classified as InvalidType";
-    ASSERT_TRUE((ReadJsonPort(object{{"port", "443"}}, "port").error ==
-              JsonPortError::InvalidType)) << "string port was not classified as InvalidType";
+    ASSERT_TRUE((infra::ReadJsonPort(object{{"port", 443.0}}, "port").error ==
+              infra::JsonPortError::InvalidType)) << "fractional port was not classified as InvalidType";
+    ASSERT_TRUE((infra::ReadJsonPort(object{{"port", "443"}}, "port").error ==
+              infra::JsonPortError::InvalidType)) << "string port was not classified as InvalidType";
 }
 
 
 TEST(JsonField, ThrowingFallbacks) {
     const auto source = ParseObject(R"({"text":"set","flag":false,"bad":1})");
 
-    ASSERT_TRUE((::JsonStringOr(source, "text", "fallback") == "set")) << "present string was replaced by fallback";
-    ASSERT_TRUE((::JsonStringOr(source, "missing", "fallback") == "fallback")) << "absent string did not use fallback";
-    EXPECT_THROW((void)::JsonStringOr(source, "bad", "fallback"), std::invalid_argument);
+    ASSERT_TRUE((::infra::JsonStringOr(source, "text", "fallback") == "set")) << "present string was replaced by fallback";
+    ASSERT_TRUE((::infra::JsonStringOr(source, "missing", "fallback") == "fallback")) << "absent string did not use fallback";
+    EXPECT_THROW((void)::infra::JsonStringOr(source, "bad", "fallback"), std::invalid_argument);
 
-    ASSERT_TRUE((!::JsonBoolOr(source, "flag", true))) << "present boolean was replaced by fallback";
-    ASSERT_TRUE((::JsonBoolOr(source, "missing", true))) << "absent boolean did not use fallback";
-    EXPECT_THROW((void)::JsonBoolOr(source, "bad", true), std::invalid_argument);
+    ASSERT_TRUE((!::infra::JsonBoolOr(source, "flag", true))) << "present boolean was replaced by fallback";
+    ASSERT_TRUE((::infra::JsonBoolOr(source, "missing", true))) << "absent boolean did not use fallback";
+    EXPECT_THROW((void)::infra::JsonBoolOr(source, "bad", true), std::invalid_argument);
 }
 
 }  // namespace

@@ -48,9 +48,9 @@ public:
         Require(prepared.has_value(), "Freedom preparation failed");
         worker.AddOutbound(std::move(*prepared));
 
-        auto request = proxyman::inbound::PrepareBuildRequest("vless", "sampling", InboundProtocolSettings{});
+        auto request = proxyman::inbound::PrepareBuildRequest("vless", "sampling", infra::InboundProtocolSettings{});
         Require(request.has_value(), "VLESS preparation failed");
-        const std::array users{InboundUserSpec{
+        const std::array users{infra::InboundUserSpec{
             .user_id = 1, .email = "sampling",
             .credential = "00112233-4455-6677-8899-aabbccddeeff", .flow = {}}};
         auto credentials = proxyman::inbound::BuildUsers(*request, users);
@@ -62,14 +62,14 @@ public:
             .inbound_tag = "sampling", .inbound_tags = {}, .protocol = std::string(protocol_),
             .stream_settings = {},
             .dispatch_policy = {{}, routing::ForceOutbound{"sampling-direct"}},
-            .proxy_protocol = ProxyProtocolMode::Off};
+            .proxy_protocol = transport::internet::ProxyProtocolMode::Off};
         Require(worker.RegisterInbound(std::move(*request), std::move(receiver)), "VLESS registration failed");
         tcp::acceptor reservation(io, {net::ip::address_v4::loopback(), 0});
         port = reservation.local_endpoint().port();
         reservation.close();
-        const auto listen = InboundListen::Parse("127.0.0.1");
+        const auto listen = transport::internet::InboundListen::Parse("127.0.0.1");
         Require(listen.has_value(), "loopback listen parsing failed");
-        Require(worker.AddListener(PortBinding{.port = port, .protocol = std::string(protocol_), .tag = "sampling", .listen = *listen}),
+        Require(worker.AddListener(app::PortBinding{.port = port, .protocol = std::string(protocol_), .tag = "sampling", .listen = *listen}),
                 "VLESS listener failed");
     }
 
@@ -109,7 +109,7 @@ public:
         Require(received == response, "download tail changed");
     }
 
-    net::awaitable<WorkerRuntimeStatsSnapshot> WaitActive(size_t expected) {
+    net::awaitable<app::WorkerRuntimeStatsSnapshot> WaitActive(size_t expected) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         for (;;) {
             auto snapshot = worker.CollectRuntimeStats(true);
@@ -148,15 +148,15 @@ public:
 
     net::io_context io;
     app::dns::DNSWorker dns;
-    StatsShard totals;
+    app::StatsShard totals;
     WorkerCoordinatorFixture coordinator;
-    Worker worker;
+    app::Worker worker;
     tcp::acceptor destination;
     std::vector<tcp::socket> clients;
     std::vector<tcp::socket> peers;
 private:
-    static WorkerRuntimeConfig Configuration() {
-        WorkerRuntimeConfig config;
+    static app::WorkerRuntimeConfig Configuration() {
+        app::WorkerRuntimeConfig config;
         config.workers = 1;
         config.timeouts.idle = 0;
         config.timeouts.read = 0;

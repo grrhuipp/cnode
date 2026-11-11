@@ -33,7 +33,7 @@ public:
         std::vector<std::filesystem::path> records;
     };
 
-    explicit TrafficJournal(const PanelConfig& config);
+    explicit TrafficJournal(const infra::PanelConfig& config);
     ~TrafficJournal();
     TrafficJournal(const TrafficJournal&) = delete;
     TrafficJournal& operator=(const TrafficJournal&) = delete;

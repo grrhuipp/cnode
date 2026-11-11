@@ -11,6 +11,8 @@
 #include <vector>
 
 
+namespace transport::internet {
+
 struct RealityClientState;
 struct RealityServerConnState;
 struct RealityConfig;
@@ -182,4 +184,6 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapRealityClient(
     SslContext& ctx,
     const RealityConfig& reality,
     std::string_view server_name = {});
+
+}  // namespace transport::internet
 

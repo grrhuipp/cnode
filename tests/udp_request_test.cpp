@@ -27,11 +27,11 @@ enum class WriteAbort { RequestCancel, ParentCancellation, Deadline };
 enum class Deadline { Idle, Read, Phase };
 enum class RelayAbort { Cancellation, Deadline };
 
-TargetAddress Target(const udp::endpoint& endpoint) {
-    return TargetAddress(endpoint.address(), endpoint.port());
+common::TargetAddress Target(const udp::endpoint& endpoint) {
+    return common::TargetAddress(endpoint.address(), endpoint.port());
 }
 
-buf::MultiBuffer Packet(const TargetAddress& target, size_t size) {
+buf::MultiBuffer Packet(const common::TargetAddress& target, size_t size) {
     std::vector<uint8_t> bytes(size);
     for (size_t i = 0; i < size; ++i) bytes[i] = static_cast<uint8_t>(i * 37);
     buf::MultiBuffer payload;
@@ -235,7 +235,7 @@ TEST_F(UdpRequestTest, CancellingOneReaderLeavesOtherRequestsUsable) {
         if (completion->failure) {
             try { std::rethrow_exception(completion->failure); }
             catch (const transport::LinkError& error) {
-                EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
+                EXPECT_EQ(error.code(), common::ErrorCode::CANCELLED);
             }
         }
         co_await RoundTrip(io, survivor, 20000);
@@ -250,7 +250,7 @@ TEST_F(UdpRequestTest, ClosedRequestRejectsNewReads) {
         try { co_await request.ReadMultiBuffer(); }
         catch (const transport::LinkError& error) {
             rejected = true;
-            EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
+            EXPECT_EQ(error.code(), common::ErrorCode::CANCELLED);
         }
         EXPECT_TRUE(rejected);
     });
@@ -280,7 +280,7 @@ TEST_P(DnsWriteAbortTest, AbortedResolutionCannotSendAfterLateDnsResponse) {
         auto completion = std::make_shared<Completion>();
         net::cancellation_signal parent;
         net::co_spawn(io, request.WriteMultiBuffer(
-            Packet(TargetAddress("cancelled-write.example", sink.local_endpoint().port()), 32)),
+            Packet(common::TargetAddress("cancelled-write.example", sink.local_endpoint().port()), 32)),
             net::bind_cancellation_slot(parent.slot(),
                 [completion](std::exception_ptr error) {
                     completion->failure = error;
@@ -300,7 +300,7 @@ TEST_P(DnsWriteAbortTest, AbortedResolutionCannotSendAfterLateDnsResponse) {
         if (completion->failure) {
             try { std::rethrow_exception(completion->failure); }
             catch (const transport::LinkError& error) {
-                EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
+                EXPECT_EQ(error.code(), common::ErrorCode::CANCELLED);
             }
         }
         if (abort == WriteAbort::Deadline) {
@@ -336,7 +336,7 @@ class UdpDeadlineTest : public UdpRequestTest,
 TEST_P(UdpDeadlineTest, PendingReadExpiresOnceAtItsDeadline) {
     Run([&]() -> net::awaitable<void> {
         auto& channel = Request();
-        PhaseDeadlineHandle phase;
+        transport::PhaseDeadlineHandle phase;
         const auto kind = GetParam();
         if (kind == Deadline::Idle) channel.SetIdleTimeout(1s);
         if (kind == Deadline::Read) channel.SetReadTimeout(1s);
@@ -346,7 +346,7 @@ TEST_P(UdpDeadlineTest, PendingReadExpiresOnceAtItsDeadline) {
         try { co_await channel.ReadMultiBuffer(); }
         catch (const transport::LinkError& error) {
             cancelled = true;
-            EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
+            EXPECT_EQ(error.code(), common::ErrorCode::CANCELLED);
         }
         const auto elapsed = std::chrono::steady_clock::now() - started;
         EXPECT_TRUE(cancelled);
@@ -464,7 +464,7 @@ class OnePacketReader final : public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
 
-    OnePacketReader(TargetAddress target)
+    OnePacketReader(common::TargetAddress target)
         : target_(std::move(target)) {}
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         if (used_) co_return buf::MultiBuffer{};
@@ -474,7 +474,7 @@ public:
 private:
     transport::CancellationSource cancellation_;
 
-    TargetAddress target_;
+    common::TargetAddress target_;
     bool used_ = false;
 };
 
@@ -491,13 +491,13 @@ TEST_F(UdpRequestTest, RelayRateLimitAndHalfCloseBudgetPreserveSuccessfulWriteAc
         OnePacketReader input(Target(peer.local_endpoint()));
         IgnoreWriter output;
         session::Context context;
-        context.content.network = Network::UDP;
-        StatsShard stats;
+        context.content.network = common::Network::UDP;
+        app::StatsShard stats;
         const auto started = std::chrono::steady_clock::now();
-        const auto result = co_await DoRelayLink(io, input, output, nullptr,
-            target, context, stats, RelayConfig{.downlink_only = 1s, .speed_limit = 1000});
+        const auto result = co_await app::DoRelayLink(io, input, output, nullptr,
+            target, context, stats, app::RelayConfig{.downlink_only = 1s, .speed_limit = 1000});
         const auto elapsed = std::chrono::steady_clock::now() - started;
-        EXPECT_EQ(result.error, ErrorCode::RELAY_TIMEOUT);
+        EXPECT_EQ(result.error, common::ErrorCode::RELAY_TIMEOUT);
         EXPECT_EQ(result.bytes_up, 2000u);
         EXPECT_EQ(result.bytes_down, 0u);
         EXPECT_EQ(stats.Snapshot().bytes_out, 2000u);
@@ -510,14 +510,14 @@ TEST_F(UdpRequestTest, RelayRateLimitAndHalfCloseBudgetPreserveSuccessfulWriteAc
 TEST_F(UdpRequestTest, InvalidDatagramRetainsErrorWithoutCountingFailedSend) {
     Run([&]() -> net::awaitable<void> {
         auto& target = Request();
-        OnePacketReader input(TargetAddress{});
+        OnePacketReader input(common::TargetAddress{});
         IgnoreWriter output;
         session::Context context;
-        context.content.network = Network::UDP;
-        StatsShard stats;
-        const auto result = co_await DoRelayLink(io, input, output, nullptr,
+        context.content.network = common::Network::UDP;
+        app::StatsShard stats;
+        const auto result = co_await app::DoRelayLink(io, input, output, nullptr,
                                                target, context, stats);
-        EXPECT_EQ(result.error, ErrorCode::INVALID_ARGUMENT);
+        EXPECT_EQ(result.error, common::ErrorCode::INVALID_ARGUMENT);
         EXPECT_EQ(result.bytes_up, 0u);
         EXPECT_EQ(context.traffic.bytes_up, 0u);
         EXPECT_EQ(stats.Snapshot().bytes_out, 0u);
@@ -534,8 +534,8 @@ TEST_P(UdpRelayAbortTest, CancellationJoinsRateLimitedRelayWithoutCountingUnsent
         OnePacketReader input(Target(peer.local_endpoint()));
         IgnoreWriter output;
         session::Context context;
-        context.content.network = Network::UDP;
-        StatsShard stats;
+        context.content.network = common::Network::UDP;
+        app::StatsShard stats;
         net::steady_timer cancellation(io);
         const bool deadline = GetParam() == RelayAbort::Deadline;
         if (deadline) target.StartPhaseDeadline(1s);
@@ -546,11 +546,11 @@ TEST_P(UdpRelayAbortTest, CancellationJoinsRateLimitedRelayWithoutCountingUnsent
             });
         }
         const auto start = std::chrono::steady_clock::now();
-        const auto result = co_await DoRelayLink(io, input, output, nullptr,
-            target, context, stats, RelayConfig{.speed_limit = 100});
+        const auto result = co_await app::DoRelayLink(io, input, output, nullptr,
+            target, context, stats, app::RelayConfig{.speed_limit = 100});
         cancellation.cancel();
         const auto elapsed = std::chrono::steady_clock::now() - start;
-        EXPECT_EQ(result.error, deadline ? ErrorCode::RELAY_TIMEOUT : ErrorCode::CANCELLED);
+        EXPECT_EQ(result.error, deadline ? common::ErrorCode::RELAY_TIMEOUT : common::ErrorCode::CANCELLED);
         EXPECT_EQ(result.bytes_up, 0u);
         EXPECT_EQ(context.traffic.bytes_up, 0u);
         EXPECT_EQ(stats.Snapshot().bytes_out, 0u);

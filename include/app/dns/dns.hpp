@@ -30,13 +30,13 @@ struct DnsCacheStats {
     uint64_t capacity = 0;
 };
 
-struct DnsResult : ResultStatus {
+struct DnsResult : common::ResultStatus {
     std::vector<net::ip::address> addresses;
     bool from_cache = false;
     uint32_t ttl = defaults::kDnsMinTTL;
 
     [[nodiscard]] bool Ok() const noexcept {
-        return ResultStatus::Ok() && !addresses.empty();
+        return common::ResultStatus::Ok() && !addresses.empty();
     }
 };
 

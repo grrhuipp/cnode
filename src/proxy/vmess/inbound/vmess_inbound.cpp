@@ -26,26 +26,26 @@
 
 namespace {
 
-Network RequestNetwork(::vmess::Command command) noexcept {
-    return command == ::vmess::Command::UDP
-        ? Network::UDP : command == ::vmess::Command::Mux
-        ? Network::MUX : Network::TCP;
+common::Network RequestNetwork(::proxy::vmess::Command command) noexcept {
+    return command == ::proxy::vmess::Command::UDP
+        ? common::Network::UDP : command == ::proxy::vmess::Command::Mux
+        ? common::Network::MUX : common::Network::TCP;
 }
 
-net::awaitable<tl::expected<UserOnlineSessionGuard, ErrorCode>>
-ParseHandshake(AsyncStream& stream,
-               ::vmess::encoding::ServerSession& vmess_session,
+net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>>
+ParseHandshake(transport::AsyncStream& stream,
+               ::proxy::vmess::encoding::ServerSession& vmess_session,
                const proxyman::inbound::AdmissionEnvironment& environment,
                proxy::InboundAuthentication authentication,
                session::Context& ctx) {
-    std::array<uint8_t, ::vmess::encoding::kMaxRequestHeaderWireSize> header_buf{};
+    std::array<uint8_t, ::proxy::vmess::encoding::kMaxRequestHeaderWireSize> header_buf{};
     size_t total_read = 0;
-    std::optional<::vmess::VMessRequest> request;
+    std::optional<::proxy::vmess::VMessRequest> request;
     size_t consumed = 0;
     while (!request) {
         const size_t required = vmess_session.RequiredHeaderBytes();
         if (required > header_buf.size()) {
-            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         auto read = co_await proxy::ReadHandshakeExact(
             stream, {header_buf.data() + total_read, required - total_read},
@@ -65,7 +65,7 @@ ParseHandshake(AsyncStream& stream,
             }
             auto bound = std::move(authentication).Bind(authenticated->user->profile,
                 proxy::InboundRequestTarget{RequestNetwork(authenticated->command), authenticated->target});
-            co_return tl::unexpected(std::move(bound).Reject(reason, ErrorCode::PROTOCOL_DECODE_FAILED));
+            co_return tl::unexpected(std::move(bound).Reject(reason, common::ErrorCode::PROTOCOL_DECODE_FAILED));
         }
     }
 
@@ -77,11 +77,11 @@ ParseHandshake(AsyncStream& stream,
             RequestNetwork(request->command),
             request->target,
             std::move(request->forwarded)});
-    if (!co_await ::vmess::RegisterSessionIfNew(
+    if (!co_await ::proxy::vmess::RegisterSessionIfNew(
             environment.coordinator, *request->user, request->body_key, request->body_iv)) {
         // Replay is not a credential failure: it never feeds the ban table.
         constexpr std::string_view reason = "session replay admission rejected";
-        co_return tl::unexpected(std::move(bound).Reject(reason, ErrorCode::PERMISSION_DENIED));
+        co_return tl::unexpected(std::move(bound).Reject(reason, common::ErrorCode::PERMISSION_DENIED));
     }
 
     LOG_CONN_TRACE(ctx,
@@ -108,17 +108,17 @@ ParseHandshake(AsyncStream& stream,
 
 namespace proxy::vmess::inbound {
 
-class Handler final : public ::Inbound {
+class Handler final : public ::proxy::Inbound {
 public:
     explicit Handler(const ::proxyman::inbound::AdmissionEnvironment& environment);
 
-    ::net::awaitable<::RelayResult> Process(
-        std::unique_ptr<::AsyncStream> stream,
+    ::net::awaitable<::app::RelayResult> Process(
+        std::unique_ptr<::transport::AsyncStream> stream,
         ::routing::Dispatcher& dispatcher,
         const ::proxyman::inbound::ReceiverSettings& receiver,
         ::net::io_context& io_context,
         ::session::Context& ctx,
-        const ::TimeoutsConfig& timeouts,
+        const ::infra::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) override;
 
 private:
@@ -136,14 +136,14 @@ proxy::vmess::inbound::Handler::Handler(
     : environment_(environment)
 {}
 
-net::awaitable<RelayResult>
+net::awaitable<app::RelayResult>
 proxy::vmess::inbound::Handler::Process(
-    std::unique_ptr<AsyncStream> stream,
+    std::unique_ptr<transport::AsyncStream> stream,
     routing::Dispatcher& dispatcher,
     const proxyman::inbound::ReceiverSettings& receiver,
     net::io_context& io_context,
     session::Context& ctx,
-    const TimeoutsConfig& timeouts,
+    const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout)
 {
     const std::string_view tag   = ctx.inbound.tag;
@@ -151,14 +151,14 @@ proxy::vmess::inbound::Handler::Process(
 
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
-    std::optional<UserOnlineSessionGuard> user_session;
-    std::optional<::vmess::encoding::RequestBodyReader> request_reader;
-    std::optional<::vmess::encoding::ResponseBodyWriter> response_writer;
+    std::optional<common::UserOnlineSessionGuard> user_session;
+    std::optional<::proxy::vmess::encoding::RequestBodyReader> request_reader;
+    std::optional<::proxy::vmess::encoding::ResponseBodyWriter> response_writer;
     try {
         auto authentication = co_await proxy::BeginInboundAuthentication(environment_, ctx);
         if (!authentication) co_return proxy::RejectInbound(environment_.stats, stream.get(), authentication.error());
         {
-            ::vmess::encoding::ServerSession vmess_session(tag);
+            ::proxy::vmess::encoding::ServerSession vmess_session(tag);
             auto parsed_session = co_await ParseHandshake(
                 *stream, vmess_session, environment_, std::move(*authentication), ctx);
             if (!parsed_session) {
@@ -172,19 +172,19 @@ proxy::vmess::inbound::Handler::Process(
             request_reader.emplace(std::move(*reader));
             response_writer.emplace(std::move(*writer));
         }
-    } catch (const WorkerMailboxFull&) {
-        co_return proxy::RejectInbound(environment_.stats, stream.get(), ErrorCode::RESOURCE_EXHAUSTED);
+    } catch (const app::WorkerMailboxFull&) {
+        co_return proxy::RejectInbound(environment_.stats, stream.get(), common::ErrorCode::RESOURCE_EXHAUSTED);
     } catch (const IoSystemError& e) {
         co_return proxy::RejectInbound(
             environment_.stats, stream.get(),
-            e.code() == net::error::operation_aborted ? ErrorCode::CANCELLED : MapAsioError(e.code()));
+            e.code() == net::error::operation_aborted ? common::ErrorCode::CANCELLED : common::MapAsioError(e.code()));
     }
     if (!request_reader || !response_writer) {
-        co_return proxy::RejectInbound(environment_.stats, stream.get(), ErrorCode::RESOURCE_EXHAUSTED);
+        co_return proxy::RejectInbound(environment_.stats, stream.get(), common::ErrorCode::RESOURCE_EXHAUSTED);
     }
-    const Network net = ctx.content.network;
+    const common::Network net = ctx.content.network;
 
-    if (net == Network::MUX) {
+    if (net == common::Network::MUX) {
         co_return co_await proxy::ServeMuxInbound(
             io_context,
             transport::Link{&*request_reader, &*response_writer},
@@ -203,7 +203,7 @@ proxy::vmess::inbound::Handler::Process(
         receiver.dispatch_policy,
         std::move(stream),
         transport::Link{&*request_reader, &*response_writer},
-        InitialPayload{},
+        common::InitialPayload{},
         ctx,
         environment_.stats,
         timeouts);
@@ -215,8 +215,8 @@ proxy::vmess::inbound::Handler::Process(
 // ============================================================================
 namespace {
 [[nodiscard]] std::optional<::proxyman::inbound::PreparedVmessUser>
-BuildPreparedVmessUser(const ::InboundUserSpec& spec) {
-    auto user = ::vmess::MemoryAccount::FromUUID(spec.credential);
+BuildPreparedVmessUser(const ::infra::InboundUserSpec& spec) {
+    auto user = ::proxy::vmess::MemoryAccount::FromUUID(spec.credential);
     if (!user) {
         return std::nullopt;
     }
@@ -235,13 +235,13 @@ const bool kVmessInboundRegistered = [] {
 
     reg.create_tcp_handler =
         [](const ::proxyman::inbound::AdmissionEnvironment& environment,
-           const ::proxyman::inbound::BuildRequest&) -> std::unique_ptr<::Inbound> {
+           const ::proxyman::inbound::BuildRequest&) -> std::unique_ptr<::proxy::Inbound> {
             return std::make_unique<::proxy::vmess::inbound::Handler>(environment);
         };
 
     reg.build_users =
         [](const ::proxyman::inbound::BuildRequest& req,
-           std::span<const ::InboundUserSpec> specs)
+           std::span<const ::infra::InboundUserSpec> specs)
             -> std::optional<::proxyman::inbound::UserSet> {
             std::vector<::proxyman::inbound::PreparedVmessUser> users;
             users.reserve(specs.size());

@@ -9,9 +9,13 @@
 #include <span>
 #include <variant>
 
+namespace app {
+
 class GroupCoordinator;
 
-namespace ss {
+}  // namespace app
+
+namespace proxy::shadowsocks {
 
 enum class Ss2022SaltAdmission : uint8_t { Accepted, Replayed, Limited };
 
@@ -43,6 +47,6 @@ private:
 // closed admission throws IoSystemError(operation_aborted). An accepted operation
 // completes on its owner before the caller resumes, including cancellation.
 [[nodiscard]] net::awaitable<Ss2022SaltAdmission> AdmitSs2022RequestSalt(
-    GroupCoordinator& coordinator, const KeyBytes& salt);
+    app::GroupCoordinator& coordinator, const KeyBytes& salt);
 
-}  // namespace ss
+}  // namespace proxy::shadowsocks

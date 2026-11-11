@@ -22,7 +22,7 @@
 #include <span>
 #include <string_view>
 #include <utility>
-namespace trojan {
+namespace proxy::trojan {
 
 using PasswordHash = std::array<char, 56>;
 
@@ -53,8 +53,8 @@ enum class TrojanCommand : uint8_t {
 struct TrojanRequest {
     PasswordHash         password_hash{};  // SHA224 密码哈希（十六进制，56字节）
     TrojanCommand        command = TrojanCommand::CONNECT;
-    TargetAddress        target;
-    std::optional<ForwardedMetadata> forwarded;
+    common::TargetAddress        target;
+    std::optional<common::ForwardedMetadata> forwarded;
 
     [[nodiscard]] std::string_view PasswordHashView() const noexcept {
         return {password_hash.data(), password_hash.size()};
@@ -67,7 +67,7 @@ inline constexpr size_t kRequestPrefixSize = kPasswordHashSize + 3;
 // UDP 包头：不带元数据的 SOCKS5 地址之后是 2 字节长度与 CRLF。
 inline constexpr size_t kUdpPacketTrailerSize = 2 + 2;
 inline constexpr size_t kMaxUdpPacketHeaderSize =
-    kMaxBaseEncodedAddressSize + kUdpPacketTrailerSize;
+    common::kMaxBaseEncodedAddressSize + kUdpPacketTrailerSize;
 
 enum class RequestDecodeStatus : uint8_t { Complete, Incomplete, InvalidHeader, InvalidAddress };
 
@@ -88,20 +88,20 @@ struct RequestDecodeResult {
 [[nodiscard]] size_t EncodeRequestTo(
     std::span<const char, 56> password_hash,
     TrojanCommand cmd,
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     uint8_t* output,
     size_t output_size,
-    ForwardedMetadataView forwarded = {});
+    common::ForwardedMetadataView forwarded = {});
 
 // 返回写入字节数，0 表示目标非法、负载超过 uint16 或缓冲区不足。
 [[nodiscard]] size_t EncodeUdpPacketHeaderTo(
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     size_t payload_len,
     uint8_t* output,
     size_t output_size);
 
 struct FramedUdpPacket {
-    TargetAddress target;
+    common::TargetAddress target;
     buf::MultiBuffer payload;
 };
 
@@ -121,13 +121,13 @@ private:
     void Fail() noexcept;
 
     buf::MultiBuffer pending_;
-    std::optional<TargetAddress> target_;
+    std::optional<common::TargetAddress> target_;
     size_t payload_size_ = 0;
     State state_ = State::Active;
 };
 
 net::awaitable<buf::MultiBuffer> ReadUdpDatagram(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     UdpFramer& framer);
 
 net::awaitable<void> WriteUdpDatagram(
@@ -136,14 +136,14 @@ net::awaitable<void> WriteUdpDatagram(
 
 net::awaitable<void> WriteUdpDatagram(
     transport::MultiBufferWriter& writer,
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     std::span<const net::const_buffer> payload);
 
 class UdpStreamEndpoint final : public proxy::OutboundStreamEndpointBase {
 public:
     explicit UdpStreamEndpoint(
-        AsyncStream& stream,
-        const TargetAddress& fallback_target = EmptyTarget(),
+        transport::AsyncStream& stream,
+        const common::TargetAddress& fallback_target = EmptyTarget(),
         transport::EofAction read_eof_action = transport::EofAction::ShutdownPeerWrite) noexcept
         : OutboundStreamEndpointBase(stream)
         , fallback_target_(fallback_target)
@@ -171,14 +171,14 @@ public:
     }
 
 private:
-    static const TargetAddress& EmptyTarget() noexcept {
-        static const TargetAddress kEmpty{};
+    static const common::TargetAddress& EmptyTarget() noexcept {
+        static const common::TargetAddress kEmpty{};
         return kEmpty;
     }
 
-    const TargetAddress& fallback_target_;
+    const common::TargetAddress& fallback_target_;
     UdpFramer framer_;
     transport::EofAction read_eof_action_;
 };
 
-}  // namespace trojan
+}  // namespace proxy::trojan

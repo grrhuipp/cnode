@@ -7,8 +7,8 @@ namespace {
 using namespace std::chrono_literals;
 struct Owner {
     int calls = 0;
-    ::ErrorCode reason = ::ErrorCode::OK;
-    void OnTimeout(::ErrorCode error) noexcept { ++calls; reason = error; }
+    ::common::ErrorCode reason = ::common::ErrorCode::OK;
+    void OnTimeout(::common::ErrorCode error) noexcept { ++calls; reason = error; }
 };
 using Timeouts = ::transport::internet::detail::ConnectionTimeouts<Owner>;
 
@@ -22,7 +22,7 @@ TEST(ConnectionTimeouts, ActivityArmsIdleTimeoutAfterCompletedWrite) {
     timeouts.TouchActivity();
     io.run_for(1100ms);
     EXPECT_EQ(owner.calls, 1);
-    EXPECT_EQ(owner.reason, ::ErrorCode::CANCELLED);
+    EXPECT_EQ(owner.reason, ::common::ErrorCode::CANCELLED);
     EXPECT_TRUE(timeouts.ConsumeIdleTimeout());
     EXPECT_FALSE(timeouts.ConsumeWriteTimeout());
 }

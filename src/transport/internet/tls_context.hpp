@@ -38,6 +38,8 @@ private:
 // One registration per prepared configuration, not per Worker or handshake.
 // A single bounded background scheduler signs and publishes immutable contexts.
 // 续期只按启动时的 TlsConfig 快照重建同一种自签服务端上下文。
+namespace transport::internet {
+
 class AutoSignContextRenewal {
 public:
     using Clock = std::chrono::system_clock;
@@ -85,3 +87,5 @@ private:
 // SSL_CTX_use_PrivateKey_file. Logs the failing step.
 [[nodiscard]] bool ConfigureTlsCertificatePem(
     SSL_CTX* context, const TlsPemMaterial& pem);
+
+}  // namespace transport::internet

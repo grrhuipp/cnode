@@ -42,23 +42,23 @@ using Clock = std::chrono::steady_clock;
 constexpr size_t kBatchLimit = 64;
 
 
-class DummyInbound : public ::Inbound {
+class DummyInbound : public ::proxy::Inbound {
 public:
-    ::net::awaitable<::RelayResult> Process(
-        std::unique_ptr<::AsyncStream>, ::routing::Dispatcher&,
+    ::net::awaitable<::app::RelayResult> Process(
+        std::unique_ptr<::transport::AsyncStream>, ::routing::Dispatcher&,
         const ::proxyman::inbound::ReceiverSettings&, ::net::io_context&,
-        ::session::Context&, const ::TimeoutsConfig&, uint32_t) override {
-        co_return ::RelayResult{};
+        ::session::Context&, const ::infra::TimeoutsConfig&, uint32_t) override {
+        co_return ::app::RelayResult{};
     }
 
-    tl::expected<::InboundDatagramResult, ::ErrorCode> Process(
-        const ::InboundDatagramRequest&) override {
-        return tl::unexpected(::ErrorCode::PROTOCOL_AUTH_FAILED);
+    tl::expected<::proxy::InboundDatagramResult, ::common::ErrorCode> Process(
+        const ::proxy::InboundDatagramRequest&) override {
+        return tl::unexpected(::common::ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 };
 
-using Ingress = ::worker_detail::UdpIngress;
-using Reclaimer = ::worker_detail::UdpAssociationReclaimer;
+using Ingress = ::app::worker_detail::UdpIngress;
+using Reclaimer = ::app::worker_detail::UdpAssociationReclaimer;
 using SessionPtr = Ingress::ClientSessionPtr;
 
 struct ReenterOnCancel {
@@ -92,14 +92,14 @@ private:
     }
 };
 
-class DatagramResponse final : public ::InboundDatagramResponse {
+class DatagramResponse final : public ::proxy::InboundDatagramResponse {
 public:
-    ::buf::MultiBuffer Encode(::UDPPacketView) override { return {}; }
+    ::buf::MultiBuffer Encode(::proxy::UDPPacketView) override { return {}; }
 };
 
-class AcceptedReplyResponse final : public ::InboundDatagramResponse {
+class AcceptedReplyResponse final : public ::proxy::InboundDatagramResponse {
 public:
-    ::buf::MultiBuffer Encode(::UDPPacketView packet) override {
+    ::buf::MultiBuffer Encode(::proxy::UDPPacketView packet) override {
         ::buf::MultiBuffer result;
         if (!::buf::AppendSpanToMultiBuffer(packet.data, result)) throw std::bad_alloc();
         return result;
@@ -111,30 +111,30 @@ public:
 // 0x43 selects protocol session 2, anything else session 1.
 class DatagramInbound final : public DummyInbound {
 public:
-    tl::expected<::InboundDatagramResult, ::ErrorCode> Process(
-        const ::InboundDatagramRequest& request) override {
-        ::InboundDatagramResult result;
+    tl::expected<::proxy::InboundDatagramResult, ::common::ErrorCode> Process(
+        const ::proxy::InboundDatagramRequest& request) override {
+        ::proxy::InboundDatagramResult result;
         result.user = &profile_;
         const std::array<uint8_t, 1> owner{0x71};
         if (!result.session_owner.Assign(owner)) {
-            return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
+            return tl::unexpected(::common::ErrorCode::RESOURCE_EXHAUSTED);
         }
         result.session_id = !request.payload.empty() && request.payload[0] == 0x43 ? 2 : 1;
-        result.target = ::TargetAddress(
+        result.target = ::common::TargetAddress(
             ::net::ip::address_v4::loopback(), 53);
         ::buf::BufferGuard payload{::buf::Buffer::New()};
-        if (!payload) return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
+        if (!payload) return tl::unexpected(::common::ErrorCode::RESOURCE_EXHAUSTED);
         payload->Tail()[0] = 0x42;
         payload->Produce(1);
         result.payload.push_back(std::move(payload));
         return result;
     }
-    tl::expected<std::shared_ptr<::InboundDatagramResponse>, ::ErrorCode>
-    CreateDatagramResponse(const ::InboundDatagramResult&) override {
+    tl::expected<std::shared_ptr<::proxy::InboundDatagramResponse>, ::common::ErrorCode>
+    CreateDatagramResponse(const ::proxy::InboundDatagramResult&) override {
         return std::make_shared<DatagramResponse>();
     }
 private:
-    ::UserProfile profile_;
+    ::common::UserProfile profile_;
 };
 
 bool IsDecodedPayload(const ::buf::MultiBuffer& payload) {
@@ -150,19 +150,19 @@ public:
     unsigned dispatched = 0;
     unsigned packets_read = 0;
     const ::transport::MultiBufferReader* last_reader = nullptr;
-    ::net::awaitable<::RelayResult> Dispatch(
+    ::net::awaitable<::app::RelayResult> Dispatch(
         ::net::io_context&, const ::routing::DispatchPolicy&,
-        std::unique_ptr<::AsyncStream>, ::transport::Link link,
-        ::InitialPayload, ::session::Context&, ::StatsShard&,
-        const ::TimeoutsConfig&) override {
+        std::unique_ptr<::transport::AsyncStream>, ::transport::Link link,
+        ::common::InitialPayload, ::session::Context&, ::app::StatsShard&,
+        const ::infra::TimeoutsConfig&) override {
         ++dispatched;
         EXPECT_NE(link.reader, nullptr);
-        if (!link.reader) co_return ::RelayResult{};
+        if (!link.reader) co_return ::app::RelayResult{};
         last_reader = link.reader;
         auto payload = co_await link.reader->ReadMultiBuffer();
         EXPECT_TRUE(IsDecodedPayload(payload)) << "rebuilt native request did not receive exactly its decoded first packet";
         ++packets_read;
-        co_return ::RelayResult{};
+        co_return ::app::RelayResult{};
     }
 };
 
@@ -171,15 +171,15 @@ public:
 struct DatagramSource {
     explicit DatagramSource(::net::io_context& io)
         : coordinator(io),
-          limiter(::ConnectionLimiter::Acquire({}, coordinator.Get())),
+          limiter(::app::ConnectionLimiter::Acquire({}, coordinator.Get())),
           online_users(*coordinator.Get()) {
         coordinator.Get()->RegisterWorker(io);
     }
     WorkerCoordinatorFixture coordinator;
-    std::shared_ptr<::ConnectionLimiter> limiter;
-    ::UserOnlineTracker online_users;
+    std::shared_ptr<::app::ConnectionLimiter> limiter;
+    ::common::UserOnlineTracker online_users;
     DatagramDispatcher dispatcher;
-    ::StatsShard stats;
+    ::app::StatsShard stats;
     const ::proxyman::inbound::AdmissionEnvironment admission{
         *coordinator.Get(), *limiter, online_users, stats};
     ::app::RequestLoadState request_load{1024, 0};
@@ -190,11 +190,11 @@ struct DatagramSource {
 
     void Send(UdpSocketFixtures& sockets, Ingress& ingress, ::net::io_context& io, std::string_view,
               ::udp::socket* sock, uint16_t client_port,
-              std::span<const uint8_t> packet, const ::TimeoutsConfig& timeouts) {
+              std::span<const uint8_t> packet, const ::infra::TimeoutsConfig& timeouts) {
         const ::app::DatagramSessionEnvironment environment{
             .timeouts = timeouts, .dispatcher = &dispatcher,
             .admission = &admission, .request_load = &request_load};
-        ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
+        ingress.ProcessDatagram(::app::worker_detail::UdpDatagramContext{
             .socket = sockets.Find(ingress, sock).get(),
             .client_endpoint = {::net::ip::address_v4::loopback(), client_port},
             .payload = packet,
@@ -210,15 +210,15 @@ struct DatagramSource {
     *received = IsDecodedPayload(payload);
 }
 
-::worker_detail::ClientSessionKey Key(uint64_t id) {
-    ::InboundDatagramOwner owner;
+::app::worker_detail::ClientSessionKey Key(uint64_t id) {
+    ::proxy::InboundDatagramOwner owner;
     const std::array<uint8_t, 1> bytes{0x71};
     if (!owner.Assign(bytes)) throw std::runtime_error("failed to prepare typed session owner");
     return {owner, id};
 }
 
 SessionPtr MakeSession(UdpSocketFixtures& sockets, Ingress& ingress, ::net::io_context& io,
-                       std::string socket_key, ::worker_detail::ClientSessionKey client_key,
+                       std::string socket_key, ::app::worker_detail::ClientSessionKey client_key,
                        Clock::time_point last_active,
                        std::chrono::seconds idle_timeout) {
     auto session = ingress.CreateClientSession(sockets.Get(ingress, socket_key), client_key, io,
@@ -243,7 +243,7 @@ size_t Associations(std::initializer_list<const Ingress*> ingresses) {
     return total;
 }
 
-size_t ActiveEvents(const ::TimeoutScheduler& scheduler) {
+size_t ActiveEvents(const ::transport::internet::TimeoutScheduler& scheduler) {
     return scheduler.GetResourceStats().active_events;
 }
 
@@ -295,10 +295,10 @@ class UdpAssociationReclaimerTest : public ::testing::Test {
 protected:
     ::net::io_context io;
     UdpSocketFixtures sockets{io};
-    ::TimeoutScheduler& scheduler = ::TimeoutScheduler::ForIoContext(io);
+    ::transport::internet::TimeoutScheduler& scheduler = ::transport::internet::TimeoutScheduler::ForIoContext(io);
     const size_t idle_events = ActiveEvents(scheduler);
     Reclaimer reclaimer{scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); }};
-    ::worker_detail::UdpResourceBudget budget;
+    ::app::worker_detail::UdpResourceBudget budget;
     Ingress first{"first", std::make_unique<DummyInbound>(), reclaimer, budget, io};
     Ingress second{"second", std::make_unique<DummyInbound>(), reclaimer, budget, io};
     const Clock::time_point now = Clock::now();
@@ -433,8 +433,8 @@ TEST_F(UdpAssociationReclaimerTest, IdleExpiryAllowsSynchronousSocketRetirement)
 TEST_F(UdpAssociationReclaimerTest, DownlinkDoesNotRefreshIdleDeadline) {
     // Downlink traffic does not refresh idle time: the row still expires at
     // its original deadline, well before a refreshed deadline could pass.
-    ::TargetAddress target;
-    target.type = ::AddressType::IPv4;
+    ::common::TargetAddress target;
+    target.type = ::common::AddressType::IPv4;
     target.resolved_addr = ::net::ip::address_v4::loopback();
     target.port = 53;
     Ingress downlink_ingress("downlink", std::make_unique<DummyInbound>(), reclaimer, budget, io);
@@ -488,7 +488,7 @@ TEST_F(UdpAssociationReclaimerTest, UplinkRefreshesAndRearmsIdleDeadline) {
     auto activity_socket = AttachOpenSocket(sockets, activity_ingress, io, "activity");
     DatagramSource activity_source{io};
     DrainIngress drain{io, activity_ingress};
-    ::TimeoutsConfig activity_timeouts;
+    ::infra::TimeoutsConfig activity_timeouts;
     activity_timeouts.idle = 1;
     constexpr auto uplink_idle = 1s;
     auto uplink = MakeSession(sockets, activity_ingress, io, "activity", Key(1),
@@ -661,7 +661,7 @@ TEST_P(UdpStoredTimeoutTest, SameKeyRequestsUseStoredTimeoutRatherThanPacketSnap
     auto prior = MakeSession(sockets, ingress, io, "request", Key(1), Clock::now() - 2s,
         expired ? 1s : 0s);
     ASSERT_NE(prior, nullptr);
-    ::TimeoutsConfig packet_timeouts;
+    ::infra::TimeoutsConfig packet_timeouts;
     packet_timeouts.idle = expired ? 0 : 1;
     const std::array<uint8_t, 1> packet{0x42};
     source.Send(sockets, ingress, io, "request", socket.get(), 20001, packet, packet_timeouts);
@@ -690,7 +690,7 @@ TEST_F(UdpAssociationReclaimerTest, CurrentKeyExpiryDoesNotRebuildRetiredSocket)
                             reclaimer, budget, io);
     DatagramSource request_source{io};
     DrainIngress drain{io, request_ingress};
-    ::TimeoutsConfig packet_timeouts;
+    ::infra::TimeoutsConfig packet_timeouts;
     const std::array<uint8_t, 1> request_packet{0x42};
     auto request_socket = AttachOpenSocket(sockets, request_ingress, io, "request");
     const auto scoped_key = Key(1);

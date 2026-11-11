@@ -61,8 +61,8 @@ ParseRealityShortId(std::string_view value) noexcept {
 
     RealityShortId parsed{};
     for (std::size_t i = 0; i < value.size(); i += 2) {
-        const int high = HexDigitValue(value[i]);
-        const int low = HexDigitValue(value[i + 1]);
+        const int high = common::HexDigitValue(value[i]);
+        const int low = common::HexDigitValue(value[i + 1]);
         if (high < 0 || low < 0) {
             return tl::unexpected(RealityShortIdError::InvalidFormat);
         }
@@ -117,7 +117,7 @@ ParseRealityClientVersion(std::string_view value) noexcept {
 
 [[nodiscard]] inline uint32_t RealityClientVersionValue(
     std::span<const uint8_t, 4> version) noexcept {
-    return LoadU32BE(version.data());
+    return common::LoadU32BE(version.data());
 }
 
 [[nodiscard]] inline bool IsRealityServerNameAllowed(
@@ -129,6 +129,8 @@ ParseRealityClientVersion(std::string_view value) noexcept {
 }
 
 }  // namespace transport::internet
+
+namespace transport::internet {
 
 enum class StreamEndpointRole {
     Inbound,
@@ -490,5 +492,7 @@ struct OutboundStreamDefaults {
 
 [[nodiscard]] StreamSettings NormalizeOutboundStreamSettings(
     const StreamSettings& source, const OutboundStreamDefaults& defaults = {});
+
+}  // namespace transport::internet
 
 

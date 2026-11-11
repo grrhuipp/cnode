@@ -9,7 +9,7 @@
 #include <string_view>
 #include <utility>
 
-namespace worker_detail {
+namespace app::worker_detail {
 
 // Worker 私有：一个入站 tag 的全部 TCP acceptor 的唯一 owner。
 class TcpListenerOwner final {
@@ -55,7 +55,7 @@ public:
 
         auto acceptor = std::move(it->second);
         acceptors_.erase(it);
-        MaybeShrinkHashContainer(acceptors_, 8);
+        common::MaybeShrinkHashContainer(acceptors_, 8);
 
         IoErrorCode ec;
         acceptor->close(ec);
@@ -63,7 +63,7 @@ public:
 
 private:
     memory::UnorderedMap<memory::String, AcceptorPtr,
-                         TransparentStringHash, TransparentStringEq> acceptors_;
+                         common::TransparentStringHash, common::TransparentStringEq> acceptors_;
 };
 
-}  // namespace worker_detail
+}  // namespace app::worker_detail

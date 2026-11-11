@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-namespace detail {
+namespace common::detail {
 
 template <typename Handler>
 struct BatchState {
@@ -88,6 +88,8 @@ inline net::awaitable<void> RunBatchOnExecutor(
 // after all tasks finish. The first non-cancellation failure takes precedence
 // over child cancellation. Caller cancellation is deferred until all started
 // tasks finish; it cannot detach tasks that borrow the caller's state.
+namespace common {
+
 inline net::awaitable<void> RunAwaitableBatch(
     net::any_io_executor executor,
     std::vector<net::awaitable<void>> tasks) {
@@ -117,3 +119,5 @@ template <typename WorkerRange, typename TaskFactory>
     }
     return RunAwaitableBatch(std::move(executor), std::move(tasks));
 }
+
+}  // namespace common

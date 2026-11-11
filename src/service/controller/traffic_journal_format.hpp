@@ -70,7 +70,7 @@ struct RecordRow {
 };
 
 [[nodiscard]] inline std::optional<int64_t> DecodeCounter(const json::value& value) noexcept {
-    const auto number = JsonUnsignedInteger(value);
+    const auto number = infra::JsonUnsignedInteger(value);
     if (!number || *number > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
         return std::nullopt;
     }

@@ -10,15 +10,29 @@
 #include <tl/expected.hpp>
 
 
+namespace app {
+
 struct StatsShard;
+
+}  // namespace app
+namespace infra {
+
 struct TimeoutsConfig;
+
+}  // namespace infra
+namespace transport::internet {
+
 class OutboundDialer;
+
+}  // namespace transport::internet
 
 namespace session {
 struct Context;
 }
 
-using OutboundProcessResult = tl::expected<RelayResult, ErrorCode>;
+namespace proxy {
+
+using OutboundProcessResult = tl::expected<app::RelayResult, common::ErrorCode>;
 
 // ============================================================================
 // Outbound - Xray proxy.Outbound
@@ -36,10 +50,12 @@ public:
     virtual net::awaitable<OutboundProcessResult> Process(
         session::Context& ctx,
         transport::Link inbound,
-        OutboundDialer& dialer,
-        const TimeoutsConfig& timeouts,
-        StatsShard& stats,
-        const RelayConfig& relay_config,
+        transport::internet::OutboundDialer& dialer,
+        const infra::TimeoutsConfig& timeouts,
+        app::StatsShard& stats,
+        const app::RelayConfig& relay_config,
         buf::MultiBufferBatch first_payload) = 0;
 };
+
+}  // namespace proxy
 

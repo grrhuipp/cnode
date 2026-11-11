@@ -20,6 +20,8 @@
 #include <netinet/tcp.h>
 
 
+namespace transport::internet {
+
 namespace {
 constexpr size_t kProxyProbeBytes = 256;
 template<class Timeouts, bool IsRead>
@@ -105,20 +107,22 @@ enum Flag : uint8_t {
     kDeferWriteCancellation = 1u << 4,
 };
 
-struct TcpStream::Impl {
+}  // namespace transport::internet
+
+struct transport::internet::TcpStream::Impl {
     static constexpr uint8_t kReadDrainBudget = 16;
 
-    explicit Impl(tcp::socket sock, TcpStream& owner)
+    explicit Impl(tcp::socket sock, transport::internet::TcpStream& owner)
         : socket(std::move(sock))
         , owner(owner)
         , timeouts(SocketIoContext(this->socket), *this) {}
 
-    void OnTimeout(ErrorCode reason) noexcept {
+    void OnTimeout(common::ErrorCode reason) noexcept {
         // A deadline is terminal, not a graceful EOF. Select reset before
         // notifying subscribers: a subscriber can close the socket reentrantly,
         // and a normal close would leave queued writes draining without a bound.
         SetFlag(kAbortiveClose);
-        if (reason != ErrorCode::CANCELLED) owner.Cancellation().Stop(reason);
+        if (reason != common::ErrorCode::CANCELLED) owner.Cancellation().Stop(reason);
         owner.Cancel();
         owner.Close();
     }
@@ -151,13 +155,15 @@ struct TcpStream::Impl {
     }
 
     tcp::socket socket;
-    TcpStream& owner;
+    transport::internet::TcpStream& owner;
     transport::internet::detail::ConnectionTimeouts<Impl> timeouts;
     buf::MultiBuffer pending_data;
     std::uint64_t cancellation_epoch_ = 0;
     uint8_t read_drain_budget = 0;
     uint8_t flags = 0;
 };
+
+namespace transport::internet {
 
 DetachedTcpState::~DetachedTcpState() noexcept {
     if (fd >= 0) ::close(fd);
@@ -168,7 +174,9 @@ DetachedTcpState::DetachedTcpState(DetachedTcpState&& other) noexcept
     , protocol(other.protocol)
     , pending_bytes(std::move(other.pending_bytes)) {}
 
-DetachedTcpState& DetachedTcpState::operator=(DetachedTcpState&& other) noexcept {
+}  // namespace transport::internet
+
+transport::internet::DetachedTcpState& transport::internet::DetachedTcpState::operator=(transport::internet::DetachedTcpState&& other) noexcept {
     if (this != &other) {
         if (fd >= 0) ::close(fd);
         fd = std::exchange(other.fd, -1);
@@ -181,6 +189,8 @@ DetachedTcpState& DetachedTcpState::operator=(DetachedTcpState&& other) noexcept
 // ============================================================================
 // TcpStream 实现
 // ============================================================================
+
+namespace transport::internet {
 
 TcpStream::TcpStream(tcp::socket socket)
     : impl_(std::make_unique<Impl>(std::move(socket), *this)) {
@@ -374,7 +384,7 @@ net::awaitable<void> TcpStream::WriteMultiBuffer(buf::MultiBuffer mb) {
         mb.clear();
         throw IoSystemError(io_error::broken_pipe);
     }
-    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> builder;
+    common::ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> builder;
     try {
         builder.AppendMultiBuffer(mb);
         auto buffers = builder.Span();
@@ -893,17 +903,17 @@ net::awaitable<DialResult> TcpStream::Connect(
     std::chrono::seconds timeout) {
 
     if (timeout.count() <= 0) {
-        co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
+        co_return DialResult::Fail(common::ErrorCode::DIAL_TIMEOUT, "connection timed out");
     }
     IoErrorCode ec;
     tcp::socket socket(io_context);
     socket.open(endpoint.protocol(), ec);
     if (ec)
-        co_return DialResult::Fail(ErrorCode::SOCKET_CREATE_FAILED, ec.message());
+        co_return DialResult::Fail(common::ErrorCode::SOCKET_CREATE_FAILED, ec.message());
     if (bind_local) {
         socket.bind(tcp::endpoint(*bind_local, 0), ec);
         if (ec)
-            co_return DialResult::Fail(ErrorCode::SOCKET_BIND_FAILED, ec.message());
+            co_return DialResult::Fail(common::ErrorCode::SOCKET_BIND_FAILED, ec.message());
     }
 
     auto stream = std::make_unique<TcpStream>(std::move(socket));
@@ -911,7 +921,7 @@ net::awaitable<DialResult> TcpStream::Connect(
     auto& scheduler = TimeoutScheduler::ForIoContext(SocketIoContext(stream->impl_->socket));
     if (!scheduler.ScheduleAfter(
             std::chrono::duration_cast<std::chrono::milliseconds>(timeout), deadline))
-        co_return DialResult::Fail(ErrorCode::CANCELLED, "connection cancelled");
+        co_return DialResult::Fail(common::ErrorCode::CANCELLED, "connection cancelled");
 
     IoErrorCode connect_ec;
     const auto result = ::connect(stream->NativeHandle(), endpoint.data(), endpoint.size());
@@ -932,9 +942,9 @@ net::awaitable<DialResult> TcpStream::Connect(
     }
     deadline.Cancel();
     if (deadline.timed_out)
-        co_return DialResult::Fail(ErrorCode::DIAL_TIMEOUT, "connection timed out");
+        co_return DialResult::Fail(common::ErrorCode::DIAL_TIMEOUT, "connection timed out");
     if (connect_ec)
-        co_return DialResult::Fail(MapAsioError(connect_ec), connect_ec.message());
+        co_return DialResult::Fail(common::MapAsioError(connect_ec), connect_ec.message());
     co_return DialResult::Success(std::move(stream));
 }
 
@@ -1028,4 +1038,6 @@ void SetupConnectedSocket(tcp::socket& sock) {
                reinterpret_cast<const char*>(&keepcnt), sizeof(keepcnt));
 }
 }  // namespace
+
+}  // namespace transport::internet
 

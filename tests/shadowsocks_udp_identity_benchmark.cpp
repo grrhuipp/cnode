@@ -31,9 +31,9 @@ uint64_t CpuNs() {
     return uint64_t(value.tv_sec) * 1000000000 + value.tv_nsec;
 }
 
-void Verify(const ss::SsUdpDecodeResult& result,
+void Verify(const proxy::shadowsocks::SsUdpDecodeResult& result,
             const UserStore::ShadowsocksUsersView& users,
-            size_t position, const TargetAddress& target,
+            size_t position, const common::TargetAddress& target,
             std::span<const uint8_t> payload, uint64_t packet_id) {
     Require(result.user_index == position);
     Require(result.target.SameEndpoint(target) && !result.forwarded);
@@ -56,31 +56,31 @@ void Verify(const ss::SsUdpDecodeResult& result,
     Require(offset == payload.size());
 }
 
-void RunCase(const char* cipher_name, const ss::SsCipherInfo& cipher,
+void RunCase(const char* cipher_name, const proxy::shadowsocks::SsCipherInfo& cipher,
              const UserStore::ShadowsocksUsersView& users, size_t groups,
              size_t position, size_t payload_size, bool deferred_replay,
              size_t iterations, size_t idle_rss) {
     SCOPED_TRACE(::testing::Message() << cipher_name << " users=" << users.size()
         << " groups=" << groups << " snapshot_position=" << position
         << " payload=" << payload_size << " deferred_replay=" << deferred_replay);
-    const TargetAddress target("127.0.0.1", 443);
+    const common::TargetAddress target("127.0.0.1", 443);
     std::array<uint8_t, 1200> payload_storage{};
     for (size_t i = 0; i < payload_storage.size(); ++i)
         payload_storage[i] = static_cast<uint8_t>(i * 29 + 17);
     const auto payload = std::span<const uint8_t>(payload_storage).first(payload_size);
-    ss::KeyBytes key;
+    proxy::shadowsocks::KeyBytes key;
     Require(key.assign(users[position].derived_key.span()));
-    std::array<ss::KeyBytes, 2> chain{};
-    std::span<const ss::KeyBytes> psk_chain;
+    std::array<proxy::shadowsocks::KeyBytes, 2> chain{};
+    std::span<const proxy::shadowsocks::KeyBytes> psk_chain;
     if (!users[position].identity_key.empty()) {
         Require(chain[0].assign(users[position].identity_key.span()));
         chain[1] = key;
         psk_chain = chain;
     }
-    ss::Ss2022UdpSessionState encoder;
-    Require(ss::Init2022UdpSessionState(encoder, cipher, key));
+    proxy::shadowsocks::Ss2022UdpSessionState encoder;
+    Require(proxy::shadowsocks::Init2022UdpSessionState(encoder, cipher, key));
     encoder.client_session_id = {0x00, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde};
-    const size_t wire_size = ss::Encode2022UdpRequestPacketTo(
+    const size_t wire_size = proxy::shadowsocks::Encode2022UdpRequestPacketTo(
         target, payload.data(), payload.size(), encoder, psk_chain, nullptr, 0);
     Require(wire_size != 0);
     // At most 32 packets live, independent of CNODE_BENCH_ITERATIONS. Re-encode
@@ -89,17 +89,17 @@ void RunCase(const char* cipher_name, const ss::SsCipherInfo& cipher,
     std::vector<uint8_t> wire(kBatchSize * wire_size);
     std::array<uint64_t, kBatchSize> packet_ids{};
     std::vector<double> latencies(iterations);
-    ss::Ss2022UdpReplayCache replay_cache;
+    proxy::shadowsocks::Ss2022UdpReplayCache replay_cache;
     const auto prepare = [&](size_t count) {
         for (size_t i = 0; i < count; ++i) {
             packet_ids[i] = encoder.next_packet_id;
-            Require(ss::Encode2022UdpRequestPacketTo(
+            Require(proxy::shadowsocks::Encode2022UdpRequestPacketTo(
                 target, payload.data(), payload.size(), encoder, psk_chain,
                 wire.data() + i * wire_size, wire_size) == wire_size);
         }
     };
     const auto decode = [&](size_t i, bool deferred) {
-        return ss::DecodeUdpPacket(wire.data() + i * wire_size, wire_size, users,
+        return proxy::shadowsocks::DecodeUdpPacket(wire.data() + i * wire_size, wire_size, users,
             cipher.type, cipher.key_size, cipher.salt_size, replay_cache, deferred);
     };
     const auto authenticate = [&](size_t i, bool deferred) {
@@ -192,7 +192,7 @@ TEST(ShadowsocksUdpIdentityBenchmark, AuthenticationMatrix) {
         // This is codec/authentication work, NOT full UDP ingress: deferred rows
         // exclude directory/association replay commit, routing and network I/O.
         for (const char* cipher_name : {"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"}) {
-            const auto cipher = ss::ParseCipherMethod(cipher_name);
+            const auto cipher = proxy::shadowsocks::ParseCipherMethod(cipher_name);
             ASSERT_TRUE(cipher.has_value());
             for (size_t count : {1u, 16u, 256u, 4096u}) {
                 for (size_t groups : {0u, 1u, 4u, 16u}) {

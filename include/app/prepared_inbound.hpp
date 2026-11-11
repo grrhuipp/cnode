@@ -14,9 +14,15 @@
 #include <vector>
 
 
+namespace infra {
+
 struct InboundSpec;
 struct InboundUserSpec;
 struct StaticInboundConfig;
+
+}  // namespace infra
+namespace app {
+
 class Worker;
 
 // ============================================================================
@@ -26,7 +32,7 @@ struct PortBinding {
     uint16_t    port     = 0;
     std::string protocol;           // "vmess" / "trojan"
     std::string tag;                // inbound tag
-    InboundListen listen;
+    transport::internet::InboundListen listen;
 };
 
 // Cold-path result shared by static and panel sources. Every field is
@@ -41,19 +47,19 @@ struct PreparedInbound {
 // The single inbound builder: protocol settings, users, transport security,
 // receiver settings and port binding. Throws std::invalid_argument on any
 // invalid field; has no UserStore or Worker side effects.
-[[nodiscard]] PreparedInbound PrepareInbound(const InboundSpec& spec);
+[[nodiscard]] PreparedInbound PrepareInbound(const infra::InboundSpec& spec);
 
 // Rebuilds only the users of an already prepared inbound. Every user must be
 // accepted; a partial authentication snapshot is rejected.
 [[nodiscard]] std::shared_ptr<const proxyman::inbound::UserSet> PrepareInboundUsers(
     const proxyman::inbound::BuildRequest& request,
-    std::span<const InboundUserSpec> users);
+    std::span<const infra::InboundUserSpec> users);
 
 // Map every static source (plus the test inbound) to InboundSpec, validate the
 // complete set, then prepare each through the shared inbound builder.
 // Preparation has no UserStore or Worker side effects.
 [[nodiscard]] std::vector<PreparedInbound> PrepareStartupInbounds(
-    std::vector<StaticInboundConfig> sources, bool enable_test_mode);
+    std::vector<infra::StaticInboundConfig> sources, bool enable_test_mode);
 
 
 // ============================================================================
@@ -117,3 +123,5 @@ net::awaitable<void> RollbackUsers(
     std::span<const std::unique_ptr<Worker>> workers,
     std::optional<UserPublicationRollback>& rollback,
     const bool& stopping);
+
+}  // namespace app

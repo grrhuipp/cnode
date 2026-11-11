@@ -13,7 +13,7 @@
 #include <random>
 #include <utility>
 
-namespace anytls {
+namespace proxy::anytls {
 
 
 namespace {
@@ -24,8 +24,8 @@ std::array<uint8_t, kFrameHeaderSize> BuildFrameHeaderBytes(
     size_t payload_size) noexcept {
     std::array<uint8_t, kFrameHeaderSize> header{};
     header[0] = cmd;
-    StoreU32BE(header.data() + 1, sid);
-    StoreU16BE(header.data() + 5, static_cast<uint16_t>(payload_size));
+    common::StoreU32BE(header.data() + 1, sid);
+    common::StoreU16BE(header.data() + 5, static_cast<uint16_t>(payload_size));
     return header;
 }
 
@@ -135,19 +135,19 @@ bool FrameBatch::Append(uint8_t cmd, uint32_t sid, std::span<const uint8_t> byte
     return true;
 }
 
-tl::expected<void, ErrorCode> FrameBatch::Encode(
+tl::expected<void, common::ErrorCode> FrameBatch::Encode(
     uint8_t cmd, uint32_t sid, const buf::MultiBuffer& payload) {
     Begin(payload.size());
     for (const auto* buffer : payload) {
         if (!buffer || buffer->IsEmpty()) continue;
         if (!Append(cmd, sid, buffer->Bytes())) {
-            return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+            return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
         }
     }
     return {};
 }
 
-tl::expected<void, ErrorCode> FrameBatch::Encode(
+tl::expected<void, common::ErrorCode> FrameBatch::Encode(
     uint8_t cmd, uint32_t sid, std::span<const net::const_buffer> input) {
     size_t frame_count = 0;
     for (const net::const_buffer& buffer : input) {
@@ -163,7 +163,7 @@ tl::expected<void, ErrorCode> FrameBatch::Encode(
         while (!remaining.empty()) {
             const size_t chunk_size = std::min(remaining.size(), kMaxFramePayload);
             if (!Append(cmd, sid, remaining.first(chunk_size))) {
-                return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+                return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
             }
             remaining = remaining.subspan(chunk_size);
         }
@@ -171,8 +171,8 @@ tl::expected<void, ErrorCode> FrameBatch::Encode(
     return {};
 }
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WriteMultiBufferAsFrameBatch(AsyncStream& stream,
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteMultiBufferAsFrameBatch(transport::AsyncStream& stream,
                              uint8_t cmd,
                              uint32_t sid,
                              buf::MultiBuffer mb) {
@@ -188,15 +188,15 @@ WriteMultiBufferAsFrameBatch(AsyncStream& stream,
             co_await stream.WriteBuffers(buffers);
         } catch (const IoSystemError& e) {
             mb.clear();
-            co_return tl::unexpected(MapAsioError(e.code()));
+            co_return tl::unexpected(common::MapAsioError(e.code()));
         }
     }
     mb.clear();
-    co_return tl::expected<void, ErrorCode>{};
+    co_return tl::expected<void, common::ErrorCode>{};
 }
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WriteBuffersAsFrameBatch(AsyncStream& stream,
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteBuffersAsFrameBatch(transport::AsyncStream& stream,
                          uint8_t cmd,
                          uint32_t sid,
                          std::span<const net::const_buffer> buffers) {
@@ -210,13 +210,13 @@ WriteBuffersAsFrameBatch(AsyncStream& stream,
         try {
             co_await stream.WriteBuffers(framed);
         } catch (const IoSystemError& e) {
-            co_return tl::unexpected(MapAsioError(e.code()));
+            co_return tl::unexpected(common::MapAsioError(e.code()));
         }
     }
-    co_return tl::expected<void, ErrorCode>{};
+    co_return tl::expected<void, common::ErrorCode>{};
 }
 
-tl::expected<PeerSettings, ErrorCode> ParsePeerSettings(std::string_view text) {
+tl::expected<PeerSettings, common::ErrorCode> ParsePeerSettings(std::string_view text) {
     PeerSettings result;
     bool has_version = false;
     bool has_padding_md5 = false;
@@ -228,21 +228,21 @@ tl::expected<PeerSettings, ErrorCode> ParsePeerSettings(std::string_view text) {
         if (line.empty()) continue;
         const auto separator = line.find('=');
         if (separator == std::string_view::npos || separator == 0)
-            return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         const auto key = line.substr(0, separator);
         const auto value = line.substr(separator + 1);
         if (key == "v") {
             if (std::exchange(has_version, true) || value.empty())
-                return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
             uint32_t peer_version = 0;
             const auto [ptr, error] = std::from_chars(value.data(), value.data() + value.size(), peer_version);
             if (error != std::errc{} || ptr != value.data() + value.size() || peer_version == 0)
-                return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
             result.version = std::min(peer_version, kProtocolVersion) >= 2
                 ? SessionVersion::V2 : SessionVersion::V1;
         } else if (key == "padding-md5") {
             if (std::exchange(has_padding_md5, true))
-                return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
             result.padding_md5 = value;
         }
         // Unknown well-formed keys belong to extensions, never feature gates.
@@ -260,13 +260,13 @@ memory::String ClientSettings(const PaddingScheme& scheme) {
 }
 
 
-tl::expected<void, ErrorCode> AppendFrameBytesTo(
+tl::expected<void, common::ErrorCode> AppendFrameBytesTo(
     memory::ByteVector& out,
     uint8_t cmd,
     uint32_t sid,
     std::span<const uint8_t> payload) {
     if (payload.size() > kMaxFramePayload) {
-        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     const auto header = BuildFrameHeaderBytes(cmd, sid, payload.size());
     const size_t offset = out.size();
@@ -275,29 +275,29 @@ tl::expected<void, ErrorCode> AppendFrameBytesTo(
     if (!payload.empty()) {
         std::memcpy(out.data() + offset + kFrameHeaderSize, payload.data(), payload.size());
     }
-    return tl::expected<void, ErrorCode>{};
+    return tl::expected<void, common::ErrorCode>{};
 }
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WriteAll(AsyncStream& stream, std::span<const uint8_t> data) {
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteAll(transport::AsyncStream& stream, std::span<const uint8_t> data) {
     while (!data.empty()) {
         try {
             const auto n = co_await stream.AsyncWrite(net::buffer(data.data(), data.size()));
             if (n == 0) {
-                co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+                co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
             }
             data = data.subspan(n);
         } catch (const IoSystemError& e) {
-            co_return tl::unexpected(MapAsioError(e.code()));
+            co_return tl::unexpected(common::MapAsioError(e.code()));
         }
     }
-    co_return tl::expected<void, ErrorCode>{};
+    co_return tl::expected<void, common::ErrorCode>{};
 }
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WriteFrame(AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload) {
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteFrame(transport::AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload) {
     if (payload.size() > kMaxFramePayload) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
     auto header = BuildFrameHeaderBytes(cmd, sid, payload.size());
@@ -307,17 +307,17 @@ WriteFrame(AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<const uint8
     try {
         co_await stream.WriteBuffers(buffers);
     } catch (const IoSystemError& e) {
-        co_return tl::unexpected(MapAsioError(e.code()));
+        co_return tl::unexpected(common::MapAsioError(e.code()));
     }
-    co_return tl::expected<void, ErrorCode>{};
+    co_return tl::expected<void, common::ErrorCode>{};
 }
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WritePacketWithPadding(AsyncStream& stream,
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WritePacketWithPadding(transport::AsyncStream& stream,
                        std::span<const PaddingRecord> record_rules,
                        memory::ByteVector packet) {
     if (packet.empty()) {
-        co_return tl::expected<void, ErrorCode>{};
+        co_return tl::expected<void, common::ErrorCode>{};
     }
 
     if (record_rules.empty()) {
@@ -365,19 +365,19 @@ WritePacketWithPadding(AsyncStream& stream,
             stream,
             std::span<const uint8_t>(packet.data() + offset, packet.size() - offset));
     }
-    co_return tl::expected<void, ErrorCode>{};
+    co_return tl::expected<void, common::ErrorCode>{};
 }
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WritePacketWithPadding(AsyncStream& stream,
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WritePacketWithPadding(transport::AsyncStream& stream,
                        const PaddingScheme& scheme,
                        uint32_t packet_index,
                        memory::ByteVector packet) {
     return WritePacketWithPadding(stream, scheme.RecordFor(packet_index), std::move(packet));
 }
 
-static net::awaitable<tl::expected<void, ErrorCode>>
-WritePaddedMultiBufferFrames(AsyncStream& stream,
+static net::awaitable<tl::expected<void, common::ErrorCode>>
+WritePaddedMultiBufferFrames(transport::AsyncStream& stream,
                              std::span<const PaddingRecord> records,
                              uint8_t cmd,
                              uint32_t sid,
@@ -397,8 +397,8 @@ WritePaddedMultiBufferFrames(AsyncStream& stream,
     co_return co_await WritePacketWithPadding(stream, records, std::move(packet));
 }
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WriteMultiBufferAsFramesWithPadding(AsyncStream& stream,
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteMultiBufferAsFramesWithPadding(transport::AsyncStream& stream,
                                     const PaddingScheme& scheme,
                                     uint32_t packet_index,
                                     uint8_t cmd,
@@ -411,8 +411,8 @@ WriteMultiBufferAsFramesWithPadding(AsyncStream& stream,
     return WritePaddedMultiBufferFrames(stream, records, cmd, sid, std::move(mb));
 }
 
-static net::awaitable<tl::expected<void, ErrorCode>>
-WritePaddedBufferFrames(AsyncStream& stream,
+static net::awaitable<tl::expected<void, common::ErrorCode>>
+WritePaddedBufferFrames(transport::AsyncStream& stream,
                         std::span<const PaddingRecord> records,
                         uint8_t cmd,
                         uint32_t sid,
@@ -450,8 +450,8 @@ WritePaddedBufferFrames(AsyncStream& stream,
     co_return co_await WritePacketWithPadding(stream, records, std::move(packet));
 }
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WriteBuffersAsFramesWithPadding(AsyncStream& stream,
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteBuffersAsFramesWithPadding(transport::AsyncStream& stream,
                                 const PaddingScheme& scheme,
                                 uint32_t packet_index,
                                 uint8_t cmd,
@@ -464,8 +464,8 @@ WriteBuffersAsFramesWithPadding(AsyncStream& stream,
     return WritePaddedBufferFrames(stream, records, cmd, sid, buffers);
 }
 
-net::awaitable<tl::expected<FrameHeader, ErrorCode>>
-ReadFrameHeader(AsyncStream& stream) {
+net::awaitable<tl::expected<FrameHeader, common::ErrorCode>>
+ReadFrameHeader(transport::AsyncStream& stream) {
     std::array<uint8_t, kFrameHeaderSize> header{};
     if (auto ok = co_await proxy::ReadHandshakeExact(stream, header, proxy::HandshakeProgress::NotStarted); !ok) {
         co_return tl::unexpected(ok.error());
@@ -473,13 +473,13 @@ ReadFrameHeader(AsyncStream& stream) {
 
     FrameHeader out;
     out.cmd = header[0];
-    out.sid = LoadU32BE(header.data() + 1);
-    out.length = LoadU16BE(header.data() + 5);
+    out.sid = common::LoadU32BE(header.data() + 1);
+    out.length = common::LoadU16BE(header.data() + 5);
     co_return out;
 }
 
-net::awaitable<tl::expected<memory::String, ErrorCode>>
-ReadFrameText(AsyncStream& stream, uint16_t length) {
+net::awaitable<tl::expected<memory::String, common::ErrorCode>>
+ReadFrameText(transport::AsyncStream& stream, uint16_t length) {
     memory::String text(length, '\0');
     if (auto ok = co_await proxy::ReadHandshakeExact(
             stream,
@@ -491,8 +491,8 @@ ReadFrameText(AsyncStream& stream, uint16_t length) {
     co_return text;
 }
 
-net::awaitable<tl::expected<void, ErrorCode>>
-DiscardFramePayload(AsyncStream& stream, uint16_t length) {
+net::awaitable<tl::expected<void, common::ErrorCode>>
+DiscardFramePayload(transport::AsyncStream& stream, uint16_t length) {
     std::array<uint8_t, 256> scratch{};
     size_t remaining = length;
     while (remaining > 0) {
@@ -504,17 +504,17 @@ DiscardFramePayload(AsyncStream& stream, uint16_t length) {
         }
         remaining -= want;
     }
-    co_return tl::expected<void, ErrorCode>{};
+    co_return tl::expected<void, common::ErrorCode>{};
 }
 
-net::awaitable<tl::expected<buf::MultiBuffer, ErrorCode>>
-ReadFramePayload(AsyncStream& stream, uint16_t length) {
+net::awaitable<tl::expected<buf::MultiBuffer, common::ErrorCode>>
+ReadFramePayload(transport::AsyncStream& stream, uint16_t length) {
     buf::MultiBuffer mb;
     size_t remaining = length;
     while (remaining > 0) {
         buf::BufferGuard buffer{buf::Buffer::New()};
         if (!buffer) {
-            co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+            co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
         }
         const size_t want = std::min<size_t>(remaining, buffer->Available());
         if (auto ok = co_await proxy::ReadHandshakeExact(
@@ -623,4 +623,4 @@ const std::shared_ptr<const PaddingScheme>& DefaultPaddingScheme() {
         "7=500-1000").value());
     return scheme;
 }
-}  // namespace anytls
+}  // namespace proxy::anytls

@@ -24,7 +24,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
-namespace vmess {
+namespace proxy::vmess {
 
 
 constexpr uint8_t VERSION             = 1;
@@ -67,8 +67,8 @@ struct VMessRequest {
     uint8_t options         = 0;
     Security security       = Security::AES_128_GCM;
     Command  command        = Command::TCP;
-    TargetAddress target;
-    std::optional<ForwardedMetadata> forwarded;
+    common::TargetAddress target;
+    std::optional<common::ForwardedMetadata> forwarded;
 
     std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> user;
     ~VMessRequest() noexcept {
@@ -219,4 +219,4 @@ private:
     void Refill();
 };
 
-}  // namespace vmess
+}  // namespace proxy::vmess

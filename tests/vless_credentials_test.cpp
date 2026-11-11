@@ -9,7 +9,7 @@ struct IdentityCase { std::string_view id; std::string_view expected; };
 class VlessIdentity : public testing::TestWithParam<IdentityCase> {};
 TEST_P(VlessIdentity, MapsUuidOrCustomIdToProtocolIdentity) {
     const auto& item = GetParam();
-    const auto bytes = ::vless::ParseUuidBytes(item.id);
+    const auto bytes = ::proxy::vless::ParseUuidBytes(item.id);
     ASSERT_TRUE(bytes);
     constexpr std::string_view hex = "0123456789abcdef";
     std::string actual;
@@ -29,15 +29,15 @@ INSTANTIATE_TEST_SUITE_P(Vectors, VlessIdentity, testing::Values(
 
 class InvalidVlessIdentity : public testing::TestWithParam<const char*> {};
 TEST_P(InvalidVlessIdentity, RejectsInvalidLengthOrMalformedUuid) {
-    EXPECT_FALSE(::vless::ParseUuidBytes(GetParam()));
+    EXPECT_FALSE(::proxy::vless::ParseUuidBytes(GetParam()));
 }
 INSTANTIATE_TEST_SUITE_P(Inputs, InvalidVlessIdentity, testing::Values(
     "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "b831381d-6324-4d53-ad4f-8cda48b3081Z"));
 
 class VlessEncryptionAbsent : public testing::TestWithParam<const char*> {};
 TEST_P(VlessEncryptionAbsent, NoneIsSuccessfulAbsence) {
-    auto client = vless::ParseVlessClientEncryption(GetParam());
-    auto server = vless::ParseVlessServerDecryption(GetParam());
+    auto client = proxy::vless::ParseVlessClientEncryption(GetParam());
+    auto server = proxy::vless::ParseVlessServerDecryption(GetParam());
     ASSERT_TRUE(client);
     ASSERT_TRUE(server);
     EXPECT_FALSE(client->has_value());
@@ -47,10 +47,10 @@ INSTANTIATE_TEST_SUITE_P(Spellings, VlessEncryptionAbsent, testing::Values("", "
 }  // namespace
 
 TEST(VlessCredentials, NormalizesFlowCase) {
-    EXPECT_EQ(::vless::NormalizeFlow("XTLS-rprx-VISION"), "xtls-rprx-vision");
+    EXPECT_EQ(::proxy::vless::NormalizeFlow("XTLS-rprx-VISION"), "xtls-rprx-vision");
 }
 
 TEST(VlessCredentials, RejectsUnknownEncryption) {
-    EXPECT_FALSE(vless::ParseVlessClientEncryption("invalid"));
-    EXPECT_FALSE(vless::ParseVlessServerDecryption("invalid"));
+    EXPECT_FALSE(proxy::vless::ParseVlessClientEncryption("invalid"));
+    EXPECT_FALSE(proxy::vless::ParseVlessServerDecryption("invalid"));
 }

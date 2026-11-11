@@ -31,7 +31,7 @@ int64_t CpuNanoseconds(const timespec& value) {
 }
 
 net::awaitable<Measurement> Transfer(
-    TcpStream& stream, tcp::socket& peer, const std::vector<uint8_t>& payload,
+    transport::internet::TcpStream& stream, tcp::socket& peer, const std::vector<uint8_t>& payload,
     std::span<const net::const_buffer> buffers, std::size_t iterations) {
     std::vector<uint8_t> received(payload.size());
     timespec cpu_start{}, cpu_end{};
@@ -66,7 +66,7 @@ TEST(TcpSendBenchmark, VerifiedBursts) {
             socket.connect(acceptor.local_endpoint());
             acceptor.accept(peer);
             peer.set_option(net::socket_base::receive_buffer_size(256 * 1024));
-            TcpStream stream(std::move(socket));
+            transport::internet::TcpStream stream(std::move(socket));
             stream.SetWriteTimeout(2s);
             std::vector<uint8_t> payload(burst);
             for (std::size_t index = 0; index < burst; ++index)

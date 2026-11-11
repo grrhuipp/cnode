@@ -27,6 +27,8 @@
 // ============================================================================
 // 统计数据聚合结果
 // ============================================================================
+namespace app {
+
 struct StatsSnapshot {
     uint64_t connections_total = 0;
     uint64_t connections_active = 0;
@@ -149,7 +151,7 @@ public:
     // Requires at least one Worker; each Worker owns exactly one shard.
     explicit ShardedStats(uint32_t num_workers)
         : shards_(num_workers)
-        , last_sample_time_(steady_clock::now()) {
+        , last_sample_time_(common::steady_clock::now()) {
         if (shards_.empty()) {
             throw std::invalid_argument("stats require at least one worker shard");
         }
@@ -169,7 +171,7 @@ public:
 
     // 采样（每秒调用）
     void SampleNow(const StatsSnapshot& snapshot) {
-        auto now = steady_clock::now();
+        auto now = common::steady_clock::now();
         auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - last_sample_time_).count();
         if (elapsed_ms <= 0) return;
@@ -188,7 +190,7 @@ public:
         // 滑动窗口：遍历所有有效采样点，累加增量 / 计算时间跨度
         uint64_t window_in  = 0;
         uint64_t window_out = 0;
-        time_point oldest_start = now;
+        common::time_point oldest_start = now;
         bool has_valid = false;
 
         for (const auto& s : samples_) {
@@ -223,7 +225,7 @@ private:
     struct Sample {
         uint64_t bytes_in   = 0;
         uint64_t bytes_out  = 0;
-        time_point start_time;   // 本采样周期的起始时刻（= 上次采样时间）
+        common::time_point start_time;   // 本采样周期的起始时刻（= 上次采样时间）
         bool valid = false;      // 是否已写入有效数据
     };
 
@@ -232,7 +234,7 @@ private:
 
     uint64_t last_bytes_in_ = 0;
     uint64_t last_bytes_out_ = 0;
-    time_point last_sample_time_;
+    common::time_point last_sample_time_;
 
     double current_in_rate_ = 0;
     double current_out_rate_ = 0;
@@ -254,6 +256,8 @@ private:
     }
     return std::format("{:.2f}{}", value, units[unit_index]);
 }
+
+}  // namespace app
 
 
 namespace session {
@@ -332,8 +336,8 @@ private:
 
     std::unordered_map<std::string,
                        AccountBucket,
-                       TransparentStringHash,
-                       TransparentStringEq> accounts_;
+                       common::TransparentStringHash,
+                       common::TransparentStringEq> accounts_;
 };
 
 }  // namespace app

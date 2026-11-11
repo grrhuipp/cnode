@@ -13,6 +13,8 @@
 #include <string_view>
 
 
+namespace common {
+
 [[nodiscard]] constexpr uint16_t LoadU16BE(const uint8_t* in) noexcept {
     return static_cast<uint16_t>((static_cast<uint16_t>(in[0]) << 8) |
                                  static_cast<uint16_t>(in[1]));
@@ -258,4 +260,6 @@ private:
     size_t pos_;
     bool error_;
 };
+
+}  // namespace common
 

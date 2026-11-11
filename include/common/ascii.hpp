@@ -5,6 +5,8 @@
 
 // 唯一的 ASCII 字符工具：只折叠 A-Z，不受 locale 影响，非 ASCII 字节原样保留。
 
+namespace common {
+
 [[nodiscard]] constexpr char ToLowerAscii(char ch) noexcept {
     return ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch + ('a' - 'A')) : ch;
 }
@@ -47,3 +49,5 @@ inline void LowerAsciiInPlace(std::string& value) noexcept {
     while (!value.empty() && is_space(value.back())) value.remove_suffix(1);
     return value;
 }
+
+}  // namespace common

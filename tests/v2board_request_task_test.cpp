@@ -189,7 +189,7 @@ TEST_P(PanelHttpConsumer, PreservesResponseBoundariesAndValidatorIdentity) {
     auto client = ::api::CreatePanelClient(io, std::move(config), dns);
     std::exception_ptr server_failure, client_failure;
     bool served = false, completed = false;
-    UserListFetchResult result;
+    api::UserListFetchResult result;
     auto serve = [&]() -> net::awaitable<void> {
         auto socket = co_await acceptor.async_accept(net::use_awaitable);
         net::streambuf request;
@@ -274,7 +274,7 @@ TEST_P(PanelHttpConsumer, PreservesResponseBoundariesAndValidatorIdentity) {
     };
     net::co_spawn(io, serve(), [&](std::exception_ptr failure) { server_failure = failure; });
     net::co_spawn(io, client->GetUserList("committed-users"),
-        [&](std::exception_ptr failure, UserListFetchResult value) {
+        [&](std::exception_ptr failure, api::UserListFetchResult value) {
             client_failure = failure;
             result = std::move(value);
             completed = true;

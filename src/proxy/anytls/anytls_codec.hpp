@@ -24,11 +24,23 @@
 #include <string_view>
 #include <tl/expected.hpp>
 
+namespace transport {
+
 class AsyncStream;
+
+}  // namespace transport
+namespace common {
+
 class AwaitableTaskGroup;
+
+}  // namespace common
+namespace app {
+
 struct StatsShard;
+
+}  // namespace app
 namespace proxyman::inbound { struct AdmissionEnvironment; }
-namespace anytls {
+namespace proxy::anytls {
 
 [[nodiscard]] inline std::array<uint8_t, 32> PasswordHash(std::string_view password) noexcept {
     std::array<uint8_t, 32> out{};
@@ -63,7 +75,7 @@ struct PeerSettings {
     std::string_view padding_md5; // Handshake-only metadata view, never retained by a session.
 };
 
-[[nodiscard]] tl::expected<PeerSettings, ErrorCode> ParsePeerSettings(std::string_view text);
+[[nodiscard]] tl::expected<PeerSettings, common::ErrorCode> ParsePeerSettings(std::string_view text);
 
 struct FrameHeader {
     uint8_t cmd = 0;
@@ -78,9 +90,9 @@ public:
     FrameBatch() = default;
     FrameBatch(const FrameBatch&) = delete;
     FrameBatch& operator=(const FrameBatch&) = delete;
-    [[nodiscard]] tl::expected<void, ErrorCode> Encode(
+    [[nodiscard]] tl::expected<void, common::ErrorCode> Encode(
         uint8_t cmd, uint32_t sid, const buf::MultiBuffer& payload);
-    [[nodiscard]] tl::expected<void, ErrorCode> Encode(
+    [[nodiscard]] tl::expected<void, common::ErrorCode> Encode(
         uint8_t cmd, uint32_t sid, std::span<const net::const_buffer> buffers);
     [[nodiscard]] std::span<const net::const_buffer> Buffers() const noexcept {
         return spilled_ ? std::span<const net::const_buffer>(spill_buffers_)
@@ -100,7 +112,7 @@ private:
 };
 
 [[nodiscard]] memory::String ClientSettings(const PaddingScheme& scheme);
-[[nodiscard]] tl::expected<void, ErrorCode> AppendFrameBytesTo(
+[[nodiscard]] tl::expected<void, common::ErrorCode> AppendFrameBytesTo(
     memory::ByteVector& out,
     uint8_t cmd,
     uint32_t sid,
@@ -108,61 +120,61 @@ private:
 
 // Protocol validation and actual I/O errors are values. Non-I/O exceptions
 // retain their types for the owning request/session boundary to classify.
-net::awaitable<tl::expected<void, ErrorCode>>
-WriteAll(AsyncStream& stream, std::span<const uint8_t> data);
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteAll(transport::AsyncStream& stream, std::span<const uint8_t> data);
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WriteFrame(AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload);
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteFrame(transport::AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload);
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WritePacketWithPadding(AsyncStream& stream,
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WritePacketWithPadding(transport::AsyncStream& stream,
                        std::span<const PaddingRecord> record_rules,
                        memory::ByteVector packet);
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WritePacketWithPadding(AsyncStream& stream,
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WritePacketWithPadding(transport::AsyncStream& stream,
                        const PaddingScheme& scheme,
                        uint32_t packet_index,
                        memory::ByteVector packet);
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WriteMultiBufferAsFrameBatch(AsyncStream& stream, uint8_t cmd, uint32_t sid, buf::MultiBuffer mb);
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteMultiBufferAsFrameBatch(transport::AsyncStream& stream, uint8_t cmd, uint32_t sid, buf::MultiBuffer mb);
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WriteBuffersAsFrameBatch(AsyncStream& stream,
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteBuffersAsFrameBatch(transport::AsyncStream& stream,
                          uint8_t cmd,
                          uint32_t sid,
                          std::span<const net::const_buffer> buffers);
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WriteMultiBufferAsFramesWithPadding(AsyncStream& stream,
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteMultiBufferAsFramesWithPadding(transport::AsyncStream& stream,
                                     const PaddingScheme& scheme,
                                     uint32_t packet_index,
                                     uint8_t cmd,
                                     uint32_t sid,
                                     buf::MultiBuffer mb);
 
-net::awaitable<tl::expected<void, ErrorCode>>
-WriteBuffersAsFramesWithPadding(AsyncStream& stream,
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteBuffersAsFramesWithPadding(transport::AsyncStream& stream,
                                 const PaddingScheme& scheme,
                                 uint32_t packet_index,
                                 uint8_t cmd,
                                 uint32_t sid,
                                 std::span<const net::const_buffer> buffers);
 
-net::awaitable<tl::expected<FrameHeader, ErrorCode>>
-ReadFrameHeader(AsyncStream& stream);
+net::awaitable<tl::expected<FrameHeader, common::ErrorCode>>
+ReadFrameHeader(transport::AsyncStream& stream);
 
-net::awaitable<tl::expected<memory::String, ErrorCode>>
-ReadFrameText(AsyncStream& stream, uint16_t length);
+net::awaitable<tl::expected<memory::String, common::ErrorCode>>
+ReadFrameText(transport::AsyncStream& stream, uint16_t length);
 
-net::awaitable<tl::expected<void, ErrorCode>>
-DiscardFramePayload(AsyncStream& stream, uint16_t length);
+net::awaitable<tl::expected<void, common::ErrorCode>>
+DiscardFramePayload(transport::AsyncStream& stream, uint16_t length);
 
-net::awaitable<tl::expected<buf::MultiBuffer, ErrorCode>>
-ReadFramePayload(AsyncStream& stream, uint16_t length);
+net::awaitable<tl::expected<buf::MultiBuffer, common::ErrorCode>>
+ReadFramePayload(transport::AsyncStream& stream, uint16_t length);
 
-}  // namespace anytls
+}  // namespace proxy::anytls
 
 namespace proxy::anytls::inbound {
 
@@ -172,32 +184,32 @@ namespace proxy::anytls::inbound {
 // AnyTLS 服务端侧协议处理器：负责 sha256(password) 认证头、
 // settings/SYN/PSH/FIN 帧解析，并将单请求 TCP framed stream 交给 dispatcher。
 //
-// 协议核心 codec 位于 anytls；handler 与其它协议一致归于
-// proxy::<name>::inbound（对应 vmess core=vmess, handler=proxy::vmess::*）。
+// 协议核心 codec 与 handler 统一归于 proxy::anytls。
+
 // ============================================================================
 class Handler final : public Inbound {
 public:
     Handler(const proxyman::inbound::AdmissionEnvironment& environment,
-            std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme = {});
+            std::shared_ptr<const ::proxy::anytls::PaddingScheme> padding_scheme = {});
 
-    net::awaitable<RelayResult> Process(
-        std::unique_ptr<AsyncStream> stream,
+    net::awaitable<app::RelayResult> Process(
+        std::unique_ptr<transport::AsyncStream> stream,
         routing::Dispatcher& dispatcher,
         const proxyman::inbound::ReceiverSettings& receiver,
         net::io_context& io_context,
         session::Context& ctx,
-        const TimeoutsConfig& timeouts,
+        const infra::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) override;
 
 private:
     const proxyman::inbound::AdmissionEnvironment& environment_;
-    std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme_;
+    std::shared_ptr<const ::proxy::anytls::PaddingScheme> padding_scheme_;
 };
 
 }  // namespace proxy::anytls::inbound
 
-// 协议核心 codec/validator 位于 anytls；handler 与其它协议一致归于
-// proxy::<name>::outbound（对应 vmess core=vmess, handler=proxy::vmess::*）。
+// 协议核心 codec/validator 与 handler 统一归于 proxy::anytls。
+
 namespace proxy::anytls::outbound {
 
 
@@ -217,16 +229,16 @@ public:
     Handler(std::string_view tag,
             net::io_context& io_context,
             std::shared_ptr<const infra::AnyTlsSettings> settings,
-            AwaitableTaskGroup& tasks);
+            common::AwaitableTaskGroup& tasks);
     ~Handler() noexcept override;
 
     net::awaitable<OutboundProcessResult> Process(
         session::Context& ctx,
         transport::Link inbound,
-        OutboundDialer& dialer,
-        const TimeoutsConfig& timeouts,
-        StatsShard& stats,
-        const RelayConfig& relay_config,
+        transport::internet::OutboundDialer& dialer,
+        const infra::TimeoutsConfig& timeouts,
+        app::StatsShard& stats,
+        const app::RelayConfig& relay_config,
         buf::MultiBufferBatch first_payload) override;
 
 private:
@@ -236,8 +248,8 @@ private:
     struct LogicalStreamLease;
 
     net::awaitable<OutboundProcessResult> ProcessSession(
-        session::Context& ctx, transport::Link inbound, OutboundDialer& dialer,
-        const TimeoutsConfig& timeouts, StatsShard& stats, const RelayConfig& relay_config,
+        session::Context& ctx, transport::Link inbound, transport::internet::OutboundDialer& dialer,
+        const infra::TimeoutsConfig& timeouts, app::StatsShard& stats, const app::RelayConfig& relay_config,
         buf::MultiBufferBatch first_payload,
         std::shared_ptr<ClientSession> session, bool& reusable);
     memory::String tag_;

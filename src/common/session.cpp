@@ -29,12 +29,14 @@ void Context::InitSubstreamFrom(const Context& parent, uint16_t sub_source_port)
     }
     outbound = {};
     outbound.tag = parent_outbound_tag;
-    content.network = Network::TCP;
+    content.network = common::Network::TCP;
     content.protocol.clear();
     content.speed_limit = parent_speed_limit;
     traffic = {};
 }
 }  // namespace session
+
+namespace common {
 
 std::string FormatAccessLog(const session::Context& ctx,
                             AccessStatus status,
@@ -170,4 +172,6 @@ std::string FormatAccessLog(const session::Context& ctx,
     }
     return access;
 }
+
+}  // namespace common
 

@@ -6,6 +6,8 @@
 #include <utility>
 
 
+namespace transport::internet {
+
 std::string XHttpConfig::NormalizedPath() const {
     std::string normalized = path.empty()
         ? std::string(constants::binding::kRootPath)
@@ -103,29 +105,29 @@ void NormalizeInPlace(StreamSettings& settings) {
 }  // namespace
 
 NetworkMode ParseNetworkMode(std::string_view network) noexcept {
-    if (network.empty() || EqualsAsciiCI(network, constants::protocol::kTcp) ||
-        EqualsAsciiCI(network, constants::protocol::kRaw)) {
+    if (network.empty() || common::EqualsAsciiCI(network, constants::protocol::kTcp) ||
+        common::EqualsAsciiCI(network, constants::protocol::kRaw)) {
         return NetworkMode::Tcp;
     }
-    if (EqualsAsciiCI(network, constants::protocol::kWs) ||
-        EqualsAsciiCI(network, constants::protocol::kWebSocket)) {
+    if (common::EqualsAsciiCI(network, constants::protocol::kWs) ||
+        common::EqualsAsciiCI(network, constants::protocol::kWebSocket)) {
         return NetworkMode::Ws;
     }
-    if (EqualsAsciiCI(network, constants::protocol::kHttpUpgrade)) return NetworkMode::HttpUpgrade;
-    if (EqualsAsciiCI(network, constants::protocol::kGrpc)) return NetworkMode::Grpc;
-    if (EqualsAsciiCI(network, constants::protocol::kHttp) || EqualsAsciiCI(network, "h2")) {
+    if (common::EqualsAsciiCI(network, constants::protocol::kHttpUpgrade)) return NetworkMode::HttpUpgrade;
+    if (common::EqualsAsciiCI(network, constants::protocol::kGrpc)) return NetworkMode::Grpc;
+    if (common::EqualsAsciiCI(network, constants::protocol::kHttp) || common::EqualsAsciiCI(network, "h2")) {
         return NetworkMode::Http;
     }
-    if (EqualsAsciiCI(network, constants::protocol::kXHttp) || EqualsAsciiCI(network, "splithttp")) {
+    if (common::EqualsAsciiCI(network, constants::protocol::kXHttp) || common::EqualsAsciiCI(network, "splithttp")) {
         return NetworkMode::XHttp;
     }
     return NetworkMode::Unsupported;
 }
 
 SecurityMode ParseSecurityMode(std::string_view security) noexcept {
-    if (security.empty() || EqualsAsciiCI(security, constants::protocol::kNone)) return SecurityMode::None;
-    if (EqualsAsciiCI(security, constants::protocol::kTls)) return SecurityMode::Tls;
-    if (EqualsAsciiCI(security, constants::protocol::kReality)) return SecurityMode::Reality;
+    if (security.empty() || common::EqualsAsciiCI(security, constants::protocol::kNone)) return SecurityMode::None;
+    if (common::EqualsAsciiCI(security, constants::protocol::kTls)) return SecurityMode::Tls;
+    if (common::EqualsAsciiCI(security, constants::protocol::kReality)) return SecurityMode::Reality;
     return SecurityMode::Unsupported;
 }
 
@@ -193,4 +195,6 @@ StreamSettings NormalizeOutboundStreamSettings(
     }
     return settings;
 }
+
+}  // namespace transport::internet
 

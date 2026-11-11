@@ -17,6 +17,8 @@
 #include <utility>
 
 
+namespace transport {
+
 class AsyncStream;
 
 // Borrowed observation of one owner's absolute phase deadline. The owner must
@@ -54,7 +56,7 @@ private:
 // One logical stream's phase deadline, owned inline by that stream on its
 // Worker scheduler. The stream must outlive this member; no private timer or
 // background task is owned here.
-class StreamPhaseDeadline final : private TimeoutEvent {
+class StreamPhaseDeadline final : private transport::internet::TimeoutEvent {
 public:
     StreamPhaseDeadline(net::io_context& io_context, AsyncStream& owner);
     ~StreamPhaseDeadline() noexcept;
@@ -74,7 +76,13 @@ private:
     uint8_t expired_ = 0;
 };
 
+}  // namespace transport
+
+namespace transport::internet {
+
 class TcpStream;
+
+}  // namespace transport::internet
 
 // ============================================================================
 // AsyncStream - 异步流抽象接口
@@ -87,6 +95,8 @@ class TcpStream;
 // │ 4. TLS 流的 AsyncShutdownWrite() 必须发送 close_notify                  │
 // └─────────────────────────────────────────────────────────────────────────┘
 // ============================================================================
+namespace transport {
+
 class AsyncStream : public transport::MultiBufferReader,
                     public transport::MultiBufferWriter {
 public:
@@ -251,22 +261,22 @@ protected:
     // must cancel only that logical stream, never the shared physical stream.
     virtual StreamPhaseDeadline* LogicalPhaseDeadline() noexcept { return nullptr; }
 
-    void NotifyCancellation(ErrorCode reason = ErrorCode::CANCELLED) noexcept {
+    void NotifyCancellation(common::ErrorCode reason = common::ErrorCode::CANCELLED) noexcept {
         Cancellation().CancelPending(reason);
     }
-    void NotifyClosed(ErrorCode reason = ErrorCode::CANCELLED) noexcept {
+    void NotifyClosed(common::ErrorCode reason = common::ErrorCode::CANCELLED) noexcept {
         Cancellation().Stop(reason);
     }
     // 仅 transport/internet 包装链和 AsyncStream 自身能力方法使用。
     // 不能作为 app/proxy/relay 公开逃逸到 TcpStream 的入口。
-    static TcpStream* BaseTcpStreamOf(AsyncStream& stream) {
+    static transport::internet::TcpStream* BaseTcpStreamOf(AsyncStream& stream) {
         return stream.BaseTcpStream();
     }
-    static const TcpStream* BaseTcpStreamOf(const AsyncStream& stream) {
+    static const transport::internet::TcpStream* BaseTcpStreamOf(const AsyncStream& stream) {
         return stream.BaseTcpStream();
     }
-    virtual TcpStream* BaseTcpStream() { return nullptr; }
-    virtual const TcpStream* BaseTcpStream() const { return nullptr; }
+    virtual transport::internet::TcpStream* BaseTcpStream() { return nullptr; }
+    virtual const transport::internet::TcpStream* BaseTcpStream() const { return nullptr; }
 
 private:
     transport::CancellationSource cancellation_;
@@ -295,11 +305,11 @@ bool ConsumeWriteSideTimeout(Stream& stream) {
 // ============================================================================
 // DialResult - 拨号结果
 // ============================================================================
-struct DialResult : ResultStatus {
+struct DialResult : common::ResultStatus {
     std::unique_ptr<AsyncStream> stream;  // 成功时有效
 
     [[nodiscard]] bool Ok() const noexcept {
-        return ResultStatus::Ok() && stream != nullptr;
+        return common::ResultStatus::Ok() && stream != nullptr;
     }
 
     [[nodiscard]] static DialResult Success(std::unique_ptr<AsyncStream> s) {
@@ -309,11 +319,13 @@ struct DialResult : ResultStatus {
     }
 
     [[nodiscard]] static DialResult Fail(
-        ErrorCode code,
+        common::ErrorCode code,
         std::string_view msg = "") {
         DialResult r;
         r.SetError(code, msg);
         return r;
     }
 };
+
+}  // namespace transport
 

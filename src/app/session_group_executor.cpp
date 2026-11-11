@@ -14,7 +14,7 @@
 #include <system_error>
 
 
-struct GroupCoordinator::ReservedState {
+struct app::GroupCoordinator::ReservedState {
     explicit ReservedState(net::io_context& io)
         : event(io), stopped(io, 1) {
         const int descriptor = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -24,7 +24,7 @@ struct GroupCoordinator::ReservedState {
         if (error) { ::close(descriptor); throw IoSystemError(error); }
     }
     net::posix::stream_descriptor event;
-    SignalChannel stopped;
+    common::SignalChannel stopped;
     std::atomic<ReservedOperation*> incoming{nullptr};
     std::atomic<bool> started{false};
     bool stopping = false;
@@ -33,13 +33,15 @@ struct GroupCoordinator::ReservedState {
     memory::Vector<net::io_context*> workers;
 };
 
+namespace app {
+
 GroupCoordinator::GroupCoordinator(net::io_context& io, size_t capacity)
     : reactor_(io), mailbox_(io, capacity),
       reserved_(std::make_unique<ReservedState>(io)) {}
 
 GroupCoordinator::~GroupCoordinator() {
     if (reserved_->started.load(std::memory_order_relaxed) && !reserved_->joined)
-        FailRuntime("group-coordinator", "reserved controls were not joined");
+        common::FailRuntime("group-coordinator", "reserved controls were not joined");
     DrainReserved();
 }
 
@@ -80,7 +82,7 @@ void GroupCoordinator::PostReserved(std::unique_ptr<ReservedOperation> operation
     do { written = ::write(reserved_->event.native_handle(), &one, sizeof(one)); }
     while (written < 0 && errno == EINTR);
     if (written < 0 && errno != EAGAIN)
-        FailRuntime("group-coordinator", "cannot notify reserved return");
+        common::FailRuntime("group-coordinator", "cannot notify reserved return");
 }
 
 void GroupCoordinator::DrainReserved() noexcept {
@@ -113,7 +115,7 @@ void GroupCoordinator::ArmReserved() {
                     (void)reserved_->stopped.try_send(IoErrorCode{});
                     return;
                 }
-                if (error) FailRuntime("group-coordinator", "reserved return readiness failed");
+                if (error) common::FailRuntime("group-coordinator", "reserved return readiness failed");
                 ArmReserved();
             });
     } catch (...) {
@@ -139,3 +141,5 @@ net::awaitable<void> GroupCoordinator::Finalize() {
     DrainReserved();
     reserved_->joined = true;
 }
+
+}  // namespace app

@@ -58,10 +58,10 @@ void SessionTrackingState::UnregisterActiveSession(ActiveSession& node) noexcept
         if (bucket->traffic.empty()) {
             if (const auto entry = accounts_.find(bucket->key); entry != accounts_.end()) {
                 accounts_.erase(entry);
-                MaybeShrinkHashContainer(accounts_, 8);
+                common::MaybeShrinkHashContainer(accounts_, 8);
             }
         } else {
-            MaybeShrinkHashContainer(bucket->traffic);
+            common::MaybeShrinkHashContainer(bucket->traffic);
         }
     }
     node = {};
@@ -123,9 +123,9 @@ void SessionTrackingState::CommitTraffic(
     }
     if (bucket.traffic.empty()) {
         accounts_.erase(entry);
-        MaybeShrinkHashContainer(accounts_, 8);
+        common::MaybeShrinkHashContainer(accounts_, 8);
     } else {
-        MaybeShrinkHashContainer(bucket.traffic);
+        common::MaybeShrinkHashContainer(bucket.traffic);
     }
 }
 

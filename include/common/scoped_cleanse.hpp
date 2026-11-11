@@ -9,6 +9,8 @@
 // 有 data()/size() 的对象（std::array、std::span、std::string、ByteVector 等）
 // 按析构时的 data()/size() 擦除所指字节；其余对象（C 数组、POD 聚合）必须可平凡复制，按整个对象擦除。
 // 用法：ScopedCleanse cleanse{salt, subkey};
+namespace common {
+
 template <typename... Secrets>
 class ScopedCleanse {
 public:
@@ -38,3 +40,5 @@ private:
 
 template <typename... Secrets>
 ScopedCleanse(Secrets&...) -> ScopedCleanse<Secrets...>;
+
+}  // namespace common

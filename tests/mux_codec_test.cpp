@@ -42,7 +42,7 @@ TEST_P(MuxPayload, PreservesPayloadLengthAcrossBufferLayouts) {
     std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
     const size_t count = item.udp
         ? mux::EncodeNewHeaderTo(header, 9, mux::NetworkType::UDP,
-              TargetAddress("example.com", 53), item.size, true)
+              common::TargetAddress("example.com", 53), item.size, true)
         : mux::EncodeKeepDataHeaderTo(header, 7, item.size);
     ASSERT_NE(count, 0u);
     std::vector<uint8_t> wire(header.begin(), header.begin() + count);
@@ -64,7 +64,7 @@ class MuxUdpNew : public testing::TestWithParam<bool> {};
 TEST_P(MuxUdpNew, DistinguishesControlFromEmptyDataAtEveryHeaderSplit) {
     std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
     const size_t count = mux::EncodeNewHeaderTo(header, 7, mux::NetworkType::UDP,
-        TargetAddress("example.com", 53), 0, GetParam());
+        common::TargetAddress("example.com", 53), 0, GetParam());
     ASSERT_NE(count, 0u);
     const auto wire = std::span(header).first(count);
     for (size_t split = 0; split <= count; ++split) {
@@ -82,7 +82,7 @@ class OversizedMuxPayload : public testing::TestWithParam<int> {};
 TEST_P(OversizedMuxPayload, RejectsLengthRatherThanTruncating) {
     std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
     const size_t size = size_t(std::numeric_limits<uint16_t>::max()) + 1;
-    const TargetAddress target("example.com", 53);
+    const common::TargetAddress target("example.com", 53);
     switch (GetParam()) {
     case 0: EXPECT_EQ(mux::EncodeKeepDataHeaderTo(header, 7, size), 0u); break;
     case 1: EXPECT_EQ(mux::EncodeNewHeaderTo(header, 7, mux::NetworkType::UDP, target, size, true), 0u); break;
@@ -94,10 +94,10 @@ INSTANTIATE_TEST_SUITE_P(FrameKinds, OversizedMuxPayload, testing::Values(0, 1, 
 class InvalidMuxTarget : public testing::TestWithParam<int> {};
 TEST_P(InvalidMuxTarget, RejectsInvalidTargetOrNetworkBeforeEncoding) {
     std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
-    TargetAddress target("example.com", GetParam() < 2 ? 0 : 53);
+    common::TargetAddress target("example.com", GetParam() < 2 ? 0 : 53);
     auto network = mux::NetworkType::TCP;
     if (GetParam() == 2) {
-        target.type = AddressType::Domain;
+        target.type = common::AddressType::Domain;
         target.host.assign(256, 'a');
     }
     if (GetParam() == 3) network = static_cast<mux::NetworkType>(0xff);
@@ -131,7 +131,7 @@ class MuxGlobalId : public testing::TestWithParam<size_t> {};
 TEST_P(MuxGlobalId, AcceptsExactlyEightBytesOfGlobalIdMetadata) {
     std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
     const auto count = mux::EncodeNewHeaderTo(header, 7, mux::NetworkType::UDP,
-        TargetAddress("example.com", 53), 0, false);
+        common::TargetAddress("example.com", 53), 0, false);
     ASSERT_GE(count, 2u);
     std::vector<uint8_t> wire(header.begin(), header.begin() + count);
     const auto meta = (size_t(wire[0]) << 8 | wire[1]) + GetParam();
@@ -180,7 +180,7 @@ TEST(XudpCodec, EmptyPacketConsumesItsHeaderWithoutCorruptingSuccessor) {
 TEST(MuxCodec, RejectsPayloadLengthWithoutDataOption) {
     std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
     EXPECT_EQ(mux::EncodeNewHeaderTo(header, 7, mux::NetworkType::UDP,
-        TargetAddress("example.com", 53), 1, false), 0u);
+        common::TargetAddress("example.com", 53), 1, false), 0u);
 }
 
 TEST(MuxCodec, RejectsUnknownOptionBitsAcrossLayouts) {

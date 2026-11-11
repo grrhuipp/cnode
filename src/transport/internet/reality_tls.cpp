@@ -37,6 +37,8 @@
 #include <string_view>
 #include <vector>
 
+namespace transport::internet {
+
 void RealityClientHelloReader::Append(std::span<const uint8_t> bytes) {
     if (bytes.empty() || bytes.size() > ReadSize()) {
         status_ = Status::Invalid;
@@ -52,7 +54,7 @@ void RealityClientHelloReader::Append(std::span<const uint8_t> bytes) {
             return;
         }
         if (header_size_ != header_.size()) return;
-        remaining_ = LoadU16BE(header_.data() + 3);
+        remaining_ = common::LoadU16BE(header_.data() + 3);
         if (remaining_ == 0 || remaining_ > 16384) {
             status_ = Status::Invalid;
         }
@@ -68,7 +70,7 @@ void RealityClientHelloReader::Append(std::span<const uint8_t> bytes) {
             return;
         }
         if (hello_.size() == 4) {
-            hello_size_ = 4 + LoadU24BE(hello_.data() + 1);
+            hello_size_ = 4 + common::LoadU24BE(hello_.data() + 1);
             if (hello_size_ < 4 + 2 + 32 + 1 + 32 + 2 + 2 + 1 + 1 + 2 || hello_size_ > kMaxHelloSize) {
                 status_ = Status::Invalid;
                 return;
@@ -88,6 +90,8 @@ void RealityClientHelloReader::Append(std::span<const uint8_t> bytes) {
     }
 }
 
+}  // namespace transport::internet
+
 namespace transport::internet {
 namespace {
 
@@ -95,12 +99,12 @@ template <std::size_t N>
 tl::expected<std::array<uint8_t, N>, RealityKeyError>
 DecodeFixedBase64Url(std::string_view value) noexcept {
     constexpr std::size_t kEncodedSize = (N * 8 + 5) / 6;
-    static_assert(Base64UrlDecodedSize(kEncodedSize) == N);
+    static_assert(common::Base64UrlDecodedSize(kEncodedSize) == N);
     std::array<uint8_t, N> decoded{};
     if (value.size() != kEncodedSize) {
         return tl::unexpected(RealityKeyError::InvalidFormat);
     }
-    const auto result = DecodeBase64Url(value, decoded);
+    const auto result = common::DecodeBase64Url(value, decoded);
     if (!result || result->nonzero_pad_bits) {
         OPENSSL_cleanse(decoded.data(), decoded.size());
         return tl::unexpected(RealityKeyError::InvalidFormat);
@@ -150,7 +154,7 @@ ParseRealityMldsa65PublicKey(std::string_view value) noexcept {
 
 std::optional<std::string>
 NormalizeRealityFingerprint(std::string_view value) {
-    const std::string normalized = LowerAscii(std::string(value));
+    const std::string normalized = common::LowerAscii(std::string(value));
     if (normalized.empty() ||
         normalized == "chrome" ||
         normalized == "firefox" ||
@@ -169,6 +173,8 @@ NormalizeRealityFingerprint(std::string_view value) {
 }
 
 }  // namespace transport::internet
+
+namespace transport::internet {
 
 namespace {
 
@@ -258,7 +264,7 @@ void FreeRealityServerConnState(void* /*parent*/,
 [[nodiscard]] bool HasHandshakeHeader(const SSL_CLIENT_HELLO& hello) noexcept {
     return hello.client_hello_len >= 4 &&
         hello.client_hello[0] == SSL3_MT_CLIENT_HELLO &&
-        LoadU24BE(hello.client_hello + 1) == hello.client_hello_len - 4;
+        common::LoadU24BE(hello.client_hello + 1) == hello.client_hello_len - 4;
 }
 
 [[nodiscard]] memory::ByteVector FramedClientHello(const SSL_CLIENT_HELLO& hello) {
@@ -270,7 +276,7 @@ void FreeRealityServerConnState(void* /*parent*/,
     }
     framed.resize(4 + hello.client_hello_len);
     framed[0] = SSL3_MT_CLIENT_HELLO;
-    StoreU24BE(framed.data() + 1, static_cast<uint32_t>(hello.client_hello_len));
+    common::StoreU24BE(framed.data() + 1, static_cast<uint32_t>(hello.client_hello_len));
     std::copy_n(hello.client_hello, hello.client_hello_len, framed.data() + 4);
     return framed;
 }
@@ -285,7 +291,7 @@ void FreeRealityServerConnState(void* /*parent*/,
     std::span<const uint8_t, kRealityX25519KeySize> peer_public,
     std::span<const uint8_t, 20> random_salt) noexcept {
     std::array<uint8_t, kRealityX25519KeySize> shared{};
-    const ScopedCleanse wipe_shared{shared};
+    const common::ScopedCleanse wipe_shared{shared};
     if (X25519(shared.data(), state.private_key.data(), peer_public.data()) != 1) {
         return std::nullopt;
     }
@@ -300,7 +306,7 @@ void FreeRealityServerConnState(void* /*parent*/,
     std::span<const uint8_t> shared,
     std::span<const uint8_t, 20> random_salt) noexcept {
     std::array<uint8_t, 32> auth_key{};
-    const ScopedCleanse wipe_auth{auth_key};
+    const common::ScopedCleanse wipe_auth{auth_key};
     static constexpr std::string_view kRealityInfo = "REALITY";
     if (HKDF(auth_key.data(),
              auth_key.size(),
@@ -344,7 +350,7 @@ OpenRealitySessionId(
     std::span<const uint8_t, kRealitySessionIdSize> ciphertext,
     std::span<const uint8_t> aad) noexcept {
     std::array<uint8_t, kRealityPlainAuthSize> plain{};
-    const ScopedCleanse wipe_plain{plain};
+    const common::ScopedCleanse wipe_plain{plain};
     size_t plain_len = 0;
     if (!WithRealitySessionIdAead(auth_key, [&](EVP_AEAD_CTX& aead) noexcept {
             return EVP_AEAD_CTX_open(&aead,
@@ -402,7 +408,7 @@ BuildRealityClientAuthPlain(
     const auto now = static_cast<uint32_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
-    StoreU32BE(plain.data() + 4, now);
+    common::StoreU32BE(plain.data() + 4, now);
     std::copy(short_id.begin(), short_id.end(), plain.begin() + 8);
     return plain;
 }
@@ -476,12 +482,12 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     if (!auth_key) {
         return 0;
     }
-    const ScopedCleanse wipe_auth{*auth_key};
+    const common::ScopedCleanse wipe_auth{*auth_key};
 
     auto plain = BuildRealityClientAuthPlain(
         std::span<const uint8_t, kRealityShortIdSize>(
             state->short_id.data(), state->short_id.size()));
-    const ScopedCleanse wipe_plain{plain};
+    const common::ScopedCleanse wipe_plain{plain};
     auto encrypted = SealRealitySessionId(
         std::span<const uint8_t, 32>(auth_key->data(), auth_key->size()),
         std::span<const uint8_t, kRealityAesGcmNonceSize>(
@@ -572,7 +578,7 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     }
 
     std::array<uint8_t, 64> expected{};
-    const ScopedCleanse wipe_expected{expected};
+    const common::ScopedCleanse wipe_expected{expected};
     unsigned int expected_len = 0;
     if (!HMAC(EVP_sha512(),
               auth_key.data(),
@@ -619,7 +625,7 @@ int RealityClientHelloCallback(SSL* /*ssl*/,
     }
 
     std::array<uint8_t, 64> mldsa_msg{};
-    const ScopedCleanse wipe_mldsa_msg{mldsa_msg};
+    const common::ScopedCleanse wipe_mldsa_msg{mldsa_msg};
     if (!ComputeRealityTranscriptHmac(
             state.auth_key,
             peer_public,
@@ -704,7 +710,7 @@ namespace {
         return false;
     }
 
-    const uint32_t client_time = LoadU32BE(plain.data() + 4);
+    const uint32_t client_time = common::LoadU32BE(plain.data() + 4);
     if (!IsRealityClientTimeAllowed(client_time, state.max_time_diff_ms)) {
         return false;
     }
@@ -755,7 +761,7 @@ namespace {
     }
 
     std::array<uint8_t, 64> signature{};
-    const ScopedCleanse wipe_signature{signature};
+    const common::ScopedCleanse wipe_signature{signature};
     unsigned int signature_len = 0;
     if (!HMAC(EVP_sha512(),
               auth_key.data(),
@@ -817,7 +823,7 @@ void RealityServerMsgCallback(int is_write,
     }
 
     std::array<uint8_t, 64> mldsa_msg{};
-    const ScopedCleanse wipe_mldsa_msg{mldsa_msg};
+    const common::ScopedCleanse wipe_mldsa_msg{mldsa_msg};
     if (!ComputeRealityTranscriptHmac(
             conn_state->auth_key,
             state->ed25519_public,
@@ -844,7 +850,7 @@ void RealityServerMsgCallback(int is_write,
 
 // RFC 8446 §4.2.1 supported_versions body; null when malformed.
 [[nodiscard]] std::optional<bool> OffersTls13(std::span<const uint8_t> ext_data) noexcept {
-    ByteReader versions_outer(ext_data);
+    common::ByteReader versions_outer(ext_data);
     const uint8_t versions_len = versions_outer.ReadU8();
     const auto versions_bytes = versions_outer.ReadBytes(versions_len);
     if (!versions_outer.Ok() || !versions_outer.Empty() ||
@@ -852,7 +858,7 @@ void RealityServerMsgCallback(int is_write,
         return std::nullopt;
     }
     bool supports_tls13 = false;
-    ByteReader versions(versions_bytes);
+    common::ByteReader versions(versions_bytes);
     while (!versions.Empty()) {
         if (versions.ReadU16BE() == TLS1_3_VERSION) {
             supports_tls13 = true;
@@ -875,7 +881,7 @@ struct RealityClientHelloExtensions {
     bool has_supported_versions = false;
     bool supports_tls13 = false;
 
-    ByteReader extensions(extensions_bytes);
+    common::ByteReader extensions(extensions_bytes);
     while (!extensions.Empty()) {
         const uint16_t ext_type = extensions.ReadU16BE();
         const auto ext_data = extensions.ReadBytes(extensions.ReadU16BE());
@@ -927,7 +933,7 @@ VerifyRealityClientHelloHandshake(
     memory::ByteVector handshake,
     const RealityServerState& state) {
     // This is the reassembled handshake, including its four-byte header.
-    ByteReader reader(handshake);
+    common::ByteReader reader(handshake);
     const uint8_t msg_type = reader.ReadU8();
     const uint32_t hello_len = reader.ReadU24BE();
     if (!reader.Ok() || msg_type != SSL3_MT_CLIENT_HELLO ||
@@ -970,7 +976,7 @@ VerifyRealityClientHelloHandshake(
     if (!auth_key) {
         return nullptr;
     }
-    const ScopedCleanse wipe_auth{*auth_key};
+    const common::ScopedCleanse wipe_auth{*auth_key};
 
     std::array<uint8_t, kRealitySessionIdSize> session_id{};
     std::copy_n(handshake.data() + 4 + 35, kRealitySessionIdSize, session_id.data());
@@ -982,7 +988,7 @@ VerifyRealityClientHelloHandshake(
         session_id,
         handshake);
     if (!plain) return nullptr;
-    const ScopedCleanse wipe_plain{*plain};
+    const common::ScopedCleanse wipe_plain{*plain};
     if (!IsRealityClientAuthAllowed(state, *plain)) return nullptr;
 
     auto conn_state = std::make_unique<RealityServerConnState>();
@@ -1087,7 +1093,7 @@ VerifyRealityClientHelloHandshake(
     }
 
     std::array<uint8_t, 32> seed{};
-    const ScopedCleanse wipe_seed{seed};
+    const common::ScopedCleanse wipe_seed{seed};
     if (RAND_bytes(seed.data(), static_cast<int>(seed.size())) != 1) {
         LOG_ERROR("REALITY Ed25519 seed generation failed");
         return {};
@@ -1425,3 +1431,5 @@ void ClearRealityServerConnState(SSL* ssl) noexcept {
         delete state;
     }
 }
+
+}  // namespace transport::internet

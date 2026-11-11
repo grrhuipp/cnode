@@ -21,8 +21,8 @@ struct CompoundRoutingRule {
     void SetProtocolCondition(const std::vector<std::string>& protocols);
     void SetInboundTagCondition(const std::vector<std::string>& tags);
     void SetUserCondition(const std::vector<std::string>& users);
-    void SetPortCondition(const std::vector<RoutingPortRange>& ports);
-    void SetSourcePortCondition(const std::vector<RoutingPortRange>& ports);
+    void SetPortCondition(const std::vector<infra::RoutingPortRange>& ports);
+    void SetSourcePortCondition(const std::vector<infra::RoutingPortRange>& ports);
     [[nodiscard]] bool HasAnyCondition() const noexcept;
 
     std::optional<::geo::CidrSet> source_ip_matcher;
@@ -36,8 +36,8 @@ struct CompoundRoutingRule {
     std::vector<std::string> protocol_values;
     std::vector<std::string> inbound_tag_values;
     std::vector<std::string> user_values;
-    std::vector<RoutingPortRange> port_ranges;
-    std::vector<RoutingPortRange> source_port_ranges;
+    std::vector<infra::RoutingPortRange> port_ranges;
+    std::vector<infra::RoutingPortRange> source_port_ranges;
 
     [[nodiscard]] bool Match(
         const session::Context& ctx,
@@ -54,7 +54,7 @@ private:
     [[nodiscard]] bool MatchInboundTag(const session::Context& ctx) const;
     [[nodiscard]] bool MatchUser(const session::Context& ctx) const;
     [[nodiscard]] static bool MatchPortRanges(
-        const std::vector<RoutingPortRange>& ranges,
+        const std::vector<infra::RoutingPortRange>& ranges,
         uint16_t port) noexcept;
 };
 
@@ -64,7 +64,7 @@ class Router final : public routing::Router {
 public:
     // Immutable process-allocated routing snapshot, shared by session domains.
     // Failed builds never publish partial matchers.
-    Router(const RoutingConfig& config, const ::geo::GeoDatabase* geo_database);
+    Router(const infra::RoutingConfig& config, const ::geo::GeoDatabase* geo_database);
     ~Router() noexcept override;
     Router(const Router&) = delete;
     Router& operator=(const Router&) = delete;

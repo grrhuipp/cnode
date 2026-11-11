@@ -16,6 +16,8 @@
 // ============================================================================
 // 嗅探结果
 // ============================================================================
+namespace sniff {
+
 struct SniffResult {
     bool success = false;           // 是否嗅探成功
     bool need_more = false;         // 已识别协议，但还要更多字节（对齐 xray ErrProtoNeedMoreData）
@@ -77,8 +79,8 @@ private:
 // individual datagrams and retains only bounded QUIC CRYPTO reassembly state.
 class Sniffer {
 public:
-    [[nodiscard]] SniffResult Sniff(std::span<const uint8_t> data, Network network) {
-        if (network == Network::UDP) {
+    [[nodiscard]] SniffResult Sniff(std::span<const uint8_t> data, common::Network network) {
+        if (network == common::Network::UDP) {
             return quic_.Sniff(data);
         }
         if (auto result = SniffTls(data); result.success || result.need_more) {
@@ -93,4 +95,6 @@ public:
 private:
     QuicSniffer quic_;
 };
+
+}  // namespace sniff
 

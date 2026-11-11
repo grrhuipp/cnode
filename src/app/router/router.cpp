@@ -58,7 +58,7 @@ void SortUniqueStrings(StringVector& values) {
     return nullptr;
 }
 
-[[nodiscard]] std::span<const uint8_t> NetworkBytes(const RoutingIpNetwork& network) noexcept {
+[[nodiscard]] std::span<const uint8_t> NetworkBytes(const infra::RoutingIpNetwork& network) noexcept {
     return std::span<const uint8_t>(network.Network()).first(network.IsV6() ? 16 : 4);
 }
 
@@ -103,11 +103,11 @@ void CompoundRoutingRule::SetUserCondition(const std::vector<std::string>& users
     SortUniqueStrings(user_values);
 }
 
-void CompoundRoutingRule::SetPortCondition(const std::vector<RoutingPortRange>& ports) {
+void CompoundRoutingRule::SetPortCondition(const std::vector<infra::RoutingPortRange>& ports) {
     port_ranges.assign(ports.begin(), ports.end());
 }
 
-void CompoundRoutingRule::SetSourcePortCondition(const std::vector<RoutingPortRange>& ports) {
+void CompoundRoutingRule::SetSourcePortCondition(const std::vector<infra::RoutingPortRange>& ports) {
     source_port_ranges.assign(ports.begin(), ports.end());
 }
 
@@ -168,7 +168,7 @@ bool CompoundRoutingRule::Match(
 }
 
 bool CompoundRoutingRule::MatchNetwork(const session::Context& ctx) const noexcept {
-    const uint8_t bit = (ctx.content.network == Network::UDP) ? kNetworkUdp : kNetworkTcp;
+    const uint8_t bit = (ctx.content.network == common::Network::UDP) ? kNetworkUdp : kNetworkTcp;
     return (network_mask & bit) != 0;
 }
 
@@ -200,7 +200,7 @@ bool CompoundRoutingRule::MatchUser(const session::Context& ctx) const {
 }
 
 bool CompoundRoutingRule::MatchPortRanges(
-    const std::vector<RoutingPortRange>& ranges,
+    const std::vector<infra::RoutingPortRange>& ranges,
     uint16_t port) noexcept {
     for (const auto& range : ranges) {
         if (port >= range.start && port <= range.end) return true;
@@ -214,7 +214,7 @@ bool CompoundRoutingRule::MatchPortRanges(
 // Router 实现
 // ============================================================================
 
-Router::Router(const RoutingConfig& routing, const ::geo::GeoDatabase* geo)
+Router::Router(const infra::RoutingConfig& routing, const ::geo::GeoDatabase* geo)
     : domain_strategy_(routing.domain_strategy) {
     compound_rules_.reserve(routing.rules.size());
     for (const auto& rc : routing.rules) {

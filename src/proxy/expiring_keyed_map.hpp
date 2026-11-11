@@ -78,7 +78,7 @@ public:
     template <typename OnErase = IgnoreErasedEntry>
     void Prune(TimePoint now, OnErase&& on_erase = {}) {
         while (first_ && first_->expires_at <= now) EvictOldest(on_erase);
-        MaybeShrinkHashContainer(entries_);
+        common::MaybeShrinkHashContainer(entries_);
     }
 
     template <typename OnErase = IgnoreErasedEntry>

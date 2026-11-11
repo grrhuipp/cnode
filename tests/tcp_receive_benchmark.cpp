@@ -32,7 +32,7 @@ int64_t CpuNanoseconds(const timespec& value) {
 }
 
 net::awaitable<Measurement> Transfer(
-    TcpStream& stream, tcp::socket& peer, const std::vector<uint8_t>& payload,
+    transport::internet::TcpStream& stream, tcp::socket& peer, const std::vector<uint8_t>& payload,
     std::size_t iterations) {
     timespec cpu_start{}, cpu_end{};
     if (::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_start) != 0)
@@ -73,7 +73,7 @@ TEST(TcpReceiveBenchmark, VerifiedBursts) {
         socket.set_option(net::socket_base::receive_buffer_size(256 * 1024));
         socket.connect(acceptor.local_endpoint());
         acceptor.accept(peer);
-        TcpStream stream(std::move(socket));
+        transport::internet::TcpStream stream(std::move(socket));
         stream.SetReadTimeout(2s);
         std::vector<uint8_t> payload(burst);
         for (std::size_t index = 0; index < burst; ++index)

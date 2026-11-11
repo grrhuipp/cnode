@@ -32,10 +32,10 @@ public:
             if (packet.source.port() == 0) {
                 continue;
             }
-            const TargetAddress source(iputil::NormalizeAddress(packet.source.address()),
+            const common::TargetAddress source(iputil::NormalizeAddress(packet.source.address()),
                                        packet.source.port());
             if (!buf::SetUdpTarget(packet.payload, source))
-                throw transport::LinkError(ErrorCode::RESOURCE_EXHAUSTED);
+                throw transport::LinkError(common::ErrorCode::RESOURCE_EXHAUSTED);
             socket_.TouchActivity();
             co_return std::move(packet.payload);
         }
@@ -46,13 +46,13 @@ public:
         const auto datagram = buf::InspectUdpDatagram(payload);
         if (datagram.status == buf::UdpDatagramStatus::Empty) co_return;
         if (!datagram.Valid() || !datagram.target || !datagram.target->IsValid())
-            throw transport::LinkError(ErrorCode::INVALID_ARGUMENT);
-        const TargetAddress& target = *datagram.target;
+            throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
+        const common::TargetAddress& target = *datagram.target;
         if (write_closed_) throw transport::WriteClosed{};
         auto write = socket_.StartWrite();
         if (target.resolved_addr) {
             if (target.resolved_addr->is_v6() != socket_.IsIPv6())
-                throw transport::LinkError(ErrorCode::INVALID_ARGUMENT);
+                throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
             // target 借用 payload 的元数据：先取出端点，再移交 payload。
             const udp::endpoint endpoint(*target.resolved_addr, target.port);
             co_await write.SendTo(endpoint, std::move(payload));

@@ -61,7 +61,7 @@ net::awaitable<void> Wait(net::steady_timer& timer, Counts& counts,
     }
 }
 
-net::awaitable<void> AddChild(::AwaitableTaskGroup& group,
+net::awaitable<void> AddChild(::common::AwaitableTaskGroup& group,
                               net::steady_timer& timer, Counts& counts) {
     Lifetime lifetime(counts);
     co_await net::post(net::use_awaitable);
@@ -76,8 +76,8 @@ TEST(AwaitableTaskGroup, DynamicCancellationJoinsChildCleanup) {
     Counts counts;
     int returned = -1;
     std::exception_ptr failure;
-    net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
-        [&](::AwaitableTaskGroup& group) {
+    net::co_spawn(io, ::common::RunAwaitableTaskGroup(io.get_executor(),
+        [&](::common::AwaitableTaskGroup& group) {
             group.Spawn(Wait(gate, counts, true));
             group.Spawn(AddChild(group, gate, counts));
         }), net::bind_cancellation_slot(cancellation.slot(),
@@ -109,7 +109,7 @@ net::awaitable<void> Fail() {
     throw OwnerFailure{};
 }
 
-net::awaitable<void> Stop(::AwaitableTaskGroup& group,
+net::awaitable<void> Stop(::common::AwaitableTaskGroup& group,
                          net::steady_timer& gate, Counts& counts, bool& rejected) {
     co_await net::post(net::use_awaitable);
     group.Cancel();
@@ -126,8 +126,8 @@ TEST(AwaitableTaskGroup, ExplicitCancelRejectsLateSpawnAndJoinsChildren) {
     gate.expires_at(net::steady_timer::time_point::max());
     Counts counts;
     bool rejected = false;
-    auto result = net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
-        [&](::AwaitableTaskGroup& group) {
+    auto result = net::co_spawn(io, ::common::RunAwaitableTaskGroup(io.get_executor(),
+        [&](::common::AwaitableTaskGroup& group) {
             group.Spawn(Wait(gate, counts, true));
             group.Spawn(Stop(group, gate, counts, rejected));
         }), net::use_future);
@@ -150,8 +150,8 @@ TEST_P(TaskGroupFailure, CancelsAndJoinsPendingChildren) {
     net::steady_timer gate(io);
     gate.expires_at(net::steady_timer::time_point::max());
     Counts counts;
-    auto result = net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
-        [&](::AwaitableTaskGroup& group) {
+    auto result = net::co_spawn(io, ::common::RunAwaitableTaskGroup(io.get_executor(),
+        [&](::common::AwaitableTaskGroup& group) {
             group.Spawn(Wait(gate, counts, true));
             if (start_failure) throw OwnerFailure{};
             group.Spawn(Fail());
@@ -186,8 +186,8 @@ net::awaitable<void> FailingCleanup(bool& finished) {
 TEST(AwaitableTaskGroup, FailureOutranksCancellation) {
     net::io_context io;
     bool cleanup_finished = false;
-    auto result = net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
-        [&](::AwaitableTaskGroup& group) {
+    auto result = net::co_spawn(io, ::common::RunAwaitableTaskGroup(io.get_executor(),
+        [&](::common::AwaitableTaskGroup& group) {
             group.Spawn(AbortedChild());
             group.Spawn(FailingCleanup(cleanup_finished));
         }), net::use_future);
@@ -229,8 +229,8 @@ TEST_P(TaskGroupRequestCancellation, JoinsCleanupAndPreservesSiblingFailureSeman
     auto* request_source = source.get();
     auto request = CancelledRequest(operation, cleanup, request_counts,
                                     std::move(source), fail_cleanup);
-    auto result = net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
-        [&](::AwaitableTaskGroup& group) {
+    auto result = net::co_spawn(io, ::common::RunAwaitableTaskGroup(io.get_executor(),
+        [&](::common::AwaitableTaskGroup& group) {
             group.Spawn(std::move(request), request_source);
             group.Spawn(Wait(sibling, sibling_counts));
         }), net::use_future);
@@ -263,8 +263,8 @@ TEST(AwaitableTaskGroup, StoppedRequestNeverStarts) {
     ::transport::CancellationSource source;
     source.Stop();
     Counts counts;
-    auto result = net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
-        [&](::AwaitableTaskGroup& group) {
+    auto result = net::co_spawn(io, ::common::RunAwaitableTaskGroup(io.get_executor(),
+        [&](::common::AwaitableTaskGroup& group) {
             group.Spawn(Wait(gate, counts), &source);
         }), net::use_future);
     io.run();
@@ -276,12 +276,12 @@ net::awaitable<void> WithFailure(net::io_context& io, net::steady_timer& timer,
                                 Counts& counts, int allocation) {
     std::vector<net::awaitable<void>> tasks;
     for (int i = 0; i < 3; ++i) tasks.push_back(Wait(timer, counts));
-    auto start = [&](::AwaitableTaskGroup& group) {
+    auto start = [&](::common::AwaitableTaskGroup& group) {
         for (auto& task : tasks) group.Spawn(std::move(task));
     };
     fail_after = allocation;
     try {
-        co_await ::RunAwaitableTaskGroup(io.get_executor(), start);
+        co_await ::common::RunAwaitableTaskGroup(io.get_executor(), start);
     } catch (...) {
         fail_after = -1;
         throw;
@@ -343,7 +343,7 @@ net::awaitable<void> Observe(net::any_io_executor expected, bool& matched) {
 
 net::awaitable<void> CrossExecutor(net::any_io_executor caller,
                                   net::any_io_executor worker, bool& child, bool& parent) {
-    co_await ::RunAwaitableTaskGroup(worker, [&](::AwaitableTaskGroup& group) {
+    co_await ::common::RunAwaitableTaskGroup(worker, [&](::common::AwaitableTaskGroup& group) {
         group.Spawn(Observe(worker, child));
     });
     parent = (co_await net::this_coro::executor) == caller;
@@ -352,8 +352,8 @@ net::awaitable<void> CrossExecutor(net::any_io_executor caller,
 TEST(AwaitableTaskGroup, MoveOnlyStartCallbackRuns) {
     net::io_context io;
     bool started = false;
-    auto result = net::co_spawn(io, ::RunAwaitableTaskGroup(io.get_executor(),
-        [value = std::make_unique<int>(42), &started](::AwaitableTaskGroup&) {
+    auto result = net::co_spawn(io, ::common::RunAwaitableTaskGroup(io.get_executor(),
+        [value = std::make_unique<int>(42), &started](::common::AwaitableTaskGroup&) {
             started = *value == 42;
         }), net::use_future);
     io.run();
@@ -388,7 +388,7 @@ TEST(AwaitableTaskGroup, ResidentJoinCancelsChildrenAndClosesAdmission) {
     bool joined = false;
     bool rejected = false;
     {
-        ::ResidentTaskGroup resident(io.get_executor());
+        ::common::ResidentTaskGroup resident(io.get_executor());
         ::transport::CancellationSource own;
         auto started = net::co_spawn(io, [&]() -> net::awaitable<void> {
             resident.Tasks().Spawn(Wait(gate, counts, true));

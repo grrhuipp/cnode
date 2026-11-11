@@ -6,10 +6,22 @@
 
 #include <cstdint>
 
+namespace transport {
+
 class AsyncStream;
+
+}  // namespace transport
+namespace app {
+
 class ConnectionLimiter;
 struct StatsShard;
+
+}  // namespace app
+namespace infra {
+
 struct TimeoutsConfig;
+
+}  // namespace infra
 namespace proxyman::inbound { struct AdmissionEnvironment; }
 
 namespace routing {
@@ -33,16 +45,16 @@ namespace proxy {
 // environment: each child takes logical admission under the physical family;
 // a refused child closes with OptionError without affecting its parent.
 // ============================================================================
-net::awaitable<RelayResult> ServeMuxInbound(
+net::awaitable<app::RelayResult> ServeMuxInbound(
     net::io_context& io_context,
     transport::Link client_link,
-    AsyncStream& client_control,
+    transport::AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& policy,
     const proxyman::inbound::AdmissionEnvironment& environment,
     session::Context& parent_ctx,
-    StatsShard& stats,
-    const TimeoutsConfig& timeouts,
+    app::StatsShard& stats,
+    const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout);
 
 }  // namespace proxy

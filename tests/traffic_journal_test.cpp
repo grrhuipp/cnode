@@ -33,7 +33,7 @@ protected:
         config.Name = "test";
         config.APIHost = "http://127.0.0.1:12345";
         config.Key = "not-written-to-journal";
-        config.NodeIDs = ::PanelNodeIds::Parse(::json::array{1});
+        config.NodeIDs = ::infra::PanelNodeIds::Parse(::json::array{1});
         config.TrafficJournalDir = root / "journal";
     }
     void TearDown() override {
@@ -64,7 +64,7 @@ protected:
         EXPECT_EQ(WEXITSTATUS(status), 0);
     }
     std::filesystem::path root;
-    ::PanelConfig config;
+    ::infra::PanelConfig config;
 };
 
 TEST_F(TrafficJournalTest, ReadyRecordSurvivesCrashAndAcknowledgementRemovesIt) {

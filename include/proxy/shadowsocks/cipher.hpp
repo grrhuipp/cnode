@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ss {
+namespace proxy::shadowsocks {
 
 enum class SsCipherType : uint8_t {
     AES_128_GCM = 0,
@@ -20,4 +20,4 @@ struct SsCipherInfo {
     size_t salt_size;
 };
 
-}  // namespace ss
+}  // namespace proxy::shadowsocks

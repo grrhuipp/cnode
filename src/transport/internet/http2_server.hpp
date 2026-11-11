@@ -29,7 +29,7 @@ public:
     }
     [[nodiscard]] net::io_context& IoContext() const noexcept {
         return static_cast<net::io_context&>(net::query(
-            const_cast<SignalChannel&>(input_signal_).get_executor(),
+            const_cast<common::SignalChannel&>(input_signal_).get_executor(),
             net::execution::context));
     }
     void SetUploadBudget(const std::shared_ptr<XHttpPacketUpSession>& budget) noexcept {
@@ -110,10 +110,10 @@ private:
     void ReleaseDecoderStorage(Http2ServerSession* session) noexcept;
     [[nodiscard]] std::shared_ptr<Http2ServerSession> LockWritableSession() const;
 
-    SignalChannel input_signal_;
+    common::SignalChannel input_signal_;
     // JoinOwner's frame-local channel, published only while it waits.
-    SignalChannel* owner_signal_ = nullptr;
-    std::optional<SignalChannel> credit_signal_;
+    common::SignalChannel* owner_signal_ = nullptr;
+    std::optional<common::SignalChannel> credit_signal_;
     H2SendWindow send_window_;
     int64_t receive_window_ = H2SendWindow::kDefault;
     uint32_t consumed_credit_ = 0;
@@ -252,7 +252,7 @@ public:
 
     // `http_config` (required for RawData) and `xhttp_config` are borrowed
     // from the handshake caller, which awaits Run() to completion.
-    Http2ServerSession(GroupCoordinator& coordinator, net::io_context& io_context,
+    Http2ServerSession(app::GroupCoordinator& coordinator, net::io_context& io_context,
                        std::unique_ptr<AsyncStream> stream,
                        std::shared_ptr<InboundTransportStreamHandler> stream_handler,
                        H2PayloadCodec payload_codec,
@@ -293,8 +293,8 @@ public:
 
     net::awaitable<void> Run() {
         try {
-            co_await RunAwaitableTaskGroup(io_context_.get_executor(),
-                [this](AwaitableTaskGroup& tasks) {
+            co_await common::RunAwaitableTaskGroup(io_context_.get_executor(),
+                [this](common::AwaitableTaskGroup& tasks) {
                     tasks_ = &tasks;
                     tasks.Spawn(RunReadLoop());
                 });
@@ -382,7 +382,7 @@ public:
         }
         auto sub = std::move(it->second);
         streams_.erase(it);
-        MaybeShrinkHashContainer(streams_, 8);
+        common::MaybeShrinkHashContainer(streams_, 8);
         if (sub) {
             sub->CancelFromSession(error);
         }
@@ -662,7 +662,7 @@ private:
             error == H2Error::RefusedStream ? IoErrorCode(io_error::no_buffer_space) :
             IoErrorCode(io_error::operation_aborted));
         std::array<uint8_t, 4> payload{};
-        StoreU32BE(payload.data(), static_cast<uint32_t>(error));
+        common::StoreU32BE(payload.data(), static_cast<uint32_t>(error));
         co_return co_await WriteFrameSerialized(H2FrameType::RST_STREAM, 0, stream_id, payload);
     }
 
@@ -864,7 +864,7 @@ private:
         if (payload_codec_ == H2PayloadCodec::RawData && !xhttp_config_ && http_config_) {
             if (!detail::PathPrefixMatchesSegment(http_config_->path, request->path) ||
                 (!http_config_->method.empty() &&
-                 !EqualsAsciiCI(request->method, http_config_->method))) {
+                 !common::EqualsAsciiCI(request->method, http_config_->method))) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
             if (const std::string_view expected_host =
@@ -875,11 +875,11 @@ private:
             }
         }
         if (payload_codec_ == H2PayloadCodec::GrpcHunk && grpc_config_) {
-            if (!EqualsAsciiCI(request->method, "POST") ||
+            if (!common::EqualsAsciiCI(request->method, "POST") ||
                 !detail::PathMatchesExactly(grpc_config_->request_path, request->path)) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
             }
-            if (const std::string_view expected_authority = TrimAscii(grpc_config_->authority);
+            if (const std::string_view expected_authority = common::TrimAscii(grpc_config_->authority);
                 !expected_authority.empty() &&
                 !AuthorityMatchesHost(request->authority, expected_authority)) {
                 co_return co_await ResetStream(stream_id, H2Error::Protocol);
@@ -980,7 +980,7 @@ private:
         CancelAll();
     }
 
-    GroupCoordinator& coordinator_;
+    app::GroupCoordinator& coordinator_;
     net::io_context& io_context_;
     std::unique_ptr<AsyncStream> stream_;
     std::shared_ptr<InboundTransportStreamHandler> stream_handler_;
@@ -996,7 +996,7 @@ private:
     HpackDecoder hpack_decoder_;
     uint64_t conn_id_ = 0;
     uint32_t last_remote_stream_id_ = 0;
-    AwaitableTaskGroup* tasks_ = nullptr;
+    common::AwaitableTaskGroup* tasks_ = nullptr;
     size_t active_requests_ = 0;
     bool ready_ = false;
     bool cancelled_ = false;

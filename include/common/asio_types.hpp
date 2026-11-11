@@ -22,6 +22,8 @@ using IoSystemError = std::system_error;
 
 // asio's default channel traits store queued values in std::deque; RingDeque
 // keeps an idle channel at zero bytes and returns storage once drained.
+namespace common {
+
 template <typename... Signatures>
 struct ChannelTraits {
     template <typename... NewSignatures>
@@ -63,3 +65,5 @@ using SignalChannel = net::experimental::basic_channel<
     net::any_io_executor,
     ChannelTraits<>,
     void(IoErrorCode)>;
+
+}  // namespace common

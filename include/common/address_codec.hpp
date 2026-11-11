@@ -21,6 +21,8 @@
 
 // SOCKS5: type/address/port; VLESS, VMess and Mux: port/type/address;
 // UoT datagrams: type/address/port with the UoT-specific 0/1/2 types.
+namespace common {
+
 enum class AddressWireFormat : uint8_t { Socks5, PortFirst, Uot };
 enum class AddressDecodeStatus : uint8_t { Complete, Incomplete, Invalid };
 
@@ -57,7 +59,9 @@ struct AddressDecodeResult {
     std::optional<ForwardedMetadata> forwarded;
 };
 
-namespace detail {
+}  // namespace common
+
+namespace common::detail {
 
 [[nodiscard]] inline bool ReadAddressMetadataVarint(
     std::span<const uint8_t> data, size_t& pos, uint64_t& out) noexcept {
@@ -146,6 +150,8 @@ struct NormalizedMetadataView {
 }  // namespace detail
 
 // Every AddressWireFormat encodes the same fields, so the size is format-free.
+namespace common {
+
 [[nodiscard]] inline size_t AddressEncodedSize(
     const TargetAddress& target,
     ForwardedMetadataView metadata = {}) noexcept {
@@ -511,4 +517,6 @@ template <typename Reader>
         pending.AppendAndCoalesce(std::move(next));
     }
 }
+
+}  // namespace common
 

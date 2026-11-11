@@ -17,7 +17,7 @@
 #include <limits>
 #include <span>
 
-namespace ss {
+namespace proxy::shadowsocks {
 
 namespace {
 
@@ -33,9 +33,9 @@ constexpr size_t kMinSocks5AddressSize = 1 + 1 + 1 + 2;
 constexpr std::array<uint8_t, 12> kZeroNonce{};
 
 struct Parsed2022Body {
-    TargetAddress target;
+    common::TargetAddress target;
     std::span<const uint8_t> payload;
-    std::optional<ForwardedMetadata> forwarded;
+    std::optional<common::ForwardedMetadata> forwarded;
 };
 
 
@@ -45,28 +45,28 @@ struct Parsed2022Body {
 }
 
 
-[[nodiscard]] bool WriteClassicUdpPlaintext(const TargetAddress& target,
+[[nodiscard]] bool WriteClassicUdpPlaintext(const common::TargetAddress& target,
                                             const uint8_t* payload,
                                             size_t payload_len,
                                             std::span<uint8_t> plaintext,
-                                            ForwardedMetadataView forwarded = {}) noexcept {
-    const size_t addr_size = AddressEncodedSize(target, forwarded);
+                                            common::ForwardedMetadataView forwarded = {}) noexcept {
+    const size_t addr_size = common::AddressEncodedSize(target, forwarded);
     if (addr_size == 0 || plaintext.size() != addr_size + payload_len) {
         return false;
     }
     if (payload_len > 0) {
         std::memmove(plaintext.data() + addr_size, payload, payload_len);
     }
-    return EncodeAddressTo(
-               target, plaintext.data(), addr_size, AddressWireFormat::Socks5, forwarded) == addr_size;
+    return common::EncodeAddressTo(
+               target, plaintext.data(), addr_size, common::AddressWireFormat::Socks5, forwarded) == addr_size;
 }
 
-[[nodiscard]] bool Write2022ClientBodyPlaintext(const TargetAddress& target,
+[[nodiscard]] bool Write2022ClientBodyPlaintext(const common::TargetAddress& target,
                                                 const uint8_t* payload,
                                                 size_t payload_len,
                                                 std::span<uint8_t> plaintext,
-                                                ForwardedMetadataView forwarded = {}) noexcept {
-    const size_t addr_size = AddressEncodedSize(target, forwarded);
+                                                common::ForwardedMetadataView forwarded = {}) noexcept {
+    const size_t addr_size = common::AddressEncodedSize(target, forwarded);
     constexpr size_t kHeaderSize = 1 + 8 + 2;
     if (addr_size == 0 || plaintext.size() != kHeaderSize + addr_size + payload_len) {
         return false;
@@ -76,20 +76,20 @@ struct Parsed2022Body {
     }
     size_t pos = 0;
     plaintext[pos++] = kSs2022ClientPacket;
-    StoreU64BE(plaintext.data() + pos, UnixSecondsNow());
+    common::StoreU64BE(plaintext.data() + pos, UnixSecondsNow());
     pos += 8;
-    StoreU16BE(plaintext.data() + pos, 0);
+    common::StoreU16BE(plaintext.data() + pos, 0);
     pos += 2;
-    return EncodeAddressTo(
-               target, plaintext.data() + pos, addr_size, AddressWireFormat::Socks5, forwarded) == addr_size;
+    return common::EncodeAddressTo(
+               target, plaintext.data() + pos, addr_size, common::AddressWireFormat::Socks5, forwarded) == addr_size;
 }
 
-[[nodiscard]] bool Write2022ServerBodyPlaintext(const TargetAddress& target,
+[[nodiscard]] bool Write2022ServerBodyPlaintext(const common::TargetAddress& target,
                                                 const uint8_t* payload,
                                                 size_t payload_len,
                                                 std::span<const uint8_t, 8> client_session_id,
                                                 std::span<uint8_t> plaintext) noexcept {
-    const size_t addr_size = AddressEncodedSize(target);
+    const size_t addr_size = common::AddressEncodedSize(target);
     constexpr size_t kHeaderSize = 1 + 8 + 8 + 2;
     if (addr_size == 0 || plaintext.size() != kHeaderSize + addr_size + payload_len) {
         return false;
@@ -99,13 +99,13 @@ struct Parsed2022Body {
     }
     size_t pos = 0;
     plaintext[pos++] = kSs2022ServerPacket;
-    StoreU64BE(plaintext.data() + pos, UnixSecondsNow());
+    common::StoreU64BE(plaintext.data() + pos, UnixSecondsNow());
     pos += 8;
     std::memcpy(plaintext.data() + pos, client_session_id.data(), client_session_id.size());
     pos += client_session_id.size();
-    StoreU16BE(plaintext.data() + pos, 0);
+    common::StoreU16BE(plaintext.data() + pos, 0);
     pos += 2;
-    return EncodeAddressTo(target, plaintext.data() + pos, addr_size, AddressWireFormat::Socks5) == addr_size;
+    return common::EncodeAddressTo(target, plaintext.data() + pos, addr_size, common::AddressWireFormat::Socks5) == addr_size;
 }
 
 [[nodiscard]] std::optional<Parsed2022Body> Parse2022ClientBodyPlaintext(
@@ -114,21 +114,21 @@ struct Parsed2022Body {
     if (plaintext.size() < kMinHeader || plaintext[0] != kSs2022ClientPacket) {
         return std::nullopt;
     }
-    if (!TimestampFresh(LoadU64BE(plaintext.data() + 1), UnixSecondsNow())) {
+    if (!TimestampFresh(common::LoadU64BE(plaintext.data() + 1), UnixSecondsNow())) {
         return std::nullopt;
     }
-    const size_t padding_len = LoadU16BE(plaintext.data() + 1 + 8);
+    const size_t padding_len = common::LoadU16BE(plaintext.data() + 1 + 8);
     size_t pos = kMinHeader;
     if (pos + padding_len > plaintext.size()) {
         return std::nullopt;
     }
     pos += padding_len;
 
-    auto addr = DecodeAddress(
+    auto addr = common::DecodeAddress(
         std::span<const uint8_t>(plaintext.data() + pos, plaintext.size() - pos),
-        AddressWireFormat::Socks5,
+        common::AddressWireFormat::Socks5,
         {.require_non_empty_domain = true, .allow_metadata = true});
-    if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
+    if (addr.status != common::AddressDecodeStatus::Complete || !addr.target.IsValid()) {
         return std::nullopt;
     }
     pos += addr.consumed;
@@ -147,7 +147,7 @@ struct Parsed2022Body {
     if (plaintext.size() < kMinHeader || plaintext[0] != kSs2022ServerPacket) {
         return std::nullopt;
     }
-    if (!TimestampFresh(LoadU64BE(plaintext.data() + 1), UnixSecondsNow())) {
+    if (!TimestampFresh(common::LoadU64BE(plaintext.data() + 1), UnixSecondsNow())) {
         return std::nullopt;
     }
     if (!std::equal(expected_client_session_id.begin(),
@@ -155,18 +155,18 @@ struct Parsed2022Body {
                    plaintext.begin() + 1 + 8)) {
         return std::nullopt;
     }
-    const size_t padding_len = LoadU16BE(plaintext.data() + 1 + 8 + 8);
+    const size_t padding_len = common::LoadU16BE(plaintext.data() + 1 + 8 + 8);
     size_t pos = kMinHeader;
     if (pos + padding_len > plaintext.size()) {
         return std::nullopt;
     }
     pos += padding_len;
 
-    auto addr = DecodeAddress(
+    auto addr = common::DecodeAddress(
         std::span<const uint8_t>(plaintext.data() + pos, plaintext.size() - pos),
-        AddressWireFormat::Socks5,
+        common::AddressWireFormat::Socks5,
         {.require_non_empty_domain = true, .allow_metadata = false});
-    if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
+    if (addr.status != common::AddressDecodeStatus::Complete || !addr.target.IsValid()) {
         return std::nullopt;
     }
     pos += addr.consumed;
@@ -316,7 +316,7 @@ struct PlaintextScratch {
     static_assert(sizeof(headers) == kSs2022UdpSeparateHeaderSize * 2);
     auto& separate = headers[0];
     auto& identity_hash = headers[1];
-    ScopedCleanse cleanse_headers{headers};
+    common::ScopedCleanse cleanse_headers{headers};
     PlaintextScratch scratch;
     for (size_t group = 0; group < users.size();) {
         const auto& first = users[group];
@@ -388,7 +388,7 @@ struct PlaintextScratch {
             if (!parsed) {
                 return std::nullopt;
             }
-            const uint64_t packet_id = LoadU64BE(
+            const uint64_t packet_id = common::LoadU64BE(
                 separate.data() + kSs2022UdpSessionIdSize);
             if (!deferred_replay &&
                 !replay_cache.Accept(user.derived_key.span(), client_session_id, packet_id)) {
@@ -442,7 +442,7 @@ struct PlaintextScratch {
         const auto plaintext = scratch.Span();
         std::array<uint8_t, 8> client_session_id{};
         std::memcpy(client_session_id.data(), plaintext.data(), client_session_id.size());
-        const uint64_t packet_id = LoadU64BE(
+        const uint64_t packet_id = common::LoadU64BE(
             plaintext.data() + kSs2022UdpSessionIdSize);
         const auto body = plaintext.subspan(
             kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize);
@@ -462,7 +462,7 @@ struct PlaintextScratch {
 }
 
 [[nodiscard]] size_t EncodeClassicUdpPacketTo(
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     const uint8_t* payload,
     size_t payload_len,
     std::span<const uint8_t> master_key,
@@ -471,14 +471,14 @@ struct PlaintextScratch {
     size_t salt_size,
     uint8_t* output,
     size_t output_size,
-    ForwardedMetadataView forwarded) {
+    common::ForwardedMetadataView forwarded) {
 
     if (key_size > 64 || salt_size > 64 || master_key.size() < key_size ||
         (payload_len > 0 && !payload)) {
         return 0;
     }
 
-    const size_t addr_size = AddressEncodedSize(target, forwarded);
+    const size_t addr_size = common::AddressEncodedSize(target, forwarded);
     if (addr_size == 0) {
         return 0;
     }
@@ -521,7 +521,7 @@ struct PlaintextScratch {
 }
 
 [[nodiscard]] size_t Encode2022UdpAesPacketTo(
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     const uint8_t* payload,
     size_t payload_len,
     Ss2022UdpTxState& state,
@@ -529,7 +529,7 @@ struct PlaintextScratch {
     bool response,
     uint8_t* output,
     size_t output_size,
-    ForwardedMetadataView forwarded = {}) {
+    common::ForwardedMetadataView forwarded = {}) {
 
     const KeyBytes* body_key = &state.key;
     if (!response && !psk_chain.empty()) {
@@ -539,7 +539,7 @@ struct PlaintextScratch {
         return 0;
     }
 
-    const size_t addr_size = AddressEncodedSize(target, response ? ForwardedMetadataView{} : forwarded);
+    const size_t addr_size = common::AddressEncodedSize(target, response ? common::ForwardedMetadataView{} : forwarded);
     if (addr_size == 0) {
         return 0;
     }
@@ -573,7 +573,7 @@ struct PlaintextScratch {
     std::memcpy(separate.data(),
                 response ? state.server_session_id.data() : state.client_session_id.data(),
                 kSs2022UdpSessionIdSize);
-    StoreU64BE(separate.data() + kSs2022UdpSessionIdSize, state.next_packet_id);
+    common::StoreU64BE(separate.data() + kSs2022UdpSessionIdSize, state.next_packet_id);
 
     const KeyBytes* header_key = response ? &state.key : body_key;
     if (!response && !psk_chain.empty()) {
@@ -636,20 +636,20 @@ struct PlaintextScratch {
 }
 
 [[nodiscard]] size_t Encode2022UdpChachaPacketTo(
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     const uint8_t* payload,
     size_t payload_len,
     Ss2022UdpTxState& state,
     bool response,
     uint8_t* output,
     size_t output_size,
-    ForwardedMetadataView forwarded = {}) {
+    common::ForwardedMetadataView forwarded = {}) {
 
     if (state.key.size != 32 || (payload_len > 0 && !payload)) {
         return 0;
     }
 
-    const size_t addr_size = AddressEncodedSize(target, response ? ForwardedMetadataView{} : forwarded);
+    const size_t addr_size = common::AddressEncodedSize(target, response ? common::ForwardedMetadataView{} : forwarded);
     if (addr_size == 0) {
         return 0;
     }
@@ -679,7 +679,7 @@ struct PlaintextScratch {
     std::memcpy(cipher_out,
                 response ? state.server_session_id.data() : state.client_session_id.data(),
                 kSs2022UdpSessionIdSize);
-    StoreU64BE(cipher_out + kSs2022UdpSessionIdSize, state.next_packet_id);
+    common::StoreU64BE(cipher_out + kSs2022UdpSessionIdSize, state.next_packet_id);
 
     std::array<uint8_t, 24> nonce{};
     if (!RandomBytes(nonce)) {
@@ -764,7 +764,7 @@ size_t Ss2022UdpReplayCache::SessionKeyHash::operator()(
     const size_t cred_len = std::min(key.credential.size, KeyBytes::kMaxSize);
     std::memcpy(buf.data(), key.credential.bytes.data(), cred_len);
     buf[cred_len] = static_cast<uint8_t>(cred_len);
-    StoreU64BE(buf.data() + cred_len + 1, key.session_id);
+    common::StoreU64BE(buf.data() + cred_len + 1, key.session_id);
     const size_t hash = static_cast<size_t>(
         SIPHASH_24(kSeed.data(), buf.data(), cred_len + 1 + sizeof(uint64_t)));
     OPENSSL_cleanse(buf.data(), cred_len);
@@ -778,7 +778,7 @@ bool Ss2022UdpReplayCache::Accept(
     std::chrono::steady_clock::time_point now) {
     SessionKey key;
     if (authenticated_key.empty() || !key.credential.assign(authenticated_key)) return false;
-    key.session_id = LoadU64BE(session_id.data());
+    key.session_id = common::LoadU64BE(session_id.data());
     auto it = sessions_.find(key);
     if (it != sessions_.end()) {
         if (now - it->second.last_seen < kRetention) {
@@ -816,7 +816,7 @@ void Ss2022UdpReplayCache::PruneExpired(
             ++it;
         }
     }
-    MaybeShrinkHashContainer(sessions_);
+    common::MaybeShrinkHashContainer(sessions_);
 }
 
 const InboundDatagramAssociationPolicy& Ss2022UdpAssociation::Policy() noexcept {
@@ -911,11 +911,11 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
         if (!decrypted) {
             continue;
         }
-        auto addr = DecodeAddress(
+        auto addr = common::DecodeAddress(
             scratch.Span(),
-            AddressWireFormat::Socks5,
+            common::AddressWireFormat::Socks5,
             {.require_non_empty_domain = true, .allow_metadata = true});
-        if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
+        if (addr.status != common::AddressDecodeStatus::Complete || !addr.target.IsValid()) {
             return std::nullopt;
         }
 
@@ -937,7 +937,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
 }
 
 size_t EncodeUdpPacketTo(
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     const uint8_t* payload,
     size_t payload_len,
     std::span<const uint8_t> master_key,
@@ -946,7 +946,7 @@ size_t EncodeUdpPacketTo(
     size_t salt_size,
     uint8_t* output,
     size_t output_size,
-    ForwardedMetadataView forwarded) {
+    common::ForwardedMetadataView forwarded) {
 
     if (Is2022Cipher(cipher_type)) {
         return 0;
@@ -1011,11 +1011,11 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
         return std::nullopt;
     }
 
-    auto addr = DecodeAddress(
+    auto addr = common::DecodeAddress(
         scratch.Span(),
-        AddressWireFormat::Socks5,
+        common::AddressWireFormat::Socks5,
         {.require_non_empty_domain = true, .allow_metadata = false});
-    if (addr.status != AddressDecodeStatus::Complete || !addr.target.IsValid()) {
+    if (addr.status != common::AddressDecodeStatus::Complete || !addr.target.IsValid()) {
         return std::nullopt;
     }
 
@@ -1047,14 +1047,14 @@ bool Init2022UdpSessionState(
 }
 
 size_t Encode2022UdpRequestPacketTo(
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     const uint8_t* payload,
     size_t payload_len,
     Ss2022UdpTxState& state,
     std::span<const KeyBytes> psk_chain,
     uint8_t* output,
     size_t output_size,
-    ForwardedMetadataView forwarded) {
+    common::ForwardedMetadataView forwarded) {
 
     if (Is2022AesCipher(state.cipher_info.type)) {
         return Encode2022UdpAesPacketTo(
@@ -1069,7 +1069,7 @@ size_t Encode2022UdpRequestPacketTo(
 }
 
 size_t Encode2022UdpResponsePacketTo(
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     const uint8_t* payload,
     size_t payload_len,
     Ss2022UdpTxState& state,
@@ -1115,7 +1115,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
         }
         std::memcpy(
             server_session_id.data(), separate.data(), server_session_id.size());
-        packet_id = LoadU64BE(separate.data() + kSs2022UdpSessionIdSize);
+        packet_id = common::LoadU64BE(separate.data() + kSs2022UdpSessionIdSize);
         const size_t body_offset = kSs2022UdpSeparateHeaderSize;
         const size_t ciphertext_len = datagram_len - body_offset;
         uint8_t* plain_dst = scratch.Prepare(ciphertext_len - SsAeadCipher::kTagSize);
@@ -1167,7 +1167,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
         const auto plaintext = scratch.Span();
         std::memcpy(
             server_session_id.data(), plaintext.data(), server_session_id.size());
-        packet_id = LoadU64BE(
+        packet_id = common::LoadU64BE(
             plaintext.data() + kSs2022UdpSessionIdSize);
         body_span = plaintext.subspan(
             kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize);
@@ -1194,13 +1194,13 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     return result;
 }
 
-size_t ss::UdpResponse::EncodePacketTo(
-    const TargetAddress& target,
+size_t proxy::shadowsocks::UdpResponse::EncodePacketTo(
+    const common::TargetAddress& target,
     std::span<const uint8_t> payload,
     uint8_t* out,
     size_t out_capacity) {
-    if (auto* ss2022 = std::get_if<ss::Ss2022UdpTxState>(&state_)) {
-        return ss::Encode2022UdpResponsePacketTo(
+    if (auto* ss2022 = std::get_if<proxy::shadowsocks::Ss2022UdpTxState>(&state_)) {
+        return proxy::shadowsocks::Encode2022UdpResponsePacketTo(
             target,
             payload.data(),
             payload.size(),
@@ -1209,7 +1209,7 @@ size_t ss::UdpResponse::EncodePacketTo(
             out_capacity);
     }
     const auto& classic = std::get<ClassicState>(state_);
-    return ss::EncodeUdpPacketTo(
+    return proxy::shadowsocks::EncodeUdpPacketTo(
         target,
         payload.data(),
         payload.size(),
@@ -1221,7 +1221,7 @@ size_t ss::UdpResponse::EncodePacketTo(
         out_capacity);
 }
 
-buf::MultiBuffer ss::UdpResponse::Encode(UDPPacketView packet) {
+buf::MultiBuffer proxy::shadowsocks::UdpResponse::Encode(UDPPacketView packet) {
     const size_t encoded_len = EncodePacketTo(
         packet.target, packet.data, nullptr, 0);
     if (encoded_len == 0) {
@@ -1248,4 +1248,4 @@ buf::MultiBuffer ss::UdpResponse::Encode(UDPPacketView packet) {
     }
     return payload;
 }
-}  // namespace ss
+}  // namespace proxy::shadowsocks

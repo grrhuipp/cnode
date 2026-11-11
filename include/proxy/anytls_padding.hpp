@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-namespace anytls {
+namespace proxy::anytls {
 
 inline constexpr size_t kMaxFramePayload = 0xffff;
 
@@ -54,4 +54,4 @@ private:
 [[nodiscard]] std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw);
 [[nodiscard]] const std::shared_ptr<const PaddingScheme>& DefaultPaddingScheme();
 
-} // namespace anytls
+} // namespace proxy::anytls

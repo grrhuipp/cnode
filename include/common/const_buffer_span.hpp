@@ -12,6 +12,8 @@
 #include <cstdint>
 
 
+namespace common {
+
 template <size_t StackCapacity>
 class ConstBufferSpanBuilder {
 public:
@@ -142,3 +144,5 @@ private:
     std::optional<memory::Vector<net::const_buffer>> spill_;
     size_t count_ = 0;
 };
+
+}  // namespace common

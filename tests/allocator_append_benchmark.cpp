@@ -189,7 +189,7 @@ TEST(BufferSpanBenchmark, TrackedDescriptors) {
                 SCOPED_TRACE(blocks);
                 SCOPED_TRACE(from_multibuffer);
                 {
-                    ConstBufferSpanBuilder<8> probe;
+                    common::ConstBufferSpanBuilder<8> probe;
                     if (from_multibuffer) probe.AppendMultiBuffer(payload);
                     else probe.AppendBuffers(descriptors);
                     ASSERT_EQ(probe.size(), blocks);
@@ -203,7 +203,7 @@ TEST(BufferSpanBenchmark, TrackedDescriptors) {
                 ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_start), 0);
                 const auto start = std::chrono::steady_clock::now();
                 for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
-                    ConstBufferSpanBuilder<8> output;
+                    common::ConstBufferSpanBuilder<8> output;
                     if (from_multibuffer) output.AppendMultiBuffer(payload);
                     else output.AppendBuffers(descriptors);
                     const auto views = output.Span();

@@ -23,7 +23,7 @@ TEST(XhttpFdHandoff, TcpStaticBoundaryDetachAndRestorePreservesPrefixAndStream) 
     client_sock.connect(acceptor.local_endpoint());
     acceptor.accept(server_sock);
 
-    auto server_stream = std::make_unique<TcpStream>(std::move(server_sock));
+    auto server_stream = std::make_unique<transport::internet::TcpStream>(std::move(server_sock));
     const std::string payload = "POST /fixture/s1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
     net::write(client_sock, net::buffer(payload));
 
@@ -42,7 +42,7 @@ TEST(XhttpFdHandoff, TcpStaticBoundaryDetachAndRestorePreservesPrefixAndStream) 
     auto restore_fut = net::co_spawn(
         io_a,
         [&, state = std::move(*detached)]() mutable -> net::awaitable<void> {
-            auto restored = TcpStream::RestoreFromHandoff(io_a, std::move(state));
+            auto restored = transport::internet::TcpStream::RestoreFromHandoff(io_a, std::move(state));
             EXPECT_TRUE(restored != nullptr) << "TCP RestoreFromHandoff failed";
                 if (!(restored != nullptr)) co_return;
             std::array<uint8_t, 128> buf{};
@@ -68,12 +68,12 @@ TEST(XhttpFdHandoff, TcpStaticBoundaryDetachAndRestorePreservesPrefixAndStream) 
 }
 
 TEST(XhttpFdHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPlaintext) {
-    TlsStream::InitializeIo();
-    TlsConfig tls_cfg;
+    transport::internet::TlsStream::InitializeIo();
+    transport::internet::TlsConfig tls_cfg;
     tls_cfg.server_name = "localhost";
-    auto server_ctx = SslContext::CreateServerAutoSign(tls_cfg);
+    auto server_ctx = transport::internet::SslContext::CreateServerAutoSign(tls_cfg);
     tls_cfg.allow_insecure = true;
-    auto client_ctx = SslContext::CreateClient(tls_cfg);
+    auto client_ctx = transport::internet::SslContext::CreateClient(tls_cfg);
     ASSERT_TRUE(server_ctx && client_ctx);
 
     net::io_context io_b, io_a;
@@ -82,8 +82,8 @@ TEST(XhttpFdHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPlainte
     raw_client.connect(acceptor.local_endpoint());
     acceptor.accept(raw_server);
 
-    std::unique_ptr<TlsStream> client_tls;
-    std::unique_ptr<TlsStream> server_tls;
+    std::unique_ptr<transport::internet::TlsStream> client_tls;
+    std::unique_ptr<transport::internet::TlsStream> server_tls;
     const std::string payload = "POST /fixture/tls-s1 HTTP/1.1\r\nHost: localhost\r\n\r\nbody-bytes";
     std::array<uint8_t, 24> prefix{};
     size_t prefix_n = 0;
@@ -91,8 +91,8 @@ TEST(XhttpFdHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPlainte
     auto client_fut = net::co_spawn(
         io_b,
         [&]() -> net::awaitable<void> {
-            client_tls = co_await WrapTlsClient(
-                std::make_unique<TcpStream>(std::move(raw_client)), *client_ctx, "localhost");
+            client_tls = co_await transport::internet::WrapTlsClient(
+                std::make_unique<transport::internet::TcpStream>(std::move(raw_client)), *client_ctx, "localhost");
             EXPECT_TRUE(client_tls != nullptr) << "client TLS handshake failed";
                 if (!(client_tls != nullptr)) co_return;
             co_await client_tls->AsyncWrite(net::buffer(payload));
@@ -102,8 +102,8 @@ TEST(XhttpFdHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPlainte
     auto server_fut = net::co_spawn(
         io_b,
         [&]() -> net::awaitable<void> {
-            server_tls = co_await WrapTlsServer(
-                std::make_unique<TcpStream>(std::move(raw_server)), *server_ctx);
+            server_tls = co_await transport::internet::WrapTlsServer(
+                std::make_unique<transport::internet::TcpStream>(std::move(raw_server)), *server_ctx);
             EXPECT_TRUE(server_tls != nullptr) << "server TLS handshake failed";
                 if (!(server_tls != nullptr)) co_return;
             prefix_n = co_await server_tls->AsyncRead(net::buffer(prefix));
@@ -123,7 +123,7 @@ TEST(XhttpFdHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPlainte
     auto restore_fut = net::co_spawn(
         io_a,
         [&, state = std::move(*detached)]() mutable -> net::awaitable<void> {
-            auto restored = TlsStream::RestoreFromHandoff(io_a, std::move(state));
+            auto restored = transport::internet::TlsStream::RestoreFromHandoff(io_a, std::move(state));
             EXPECT_TRUE(restored != nullptr) << "TLS RestoreFromHandoff failed";
                 if (!(restored != nullptr)) co_return;
             std::array<uint8_t, 128> buf{};

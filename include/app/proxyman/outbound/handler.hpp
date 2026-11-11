@@ -17,7 +17,11 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+namespace common {
+
 class AwaitableTaskGroup;
+
+}  // namespace common
 namespace app::dns {
 class DNS;
 }  // namespace app::dns
@@ -39,11 +43,11 @@ struct TypedOutboundProtocolSettings final : OutboundProtocolSettings {
 // resident task group (joined before the Worker's teardown). Dialing goes
 // through the owning Handler's OutboundDialer, never through creator state.
 struct PreparedOutboundCreator {
-    using CreateFn = std::unique_ptr<::Outbound> (*)(
+    using CreateFn = std::unique_ptr<::proxy::Outbound> (*)(
         std::string_view tag,
         const std::shared_ptr<const OutboundProtocolSettings>& settings,
         ::net::io_context& io_context,
-        ::AwaitableTaskGroup& tasks);
+        ::common::AwaitableTaskGroup& tasks);
 
     std::shared_ptr<const OutboundProtocolSettings> settings;
     CreateFn create_fn = nullptr;
@@ -60,10 +64,10 @@ struct PreparedOutboundCreator {
         return create_fn != nullptr;
     }
 
-    [[nodiscard]] std::unique_ptr<::Outbound> operator()(
+    [[nodiscard]] std::unique_ptr<::proxy::Outbound> operator()(
         std::string_view tag,
         ::net::io_context& io_context,
-        ::AwaitableTaskGroup& tasks) const {
+        ::common::AwaitableTaskGroup& tasks) const {
         return create_fn(tag, settings, io_context, tasks);
     }
 };
@@ -77,7 +81,7 @@ template <typename State, auto Fn>
         +[](std::string_view tag,
             const std::shared_ptr<const OutboundProtocolSettings>& base,
             ::net::io_context& io_context,
-            ::AwaitableTaskGroup& tasks) -> std::unique_ptr<::Outbound> {
+            ::common::AwaitableTaskGroup& tasks) -> std::unique_ptr<::proxy::Outbound> {
             const auto* holder = static_cast<const Holder*>(base.get());
             return Fn(tag, std::shared_ptr<const Decayed>(base, &holder->value),
                       io_context, tasks);
@@ -89,7 +93,7 @@ template <typename State, auto Fn>
 struct PreparedOutboundConfig {
     std::string tag;
     std::string protocol;
-    OutboundSenderSettings sender;
+    transport::internet::OutboundSenderSettings sender;
     PreparedOutboundCreator create;
 };
 // What a protocol contributes to its Handler: the protocol constructor and the
@@ -97,7 +101,7 @@ struct PreparedOutboundConfig {
 // of the source config overrides the protocol's default bind.
 struct PreparedOutboundProxy {
     PreparedOutboundCreator create;
-    OutboundSenderSettings sender;
+    transport::internet::OutboundSenderSettings sender;
 };
 
 // Cold-path registration API. Proxyman receives an already normalized
@@ -113,10 +117,10 @@ void RegisterProxy(
 // Prepared configs are runtime invariants. Construction failures throw;
 // callers must not continue with a partially installed outbound handler.
 // `tasks` must outlive the protocol instance and join everything it starts.
-[[nodiscard]] std::unique_ptr<::Outbound> NewProxy(
+[[nodiscard]] std::unique_ptr<::proxy::Outbound> NewProxy(
     const PreparedOutboundConfig& config,
     ::net::io_context& io_context,
-    ::AwaitableTaskGroup& tasks);
+    ::common::AwaitableTaskGroup& tasks);
 
 // ============================================================================
 // Handler - Xray app/proxyman/outbound.Handler
@@ -131,7 +135,7 @@ public:
     // client and resident task group outlive the handler).
     Handler(PreparedOutboundConfig config, net::io_context& io_context,
             app::dns::DNS& dns, std::chrono::seconds dial_timeout,
-            AwaitableTaskGroup& tasks);
+            common::AwaitableTaskGroup& tasks);
     ~Handler();
     Handler(const Handler&) = delete;
     Handler& operator=(const Handler&) = delete;
@@ -139,20 +143,20 @@ public:
     [[nodiscard]] std::string_view Tag() const noexcept { return config_.tag; }
 
     // The caller keeps this handler alive until the returned awaitable completes.
-    [[nodiscard]] net::awaitable<OutboundProcessResult> Dispatch(
+    [[nodiscard]] net::awaitable<proxy::OutboundProcessResult> Dispatch(
         session::Context& ctx,
         transport::Link inbound,
-        const TimeoutsConfig& timeouts,
-        StatsShard& stats,
-        const RelayConfig& relay_config,
+        const infra::TimeoutsConfig& timeouts,
+        app::StatsShard& stats,
+        const app::RelayConfig& relay_config,
         buf::MultiBufferBatch&& first_payload);
 
 private:
     // Destroyed in reverse order: the protocol instance before the dialer,
     // the dialer before the sender settings it borrows from config_.
     const PreparedOutboundConfig config_;
-    OutboundDialer dialer_;
-    std::unique_ptr<::Outbound> proxy_;
+    transport::internet::OutboundDialer dialer_;
+    std::unique_ptr<::proxy::Outbound> proxy_;
 };
 
 // ============================================================================
@@ -168,7 +172,7 @@ public:
     // 任一配置非法、tag 重复或协议构造失败都直接抛出，不留下部分发布。
     HandlerRegistry(const std::vector<PreparedOutboundConfig>& configurations,
                     net::io_context& io_context, app::dns::DNS& dns,
-                    std::chrono::seconds dial_timeout, AwaitableTaskGroup& tasks);
+                    std::chrono::seconds dial_timeout, common::AwaitableTaskGroup& tasks);
     ~HandlerRegistry();
     HandlerRegistry(const HandlerRegistry&) = delete;
     HandlerRegistry& operator=(const HandlerRegistry&) = delete;
@@ -186,9 +190,9 @@ private:
     net::io_context& io_context_;
     app::dns::DNS& dns_;
     const std::chrono::seconds dial_timeout_;
-    AwaitableTaskGroup& tasks_;
+    common::AwaitableTaskGroup& tasks_;
     memory::UnorderedMap<memory::String, std::shared_ptr<Handler>,
-                         TransparentStringHash, TransparentStringEq> handlers_;
+                         common::TransparentStringHash, common::TransparentStringEq> handlers_;
 };
 
 }  // namespace proxyman::outbound

@@ -130,27 +130,27 @@ private:
     size_t cutpoint_index_ = 0;
 };
 
-std::optional<vless::VlessEncryptionHeaderXor> MakeHeaderXor(
+std::optional<proxy::vless::VlessEncryptionHeaderXor> MakeHeaderXor(
     bool enabled,
     std::span<const uint8_t> key,
-    const std::array<uint8_t, vless::kVlessEncryptionCtrIvSize>& context) {
+    const std::array<uint8_t, proxy::vless::kVlessEncryptionCtrIvSize>& context) {
     if (!enabled) {
         return std::nullopt;
     }
-    auto result = vless::VlessEncryptionHeaderXor::Create(key, context);
+    auto result = proxy::vless::VlessEncryptionHeaderXor::Create(key, context);
     if (!result) throw std::runtime_error("header XOR fixture unavailable");
     return result;
 }
 
-void ResumeInterruptedRecords(vless::VlessEncryptionAeadCipher cipher,
+void ResumeInterruptedRecords(proxy::vless::VlessEncryptionAeadCipher cipher,
                    bool header_xor,
                    bool empty_on_cancel,
                    bool lazy_context) {
     net::io_context io;
     net::cancellation_signal signal;
     const auto exercise = [&]() -> net::awaitable<void> {
-        std::array<uint8_t, vless::kVlessEncryptionCtrIvSize> context{};
-        vless::VlessEncryptionUnitedKey key;
+        std::array<uint8_t, proxy::vless::kVlessEncryptionCtrIvSize> context{};
+        proxy::vless::VlessEncryptionUnitedKey key;
         for (size_t i = 0; i < context.size(); ++i) {
             context[i] = static_cast<uint8_t>(0x31 + i * 7);
         }
@@ -158,7 +158,7 @@ void ResumeInterruptedRecords(vless::VlessEncryptionAeadCipher cipher,
             key.bytes[i] = static_cast<uint8_t>(0xa7 ^ (i * 13));
         }
         const auto create_aead = [&] {
-            auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+            auto aead = proxy::vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
             if (!aead) throw std::runtime_error("AEAD fixture unavailable");
             return std::move(*aead);
         };
@@ -169,7 +169,7 @@ void ResumeInterruptedRecords(vless::VlessEncryptionAeadCipher cipher,
         if (lazy_context) {
             capture.bytes.insert(capture.bytes.end(), context.begin(), context.end());
         }
-        std::optional<vless::VlessEncryptionWriter> writer;
+        std::optional<proxy::vless::VlessEncryptionWriter> writer;
         writer.emplace(capture, create_aead(), key,
                        MakeHeaderXor(header_xor, key.bytes, context));
         std::array<size_t, 5> boundaries{};
@@ -183,8 +183,8 @@ void ResumeInterruptedRecords(vless::VlessEncryptionAeadCipher cipher,
             const net::const_buffer buffer(data.data(), data.size());
             co_await writer->WriteBuffers(
                 std::span<const net::const_buffer>(&buffer, 1));
-            EXPECT_EQ(capture.bytes.size() - boundaries[record], vless::kVlessEncryptionRecordHeaderSize + data.size() +
-                vless::kVlessEncryptionTagSize) << "writer did not produce one encrypted record per plaintext";
+            EXPECT_EQ(capture.bytes.size() - boundaries[record], proxy::vless::kVlessEncryptionRecordHeaderSize + data.size() +
+                proxy::vless::kVlessEncryptionTagSize) << "writer did not produce one encrypted record per plaintext";
         }
         boundaries.back() = capture.bytes.size();
 
@@ -193,7 +193,7 @@ void ResumeInterruptedRecords(vless::VlessEncryptionAeadCipher cipher,
             cutpoints = {0, 1, context.size() - 1};
         }
         const size_t second = boundaries[1];
-        const size_t body = second + vless::kVlessEncryptionRecordHeaderSize;
+        const size_t body = second + proxy::vless::kVlessEncryptionRecordHeaderSize;
         // Record zero succeeds first. Repeated cancellation then covers an
         // untouched header, partial header, complete header, partial body and
         // partial authentication tag, all on the same reader and record.
@@ -203,11 +203,11 @@ void ResumeInterruptedRecords(vless::VlessEncryptionAeadCipher cipher,
             boundaries[2] - 1,
         });
         InterruptedReader source(capture.bytes, cutpoints, signal, empty_on_cancel);
-        vless::VlessEncryptionTicketRejection rejection;
-        std::optional<vless::VlessEncryptionReader> reader;
+        proxy::vless::VlessEncryptionTicketRejection rejection;
+        std::optional<proxy::vless::VlessEncryptionReader> reader;
         if (lazy_context) {
             reader.emplace(source,
-                           vless::VlessEncryptionDeferredRead{
+                           proxy::vless::VlessEncryptionDeferredRead{
                                .cipher = cipher,
                                .header_xor = header_xor,
                                .ticket_rejection = &rejection,
@@ -257,19 +257,19 @@ void ResumeInterruptedRecords(vless::VlessEncryptionAeadCipher cipher,
     future.get();
 }
 
-void AuthenticateDeferredResponse(vless::VlessEncryptionAeadCipher cipher,
+void AuthenticateDeferredResponse(proxy::vless::VlessEncryptionAeadCipher cipher,
                               bool header_xor,
                               unsigned boundary) {
     net::io_context io;
     net::cancellation_signal signal;
     const auto exercise = [&]() -> net::awaitable<void> {
-        std::array<uint8_t, vless::kVlessEncryptionCtrIvSize> context{};
-        vless::VlessEncryptionUnitedKey key;
-        auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+        std::array<uint8_t, proxy::vless::kVlessEncryptionCtrIvSize> context{};
+        proxy::vless::VlessEncryptionUnitedKey key;
+        auto aead = proxy::vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
         if (!aead) throw std::runtime_error("AEAD fixture unavailable");
         CaptureWriter capture;
         capture.bytes.insert(capture.bytes.end(), context.begin(), context.end());
-        vless::VlessEncryptionWriter writer(
+        proxy::vless::VlessEncryptionWriter writer(
             capture, std::move(*aead), key,
             MakeHeaderXor(header_xor, key.bytes, context));
         constexpr std::string_view payload = "authenticated-ticket-response";
@@ -285,10 +285,10 @@ void AuthenticateDeferredResponse(vless::VlessEncryptionAeadCipher cipher,
             case 6: break;
         }
         InterruptedReader source(capture.bytes, {}, signal, false);
-        vless::VlessEncryptionTicketRejection rejection;
-        vless::VlessEncryptionReader reader(
+        proxy::vless::VlessEncryptionTicketRejection rejection;
+        proxy::vless::VlessEncryptionReader reader(
             source,
-            vless::VlessEncryptionDeferredRead{
+            proxy::vless::VlessEncryptionDeferredRead{
                 .cipher = cipher,
                 .header_xor = header_xor,
                 .ticket_rejection = &rejection,
@@ -343,7 +343,7 @@ public:
         }
         // Publish an incomplete record before reporting an unknown write result.
         const net::const_buffer prefix(
-            buffers.front().data(), vless::kVlessEncryptionRecordHeaderSize + 3);
+            buffers.front().data(), proxy::vless::kVlessEncryptionRecordHeaderSize + 3);
         co_await capture.WriteBuffers(
             std::span<const net::const_buffer>(&prefix, 1));
         if (fault_ == WriteFault::PartialFailure) {
@@ -371,17 +371,17 @@ private:
     bool armed_ = true;
 };
 
-void RejectWritesAfterFailure(vless::VlessEncryptionAeadCipher cipher,
+void RejectWritesAfterFailure(proxy::vless::VlessEncryptionAeadCipher cipher,
                           bool header_xor, WriteFault fault) {
     net::io_context io;
     net::cancellation_signal signal;
     const auto exercise = [&]() -> net::awaitable<void> {
-        const std::array<uint8_t, vless::kVlessEncryptionCtrIvSize> context{};
-        const vless::VlessEncryptionUnitedKey key;
-        auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+        const std::array<uint8_t, proxy::vless::kVlessEncryptionCtrIvSize> context{};
+        const proxy::vless::VlessEncryptionUnitedKey key;
+        auto aead = proxy::vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
         if (!aead) throw std::runtime_error("AEAD fixture unavailable");
         InterruptedWriter destination(fault, signal);
-        vless::VlessEncryptionWriter writer(
+        proxy::vless::VlessEncryptionWriter writer(
             destination, std::move(*aead), key,
             MakeHeaderXor(header_xor, key.bytes, context));
         constexpr std::string_view payload = "encrypted-write-lifecycle";
@@ -419,16 +419,16 @@ void RejectWritesAfterFailure(vless::VlessEncryptionAeadCipher cipher,
     future.get();
 }
 
-void RejectWritesAfterShutdown(vless::VlessEncryptionAeadCipher cipher,
+void RejectWritesAfterShutdown(proxy::vless::VlessEncryptionAeadCipher cipher,
                            bool header_xor) {
     net::io_context io;
     const auto exercise = [&]() -> net::awaitable<void> {
-        const std::array<uint8_t, vless::kVlessEncryptionCtrIvSize> context{};
-        const vless::VlessEncryptionUnitedKey key;
-        auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+        const std::array<uint8_t, proxy::vless::kVlessEncryptionCtrIvSize> context{};
+        const proxy::vless::VlessEncryptionUnitedKey key;
+        auto aead = proxy::vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
         if (!aead) throw std::runtime_error("AEAD fixture unavailable");
         CaptureWriter destination;
-        vless::VlessEncryptionWriter writer(
+        proxy::vless::VlessEncryptionWriter writer(
             destination, std::move(*aead), key,
             MakeHeaderXor(header_xor, key.bytes, context));
         constexpr std::string_view payload = "before-write-shutdown";
@@ -453,18 +453,18 @@ void RejectWritesAfterShutdown(vless::VlessEncryptionAeadCipher cipher,
     future.get();
 }
 
-void ResumePrecancelledWriter(vless::VlessEncryptionAeadCipher cipher,
+void ResumePrecancelledWriter(proxy::vless::VlessEncryptionAeadCipher cipher,
                             bool header_xor) {
     net::io_context io;
     net::cancellation_signal signal;
     const auto exercise = [&]() -> net::awaitable<void> {
-        const std::array<uint8_t, vless::kVlessEncryptionCtrIvSize> context{};
-        const vless::VlessEncryptionUnitedKey key;
-        auto aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
-        auto read_aead = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+        const std::array<uint8_t, proxy::vless::kVlessEncryptionCtrIvSize> context{};
+        const proxy::vless::VlessEncryptionUnitedKey key;
+        auto aead = proxy::vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+        auto read_aead = proxy::vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
         if (!aead || !read_aead) throw std::runtime_error("AEAD fixture unavailable");
         CaptureWriter destination;
-        vless::VlessEncryptionWriter writer(
+        proxy::vless::VlessEncryptionWriter writer(
             destination, std::move(*aead), key,
             MakeHeaderXor(header_xor, key.bytes, context));
         constexpr std::string_view payload = "recoverable-before-record-start";
@@ -484,7 +484,7 @@ void ResumePrecancelledWriter(vless::VlessEncryptionAeadCipher cipher,
         co_await writer.WriteBuffers(
             std::span<const net::const_buffer>(&buffer, 1));
         InterruptedReader source(destination.bytes, {}, signal, false);
-        vless::VlessEncryptionReader reader(
+        proxy::vless::VlessEncryptionReader reader(
             source, std::move(*read_aead), key,
             MakeHeaderXor(header_xor, key.bytes, context));
         const auto decoded = Flatten(co_await reader.ReadMultiBuffer());
@@ -501,7 +501,7 @@ void ResumePrecancelledWriter(vless::VlessEncryptionAeadCipher cipher,
 }  // namespace
 
 namespace {
-using Cipher = vless::VlessEncryptionAeadCipher;
+using Cipher = proxy::vless::VlessEncryptionAeadCipher;
 const auto ciphers = testing::Values(Cipher::Aes256Gcm, Cipher::Chacha20Poly1305);
 
 class InterruptedEncryptedRead
@@ -545,38 +545,38 @@ INSTANTIATE_TEST_SUITE_P(Modes, EncryptedWriter, testing::Combine(ciphers, testi
 }  // namespace
 
 TEST(VlessEncryptionCrypto, MlKemSeedPreservesBothHalves) {
-    vless::VlessSecretBytes<vless::kVlessMlKem768SeedSize> seed;
+    proxy::vless::VlessSecretBytes<proxy::vless::kVlessMlKem768SeedSize> seed;
     for (size_t i = 0; i < seed.bytes.size(); ++i) {
         seed.bytes[i] = static_cast<uint8_t>(i);
     }
-    auto key = vless::CreateVlessMlKem768PrivateKeyFromSeed(seed.bytes);
+    auto key = proxy::vless::CreateVlessMlKem768PrivateKeyFromSeed(seed.bytes);
     ASSERT_TRUE(key);
     EXPECT_EQ(EVP_PKEY_id(key.get()), EVP_PKEY_ML_KEM_768);
-    vless::VlessSecretBytes<vless::kVlessMlKem768SeedSize> exported;
+    proxy::vless::VlessSecretBytes<proxy::vless::kVlessMlKem768SeedSize> exported;
     size_t exported_size = exported.bytes.size();
     ASSERT_EQ(EVP_PKEY_get_private_seed(
                   key.get(), exported.bytes.data(), &exported_size), 1);
     EXPECT_EQ(exported_size, 64u);
     EXPECT_EQ(exported.bytes, seed.bytes);
 
-    const auto public_key = vless::DeriveVlessMlKem768PublicKey(key.get());
+    const auto public_key = proxy::vless::DeriveVlessMlKem768PublicKey(key.get());
     ASSERT_TRUE(public_key);
     auto changed_seed = seed;
     changed_seed.bytes.back() ^= 1;  // z only affects implicit rejection.
-    auto changed_z = vless::CreateVlessMlKem768PrivateKeyFromSeed(changed_seed.bytes);
+    auto changed_z = proxy::vless::CreateVlessMlKem768PrivateKeyFromSeed(changed_seed.bytes);
     ASSERT_TRUE(changed_z);
-    EXPECT_EQ(vless::DeriveVlessMlKem768PublicKey(changed_z.get()), public_key);
+    EXPECT_EQ(proxy::vless::DeriveVlessMlKem768PublicKey(changed_z.get()), public_key);
     changed_seed = seed;
     changed_seed.bytes.front() ^= 1;  // d determines the public key.
-    auto changed_d = vless::CreateVlessMlKem768PrivateKeyFromSeed(changed_seed.bytes);
+    auto changed_d = proxy::vless::CreateVlessMlKem768PrivateKeyFromSeed(changed_seed.bytes);
     ASSERT_TRUE(changed_d);
-    EXPECT_NE(vless::DeriveVlessMlKem768PublicKey(changed_d.get()), public_key);
+    EXPECT_NE(proxy::vless::DeriveVlessMlKem768PublicKey(changed_d.get()), public_key);
 
-    std::array<uint8_t, vless::kVlessMlKem768CiphertextSize> invalid{};
-    vless::VlessSecretBytes<vless::kVlessMlKem768SharedSecretSize> rejected, repeated, other_z;
-    ASSERT_TRUE(vless::DecapsulateVlessMlKem768(key.get(), invalid, rejected.bytes));
-    ASSERT_TRUE(vless::DecapsulateVlessMlKem768(key.get(), invalid, repeated.bytes));
-    ASSERT_TRUE(vless::DecapsulateVlessMlKem768(changed_z.get(), invalid, other_z.bytes));
+    std::array<uint8_t, proxy::vless::kVlessMlKem768CiphertextSize> invalid{};
+    proxy::vless::VlessSecretBytes<proxy::vless::kVlessMlKem768SharedSecretSize> rejected, repeated, other_z;
+    ASSERT_TRUE(proxy::vless::DecapsulateVlessMlKem768(key.get(), invalid, rejected.bytes));
+    ASSERT_TRUE(proxy::vless::DecapsulateVlessMlKem768(key.get(), invalid, repeated.bytes));
+    ASSERT_TRUE(proxy::vless::DecapsulateVlessMlKem768(changed_z.get(), invalid, other_z.bytes));
     EXPECT_EQ(rejected.bytes, repeated.bytes);
     EXPECT_NE(rejected.bytes, other_z.bytes);
 }
@@ -584,32 +584,32 @@ TEST(VlessEncryptionCrypto, MlKemSeedPreservesBothHalves) {
 namespace {
 class MlKemPublicKeyEncoding : public testing::TestWithParam<bool> {};
 TEST_P(MlKemPublicKeyEncoding, EncapsulationInteroperatesAndRejectsInvalidDecapsulationInputs) {
-    auto key = vless::GenerateVlessMlKem768PrivateKey();
+    auto key = proxy::vless::GenerateVlessMlKem768PrivateKey();
     ASSERT_TRUE(key);
-    const auto public_key = vless::DeriveVlessMlKem768PublicKey(key.get());
+    const auto public_key = proxy::vless::DeriveVlessMlKem768PublicKey(key.get());
     ASSERT_TRUE(public_key);
     EXPECT_EQ(public_key->size(), 1184u);
-    auto peer = vless::CreateVlessMlKem768PublicKey(*public_key);
+    auto peer = proxy::vless::CreateVlessMlKem768PublicKey(*public_key);
     ASSERT_TRUE(peer);
-    EXPECT_EQ(vless::DeriveVlessMlKem768PublicKey(peer.get()), public_key);
+    EXPECT_EQ(proxy::vless::DeriveVlessMlKem768PublicKey(peer.get()), public_key);
 
     {
         const bool encoded = GetParam();
         const auto encapsulated = encoded
-            ? vless::EncapsulateVlessMlKem768(*public_key)
-            : vless::EncapsulateVlessMlKem768(peer.get());
+            ? proxy::vless::EncapsulateVlessMlKem768(*public_key)
+            : proxy::vless::EncapsulateVlessMlKem768(peer.get());
         ASSERT_TRUE(encapsulated);
         EXPECT_EQ(encapsulated->ciphertext.size(), 1088u);
         EXPECT_EQ(encapsulated->shared_secret.bytes.size(), 32u);
-        vless::VlessSecretBytes<vless::kVlessMlKem768SharedSecretSize> shared;
-        ASSERT_TRUE(vless::DecapsulateVlessMlKem768(
+        proxy::vless::VlessSecretBytes<proxy::vless::kVlessMlKem768SharedSecretSize> shared;
+        ASSERT_TRUE(proxy::vless::DecapsulateVlessMlKem768(
             key.get(), encapsulated->ciphertext, shared.bytes));
         EXPECT_EQ(shared.bytes, encapsulated->shared_secret.bytes);
-        EXPECT_FALSE(vless::DecapsulateVlessMlKem768(
+        EXPECT_FALSE(proxy::vless::DecapsulateVlessMlKem768(
             peer.get(), encapsulated->ciphertext, shared.bytes));
-        EXPECT_FALSE(vless::DecapsulateVlessMlKem768(
+        EXPECT_FALSE(proxy::vless::DecapsulateVlessMlKem768(
             key.get(), std::span(encapsulated->ciphertext).first(1087), shared.bytes));
-        EXPECT_FALSE(vless::DecapsulateVlessMlKem768(
+        EXPECT_FALSE(proxy::vless::DecapsulateVlessMlKem768(
             nullptr, encapsulated->ciphertext, shared.bytes));
     }
 }
@@ -617,37 +617,37 @@ INSTANTIATE_TEST_SUITE_P(Forms, MlKemPublicKeyEncoding, testing::Bool());
 }
 
 TEST(VlessEncryptionCrypto, MlKemRejectsInvalidKeyMaterial) {
-    std::array<uint8_t, vless::kVlessMlKem768SeedSize + 1> seed{};
-    EXPECT_FALSE(vless::CreateVlessMlKem768PrivateKeyFromSeed(seed));
-    EXPECT_FALSE(vless::CreateVlessMlKem768PrivateKeyFromSeed(
+    std::array<uint8_t, proxy::vless::kVlessMlKem768SeedSize + 1> seed{};
+    EXPECT_FALSE(proxy::vless::CreateVlessMlKem768PrivateKeyFromSeed(seed));
+    EXPECT_FALSE(proxy::vless::CreateVlessMlKem768PrivateKeyFromSeed(
         std::span(seed).first(63)));
-    std::array<uint8_t, vless::kVlessMlKem768PublicKeySize> invalid{};
+    std::array<uint8_t, proxy::vless::kVlessMlKem768PublicKeySize> invalid{};
     invalid.fill(0xff);  // Encoded coefficients must be reduced modulo q.
-    EXPECT_FALSE(vless::CreateVlessMlKem768PublicKey(invalid));
-    EXPECT_FALSE(vless::EncapsulateVlessMlKem768(invalid));
-    EXPECT_FALSE(vless::CreateVlessMlKem768PublicKey(std::span(invalid).first(1183)));
-    EXPECT_FALSE(vless::EncapsulateVlessMlKem768(std::span(invalid).first(1183)));
-    EXPECT_FALSE(vless::EncapsulateVlessMlKem768(nullptr));
-    EXPECT_FALSE(vless::DeriveVlessMlKem768PublicKey(nullptr));
+    EXPECT_FALSE(proxy::vless::CreateVlessMlKem768PublicKey(invalid));
+    EXPECT_FALSE(proxy::vless::EncapsulateVlessMlKem768(invalid));
+    EXPECT_FALSE(proxy::vless::CreateVlessMlKem768PublicKey(std::span(invalid).first(1183)));
+    EXPECT_FALSE(proxy::vless::EncapsulateVlessMlKem768(std::span(invalid).first(1183)));
+    EXPECT_FALSE(proxy::vless::EncapsulateVlessMlKem768(nullptr));
+    EXPECT_FALSE(proxy::vless::DeriveVlessMlKem768PublicKey(nullptr));
 }
 
 namespace {
 class MlKemHandshakeCipher : public testing::TestWithParam<Cipher> {};
 TEST_P(MlKemHandshakeCipher, PreservesPfsAndTicketsAndRejectsTamperedTicket) {
-    vless::VlessSecretBytes<vless::kVlessMlKem768SeedSize> seed;
-    auto key = vless::CreateVlessMlKem768PrivateKeyFromSeed(seed.bytes);
+    proxy::vless::VlessSecretBytes<proxy::vless::kVlessMlKem768SeedSize> seed;
+    auto key = proxy::vless::CreateVlessMlKem768PrivateKeyFromSeed(seed.bytes);
     ASSERT_TRUE(key);
-    const auto public_key = vless::DeriveVlessMlKem768PublicKey(key.get());
+    const auto public_key = proxy::vless::DeriveVlessMlKem768PublicKey(key.get());
     ASSERT_TRUE(public_key);
-    auto peer = vless::CreateVlessMlKem768PublicKey(*public_key);
+    auto peer = proxy::vless::CreateVlessMlKem768PublicKey(*public_key);
     ASSERT_TRUE(peer);
-    vless::VlessEncryptionConfig client;
+    proxy::vless::VlessEncryptionConfig client;
     client.client_keys.push_back({
         .public_key = {public_key->begin(), public_key->end()},
         .mlkem_key = std::move(peer),
     });
-    vless::VlessEncryptionConfig server;
-    server.role = vless::VlessEncryptionRole::Server;
+    proxy::vless::VlessEncryptionConfig server;
+    server.role = proxy::vless::VlessEncryptionRole::Server;
     server.seconds_from = server.seconds_to = 120;
     server.server_keys.emplace_back(
         std::vector<uint8_t>(seed.bytes.begin(), seed.bytes.end()),
@@ -655,25 +655,25 @@ TEST_P(MlKemHandshakeCipher, PreservesPfsAndTicketsAndRejectsTamperedTicket) {
 
     {
         const auto cipher = GetParam();
-        auto nfs = vless::BuildVlessEncryptionClientNfsHello(client);
+        auto nfs = proxy::vless::BuildVlessEncryptionClientNfsHello(client);
         ASSERT_TRUE(nfs);
-        auto opened_nfs = vless::OpenVlessEncryptionClientNfsHello(server, nfs->bytes);
+        auto opened_nfs = proxy::vless::OpenVlessEncryptionClientNfsHello(server, nfs->bytes);
         ASSERT_TRUE(opened_nfs);
         ASSERT_EQ(opened_nfs->nfs_key.bytes, nfs->nfs_key.bytes);
-        auto nfs_aead = vless::VlessEncryptionAead::Create(
+        auto nfs_aead = proxy::vless::VlessEncryptionAead::Create(
             nfs->iv, nfs->nfs_key.bytes, cipher);
         ASSERT_TRUE(nfs_aead);
-        auto hello = vless::BuildVlessEncryptionClientPfsHello(*nfs_aead);
+        auto hello = proxy::vless::BuildVlessEncryptionClientPfsHello(*nfs_aead);
         ASSERT_TRUE(hello);
         EXPECT_EQ(hello->public_key.size(), 1216u);
-        auto response = vless::BuildVlessEncryptionServerPfsResponse(
+        auto response = proxy::vless::BuildVlessEncryptionServerPfsResponse(
             server, nfs->iv, opened_nfs->nfs_key, hello->public_key, cipher);
         ASSERT_TRUE(response);
         ASSERT_EQ(response->encrypted_public_key.size(), 1136u);
         const auto encrypted_public =
-            std::span<const uint8_t, vless::kVlessEncryptionEncryptedServerPfsPublicSize>(
+            std::span<const uint8_t, proxy::vless::kVlessEncryptionEncryptedServerPfsPublicSize>(
                 response->encrypted_public_key.data(), response->encrypted_public_key.size());
-        auto opened = vless::OpenVlessEncryptionServerPfsResponse(
+        auto opened = proxy::vless::OpenVlessEncryptionServerPfsResponse(
             *hello, nfs->iv, nfs->nfs_key, encrypted_public,
             response->encrypted_ticket, cipher);
         ASSERT_TRUE(opened);
@@ -681,14 +681,14 @@ TEST_P(MlKemHandshakeCipher, PreservesPfsAndTicketsAndRejectsTamperedTicket) {
         EXPECT_EQ(opened->united_key.bytes, response->united_key.bytes);
         EXPECT_EQ(opened->ticket, response->ticket);
         EXPECT_EQ(opened->ticket_seconds, 120);
-        auto zero_rtt = vless::BuildVlessEncryptionClientZeroRttRequest(
+        auto zero_rtt = proxy::vless::BuildVlessEncryptionClientZeroRttRequest(
             nfs->iv, nfs->nfs_key, opened->pfs_key, opened->ticket, cipher);
         ASSERT_TRUE(zero_rtt);
         EXPECT_EQ(zero_rtt->bytes.size(), 50u);
         EXPECT_EQ(zero_rtt->united_key.bytes, opened->united_key.bytes);
 
         response->encrypted_ticket.back() ^= 1;
-        EXPECT_FALSE(vless::OpenVlessEncryptionServerPfsResponse(
+        EXPECT_FALSE(proxy::vless::OpenVlessEncryptionServerPfsResponse(
             *hello, nfs->iv, nfs->nfs_key, encrypted_public,
             response->encrypted_ticket, cipher));
     }
@@ -700,24 +700,24 @@ namespace {
 class TransferredAead : public testing::TestWithParam<std::tuple<Cipher, bool>> {};
 TEST_P(TransferredAead, ContinuesRecordSequenceWithoutLeavingTwoUsableOwners) {
     const auto [cipher, assignment] = GetParam();
-    const std::array<uint8_t, vless::kVlessEncryptionIvSize> context{};
-    const vless::VlessEncryptionUnitedKey key;
+    const std::array<uint8_t, proxy::vless::kVlessEncryptionIvSize> context{};
+    const proxy::vless::VlessEncryptionUnitedKey key;
     const std::array<uint8_t, 4> plaintext{1, 2, 3, 4};
-    std::array<uint8_t, plaintext.size() + vless::kVlessEncryptionTagSize> ciphertext{};
+    std::array<uint8_t, plaintext.size() + proxy::vless::kVlessEncryptionTagSize> ciphertext{};
     std::array<uint8_t, plaintext.size()> opened{};
-    auto source = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
-    auto reader = vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+    auto source = proxy::vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
+    auto reader = proxy::vless::VlessEncryptionAead::Create(context, key.bytes, cipher);
     ASSERT_TRUE(source);
     ASSERT_TRUE(reader);
     ASSERT_EQ(source->Seal(plaintext, {}, ciphertext), ciphertext.size());
     ASSERT_EQ(reader->Open(ciphertext, {}, opened), plaintext.size());
     EXPECT_EQ(opened, plaintext);
 
-    std::optional<vless::VlessEncryptionAead> destination;
+    std::optional<proxy::vless::VlessEncryptionAead> destination;
     if (assignment) {
-        vless::VlessEncryptionUnitedKey replaced_key;
+        proxy::vless::VlessEncryptionUnitedKey replaced_key;
         replaced_key.bytes.fill(0xff);
-        destination = vless::VlessEncryptionAead::Create(context, replaced_key.bytes, cipher);
+        destination = proxy::vless::VlessEncryptionAead::Create(context, replaced_key.bytes, cipher);
         ASSERT_TRUE(destination);
         *destination = std::move(*source);
     } else {

@@ -28,7 +28,11 @@ class DNS;
 }  // namespace dns
 }  // namespace app
 
+namespace common {
+
 class AwaitableTaskGroup;
+
+}  // namespace common
 
 namespace app::dispatcher {
 
@@ -93,32 +97,32 @@ public:
     net::awaitable<RelayResult> Dispatch(
         net::io_context& io_context,
         const routing::DispatchPolicy& policy,
-        std::unique_ptr<AsyncStream> inbound,
+        std::unique_ptr<transport::AsyncStream> inbound,
         transport::Link inbound_link,
-        InitialPayload first_packet,
+        common::InitialPayload first_packet,
         session::Context& ctx,
         StatsShard& stats,
-        const TimeoutsConfig& timeouts) override;
+        const infra::TimeoutsConfig& timeouts) override;
 
 private:
     struct RouteResult {
         std::shared_ptr<proxyman::outbound::Handler> handler;
-        ErrorCode error;
+        common::ErrorCode error;
     };
 
     net::awaitable<void> DispatchPreparedLink(
         net::io_context& io_context,
         const routing::DispatchPolicy& policy,
-        std::unique_ptr<AsyncStream> inbound,
+        std::unique_ptr<transport::AsyncStream> inbound,
         transport::Link inbound_link,
-        InitialPayload& first_packet,
+        common::InitialPayload& first_packet,
         session::Context& ctx,
         StatsShard& stats,
-        const TimeoutsConfig& timeouts,
+        const infra::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout,
         RelayResult& result,
-        AwaitableTaskGroup& request_group,
-        ErrorCode& cancellation_reason);
+        common::AwaitableTaskGroup& request_group,
+        common::ErrorCode& cancellation_reason);
     [[nodiscard]] detail::OutboundSelection SelectRoute(
         session::Context& ctx,
         const routing::DispatchPolicy& policy) const;

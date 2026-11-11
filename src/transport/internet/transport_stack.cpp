@@ -23,6 +23,8 @@
 #include <string_view>
 
 
+namespace transport::internet {
+
 net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
     AsyncStream& raw,
     std::chrono::seconds timeout) {
@@ -60,7 +62,7 @@ std::unique_ptr<TcpStream> TakeOwnedTcpStream(std::unique_ptr<AsyncStream>& stre
 constexpr std::string_view kDefaultHttpAuthority = "www.example.com";
 
 [[nodiscard]] bool OffersHttp2(const StreamSettings& s) {
-    return !(s.tls.alpn.size() == 1 && EqualsAsciiCI(s.tls.alpn.front(), "http/1.1"));
+    return !(s.tls.alpn.size() == 1 && common::EqualsAsciiCI(s.tls.alpn.front(), "http/1.1"));
 }
 
 [[nodiscard]] bool ShouldUseHttp2ForXHttp(const StreamSettings& s) {
@@ -86,7 +88,7 @@ net::awaitable<void> RunRealityFallbackProxy(
     const RealityConfig& reality,
     memory::ByteVector initial_bytes) {
     session::Context& ctx = fallback.ctx;
-    const TimeoutsConfig& timeouts = fallback.timeouts;
+    const infra::TimeoutsConfig& timeouts = fallback.timeouts;
 
     // A plain TCP dest; no send-through binding, as in Xray's dest dial.
     static const StreamSettings kRawTcp{};
@@ -109,7 +111,7 @@ net::awaitable<void> RunRealityFallbackProxy(
     } else {
         LOG_CONN_DEBUG(ctx, "REALITY fallback target {}:{} failed > {}",
                        reality.dest_host, reality.dest_port,
-                       ErrorCodeToString(dest_target.error()));
+                       common::ErrorCodeToString(dest_target.error()));
     }
 
     if (!dest_stream || !client_tcp->IsOpen()) {
@@ -149,7 +151,7 @@ net::awaitable<void> RunRealityFallbackProxy(
     }
 
     AsyncStream& client = *client_tcp;
-    (void)co_await DoRelayLink(
+    (void)co_await app::DoRelayLink(
         io_context,
         static_cast<transport::MultiBufferReader&>(client),
         static_cast<transport::MultiBufferWriter&>(client),
@@ -157,7 +159,7 @@ net::awaitable<void> RunRealityFallbackProxy(
         *dest_stream,
         ctx,
         fallback.stats,
-        RelayConfig{
+        app::RelayConfig{
             .uplink_only = timeouts.UplinkOnlyTimeout(),
             .downlink_only = timeouts.DownlinkOnlyTimeout(),
         },
@@ -176,19 +178,19 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
     if (!ctx) {
         LOG_CONN_ERROR(conn_id, "{} inbound security requires a Worker-owned server context",
                   s.IsReality() ? "REALITY" : "TLS");
-        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+        co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
     }
 
     auto tcp = TakeOwnedTcpStream(stream);
     if (!tcp) {
         LOG_CONN_ERROR(conn_id, "inbound TLS security requires a TCP base stream");
-        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+        co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
     }
     std::unique_ptr<RealityServerConnState> reality_conn_state;
     if (s.IsReality() && s.reality.HasDest()) {
         if (!fallback) {
             LOG_CONN_ERROR(conn_id, "REALITY dest fallback requires an inbound fallback context");
-            co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+            co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
         }
         memory::ByteVector initial_bytes;
         {
@@ -201,7 +203,7 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
                     if (pending.empty()) {
                         pending = co_await tcp->ReadMultiBuffer();
                         if (pending.empty()) {
-                            co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+                            co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
                         }
                     }
                     const auto front = pending.FrontSpan();
@@ -211,7 +213,7 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
                 }
                 tcp->PrependReadMultiBuffer(std::move(pending));
             } catch (...) {
-                co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
+                co_return tl::unexpected(common::ErrorCode::TLS_HANDSHAKE_FAILED);
             }
             if (reader.State() == RealityClientHelloReader::Status::Complete) {
                 reality_conn_state = VerifyRealityClientHello(
@@ -239,7 +241,7 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
     if (reality_conn_state) {
         tls = std::make_unique<TlsStream>(std::move(tcp), *ctx, true);
         if (!tls->SetRealityServerPreverified(std::move(reality_conn_state))) {
-            co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
+            co_return tl::unexpected(common::ErrorCode::TLS_HANDSHAKE_FAILED);
         }
         if (!co_await tls->Handshake()) {
             tls.reset();
@@ -250,7 +252,7 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
     if (!tls) {
         LOG_CONN_DEBUG(conn_id, "{} server handshake failed",
                       s.IsReality() ? "REALITY" : "TLS");
-        co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::TLS_HANDSHAKE_FAILED);
     }
     LOG_CONN_DEBUG(conn_id, "{} server handshake completed",
                   s.IsReality() ? "REALITY" : "TLS");
@@ -267,13 +269,13 @@ net::awaitable<TransportBuildResult> ConnectOutboundSecurity(
     if (!ctx) {
         LOG_CONN_ERROR(conn_id, "{} outbound security requires a Worker-owned client context",
                   s.IsReality() ? "REALITY" : "TLS");
-        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+        co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
     }
 
     auto tcp = TakeOwnedTcpStream(stream);
     if (!tcp) {
         LOG_CONN_ERROR(conn_id, "outbound TLS security requires a TCP base stream");
-        co_return tl::unexpected(ErrorCode::INVALID_ARGUMENT);
+        co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
     }
     auto tls = s.IsReality()
         ? co_await WrapRealityClient(std::move(tcp), *ctx, s.reality, sni)
@@ -282,7 +284,7 @@ net::awaitable<TransportBuildResult> ConnectOutboundSecurity(
         LOG_CONN_DEBUG(conn_id, "{} client handshake failed (sni={})",
                       s.IsReality() ? "REALITY" : "TLS",
                       sni);
-        co_return tl::unexpected(ErrorCode::TLS_HANDSHAKE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::TLS_HANDSHAKE_FAILED);
     }
     const std::string_view alpn = tls->NegotiatedAlpn();
     LOG_CONN_DEBUG(conn_id, "{} client handshake completed (sni={} alpn={})",
@@ -295,7 +297,7 @@ net::awaitable<TransportBuildResult> ConnectOutboundSecurity(
 // HTTP/2 prior knowledge is recognized by the full client preface; anything
 // else is served as HTTP/1 with the sniffed bytes as the start of the request.
 net::awaitable<TransportBuildResult> DoHttpServerHandshake(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
     const HttpConfig& cfg,
     net::io_context& io_context,
@@ -310,7 +312,7 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
         const size_t n = co_await stream->AsyncRead(
             net::buffer(first.data() + total, first.size() - total));
         if (n == 0) {
-            co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+            co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
         }
         total += n;
         if (!kHttp2ClientPreface.starts_with(std::string_view(
@@ -367,20 +369,20 @@ net::awaitable<TransportBuildResult> DoXHttp2PacketUpClientRequest(
         (void)co_await body->AsyncRead(net::buffer(scratch));
     } catch (...) {
         body->CloseAbortive();
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
     body->Close();
     co_return std::unique_ptr<AsyncStream>{};
 }
 
-void LogLayerFailure(uint64_t conn_id, std::string_view layer, ErrorCode error) {
-    LOG_CONN_DEBUG(conn_id, "{} failed > {}", layer, ErrorCodeToString(error));
+void LogLayerFailure(uint64_t conn_id, std::string_view layer, common::ErrorCode error) {
+    LOG_CONN_DEBUG(conn_id, "{} failed > {}", layer, common::ErrorCodeToString(error));
 }
 
 }  // namespace
 
 net::awaitable<TransportBuildResult> BuildInboundTransport(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> raw,
     const StreamSettings& s,
@@ -397,7 +399,7 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
         LOG_CONN_ERROR(conn_id, "unsupported inbound transport combination network={} security={}",
                   s.NetworkName(),
                   SecurityModeName(s.security_mode));
-        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
     // 1. TLS / REALITY 层（服务端）
@@ -502,7 +504,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
         LOG_CONN_ERROR(conn_id, "unsupported outbound transport combination network={} security={}",
                   s.NetworkName(),
                   SecurityModeName(s.security_mode));
-        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
     const std::string_view sni = tls_server_name.empty()
@@ -562,7 +564,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
         if (const XHttpMode mode = ResolveXHttpOutboundMode(s); mode != XHttpMode::StreamOne) {
             LOG_CONN_ERROR(conn_id, "XHTTP client {} requires the split dialer",
                       XHttpModeName(mode));
-            co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
         }
         const HttpConfig http = transport::internet::XHttpStreamOneHttpConfig(s.xhttp, true);
         auto xhttp_result = co_await transport::internet::DoHttp2ClientHandshake(
@@ -620,7 +622,7 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
     std::span<const net::const_buffer> packet_payload,
     uint64_t trace_conn_id) {
     if (!raw || !s.IsXHttp() || s.IsUnsupported()) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_UNSUPPORTED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
     }
 
     const std::string_view sni = tls_server_name.empty()
@@ -667,9 +669,11 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
             co_await (*http2_result)->WriteBuffers(packet_payload);
         } catch (...) {
             (*http2_result)->CloseAbortive();
-            co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+            co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
         }
     }
     co_return http2_result;
 }
+
+}  // namespace transport::internet
 

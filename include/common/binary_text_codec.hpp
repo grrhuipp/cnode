@@ -12,6 +12,8 @@
 
 // RFC 4648 §8 / RFC 5234 HEXDIG digit value, accepting both letter cases;
 // -1 for any other character.
+namespace common {
+
 [[nodiscard]] constexpr int HexDigitValue(unsigned char ch) noexcept {
     if (ch >= '0' && ch <= '9') return ch - '0';
     if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
@@ -94,4 +96,6 @@ ParseUuid(std::string_view text) noexcept {
     }
     return out;
 }
+
+}  // namespace common
 

@@ -32,7 +32,7 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
-namespace vmess::encoding {
+namespace proxy::vmess::encoding {
 
 namespace {
 
@@ -118,9 +118,9 @@ std::optional<size_t> BodyChunkCipher::DecodeLength(const uint8_t* in) {
         if (length_->Decrypt(in, LengthSize(), plain) != static_cast<ssize_t>(sizeof(plain))) {
             return std::nullopt;
         }
-        return static_cast<size_t>(LoadU16BE(&plain[0])) + length_->Overhead();
+        return static_cast<size_t>(common::LoadU16BE(&plain[0])) + length_->Overhead();
     }
-    uint16_t wire = LoadU16BE(&in[0]);
+    uint16_t wire = common::LoadU16BE(&in[0]);
     if (mask_) {
         wire ^= mask_->NextMask();
     }
@@ -153,7 +153,7 @@ void BodyEncoder::CheckWritable() const {
 void BodyEncoder::Encode(const buf::MultiBuffer& payload, buf::MultiBuffer& out) {
     CheckWritable();
     if (&payload == &out) {
-        throw transport::LinkError(ErrorCode::INVALID_ARGUMENT);
+        throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
     }
     if (PacketMode() &&
         (payload.byte_size() != 0 || buf::InspectUdpDatagram(payload).Valid())) {
@@ -180,7 +180,7 @@ void BodyEncoder::Encode(std::span<const net::const_buffer> payload, buf::MultiB
         ValidatePacketSize(size);
         for (const auto& buffer : payload) {
             if (buffer.size() != 0 && !buffer.data()) {
-                throw transport::LinkError(ErrorCode::INVALID_ARGUMENT);
+                throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
             }
         }
         const buf::ContiguousBufferView packet(payload);
@@ -228,12 +228,12 @@ size_t BodyEncoder::EncodeEndTo(std::span<uint8_t, 128> out) {
 }
 
 net::awaitable<void> BodyEncoder::WriteFirstEncodedChunks(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     buf::MultiBuffer chunks,
     std::span<const uint8_t> first_header,
     bool& header_sent) {
     header_sent = true;
-    ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+    common::ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
     framed.Append(net::buffer(first_header.data(), first_header.size()));
     framed.AppendMultiBuffer(chunks);
     co_await stream.WriteBuffers(framed.Span());
@@ -242,12 +242,12 @@ net::awaitable<void> BodyEncoder::WriteFirstEncodedChunks(
 
 template <typename Payload>
 net::awaitable<void> BodyEncoder::WriteEncoded(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     Payload payload,
     const char* cancel_what,
     std::span<const uint8_t> first_header,
     bool* header_sent,
-    [[maybe_unused]] const TargetAddress* udp_target) {
+    [[maybe_unused]] const common::TargetAddress* udp_target) {
     constexpr bool kOwnsPayload = std::is_same_v<Payload, buf::MultiBuffer>;
     CheckWritable();
     if ((co_await net::this_coro::cancellation_state).cancelled() !=
@@ -288,18 +288,18 @@ net::awaitable<void> BodyEncoder::WriteEncoded(
 }
 
 net::awaitable<void> BodyEncoder::WriteMultiBuffer(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     buf::MultiBuffer mb,
     const char* cancel_what,
     std::span<const uint8_t> first_header,
     bool* header_sent,
-    const TargetAddress* udp_target) {
+    const common::TargetAddress* udp_target) {
     return WriteEncoded(stream, std::move(mb), cancel_what, first_header, header_sent,
                         udp_target);
 }
 
 net::awaitable<void> BodyEncoder::WriteBuffers(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     std::span<const net::const_buffer> buffers,
     const char* cancel_what,
     std::span<const uint8_t> first_header,
@@ -307,7 +307,7 @@ net::awaitable<void> BodyEncoder::WriteBuffers(
     return WriteEncoded(stream, buffers, cancel_what, first_header, header_sent, nullptr);
 }
 net::awaitable<void> BodyEncoder::WriteEOF(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     const char* cancel_what,
     std::span<const uint8_t> first_header,
     bool* header_sent) {
@@ -323,7 +323,7 @@ net::awaitable<void> BodyEncoder::WriteEOF(
         const size_t eof_len = EncodeEndTo(eof_chunk);
         if (eof_len == 0) co_return;
         frame_generated = true;
-        ConstBufferSpanBuilder<2> buffers;
+        common::ConstBufferSpanBuilder<2> buffers;
         if (header_sent && !*header_sent) {
             *header_sent = true;
             buffers.Append(net::buffer(first_header.data(), first_header.size()));
@@ -345,10 +345,10 @@ net::awaitable<void> BodyEncoder::WriteEOF(
 void BodyEncoder::ValidatePacketSize(size_t size) const {
     // Standard VMess framing uses an empty body exclusively as EOF.
     if (size == 0) {
-        throw transport::LinkError(ErrorCode::NOT_SUPPORTED);
+        throw transport::LinkError(common::ErrorCode::NOT_SUPPORTED);
     }
     if (size > MAX_CHUNK_SIZE - cipher_.Overhead()) {
-        throw transport::LinkError(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 }
 
@@ -561,7 +561,7 @@ namespace {
 // Version, body IV/key, response header, options, security, reserved,
 // command, largest address, optional padding and FNV-1a checksum.
 constexpr size_t kRequestHeaderMax =
-    1 + 16 + 16 + 1 + 1 + 1 + 1 + 1 + kMaxEncodedAddressSize + 15 + 4;
+    1 + 16 + 16 + 1 + 1 + 1 + 1 + 1 + common::kMaxEncodedAddressSize + 15 + 4;
 // AuthID, sealed length, connection nonce, sealed header.
 constexpr size_t kRequestPacketMax = 16 + 18 + 8 + kRequestHeaderMax + 16;
 constexpr size_t kResponseHeaderMax = 1024;
@@ -573,19 +573,19 @@ constexpr size_t kResponseHeaderMax = 1024;
     return options;
 }
 
-tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
+tl::expected<size_t, common::ErrorCode> BuildRequestHeaderPacket(
     const MemoryAccount& user,
     const AES_KEY& auth_id_key,
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     Security security,
     Command command,
     const BodyKey& request_body,
     uint8_t response_header,
-    ForwardedMetadataView forwarded,
+    common::ForwardedMetadataView forwarded,
     std::array<uint8_t, kRequestPacketMax>& packet) {
     std::array<uint8_t, kRequestHeaderMax> header{};
-    ScopedCleanse cleanse_header{header};
-    ByteWriter writer(header.data(), header.size());
+    common::ScopedCleanse cleanse_header{header};
+    common::ByteWriter writer(header.data(), header.size());
     writer.WriteU8(VERSION);
     writer.WriteBytes(request_body.iv.data(), request_body.iv.size());
     writer.WriteBytes(request_body.key.data(), request_body.key.size());
@@ -596,24 +596,24 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
     writer.WriteU8(0);
     writer.WriteU8(static_cast<uint8_t>(command));
     if (!writer.Ok()) {
-        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     size_t header_len = writer.Position();
     if (command == Command::TCP || command == Command::UDP) {
         if (!target.IsValid() || (target.IsDomain() && target.host.size() > 253)) {
-            return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+            return tl::unexpected(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
-        const size_t address_size = EncodeAddressTo(
+        const size_t address_size = common::EncodeAddressTo(
             target, header.data() + header_len, header.size() - header_len,
-            AddressWireFormat::PortFirst, forwarded);
+            common::AddressWireFormat::PortFirst, forwarded);
         if (address_size == 0) {
-            return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+            return tl::unexpected(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
         header_len += address_size;
     } else if (command != Command::Mux) {
-        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
-    const uint32_t checksum = Fnv1a32(std::span<const uint8_t>(header.data(), header_len));
+    const uint32_t checksum = common::Fnv1a32(std::span<const uint8_t>(header.data(), header_len));
     header[header_len++] = static_cast<uint8_t>(checksum >> 24);
     header[header_len++] = static_cast<uint8_t>(checksum >> 16);
     header[header_len++] = static_cast<uint8_t>(checksum >> 8);
@@ -627,7 +627,7 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
     uint8_t* sealed_header = packet.data() + kRequestHeaderPrefixSize;
     GenerateAuthID(auth_id_key, timestamp, auth_id);
     if (RAND_bytes(connection_nonce, 8) != 1) {
-        return tl::unexpected(ErrorCode::INTERNAL);
+        return tl::unexpected(common::ErrorCode::INTERNAL);
     }
     const std::span<const uint8_t, 16> auth_id_view(auth_id, 16);
     const std::span<const uint8_t, 8> nonce_view(connection_nonce, 8);
@@ -638,12 +638,12 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
         static_cast<uint8_t>(header_len),
     };
     if (!proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {length_key.key.data(), 16}, {length_key.nonce.data(), 12}, {length_plain, sizeof(length_plain)}, {auth_id, 16}, sealed_length, {sealed_length + 2, 16})) {
-        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
     const auto payload_key = RequestHeaderPayloadKey(user.cmd_key, auth_id_view, nonce_view);
     if (!proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {payload_key.key.data(), 16}, {payload_key.nonce.data(), 12}, {header.data(), header_len}, {auth_id, 16}, sealed_header, {sealed_header + header_len, 16})) {
-        return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     return kRequestHeaderPrefixSize + header_len + GCM_TAG_SIZE;
 }
@@ -677,14 +677,14 @@ ClientSession::ClientSession(Security security, Command command)
                         keys_.request, keys_.response) {}
 
 net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     const MemoryAccount& user,
     const AES_KEY& auth_id_key,
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     Command command,
-    ForwardedMetadataView forwarded) {
+    common::ForwardedMetadataView forwarded) {
     if (request_encoder_.Failed()) {
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
     if (request_header_sent_) {
         co_return VMessHandshakeResult{};
@@ -692,14 +692,14 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(
     try {
         request_encoder_.CheckWritable();
     } catch (const transport::WriteClosed&) {
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
     if ((co_await net::this_coro::cancellation_state).cancelled() !=
         net::cancellation_type::none) {
-        co_return tl::unexpected(ErrorCode::CANCELLED);
+        co_return tl::unexpected(common::ErrorCode::CANCELLED);
     }
     std::array<uint8_t, kRequestPacketMax> packet{};
-    ScopedCleanse cleanse_packet{packet};
+    common::ScopedCleanse cleanse_packet{packet};
     auto built = BuildRequestHeaderPacket(
         user, auth_id_key, target, security_, command, keys_.request,
         keys_.response_header, forwarded, packet);
@@ -717,36 +717,36 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(
         co_await stream.WriteBuffers(buffers);
     } catch (const transport::WriteClosed&) {
         request_encoder_.Finish();
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     } catch (...) {
         fail_request();
         co_return tl::unexpected(transport::ClassifyFailure(
-            std::current_exception(), ErrorCode::SOCKET_WRITE_FAILED));
+            std::current_exception(), common::ErrorCode::SOCKET_WRITE_FAILED));
     }
     request_header_sent_ = true;
     co_return VMessHandshakeResult{};
 }
 
 net::awaitable<void> ClientSession::EncodeRequestBody(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     buf::MultiBuffer mb) {
     return request_encoder_.WriteMultiBuffer(
         stream, std::move(mb), "VMess request write cancelled before start");
 }
 
 net::awaitable<void> ClientSession::EncodeRequestBody(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     std::span<const net::const_buffer> buffers) {
     return request_encoder_.WriteBuffers(
         stream, buffers, "VMess request write cancelled before start");
 }
 
-net::awaitable<void> ClientSession::EncodeRequestBodyEOF(AsyncStream& stream) {
+net::awaitable<void> ClientSession::EncodeRequestBodyEOF(transport::AsyncStream& stream) {
     return request_encoder_.WriteEOF(
         stream, "VMess request EOF cancelled before start");
 }
 
-net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
+net::awaitable<void> ClientSession::DecodeResponseHeader(transport::AsyncStream& stream) {
     auto reset_header_state = [this]() noexcept {
         memory::ByteVector{}.swap(response_header_sealed_);
         response_length_read_ = 0;
@@ -771,7 +771,7 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
                 length_size != length.size()) {
                 ThrowResponseHeaderError();
             }
-            const size_t header_len = LoadU16BE(&length[0]);
+            const size_t header_len = common::LoadU16BE(&length[0]);
             if (header_len < 4 || header_len > kResponseHeaderMax) {
                 ThrowResponseHeaderError();
             }
@@ -805,14 +805,14 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
     }
 }
 
-net::awaitable<buf::MultiBuffer> ClientSession::DecodeResponse(AsyncStream& stream) {
+net::awaitable<buf::MultiBuffer> ClientSession::DecodeResponse(transport::AsyncStream& stream) {
     if (response_header_received_) {
         return response_decoder_.Read(stream);
     }
     return DecodeFirstResponse(stream);
 }
 
-net::awaitable<buf::MultiBuffer> ClientSession::DecodeFirstResponse(AsyncStream& stream) {
+net::awaitable<buf::MultiBuffer> ClientSession::DecodeFirstResponse(transport::AsyncStream& stream) {
     if (!response_header_received_) {
         co_await DecodeResponseHeader(stream);
     }
@@ -850,7 +850,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
         return false;
     }
 
-    ByteReader reader(data, len);
+    common::ByteReader reader(data, len);
 
     const uint8_t version = reader.ReadU8();
     if (!reader.Ok() || version != VERSION) {
@@ -884,13 +884,13 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
     if (!reader.Ok()) return false;
 
     if (request.command == Command::Mux) {
-        request.target = TargetAddress("v1.mux.cool", 0);
+        request.target = common::TargetAddress("v1.mux.cool", 0);
     } else if (request.command == Command::TCP || request.command == Command::UDP) {
-        auto address = DecodeAddress(
+        auto address = common::DecodeAddress(
             std::span(data + reader.Position(), reader.Remaining()),
-            AddressWireFormat::PortFirst,
+            common::AddressWireFormat::PortFirst,
             {.require_non_empty_domain = true, .allow_metadata = true});
-        if (address.status != AddressDecodeStatus::Complete) return false;
+        if (address.status != common::AddressDecodeStatus::Complete) return false;
         reader.Skip(address.consumed);
         request.target = std::move(address.target);
         request.forwarded = std::move(address.forwarded);
@@ -906,7 +906,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
     size_t pos = reader.Position();
     if (pos + 4 != len) return false;
 
-    uint32_t expected_fnv = Fnv1a32(std::span<const uint8_t>(data, pos));
+    uint32_t expected_fnv = common::Fnv1a32(std::span<const uint8_t>(data, pos));
     uint32_t actual_fnv = reader.ReadU32BE();
 
     if (!reader.Ok() || expected_fnv != actual_fnv) {
@@ -940,7 +940,7 @@ bool OpenRequestHeader(const uint8_t* packet,
         user->cmd_key,
         std::span<const uint8_t, 16>(packet, 16),
         std::span<const uint8_t, 8>(packet + kConnectionNonceOffset, 8));
-    ScopedCleanse cleanse_plain{plain};
+    common::ScopedCleanse cleanse_plain{plain};
     size_t written = 0;
     if (!proxy::OpenOneShotAead(EVP_aead_aes_128_gcm(), {key.key.data(), 16}, {key.nonce.data(), key.nonce.size()}, {packet + kRequestHeaderPrefixSize, header_len + 16}, {packet, 16}, {plain.data(), header_len}, written)) {
         failure_reason = "authentication failed: request header integrity check failed";
@@ -981,12 +981,12 @@ bool BuildResponseHeader(const VMessRequest& request,
 }  // namespace
 
 RequestBodyReader::RequestBodyReader(const VMessRequest& request,
-                                     AsyncStream& stream)
+                                     transport::AsyncStream& stream)
     : decoder_(RequestBodyOptions(request), RequestBodyKey(request),
                RequestBodyKey(request))
     , stream_(&stream)
     , is_udp_(request.command == Command::UDP)
-    , udp_target_(is_udp_ ? request.target : TargetAddress{}) {}
+    , udp_target_(is_udp_ ? request.target : common::TargetAddress{}) {}
 
 net::awaitable<buf::MultiBuffer> RequestBodyReader::ReadUdpMultiBuffer() {
     auto mb = co_await decoder_.Read(*stream_);
@@ -999,11 +999,11 @@ net::awaitable<buf::MultiBuffer> RequestBodyReader::ReadUdpMultiBuffer() {
 ResponseBodyWriter::ResponseBodyWriter(
     const VMessRequest& request,
     const BodyKey& response,
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     const std::array<uint8_t, kResponseHeaderSize>& response_header)
     : encoder_(RequestBodyOptions(request), RequestBodyKey(request), response)
     , stream_(&stream)
-    , udp_target_(request.command == Command::UDP ? request.target : TargetAddress{})
+    , udp_target_(request.command == Command::UDP ? request.target : common::TargetAddress{})
     , response_header_(response_header) {}
 
 ServerSession::ServerSession(std::string_view tag)
@@ -1037,7 +1037,7 @@ std::pair<std::optional<VMessRequest>, size_t> ServerSession::DecodeRequestHeade
             required_header_bytes_ = 0;
             return {std::nullopt, 0};
         }
-        pending.header_length = LoadU16BE(&plain[0]);
+        pending.header_length = common::LoadU16BE(&plain[0]);
         constexpr size_t kMinRequestHeaderLength = kRequestHeaderFixedSize + kRequestHeaderChecksumSize;
         if (pending.header_length < kMinRequestHeaderLength ||
             pending.header_length > kRequestHeaderMax) {
@@ -1071,35 +1071,35 @@ void ServerSession::SetRequest(VMessRequest request) {
     state_ = Accepted{std::move(request)};
 }
 
-tl::expected<RequestBodyReader, ErrorCode> ServerSession::DecodeRequestBody(
-    AsyncStream& stream) {
+tl::expected<RequestBodyReader, common::ErrorCode> ServerSession::DecodeRequestBody(
+    transport::AsyncStream& stream) {
     const auto* accepted = std::get_if<Accepted>(&state_);
-    if (!accepted) return tl::unexpected(ErrorCode::INTERNAL);
+    if (!accepted) return tl::unexpected(common::ErrorCode::INTERNAL);
     try {
         return RequestBodyReader(accepted->request, stream);
     } catch (const std::bad_alloc&) {
-        return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
     }
 }
 
-tl::expected<ResponseBodyWriter, ErrorCode> ServerSession::EncodeResponseBodyWithHeader(
-    AsyncStream& stream) {
+tl::expected<ResponseBodyWriter, common::ErrorCode> ServerSession::EncodeResponseBodyWithHeader(
+    transport::AsyncStream& stream) {
     const auto* accepted = std::get_if<Accepted>(&state_);
-    if (!accepted) return tl::unexpected(ErrorCode::INTERNAL);
+    if (!accepted) return tl::unexpected(common::ErrorCode::INTERNAL);
     try {
         const auto& request = accepted->request;
         const BodyKey response = ResponseBodyKey(RequestBodyKey(request));
         std::array<uint8_t, kResponseHeaderSize> response_header{};
         if (!BuildResponseHeader(request, response, response_header))
-            return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+            return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
         return ResponseBodyWriter(request, response, stream, response_header);
     } catch (const std::bad_alloc&) {
-        return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
     }
 }
-}  // namespace vmess::encoding
+}  // namespace proxy::vmess::encoding
 
-namespace vmess {
+namespace proxy::vmess {
 
 namespace {
 
@@ -1268,7 +1268,7 @@ FindByAuthIDForTag(
 }
 
 net::awaitable<bool> RegisterSessionIfNew(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     const proxyman::inbound::UserStore::VmessCredential& user,
     const std::array<uint8_t, 16>& body_key,
     const std::array<uint8_t, 16>& body_iv) {
@@ -1286,4 +1286,4 @@ net::awaitable<bool> RegisterSessionIfNew(
     });
 }
 
-}  // namespace vmess
+}  // namespace proxy::vmess

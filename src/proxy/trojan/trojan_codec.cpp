@@ -11,7 +11,7 @@
 #include <cstring>
 #include <new>
 
-namespace trojan {
+namespace proxy::trojan {
 
 // ============================================================================
 // TCP 请求编解码
@@ -25,7 +25,7 @@ RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
         return result;
     }
     for (size_t i = 0; i < kPasswordHashSize; ++i) {
-        if (HexDigitValue(data[i]) < 0) {
+        if (common::HexDigitValue(data[i]) < 0) {
             result.status = RequestDecodeStatus::InvalidHeader;
             return result;
         }
@@ -38,10 +38,10 @@ RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
         return result;
     }
 
-    auto address = DecodeAddress(
-        data.subspan(kRequestPrefixSize), AddressWireFormat::Socks5,
+    auto address = common::DecodeAddress(
+        data.subspan(kRequestPrefixSize), common::AddressWireFormat::Socks5,
         {.require_non_empty_domain = true, .allow_metadata = true});
-    if (address.status == AddressDecodeStatus::Invalid) {
+    if (address.status == common::AddressDecodeStatus::Invalid) {
         result.status = RequestDecodeStatus::InvalidAddress;
         return result;
     }
@@ -49,8 +49,8 @@ RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
     // every partial address stage never reads past the header and lets the
     // final stage complete without decoding the address again.
     const size_t address_end = kRequestPrefixSize + address.consumed;
-    if (address.status == AddressDecodeStatus::Incomplete || data.size() < address_end + 2) {
-        result.required = address.status == AddressDecodeStatus::Incomplete
+    if (address.status == common::AddressDecodeStatus::Incomplete || data.size() < address_end + 2) {
+        result.required = address.status == common::AddressDecodeStatus::Incomplete
             ? kRequestPrefixSize + address.required + 2
             : address_end + 2;
         return result;
@@ -75,12 +75,12 @@ RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
 size_t EncodeRequestTo(
     std::span<const char, 56> password_hash,
     TrojanCommand cmd,
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     uint8_t* output,
     size_t output_size,
-    ForwardedMetadataView forwarded) {
+    common::ForwardedMetadataView forwarded) {
 
-    const size_t addr_size = AddressEncodedSize(target, forwarded);
+    const size_t addr_size = common::AddressEncodedSize(target, forwarded);
     if (addr_size == 0) {
         return 0;
     }
@@ -105,17 +105,17 @@ size_t EncodeRequestTo(
         overlaps_output(forwarded.inbound_tag.data(), forwarded.inbound_tag.size())) {
         return 0;
     }
-    ByteWriter writer(output, header_size);
+    common::ByteWriter writer(output, header_size);
 
     writer.WriteString(std::string_view(password_hash.data(), password_hash.size()));
     writer.WriteU8(0x0D);
     writer.WriteU8(0x0A);
     writer.WriteU8(static_cast<uint8_t>(cmd));
 
-    const size_t encoded = EncodeAddressTo(target, output + writer.Position(),
-        header_size - writer.Position(), AddressWireFormat::Socks5, forwarded);
+    const size_t encoded = common::EncodeAddressTo(target, output + writer.Position(),
+        header_size - writer.Position(), common::AddressWireFormat::Socks5, forwarded);
     if (encoded == 0) return 0;
-    ByteWriter tail(output + writer.Position() + encoded,
+    common::ByteWriter tail(output + writer.Position() + encoded,
                     header_size - writer.Position() - encoded);
     tail.WriteU8(0x0D);
     tail.WriteU8(0x0A);
@@ -124,7 +124,7 @@ size_t EncodeRequestTo(
 }
 
 size_t EncodeUdpPacketHeaderTo(
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     size_t payload_len,
     uint8_t* output,
     size_t output_size) {
@@ -132,14 +132,14 @@ size_t EncodeUdpPacketHeaderTo(
         return 0;
     }
 
-    const size_t address_size = AddressEncodedSize(target);
+    const size_t address_size = common::AddressEncodedSize(target);
     if (!output || address_size == 0 || address_size + kUdpPacketTrailerSize > output_size) {
         return 0;
     }
-    const size_t encoded = EncodeAddressTo(
-        target, output, output_size, AddressWireFormat::Socks5);
+    const size_t encoded = common::EncodeAddressTo(
+        target, output, output_size, common::AddressWireFormat::Socks5);
     if (encoded == 0) return 0;
-    ByteWriter writer(output + encoded, output_size - encoded);
+    common::ByteWriter writer(output + encoded, output_size - encoded);
     writer.WriteU16BE(static_cast<uint16_t>(payload_len));
     writer.WriteU8(0x0D);
     writer.WriteU8(0x0A);
@@ -150,11 +150,11 @@ size_t EncodeUdpPacketHeaderTo(
 
 void UdpFramer::Feed(buf::MultiBuffer input) {
     if (state_ != State::Active) {
-        throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     try {
         if (!buf::AppendPacketStreamInput(pending_, std::move(input))) {
-            throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
+            throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         }
     } catch (...) {
         Fail();
@@ -165,7 +165,7 @@ void UdpFramer::Feed(buf::MultiBuffer input) {
 bool UdpFramer::Next(FramedUdpPacket& out) {
     out = {};
     if (state_ == State::Failed) {
-        throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     if (state_ == State::Finished) return false;
     if (!target_) {
@@ -179,22 +179,22 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
             (void)pending_.CopyPrefixTo(std::span<uint8_t>(scratch.data(), copied));
             header = std::span<const uint8_t>(scratch.data(), copied);
         }
-        auto address = DecodeAddress(
+        auto address = common::DecodeAddress(
             header,
-            AddressWireFormat::Socks5,
+            common::AddressWireFormat::Socks5,
             {.require_non_empty_domain = true, .allow_metadata = false});
-        if (address.status == AddressDecodeStatus::Incomplete) return false;
-        if (address.status == AddressDecodeStatus::Invalid || !address.target.IsValid()) {
+        if (address.status == common::AddressDecodeStatus::Incomplete) return false;
+        if (address.status == common::AddressDecodeStatus::Invalid || !address.target.IsValid()) {
             Fail();
-            throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
+            throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         const size_t pos = address.consumed;
         if (copied < pos + kUdpPacketTrailerSize) return false;
         if (header[pos + 2] != '\r' || header[pos + 3] != '\n') {
             Fail();
-            throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
+            throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         }
-        payload_size_ = LoadU16BE(&header[pos]);
+        payload_size_ = common::LoadU16BE(&header[pos]);
         target_.emplace(std::move(address.target));
         (void)pending_.DropPrefixBytes(pos + kUdpPacketTrailerSize);
     }
@@ -217,7 +217,7 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
 void UdpFramer::Finish() {
     if (state_ == State::Failed || target_ || pending_.byte_size() != 0) {
         Fail();
-        throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     state_ = State::Finished;
 }
@@ -230,7 +230,7 @@ void UdpFramer::Fail() noexcept {
 }
 
 net::awaitable<buf::MultiBuffer> ReadUdpDatagram(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     UdpFramer& framer) {
     if (framer.Finished()) co_return buf::MultiBuffer{};
     while (true) {
@@ -240,7 +240,7 @@ net::awaitable<buf::MultiBuffer> ReadUdpDatagram(
         }
         buf::MultiBuffer raw = co_await stream.ReadMultiBuffer();
         if (raw.byte_size() == 0) {
-            co_await ThrowIfCancelledOnEof();
+            co_await common::ThrowIfCancelledOnEof();
             framer.Finish();
             co_return buf::MultiBuffer{};
         }
@@ -250,13 +250,13 @@ net::awaitable<buf::MultiBuffer> ReadUdpDatagram(
 
 // 报头编码只会因目标地址失败：长度已由 RequireUdp* 限制在 uint16 内。
 static size_t EncodeRequiredUdpPacketHeader(
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     size_t payload_size,
     std::array<uint8_t, kMaxUdpPacketHeaderSize>& header) {
     const size_t header_size = EncodeUdpPacketHeaderTo(
         target, payload_size, header.data(), header.size());
     if (header_size == 0) {
-        throw transport::LinkError(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
     return header_size;
 }
@@ -277,7 +277,7 @@ net::awaitable<void> WriteUdpDatagram(
 
 net::awaitable<void> WriteUdpDatagram(
     transport::MultiBufferWriter& writer,
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     std::span<const net::const_buffer> payload) {
     const size_t payload_size = proxy::RequireUdpPayloadSize(payload);
     std::array<uint8_t, kMaxUdpPacketHeaderSize> header;
@@ -286,4 +286,4 @@ net::awaitable<void> WriteUdpDatagram(
         writer, std::span<const uint8_t>(header.data(), header_size), payload);
 }
 
-}  // namespace trojan
+}  // namespace proxy::trojan

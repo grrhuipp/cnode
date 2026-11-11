@@ -5,7 +5,7 @@
 #include <asio/this_coro.hpp>
 #include <type_traits>
 
-namespace ss {
+namespace proxy::shadowsocks {
 using buf::ChunkBytes;
 using detail::kStreamChunkPayloadSize;
 using detail::MakeNonce;
@@ -78,7 +78,7 @@ net::awaitable<void> SsStreamWriter::WriteEncrypted(BufferRange buffers) {
         throw IoSystemError(io_error::not_connected, "Shadowsocks response writer has no stream");
     }
     if (write_finished_) throw transport::WriteClosed();
-    AsyncStream& stream = *stream_;
+    transport::AsyncStream& stream = *stream_;
 
     bool has_data = false;
     for (const auto& buffer : buffers) {
@@ -136,7 +136,7 @@ net::awaitable<void> SsStreamWriter::WriteEncrypted(BufferRange buffers) {
 }
 
 net::awaitable<void> SsStreamWriter::FlushPendingAndWrite(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     buf::MultiBuffer out_mb) {
     if (out_mb.byte_size() == 0 && pending_prefix_.byte_size() == 0) {
         co_return;
@@ -169,7 +169,7 @@ bool SsStreamWriter::InitResponseCipher() {
     }
 
     std::array<uint8_t, 64> write_subkey{};
-    ScopedCleanse cleanse_init_legacy{server_salt, write_subkey};
+    common::ScopedCleanse cleanse_init_legacy{server_salt, write_subkey};
     if (!DeriveSubkey(pending_handshake_->master_key.data(), key_size,
                       server_salt.data(), key_size,
                       write_subkey.data())) {
@@ -254,7 +254,7 @@ bool SsStreamWriter::InitResponseCipher2022(
     constexpr size_t kFixedCipherMaxSize =
         kFixedPlainMaxSize + SsAeadCipher::kTagSize;
     std::array<uint8_t, kFixedPlainMaxSize> fixed_plain{};
-    ScopedCleanse cleanse_init_2022{server_salt, write_subkey, fixed_plain};
+    common::ScopedCleanse cleanse_init_2022{server_salt, write_subkey, fixed_plain};
     if (!Derive2022Subkey(pending_handshake_->master_key.data(), key_size,
                           server_salt.data(), key_size,
                           write_subkey.data())) {
@@ -266,10 +266,10 @@ bool SsStreamWriter::InitResponseCipher2022(
 
     const size_t fixed_plain_size = 1 + 8 + key_size + 2;
     fixed_plain[0] = 1;
-    StoreU64BE(fixed_plain.data() + 1, UnixSecondsNow());
+    common::StoreU64BE(fixed_plain.data() + 1, UnixSecondsNow());
     std::memcpy(fixed_plain.data() + 9,
                 pending_handshake_->request_salt.data(), key_size);
-    StoreU16BE(fixed_plain.data() + 9 + key_size,
+    common::StoreU16BE(fixed_plain.data() + 9 + key_size,
              static_cast<uint16_t>(want));
 
     std::array<uint8_t, kFixedCipherMaxSize> fixed_cipher{};
@@ -298,4 +298,4 @@ bool SsStreamWriter::InitResponseCipher2022(
     write_init_ = true;
     return true;
 }
-}  // namespace ss
+}  // namespace proxy::shadowsocks

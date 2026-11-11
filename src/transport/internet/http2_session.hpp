@@ -50,7 +50,7 @@ inline constexpr std::string_view kHttp2ClientPreface =
 // gRPC server: reads the client preface, then serves the connection until it
 // ends. Logical streams are delivered to `stream_handler`.
 [[nodiscard]] net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
     const GrpcConfig& cfg,
     net::io_context& io_context,
@@ -60,7 +60,7 @@ inline constexpr std::string_view kHttp2ClientPreface =
 // h2 / XHTTP server after the caller consumed the client preface. `cfg` and
 // `xhttp_cfg` are borrowed for the whole call; the session never outlives it.
 [[nodiscard]] net::awaitable<TransportBuildResult> RunHttp2ServerSession(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
     const HttpConfig& cfg,
     const XHttpConfig* xhttp_cfg,
@@ -102,7 +102,7 @@ public:
                 consumed += size;
                 if (prefix_size_ != prefix_.size()) break;
                 if (prefix_[0] != 0) return tl::unexpected("gRPC compressed messages are unsupported");
-                message_size_ = LoadU32BE(prefix_.data() + 1);
+                message_size_ = common::LoadU32BE(prefix_.data() + 1);
                 if (message_size_ > kMaxGrpcHunkMessageSize)
                     return tl::unexpected("gRPC message exceeds 4 MiB");
             }
@@ -156,14 +156,14 @@ private:
         size_t size = 0;
     };
 
-    [[nodiscard]] static bool ReadKey(ByteReader& reader, uint32_t& key) noexcept {
+    [[nodiscard]] static bool ReadKey(common::ByteReader& reader, uint32_t& key) noexcept {
         const auto value = reader.ReadVarintU64();
         if (!value || *value > UINT32_MAX || (*value >> 3) == 0) return false;
         key = static_cast<uint32_t>(*value);
         return true;
     }
 
-    [[nodiscard]] static bool SkipField(ByteReader& reader, uint32_t key, unsigned depth) noexcept {
+    [[nodiscard]] static bool SkipField(common::ByteReader& reader, uint32_t key, unsigned depth) noexcept {
         switch (key & 7) {
         case 0:
             return reader.ReadVarintU64().has_value();
@@ -193,7 +193,7 @@ private:
     [[nodiscard]] static std::optional<DataField> DecodeMessage(
         std::span<const uint8_t> bytes) noexcept {
         DataField data;
-        ByteReader reader(bytes);
+        common::ByteReader reader(bytes);
         while (!reader.Empty()) {
             uint32_t key = 0;
             if (!ReadKey(reader, key)) return std::nullopt;

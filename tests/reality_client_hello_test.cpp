@@ -7,7 +7,7 @@
 #include <vector>
 
 namespace {
-using Reader = ::RealityClientHelloReader;
+using Reader = ::transport::internet::RealityClientHelloReader;
 std::vector<uint8_t> Records(const std::vector<uint8_t>& hello, size_t fragment) {
     std::vector<uint8_t> wire;
     for (size_t offset = 0; offset < hello.size();) {

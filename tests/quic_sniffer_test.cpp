@@ -156,9 +156,9 @@ Bytes Crypto(std::span<const uint8_t> bytes, uint64_t offset = 0) {
 }
 
 template <class Parser>
-::SniffResult Sniff(Parser& parser, const Bytes& packet) {
-    if constexpr (requires { parser.Sniff(packet, ::Network::UDP); })
-        return parser.Sniff(packet, ::Network::UDP);
+::sniff::SniffResult Sniff(Parser& parser, const Bytes& packet) {
+    if constexpr (requires { parser.Sniff(packet, ::common::Network::UDP); })
+        return parser.Sniff(packet, ::common::Network::UDP);
     else
         return parser.Sniff(packet);
 }
@@ -181,7 +181,7 @@ protected:
 
 TEST_F(QuicSnifferCases, SupportedVersionsExtractDomain) {
     for (uint32_t version : {uint32_t{1}, uint32_t{0x6b3343cf}, uint32_t{0xff00001d}}) {
-        ::QuicSniffer parser;
+        ::sniff::QuicSniffer parser;
         {
     const auto result = Sniff(parser, Protect(Crypto(hello), 0, version));
     EXPECT_TRUE(result.success);
@@ -194,7 +194,7 @@ TEST_F(QuicSnifferCases, SupportedVersionsExtractDomain) {
 
 TEST_F(QuicSnifferCases, SupportedVersionsReassembleCrypto) {
     for (uint32_t version : {uint32_t{1}, uint32_t{0x6b3343cf}, uint32_t{0xff00001d}}) {
-        ::QuicSniffer split;
+        ::sniff::QuicSniffer split;
         {
     const auto result = Sniff(split, Protect(Crypto(large.first(1000)), 0, version));
     EXPECT_FALSE(result.success);
@@ -212,7 +212,7 @@ TEST_F(QuicSnifferCases, SupportedVersionsReassembleCrypto) {
 }
 
 TEST_F(QuicSnifferCases, DispatcherReassemblesAcrossDatagrams) {
-    ::Sniffer parser;
+    ::sniff::Sniffer parser;
     {
     const auto result = Sniff(parser, first);
     EXPECT_FALSE(result.success);
@@ -229,7 +229,7 @@ TEST_F(QuicSnifferCases, DispatcherReassemblesAcrossDatagrams) {
 }
 
 TEST_F(QuicSnifferCases, ReorderedDuplicateDoesNotFillMissingPrefix) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     {
     const auto result = Sniff(parser, second);
     EXPECT_FALSE(result.success);
@@ -252,7 +252,7 @@ TEST_F(QuicSnifferCases, ReorderedDuplicateDoesNotFillMissingPrefix) {
 }
 
 TEST_F(QuicSnifferCases, CryptoHolesMustArriveBeforeSuccess) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     const auto bytes = std::span<const uint8_t>(hello);
     {
     const auto result = Sniff(parser, Protect(Crypto(bytes.first(8)), 0));
@@ -278,7 +278,7 @@ TEST_F(QuicSnifferCases, CryptoHolesMustArriveBeforeSuccess) {
 }
 
 TEST_F(QuicSnifferCases, MatchingOverlapCompletesHello) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     {
     const auto result = Sniff(parser, first);
     EXPECT_FALSE(result.success);
@@ -295,7 +295,7 @@ TEST_F(QuicSnifferCases, MatchingOverlapCompletesHello) {
 }
 
 TEST_F(QuicSnifferCases, ConflictingOverlapIsTerminal) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     {
     const auto result = Sniff(parser, first);
     EXPECT_FALSE(result.success);
@@ -317,7 +317,7 @@ TEST_F(QuicSnifferCases, ConflictingOverlapIsTerminal) {
 }
 
 TEST_F(QuicSnifferCases, CoalescedInitialsCompleteHello) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     auto coalesced = first;
     coalesced.insert(coalesced.end(), second.begin(), second.end());
     {
@@ -336,7 +336,7 @@ TEST_F(QuicSnifferCases, OpaqueCoalescedTrailersPreservePendingCrypto) {
                                 Bytes{0xf0, 0, 0, 0, 1, 0, 0,
                                       0, 0, 0, 0, 0, 0, 0, 0,
                                       0, 0, 0, 0, 0, 0, 0, 0}}) {
-        ::QuicSniffer parser;
+        ::sniff::QuicSniffer parser;
         auto packet = first;
         packet.insert(packet.end(), trailer.begin(), trailer.end());
         {
@@ -361,13 +361,13 @@ TEST_F(QuicSnifferCases, ReorderedEarlyDataPreservesOnlyMatchingConnection) {
     // same-connection long-header datagram must not terminate reassembly.
     auto early = handshake_packet;
     early[0] = 0xd0;
-    ::QuicSniffer standalone;
+    ::sniff::QuicSniffer standalone;
     {
     const auto result = Sniff(standalone, early);
     EXPECT_FALSE(result.success);
     EXPECT_FALSE(result.need_more);
 }
-    ::QuicSniffer pending;
+    ::sniff::QuicSniffer pending;
     {
     const auto result = Sniff(pending, first);
     EXPECT_FALSE(result.success);
@@ -388,7 +388,7 @@ TEST_F(QuicSnifferCases, ReorderedEarlyDataPreservesOnlyMatchingConnection) {
     EXPECT_EQ(result.domain, "auth.openai.com");
 }
     early[13] = 1;
-    ::QuicSniffer unrelated;
+    ::sniff::QuicSniffer unrelated;
     {
     const auto result = Sniff(unrelated, first);
     EXPECT_FALSE(result.success);
@@ -404,7 +404,7 @@ TEST_F(QuicSnifferCases, ReorderedEarlyDataPreservesOnlyMatchingConnection) {
 
 TEST_F(QuicSnifferCases, ConnectionOrVersionChangeIsTerminal) {
     for (bool change_version : {false, true}) {
-        ::QuicSniffer parser;
+        ::sniff::QuicSniffer parser;
         {
     const auto result = Sniff(parser, first);
     EXPECT_FALSE(result.success);
@@ -430,13 +430,13 @@ TEST_F(QuicSnifferCases, NonInitialInputIsTerminal) {
     for (const Bytes& invalid : {Bytes{0, 1, 2, 3, 4, 5, 6, 7},
                                 Bytes{0xc0, 0, 0, 0, 2, 0, 0},
                                 Bytes{0x16, 3, 1, 0, 1}}) {
-        ::Sniffer parser;
+        ::sniff::Sniffer parser;
         {
     const auto result = Sniff(parser, invalid);
     EXPECT_FALSE(result.success);
     EXPECT_FALSE(result.need_more);
 }
-        ::QuicSniffer pending;
+        ::sniff::QuicSniffer pending;
         {
     const auto result = Sniff(pending, first);
     EXPECT_FALSE(result.success);
@@ -461,7 +461,7 @@ TEST_F(QuicSnifferCases, UnauthenticatedOrTruncatedInitialFails) {
         auto invalid = second;
         if (truncate) invalid.pop_back();
         else invalid.back() ^= 1;
-        ::QuicSniffer parser;
+        ::sniff::QuicSniffer parser;
         {
     const auto result = Sniff(parser, first);
     EXPECT_FALSE(result.success);
@@ -477,7 +477,7 @@ TEST_F(QuicSnifferCases, UnauthenticatedOrTruncatedInitialFails) {
 }
 
 TEST_F(QuicSnifferCases, PacketNumberWrapReconstructsNonce) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     const auto prefix = Protect(Crypto(large.first(1000)), 255, 1, 0, 1);
     {
     const auto result = Sniff(parser, prefix);
@@ -495,7 +495,7 @@ TEST_F(QuicSnifferCases, PacketNumberWrapReconstructsNonce) {
 }
 
 TEST_F(QuicSnifferCases, FragmentedTlsHeaderReassembles) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     {
     const auto result = Sniff(parser, Protect(Crypto(large.first(1)), 0));
     EXPECT_FALSE(result.success);
@@ -512,7 +512,7 @@ TEST_F(QuicSnifferCases, FragmentedTlsHeaderReassembles) {
 }
 
 TEST_F(QuicSnifferCases, ReorderedCryptoFramesReassemble) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     auto frames = Crypto(std::span<const uint8_t>(hello).subspan(20), 20);
     const auto prefix = Crypto(std::span<const uint8_t>(hello).first(20));
     frames.insert(frames.end(), prefix.begin(), prefix.end());
@@ -533,7 +533,7 @@ TEST_F(QuicSnifferCases, LargeAckVarintsDoNotCountAsCryptoOffsets) {
     Varint(frames, uint64_t{1} << 35);
     Varint(frames, 0);
     Varint(frames, 0);
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     {
     const auto result = Sniff(parser, Protect(frames));
     EXPECT_FALSE(result.success);
@@ -550,7 +550,7 @@ TEST_F(QuicSnifferCases, LargeAckVarintsDoNotCountAsCryptoOffsets) {
 }
 
 TEST_F(QuicSnifferCases, CryptoOffsetBudgetIsBounded) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     const std::array<uint8_t, 1> byte{0};
     {
     const auto result = Sniff(parser, Protect(Crypto(byte, 65535)));
@@ -566,7 +566,7 @@ TEST_F(QuicSnifferCases, CryptoOffsetBudgetIsBounded) {
 }
 
 TEST_F(QuicSnifferCases, OversizedTlsLengthFails) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     const std::array<uint8_t, 4> oversized{1, 1, 0, 0};
     {
     const auto result = Sniff(parser, Protect(Crypto(oversized)));
@@ -576,7 +576,7 @@ TEST_F(QuicSnifferCases, OversizedTlsLengthFails) {
 }
 
 TEST_F(QuicSnifferCases, NonClientHelloFails) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     auto invalid = hello;
     invalid[0] = 2;
     {
@@ -587,7 +587,7 @@ TEST_F(QuicSnifferCases, NonClientHelloFails) {
 }
 
 TEST_F(QuicSnifferCases, InvalidServerNameFails) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     auto invalid = hello;
     invalid.back() = '!'; // complete but invalid SNI is terminal
     {
@@ -598,7 +598,7 @@ TEST_F(QuicSnifferCases, InvalidServerNameFails) {
 }
 
 TEST_F(QuicSnifferCases, DuplicateBytesExhaustBudgetTerminally) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     // The byte budget independently bounds duplicate retransmissions.
     for (size_t i = 0; i < 52; ++i) {
     const auto result = Sniff(parser, first);
@@ -620,7 +620,7 @@ TEST_F(QuicSnifferCases, DuplicateBytesExhaustBudgetTerminally) {
 
 TEST_F(QuicSnifferCases, FinalDatagramMayCrossByteBudget) {
     // A final already-read datagram may cross the byte budget and succeed.
-    ::QuicSniffer crossing;
+    ::sniff::QuicSniffer crossing;
     for (size_t i = 0; i < 52; ++i) {
     const auto result = Sniff(crossing, first);
     EXPECT_FALSE(result.success);
@@ -637,7 +637,7 @@ TEST_F(QuicSnifferCases, FinalDatagramMayCrossByteBudget) {
 }
 
 TEST_F(QuicSnifferCases, DatagramCountBudgetIsBounded) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     const auto tiny = Protect(Crypto(large.first(1)), 0, 1, 0, 2, false);
     for (size_t i = 0; i < 63; ++i) {
     const auto result = Sniff(parser, tiny);
@@ -658,7 +658,7 @@ TEST_F(QuicSnifferCases, DatagramCountBudgetIsBounded) {
 }
 
 TEST_F(QuicSnifferCases, OversizedDatagramFails) {
-    ::QuicSniffer parser;
+    ::sniff::QuicSniffer parser;
     {
     const auto result = Sniff(parser, Bytes(65537, 0xc0));
     EXPECT_FALSE(result.success);

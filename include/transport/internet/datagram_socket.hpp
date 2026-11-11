@@ -42,7 +42,7 @@ public:
 
         [[nodiscard]] net::awaitable<ReceivedDatagram> Receive();
         [[nodiscard]] bool Cancelled() const noexcept;
-        [[nodiscard]] ErrorCode CancellationReason() const noexcept;
+        [[nodiscard]] common::ErrorCode CancellationReason() const noexcept;
 
     private:
         friend class DatagramSocket;
@@ -65,7 +65,7 @@ public:
         [[nodiscard]] net::awaitable<void> SendTo(
             udp::endpoint destination, buf::MultiBuffer payload);
         [[nodiscard]] bool Cancelled() const noexcept;
-        [[nodiscard]] ErrorCode CancellationReason() const noexcept;
+        [[nodiscard]] common::ErrorCode CancellationReason() const noexcept;
 
     private:
         friend class DatagramSocket;

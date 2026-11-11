@@ -21,20 +21,26 @@
 #include <utility>
 #include <vector>
 
+namespace transport::internet {
+
 struct TlsPemMaterial;
 
+}  // namespace transport::internet
+
 namespace infra {
-[[nodiscard]] WsConfig ParseWsConfig(const json::object& source);
-[[nodiscard]] HttpUpgradeConfig ParseHttpUpgradeConfig(const json::object& source);
-[[nodiscard]] HttpConfig ParseHttpConfig(const json::object& source);
-[[nodiscard]] GrpcConfig ParseGrpcConfig(const json::object& source);
-[[nodiscard]] XHttpConfig ParseXHttpConfig(const json::object& source);
-[[nodiscard]] RealityConfig ParseRealityConfig(const json::object& source);
-[[nodiscard]] StreamSettings ParseStreamSettings(const json::object& source, StreamEndpointRole role);
+[[nodiscard]] transport::internet::WsConfig ParseWsConfig(const json::object& source);
+[[nodiscard]] transport::internet::HttpUpgradeConfig ParseHttpUpgradeConfig(const json::object& source);
+[[nodiscard]] transport::internet::HttpConfig ParseHttpConfig(const json::object& source);
+[[nodiscard]] transport::internet::GrpcConfig ParseGrpcConfig(const json::object& source);
+[[nodiscard]] transport::internet::XHttpConfig ParseXHttpConfig(const json::object& source);
+[[nodiscard]] transport::internet::RealityConfig ParseRealityConfig(const json::object& source);
+[[nodiscard]] transport::internet::StreamSettings ParseStreamSettings(const json::object& source, transport::internet::StreamEndpointRole role);
 [[nodiscard]] OutboundSettings ParseOutboundSettings(
     std::string_view protocol, const json::object& settings);
 }  // namespace infra
 
+
+namespace infra {
 
 class PanelNodeIds {
 public:
@@ -79,12 +85,12 @@ struct PanelConfig {
     std::string NodeType = std::string(constants::panel::kDefaultNodeType);
     // Local durable accounting state; resolved relative to the loaded config directory.
     std::filesystem::path TrafficJournalDir = "traffic-journal";
-    InboundListen ListenIP;
-    OutboundBind SendIP = OutboundBind::Auto();
+    transport::internet::InboundListen ListenIP;
+    transport::internet::OutboundBind SendIP = transport::internet::OutboundBind::Auto();
     bool EnableDNS = true;
     proxy::freedom::outbound::DomainStrategy DNSType =
         proxy::freedom::outbound::DomainStrategy::UseIP;
-    ProxyProtocolMode ProxyProtocol = ProxyProtocolMode::Auto; // off / auto / on
+    transport::internet::ProxyProtocolMode ProxyProtocol = transport::internet::ProxyProtocolMode::Auto; // off / auto / on
 
     // TLS 能力配置。
     // true 表示本实例可以为面板中 tls=true 的节点终止 TLS；并不强制所有节点启用 TLS。
@@ -92,7 +98,7 @@ struct PanelConfig {
     bool TLSEnable = false;
     std::string TLSCert;                    // 证书文件路径（空则自签名）
     std::string TLSKey;                     // 私钥文件路径（空则自签名）
-    std::shared_ptr<const TlsPemMaterial> TLSPem;
+    std::shared_ptr<const transport::internet::TlsPemMaterial> TLSPem;
     static PanelConfig FromJson(const json::object& j);
     [[nodiscard]] bool Validate() const;
 };
@@ -168,14 +174,16 @@ struct StaticInboundSemanticValidation {
 [[nodiscard]] StaticInboundSemanticValidation ValidateStaticInboundSemantics(
     std::span<const StaticInboundConfig> inbounds);
 
+}  // namespace infra
+
 
 namespace infra {
 
 // Cold-path configuration normalization. A string preserves the existing
 // binding semantics; an ordered array chooses only assigned local addresses.
-[[nodiscard]] OutboundBind ParseOutboundBindConfig(
+[[nodiscard]] transport::internet::OutboundBind ParseOutboundBindConfig(
     const json::value& value, const json::value* strategy = nullptr);
-[[nodiscard]] std::optional<OutboundBind> ParseOptionalOutboundBind(
+[[nodiscard]] std::optional<transport::internet::OutboundBind> ParseOptionalOutboundBind(
     const json::object& source, std::string_view context);
 
 
@@ -207,11 +215,11 @@ struct RealityServerInput {
 // Validates and writes the server-side fields into `out`; client-only fields
 // of `out` are left untouched.
 [[nodiscard]] tl::expected<void, std::string> ApplyRealityServerInput(
-    const RealityServerInput& input, RealityConfig& out);
+    const RealityServerInput& input, transport::internet::RealityConfig& out);
 
 // Requirements of a REALITY config terminating client connections.
 [[nodiscard]] tl::expected<void, std::string> ValidateInboundReality(
-    const RealityConfig& config);
+    const transport::internet::RealityConfig& config);
 
 // ---------------------------------------------------------------------------
 // TLS / transport request fields
@@ -256,16 +264,16 @@ struct RealityServerInput {
 // Proxy Protocol & HTTP/2 initial window
 // ---------------------------------------------------------------------------
 
-[[nodiscard]] InboundListen ParseInboundListen(
+[[nodiscard]] transport::internet::InboundListen ParseInboundListen(
     const json::object& object,
     std::string_view key,
     std::string_view field_label,
-    InboundListen fallback = InboundListen{});
+    transport::internet::InboundListen fallback = transport::internet::InboundListen{});
 
 // Header presence policy is independent of v1/v2 format detection.
-[[nodiscard]] ProxyProtocolMode ParseProxyProtocolMode(
+[[nodiscard]] transport::internet::ProxyProtocolMode ParseProxyProtocolMode(
     const json::object& object, std::string_view key,
-    ProxyProtocolMode fallback = ProxyProtocolMode::Auto);
+    transport::internet::ProxyProtocolMode fallback = transport::internet::ProxyProtocolMode::Auto);
 
 inline constexpr uint32_t kHttp2MaxInitialWindow = 0x7fffffffU;
 [[nodiscard]] tl::expected<std::optional<uint32_t>, std::string>
@@ -273,7 +281,3 @@ ParseHttp2InitialWindow(const json::object& source);
 
 }  // namespace infra
 
-using infra::kHttp2MaxInitialWindow;
-using infra::ParseHttp2InitialWindow;
-using infra::ParseProxyProtocolMode;
-using infra::ParseInboundListen;

@@ -9,6 +9,8 @@
 #include <span>
 #include <string>
 
+namespace transport::internet {
+
 enum class ProxyProtocolMode : uint8_t {
     Off,
     Auto,
@@ -80,4 +82,6 @@ inline constexpr size_t kProxyProtocolMaxHeaderSize = 108;
     const tcp::endpoint& src,
     const tcp::endpoint& dst,
     std::span<uint8_t, kProxyProtocolMaxHeaderSize> out) noexcept;
+
+}  // namespace transport::internet
 

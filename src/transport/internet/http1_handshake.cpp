@@ -170,7 +170,7 @@ public:
             co_return;
         }
         Http1ChunkPrefixBuffer prefix{};
-        ConstBufferSpanBuilder<16> chunk_buffers;
+        common::ConstBufferSpanBuilder<16> chunk_buffers;
         if (!AppendHttp1Chunk(chunk_buffers, prefix, buffers, len)) {
             throw IoSystemError(io_error::fault, "http1 chunk size encode failed");
         }
@@ -509,22 +509,22 @@ private:
 };
 
 [[nodiscard]] bool IsReservedUpgradeHeader(std::string_view key) noexcept {
-    return EqualsAsciiCI(key, "Host") ||
-           EqualsAsciiCI(key, "Upgrade") ||
-           EqualsAsciiCI(key, "Connection") ||
-           EqualsAsciiCI(key, "Sec-WebSocket-Key") ||
-           EqualsAsciiCI(key, "Sec-WebSocket-Version");
+    return common::EqualsAsciiCI(key, "Host") ||
+           common::EqualsAsciiCI(key, "Upgrade") ||
+           common::EqualsAsciiCI(key, "Connection") ||
+           common::EqualsAsciiCI(key, "Sec-WebSocket-Key") ||
+           common::EqualsAsciiCI(key, "Sec-WebSocket-Version");
 }
 
 [[nodiscard]] bool HasWebSocketUpgradeHeaders(std::string_view head) {
-    return EqualsAsciiCI(TrimAscii(ExtractHeaderValueCI(head, "Upgrade")), "websocket") &&
+    return common::EqualsAsciiCI(common::TrimAscii(ExtractHeaderValueCI(head, "Upgrade")), "websocket") &&
            HeaderListContainsTokenCI(head, "Connection", "upgrade");
 }
 
-void LogHeadReadFailure(std::string_view scope, uint64_t conn_id, ErrorCode error) {
-    if (error == ErrorCode::SOCKET_EOF) {
+void LogHeadReadFailure(std::string_view scope, uint64_t conn_id, common::ErrorCode error) {
+    if (error == common::ErrorCode::SOCKET_EOF) {
         LOG_CONN_DEBUG(conn_id, "{} peer closed while reading HTTP/1 message head", scope);
-    } else if (error == ErrorCode::PROTOCOL_DECODE_FAILED) {
+    } else if (error == common::ErrorCode::PROTOCOL_DECODE_FAILED) {
         LOG_CONN_DEBUG(conn_id, "{} HTTP/1 message head too large or incomplete", scope);
     }
 }
@@ -541,7 +541,7 @@ constexpr std::string_view kSwitchingProtocolsFields =
 
 // Reads the response head of a client handshake and requires `status_code`.
 // Read-ahead belongs to the established byte stream.
-net::awaitable<tl::expected<void, ErrorCode>> ReadClientResponse(
+net::awaitable<tl::expected<void, common::ErrorCode>> ReadClientResponse(
     AsyncStream& stream,
     std::string_view scope,
     uint64_t conn_id,
@@ -554,15 +554,15 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadClientResponse(
     const std::string_view status_line = ExtractStartLine(head->Text());
     if (!HasStatusCode(status_line, status_code)) {
         LOG_CONN_DEBUG(conn_id, "{} client request rejected", scope);
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     MoveReadAhead(stream, *head);
-    co_return tl::expected<void, ErrorCode>{};
+    co_return tl::expected<void, common::ErrorCode>{};
 }
 
 }  // namespace
 
-net::awaitable<tl::expected<Http1ResponseHead, ErrorCode>>
+net::awaitable<tl::expected<Http1ResponseHead, common::ErrorCode>>
 ReadHttp1ResponseHead(AsyncStream& stream, Http1HeadReadLimits limits) {
     Http1ResponseHead response;
     size_t total_head_bytes = 0;
@@ -570,19 +570,19 @@ ReadHttp1ResponseHead(AsyncStream& stream, Http1HeadReadLimits limits) {
         auto remaining_limits = limits;
         if (limits.max_head_bytes != 0) {
             if (total_head_bytes >= limits.max_head_bytes)
-                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
             remaining_limits.max_head_bytes -= total_head_bytes;
         }
         auto read = co_await ReadHttp1MessageHead(stream, response.head, {}, remaining_limits);
         if (!read) co_return tl::unexpected(read.error());
         total_head_bytes += response.head.header_end;
         if (limits.max_head_bytes == 0 && total_head_bytes > 256 * 1024)
-            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         const auto text = response.head.Text();
         const auto line = ExtractStartLine(text);
         const size_t space = line.find(' ');
         if (space == std::string_view::npos)
-            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         const auto version = line.substr(0, space);
         const auto rest = line.substr(space + 1);
         const auto token = rest.substr(0, rest.find(' '));
@@ -593,7 +593,7 @@ ReadHttp1ResponseHead(AsyncStream& stream, Http1HeadReadLimits limits) {
             token.size() != 3 || ec != std::errc{} ||
             end != token.data() + token.size() || status < 100 || status > 599 ||
             !IsValidHttpHeaderValue(rest))
-            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
 
         std::optional<uint64_t> length;
         bool transfer_encoding = false;
@@ -603,21 +603,21 @@ ReadHttp1ResponseHead(AsyncStream& stream, Http1HeadReadLimits limits) {
         while (offset < text.size() - 2) {
             const size_t end_line = text.find("\r\n", offset);
             if (end_line == std::string_view::npos)
-                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
             std::string_view name, value;
             if (!SplitAndValidateHttpHeaderLine(
                     text.substr(offset, end_line - offset), name, value))
-                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
             offset = end_line + 2;
-            if (EqualsAsciiCI(name, "Content-Length")) {
+            if (common::EqualsAsciiCI(name, "Content-Length")) {
                 uint64_t parsed = 0;
                 const auto [last, error] = std::from_chars(
                     value.data(), value.data() + value.size(), parsed);
                 if (value.empty() || error != std::errc{} ||
                     last != value.data() + value.size() || (length && *length != parsed))
-                    co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                    co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
                 length = parsed;
-            } else if (EqualsAsciiCI(name, "Transfer-Encoding")) {
+            } else if (common::EqualsAsciiCI(name, "Transfer-Encoding")) {
                 transfer_encoding = true;
                 while (!value.empty()) {
                     const size_t comma = value.find(',');
@@ -626,13 +626,13 @@ ReadHttp1ResponseHead(AsyncStream& stream, Http1HeadReadLimits limits) {
                         : value.substr(comma + 1);
                     if (coding.empty()) continue;
                     ++coding_count;
-                    only_chunked &= EqualsAsciiCI(coding, "chunked");
+                    only_chunked &= common::EqualsAsciiCI(coding, "chunked");
                 }
             }
         }
         if (status < 200) {
             if (status == 101)
-                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
             continue;
         }
         response.status = status;
@@ -642,7 +642,7 @@ ReadHttp1ResponseHead(AsyncStream& stream, Http1HeadReadLimits limits) {
             response.framing = Http1BodyContentLength{0};
         } else if (transfer_encoding) {
             if (version == "HTTP/1.0" || length || coding_count != 1 || !only_chunked)
-                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
             response.framing = Http1BodyChunked{};
         } else if (length) {
             response.framing = Http1BodyContentLength{*length};
@@ -651,7 +651,7 @@ ReadHttp1ResponseHead(AsyncStream& stream, Http1HeadReadLimits limits) {
     }
 }
 
-net::awaitable<tl::expected<void, ErrorCode>> ReadHttp1MessageHead(
+net::awaitable<tl::expected<void, common::ErrorCode>> ReadHttp1MessageHead(
     AsyncStream& stream, Http1MessageHead& head, std::span<const uint8_t> initial,
     Http1HeadReadLimits limits) {
     if (!head.extended_storage.empty() && head.header_end != 0) {
@@ -695,7 +695,7 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadHttp1MessageHead(
                 first.reset();
             }
             if (!first) {
-                co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+                co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
             }
             first->CompactToFront();
             const size_t first_len = first->Len();
@@ -714,7 +714,7 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadHttp1MessageHead(
         } else {
             head.storage = buf::BufferGuard{buf::Buffer::New()};
             if (!head.storage) {
-                co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+                co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
             }
             head.bytes = head.storage->Tail().data();
             head.header_end = 0;
@@ -727,7 +727,7 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadHttp1MessageHead(
     if (head.extended_storage.empty()) head.bytes = data;
     if (!initial.empty()) {
         if (initial.size() > head_limit || head.size > head_limit - initial.size())
-            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         if (head.extended_storage.empty() && initial.size() <= capacity - head.size) {
             std::memcpy(data + head.size, initial.data(), initial.size());
         } else {
@@ -752,20 +752,20 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadHttp1MessageHead(
         const size_t checked_size = end == std::string_view::npos
             ? received.size() : end + kTerminator.size();
         if (checked_size > head_limit)
-            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         if (limits.max_line_bytes != 0) {
             while (line_start < checked_size) {
                 const size_t scan_from = line_scanned > line_start ? line_scanned - 1 : line_start;
                 const size_t crlf = received.find("\r\n", scan_from);
                 if (crlf != std::string_view::npos && crlf + 2 <= checked_size) {
                     if (crlf - line_start > limits.max_line_bytes)
-                        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
                     line_start = line_scanned = crlf + 2;
                 } else {
                     const size_t partial = checked_size - line_start;
                     if (partial > limits.max_line_bytes &&
                         (partial - limits.max_line_bytes != 1 || received[checked_size - 1] != '\r'))
-                        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
                     line_scanned = checked_size;
                     break;
                 }
@@ -773,22 +773,22 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadHttp1MessageHead(
         }
         if (end != std::string_view::npos) {
             head.header_end = checked_size;
-            co_return tl::expected<void, ErrorCode>{};
+            co_return tl::expected<void, common::ErrorCode>{};
         }
         scanned = head.size;
         if (head.size >= head_limit)
-            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         if (head.extended_storage.empty() && head.size < capacity) {
             const size_t want = std::min(capacity - head.size, head_limit - head.size);
             const size_t n = co_await stream.AsyncRead(net::buffer(data + head.size, want));
-            if (n == 0) co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+            if (n == 0) co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
             head.size += n;
         } else {
             if (head.extended_storage.empty())
                 head.extended_storage.assign(unsafe::ptr_cast<const char>(data), head.size);
             const size_t want = std::min(capacity, head_limit - head.size);
             const size_t n = co_await stream.AsyncRead(net::buffer(data, want));
-            if (n == 0) co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+            if (n == 0) co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
             head.extended_storage.append(unsafe::ptr_cast<const char>(data), n);
             head.size += n;
             head.bytes = unsafe::ptr_cast<const uint8_t>(head.extended_storage.data());
@@ -796,7 +796,7 @@ net::awaitable<tl::expected<void, ErrorCode>> ReadHttp1MessageHead(
     }
 }
 
-net::awaitable<tl::expected<Http1MessageHead, ErrorCode>> ReadHttp1MessageHead(
+net::awaitable<tl::expected<Http1MessageHead, common::ErrorCode>> ReadHttp1MessageHead(
     AsyncStream& stream, std::span<const uint8_t> initial, Http1HeadReadLimits limits) {
     Http1MessageHead head;
     if (auto res = co_await ReadHttp1MessageHead(stream, head, initial, limits); !res) {
@@ -848,7 +848,7 @@ bool VisitHeaderValuesCI(std::string_view head, std::string_view name, Visit&& v
         const std::string_view line = head.substr(line_start, line_end - line_start);
         if (const size_t colon = line.find(':');
             colon != std::string_view::npos &&
-            EqualsAsciiCI(line.substr(0, colon), name)) {
+            common::EqualsAsciiCI(line.substr(0, colon), name)) {
             size_t value_start = colon + 1;
             while (value_start < line.size() &&
                    (line[value_start] == ' ' || line[value_start] == '\t')) {
@@ -886,7 +886,7 @@ size_t CountHeadersCI(std::string_view head, std::string_view name) {
 bool HeaderContainsTokenCI(std::string_view value, std::string_view token) {
     while (!value.empty()) {
         const size_t comma = value.find(',');
-        if (EqualsAsciiCI(TrimAscii(value.substr(0, comma)), token)) {
+        if (common::EqualsAsciiCI(common::TrimAscii(value.substr(0, comma)), token)) {
             return true;
         }
         if (comma == std::string_view::npos) {
@@ -928,7 +928,7 @@ void RecordExtractedRealIp(std::string_view head,
         return;
     }
     std::string_view val = ExtractHeaderValueCI(head, header_name);
-    val = TrimAscii(val.substr(0, val.find(',')));
+    val = common::TrimAscii(val.substr(0, val.find(',')));
     if (!val.empty()) {
         metadata->real_ip.assign(val);
     }
@@ -936,7 +936,7 @@ void RecordExtractedRealIp(std::string_view head,
 
 std::string_view PublicHttpTargetForLog(std::string_view value) {
     constexpr std::string_view invalid = "[invalid HTTP target]";
-    value = TrimAscii(value);
+    value = common::TrimAscii(value);
     value = value.substr(0, value.find_first_of("?#"));
     if (value.empty()) return "-";
     for (unsigned char ch : value) {
@@ -1076,7 +1076,7 @@ void AppendHeaderLine(memory::String& out,
     out.append("\r\n");
 }
 
-net::awaitable<tl::expected<Http1Request, ErrorCode>> ReadHttp1Request(
+net::awaitable<tl::expected<Http1Request, common::ErrorCode>> ReadHttp1Request(
     AsyncStream& stream,
     std::string_view scope,
     uint64_t conn_id,
@@ -1089,7 +1089,7 @@ net::awaitable<tl::expected<Http1Request, ErrorCode>> ReadHttp1Request(
     const std::string_view text = request.head.Text();
     request.start_line = ExtractStartLine(text);
     request.line = ParseHttp1RequestLine(request.start_line);
-    request.host = TrimAscii(ExtractHeaderValueCI(text, "Host"));
+    request.host = common::TrimAscii(ExtractHeaderValueCI(text, "Host"));
     LOG_CONN_TRACE(conn_id,
         "{} request line='{}' method='{}' path='{}' host='{}' bytes={}",
         scope,
@@ -1105,7 +1105,7 @@ bool RejectHostMismatch(std::string_view scope,
                         uint64_t conn_id,
                         std::string_view expected_host,
                         std::string_view host) {
-    if (expected_host.empty() || EqualsAsciiCI(host, expected_host)) {
+    if (expected_host.empty() || common::EqualsAsciiCI(host, expected_host)) {
         return false;
     }
     LOG_CONN_DEBUG(conn_id,
@@ -1122,7 +1122,7 @@ void MoveReadAhead(AsyncStream& stream, Http1MessageHead& head) {
     }
 }
 
-net::awaitable<tl::expected<Http1MessageHead, ErrorCode>>
+net::awaitable<tl::expected<Http1MessageHead, common::ErrorCode>>
 ExecuteHttp1UpgradeClientHandshake(
     AsyncStream& stream,
     std::string_view scope,
@@ -1164,7 +1164,7 @@ ExecuteHttp1UpgradeClientHandshake(
     memory::String{}.swap(request);
     if (!write_ok) {
         LOG_CONN_DEBUG(conn_id, "{} client failed to send upgrade request", scope);
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
 
     auto head = co_await ReadHttp1MessageHead(stream);
@@ -1176,10 +1176,10 @@ ExecuteHttp1UpgradeClientHandshake(
     const std::string_view status_line = ExtractStartLine(response);
     if (!HasStatusCode(status_line, "101")) {
         LOG_CONN_DEBUG(conn_id, "{} client upgrade rejected", scope);
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     if (!HasWebSocketUpgradeHeaders(response)) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     co_return std::move(*head);
 }
@@ -1251,19 +1251,19 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     const Http1RequestLine& line = request->line;
     if (line.method.empty() || !detail::PathPrefixMatchesSegment(cfg.path, line.target)) {
         LogPathMismatch(kScope, conn_id, cfg.path, line.target);
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    if (!cfg.method.empty() && !EqualsAsciiCI(line.method, cfg.method)) {
+    if (!cfg.method.empty() && !common::EqualsAsciiCI(line.method, cfg.method)) {
         LOG_CONN_DEBUG(conn_id,
             "HTTP server method mismatch expected='{}' actual='{}'",
             PublicHttpMethodForLog(cfg.method),
             PublicHttpMethodForLog(line.method));
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     if (RejectHostMismatch(kScope, conn_id,
                            ResolveConfiguredHttpHost(cfg.host, &cfg.headers),
                            request->host)) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     RecordExtractedRealIp(request->head.Text(), cfg.real_ip_header, transport_metadata);
@@ -1281,7 +1281,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
 
     if (!co_await WriteFullToStream(*stream, response)) {
         LOG_CONN_DEBUG(conn_id, "HTTP server failed to send 200 response");
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
 
     MoveReadAhead(*stream, request->head);
@@ -1300,7 +1300,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
         ? std::string_view("PUT") : std::string_view(cfg.method);
     size_t reserve_size = 192 + method.size() + req_path.size() + host.size();
     for (const auto& [key, value] : cfg.headers) {
-        if (!key.empty() && !EqualsAsciiCI(key, "Host")) {
+        if (!key.empty() && !common::EqualsAsciiCI(key, "Host")) {
             reserve_size += key.size() + value.size() + 4;
         }
     }
@@ -1309,7 +1309,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
     request.reserve(reserve_size);
     AppendRequestStart(request, method, req_path, host);
     for (const auto& [key, value] : cfg.headers) {
-        if (!key.empty() && !EqualsAsciiCI(key, "Host")) {
+        if (!key.empty() && !common::EqualsAsciiCI(key, "Host")) {
             AppendHeaderLine(request, key, value);
         }
     }
@@ -1317,7 +1317,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
 
     if (!co_await WriteFullToStream(*stream, request)) {
         LOG_CONN_DEBUG(conn_id, "HTTP client failed to send request");
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
     memory::String{}.swap(request);
     if (auto response = co_await ReadClientResponse(*stream, "HTTP", conn_id, "200");
@@ -1342,23 +1342,23 @@ net::awaitable<TransportBuildResult> DoHttpUpgradeServerHandshake(
     if (!request->start_line.starts_with("GET ") ||
         !detail::PathMatchesExactly(cfg.path, request->line.target)) {
         LogPathMismatch(kScope, conn_id, cfg.path, request->line.target);
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     if (!HasWebSocketUpgradeHeaders(request->head.Text())) {
         LOG_CONN_DEBUG(conn_id, "HTTPUpgrade server received invalid upgrade headers");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     if (RejectHostMismatch(kScope, conn_id,
                            ResolveConfiguredHttpHost(cfg.host, &cfg.headers),
                            request->host)) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     RecordExtractedRealIp(request->head.Text(), cfg.real_ip_header, transport_metadata);
 
     if (!co_await WriteFullToStream(*stream, kSwitchingProtocolsResponse)) {
         LOG_CONN_DEBUG(conn_id, "HTTPUpgrade server failed to send 101 response");
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
 
     MoveReadAhead(*stream, request->head);
@@ -1401,27 +1401,27 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     const std::string_view text = request->head.Text();
     if (!HasWebSocketUpgradeHeaders(text)) {
         LOG_CONN_DEBUG(conn_id, "WebSocket server missing 'Upgrade: websocket' header");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     if (!request->start_line.starts_with("GET ") ||
         !request->start_line.ends_with(" HTTP/1.1") ||
-        TrimAscii(ExtractHeaderValueCI(text, "Sec-WebSocket-Version")) != "13") {
+        common::TrimAscii(ExtractHeaderValueCI(text, "Sec-WebSocket-Version")) != "13") {
         LOG_CONN_DEBUG(conn_id, "WebSocket server received invalid upgrade request");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     if (!detail::PathMatchesExactly(ws_cfg.path, request->line.target)) {
         LogPathMismatch(kScope, conn_id, ws_cfg.path, request->line.target);
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     // RFC 6455 4.2.1: the key is a base64-encoded 16-byte nonce.
-    const std::string_view ws_key = TrimAscii(ExtractHeaderValueCI(text, "Sec-WebSocket-Key"));
+    const std::string_view ws_key = common::TrimAscii(ExtractHeaderValueCI(text, "Sec-WebSocket-Key"));
     std::array<uint8_t, 18> decoded_key;
     if (ws_key.size() != 24 || ws_key[22] != '=' || ws_key[23] != '=' ||
         EVP_DecodeBlock(decoded_key.data(),
             reinterpret_cast<const uint8_t*>(ws_key.data()), 24) != 18) {
         LOG_CONN_DEBUG(conn_id, "WebSocket server received invalid Sec-WebSocket-Key header");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     RecordExtractedRealIp(text, ws_cfg.real_ip_header, transport_metadata);
@@ -1435,7 +1435,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     response.append("\r\n\r\n");
     if (!co_await WriteFullToStream(*stream, response)) {
         LOG_CONN_DEBUG(conn_id, "WebSocket server failed to send 101 response");
-        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
 
     // Bytes read past the request head belong to the WebSocket frame stream.

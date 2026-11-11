@@ -12,9 +12,9 @@ using namespace std::chrono_literals;
 
 // Exercise the real AsyncStream capability dispatch and Worker scheduler, with
 // a shared physical transport and independently observable logical cancellation.
-class LogicalStream final : public ::AsyncStream {
+class LogicalStream final : public ::transport::AsyncStream {
 public:
-    LogicalStream(::net::io_context& io, ::TcpStream& physical, int& cancellations)
+    LogicalStream(::net::io_context& io, ::transport::internet::TcpStream& physical, int& cancellations)
         : physical_(physical), cancellations_(cancellations),
           deadline_(io, *this) {}
 
@@ -41,13 +41,13 @@ public:
     bool IsOpen() const override { return open_; }
 
 protected:
-    ::StreamPhaseDeadline* LogicalPhaseDeadline() noexcept override { return &deadline_; }
-    ::TcpStream* BaseTcpStream() override { return &physical_; }
+    ::transport::StreamPhaseDeadline* LogicalPhaseDeadline() noexcept override { return &deadline_; }
+    ::transport::internet::TcpStream* BaseTcpStream() override { return &physical_; }
 
 private:
-    ::TcpStream& physical_;
+    ::transport::internet::TcpStream& physical_;
     int& cancellations_;
-    ::StreamPhaseDeadline deadline_;
+    ::transport::StreamPhaseDeadline deadline_;
     bool open_ = true;
 };
 
@@ -62,13 +62,13 @@ private:
 
 TEST(PhaseDeadline, ClearingOneLogicalDeadlineDoesNotCancelItsSiblingOrPhysicalStream) {
     ::net::io_context io;
-    ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
-    auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
+    ::transport::internet::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
+    auto& scheduler = ::transport::internet::TimeoutScheduler::ForIoContext(io);
     int first_cancelled = 0, second_cancelled = 0;
     LogicalStream first(io, physical, first_cancelled);
     LogicalStream second(io, physical, second_cancelled);
-    ::AsyncStream& first_control = first;
-    ::AsyncStream& second_control = second;
+    ::transport::AsyncStream& first_control = first;
+    ::transport::AsyncStream& second_control = second;
     int physical_notifications = 0, first_notifications = 0, second_notifications = 0;
     CancellationObserver physical_observer(physical_notifications);
     CancellationObserver first_observer(first_notifications);
@@ -109,10 +109,10 @@ TEST(PhaseDeadline, ClearingOneLogicalDeadlineDoesNotCancelItsSiblingOrPhysicalS
 
 TEST(PhaseDeadline, ReplacingDeadlineInvalidatesOldTokensAndSaturatesMaximumDuration) {
     ::net::io_context io;
-    ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
+    ::transport::internet::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
     int cancellations = 0;
     LogicalStream stream(io, physical, cancellations);
-    ::AsyncStream& control = stream;
+    ::transport::AsyncStream& control = stream;
     const auto old = control.StartPhaseDeadline(1s);
     const auto maximum = control.StartPhaseDeadline(std::chrono::seconds::max());
     ASSERT_TRUE(old);
@@ -137,13 +137,13 @@ class DisabledPhaseDeadline : public ::testing::TestWithParam<int> {};
 
 TEST_P(DisabledPhaseDeadline, NonPositiveDurationClearsAnArmedDeadline) {
     ::net::io_context io;
-    ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
+    ::transport::internet::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
     int cancellations = 0;
     LogicalStream stream(io, physical, cancellations);
-    ::AsyncStream& control = stream;
+    ::transport::AsyncStream& control = stream;
     ASSERT_TRUE(control.StartPhaseDeadline(1h));
     EXPECT_FALSE(control.StartPhaseDeadline(std::chrono::seconds(GetParam())));
-    EXPECT_EQ(::TimeoutScheduler::ForIoContext(io).GetResourceStats().active_events, 0u);
+    EXPECT_EQ(::transport::internet::TimeoutScheduler::ForIoContext(io).GetResourceStats().active_events, 0u);
     io.poll();
     EXPECT_EQ(cancellations, 0);
 }
@@ -153,21 +153,21 @@ INSTANTIATE_TEST_SUITE_P(ZeroAndNegativeDuration, DisabledPhaseDeadline,
 
 TEST(PhaseDeadline, ClosedLogicalStreamRejectsDeadlineWithoutClosingPhysicalStream) {
     ::net::io_context io;
-    ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
+    ::transport::internet::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
     int cancellations = 0;
     LogicalStream stream(io, physical, cancellations);
-    ::AsyncStream& control = stream;
+    ::transport::AsyncStream& control = stream;
     ASSERT_TRUE(control.StartPhaseDeadline(1h));
     control.Close();
     EXPECT_FALSE(control.StartPhaseDeadline(1s));
-    EXPECT_EQ(::TimeoutScheduler::ForIoContext(io).GetResourceStats().active_events, 0u);
+    EXPECT_EQ(::transport::internet::TimeoutScheduler::ForIoContext(io).GetResourceStats().active_events, 0u);
     EXPECT_TRUE(physical.IsOpen());
 }
 
 TEST(PhaseDeadline, DestructionCancelsOnlyOwnedEvent) {
     ::net::io_context io;
-    ::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
-    auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
+    ::transport::internet::TcpStream physical(::tcp::socket(io, ::tcp::v4()));
+    auto& scheduler = ::transport::internet::TimeoutScheduler::ForIoContext(io);
     int destroyed_cancellations = 0, survivor_cancellations = 0;
     {
         LogicalStream survivor(io, physical, survivor_cancellations);

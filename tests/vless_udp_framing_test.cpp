@@ -74,7 +74,7 @@ void Run(Factory&& factory) {
 }
 
 buf::MultiBuffer MakeDatagram(const std::vector<uint8_t>& source,
-                              const TargetAddress& target) {
+                              const common::TargetAddress& target) {
     buf::MultiBuffer payload;
     EXPECT_TRUE((buf::AppendSpanToMultiBuffer(source, payload))) << "failed to allocate VLESS UDP test payload";
     EXPECT_TRUE((buf::SetUdpTarget(payload, target))) << "failed to tag VLESS UDP test payload";
@@ -88,7 +88,7 @@ buf::MultiBuffer MakeInput(std::span<const uint8_t> bytes) {
 
 template <typename Fn>
 void ExpectLinkError(Fn&& fn, std::string_view message,
-                     ErrorCode expected = ErrorCode::PROTOCOL_DECODE_FAILED) {
+                     common::ErrorCode expected = common::ErrorCode::PROTOCOL_DECODE_FAILED) {
     try {
         fn();
         ADD_FAILURE() << message;
@@ -100,8 +100,8 @@ void ExpectLinkError(Fn&& fn, std::string_view message,
 TEST(VlessUdpFraming, FragmentedEmptyAndDataFramesPreserveBoundaries) {
     const std::array<uint8_t, 9> wire{0, 0, 0, 2, 0x11, 0x22, 0, 1, 0x33};
     for (size_t split = 0; split <= wire.size(); ++split) {
-        vless::UdpFramer framer(false);
-        vless::FramedUdpPacket packet;
+        proxy::vless::UdpFramer framer(false);
+        proxy::vless::FramedUdpPacket packet;
         std::vector<uint8_t> decoded;
         std::vector<size_t> sizes;
         framer.Feed(MakeInput(std::span(wire).first(split)));
@@ -123,13 +123,13 @@ TEST(VlessUdpFraming, FragmentedEmptyAndDataFramesPreserveBoundaries) {
 }
 
 TEST(VlessUdpFraming, MalformedPacketAddressCannotResynchronize) {
-    vless::UdpFramer invalid(true);
+    proxy::vless::UdpFramer invalid(true);
     const std::array<uint8_t, 6> malformed{0, 1, 0xff, 0, 1, 0x42};
     invalid.Feed(MakeInput(malformed));
-    vless::FramedUdpPacket packet;
+    proxy::vless::FramedUdpPacket packet;
     ExpectLinkError([&] { (void)invalid.Next(packet); }, "invalid address accepted");
     ExpectLinkError([&] { (void)invalid.Next(packet); }, "invalid stream resynchronized");
-    vless::UdpFramer missing_address(true);
+    proxy::vless::UdpFramer missing_address(true);
     const std::array<uint8_t, 2> no_address{0, 0};
     missing_address.Feed(MakeInput(no_address));
     ExpectLinkError([&] { (void)missing_address.Next(packet); },
@@ -138,8 +138,8 @@ TEST(VlessUdpFraming, MalformedPacketAddressCannotResynchronize) {
 }
 
 TEST(VlessUdpFraming, PendingInputOverflowPermanentlyRetiresFramer) {
-    vless::FramedUdpPacket packet;
-    vless::UdpFramer bounded(false);
+    proxy::vless::FramedUdpPacket packet;
+    proxy::vless::UdpFramer bounded(false);
     const std::vector<uint8_t> excess(buf::kPacketStreamPendingLimit + 1, 0);
     ExpectLinkError([&] { bounded.Feed(MakeInput(excess)); }, "unbounded retained input");
     ExpectLinkError([&] { (void)bounded.Next(packet); }, "overflow stream recovered");
@@ -149,11 +149,11 @@ TEST(VlessUdpFraming, PendingInputOverflowPermanentlyRetiresFramer) {
 }
 
 TEST(VlessUdpFraming, MaximumPayloadDecodesFromOneByteFragments) {
-    vless::FramedUdpPacket packet;
+    proxy::vless::FramedUdpPacket packet;
     const std::vector<uint8_t> maximum(65535, 0x71);
     std::vector<uint8_t> large{0xff, 0xff};
     large.insert(large.end(), maximum.begin(), maximum.end());
-    vless::UdpFramer fragmented(false);
+    proxy::vless::UdpFramer fragmented(false);
     for (const auto byte : large) {
         fragmented.Feed(MakeInput(std::span<const uint8_t>(&byte, 1)));
     }
@@ -169,12 +169,12 @@ TEST(VlessUdpFraming, CancelledReadPreservesPartialFrame) {
     tcp::socket receiver = listener.accept();
     const std::array<uint8_t, 5> wire{0, 3, 0x11, 0x22, 0x33};
     net::write(sender, net::buffer(wire.data(), 1));
-    vless::UdpFramer framer(false);
+    proxy::vless::UdpFramer framer(false);
     auto future = net::co_spawn(io, [&]() -> net::awaitable<void> {
         std::array<uint8_t, 5> bytes{};
         co_await net::async_read(receiver, net::buffer(bytes.data(), 1), net::use_awaitable);
         framer.Feed(MakeInput(std::span(bytes).first(1)));
-        vless::FramedUdpPacket packet;
+        proxy::vless::FramedUdpPacket packet;
         EXPECT_FALSE((framer.Next(packet))) << "partial frame delivered before cancellation";
         net::post(io, [&] { receiver.cancel(); });
         IoErrorCode ec;
@@ -195,9 +195,9 @@ TEST(VlessUdpFraming, CancelledReadPreservesPartialFrame) {
 
 void CheckDecoded(const std::vector<uint8_t>& wire,
                   bool packet_addr,
-                  const TargetAddress& target,
+                  const common::TargetAddress& target,
                   const std::vector<uint8_t>& source) {
-    vless::UdpFramer framer(packet_addr);
+    proxy::vless::UdpFramer framer(packet_addr);
     size_t offset = 0;
     for (const size_t fragment : {size_t{1}, size_t{7}, size_t{4096},
                                   size_t{17}, size_t{2048}, size_t{3}}) {
@@ -212,7 +212,7 @@ void CheckDecoded(const std::vector<uint8_t>& wire,
         framer.Feed(MakeInput(std::span(wire).subspan(offset)));
     }
 
-    vless::FramedUdpPacket decoded;
+    proxy::vless::FramedUdpPacket decoded;
     ASSERT_TRUE(framer.Next(decoded));
     ASSERT_EQ(decoded.target.has_value(), packet_addr);
     if (packet_addr) {
@@ -242,20 +242,20 @@ private:
 };
 
 void CheckEmptyDatagramRoundTrip(bool packet_addr) {
-    const TargetAddress target("127.0.0.1", 53);
+    const common::TargetAddress target("127.0.0.1", 53);
     CaptureWriter capture;
     const std::vector<uint8_t> data{0x42};
     ::Run([&]() -> net::awaitable<void> {
-        co_await vless::WriteUdpDatagram(
+        co_await proxy::vless::WriteUdpDatagram(
             capture, MakeDatagram({}, target), packet_addr);
-        co_await vless::WriteUdpDatagram(
+        co_await proxy::vless::WriteUdpDatagram(
             capture, MakeDatagram(data, target), packet_addr);
-        co_await vless::WriteUdpDatagram(
+        co_await proxy::vless::WriteUdpDatagram(
             capture, target, packet_addr, std::span<const net::const_buffer>{});
     });
     EXPECT_EQ((capture.bytes.size()), ((packet_addr ? 28 : 7))) << "VLESS UDP empty datagrams did not write real frame headers";
     FragmentReader source(capture.bytes);
-    vless::UdpFramer framer(packet_addr);
+    proxy::vless::UdpFramer framer(packet_addr);
     ::Run([&]() -> net::awaitable<void> {
         for (const size_t size : {size_t{0}, size_t{1}, size_t{0}}) {
             auto packet = co_await framer.ReadDatagram(source, target);
@@ -270,13 +270,13 @@ void CheckEmptyDatagramRoundTrip(bool packet_addr) {
 }  // namespace
 
 TEST(VlessUdpFraming, LargeDatagramAndScatterWritePreserveMessageBoundary) {
-    const TargetAddress target("1.1.1.1", 53);
+    const common::TargetAddress target("1.1.1.1", 53);
     const std::vector<uint8_t> source(buf::Buffer::kSize + 257, 0x6d);
 
     CaptureWriter fixed_capture;
     auto fixed_payload = MakeDatagram(source, target);
     ::Run([&]() -> net::awaitable<void> {
-        co_await vless::WriteUdpDatagram(
+        co_await proxy::vless::WriteUdpDatagram(
             fixed_capture, std::move(fixed_payload), false);
     });
     EXPECT_TRUE((fixed_capture.bytes.size() == source.size() + 2 &&
@@ -288,7 +288,7 @@ TEST(VlessUdpFraming, LargeDatagramAndScatterWritePreserveMessageBoundary) {
     CaptureWriter packet_addr_capture;
     auto packet_addr_payload = MakeDatagram(source, target);
     ::Run([&]() -> net::awaitable<void> {
-        co_await vless::WriteUdpDatagram(
+        co_await proxy::vless::WriteUdpDatagram(
             packet_addr_capture, std::move(packet_addr_payload), true);
     });
     CheckDecoded(packet_addr_capture.bytes, true, target, source);
@@ -301,7 +301,7 @@ TEST(VlessUdpFraming, LargeDatagramAndScatterWritePreserveMessageBoundary) {
                     source.size() - buf::Buffer::kSize),
     };
     ::Run([&]() -> net::awaitable<void> {
-        co_await vless::WriteUdpDatagram(
+        co_await proxy::vless::WriteUdpDatagram(
             scatter_capture, target, false, scatter);
     });
     EXPECT_EQ((scatter_capture.bytes), (fixed_capture.bytes)) << "scatter VLESS UDP payload was split into multiple frames";
@@ -309,16 +309,16 @@ TEST(VlessUdpFraming, LargeDatagramAndScatterWritePreserveMessageBoundary) {
 }
 
 TEST(VlessUdpFraming, OversizedDatagramDoesNotWritePartialFrame) {
-    const TargetAddress target("1.1.1.1", 53);
+    const common::TargetAddress target("1.1.1.1", 53);
     const std::vector<uint8_t> oversized(65536, 0x42);
     const std::array<net::const_buffer, 1> oversized_buffers{net::buffer(oversized)};
     CaptureWriter rejected_capture;
     ExpectLinkError([&] {
         ::Run([&]() -> net::awaitable<void> {
-            co_await vless::WriteUdpDatagram(
+            co_await proxy::vless::WriteUdpDatagram(
                 rejected_capture, target, false, oversized_buffers);
         });
-    }, "oversized VLESS datagram accepted", ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }, "oversized VLESS datagram accepted", common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     EXPECT_TRUE((rejected_capture.bytes.empty())) << "oversized VLESS datagram partially written";
 
 }
@@ -335,9 +335,9 @@ TEST(VlessUdpFraming, TruncatedEofCannotResume) {
     const std::array<uint8_t, 5> wire{0, 3, 0x11, 0x22, 0x33};
     for (size_t cut = 1; cut < wire.size(); ++cut) {
         SCOPED_TRACE(cut);
-        vless::UdpFramer framer(false);
+        proxy::vless::UdpFramer framer(false);
         framer.Feed(MakeInput(std::span(wire).first(cut)));
-        vless::FramedUdpPacket packet;
+        proxy::vless::FramedUdpPacket packet;
         ASSERT_FALSE(framer.Next(packet));
         EXPECT_THROW(framer.Finish(), transport::LinkError);
         EXPECT_THROW(framer.Feed(MakeInput(std::span(wire).subspan(cut))), transport::LinkError);
@@ -348,9 +348,9 @@ TEST(VlessUdpFraming, TruncatedEofCannotResume) {
 
 TEST(VlessUdpFraming, CleanEofRejectsFurtherInput) {
     const std::array<uint8_t, 3> wire{0, 1, 0x73};
-    vless::UdpFramer framer(false);
+    proxy::vless::UdpFramer framer(false);
     framer.Feed(MakeInput(wire));
-    vless::FramedUdpPacket packet;
+    proxy::vless::FramedUdpPacket packet;
     ASSERT_TRUE(framer.Next(packet));
     EXPECT_EQ(Flatten(packet.payload), std::vector<uint8_t>({0x73}));
     framer.Finish();
@@ -363,19 +363,19 @@ TEST(VlessUdpFraming, CleanEofRejectsFurtherInput) {
 
 TEST(VlessUdpFraming, ReadEofDoesNotConsumeAnotherTransport) {
     const std::array<uint8_t, 3> wire{0, 1, 0x73};
-    const TargetAddress target("127.0.0.1", 53);
+    const common::TargetAddress target("127.0.0.1", 53);
     net::io_context io;
     tcp::acceptor listener(io, {net::ip::address_v4::loopback(), 0});
     tcp::socket ended_peer(io);
     ended_peer.connect(listener.local_endpoint());
-    TcpStream ended(listener.accept());
+    transport::internet::TcpStream ended(listener.accept());
     ended_peer.shutdown(tcp::socket::shutdown_send);
     tcp::socket fresh_peer(io);
     fresh_peer.connect(listener.local_endpoint());
-    TcpStream fresh(listener.accept());
+    transport::internet::TcpStream fresh(listener.accept());
     net::write(fresh_peer, net::buffer(wire));
     fresh_peer.shutdown(tcp::socket::shutdown_send);
-    vless::UdpFramer framer(false);
+    proxy::vless::UdpFramer framer(false);
     auto result = net::co_spawn(io, [&]() -> net::awaitable<void> {
         EXPECT_TRUE(((co_await framer.ReadDatagram(ended, target)).empty())) << "clean EOF produced a datagram";
         EXPECT_TRUE(((co_await framer.ReadDatagram(fresh, target)).empty())) << "finished VLESS framer consumed another transport";
@@ -395,8 +395,8 @@ TEST(VlessUdpFraming, ReadEofDoesNotConsumeAnotherTransport) {
 TEST(VlessUdpFraming, EmptyDatagramAllocationFailureRetiresFramer) {
     const std::array<uint8_t, 2> empty_wire{0, 0};
     const std::array<uint8_t, 3> next_wire{0, 1, 0x73};
-    const TargetAddress target("127.0.0.1", 53);
-    vless::UdpFramer framer(false);
+    const common::TargetAddress target("127.0.0.1", 53);
+    proxy::vless::UdpFramer framer(false);
     framer.Feed(MakeInput(empty_wire));
     FragmentReader source(std::span<const uint8_t>{});
     ::Run([&]() -> net::awaitable<void> {
@@ -415,20 +415,20 @@ TEST(VlessUdpFraming, EmptyDatagramAllocationFailureRetiresFramer) {
         EXPECT_TRUE((failed)) << "empty VLESS datagram allocation failure was hidden";
     });
     EXPECT_THROW(framer.Feed(MakeInput(next_wire)), transport::LinkError);
-    vless::FramedUdpPacket packet;
+    proxy::vless::FramedUdpPacket packet;
     EXPECT_THROW((void)framer.Next(packet), transport::LinkError);
     EXPECT_THROW(framer.Finish(), transport::LinkError);
 }
 
 TEST(VlessUdpFraming, PacketAddressCountsTowardWireLength) {
-    const TargetAddress target("127.0.0.1", 53);
+    const common::TargetAddress target("127.0.0.1", 53);
     constexpr size_t kAddressSize = 1 + sizeof(net::ip::address_v4::bytes_type) + sizeof(uint16_t);
     constexpr size_t kPayloadLimit = std::numeric_limits<uint16_t>::max() - kAddressSize;
     CaptureWriter capture;
     std::vector<uint8_t> payload(kPayloadLimit, 0x42);
     ::Run([&]() -> net::awaitable<void> {
         const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
-        co_await vless::WriteUdpDatagram(capture, target, true, buffers);
+        co_await proxy::vless::WriteUdpDatagram(capture, target, true, buffers);
     });
     EXPECT_EQ(capture.bytes.size(), std::numeric_limits<uint16_t>::max() + sizeof(uint16_t));
     payload.push_back(0x43);
@@ -436,11 +436,11 @@ TEST(VlessUdpFraming, PacketAddressCountsTowardWireLength) {
     try {
         ::Run([&]() -> net::awaitable<void> {
             const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
-            co_await vless::WriteUdpDatagram(rejected, target, true, buffers);
+            co_await proxy::vless::WriteUdpDatagram(rejected, target, true, buffers);
         });
         FAIL() << "packet-address framing exceeded its wire length";
     } catch (const transport::LinkError& error) {
-        EXPECT_EQ(error.code(), ErrorCode::PROTOCOL_ENCODE_FAILED);
+        EXPECT_EQ(error.code(), common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     EXPECT_TRUE(rejected.bytes.empty());
 }

@@ -79,13 +79,13 @@ struct MuxReply {
 class TcpSubState;
 
 struct ReplyQueueState {
-    explicit ReplyQueueState(SignalChannel& main_signal)
+    explicit ReplyQueueState(common::SignalChannel& main_signal)
         : main_signal_(main_signal) {}
     memory::RingDeque<MuxReply> queue;
     size_t tcp_queued_bytes = 0;   // TCP 子会话回包字节（含 overhead）
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
     uint32_t active_sub_loops = 0;
-    SignalChannel& main_signal_;
+    common::SignalChannel& main_signal_;
     TcpSubState* waiting_writers_head = nullptr;
     bool running = true;
     bool tcp_overflowed = false;
@@ -252,17 +252,17 @@ private:
 };
 
 struct ClientReadQueueState {
-    explicit ClientReadQueueState(net::io_context& io_context, SignalChannel& main_signal)
+    explicit ClientReadQueueState(net::io_context& io_context, common::SignalChannel& main_signal)
         : space_signal(net::any_io_executor(io_context.get_executor()), 1)
         , main_signal_(main_signal) {}
-    SignalChannel space_signal;
-    SignalChannel& main_signal_;
+    common::SignalChannel space_signal;
+    common::SignalChannel& main_signal_;
     memory::RingDeque<QueuedInput> queue;
     size_t queued_bytes = 0;
     bool running = true;
     bool read_backpressured = false;
     bool done = false;
-    ErrorCode error = ErrorCode::OK;
+    common::ErrorCode error = common::ErrorCode::OK;
 
     void WakeMain() noexcept {
         (void)main_signal_.try_send(IoErrorCode{});
@@ -315,7 +315,7 @@ struct ClientReadQueueState {
         return queued_bytes <= kMuxQueueLowWaterBytes;
     }
 
-    void MarkDone(ErrorCode ec) noexcept {
+    void MarkDone(common::ErrorCode ec) noexcept {
         if (done) {
             return;
         }
@@ -356,7 +356,7 @@ public:
     virtual void PushClientFramePayload(
         buf::MultiBuffer mb,
         size_t data_len,
-        const TargetAddress* packet_target = nullptr) = 0;
+        const common::TargetAddress* packet_target = nullptr) = 0;
 
     [[nodiscard]] bool DispatchDone() const noexcept {
         return dispatch_done_;
@@ -385,7 +385,7 @@ public:
                     "Mux sub-session input cancelled");
             }
         }
-        if (terminal_error_ == ErrorCode::RESOURCE_EXHAUSTED) {
+        if (terminal_error_ == common::ErrorCode::RESOURCE_EXHAUSTED) {
             throw IoSystemError(io_error::no_buffer_space, "Mux sub-session input overflow");
         }
         throw IoSystemError(io_error::operation_aborted, "Mux sub-session input cancelled");
@@ -410,7 +410,7 @@ public:
         Cancel();
     }
 
-    void Cancel(ErrorCode error = ErrorCode::CANCELLED) noexcept {
+    void Cancel(common::ErrorCode error = common::ErrorCode::CANCELLED) noexcept {
         if (cancelled_) {
             return;
         }
@@ -499,11 +499,11 @@ private:
         (void)input_signal_.try_send(IoErrorCode{});
     }
 
-    SignalChannel input_signal_;
+    common::SignalChannel input_signal_;
     transport::CancellationSource cancellation_;
     memory::RingDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
-    ErrorCode terminal_error_ = ErrorCode::CANCELLED;
+    common::ErrorCode terminal_error_ = common::ErrorCode::CANCELLED;
     bool end_sent_ = false;
     bool end_error_ = false;
     bool dispatch_done_ = false;
@@ -525,7 +525,7 @@ public:
     void PushClientFramePayload(
         buf::MultiBuffer mb,
         size_t data_len,
-        const TargetAddress* packet_target) override {
+        const common::TargetAddress* packet_target) override {
         (void)data_len;
         (void)packet_target;
         const size_t bytes = mb.byte_size();
@@ -639,7 +639,7 @@ private:
 
     friend struct ReplyQueueState;
 
-    SignalChannel output_signal_;
+    common::SignalChannel output_signal_;
     TcpSubState* next_waiting_writer_ = nullptr;
     bool waiting_in_reply_queue_ = false;
 };
@@ -688,7 +688,7 @@ public:
         uint16_t session_id,
         ReplyQueueState& reply_queue,
         uint64_t parent_conn_id,
-        TargetAddress default_target)
+        common::TargetAddress default_target)
         : MuxSubSession(io_context, session_id, reply_queue, true)
         , parent_conn_id_(parent_conn_id)
         , default_target_(std::move(default_target)) {}
@@ -700,7 +700,7 @@ public:
     void PushClientFramePayload(
         buf::MultiBuffer mb,
         size_t data_len,
-        const TargetAddress* packet_target) override {
+        const common::TargetAddress* packet_target) override {
         if (InputClosed()) {
             mb.clear();
             return;
@@ -738,7 +738,7 @@ public:
         if (!datagram.target->IsValid() ||
             datagram.payload_size > std::numeric_limits<uint16_t>::max()) {
             mb.clear();
-            throw transport::LinkError(ErrorCode::INVALID_ARGUMENT);
+            throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
         }
         if (!reply_queue_.CanPushUdp(datagram.payload_size)) {
             const uint64_t dropped = ++reply_queue_.udp_dropped;
@@ -766,7 +766,7 @@ public:
 private:
 
     uint64_t parent_conn_id_ = 0;
-    TargetAddress default_target_;
+    common::TargetAddress default_target_;
 };
 
 net::awaitable<void> RunSubDispatch(
@@ -775,8 +775,8 @@ net::awaitable<void> RunSubDispatch(
     const routing::DispatchPolicy& policy,
     const proxyman::inbound::AdmissionEnvironment& environment,
     MuxSubSession* sub,
-    StatsShard& stats,
-    const TimeoutsConfig& timeouts,
+    app::StatsShard& stats,
+    const infra::TimeoutsConfig& timeouts,
     SubLoopLease sub_loop)
 {
     (void)sub_loop;
@@ -797,7 +797,7 @@ net::awaitable<void> RunSubDispatch(
                 policy,
                 nullptr,
                 link,
-                InitialPayload{},
+                common::InitialPayload{},
                 sub->ctx,
                 stats,
                 timeouts);
@@ -815,9 +815,9 @@ namespace {
 class MuxServerSession final {
 public:
     MuxServerSession(net::io_context& io_context, transport::Link client_link,
-        AsyncStream& client_control, routing::Dispatcher& dispatcher,
+        transport::AsyncStream& client_control, routing::Dispatcher& dispatcher,
         const routing::DispatchPolicy& policy, const proxyman::inbound::AdmissionEnvironment& environment,
-        session::Context& parent_ctx, StatsShard& stats, const TimeoutsConfig& timeouts,
+        session::Context& parent_ctx, app::StatsShard& stats, const infra::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout)
         : io_context(io_context), client_link(client_link), client_control(client_control),
           dispatcher(dispatcher), policy(policy), environment(environment), parent_ctx(parent_ctx),
@@ -827,12 +827,12 @@ public:
           parent_conn_id(parent_ctx.conn_id) {}
     MuxServerSession(const MuxServerSession&) = delete;
     MuxServerSession& operator=(const MuxServerSession&) = delete;
-    net::awaitable<RelayResult> Run() {
+    net::awaitable<app::RelayResult> Run() {
         try {
-    LOG_ACCESS(FormatAccessLog(parent_ctx));
+    LOG_ACCESS(common::FormatAccessLog(parent_ctx));
     if (!client_link.Valid()) {
         client_control.CloseAbortive();
-        result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
+        result.error = common::ErrorCode::PROTOCOL_DECODE_FAILED;
         co_return result;
     }
     (void)client_control.ConsumePhaseDeadline();
@@ -851,8 +851,8 @@ public:
     // Acquire the join continuation before any task starts. Session storage is
     // released only after the reader, frame loop and every dynamic dispatch have
     // delivered their co_spawn completion, including failure/cancellation.
-    co_await RunAwaitableTaskGroup(co_await net::this_coro::executor,
-        [&](AwaitableTaskGroup& tasks) {
+    co_await common::RunAwaitableTaskGroup(co_await net::this_coro::executor,
+        [&](common::AwaitableTaskGroup& tasks) {
             tasks.Spawn(ReadClient());
             tasks.Spawn(ProcessFrames(tasks));
         });
@@ -865,9 +865,9 @@ public:
 #endif
     } catch (...) {
         stats.OnError();
-        result.error = transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL);
+        result.error = transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL);
     }
-    if (result.error != ErrorCode::OK) {
+    if (result.error != common::ErrorCode::OK) {
         client_control.CloseAbortive();
     }
     co_return result;
@@ -878,12 +878,12 @@ private:
             try {
                 buf::MultiBuffer read_mb = co_await client_link.reader->ReadMultiBuffer();
                 if (read_mb.byte_size() == 0) {
-                    client_reads.MarkDone(ErrorCode::OK);
+                    client_reads.MarkDone(common::ErrorCode::OK);
                     co_return;
                 }
                 const size_t read_bytes = read_mb.byte_size();
                 if (!client_reads.Push(std::move(read_mb), read_bytes)) {
-                    client_reads.MarkDone(ErrorCode::RESOURCE_EXHAUSTED);
+                    client_reads.MarkDone(common::ErrorCode::RESOURCE_EXHAUSTED);
                     co_return;
                 }
                 while (client_reads.running &&
@@ -891,29 +891,29 @@ private:
                     auto [ec] = co_await client_reads.space_signal.async_receive(
                         net::as_tuple(net::use_awaitable));
                     if (ec) {
-                        client_reads.MarkDone(ErrorCode::OK);
+                        client_reads.MarkDone(common::ErrorCode::OK);
                         co_return;
                     }
                 }
             } catch (...) {
                 // running 已撤销时由帧循环收尾，读侧异常不再作为结束原因。
-                ErrorCode ec = client_reads.running
-                    ? transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL)
-                    : ErrorCode::OK;
-                if (ConsumeReadSideTimeout(client_control)) {
-                    ec = ErrorCode::RELAY_TIMEOUT;
+                common::ErrorCode ec = client_reads.running
+                    ? transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL)
+                    : common::ErrorCode::OK;
+                if (transport::ConsumeReadSideTimeout(client_control)) {
+                    ec = common::ErrorCode::RELAY_TIMEOUT;
                 }
                 client_reads.MarkDone(ec);
                 co_return;
             }
         }
-        client_reads.MarkDone(ErrorCode::OK);
+        client_reads.MarkDone(common::ErrorCode::OK);
     }
     void RecordClientWriteFailure(const std::exception_ptr& failure) {
-            if (ConsumeWriteSideTimeout(client_control)) {
-                result.error = ErrorCode::RELAY_TIMEOUT;
-            } else if (!IsOperationCancelled(failure)) {
-                result.error = transport::ClassifyFailure(failure, ErrorCode::INTERNAL);
+            if (transport::ConsumeWriteSideTimeout(client_control)) {
+                result.error = common::ErrorCode::RELAY_TIMEOUT;
+            } else if (!common::IsOperationCancelled(failure)) {
+                result.error = transport::ClassifyFailure(failure, common::ErrorCode::INTERNAL);
             }
     }
     net::awaitable<bool> WriteFrameToClient(std::span<const uint8_t> frame) {
@@ -936,7 +936,7 @@ private:
     }
     net::awaitable<bool> WritePayloadFrameToClient(MuxReply& reply) {
                 const size_t payload_size = reply.PayloadSize();
-                std::array<uint8_t, 2 + 4 + 1 + kMaxBaseEncodedAddressSize + 2> write_frame{};
+                std::array<uint8_t, 2 + 4 + 1 + common::kMaxBaseEncodedAddressSize + 2> write_frame{};
                 size_t header_len = 0;
                 if (reply.is_udp) {
                     // 入队前已校验整份 datagram 带同一合法目标；队列不改写 Buffer 标签。
@@ -950,7 +950,7 @@ private:
                         LOG_CONN_DEBUG(parent_ctx,
                             "UDP reply header encode failed sid={} src={} payload={}B",
                             reply.session_id,
-                            datagram.target ? *datagram.target : TargetAddress{},
+                            datagram.target ? *datagram.target : common::TargetAddress{},
                             payload_size);
                         reply.payload.clear();
                         co_return true;
@@ -962,7 +962,7 @@ private:
                         payload_size);
                     if (header_len == 0) {
                         reply.payload.clear();
-                        result.error = ErrorCode::PROTOCOL_ENCODE_FAILED;
+                        result.error = common::ErrorCode::PROTOCOL_ENCODE_FAILED;
                         co_return false;
                     }
                 }
@@ -971,7 +971,7 @@ private:
                     co_return true;
                 }
 
-                ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+                common::ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
                 framed.Append(net::const_buffer(write_frame.data(), header_len));
                 framed.AppendMultiBuffer(reply.payload);
                 try {
@@ -986,7 +986,7 @@ private:
                 reply.payload.clear();
                 co_return false;
     }
-    net::awaitable<void> ProcessFrames(AwaitableTaskGroup& tasks) {
+    net::awaitable<void> ProcessFrames(common::AwaitableTaskGroup& tasks) {
         try {
             LOG_CONN_DEBUG(parent_ctx, "starting mux relay");
 
@@ -999,7 +999,7 @@ private:
                 if (reply.is_end || reply.dispatch_done) {
                     if (reply.dispatch_done) {
                         sub_sessions.erase(reply.session_id);
-                        MaybeShrinkHashContainer(sub_sessions, 8);
+                        common::MaybeShrinkHashContainer(sub_sessions, 8);
                     }
                     if (!reply.is_end) {
                         continue;
@@ -1027,7 +1027,7 @@ private:
                     "reply queue overflow: tcp={}B udp={}B items={} emergency_limit={}B",
                     reply_queue.tcp_queued_bytes, reply_queue.udp_queued_bytes,
                     reply_queue.queue.size(), kMuxQueueEmergencyBytes);
-                result.error = ErrorCode::RESOURCE_EXHAUSTED;
+                result.error = common::ErrorCode::RESOURCE_EXHAUSTED;
                 break;
             }
 
@@ -1044,7 +1044,7 @@ private:
                 continue;
             }
 
-            if (client_reads.done && client_reads.error != ErrorCode::OK &&
+            if (client_reads.done && client_reads.error != common::ErrorCode::OK &&
                 client_reads.queue.empty()) {
                 result.error = client_reads.error;
                 running = false;
@@ -1094,7 +1094,7 @@ private:
                 mux::FrameHeader& hdr = *opt_hdr;
                 if (hdr.frame_size == 0) {
                     LOG_CONN_DEBUG(parent_ctx, "invalid frame");
-                    result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
+                    result.error = common::ErrorCode::PROTOCOL_DECODE_FAILED;
                     running = false;
                     break;
                 }
@@ -1109,7 +1109,7 @@ private:
                     if (frame_buf.DropPrefixBytes(hdr.data_offset) != hdr.data_offset ||
                         !frame_buf.MovePrefixTo(frame_payload, hdr.data_len)) {
                         LOG_CONN_DEBUG(parent_ctx, "payload extraction failed");
-                        result.error = ErrorCode::RESOURCE_EXHAUSTED;
+                        result.error = common::ErrorCode::RESOURCE_EXHAUSTED;
                         running = false;
                         break;
                     }
@@ -1145,13 +1145,13 @@ private:
                         proxy::BindInboundRequestTarget(
                             rejected_ctx,
                             proxy::InboundRequestTarget{
-                                is_udp ? Network::UDP : Network::TCP,
+                                is_udp ? common::Network::UDP : common::Network::TCP,
                                 std::move(hdr.target),
                                 std::move(hdr.forwarded)});
                         LOG_CONN_DEBUG(rejected_ctx,
                             "refused NEW sid={} active={}",
                             hdr.session_id, sub_sessions.size());
-                        LOG_ACCESS(FormatAccessLog(rejected_ctx, AccessStatus::Rejected,
+                        LOG_ACCESS(common::FormatAccessLog(rejected_ctx, common::AccessStatus::Rejected,
                             sub_sessions.contains(hdr.session_id)
                                 ? "duplicate stream ID" : "concurrent stream limit"));
                         std::array<uint8_t, 6> write_frame{};
@@ -1185,7 +1185,7 @@ private:
                     proxy::BindInboundRequestTarget(
                         sub_state->ctx,
                         proxy::InboundRequestTarget{
-                            is_udp ? Network::UDP : Network::TCP,
+                            is_udp ? common::Network::UDP : common::Network::TCP,
                             std::move(hdr.target),
                             std::move(hdr.forwarded)});
                     if (hdr.has_data) {
@@ -1212,7 +1212,7 @@ private:
                     } catch (...) {
                         sub_ptr->Cancel();
                         sub_ptr->MarkDispatchDone();
-                        result.error = ErrorCode::RESOURCE_EXHAUSTED;
+                        result.error = common::ErrorCode::RESOURCE_EXHAUSTED;
                         running = false;
                     }
                     break;
@@ -1225,7 +1225,7 @@ private:
                         ? nullptr
                         : session_it->second.get();
                     if ((!sub || !sub->IsUdp()) && hdr.has_target) {
-                        result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
+                        result.error = common::ErrorCode::PROTOCOL_DECODE_FAILED;
                         running = false;
                         break;
                     }
@@ -1288,8 +1288,8 @@ private:
                 continue;
             }
             if (client_reads.done) {
-                if (client_reads.error != ErrorCode::OK) {
-                    if (client_reads.error == ErrorCode::RELAY_TIMEOUT) {
+                if (client_reads.error != common::ErrorCode::OK) {
+                    if (client_reads.error == common::ErrorCode::RELAY_TIMEOUT) {
                         LOG_CONN_DEBUG(parent_ctx, "read-side timeout");
                     }
                     result.error = client_reads.error;
@@ -1297,7 +1297,7 @@ private:
                     break;
                 }
                 if (frame_buf.byte_size() != 0) {
-                    result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
+                    result.error = common::ErrorCode::PROTOCOL_DECODE_FAILED;
                     running = false;
                     break;
                 }
@@ -1316,7 +1316,7 @@ private:
             }
             }
         } catch (...) {
-            result.error = transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL);
+            result.error = transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL);
         }
 
         // ------------------------------------------------------------------------
@@ -1338,15 +1338,15 @@ private:
     }
     net::io_context& io_context;
     transport::Link client_link;
-    AsyncStream& client_control;
+    transport::AsyncStream& client_control;
     routing::Dispatcher& dispatcher;
     const routing::DispatchPolicy& policy;
     const proxyman::inbound::AdmissionEnvironment& environment;
     session::Context& parent_ctx;
-    StatsShard& stats;
-    const TimeoutsConfig& timeouts;
+    app::StatsShard& stats;
+    const infra::TimeoutsConfig& timeouts;
     uint32_t pressure_idle_timeout;
-    SignalChannel main_signal;
+    common::SignalChannel main_signal;
     ReplyQueueState reply_queue;
     ClientReadQueueState client_reads;
     memory::UnorderedMap<uint16_t, std::unique_ptr<MuxSubSession>> sub_sessions;
@@ -1354,21 +1354,21 @@ private:
     const uint64_t parent_conn_id;
     bool running = true;
     bool client_input_done = false;
-    RelayResult result;
+    app::RelayResult result;
 };
 
 }  // namespace
 
-net::awaitable<RelayResult> ServeMuxInbound(
+net::awaitable<app::RelayResult> ServeMuxInbound(
     net::io_context& io_context,
     transport::Link client_link,
-    AsyncStream& client_control,
+    transport::AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& policy,
     const proxyman::inbound::AdmissionEnvironment& environment,
     session::Context& parent_ctx,
-    StatsShard& stats,
-    const TimeoutsConfig& timeouts,
+    app::StatsShard& stats,
+    const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout)
 {
     try {
@@ -1378,8 +1378,8 @@ net::awaitable<RelayResult> ServeMuxInbound(
     } catch (...) {
         stats.OnError();
         client_control.CloseAbortive();
-        RelayResult result;
-        result.error = transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL);
+        app::RelayResult result;
+        result.error = transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL);
         co_return result;
     }
 }

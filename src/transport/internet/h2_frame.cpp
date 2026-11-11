@@ -24,10 +24,10 @@ net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream) {
     }
 
     H2Frame frame;
-    const uint32_t length = LoadU24BE(header.data());
+    const uint32_t length = common::LoadU24BE(header.data());
     frame.type = static_cast<H2FrameType>(header[3]);
     frame.flags = header[4];
-    frame.stream_id = LoadU32BE(header.data() + 5) & 0x7fff'ffffu;
+    frame.stream_id = common::LoadU32BE(header.data() + 5) & 0x7fff'ffffu;
 
     if (length > kHttp2MaxFramePayload) {
         throw IoSystemError(io_error::message_size, "HTTP/2 frame exceeds receive limit");
@@ -77,10 +77,10 @@ net::awaitable<void> WriteH2FrameBuffers(
     }
 
     std::array<uint8_t, kHttp2FrameHeaderSize> header{};
-    StoreU24BE(header.data(), static_cast<uint32_t>(payload_len));
+    common::StoreU24BE(header.data(), static_cast<uint32_t>(payload_len));
     header[3] = static_cast<uint8_t>(type);
     header[4] = flags;
-    StoreU32BE(header.data() + 5, stream_id & 0x7fff'ffffu);
+    common::StoreU32BE(header.data() + 5, stream_id & 0x7fff'ffffu);
 
     std::array<net::const_buffer, 8> all{};
     size_t count = 0;
@@ -174,9 +174,9 @@ net::awaitable<void> WriteH2Frame(
     std::span<const uint8_t> payload) {
     std::optional<uint32_t> initial_window;
     for (size_t offset = 0; offset + 6 <= payload.size(); offset += 6) {
-        const uint16_t id = LoadU16BE(payload.data() + offset);
+        const uint16_t id = common::LoadU16BE(payload.data() + offset);
         if (id != 4) continue;
-        const uint32_t value = LoadU32BE(payload.data() + offset + 2);
+        const uint32_t value = common::LoadU32BE(payload.data() + offset + 2);
         if (value > H2SendWindow::kMax) return tl::unexpected(H2Error::FlowControl);
         initial_window = value;
     }
@@ -187,7 +187,7 @@ net::awaitable<void> WriteH2Frame(
 // octets; a zero increment is a PROTOCOL_ERROR.
 [[nodiscard]] tl::expected<uint32_t, H2Error> WindowUpdateIncrement(const H2Frame& frame) {
     if (frame.payload.size() != 4) return tl::unexpected(H2Error::FrameSize);
-    const uint32_t increment = LoadU32BE(frame.payload.data()) & 0x7fff'ffffu;
+    const uint32_t increment = common::LoadU32BE(frame.payload.data()) & 0x7fff'ffffu;
     if (increment == 0) return tl::unexpected(H2Error::Protocol);
     return increment;
 }
@@ -195,11 +195,11 @@ net::awaitable<void> WriteH2Frame(
 void EncodeWindowUpdateFrame(uint8_t* out,
                              uint32_t stream_id,
                              uint32_t increment) noexcept {
-    StoreU24BE(out, 4);
+    common::StoreU24BE(out, 4);
     out[3] = static_cast<uint8_t>(H2FrameType::WINDOW_UPDATE);
     out[4] = 0;
-    StoreU32BE(out + 5, stream_id & 0x7fff'ffffu);
-    StoreU32BE(out + 9, increment & 0x7fff'ffffu);
+    common::StoreU32BE(out + 5, stream_id & 0x7fff'ffffu);
+    common::StoreU32BE(out + 9, increment & 0x7fff'ffffu);
 }
 
 // One write carries the connection frame, then the stream frame; a zero
@@ -326,10 +326,10 @@ ParseH2RequestHeaders(
                 }
                 host.emplace(value);
             } else if (!trailers && !real_ip_header.empty() &&
-                       EqualsAsciiCI(name, real_ip_header)) {
+                       common::EqualsAsciiCI(name, real_ip_header)) {
                 if (request.metadata.real_ip.empty()) {
                     const std::string_view real_ip =
-                        TrimAscii(value.substr(0, value.find(',')));
+                        common::TrimAscii(value.substr(0, value.find(',')));
                     if (!real_ip.empty()) {
                         request.metadata.real_ip.assign(real_ip);
                     }
@@ -343,7 +343,7 @@ ParseH2RequestHeaders(
         co_return std::optional<H2RequestHeaders>{};
     }
     if (host) {
-        if (has_authority && !EqualsAsciiCI(request.authority, *host)) {
+        if (has_authority && !common::EqualsAsciiCI(request.authority, *host)) {
             co_return std::optional<H2RequestHeaders>{};
         }
         if (!has_authority) request.authority = std::move(*host);

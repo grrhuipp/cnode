@@ -35,13 +35,13 @@ struct State { int fault = 0; int active = 0; bool destroyed = false; int id = 0
 
 
 template<class Scenario>
-void RunFixture(const RateLimitConfig& config, Scenario scenario) {
+void RunFixture(const app::RateLimitConfig& config, Scenario scenario) {
     net::io_context io;
-    auto coordinator = std::make_shared<GroupCoordinator>(io);
+    auto coordinator = std::make_shared<app::GroupCoordinator>(io);
     coordinator->RegisterWorker(io);
-    auto limiter = ConnectionLimiter::Acquire(config, coordinator);
-    UserOnlineTracker tracker(*coordinator);
-    StatsShard stats;
+    auto limiter = app::ConnectionLimiter::Acquire(config, coordinator);
+    common::UserOnlineTracker tracker(*coordinator);
+    app::StatsShard stats;
     const proxyman::inbound::AdmissionEnvironment environment{
         *coordinator, *limiter, tracker, stats};
     bool finalized = false;
@@ -84,7 +84,7 @@ void RunFixture(const RateLimitConfig& config, Scenario scenario) {
 void Raise(int fault) {
     switch (fault) {
         case 1: throw std::bad_alloc();
-        case 2: throw transport::LinkError(ErrorCode::BLOCKED);
+        case 2: throw transport::LinkError(common::ErrorCode::BLOCKED);
         case 3: throw IoSystemError(io_error::operation_aborted);
         case 4: throw IoSystemError(io_error::timed_out);
         case 5: throw IoSystemError(io_error::connection_reset);
@@ -93,7 +93,7 @@ void Raise(int fault) {
     }
 }
 
-class Stream final : public AsyncStream {
+class Stream final : public transport::AsyncStream {
 public:
     explicit Stream(State& state) : state_(state) {}
     State& GetState() noexcept { return state_; }
@@ -117,15 +117,15 @@ private:
     State& state_;
 };
 
-class Proxy final : public Inbound {
+class Proxy final : public proxy::Inbound {
 public:
     Proxy(int fault, bool codec) : fault_(fault), codec_(codec) {}
-    net::awaitable<RelayResult> Process(std::unique_ptr<AsyncStream> stream,
+    net::awaitable<app::RelayResult> Process(std::unique_ptr<transport::AsyncStream> stream,
         routing::Dispatcher&, const proxyman::inbound::ReceiverSettings&, net::io_context&,
-        session::Context&, const TimeoutsConfig&, uint32_t) override {
-        RelayResult result;
+        session::Context&, const infra::TimeoutsConfig&, uint32_t) override {
+        app::RelayResult result;
         if (codec_) {
-            auto text = co_await anytls::ReadFrameText(*stream, 19);
+            auto text = co_await proxy::anytls::ReadFrameText(*stream, 19);
             if (!text) result.error = text.error();
         } else {
             co_await net::post(net::use_awaitable);
@@ -139,15 +139,15 @@ private:
 };
 
 class Dispatcher final : public routing::Dispatcher {
-    net::awaitable<RelayResult> Dispatch(net::io_context&, const routing::DispatchPolicy&,
-        std::unique_ptr<AsyncStream>, transport::Link, InitialPayload, session::Context&,
-        StatsShard&, const TimeoutsConfig&) override { throw std::logic_error("unexpected dispatch"); co_return RelayResult{}; }
+    net::awaitable<app::RelayResult> Dispatch(net::io_context&, const routing::DispatchPolicy&,
+        std::unique_ptr<transport::AsyncStream>, transport::Link, common::InitialPayload, session::Context&,
+        app::StatsShard&, const infra::TimeoutsConfig&) override { throw std::logic_error("unexpected dispatch"); co_return app::RelayResult{}; }
 };
 
 using Signal = net::experimental::channel<void(IoErrorCode, int)>;
 
 struct QuotaCase {
-    QuotaCase(net::io_context& io, ConnectionLimiter& connection_limiter,
+    QuotaCase(net::io_context& io, app::ConnectionLimiter& connection_limiter,
               uint32_t global_limit, bool ip_rejection, bool reverse)
         : limiter(connection_limiter), limit(global_limit),
           reject_ip(ip_rejection), reverse_completion(reverse),
@@ -155,7 +155,7 @@ struct QuotaCase {
         for (int id = 0; id != 3; ++id) children[id].id = id;
     }
 
-    ConnectionLimiter& limiter;
+    app::ConnectionLimiter& limiter;
     uint32_t limit;
     bool reject_ip;
     bool reverse_completion;
@@ -168,20 +168,20 @@ struct QuotaCase {
 
 QuotaCase* quota_case = nullptr;
 
-class QuotaProxy final : public Inbound {
+class QuotaProxy final : public proxy::Inbound {
 public:
     explicit QuotaProxy(QuotaCase& test) : test_(test) {}
 
-    net::awaitable<RelayResult> Process(
-        std::unique_ptr<AsyncStream> stream, routing::Dispatcher&,
+    net::awaitable<app::RelayResult> Process(
+        std::unique_ptr<transport::AsyncStream> stream, routing::Dispatcher&,
         const proxyman::inbound::ReceiverSettings&, net::io_context&,
-        session::Context&, const TimeoutsConfig&, uint32_t) override {
+        session::Context&, const infra::TimeoutsConfig&, uint32_t) override {
         const int id = static_cast<Stream&>(*stream).GetState().id;
         ++test_.entered;
         if (!test_.events.try_send(IoErrorCode{}, id + 1))
             throw std::logic_error("quota fixture event queue is full");
         (void)co_await test_.gates[id].async_receive(net::use_awaitable);
-        co_return RelayResult{};
+        co_return app::RelayResult{};
     }
 
 private:
@@ -189,64 +189,64 @@ private:
 };
 
 net::awaitable<void> RunChild(
-    QuotaCase& test, InboundTransportStreamHandler& sink, int id) {
+    QuotaCase& test, transport::internet::InboundTransportStreamHandler& sink, int id) {
     co_await sink.OnInboundTransportStream(std::make_unique<Stream>(test.children[id]), {});
     if (!test.events.try_send(IoErrorCode{}, -id - 1))
         throw std::logic_error("quota fixture event queue is full");
 }
 
-net::awaitable<void> CheckGlobalSlots(ConnectionLimiter& limiter,
+net::awaitable<void> CheckGlobalSlots(app::ConnectionLimiter& limiter,
                                     uint32_t limit, uint32_t occupied) {
     // Hold all successful reservations until the bounded-capacity check ends.
-    std::vector<ConnectionLimiter::Reservation> reservations;
+    std::vector<app::ConnectionLimiter::Reservation> reservations;
     reservations.reserve(limit);
     for (uint32_t acquired = 0; acquired < limit; ++acquired) {
         auto pending = limiter.TryReserve({
-            .scope = ConnectionLimiter::ReservationScope::Physical});
+            .scope = app::ConnectionLimiter::ReservationScope::Physical});
         EXPECT_TRUE(pending);
         if (!pending) co_return;
         auto admission = co_await std::move(*pending);
-        if (admission.reason != ConnectionLimiter::RejectReason::NONE) {
-            EXPECT_EQ(admission.reason, ConnectionLimiter::RejectReason::MAX_CONNECTIONS);
+        if (admission.reason != app::ConnectionLimiter::RejectReason::NONE) {
+            EXPECT_EQ(admission.reason, app::ConnectionLimiter::RejectReason::MAX_CONNECTIONS);
             break;
         }
         reservations.push_back(std::move(admission.reservation));
     }
     EXPECT_EQ(reservations.size(), limit - occupied);
     auto pending = limiter.TryReserve({
-        .scope = ConnectionLimiter::ReservationScope::Physical});
+        .scope = app::ConnectionLimiter::ReservationScope::Physical});
     EXPECT_TRUE(pending);
     if (!pending) co_return;
     const auto rejected = co_await std::move(*pending);
-    EXPECT_EQ(rejected.reason, ConnectionLimiter::RejectReason::MAX_CONNECTIONS);
+    EXPECT_EQ(rejected.reason, app::ConnectionLimiter::RejectReason::MAX_CONNECTIONS);
 }
 
 net::awaitable<void> CheckGlobalSlots(QuotaCase& test, uint32_t occupied) {
     co_await CheckGlobalSlots(test.limiter, test.limit, occupied);
 }
 
-net::awaitable<void> CheckIPRestored(ConnectionLimiter& limiter,
+net::awaitable<void> CheckIPRestored(app::ConnectionLimiter& limiter,
                                     std::string_view ip, bool bounded) {
     auto pending = limiter.TryReserve({
-        .scope = ConnectionLimiter::ReservationScope::ClientIp,
+        .scope = app::ConnectionLimiter::ReservationScope::ClientIp,
         .tag = "test", .ip = ip, .check_ban = true});
     EXPECT_EQ(pending.has_value(), bounded);
     if (!pending) co_return;
     auto admitted = co_await std::move(*pending);
-    EXPECT_EQ(admitted.reason, ConnectionLimiter::RejectReason::NONE);
+    EXPECT_EQ(admitted.reason, app::ConnectionLimiter::RejectReason::NONE);
     if (bounded) {
         auto next = limiter.TryReserve({
-            .scope = ConnectionLimiter::ReservationScope::ClientIp,
+            .scope = app::ConnectionLimiter::ReservationScope::ClientIp,
             .tag = "test", .ip = ip, .check_ban = true});
         EXPECT_TRUE(next);
         if (!next) co_return;
         const auto rejected = co_await std::move(*next);
-        EXPECT_EQ(rejected.reason, ConnectionLimiter::RejectReason::MAX_CONNECTIONS_PER_IP);
+        EXPECT_EQ(rejected.reason, app::ConnectionLimiter::RejectReason::MAX_CONNECTIONS_PER_IP);
     }
 }
 
 net::awaitable<void> ExerciseQuota(
-    QuotaCase& test, InboundTransportStreamHandler& sink, AwaitableTaskGroup& group) {
+    QuotaCase& test, transport::internet::InboundTransportStreamHandler& sink, common::AwaitableTaskGroup& group) {
     group.Spawn(RunChild(test, sink, 0));
     EXPECT_EQ(co_await test.events.async_receive(net::use_awaitable), 1);
     co_await CheckGlobalSlots(test, 1);
@@ -284,7 +284,7 @@ net::awaitable<void> ExerciseQuota(
 }
 
 void TestQuota(uint32_t limit, bool reject_ip, bool reverse) {
-    RunFixture(RateLimitConfig{
+    RunFixture(app::RateLimitConfig{
         .max_connections = limit, .max_conn_per_ip = reject_ip ? 1u : 0u},
         [=](net::io_context& io,
             const proxyman::inbound::AdmissionEnvironment& environment) -> net::awaitable<void> {
@@ -295,15 +295,15 @@ void TestQuota(uint32_t limit, bool reject_ip, bool reverse) {
                 .inbound_tag = "test", .inbound_tags = {}, .protocol = "fixture",
                 .stream_settings = {},
                 .dispatch_policy = {{}, routing::ForceOutbound{"direct"}},
-                .proxy_protocol = ProxyProtocolMode::Off};
-            receiver.stream_settings.network_mode = ::NetworkMode::Grpc;
-            receiver.stream_settings = NormalizeStreamSettings(receiver.stream_settings);
+                .proxy_protocol = transport::internet::ProxyProtocolMode::Off};
+            receiver.stream_settings.network_mode = ::transport::internet::NetworkMode::Grpc;
+            receiver.stream_settings = transport::internet::NormalizeStreamSettings(receiver.stream_settings);
             auto handler = std::make_shared<proxyman::inbound::Handler>(
                 std::move(receiver), std::make_unique<QuotaProxy>(test), environment);
             Dispatcher dispatcher;
             auto& stats = environment.stats;
             app::RequestLoadState load(100, 0);
-            TimeoutsConfig timeouts;
+            infra::TimeoutsConfig timeouts;
             session::Context context;
             context.inbound.tag = "test";
             context.inbound.source_ip = "192.0.2.1";
@@ -322,7 +322,7 @@ void TestQuota(uint32_t limit, bool reject_ip, bool reverse) {
 }
 
 TEST(InboundAdmission, UntrackedAndPerIpReservationsSkipOnlyIrrelevantScopes) {
-    using Scope = ConnectionLimiter::ReservationScope;
+    using Scope = app::ConnectionLimiter::ReservationScope;
     RunFixture({.max_connections = 1},
         [](net::io_context&, const proxyman::inbound::AdmissionEnvironment& environment)
         -> net::awaitable<void> {
@@ -337,7 +337,7 @@ TEST(InboundAdmission, UntrackedAndPerIpReservationsSkipOnlyIrrelevantScopes) {
         EXPECT_TRUE(child);
         if (!child) co_return;
         auto logical = co_await std::move(*child);
-        EXPECT_EQ(logical.reason, ConnectionLimiter::RejectReason::NONE);
+        EXPECT_EQ(logical.reason, app::ConnectionLimiter::RejectReason::NONE);
     });
     RunFixture({}, [](net::io_context&, const proxyman::inbound::AdmissionEnvironment& environment)
         -> net::awaitable<void> {
@@ -355,7 +355,7 @@ TEST(InboundAdmission, UntrackedAndPerIpReservationsSkipOnlyIrrelevantScopes) {
             EXPECT_TRUE(pending);
             if (!pending) co_return;
             auto admitted = co_await std::move(*pending);
-            EXPECT_EQ(admitted.reason, ConnectionLimiter::RejectReason::NONE);
+            EXPECT_EQ(admitted.reason, app::ConnectionLimiter::RejectReason::NONE);
             admitted.reservation = {};
             co_await net::post(net::use_awaitable);
         }
@@ -366,9 +366,9 @@ TEST(InboundAdmission, BanOnlyReservationsRequireAnAttributedNonemptyAddress) {
     RunFixture({.ip_ban = {.enabled = true, .failure_limit = 1, .window_seconds = 60, .ban_seconds = 60}},
         [](net::io_context&, const proxyman::inbound::AdmissionEnvironment& environment)
         -> net::awaitable<void> {
-        for (auto scope : {ConnectionLimiter::ReservationScope::Physical,
-                           ConnectionLimiter::ReservationScope::ClientIp,
-                           ConnectionLimiter::ReservationScope::Logical}) {
+        for (auto scope : {app::ConnectionLimiter::ReservationScope::Physical,
+                           app::ConnectionLimiter::ReservationScope::ClientIp,
+                           app::ConnectionLimiter::ReservationScope::Logical}) {
             EXPECT_FALSE(environment.limiter.TryReserve({.scope = scope, .ip = "192.0.2.1"}));
             EXPECT_FALSE(environment.limiter.TryReserve({.scope = scope, .check_ban = true}));
             auto pending = environment.limiter.TryReserve({
@@ -376,7 +376,7 @@ TEST(InboundAdmission, BanOnlyReservationsRequireAnAttributedNonemptyAddress) {
             EXPECT_TRUE(pending);
             if (!pending) co_return;
             auto admission = co_await std::move(*pending);
-            EXPECT_EQ(admission.reason, ConnectionLimiter::RejectReason::NONE);
+            EXPECT_EQ(admission.reason, app::ConnectionLimiter::RejectReason::NONE);
         }
     });
 }
@@ -389,7 +389,7 @@ TEST(InboundAdmission, PostBindRejectionNeitherBansNorOccupiesADevice) {
         context.inbound.tag = "post-bind";
         context.inbound.source_ip = "192.0.2.1";
         context.inbound.client_ip_source = session::Inbound::ClientIpSource::ProxyProtocol;
-        const UserProfile profile{.user_id = 7, .email = "bound", .device_limit = 1};
+        const common::UserProfile profile{.user_id = 7, .email = "bound", .device_limit = 1};
         constexpr std::array<uint8_t, 1> raw{0x41};
         for (unsigned attempt = 0; attempt != 12; ++attempt) {
             context.inbound.user_id = 99;
@@ -399,13 +399,13 @@ TEST(InboundAdmission, PostBindRejectionNeitherBansNorOccupiesADevice) {
             if (!authentication) co_return;
             EXPECT_EQ(context.inbound.user_id, 0);
             EXPECT_TRUE(context.inbound.user_email.empty());
-            EXPECT_EQ(co_await authentication->VerifyCredential({proxy::KeyedInboundProtocol::Vless, raw}), ErrorCode::OK);
+            EXPECT_EQ(co_await authentication->VerifyCredential({proxy::KeyedInboundProtocol::Vless, raw}), common::ErrorCode::OK);
             auto bound = std::move(*authentication).Bind(profile,
-                proxy::InboundRequestTarget{Network::TCP, TargetAddress(net::ip::address_v4::loopback(), 443)});
+                proxy::InboundRequestTarget{common::Network::TCP, common::TargetAddress(net::ip::address_v4::loopback(), 443)});
             EXPECT_EQ(context.inbound.user_id, profile.user_id);
             EXPECT_EQ(std::string_view(context.inbound.user_email), std::string_view(profile.email));
             EXPECT_EQ(context.outbound.target.port, 443);
-            EXPECT_EQ(std::move(bound).Reject("flow rejected", ErrorCode::PROTOCOL_UNSUPPORTED), ErrorCode::PROTOCOL_UNSUPPORTED);
+            EXPECT_EQ(std::move(bound).Reject("flow rejected", common::ErrorCode::PROTOCOL_UNSUPPORTED), common::ErrorCode::PROTOCOL_UNSUPPORTED);
         }
         EXPECT_FALSE(co_await environment.limiter.IsBanned(context.inbound.tag, context.inbound.source_ip));
         EXPECT_EQ(environment.online_users.OnlineDeviceCount(context.inbound.tag, 7), 0);
@@ -423,25 +423,25 @@ TEST(InboundAdmission, PostBindRejectionNeitherBansNorOccupiesADevice) {
 // Replace the external transport builder and reporting sink; execute the
 // production accepted-TCP and logical-transport ownership/error boundaries.
 
-net::awaitable<TransportBuildResult> BuildInboundTransport(GroupCoordinator&, net::io_context&,
-    std::unique_ptr<AsyncStream> raw, const StreamSettings&, SslContext*, uint64_t,
-    std::shared_ptr<InboundTransportStreamHandler> streams, InboundTransportMetadata*,
-    const InboundFallbackContext*) {
+net::awaitable<transport::internet::TransportBuildResult> transport::internet::BuildInboundTransport(app::GroupCoordinator&, net::io_context&,
+    std::unique_ptr<transport::AsyncStream> raw, const transport::internet::StreamSettings&, transport::internet::SslContext*, uint64_t,
+    std::shared_ptr<transport::internet::InboundTransportStreamHandler> streams, transport::internet::InboundTransportMetadata*,
+    const transport::internet::InboundFallbackContext*) {
     if (streams) {
         streams->OnInboundTransportReady(*raw);
         if (quota_case) {
-            co_await RunAwaitableTaskGroup(co_await net::this_coro::executor, [&](AwaitableTaskGroup& group) {
+            co_await common::RunAwaitableTaskGroup(co_await net::this_coro::executor, [&](common::AwaitableTaskGroup& group) {
                 group.Spawn(ExerciseQuota(*quota_case, *streams, group));
             });
         } else {
             co_await streams->OnInboundTransportStream(std::move(raw), {});
         }
-        co_return std::unique_ptr<AsyncStream>{};
+        co_return std::unique_ptr<transport::AsyncStream>{};
     }
     co_return raw;
 }
-net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(AsyncStream&, std::chrono::seconds) {
-    throw std::logic_error("unexpected proxy protocol"); co_return ProxyProtocolReadResult{};
+net::awaitable<transport::internet::ProxyProtocolReadResult> transport::internet::ReadInboundProxyProtocol(transport::AsyncStream&, std::chrono::seconds) {
+    throw std::logic_error("unexpected proxy protocol"); co_return transport::internet::ProxyProtocolReadResult{};
 }
 class InboundFailureBoundary
     : public ::testing::TestWithParam<std::tuple<bool, bool, int>> {};
@@ -451,7 +451,7 @@ TEST_P(InboundFailureBoundary, ReleasesStreamAndAdmissionAfterProtocolCompletion
     State state{.fault = fault};
     bool returned = false;
     RunFixture(
-        RateLimitConfig{.max_connections = 1, .max_conn_per_ip = 1},
+        app::RateLimitConfig{.max_connections = 1, .max_conn_per_ip = 1},
         [&](net::io_context& io,
             const proxyman::inbound::AdmissionEnvironment& environment) -> net::awaitable<void> {
             auto& limiter = environment.limiter;
@@ -459,15 +459,15 @@ TEST_P(InboundFailureBoundary, ReleasesStreamAndAdmissionAfterProtocolCompletion
                 .inbound_tag = "test", .inbound_tags = {}, .protocol = "fixture",
                 .stream_settings = {},
                 .dispatch_policy = {{}, routing::ForceOutbound{"direct"}},
-                .proxy_protocol = ProxyProtocolMode::Off};
-            receiver.stream_settings.network_mode = logical ? ::NetworkMode::Grpc : ::NetworkMode::Tcp;
-            receiver.stream_settings = NormalizeStreamSettings(receiver.stream_settings);
+                .proxy_protocol = transport::internet::ProxyProtocolMode::Off};
+            receiver.stream_settings.network_mode = logical ? ::transport::internet::NetworkMode::Grpc : ::transport::internet::NetworkMode::Tcp;
+            receiver.stream_settings = transport::internet::NormalizeStreamSettings(receiver.stream_settings);
             auto handler = std::make_shared<proxyman::inbound::Handler>(
                 std::move(receiver), std::make_unique<Proxy>(fault, codec), environment);
             Dispatcher dispatcher;
             auto& stats = environment.stats;
             app::RequestLoadState load(100, 0);
-            TimeoutsConfig timeouts;
+            infra::TimeoutsConfig timeouts;
             session::Context context;
             context.conn_id = 1;
             context.inbound.tag = "test";
@@ -517,18 +517,18 @@ TEST(InboundAdmission, ClosedCoordinatorCancelsEveryAuthenticationPhaseWithoutAD
         auto credential_phase = co_await proxy::BeginInboundAuthentication(environment, context);
         EXPECT_TRUE(credential_phase);
         if (!credential_phase) co_return;
-        const UserProfile profile{.user_id = 9, .email = "closed", .device_limit = 1};
+        const common::UserProfile profile{.user_id = 9, .email = "closed", .device_limit = 1};
         auto bound = std::move(*authentication).Bind(profile, std::nullopt);
         environment.coordinator.CloseAdmission();
         auto admitted = co_await std::move(bound).Admit();
         EXPECT_FALSE(admitted);
-        if (!admitted) EXPECT_EQ(admitted.error(), ErrorCode::CANCELLED);
+        if (!admitted) EXPECT_EQ(admitted.error(), common::ErrorCode::CANCELLED);
         constexpr std::array<uint8_t, 1> credential{0x42};
-        EXPECT_EQ(co_await credential_phase->VerifyCredential({proxy::KeyedInboundProtocol::Vless, credential}), ErrorCode::CANCELLED);
+        EXPECT_EQ(co_await credential_phase->VerifyCredential({proxy::KeyedInboundProtocol::Vless, credential}), common::ErrorCode::CANCELLED);
         context.inbound.client_ip_source = session::Inbound::ClientIpSource::ProxyProtocol;
         auto beginning = co_await proxy::BeginInboundAuthentication(environment, context);
         EXPECT_FALSE(beginning);
-        if (!beginning) EXPECT_EQ(beginning.error(), ErrorCode::CANCELLED);
+        if (!beginning) EXPECT_EQ(beginning.error(), common::ErrorCode::CANCELLED);
         EXPECT_EQ(environment.online_users.OnlineDeviceCount(context.inbound.tag, 9), 0);
         EXPECT_EQ(environment.stats.errors, 0);
     });

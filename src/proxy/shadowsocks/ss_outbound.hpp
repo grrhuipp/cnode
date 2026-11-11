@@ -37,10 +37,14 @@
 // ============================================================================
 // SS Outbound 配置
 // ============================================================================
+namespace proxy::shadowsocks::outbound {
+
 struct SsOutboundConfig {
-    OutboundServer server;
+    transport::internet::OutboundServer server;
     std::optional<proxy::uot::Version> uot_version;
 };
+
+}  // namespace proxy::shadowsocks::outbound
 
 // ============================================================================
 // SsOutbound — 出站编排（握手、初始 payload、relay、收尾）
@@ -53,21 +57,21 @@ namespace proxy::shadowsocks::outbound {
 class UdpRequest final : public ::proxy::OutboundDatagramEndpointBase {
 public:
     UdpRequest(net::io_context& io, app::dns::DNS& dns,
-               const net::ip::address& bind_address, TargetAddress server,
-               const ss::SsCipherInfo& cipher_info, const ss::KeyBytes& master_key,
-               std::span<const ss::KeyBytes> psk_chain,
-               ForwardedMetadataView forwarded = {})
+               const net::ip::address& bind_address, common::TargetAddress server,
+               const proxy::shadowsocks::SsCipherInfo& cipher_info, const proxy::shadowsocks::KeyBytes& master_key,
+               std::span<const proxy::shadowsocks::KeyBytes> psk_chain,
+               common::ForwardedMetadataView forwarded = {})
         : OutboundDatagramEndpointBase(io, bind_address), dns_(dns), server_(std::move(server)),
           cipher_info_(cipher_info), master_key_(master_key), psk_chain_(psk_chain) {
-        forwarded_ = ForwardedMetadata::FromView(forwarded);
-        if (ss::Is2022Cipher(cipher_info_.type)) {
+        forwarded_ = common::ForwardedMetadata::FromView(forwarded);
+        if (proxy::shadowsocks::Is2022Cipher(cipher_info_.type)) {
             ss2022_state_.emplace();
-            if (!ss::Init2022UdpSessionState(*ss2022_state_, cipher_info_, master_key_))
-                throw transport::LinkError(ErrorCode::INTERNAL);
+            if (!proxy::shadowsocks::Init2022UdpSessionState(*ss2022_state_, cipher_info_, master_key_))
+                throw transport::LinkError(common::ErrorCode::INTERNAL);
         }
         if (server_.resolved_addr) {
             if (server_.resolved_addr->is_v6() != socket_.IsIPv6())
-                throw transport::LinkError(ErrorCode::SOCKET_BIND_FAILED);
+                throw transport::LinkError(common::ErrorCode::SOCKET_BIND_FAILED);
             server_endpoint_.emplace(*server_.resolved_addr, server_.port);
         }
     }
@@ -82,8 +86,8 @@ public:
             const buf::ContiguousBufferView view(packet.payload);
             const auto bytes = view.Bytes();
             auto decoded = ss2022_state_
-                ? ss::Decode2022UdpResponsePacket(bytes.data(), bytes.size(), *ss2022_state_)
-                : ss::DecodeUdpPacketWithKey(bytes.data(), bytes.size(), master_key_.span(),
+                ? proxy::shadowsocks::Decode2022UdpResponsePacket(bytes.data(), bytes.size(), *ss2022_state_)
+                : proxy::shadowsocks::DecodeUdpPacketWithKey(bytes.data(), bytes.size(), master_key_.span(),
                     cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size);
             if (!decoded) continue;
             if (!decoded->target.IsValid()) continue;
@@ -108,38 +112,38 @@ public:
         const size_t encoded_len = EncodedPacketSize(*datagram->target, bytes);
         const size_t maximum = server_endpoint_->address().is_v6() ? 65527 : 65507;
         if (encoded_len == 0 || encoded_len > maximum)
-            throw transport::LinkError(ErrorCode::INVALID_ARGUMENT);
+            throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
         buf::ContiguousWriteBuffer encoded;
         uint8_t* dst = encoded.Prepare(encoded_len);
         if (EncodePacketTo(*datagram->target, bytes, dst, encoded_len) != encoded_len)
-            throw transport::LinkError(ErrorCode::INTERNAL);
+            throw transport::LinkError(common::ErrorCode::INTERNAL);
         const std::array<net::const_buffer, 1> buffers{net::buffer(dst, encoded_len)};
         co_await write.SendTo(*server_endpoint_, buffers);
     }
 private:
-    size_t EncodedPacketSize(const TargetAddress& target, std::span<const uint8_t> payload) {
+    size_t EncodedPacketSize(const common::TargetAddress& target, std::span<const uint8_t> payload) {
         return EncodePacketTo(target, payload, nullptr, 0);
     }
-    size_t EncodePacketTo(const TargetAddress& target, std::span<const uint8_t> payload,
+    size_t EncodePacketTo(const common::TargetAddress& target, std::span<const uint8_t> payload,
                           uint8_t* output, size_t output_size) {
-        const ForwardedMetadataView forwarded =
-            forwarded_ ? forwarded_->View() : ForwardedMetadataView{};
+        const common::ForwardedMetadataView forwarded =
+            forwarded_ ? forwarded_->View() : common::ForwardedMetadataView{};
         if (ss2022_state_)
-            return ss::Encode2022UdpRequestPacketTo(target, payload.data(), payload.size(),
+            return proxy::shadowsocks::Encode2022UdpRequestPacketTo(target, payload.data(), payload.size(),
                 *ss2022_state_, psk_chain_, output, output_size, forwarded);
-        return ss::EncodeUdpPacketTo(target, payload.data(), payload.size(), master_key_.span(),
+        return proxy::shadowsocks::EncodeUdpPacketTo(target, payload.data(), payload.size(), master_key_.span(),
             cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size,
             output, output_size, forwarded);
     }
 
     app::dns::DNS& dns_;
-    const TargetAddress server_;
+    const common::TargetAddress server_;
     std::optional<udp::endpoint> server_endpoint_;
-    const ss::SsCipherInfo cipher_info_;
-    ss::KeyBytes master_key_;
-    const std::span<const ss::KeyBytes> psk_chain_;
-    std::optional<ForwardedMetadata> forwarded_;
-    std::optional<ss::Ss2022UdpSessionState> ss2022_state_;
+    const proxy::shadowsocks::SsCipherInfo cipher_info_;
+    proxy::shadowsocks::KeyBytes master_key_;
+    const std::span<const proxy::shadowsocks::KeyBytes> psk_chain_;
+    std::optional<common::ForwardedMetadata> forwarded_;
+    std::optional<proxy::shadowsocks::Ss2022UdpSessionState> ss2022_state_;
 };
 
 // A complete, validated credential value. Preparation never drops a chain link
@@ -147,22 +151,22 @@ private:
 class Credentials {
 public:
     [[nodiscard]] static std::optional<Credentials> Prepare(
-        const ss::SsCipherInfo& cipher, std::string_view password);
+        const proxy::shadowsocks::SsCipherInfo& cipher, std::string_view password);
 
-    [[nodiscard]] const ss::SsCipherInfo& Cipher() const noexcept { return cipher_; }
-    [[nodiscard]] const ss::KeyBytes& MasterKey() const noexcept { return master_key_; }
-    [[nodiscard]] std::span<const ss::KeyBytes> PskChain() const noexcept {
+    [[nodiscard]] const proxy::shadowsocks::SsCipherInfo& Cipher() const noexcept { return cipher_; }
+    [[nodiscard]] const proxy::shadowsocks::KeyBytes& MasterKey() const noexcept { return master_key_; }
+    [[nodiscard]] std::span<const proxy::shadowsocks::KeyBytes> PskChain() const noexcept {
         return psk_chain_;
     }
 
 private:
-    Credentials(ss::SsCipherInfo cipher, ss::KeyBytes master_key,
-                std::vector<ss::KeyBytes> psk_chain)
+    Credentials(proxy::shadowsocks::SsCipherInfo cipher, proxy::shadowsocks::KeyBytes master_key,
+                std::vector<proxy::shadowsocks::KeyBytes> psk_chain)
         : cipher_(cipher), master_key_(master_key), psk_chain_(std::move(psk_chain)) {}
 
-    ss::SsCipherInfo cipher_;
-    ss::KeyBytes master_key_;
-    std::vector<ss::KeyBytes> psk_chain_;
+    proxy::shadowsocks::SsCipherInfo cipher_;
+    proxy::shadowsocks::KeyBytes master_key_;
+    std::vector<proxy::shadowsocks::KeyBytes> psk_chain_;
 };
 
 

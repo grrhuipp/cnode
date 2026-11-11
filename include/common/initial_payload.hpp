@@ -7,6 +7,8 @@
 // The upstream bytes a protocol already decoded before dispatch. They cross
 // Dispatch by value exactly once and become the relay's first upload batch;
 // the owned buffers are transferred, never copied or staged inline.
+namespace common {
+
 class InitialPayload {
 public:
     InitialPayload() noexcept = default;
@@ -26,3 +28,5 @@ public:
 private:
     buf::MultiBuffer data_;
 };
+
+}  // namespace common

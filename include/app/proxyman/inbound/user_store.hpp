@@ -75,7 +75,7 @@ struct PreparedVmessUser {
     std::array<uint8_t, 16> uuid_bytes{};
     std::array<uint8_t, 16> cmd_key{};
     std::array<uint8_t, 16> auth_key{};
-    ::UserProfile profile;
+    ::common::UserProfile profile;
 
     ~PreparedVmessUser() noexcept {
         OPENSSL_cleanse(uuid_bytes.data(), uuid_bytes.size());
@@ -87,29 +87,29 @@ struct PreparedVmessUser {
 struct PreparedVlessUser {
     std::array<uint8_t, 16> uuid_bytes{};
     std::string flow;
-    ::UserProfile profile;
+    ::common::UserProfile profile;
 };
 
 struct PreparedTrojanUser {
     std::string password_hash;
-    ::UserProfile profile;
+    ::common::UserProfile profile;
 };
 
 struct PreparedShadowsocksUser {
     PreparedKeyBytes derived_key;
     PreparedKeyBytes identity_key;
     std::array<uint8_t, 16> psk_hash{};
-    ::UserProfile profile;
+    ::common::UserProfile profile;
 };
 
 struct PreparedAnyTlsUser {
     std::array<uint8_t, 32> password_hash{};
-    ::UserProfile profile;
+    ::common::UserProfile profile;
 };
 
 struct PreparedHysteriaUser {
     std::array<uint8_t, 32> credential_hash{};
-    ::UserProfile profile;
+    ::common::UserProfile profile;
 };
 
 using PreparedVmessUsers = std::vector<PreparedVmessUser>;
@@ -183,7 +183,7 @@ public:
         [[nodiscard]] size_t operator()(const std::array<uint8_t, 32>& value) const noexcept;
     };
 
-    using Profile = ::UserProfile;
+    using Profile = ::common::UserProfile;
 
     struct VmessCredential {
         std::array<uint8_t, 16> uuid_bytes{};
@@ -220,8 +220,8 @@ public:
     using TrojanUserMap =
         std::unordered_map<std::string,
                            TrojanCredential,
-                           TransparentStringHash,
-                           TransparentStringEq>;
+                           common::TransparentStringHash,
+                           common::TransparentStringEq>;
     using VlessUserMap =
         std::unordered_map<std::array<uint8_t, 16>,
                            VlessCredential,

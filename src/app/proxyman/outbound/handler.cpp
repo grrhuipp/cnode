@@ -15,7 +15,7 @@ namespace proxyman::outbound {
 
 Handler::Handler(PreparedOutboundConfig config, net::io_context& io_context,
                  app::dns::DNS& dns, std::chrono::seconds dial_timeout,
-                 AwaitableTaskGroup& tasks)
+                 common::AwaitableTaskGroup& tasks)
     : config_(std::move(config))
     , dialer_(io_context, dns, config_.sender, dial_timeout)
     , proxy_(NewProxy(config_, io_context, tasks)) {
@@ -23,12 +23,12 @@ Handler::Handler(PreparedOutboundConfig config, net::io_context& io_context,
 
 Handler::~Handler() = default;
 
-net::awaitable<OutboundProcessResult> Handler::Dispatch(
+net::awaitable<proxy::OutboundProcessResult> Handler::Dispatch(
     session::Context& ctx,
     transport::Link inbound,
-    const TimeoutsConfig& timeouts,
-    StatsShard& stats,
-    const RelayConfig& relay_config,
+    const infra::TimeoutsConfig& timeouts,
+    app::StatsShard& stats,
+    const app::RelayConfig& relay_config,
     buf::MultiBufferBatch&& first_payload) {
     // Not a coroutine: the callee frame is the request's outbound frame.
     return proxy_->Process(ctx, inbound, dialer_, timeouts, stats, relay_config,
@@ -42,7 +42,7 @@ net::awaitable<OutboundProcessResult> Handler::Dispatch(
 HandlerRegistry::HandlerRegistry(
     const std::vector<PreparedOutboundConfig>& configurations,
     net::io_context& io_context, app::dns::DNS& dns,
-    std::chrono::seconds dial_timeout, AwaitableTaskGroup& tasks)
+    std::chrono::seconds dial_timeout, common::AwaitableTaskGroup& tasks)
     : io_context_(io_context), dns_(dns), dial_timeout_(dial_timeout), tasks_(tasks) {
     handlers_.reserve(configurations.size());
     for (const auto& configuration : configurations) {
@@ -75,7 +75,7 @@ void HandlerRegistry::Remove(std::string_view tag) {
     const auto it = handlers_.find(tag);
     if (it == handlers_.end()) return;
     handlers_.erase(it);
-    MaybeShrinkHashContainer(handlers_, 8);
+    common::MaybeShrinkHashContainer(handlers_, 8);
 }
 
 std::shared_ptr<Handler> HandlerRegistry::Instantiate(
@@ -147,10 +147,10 @@ std::optional<PreparedOutboundConfig> PrepareOutboundConfig(
     };
 }
 
-std::unique_ptr<::Outbound> NewProxy(
+std::unique_ptr<::proxy::Outbound> NewProxy(
     const PreparedOutboundConfig& config,
     ::net::io_context& io_context,
-    ::AwaitableTaskGroup& tasks) {
+    ::common::AwaitableTaskGroup& tasks) {
     if (!config.create) {
         throw std::logic_error(
             "prepared outbound '" + config.tag + "' has no creator");

@@ -149,18 +149,18 @@ struct Wire {
             const uint32_t sid = (uint32_t(header[1]) << 24) | (uint32_t(header[2]) << 16) |
                 (uint32_t(header[3]) << 8) | header[4];
             parsed_outgoing += 7 + length;
-            if (command == anytls::kCmdSettings)
+            if (command == proxy::anytls::kCmdSettings)
                 client_settings.assign(reinterpret_cast<const char*>(header + 7), length);
-            if (command == anytls::kCmdWaste) padding_lengths.push_back(length);
-            if (command == anytls::kCmdHeartResponse) ++heart_responses;
-            if (command != anytls::kCmdPSH || responded) continue;
+            if (command == proxy::anytls::kCmdWaste) padding_lengths.push_back(length);
+            if (command == proxy::anytls::kCmdHeartResponse) ++heart_responses;
+            if (command != proxy::anytls::kCmdPSH || responded) continue;
             responded = true;
-            Frame(anytls::kCmdServerSettings, 0, "v=2");
-            if (padding_index == 0) Frame(anytls::kCmdUpdatePaddingScheme, 0, kPaddingA);
-            Frame(anytls::kCmdSYNACK, sid);
-            Frame(anytls::kCmdPSH, sid, "reply");
+            Frame(proxy::anytls::kCmdServerSettings, 0, "v=2");
+            if (padding_index == 0) Frame(proxy::anytls::kCmdUpdatePaddingScheme, 0, kPaddingA);
+            Frame(proxy::anytls::kCmdSYNACK, sid);
+            Frame(proxy::anytls::kCmdPSH, sid, "reply");
             // The first request stays busy while another physical session opens.
-            if (padding_index != 0) Frame(anytls::kCmdFIN, sid);
+            if (padding_index != 0) Frame(proxy::anytls::kCmdFIN, sid);
             wake.cancel();
         }
     }
@@ -169,13 +169,13 @@ struct Wire {
         if (!open_order || open_order->delivered) return;
         open_order->delivered = true;
         const int mode = open_order->mode;
-        if (mode == 0 || mode == 5) Frame(anytls::kCmdSYNACK, 2);
-        if (mode == 0 || mode == 2) Frame(anytls::kCmdPSH, 2, "reply");
-        if (mode <= 2) Frame(anytls::kCmdFIN, 2);
-        if (mode == 3) Frame(anytls::kCmdSYNACK, 2, "rejected");
-        if (mode == 4 || mode == 5) Frame(anytls::kCmdAlert, 0, "closed");
+        if (mode == 0 || mode == 5) Frame(proxy::anytls::kCmdSYNACK, 2);
+        if (mode == 0 || mode == 2) Frame(proxy::anytls::kCmdPSH, 2, "reply");
+        if (mode <= 2) Frame(proxy::anytls::kCmdFIN, 2);
+        if (mode == 3) Frame(proxy::anytls::kCmdSYNACK, 2, "rejected");
+        if (mode == 4 || mode == 5) Frame(proxy::anytls::kCmdAlert, 0, "closed");
         if (mode == 8) {
-            Frame(anytls::kCmdSYNACK, 2, "rejected");
+            Frame(proxy::anytls::kCmdSYNACK, 2, "rejected");
             input.resize(input.size() - 5);
             read_eof = true;
         }
@@ -192,8 +192,8 @@ struct Wire {
             const uint32_t sid = (uint32_t(header[1]) << 24) | (uint32_t(header[2]) << 16) |
                 (uint32_t(header[3]) << 8) | header[4];
             parsed_outgoing += 7 + length;
-            if (command == anytls::kCmdFIN && sid == 2) ++open_order->fin_replies;
-            if (command != anytls::kCmdPSH || sid >= target_seen.size()) continue;
+            if (command == proxy::anytls::kCmdFIN && sid == 2) ++open_order->fin_replies;
+            if (command != proxy::anytls::kCmdPSH || sid >= target_seen.size()) continue;
             if (target_seen[sid]) {
                 if (sid == 2 && open_order->delivered) ++open_order->payload_after_close;
                 continue;
@@ -204,12 +204,12 @@ struct Wire {
                 if (open_order->before_write_completion) DeliverOpenResult();
             } else {
                 if (sid == 1) {
-                    Frame(anytls::kCmdServerSettings, 0, "v=2");
-                    Frame(anytls::kCmdUpdatePaddingScheme, 0, "stop=1\n");
+                    Frame(proxy::anytls::kCmdServerSettings, 0, "v=2");
+                    Frame(proxy::anytls::kCmdUpdatePaddingScheme, 0, "stop=1\n");
                 }
-                Frame(anytls::kCmdSYNACK, sid);
-                Frame(anytls::kCmdPSH, sid, "reply");
-                Frame(anytls::kCmdFIN, sid);
+                Frame(proxy::anytls::kCmdSYNACK, sid);
+                Frame(proxy::anytls::kCmdPSH, sid, "reply");
+                Frame(proxy::anytls::kCmdFIN, sid);
                 wake.cancel();
             }
         }
@@ -218,7 +218,7 @@ struct Wire {
     [[noreturn]] void RaiseIoFault() {
         ++io_faults;
         if (io_fault_kind == 1) throw std::bad_alloc();
-        if (io_fault_kind == 2) throw transport::LinkError(ErrorCode::BLOCKED);
+        if (io_fault_kind == 2) throw transport::LinkError(common::ErrorCode::BLOCKED);
         throw std::runtime_error("original physical I/O exception");
     }
 
@@ -228,33 +228,33 @@ struct Wire {
         input.insert(input.end(), payload.begin(), payload.end());
     }
     void Fault() {
-        Frame(anytls::kCmdUpdatePaddingScheme, 0, std::string(1024, 'x'));
+        Frame(proxy::anytls::kCmdUpdatePaddingScheme, 0, std::string(1024, 'x'));
         fail_on_header = true;
         wake.cancel();
     }
     void Reply() {
         if (queue) {
-            Frame(anytls::kCmdServerSettings, 0, "v=2");
-            Frame(anytls::kCmdSYNACK, 1);
+            Frame(proxy::anytls::kCmdServerSettings, 0, "v=2");
+            Frame(proxy::anytls::kCmdSYNACK, 1);
             size_t payload_offset = 0;
             for (size_t bytes : queue->fragments) {
-                Frame(anytls::kCmdPSH, 1, std::string_view(
+                Frame(proxy::anytls::kCmdPSH, 1, std::string_view(
                     reinterpret_cast<const char*>(queue->wire_payload.data() + payload_offset), bytes));
                 payload_offset += bytes;
-                if (queue->mode >= 13 && payload_offset == 3 * 65535) Frame(anytls::kCmdHeartRequest, 0);
+                if (queue->mode >= 13 && payload_offset == 3 * 65535) Frame(proxy::anytls::kCmdHeartRequest, 0);
             }
-            if (queue->mode != 6 && queue->mode != 9) Frame(anytls::kCmdFIN, 1);
-            if (queue->mode == 12) Frame(anytls::kCmdAlert, 0);
+            if (queue->mode != 6 && queue->mode != 9) Frame(proxy::anytls::kCmdFIN, 1);
+            if (queue->mode == 12) Frame(proxy::anytls::kCmdAlert, 0);
         } else if (fail_settings) {
-            Frame(anytls::kCmdServerSettings, 0, std::string(1024, 'x'));
+            Frame(proxy::anytls::kCmdServerSettings, 0, std::string(1024, 'x'));
             fail_on_header = true;
         } else {
-            Frame(anytls::kCmdServerSettings, 0, "v=2");
-            if (io_fault_mode >= 3) Frame(anytls::kCmdUpdatePaddingScheme, 0, "stop=2\n1=64-65\n");
-            Frame(anytls::kCmdSYNACK, 1);
+            Frame(proxy::anytls::kCmdServerSettings, 0, "v=2");
+            if (io_fault_mode >= 3) Frame(proxy::anytls::kCmdUpdatePaddingScheme, 0, "stop=2\n1=64-65\n");
+            Frame(proxy::anytls::kCmdSYNACK, 1);
             if (io_fault_mode < 2) {
-                Frame(anytls::kCmdPSH, 1, "reply");
-                Frame(anytls::kCmdFIN, 1);
+                Frame(proxy::anytls::kCmdPSH, 1, "reply");
+                Frame(proxy::anytls::kCmdFIN, 1);
             }
         }
         wake.cancel();
@@ -268,7 +268,7 @@ int io_fault_mode = 0;
 int io_fault_kind = 0;
 
 // The migration regression uses actual TCP sockets and the production native
-class Stream final : public AsyncStream {
+class Stream final : public transport::AsyncStream {
 public:
     explicit Stream(std::shared_ptr<Wire> wire) : wire_(std::move(wire)) {}
     ~Stream() override {
@@ -327,8 +327,8 @@ public:
                 if (wire_->padding_index == 1) {
                     // Authentication bytes already belong to A. Publish B on
                     // the older live session before this write completes.
-                    dialed[0]->Frame(anytls::kCmdUpdatePaddingScheme, 0, kPaddingB);
-                    dialed[0]->Frame(anytls::kCmdHeartRequest, 0);
+                    dialed[0]->Frame(proxy::anytls::kCmdUpdatePaddingScheme, 0, kPaddingB);
+                    dialed[0]->Frame(proxy::anytls::kCmdHeartRequest, 0);
                     dialed[0]->wake.cancel();
                     size_t turns = 0;
                     while (dialed[0]->heart_responses == 0 && !dialed[0]->closed) {
@@ -354,10 +354,10 @@ public:
             }
             co_return data.size();
         }
-        if (data.size() == 7 && bytes[0] == anytls::kCmdHeartResponse) ++wire_->heart_responses;
+        if (data.size() == 7 && bytes[0] == proxy::anytls::kCmdHeartResponse) ++wire_->heart_responses;
         if ((wire_->io_fault_mode == 2 && wire_->writes == 2) ||
             (wire_->io_fault_mode >= 3 && data.size() == 7 &&
-             bytes[0] == (wire_->io_fault_mode == 5 ? anytls::kCmdFIN : anytls::kCmdPSH))) {
+             bytes[0] == (wire_->io_fault_mode == 5 ? proxy::anytls::kCmdFIN : proxy::anytls::kCmdPSH))) {
             wire_->partial_write += 3;
             co_await net::post(net::use_awaitable);
             wire_->RaiseIoFault();
@@ -445,9 +445,9 @@ public:
             }
             if (queue_scenario->mode == 9 && queue_scenario->received.size() == 65535) {
                 auto& wire = *dialed[0];
-                wire.Frame(anytls::kCmdPSH, 1, std::string_view(
+                wire.Frame(proxy::anytls::kCmdPSH, 1, std::string_view(
                     reinterpret_cast<const char*>(queue_scenario->expected.data() + 65535), 65535));
-                wire.Frame(anytls::kCmdFIN, 1);
+                wire.Frame(proxy::anytls::kCmdFIN, 1);
                 wire.wake.cancel();
             }
         }
@@ -459,8 +459,8 @@ public:
 // Only the external dial boundary is replaced. The production target builder,
 // Handler, codec, session pool, logical endpoint and relay execute unchanged.
 
-net::awaitable<DialResult> DialOutboundTransport(net::io_context& io, session::Context&,
-                                                const OutboundTransportTarget&) {
+net::awaitable<transport::DialResult> transport::internet::DialOutboundTransport(net::io_context& io, session::Context&,
+                                                const transport::internet::OutboundTransportTarget&) {
     auto wire = std::make_shared<Wire>(io);
     wire->fail_settings = fail_first_session && dialed.empty();
     wire->respond_on_auth = respond_on_auth;
@@ -470,7 +470,7 @@ net::awaitable<DialResult> DialOutboundTransport(net::io_context& io, session::C
     wire->padding_index = dialed.size();
     if (dialed.empty()) { wire->io_fault_mode = io_fault_mode; wire->io_fault_kind = io_fault_kind; }
     dialed.push_back(wire);
-    DialResult result;
+    transport::DialResult result;
     result.stream = std::make_unique<Stream>(wire);
     co_return result;
 }
@@ -510,7 +510,7 @@ private:
 
 // The Worker joins resident physical tasks after its request owners finish.
 // Do not abandon completion callbacks borrowing the caller's stack.
-bool JoinResidentTasks(net::io_context& io, ResidentTaskGroup& tasks) {
+bool JoinResidentTasks(net::io_context& io, common::ResidentTaskGroup& tasks) {
     bool done = false;
     std::exception_ptr failure;
     net::co_spawn(io, tasks.AsyncJoin(), [&](std::exception_ptr error) {
@@ -526,12 +526,12 @@ bool JoinResidentTasks(net::io_context& io, ResidentTaskGroup& tasks) {
 // only DialOutboundTransport above is replaced.
 struct TestDialer {
     TestDialer(net::io_context& io, app::dns::DNS& dns) : dialer(io, dns, sender, 1s) {}
-    OutboundSenderSettings sender;
-    OutboundDialer dialer;
+    transport::internet::OutboundSenderSettings sender;
+    transport::internet::OutboundDialer dialer;
 };
 
-OutboundServer LoopbackServer() {
-    return OutboundServer{
+transport::internet::OutboundServer LoopbackServer() {
+    return transport::internet::OutboundServer{
         .address = "127.0.0.1",
         .literal_address = net::ip::address_v4::loopback(),
         .port = 443,
@@ -545,7 +545,7 @@ void RunClientPadding() {
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
-    ResidentTaskGroup tasks(io.get_executor());
+    common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 60s;
@@ -567,13 +567,13 @@ void RunClientPadding() {
     std::array<net::cancellation_signal, 4> cancellations;
     std::array<bool, 4> done{};
     std::array<bool, 4> failed{};
-    std::array<ErrorCode, 4> errors{};
-    auto request = [&](proxy::anytls::outbound::Handler& active, size_t index) -> net::awaitable<OutboundProcessResult> {
+    std::array<common::ErrorCode, 4> errors{};
+    auto request = [&](proxy::anytls::outbound::Handler& active, size_t index) -> net::awaitable<proxy::OutboundProcessResult> {
         auto& ctx = contexts[index];
-        ctx.outbound.target = TargetAddress("192.0.2.1", 443);
-        StatsShard stats;
-        TimeoutsConfig timeouts;
-        RelayConfig config;
+        ctx.outbound.target = common::TargetAddress("192.0.2.1", 443);
+        app::StatsShard stats;
+        infra::TimeoutsConfig timeouts;
+        app::RelayConfig config;
         config.idle_timeout = config.write_timeout = 10s;
         config.uplink_only = config.downlink_only = 5s;
         co_return co_await active.Process(ctx,
@@ -582,7 +582,7 @@ void RunClientPadding() {
     };
     auto start = [&](proxy::anytls::outbound::Handler& active, size_t index) {
         net::co_spawn(io, request(active, index), net::bind_cancellation_slot(cancellations[index].slot(),
-            [&, index](std::exception_ptr exception, OutboundProcessResult result) {
+            [&, index](std::exception_ptr exception, proxy::OutboundProcessResult result) {
                 failed[index] = bool(exception);
                 errors[index] = result ? result->error : result.error();
                 done[index] = true;
@@ -613,14 +613,14 @@ void RunClientPadding() {
     EXPECT_EQ(dialed.size(), 2);
     EXPECT_TRUE(done[1]);
     EXPECT_FALSE(failed[1]);
-    EXPECT_EQ(errors[1], ErrorCode::OK);
+    EXPECT_EQ(errors[1], common::ErrorCode::OK);
     if (dialed.size() == 2) {
         {
             EXPECT_TRUE(dialed[1]->auth_update_seen);
             EXPECT_EQ(dialed[1]->auth_padding, 45);
         }
         EXPECT_EQ(dialed[1]->padding_lengths, (std::vector<size_t>{160}));
-        dialed[1]->Frame(anytls::kCmdAlert, 0, "fresh session required");
+        dialed[1]->Frame(proxy::anytls::kCmdAlert, 0, "fresh session required");
         dialed[1]->wake.cancel();
         io.restart();
         io.run_for(40ms);
@@ -629,7 +629,7 @@ void RunClientPadding() {
     EXPECT_EQ(dialed.size(), 3);
     EXPECT_TRUE(done[2]);
     EXPECT_FALSE(failed[2]);
-    EXPECT_EQ(errors[2], ErrorCode::OK);
+    EXPECT_EQ(errors[2], common::ErrorCode::OK);
     if (dialed.size() == 3) {
         {
             EXPECT_EQ(dialed[2]->auth_padding, 91);
@@ -641,7 +641,7 @@ void RunClientPadding() {
     io.poll();
     EXPECT_TRUE(done[0]);
     EXPECT_FALSE(failed[0]);
-    EXPECT_EQ(errors[0], ErrorCode::CANCELLED);
+    EXPECT_EQ(errors[0], common::ErrorCode::CANCELLED);
     handler.reset();
     const bool retired_during_cleanup = std::any_of(dialed.begin(), dialed.end(),
         [](const auto& wire) { return wire->closed && !wire->destroyed; });
@@ -650,7 +650,7 @@ void RunClientPadding() {
     EXPECT_EQ(dialed.size(), 4);
     EXPECT_TRUE(done[3]);
     EXPECT_FALSE(failed[3]);
-    EXPECT_EQ(errors[3], ErrorCode::OK);
+    EXPECT_EQ(errors[3], common::ErrorCode::OK);
     if (dialed.size() == 4)
         {
             EXPECT_EQ(dialed[3]->auth_padding, dialed[0]->auth_padding);
@@ -673,7 +673,7 @@ void RunOpenOrder(int mode, bool before) {
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
-    ResidentTaskGroup tasks(io.get_executor());
+    common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 60s;
@@ -685,12 +685,12 @@ void RunOpenOrder(int mode, bool before) {
     auto handler = std::make_unique<proxy::anytls::outbound::Handler>("open-order", io,
         std::make_shared<const infra::AnyTlsSettings>(settings),
         tasks.Tasks());
-    auto request = [&](Client& client, session::Context& ctx) -> net::awaitable<OutboundProcessResult> {
-        ctx.outbound.target = TargetAddress("192.0.2.1", 443);
-        ctx.content.network = Network::TCP;
-        StatsShard stats;
-        TimeoutsConfig timeouts;
-        RelayConfig config;
+    auto request = [&](Client& client, session::Context& ctx) -> net::awaitable<proxy::OutboundProcessResult> {
+        ctx.outbound.target = common::TargetAddress("192.0.2.1", 443);
+        ctx.content.network = common::Network::TCP;
+        app::StatsShard stats;
+        infra::TimeoutsConfig timeouts;
+        app::RelayConfig config;
         config.idle_timeout = config.write_timeout = 10s;
         config.uplink_only = config.downlink_only = 5s;
         co_return co_await handler->Process(ctx,
@@ -699,7 +699,7 @@ void RunOpenOrder(int mode, bool before) {
     Client warm, tested, recovery;
     session::Context warm_ctx, tested_ctx, recovery_ctx;
     bool warm_done = false, done = false, recovery_done = false;
-    ErrorCode observed = ErrorCode::OK;
+    common::ErrorCode observed = common::ErrorCode::OK;
     std::exception_ptr failure;
     net::cancellation_signal cancel;
     CleanupGuard cleanup([&] {
@@ -715,10 +715,10 @@ void RunOpenOrder(int mode, bool before) {
         io.restart();
         io.run();
     });
-    net::co_spawn(io, request(warm, warm_ctx), [&](std::exception_ptr error, OutboundProcessResult result) {
+    net::co_spawn(io, request(warm, warm_ctx), [&](std::exception_ptr error, proxy::OutboundProcessResult result) {
         EXPECT_FALSE(error);
         EXPECT_TRUE(result);
-        if (result) EXPECT_EQ(result->error, ErrorCode::OK);
+        if (result) EXPECT_EQ(result->error, common::ErrorCode::OK);
         EXPECT_EQ(warm.received, 5);
         warm_done = true;
     });
@@ -726,7 +726,7 @@ void RunOpenOrder(int mode, bool before) {
     ASSERT_TRUE(warm_done);
     ASSERT_EQ(dialed.size(), 1);
     net::co_spawn(io, request(tested, tested_ctx), net::bind_cancellation_slot(cancel.slot(),
-        [&](std::exception_ptr error, OutboundProcessResult result) {
+        [&](std::exception_ptr error, proxy::OutboundProcessResult result) {
             done = true; failure = error;
             observed = result ? result->error : result.error();
         }));
@@ -742,8 +742,8 @@ void RunOpenOrder(int mode, bool before) {
         io.run_for(mode == 6 ? 3200ms : 80ms);
     }
     const bool timely = done;
-    const auto expected = mode <= 2 ? ErrorCode::OK : mode == 6 ? ErrorCode::TIMEOUT :
-        mode == 7 ? ErrorCode::CANCELLED : ErrorCode::PROTOCOL_DECODE_FAILED;
+    const auto expected = mode <= 2 ? common::ErrorCode::OK : mode == 6 ? common::ErrorCode::TIMEOUT :
+        mode == 7 ? common::ErrorCode::CANCELLED : common::ErrorCode::PROTOCOL_DECODE_FAILED;
     EXPECT_TRUE(timely);
     EXPECT_FALSE(failure);
     EXPECT_EQ(observed, expected);
@@ -760,10 +760,10 @@ void RunOpenOrder(int mode, bool before) {
         cancel.emit(net::cancellation_type::terminal);
         io.restart(); io.run_for(200ms);
     }
-    net::co_spawn(io, request(recovery, recovery_ctx), [&](std::exception_ptr error, OutboundProcessResult result) {
+    net::co_spawn(io, request(recovery, recovery_ctx), [&](std::exception_ptr error, proxy::OutboundProcessResult result) {
         EXPECT_FALSE(error);
         EXPECT_TRUE(result);
-        if (result) EXPECT_EQ(result->error, ErrorCode::OK);
+        if (result) EXPECT_EQ(result->error, common::ErrorCode::OK);
         EXPECT_EQ(recovery.received, 5);
         recovery_done = true;
     });
@@ -826,7 +826,7 @@ void RunQueue(int mode, unsigned seed = 1) {
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
-    ResidentTaskGroup tasks(io.get_executor());
+    common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 1s;
@@ -844,24 +844,24 @@ void RunQueue(int mode, unsigned seed = 1) {
     auto control_wire = std::make_shared<Wire>(io);
     Stream control(control_wire);
     const bool use_control = mode == 0 || mode == 10 || mode == 11;
-    struct RequestTimeout final : TimeoutEvent {
+    struct RequestTimeout final : transport::internet::TimeoutEvent {
         explicit RequestTimeout(Client& client) : client(client) {}
-        void OnTimeout() override { client.source.Stop(ErrorCode::RELAY_TIMEOUT); }
+        void OnTimeout() override { client.source.Stop(common::ErrorCode::RELAY_TIMEOUT); }
         Client& client;
     } request_timeout(client);
-    if (mode == 15) (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(1s, request_timeout);
+    if (mode == 15) (void)transport::internet::TimeoutScheduler::ForIoContext(io).ScheduleAfter(1s, request_timeout);
     session::Context ctx;
-    ctx.outbound.target = TargetAddress("192.0.2.1", 443);
-    ctx.content.network = mode == 10 || mode == 11 ? Network::UDP : Network::TCP;
-    StatsShard stats;
-    TimeoutsConfig timeouts;
-    RelayConfig config;
+    ctx.outbound.target = common::TargetAddress("192.0.2.1", 443);
+    ctx.content.network = mode == 10 || mode == 11 ? common::Network::UDP : common::Network::TCP;
+    app::StatsShard stats;
+    infra::TimeoutsConfig timeouts;
+    app::RelayConfig config;
     config.idle_timeout = config.write_timeout = 10s;
     config.uplink_only = config.downlink_only = 5s;
     bool done = false;
     const auto started = std::chrono::steady_clock::now();
     int64_t completed_ms = 0;
-    ErrorCode observed = ErrorCode::OK;
+    common::ErrorCode observed = common::ErrorCode::OK;
     std::exception_ptr exception;
     net::cancellation_signal cancellation;
     CleanupGuard cleanup([&] {
@@ -881,7 +881,7 @@ void RunQueue(int mode, unsigned seed = 1) {
     net::co_spawn(io, handler->Process(ctx,
         {&client, &client, use_control ? &control : nullptr}, outbound.dialer, timeouts,
         stats, config, {}),
-        net::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr failure, OutboundProcessResult result) {
+        net::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr failure, proxy::OutboundProcessResult result) {
             done = true; exception = failure;
             completed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - started).count();
@@ -914,8 +914,8 @@ void RunQueue(int mode, unsigned seed = 1) {
     }
     io.restart();
     io.run_for(mode == 15 ? 1300ms : 80ms);
-    const ErrorCode expected = mode == 6 || mode == 14 ? ErrorCode::CANCELLED : mode == 15 ? ErrorCode::RELAY_TIMEOUT
-        : mode == 12 ? ErrorCode::PROTOCOL_DECODE_FAILED : ErrorCode::OK;
+    const common::ErrorCode expected = mode == 6 || mode == 14 ? common::ErrorCode::CANCELLED : mode == 15 ? common::ErrorCode::RELAY_TIMEOUT
+        : mode == 12 ? common::ErrorCode::PROTOCOL_DECODE_FAILED : common::ErrorCode::OK;
     EXPECT_TRUE(done);
     EXPECT_FALSE(exception);
     EXPECT_EQ(observed, expected);
@@ -966,7 +966,7 @@ void RunIoFault(int mode, int kind) {
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
-    ResidentTaskGroup tasks(io.get_executor());
+    common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 1s;
@@ -982,12 +982,12 @@ void RunIoFault(int mode, int kind) {
     io_fault_kind = kind;
     auto control_wire = std::make_shared<Wire>(io);
     Stream control(control_wire);
-    auto request = [&](Client& client, session::Context& ctx, bool first) -> net::awaitable<OutboundProcessResult> {
-        ctx.outbound.target = TargetAddress("192.0.2.1", 443);
-        ctx.content.network = first && mode == 4 ? Network::UDP : Network::TCP;
-        StatsShard stats;
-        TimeoutsConfig timeouts;
-        RelayConfig config;
+    auto request = [&](Client& client, session::Context& ctx, bool first) -> net::awaitable<proxy::OutboundProcessResult> {
+        ctx.outbound.target = common::TargetAddress("192.0.2.1", 443);
+        ctx.content.network = first && mode == 4 ? common::Network::UDP : common::Network::TCP;
+        app::StatsShard stats;
+        infra::TimeoutsConfig timeouts;
+        app::RelayConfig config;
         config.idle_timeout = config.write_timeout = 10s;
         config.uplink_only = config.downlink_only = 5s;
         buf::MultiBuffer payload;
@@ -1005,14 +1005,14 @@ void RunIoFault(int mode, int kind) {
     };
     // Relay payload and FIN failures retain the write-phase category. An open
     // exception escapes Process unchanged; unknown physical reads are INTERNAL.
-    const ErrorCode expected = kind == 1 ? ErrorCode::RESOURCE_EXHAUSTED : kind == 2 ? ErrorCode::BLOCKED :
-        mode >= 3 ? ErrorCode::RELAY_WRITE_FAILED : ErrorCode::INTERNAL;
+    const common::ErrorCode expected = kind == 1 ? common::ErrorCode::RESOURCE_EXHAUSTED : kind == 2 ? common::ErrorCode::BLOCKED :
+        mode >= 3 ? common::ErrorCode::RELAY_WRITE_FAILED : common::ErrorCode::INTERNAL;
     Client first, second;
     first.eof = mode == 5;
     session::Context first_ctx, second_ctx;
     bool first_done = false, second_done = false;
     bool request_joined = false;
-    ErrorCode observed = ErrorCode::OK;
+    common::ErrorCode observed = common::ErrorCode::OK;
     net::cancellation_signal cancel;
     CleanupGuard cleanup([&] {
         DisarmAllocationFailure();
@@ -1028,7 +1028,7 @@ void RunIoFault(int mode, int kind) {
         io.run();
     });
     net::co_spawn(io, request(first, first_ctx, true), net::bind_cancellation_slot(cancel.slot(),
-        [&](std::exception_ptr failure, OutboundProcessResult result) {
+        [&](std::exception_ptr failure, proxy::OutboundProcessResult result) {
             first_done = true;
             // The pool owns the independent physical reader's cleanup. No
             // request reader or physical write may still borrow this request.
@@ -1037,9 +1037,9 @@ void RunIoFault(int mode, int kind) {
             observed = result ? result->error : result.error();
             if (!failure) return;
             try { std::rethrow_exception(failure); }
-            catch (const std::bad_alloc&) { observed = ErrorCode::RESOURCE_EXHAUSTED; }
+            catch (const std::bad_alloc&) { observed = common::ErrorCode::RESOURCE_EXHAUSTED; }
             catch (const transport::LinkError& error) { observed = error.code(); }
-            catch (...) { observed = ErrorCode::INTERNAL; }
+            catch (...) { observed = common::ErrorCode::INTERNAL; }
         }));
     io.run_for(180ms);
     ASSERT_FALSE(dialed.empty());
@@ -1057,10 +1057,10 @@ void RunIoFault(int mode, int kind) {
         io.restart();
         io.run_for(200ms);
     }
-    net::co_spawn(io, request(second, second_ctx, false), [&](std::exception_ptr failure, OutboundProcessResult result) {
+    net::co_spawn(io, request(second, second_ctx, false), [&](std::exception_ptr failure, proxy::OutboundProcessResult result) {
         EXPECT_FALSE(failure);
         EXPECT_TRUE(result);
-        if (result) EXPECT_EQ(result->error, ErrorCode::OK);
+        if (result) EXPECT_EQ(result->error, common::ErrorCode::OK);
         EXPECT_EQ(second.received, 5);
         second_done = true;
     });
@@ -1088,7 +1088,7 @@ void RunSessionRetirement(int mode) {
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
-    ResidentTaskGroup tasks(io.get_executor());
+    common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 1s;
@@ -1102,12 +1102,12 @@ void RunSessionRetirement(int mode) {
     fail_first_session = mode == 0 || mode == 3;
     respond_on_auth = mode == 3;
     const auto failures_before = AllocationFailures();
-    auto request = [&](Client& client, session::Context& ctx) -> net::awaitable<OutboundProcessResult> {
-        ctx.outbound.target = TargetAddress("192.0.2.1", 443);
-        ctx.content.network = Network::TCP;
-        StatsShard stats;
-        TimeoutsConfig timeouts;
-        RelayConfig config;
+    auto request = [&](Client& client, session::Context& ctx) -> net::awaitable<proxy::OutboundProcessResult> {
+        ctx.outbound.target = common::TargetAddress("192.0.2.1", 443);
+        ctx.content.network = common::Network::TCP;
+        app::StatsShard stats;
+        infra::TimeoutsConfig timeouts;
+        app::RelayConfig config;
         config.idle_timeout = config.write_timeout = 10s;
         config.uplink_only = config.downlink_only = 5s;
         co_return co_await handler->Process(ctx,
@@ -1116,7 +1116,7 @@ void RunSessionRetirement(int mode) {
     Client first, second;
     session::Context ctx_first, ctx_second;
     bool first_done = false, second_done = false;
-    OutboundProcessResult first_result, second_result;
+    proxy::OutboundProcessResult first_result, second_result;
     std::exception_ptr failure;
     net::cancellation_signal cancel;
     CleanupGuard cleanup([&] {
@@ -1133,7 +1133,7 @@ void RunSessionRetirement(int mode) {
         io.run();
     });
     net::co_spawn(io, request(first, ctx_first), net::bind_cancellation_slot(cancel.slot(),
-        [&](std::exception_ptr error, OutboundProcessResult result) {
+        [&](std::exception_ptr error, proxy::OutboundProcessResult result) {
             failure = error; first_result = result; first_done = true;
         }));
     io.run_for(180ms);
@@ -1144,7 +1144,7 @@ void RunSessionRetirement(int mode) {
     EXPECT_FALSE(dialed.empty());
     if (mode == 0) {
         ASSERT_TRUE(first_result);
-        EXPECT_EQ(first_result->error, ErrorCode::RESOURCE_EXHAUSTED);
+        EXPECT_EQ(first_result->error, common::ErrorCode::RESOURCE_EXHAUSTED);
         EXPECT_TRUE(dialed[0]->closed);
     }
     // The reply is already buffered when Adopt starts the physical loop, which
@@ -1152,12 +1152,12 @@ void RunSessionRetirement(int mode) {
     // session's terminal cause before any relay begins.
     else if (mode == 3) {
         ASSERT_FALSE(first_result);
-        EXPECT_EQ(first_result.error(), ErrorCode::RESOURCE_EXHAUSTED);
+        EXPECT_EQ(first_result.error(), common::ErrorCode::RESOURCE_EXHAUSTED);
         EXPECT_TRUE(dialed[0]->closed);
     }
     else {
         ASSERT_TRUE(first_result);
-        EXPECT_EQ(first_result->error, ErrorCode::OK);
+        EXPECT_EQ(first_result->error, common::ErrorCode::OK);
         EXPECT_EQ(first.received, 5);
     }
     bool retired_while_cleaning = false;
@@ -1168,7 +1168,7 @@ void RunSessionRetirement(int mode) {
         EXPECT_TRUE(dialed[0]->closed);
         EXPECT_TRUE(dialed[0]->destroyed);
         net::co_spawn(io, request(second, ctx_second), net::bind_cancellation_slot(cancel.slot(),
-            [&](std::exception_ptr error, OutboundProcessResult result) {
+            [&](std::exception_ptr error, proxy::OutboundProcessResult result) {
                 failure = error; second_result = result; second_done = true;
             }));
         io.restart();
@@ -1176,7 +1176,7 @@ void RunSessionRetirement(int mode) {
         EXPECT_TRUE(second_done);
         EXPECT_FALSE(failure);
         ASSERT_TRUE(second_result);
-        EXPECT_EQ(second_result->error, ErrorCode::OK);
+        EXPECT_EQ(second_result->error, common::ErrorCode::OK);
         EXPECT_EQ(second.received, 5);
         EXPECT_EQ(dialed.size(), 2);
     }
@@ -1222,7 +1222,7 @@ void RunPoolLifecycle(bool join_before_retirement) {
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
-    ResidentTaskGroup tasks(io.get_executor());
+    common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 1s;
@@ -1234,12 +1234,12 @@ void RunPoolLifecycle(bool join_before_retirement) {
     dialed.clear();
     fail_first_session = respond_on_auth = false;
     io_fault_mode = io_fault_kind = 0;
-    auto request = [&](Client& client, session::Context& ctx) -> net::awaitable<OutboundProcessResult> {
-        ctx.outbound.target = TargetAddress("192.0.2.1", 443);
-        ctx.content.network = Network::TCP;
-        StatsShard stats;
-        TimeoutsConfig timeouts;
-        RelayConfig config;
+    auto request = [&](Client& client, session::Context& ctx) -> net::awaitable<proxy::OutboundProcessResult> {
+        ctx.outbound.target = common::TargetAddress("192.0.2.1", 443);
+        ctx.content.network = common::Network::TCP;
+        app::StatsShard stats;
+        infra::TimeoutsConfig timeouts;
+        app::RelayConfig config;
         config.idle_timeout = config.write_timeout = 10s;
         config.uplink_only = config.downlink_only = 5s;
         co_return co_await handler->Process(ctx,
@@ -1251,15 +1251,15 @@ void RunPoolLifecycle(bool join_before_retirement) {
     std::array<bool, 3> threw{};
     auto start = [&](size_t index) {
         net::co_spawn(io, request(clients[index], contexts[index]),
-            [&, index](std::exception_ptr error, OutboundProcessResult result) {
+            [&, index](std::exception_ptr error, proxy::OutboundProcessResult result) {
                 threw[index] = bool(error);
                 if (index < 2) {
                     EXPECT_FALSE(error);
                     EXPECT_TRUE(result);
-                    if (result) EXPECT_EQ(result->error, ErrorCode::OK);
+                    if (result) EXPECT_EQ(result->error, common::ErrorCode::OK);
                     EXPECT_EQ(clients[index].received, 5);
                 }
-                succeeded[index] = !error && result && result->error == ErrorCode::OK &&
+                succeeded[index] = !error && result && result->error == common::ErrorCode::OK &&
                     clients[index].received == 5;
             });
     };
@@ -1328,14 +1328,14 @@ void RunPoolLifecycle(bool join_before_retirement) {
 
 void RunDomainPoolIsolation() {
     net::io_context io;
-    auto coordinator = std::make_shared<GroupCoordinator>(io, 2);
+    auto coordinator = std::make_shared<app::GroupCoordinator>(io, 2);
     coordinator->RegisterWorker(io);
     app::dns::Config dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
     app::dns::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
-    auto tasks = std::make_unique<ResidentTaskGroup>(io.get_executor());
+    auto tasks = std::make_unique<common::ResidentTaskGroup>(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 60s;
@@ -1350,12 +1350,12 @@ void RunDomainPoolIsolation() {
     std::array<Client, 4> clients;
     std::array<session::Context, 4> contexts;
     std::array<bool, 4> done{};
-    auto request = [&](size_t index) -> net::awaitable<OutboundProcessResult> {
-        contexts[index].outbound.target = TargetAddress("192.0.2.1", 443);
-        contexts[index].content.network = Network::TCP;
-        StatsShard stats;
-        TimeoutsConfig timeouts;
-        RelayConfig relay;
+    auto request = [&](size_t index) -> net::awaitable<proxy::OutboundProcessResult> {
+        contexts[index].outbound.target = common::TargetAddress("192.0.2.1", 443);
+        contexts[index].content.network = common::Network::TCP;
+        app::StatsShard stats;
+        infra::TimeoutsConfig timeouts;
+        app::RelayConfig relay;
         relay.idle_timeout = relay.write_timeout = 10s;
         relay.uplink_only = relay.downlink_only = 5s;
         co_return co_await handler->Process(contexts[index],
@@ -1364,10 +1364,10 @@ void RunDomainPoolIsolation() {
     };
     auto start = [&](size_t index) {
         net::co_spawn(io, request(index),
-            [&, index](std::exception_ptr error, OutboundProcessResult result) {
+            [&, index](std::exception_ptr error, proxy::OutboundProcessResult result) {
                 EXPECT_FALSE(error);
                 EXPECT_TRUE(result);
-                if (result) EXPECT_EQ(result->error, ErrorCode::OK);
+                if (result) EXPECT_EQ(result->error, common::ErrorCode::OK);
                 EXPECT_EQ(clients[index].received, 5);
                 done[index] = true;
             });

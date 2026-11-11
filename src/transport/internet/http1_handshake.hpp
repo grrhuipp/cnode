@@ -70,12 +70,12 @@ struct Http1HeadReadLimits {
 };
 
 // `initial` holds bytes already consumed while sniffing the protocol.
-[[nodiscard]] net::awaitable<tl::expected<void, ErrorCode>>
+[[nodiscard]] net::awaitable<tl::expected<void, common::ErrorCode>>
 ReadHttp1MessageHead(AsyncStream& stream,
                      Http1MessageHead& head,
                      std::span<const uint8_t> initial = {},
                      Http1HeadReadLimits limits = {});
-[[nodiscard]] net::awaitable<tl::expected<Http1MessageHead, ErrorCode>>
+[[nodiscard]] net::awaitable<tl::expected<Http1MessageHead, common::ErrorCode>>
 ReadHttp1MessageHead(AsyncStream& stream, std::span<const uint8_t> initial = {},
                      Http1HeadReadLimits limits = {});
 
@@ -122,7 +122,7 @@ struct Http1Request {
 // HTTP、HTTPUpgrade、WebSocket 与 XHTTP 服务端共用的请求头前导：读取请求头、解析
 // 请求行与 Host，并以 `scope`（如 "HTTP server"）为日志前缀记录读失败原因与脱敏后的
 // 请求行。失败语义同 ReadHttp1MessageHead。
-[[nodiscard]] net::awaitable<tl::expected<Http1Request, ErrorCode>> ReadHttp1Request(
+[[nodiscard]] net::awaitable<tl::expected<Http1Request, common::ErrorCode>> ReadHttp1Request(
     AsyncStream& stream,
     std::string_view scope,
     uint64_t conn_id,
@@ -151,7 +151,7 @@ using Http1ChunkPrefixBuffer = std::array<char, sizeof(size_t) * 2 + 2>;
 
 template <size_t StackCapacity>
 [[nodiscard]] inline bool AppendHttp1Chunk(
-    ConstBufferSpanBuilder<StackCapacity>& out,
+    common::ConstBufferSpanBuilder<StackCapacity>& out,
     Http1ChunkPrefixBuffer& prefix,
     std::span<const net::const_buffer> payloads,
     size_t payload_len) {
@@ -171,7 +171,7 @@ template <size_t StackCapacity>
     out.Append(net::buffer(kChunkTail.data(), kChunkTail.size()));
     return true;
 }
-[[nodiscard]] net::awaitable<tl::expected<Http1MessageHead, ErrorCode>>
+[[nodiscard]] net::awaitable<tl::expected<Http1MessageHead, common::ErrorCode>>
 ExecuteHttp1UpgradeClientHandshake(
     AsyncStream& stream,
     std::string_view scope,
@@ -207,7 +207,7 @@ struct Http1ResponseHead {
 
 // Reads the final response, consuming bounded interim heads. Applies RFC 9112
 // message-length precedence and rejects unsupported transfer codings.
-[[nodiscard]] net::awaitable<tl::expected<Http1ResponseHead, ErrorCode>>
+[[nodiscard]] net::awaitable<tl::expected<Http1ResponseHead, common::ErrorCode>>
 ReadHttp1ResponseHead(AsyncStream& stream, Http1HeadReadLimits limits = {});
 
 struct Http1BodyReadOptions {

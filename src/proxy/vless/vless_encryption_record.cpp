@@ -8,7 +8,7 @@
 #include <cstring>
 #include <type_traits>
 #include <utility>
-namespace vless {
+namespace proxy::vless {
 VlessEncryptedIo::VlessEncryptedIo(proxy::BufferedStreamReader& raw_reader,
                                    transport::MultiBufferWriter& raw_writer,
                                    VlessEncryptionRuntime runtime)
@@ -105,7 +105,7 @@ bool VlessEncryptionReader::EnableRawRead() noexcept {
 net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadRawBytes() {
     auto out = co_await src_.ReadMultiBuffer();
     if (out.byte_size() == 0) {
-        co_await ThrowIfCancelledOnEof("VLESS Encryption read cancelled");
+        co_await common::ThrowIfCancelledOnEof("VLESS Encryption read cancelled");
     }
     if (header_xor_) {
         for (auto* buffer : out) {
@@ -295,7 +295,7 @@ net::awaitable<void> VlessEncryptionWriter::WriteEncrypted(BufferRange source) {
     }
     struct NoBuilder {};
     [[maybe_unused]] std::conditional_t<kOwnsBuffers,
-                       ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity>,
+                       common::ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity>,
                        NoBuilder> builder;
     std::span<const net::const_buffer> buffers;
     if constexpr (kOwnsBuffers) {
@@ -424,4 +424,4 @@ net::awaitable<void> VlessEncryptionWriter::AsyncShutdownWrite() {
     }
 }
 
-}  // namespace vless
+}  // namespace proxy::vless

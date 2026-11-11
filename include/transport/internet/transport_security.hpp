@@ -4,6 +4,8 @@
 
 #include <memory>
 
+namespace transport::internet {
+
 class SslContext;
 
 // ============================================================================
@@ -39,3 +41,5 @@ private:
     std::shared_ptr<SslContext> context_;
     std::shared_ptr<TransportSecurity> xhttp_download_;
 };
+
+}  // namespace transport::internet

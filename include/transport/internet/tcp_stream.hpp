@@ -13,6 +13,8 @@
 #include <utility>
 #include <vector>
 
+namespace transport::internet {
+
 struct DetachedTcpState {
     int fd = -1;
     tcp::endpoint::protocol_type protocol = tcp::v4();
@@ -137,4 +139,6 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+}  // namespace transport::internet
 

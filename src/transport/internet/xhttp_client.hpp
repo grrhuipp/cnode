@@ -10,6 +10,8 @@
 #include <cstddef>
 
 // 16 字节随机数的小写 hex 字符数。
+namespace transport::internet {
+
 inline constexpr size_t kXHttpSessionIdLength = 32;
 using XHttpSessionId = std::array<char, kXHttpSessionIdLength>;
 
@@ -30,3 +32,5 @@ using XHttpSessionId = std::array<char, kXHttpSessionIdLength>;
     net::io_context& io_context,
     session::Context& ctx,
     const OutboundTransportTarget& target);
+
+}  // namespace transport::internet

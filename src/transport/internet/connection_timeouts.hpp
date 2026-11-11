@@ -193,8 +193,8 @@ private:
     }
     void ReconcileNoThrow() noexcept {
         try { Reconcile(); }
-        catch (const std::bad_alloc&) { Fail(ErrorCode::RESOURCE_EXHAUSTED); }
-        catch (...) { Fail(ErrorCode::INTERNAL); }
+        catch (const std::bad_alloc&) { Fail(common::ErrorCode::RESOURCE_EXHAUSTED); }
+        catch (...) { Fail(common::ErrorCode::INTERNAL); }
     }
     void OnTimeout() noexcept override {
         armed_deadline_ = kNone;
@@ -207,12 +207,12 @@ private:
         UpdateFlags();
         if (idle_expired_ || read_expired_ || write_expired_ || phase_expired_) {
             Stop();
-            owner_.OnTimeout(ErrorCode::CANCELLED);
+            owner_.OnTimeout(common::ErrorCode::CANCELLED);
             return;
         }
         ReconcileNoThrow();
     }
-    void Fail(ErrorCode reason) noexcept {
+    void Fail(common::ErrorCode reason) noexcept {
         Stop();
         owner_.OnTimeout(reason);
     }

@@ -8,6 +8,8 @@
 #include <memory>
 
 
+namespace transport::internet {
+
 class TimeoutSchedulerService;
 class TimeoutScheduler;
 // An event embedded in its owner, never separately allocated.
@@ -70,4 +72,6 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+}  // namespace transport::internet
 

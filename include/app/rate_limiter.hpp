@@ -18,12 +18,14 @@
 // src/app/connection_limiter_core.hpp 与 src/app/rate_limiter.cpp。
 // ============================================================================
 
+namespace app {
+
 using AuthCredentialKey = std::array<uint8_t, 32>;
 
 struct RateLimitConfig {
     uint32_t max_connections = 0; // 全局最大连接数 (0=不限制)
     uint32_t max_conn_per_ip = 0; // 单 IP 最大并发连接 (0=不限制)
-    AuthFailureLimitConfig ip_ban{};
+    infra::AuthFailureLimitConfig ip_ban{};
 };
 
 // Lease shared by one physical connection and its logical children; carried in
@@ -132,3 +134,5 @@ private:
     const std::unique_ptr<ConnectionLimiterCore> core_;
     std::shared_ptr<GroupCoordinator> coordinator_;
 };
+
+}  // namespace app

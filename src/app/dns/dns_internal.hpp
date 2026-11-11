@@ -67,7 +67,7 @@ public:
             return std::nullopt;
         }
         const auto node = found->second;
-        const auto now = steady_clock::now();
+        const auto now = common::steady_clock::now();
         if (now >= node->entry.expire_time) {
             if (std::holds_alternative<memory::String>(node->entry.answer)) {
                 // Keep only bounded recovery metadata, never serve an expired
@@ -89,7 +89,7 @@ public:
         DnsCacheEntry& entry = node->entry;
         DnsResult result;
         if (const auto* reason = std::get_if<memory::String>(&entry.answer)) {
-            result.error = ErrorCode::DNS_NO_RECORD;
+            result.error = common::ErrorCode::DNS_NO_RECORD;
             result.error_msg.assign(reason->data(), reason->size());
             if (entry.negative_hits != UINT64_MAX) ++entry.negative_hits;
         } else {
@@ -105,7 +105,7 @@ public:
     }
 
     void Store(std::string_view domain, const DnsResult& result) {
-        if (capacity_ == 0 || (!result.Ok() && result.error != ErrorCode::DNS_NO_RECORD)) {
+        if (capacity_ == 0 || (!result.Ok() && result.error != common::ErrorCode::DNS_NO_RECORD)) {
             return;
         }
         const auto existing = entries_.find(domain);
@@ -130,7 +130,7 @@ public:
                 result.error_msg.data(), result.error_msg.size(), resource_);
         }
         const uint32_t ttl = result.ttl == 0 ? 0 : std::clamp(result.ttl, min_ttl_, max_ttl_);
-        prepared.expire_time = steady_clock::now() + std::chrono::seconds(ttl);
+        prepared.expire_time = common::steady_clock::now() + std::chrono::seconds(ttl);
 
         if (existing != entries_.end()) {
             const auto node = existing->second;
@@ -179,7 +179,7 @@ private:
     struct DnsCacheEntry {
         std::variant<memory::Vector<net::ip::address>,
                      memory::String> answer;
-        time_point expire_time;
+        common::time_point expire_time;
         uint64_t negative_hits = 0;
         bool expired_negative = false;
     };
@@ -228,7 +228,7 @@ public:
     };
 
     DatagramExchange(net::io_context& io, udp::endpoint endpoint)
-        : socket_(io), endpoint_(endpoint), scheduler_(TimeoutScheduler::ForIoContext(io)),
+        : socket_(io), endpoint_(endpoint), scheduler_(transport::internet::TimeoutScheduler::ForIoContext(io)),
           joined_(io) {}
 
     void RequestStop() noexcept {
@@ -283,7 +283,7 @@ public:
             co_return failure;
         }
         while (used_ids_.test(id)) ++id;
-        StoreU16BE(query.data(), id);
+        common::StoreU16BE(query.data(), id);
         Pending request(*this, id, query);
         pending_.emplace(id, &request);
         if (!scheduler_.ScheduleAfter(timeout, request)) {
@@ -321,7 +321,7 @@ private:
         if (stopping_ && active_ == 0 && !reading_) joined_.close();
     }
 
-    struct Pending final : TimeoutEvent {
+    struct Pending final : transport::internet::TimeoutEvent {
         Pending(DatagramExchange& owner, uint16_t id, std::span<const uint8_t> query)
             : owner(owner), id(id), query(query), completion(owner.socket_.get_executor()) {}
         ~Pending() {
@@ -333,7 +333,7 @@ private:
         DatagramExchange& owner;
         uint16_t id;
         std::span<const uint8_t> query;
-        SignalChannel completion;
+        common::SignalChannel completion;
         void OnTimeout() override { owner.Complete(id, io_error::timed_out); }
         Reply reply;
     };
@@ -364,7 +364,7 @@ private:
                     std::equal(query.begin() + expected, query.end(), packet.begin() + pos);
             }
             for (size_t i = 0; i < length; ++i) {
-                if (ToLowerAscii(packet[pos++]) != ToLowerAscii(query[expected++])) return false;
+                if (common::ToLowerAscii(packet[pos++]) != common::ToLowerAscii(query[expected++])) return false;
             }
         }
         return false;
@@ -410,7 +410,7 @@ private:
                         return;
                     }
                     if (!ec && size >= 2) {
-                        const uint16_t id = LoadU16BE(self->buffer_.data());
+                        const uint16_t id = common::LoadU16BE(self->buffer_.data());
                         const auto it = self->pending_.find(id);
                         if (it != self->pending_.end() &&
                             Matches(std::span(self->buffer_.data(), size), it->second->query)) {
@@ -434,8 +434,8 @@ private:
 
     udp::socket socket_;
     udp::endpoint endpoint_;
-    TimeoutScheduler& scheduler_;
-    SignalChannel joined_;
+    transport::internet::TimeoutScheduler& scheduler_;
+    common::SignalChannel joined_;
     memory::UnorderedMap<uint16_t, Pending*> pending_;
     std::array<uint8_t, 512> buffer_{};
     std::bitset<65536> used_ids_;
@@ -454,7 +454,7 @@ class InflightResolves {
             : domain(name), completion(io_context) {}
 
         memory::String domain;
-        SignalChannel completion;
+        common::SignalChannel completion;
         std::optional<DnsResult> result;
         std::exception_ptr failure;
         transport::CancellationSource cancellation;
@@ -467,7 +467,7 @@ class InflightResolves {
         const auto found = table_.find(std::string_view(pending.domain));
         if (found != table_.end() && found->second.get() == &pending) {
             table_.erase(found);
-            MaybeShrinkHashContainer(table_, 8);
+            common::MaybeShrinkHashContainer(table_, 8);
         }
     }
 
@@ -492,7 +492,7 @@ class InflightResolves {
             result = co_await query(std::string_view(pending->domain));
         } catch (const IoSystemError& error) {
             if (error.code() == io_error::operation_aborted) {
-                result.error = ErrorCode::CANCELLED;
+                result.error = common::ErrorCode::CANCELLED;
             } else {
                 failure = std::current_exception();
             }
@@ -519,7 +519,7 @@ public:
         stopping_ = true;
         for (const auto& [domain, pending] : table_) {
             pending->result.emplace();
-            pending->result->error = ErrorCode::CANCELLED;
+            pending->result->error = common::ErrorCode::CANCELLED;
             pending->completion.close();
         }
         tasks_.Tasks().Cancel();
@@ -534,7 +534,7 @@ public:
     net::awaitable<DnsResult> Run(std::string_view domain, Query query) {
         if (stopping_) {
             DnsResult cancelled;
-            cancelled.error = ErrorCode::CANCELLED;
+            cancelled.error = common::ErrorCode::CANCELLED;
             co_return cancelled;
         }
         PendingPtr pending;
@@ -543,7 +543,7 @@ public:
         } else {
             if (active_ >= capacity_) {
                 DnsResult rejected;
-                rejected.error = ErrorCode::RESOURCE_EXHAUSTED;
+                rejected.error = common::ErrorCode::RESOURCE_EXHAUSTED;
                 co_return rejected;
             }
             pending = std::make_shared<Pending>(io_context_, domain);
@@ -572,7 +572,7 @@ public:
             }
         }
         DnsResult cancelled;
-        cancelled.error = ErrorCode::CANCELLED;
+        cancelled.error = common::ErrorCode::CANCELLED;
         co_return cancelled;
     }
 
@@ -582,7 +582,7 @@ private:
     size_t capacity_;
     size_t active_ = 0;
     bool stopping_ = false;
-    ResidentTaskGroup tasks_;
+    common::ResidentTaskGroup tasks_;
 };
 
 }  // namespace app::dns

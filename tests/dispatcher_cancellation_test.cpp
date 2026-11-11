@@ -36,7 +36,7 @@ struct State {
     bool block = false;
     bool return_cancelled = false;
     bool allocation_failure = false;
-    ErrorCode read_error = ErrorCode::OK;
+    common::ErrorCode read_error = common::ErrorCode::OK;
     size_t payload_size = 0;
     size_t written = 0;
     int active = 0;
@@ -48,7 +48,7 @@ struct State {
     bool closed = false;
     bool cleanup_has_owner = false;
     app::RequestLoadState* load = nullptr;
-    TcpStream* phase_stream = nullptr;
+    transport::internet::TcpStream* phase_stream = nullptr;
 };
 
 net::awaitable<void> Wait(State& state) {
@@ -67,7 +67,7 @@ net::awaitable<void> Wait(State& state) {
     if (error) throw IoSystemError(error);
 }
 
-class Stream final : public AsyncStream {
+class Stream final : public transport::AsyncStream {
 public:
     explicit Stream(State& state) : state_(state) {}
     ~Stream() override {
@@ -82,7 +82,7 @@ public:
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
         ++state_.entered;
         if (state_.allocation_failure) throw std::bad_alloc();
-        if (state_.read_error != ErrorCode::OK) throw transport::LinkError(state_.read_error);
+        if (state_.read_error != common::ErrorCode::OK) throw transport::LinkError(state_.read_error);
         if (state_.block) co_await Wait(state_);
         co_return Payload(std::exchange(state_.payload_size, 0));
     }
@@ -92,8 +92,8 @@ public:
     int NativeHandle() const override { return -1; }
     bool IsOpen() const override { return !state_.closed; }
 protected:
-    TcpStream* BaseTcpStream() override { return state_.phase_stream; }
-    const TcpStream* BaseTcpStream() const override { return state_.phase_stream; }
+    transport::internet::TcpStream* BaseTcpStream() override { return state_.phase_stream; }
+    const transport::internet::TcpStream* BaseTcpStream() const override { return state_.phase_stream; }
 private:
     State& state_;
 };
@@ -105,25 +105,25 @@ struct OutboundProbe {
     bool relay = false;
 };
 
-class TestOutbound final : public Outbound {
+class TestOutbound final : public proxy::Outbound {
 public:
     explicit TestOutbound(OutboundProbe& probe) : probe_(probe) {}
-    net::awaitable<OutboundProcessResult> Process(
-        session::Context& ctx, transport::Link inbound, OutboundDialer& dialer,
-        const TimeoutsConfig&, StatsShard& stats, const RelayConfig& config,
+    net::awaitable<proxy::OutboundProcessResult> Process(
+        session::Context& ctx, transport::Link inbound, transport::internet::OutboundDialer& dialer,
+        const infra::TimeoutsConfig&, app::StatsShard& stats, const app::RelayConfig& config,
         buf::MultiBufferBatch first) override {
         auto& state = probe_.state;
         ++state.entered;
         if (state.block) co_await Wait(state);
         ++state.committed;
         if (state.return_cancelled) {
-            RelayResult result;
-            result.error = ErrorCode::CANCELLED;
+            app::RelayResult result;
+            result.error = common::ErrorCode::CANCELLED;
             co_return result;
         }
-        if (!probe_.relay) co_return RelayResult{};
+        if (!probe_.relay) co_return app::RelayResult{};
         Stream target(probe_.target_state);
-        co_return co_await DoRelayLink(dialer.IoContext(), *inbound.reader, *inbound.writer,
+        co_return co_await app::DoRelayLink(dialer.IoContext(), *inbound.reader, *inbound.writer,
             inbound.control, target, ctx, stats, config, std::move(first));
     }
 private:
@@ -138,7 +138,7 @@ proxyman::outbound::PreparedOutboundConfig ProbeConfig(std::string tag, Outbound
         .create = proxyman::outbound::MakePreparedOutboundCreator<
             OutboundProbe*,
             +[](std::string_view, std::shared_ptr<OutboundProbe* const> probe,
-                net::io_context&, AwaitableTaskGroup&) -> std::unique_ptr<Outbound> {
+                net::io_context&, common::AwaitableTaskGroup&) -> std::unique_ptr<proxy::Outbound> {
                 return std::make_unique<TestOutbound>(**probe);
             }>(&probe),
     };
@@ -159,7 +159,7 @@ struct Outbounds {
           registry({ProbeConfig("direct", probes.direct),
                     ProbeConfig("second", probes.second)},
                    io, dns, std::chrono::seconds(1), tasks.Tasks()) {}
-    ResidentTaskGroup tasks;
+    common::ResidentTaskGroup tasks;
     proxyman::outbound::HandlerRegistry registry;
 };
 
@@ -195,7 +195,7 @@ enum class Case { PreStopped, Sniff, Handshake, RoutingDns, Parent, Pending,
                   Success, RelaySuccess, RelayFailure, RelayCancelled, SniffMemory, SniffLinkError,
                   RoutedFallback, RuleMatch, PolicyBlockedForce, PolicyBlockedRoute, PolicyAllowed };
 
-void ExerciseDispatch(Case which, bool controlled, ErrorCode reason = ErrorCode::CANCELLED) {
+void ExerciseDispatch(Case which, bool controlled, common::ErrorCode reason = common::ErrorCode::CANCELLED) {
     net::io_context io;
     app::RequestLoadState load(100, 30);
     State source_state;
@@ -203,11 +203,11 @@ void ExerciseDispatch(Case which, bool controlled, ErrorCode reason = ErrorCode:
     IoErrorCode phase_open_error;
     phase_socket.open(tcp::v4(), phase_open_error);
     if (phase_open_error) throw IoSystemError(phase_open_error);
-    TcpStream phase_stream(std::move(phase_socket));
+    transport::internet::TcpStream phase_stream(std::move(phase_socket));
     source_state.load = &load;
     source_state.block = which == Case::Sniff;
     source_state.allocation_failure = which == Case::SniffMemory;
-    source_state.read_error = which == Case::SniffLinkError ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::OK;
+    source_state.read_error = which == Case::SniffLinkError ? common::ErrorCode::RESOURCE_EXHAUSTED : common::ErrorCode::OK;
     source_state.payload_size = 7;
     source_state.notify_closed_on_destroy = controlled &&
         (which == Case::RelayFailure || which == Case::RelayCancelled);
@@ -225,8 +225,8 @@ void ExerciseDispatch(Case which, bool controlled, ErrorCode reason = ErrorCode:
     outbound.relay = which == Case::RelaySuccess || which == Case::RelayFailure;
     outbound.state.return_cancelled = which == Case::RelayCancelled;
     outbound.target_state.payload_size = 13;
-    if (which == Case::RelayFailure) outbound.target_state.read_error = ErrorCode::SOCKET_READ_FAILED;
-    routing::DispatchPolicy policy{SniffConfig{}, routing::ForceOutbound{"direct"}};
+    if (which == Case::RelayFailure) outbound.target_state.read_error = common::ErrorCode::SOCKET_READ_FAILED;
+    routing::DispatchPolicy policy{routing::SniffConfig{}, routing::ForceOutbound{"direct"}};
     if (which == Case::RoutedFallback || which == Case::RuleMatch ||
         which == Case::PolicyBlockedRoute) {
         policy.outbound = routing::RouteWithFallback{"direct"};
@@ -238,11 +238,11 @@ void ExerciseDispatch(Case which, bool controlled, ErrorCode reason = ErrorCode:
     ctx.inbound.accounting_key = "panel/fixture/1/";
     ctx.inbound.user_id = 42;
     ctx.inbound.user_email = "dispatcher|42";
-    ctx.outbound.target = TargetAddress("192.0.2.1", 443);
+    ctx.outbound.target = common::TargetAddress("192.0.2.1", 443);
     ctx.outbound.original_target = ctx.outbound.target;
-    ctx.content.network = Network::TCP;
-    StatsShard stats;
-    TimeoutsConfig timeouts;
+    ctx.content.network = common::Network::TCP;
+    app::StatsShard stats;
+    infra::TimeoutsConfig timeouts;
     udp::socket dns_peer(io, udp::endpoint(net::ip::make_address("127.0.0.42"), 0));
     app::dns::Config dns_config{
         .servers = {dns_peer.local_endpoint()},
@@ -250,7 +250,7 @@ void ExerciseDispatch(Case which, bool controlled, ErrorCode reason = ErrorCode:
     };
     if (which == Case::RoutingDns) {
         policy.outbound = routing::RouteWithFallback{"direct"};
-        ctx.outbound.target = TargetAddress("dispatcher-cancellation.example", 443);
+        ctx.outbound.target = common::TargetAddress("dispatcher-cancellation.example", 443);
         ctx.outbound.original_target = ctx.outbound.target;
     }
     app::dns::DNSWorker dns_worker(io, dns_config, 8);
@@ -274,7 +274,7 @@ void ExerciseDispatch(Case which, bool controlled, ErrorCode reason = ErrorCode:
     bool done = false;
     bool triggered = false;
     std::exception_ptr failure;
-    RelayResult result;
+    app::RelayResult result;
     net::cancellation_signal parent;
     net::steady_timer trigger(io);
     if (which == Case::Sniff || which == Case::Handshake || which == Case::RoutingDns ||
@@ -291,9 +291,9 @@ void ExerciseDispatch(Case which, bool controlled, ErrorCode reason = ErrorCode:
     }
     auto request = dispatcher.Dispatch(io, policy, controlled ? std::move(stream) : nullptr,
         controlled ? transport::Link{} : transport::Link{reader, reader, nullptr},
-        InitialPayload{}, ctx, stats, timeouts);
+        common::InitialPayload{}, ctx, stats, timeouts);
     net::co_spawn(io, std::move(request), net::bind_cancellation_slot(parent.slot(),
-        [&](std::exception_ptr error, RelayResult value) { failure = error; result = value; done = true; }));
+        [&](std::exception_ptr error, app::RelayResult value) { failure = error; result = value; done = true; }));
     io.run_for(180ms);
     const bool completed_in_budget = done;
     if (!done) {
@@ -312,12 +312,12 @@ void ExerciseDispatch(Case which, bool controlled, ErrorCode reason = ErrorCode:
     auto expected = reason;
     if (which == Case::Success || which == Case::RelaySuccess ||
         which == Case::RoutedFallback || which == Case::RuleMatch ||
-        which == Case::PolicyAllowed) expected = ErrorCode::OK;
-    if (which == Case::RelayFailure) expected = ErrorCode::SOCKET_READ_FAILED;
-    if (which == Case::RelayCancelled) expected = ErrorCode::CANCELLED;
-    if (which == Case::SniffMemory || which == Case::SniffLinkError) expected = ErrorCode::RESOURCE_EXHAUSTED;
+        which == Case::PolicyAllowed) expected = common::ErrorCode::OK;
+    if (which == Case::RelayFailure) expected = common::ErrorCode::SOCKET_READ_FAILED;
+    if (which == Case::RelayCancelled) expected = common::ErrorCode::CANCELLED;
+    if (which == Case::SniffMemory || which == Case::SniffLinkError) expected = common::ErrorCode::RESOURCE_EXHAUSTED;
     if (which == Case::PolicyBlockedForce || which == Case::PolicyBlockedRoute)
-        expected = ErrorCode::BLOCKED;
+        expected = common::ErrorCode::BLOCKED;
     EXPECT_EQ(result.error, expected);
     if (which == Case::PreStopped || which == Case::Sniff || which == Case::RoutingDns ||
         which == Case::SniffMemory || which == Case::SniffLinkError) {
@@ -405,22 +405,22 @@ void ExerciseSiblingIsolation(bool controlled) {
     Outbounds outbound_handlers(outbounds, io, dns);
     app::dispatcher::DefaultDispatcher dispatcher(
         router, outbound_handlers.registry, request_policy, session_tracking, dns, load);
-    routing::DispatchPolicy policy_a{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"direct"}};
-    routing::DispatchPolicy policy_b{SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"second"}};
+    routing::DispatchPolicy policy_a{routing::SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"direct"}};
+    routing::DispatchPolicy policy_b{routing::SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"second"}};
     session::Context ctx_a, ctx_b;
-    ctx_a.outbound.target = ctx_b.outbound.target = TargetAddress("192.0.2.1", 443);
-    StatsShard stats;
-    TimeoutsConfig timeouts;
+    ctx_a.outbound.target = ctx_b.outbound.target = common::TargetAddress("192.0.2.1", 443);
+    app::StatsShard stats;
+    infra::TimeoutsConfig timeouts;
     bool first_done = false, second_done = false;
     int first_active_on_completion = -1;
     size_t load_on_first_completion = 0;
     net::cancellation_signal cancel_first, cancel_second;
-    RelayResult result_a, result_b;
+    app::RelayResult result_a, result_b;
     const auto link_a = controlled ? transport::Link{} : transport::Link{first.get(), first.get(), nullptr};
     const auto link_b = controlled ? transport::Link{} : transport::Link{second.get(), second.get(), nullptr};
     net::co_spawn(io, dispatcher.Dispatch(io, policy_a, controlled ? std::move(first) : nullptr,
-        link_a, InitialPayload{}, ctx_a, stats, timeouts),
-        net::bind_cancellation_slot(cancel_first.slot(), [&](std::exception_ptr error, RelayResult result) {
+        link_a, common::InitialPayload{}, ctx_a, stats, timeouts),
+        net::bind_cancellation_slot(cancel_first.slot(), [&](std::exception_ptr error, app::RelayResult result) {
             EXPECT_FALSE(error);
             first_done = true;
             result_a = result;
@@ -428,8 +428,8 @@ void ExerciseSiblingIsolation(bool controlled) {
             load_on_first_completion = load.ActiveConnections();
         }));
     net::co_spawn(io, dispatcher.Dispatch(io, policy_b, controlled ? std::move(second) : nullptr,
-        link_b, InitialPayload{}, ctx_b, stats, timeouts),
-        net::bind_cancellation_slot(cancel_second.slot(), [&](std::exception_ptr error, RelayResult result) {
+        link_b, common::InitialPayload{}, ctx_b, stats, timeouts),
+        net::bind_cancellation_slot(cancel_second.slot(), [&](std::exception_ptr error, app::RelayResult result) {
             EXPECT_FALSE(error);
             second_done = true;
             result_b = result;
@@ -440,7 +440,7 @@ void ExerciseSiblingIsolation(bool controlled) {
         if (error) return;
         direct_waiting = outbounds.direct.state.active;
         second_waiting = outbounds.second.state.active;
-        source->Cancellation().Stop(ErrorCode::RESOURCE_EXHAUSTED);
+        source->Cancellation().Stop(common::ErrorCode::RESOURCE_EXHAUSTED);
     });
     io.run_for(1s);
     const bool completed_in_budget = first_done && second_done;
@@ -454,8 +454,8 @@ void ExerciseSiblingIsolation(bool controlled) {
     EXPECT_EQ(second_waiting, 1);
     EXPECT_EQ(first_active_on_completion, 0);
     EXPECT_EQ(load_on_first_completion, 1u);
-    EXPECT_EQ(result_a.error, ErrorCode::RESOURCE_EXHAUSTED);
-    EXPECT_EQ(result_b.error, ErrorCode::OK);
+    EXPECT_EQ(result_a.error, common::ErrorCode::RESOURCE_EXHAUSTED);
+    EXPECT_EQ(result_b.error, common::ErrorCode::OK);
     EXPECT_EQ(outbounds.direct.state.cancelled, 1);
     EXPECT_EQ(outbounds.direct.state.committed, 0);
     EXPECT_EQ(outbounds.second.state.cancelled, 0);
@@ -563,7 +563,7 @@ TEST(DispatcherAccounting, RollbackRestoresTrafficFromRetiredSession) {
 }
 
 class DispatcherStopReason
-    : public ::testing::TestWithParam<std::tuple<bool, ErrorCode>> {};
+    : public ::testing::TestWithParam<std::tuple<bool, common::ErrorCode>> {};
 
 TEST_P(DispatcherStopReason, PreStoppedRequestNeverEntersOutbound) {
     const auto [controlled, reason] = GetParam();
@@ -582,10 +582,10 @@ TEST_P(DispatcherStopReason, HandshakeCancellationJoinsCleanupBeforeReleasingLoa
 
 INSTANTIATE_TEST_SUITE_P(OwnershipAndReason, DispatcherStopReason,
     ::testing::Combine(::testing::Bool(),
-        ::testing::Values(ErrorCode::CANCELLED, ErrorCode::RESOURCE_EXHAUSTED)),
-    [](const ::testing::TestParamInfo<std::tuple<bool, ErrorCode>>& info) {
+        ::testing::Values(common::ErrorCode::CANCELLED, common::ErrorCode::RESOURCE_EXHAUSTED)),
+    [](const ::testing::TestParamInfo<std::tuple<bool, common::ErrorCode>>& info) {
         return std::string(std::get<0>(info.param) ? "Owned" : "Borrowed") +
-            (std::get<1>(info.param) == ErrorCode::CANCELLED ? "Cancelled" : "ResourceExhausted");
+            (std::get<1>(info.param) == common::ErrorCode::CANCELLED ? "Cancelled" : "ResourceExhausted");
     });
 
 class DispatcherOwnership : public ::testing::TestWithParam<bool> {};

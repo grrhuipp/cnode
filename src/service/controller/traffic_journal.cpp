@@ -31,7 +31,7 @@ struct File {
     int fd;
     ~File() { if (fd >= 0) ::close(fd); }
 };
-std::string Identity(const PanelConfig& config) {
+std::string Identity(const infra::PanelConfig& config) {
     if (config.TrafficJournalDir.empty()) {
         throw std::invalid_argument("traffic journal directory is required");
     }
@@ -54,7 +54,7 @@ std::optional<format::RecordState> EntryRecordState(const std::filesystem::direc
 
 }  // namespace
 
-TrafficJournal::TrafficJournal(const PanelConfig& config)
+TrafficJournal::TrafficJournal(const infra::PanelConfig& config)
     : directory_(config.TrafficJournalDir / Identity(config)) {
     std::filesystem::create_directories(directory_);
     directory_fd_ = ::open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);

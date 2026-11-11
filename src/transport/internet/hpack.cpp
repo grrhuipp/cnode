@@ -41,7 +41,7 @@ void AppendHpackLiteralNewName(memory::ByteVector& out,
                                std::string_view value) {
     out.push_back(0);
     AppendHpackInt(out, 7, 0, static_cast<uint32_t>(name.size()));
-    for (const unsigned char ch : name) out.push_back(ToLowerAscii(ch));
+    for (const unsigned char ch : name) out.push_back(common::ToLowerAscii(ch));
     AppendHpackString(out, value);
 }
 }

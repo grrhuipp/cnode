@@ -211,6 +211,8 @@ private:
 }  // namespace json
 
 // 配置加载器统一在此将值语义的字段错误转换为 invalid_argument。
+namespace infra {
+
 template <typename T>
 T RequireJson(tl::expected<T, std::string> result) {
     if (!result) {
@@ -284,3 +286,5 @@ struct JsonPortResult {
 
 [[nodiscard]] JsonPortResult ReadJsonPort(
     const json::object& source, std::string_view key) noexcept;
+
+}  // namespace infra

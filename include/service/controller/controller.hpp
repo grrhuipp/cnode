@@ -18,17 +18,27 @@
 #include <vector>
 
 
+namespace app {
+
 class Worker;
+
+}  // namespace app
+namespace infra {
+
 struct PanelConfig;
+
+}  // namespace infra
 
 namespace api {
 class API;
 }  // namespace api
 
+namespace controller {
+
 class Controller {
 public:
     Controller(net::io_context& io_context,
-               const std::vector<std::unique_ptr<Worker>>& workers);
+               const std::vector<std::unique_ptr<app::Worker>>& workers);
     ~Controller();
 
     Controller(const Controller&) = delete;
@@ -36,7 +46,7 @@ public:
     Controller(Controller&&) = delete;
     Controller& operator=(Controller&&) = delete;
 
-    void AddPanel(std::unique_ptr<api::API> panel, const PanelConfig& panel_config);
+    void AddPanel(std::unique_ptr<api::API> panel, const infra::PanelConfig& panel_config);
     void Start();
     // Main-executor only. Stop is terminal; join waits every started loop.
     void RequestStop() noexcept;
@@ -63,4 +73,6 @@ private:
     struct Impl;
     std::shared_ptr<Impl> impl_;
 };
+
+}  // namespace controller
 

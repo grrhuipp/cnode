@@ -29,7 +29,7 @@
 #include <string_view>
 #include <variant>
 #include <tl/expected.hpp>
-namespace ss {
+namespace proxy::shadowsocks {
 
 // ============================================================================
 // 密码类型
@@ -262,9 +262,9 @@ inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
     return true;
 }
 
-[[nodiscard]] inline net::awaitable<tl::expected<void, ErrorCode>>
+[[nodiscard]] inline net::awaitable<tl::expected<void, common::ErrorCode>>
 ReadAndDecryptStreamPayload(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     SsAeadCipher& cipher,
     std::span<const uint8_t, 12> nonce,
     size_t payload_len,
@@ -273,7 +273,7 @@ ReadAndDecryptStreamPayload(
     size_t remaining = payload_len;
     while (remaining > 0) {
         buf::BufferGuard block{buf::Buffer::New()};
-        if (!block) co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        if (!block) co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
         const size_t count = std::min(remaining, size_t(block->Available()));
         if (auto read = co_await proxy::ReadHandshakeExact(stream,
                 {block->Tail().data(), count}, proxy::HandshakeProgress::Started); !read)
@@ -287,10 +287,10 @@ ReadAndDecryptStreamPayload(
             proxy::HandshakeProgress::Started); !read)
         co_return tl::unexpected(read.error());
     if (!buf::AppendSpanToMultiBuffer(tag, ciphertext))
-        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
     if (!DecryptStreamPayload(cipher, nonce, std::move(ciphertext), output))
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
-    co_return tl::expected<void, ErrorCode>{};
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
+    co_return tl::expected<void, common::ErrorCode>{};
 }
 
 // Both TCP directions use this state machine. A length is authenticated and
@@ -323,9 +323,9 @@ public:
             ciphertext_.ReleaseIfIdle();
             auto raw = co_await stream_->ReadMultiBuffer();
             if (raw.byte_size() == 0) {
-                co_await ThrowIfCancelledOnEof();
+                co_await common::ThrowIfCancelledOnEof();
                 if (length_ || ciphertext_.byte_size() != 0) {
-                    try { throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED); }
+                    try { throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED); }
                     catch (...) { Fail(); }
                 }
                 co_return buf::MultiBuffer{};
@@ -352,10 +352,10 @@ private:
                 std::array<uint8_t, 2> plain{};
                 const auto nonce = MakeNonce(nonce_);
                 if (!cipher_.Decrypt(nonce.data(), header.data(), header.size(), plain.data()))
-                    throw transport::LinkError(ErrorCode::PROTOCOL_AUTH_FAILED);
-                const size_t length = LoadU16BE(&plain[0]);
+                    throw transport::LinkError(common::ErrorCode::PROTOCOL_AUTH_FAILED);
+                const size_t length = common::LoadU16BE(&plain[0]);
                 if (length > max_payload_)
-                    throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
+                    throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
                 length_ = length;
                 ciphertext_.DropPrefixBytes(header.size());
                 ++nonce_;
@@ -367,7 +367,7 @@ private:
             buf::MultiBuffer decoded;
             const auto nonce = MakeNonce(nonce_);
             if (!DecryptStreamPayload(cipher_, nonce, std::move(record), decoded))
-                throw transport::LinkError(ErrorCode::PROTOCOL_AUTH_FAILED);
+                throw transport::LinkError(common::ErrorCode::PROTOCOL_AUTH_FAILED);
             length_.reset();
             ++nonce_;
             if (decoded.byte_size() != 0) return decoded;
@@ -387,4 +387,4 @@ private:
 
 } // namespace detail
 
-}  // namespace ss
+}  // namespace proxy::shadowsocks

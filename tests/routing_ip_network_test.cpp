@@ -6,7 +6,7 @@
 #include <string_view>
 
 TEST(RoutingIpNetwork, MasksIpv4HostBits) {
-    const auto network = ::RoutingIpNetwork::Parse("192.0.2.129/24");
+    const auto network = ::infra::RoutingIpNetwork::Parse("192.0.2.129/24");
     ASSERT_TRUE(network);
     EXPECT_FALSE(network->IsV6());
     EXPECT_EQ(network->Prefix(), 24);
@@ -17,7 +17,7 @@ TEST(RoutingIpNetwork, MasksIpv4HostBits) {
 }
 
 TEST(RoutingIpNetwork, BareIpv4MatchesOneHost) {
-    const auto network = ::RoutingIpNetwork::Parse("198.51.100.7");
+    const auto network = ::infra::RoutingIpNetwork::Parse("198.51.100.7");
     ASSERT_TRUE(network);
     EXPECT_FALSE(network->IsV6());
     EXPECT_EQ(network->Prefix(), 32);
@@ -25,7 +25,7 @@ TEST(RoutingIpNetwork, BareIpv4MatchesOneHost) {
 }
 
 TEST(RoutingIpNetwork, MasksIpv6HostBits) {
-    const auto network = ::RoutingIpNetwork::Parse("2001:db8:abcd:1234::1/48");
+    const auto network = ::infra::RoutingIpNetwork::Parse("2001:db8:abcd:1234::1/48");
     ASSERT_TRUE(network);
     EXPECT_TRUE(network->IsV6());
     EXPECT_EQ(network->Prefix(), 48);
@@ -39,7 +39,7 @@ TEST(RoutingIpNetwork, MasksIpv6HostBits) {
 }
 
 TEST(RoutingIpNetwork, BareIpv6MatchesOneHost) {
-    const auto network = ::RoutingIpNetwork::Parse("2001:db8::1");
+    const auto network = ::infra::RoutingIpNetwork::Parse("2001:db8::1");
     ASSERT_TRUE(network);
     EXPECT_TRUE(network->IsV6());
     EXPECT_EQ(network->Prefix(), 128);
@@ -50,7 +50,7 @@ namespace {
 using namespace std::string_view_literals;
 class InvalidIpNetwork : public ::testing::TestWithParam<std::string_view> {};
 TEST_P(InvalidIpNetwork, RejectsMalformedAddressOrPrefix) {
-    EXPECT_FALSE(::RoutingIpNetwork::Parse(GetParam()));
+    EXPECT_FALSE(::infra::RoutingIpNetwork::Parse(GetParam()));
 }
 INSTANTIATE_TEST_SUITE_P(ParseErrors, InvalidIpNetwork, ::testing::Values(
     ""sv, "not-an-ip"sv, "192.0.2.1/"sv, "192.0.2.1/24junk"sv,

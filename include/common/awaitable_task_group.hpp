@@ -26,6 +26,8 @@
 // group joins actual completion callbacks, including children added by another
 // child. Parent cancellation and uncaught failure stop every child; an optional
 // request source cancels only the child bound to that source.
+namespace common {
+
 class AwaitableTaskGroup {
 public:
     virtual void Spawn(net::awaitable<void> task,
@@ -36,7 +38,9 @@ protected:
     ~AwaitableTaskGroup() = default;
 };
 
-namespace task_group_detail {
+}  // namespace common
+
+namespace common::task_group_detail {
 
 struct Child final : transport::CancellationSubscription {
     net::cancellation_signal cancellation;
@@ -200,6 +204,8 @@ net::awaitable<void> RunOnExecutor(Start start) {
 
 // Start is stored by value in the coroutine, without std::function allocation
 // or type erasure. All group/child bookkeeping is allocated on the target thread.
+namespace common {
+
 template <typename Start>
 net::awaitable<void> RunAwaitableTaskGroup(net::any_io_executor executor, Start start) {
     if ((co_await net::this_coro::executor) == executor) {
@@ -209,10 +215,10 @@ net::awaitable<void> RunAwaitableTaskGroup(net::any_io_executor executor, Start 
         if (cancellation.cancelled() != net::cancellation_type::none) {
             throw IoSystemError(net::error::operation_aborted);
         }
-        co_await task_group_detail::Launch(std::move(executor), std::move(start));
+        co_await common::task_group_detail::Launch(std::move(executor), std::move(start));
     } else {
         co_await net::co_spawn(executor,
-            task_group_detail::RunOnExecutor(std::move(start)), net::use_awaitable);
+            common::task_group_detail::RunOnExecutor(std::move(start)), net::use_awaitable);
     }
     const auto cancellation = co_await net::this_coro::cancellation_state;
     if (cancellation.cancelled() != net::cancellation_type::none) {
@@ -246,7 +252,7 @@ class ResidentTaskGroup final : public AwaitableTaskGroup {
             join->wake.cancel();
         }
     };
-    using Group = task_group_detail::Group<Completion>;
+    using Group = common::task_group_detail::Group<Completion>;
 
 public:
     explicit ResidentTaskGroup(net::any_io_executor executor)
@@ -307,4 +313,6 @@ private:
     bool stopping_ = false;
     bool closed_ = false;
 };
+
+}  // namespace common
 

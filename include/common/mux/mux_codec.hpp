@@ -52,7 +52,7 @@ enum class NetworkType : uint8_t {
 
 constexpr uint8_t kOptionData  = 0x01;
 constexpr uint8_t kOptionError = 0x02;
-inline constexpr size_t kMaxFrameHeaderBytes = 2 + 4 + 1 + kMaxEncodedAddressSize + 8 + 2;
+inline constexpr size_t kMaxFrameHeaderBytes = 2 + 4 + 1 + common::kMaxEncodedAddressSize + 8 + 2;
 // ============================================================================
 // FrameHeader - 解析结果
 // ============================================================================
@@ -64,9 +64,9 @@ struct FrameHeader {
     // 地址信息（New 帧和 Keep UDP 帧才有）
     NetworkType   network       = NetworkType::TCP;
     bool          has_target    = false;
-    TargetAddress target;
+    common::TargetAddress target;
 
-    std::optional<ForwardedMetadata> forwarded;
+    std::optional<common::ForwardedMetadata> forwarded;
 
     // 载荷
     bool     has_data  = false;
@@ -99,10 +99,10 @@ struct FrameHeader {
 [[nodiscard]] size_t EncodeNewHeaderTo(std::span<uint8_t> out,
                                        uint16_t session_id,
                                        NetworkType network,
-                                       const TargetAddress& target,
+                                       const common::TargetAddress& target,
                                        size_t payload_len,
                                        bool has_data,
-                                       ForwardedMetadataView forwarded = {}) noexcept;
+                                       common::ForwardedMetadataView forwarded = {}) noexcept;
 
 [[nodiscard]] size_t EncodeEndTo(std::span<uint8_t> out,
                                  uint16_t session_id,
@@ -114,7 +114,7 @@ struct FrameHeader {
 
 [[nodiscard]] size_t EncodeKeepUDPHeaderTo(std::span<uint8_t> out,
                                            uint16_t session_id,
-                                           const TargetAddress& src,
+                                           const common::TargetAddress& src,
                                            size_t payload_len) noexcept;
 
 }  // namespace mux

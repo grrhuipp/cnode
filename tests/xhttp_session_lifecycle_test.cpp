@@ -60,7 +60,7 @@ void RunTableScenario(Scenario scenario) {
     if (failure) std::rethrow_exception(failure);
 }
 
-net::awaitable<void> NamespaceAndRetirement(GroupCoordinator& coordinator, net::io_context& io) {
+net::awaitable<void> NamespaceAndRetirement(app::GroupCoordinator& coordinator, net::io_context& io) {
     auto first = co_await GetXHttpPacketSession(coordinator, io, "inbound-a:g1", "same-id", XHttpSessionAccess::Open);
     auto other = co_await GetXHttpPacketSession(coordinator, io, "inbound-b:g1", "same-id", XHttpSessionAccess::Open);
     auto replacement = co_await GetXHttpPacketSession(coordinator, io, "inbound-a:g2", "same-id", XHttpSessionAccess::Open);
@@ -82,7 +82,7 @@ net::awaitable<void> NamespaceAndRetirement(GroupCoordinator& coordinator, net::
     EXPECT_FALSE((co_await GetXHttpPacketSession(coordinator, io, "inbound-b:g1", "same-id", XHttpSessionAccess::Join))) << "input EOF was not retired";
 }
 
-net::awaitable<void> FullTableReclaimsOnEvents(GroupCoordinator& coordinator, net::io_context& io) {
+net::awaitable<void> FullTableReclaimsOnEvents(app::GroupCoordinator& coordinator, net::io_context& io) {
     std::vector<std::shared_ptr<XHttpPacketUpSession>> active;
     active.reserve(1024);
     for (int n = 0; n != 1024; ++n) {
@@ -105,7 +105,7 @@ net::awaitable<void> FullTableReclaimsOnEvents(GroupCoordinator& coordinator, ne
     EXPECT_TRUE(bool(after_eof)) << "input EOF did not free active capacity";
 }
 
-net::awaitable<void> BoundedReplayWindow(GroupCoordinator& coordinator, net::io_context& io) {
+net::awaitable<void> BoundedReplayWindow(app::GroupCoordinator& coordinator, net::io_context& io) {
     for (int n = 0; n != 1025; ++n) {
         auto session = co_await GetXHttpPacketSession(coordinator, io, "replay", std::to_string(n), XHttpSessionAccess::Open);
         EXPECT_TRUE(bool(session)) << "tombstones consumed live capacity";
@@ -118,7 +118,7 @@ net::awaitable<void> BoundedReplayWindow(GroupCoordinator& coordinator, net::io_
     EXPECT_TRUE(bool(oldest)) << "oldest tombstone was not bounded by FIFO eviction";
 }
 
-net::awaitable<void> DomainsJoinBySession(GroupCoordinator& coordinator, net::io_context& io) {
+net::awaitable<void> DomainsJoinBySession(app::GroupCoordinator& coordinator, net::io_context& io) {
     auto scenario = [&]() -> net::awaitable<void> {
         auto first = co_await GetXHttpPacketSession(coordinator, 
             io, "group", "session-a", XHttpSessionAccess::Open);
@@ -184,18 +184,18 @@ TEST(XhttpSessionLifecycle, UploadResponseDrainPreservesWritesAndJoinsReaderOnCl
     listener.accept(peer);
     peer.non_blocking(true);
     peer.set_option(net::socket_base::send_buffer_size(4096));
-    ::HttpConfig config;
+    ::transport::internet::HttpConfig config;
     config.path = "/fixture/id";
     config.method = "POST";
     config.headers.emplace("Connection", "keep-alive");
-    std::unique_ptr<::AsyncStream> upload;
+    std::unique_ptr<::transport::AsyncStream> upload;
     std::exception_ptr failure;
     bool built = false;
     const std::string initial = "first";
     const std::array<net::const_buffer, 1> payload{net::buffer(initial)};
-    net::co_spawn(io, DoXHttp1ClientRequest(std::make_unique<::TcpStream>(std::move(client)),
-        config, "localhost", ::XHttpClientRequestKind::StreamUp, payload, 0),
-        [&](std::exception_ptr error, ::TransportBuildResult result) {
+    net::co_spawn(io, DoXHttp1ClientRequest(std::make_unique<::transport::internet::TcpStream>(std::move(client)),
+        config, "localhost", ::transport::internet::XHttpClientRequestKind::StreamUp, payload, 0),
+        [&](std::exception_ptr error, ::transport::internet::TransportBuildResult result) {
             failure = error;
             if (!error && result) upload = std::move(*result);
             built = true;
@@ -258,7 +258,7 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
     auto work_c = net::make_work_guard(control);
     auto work_0 = std::make_optional(net::make_work_guard(*worker0));
     auto work_1 = std::make_optional(net::make_work_guard(*worker1));
-    auto coordinator = std::make_shared<::GroupCoordinator>(control);
+    auto coordinator = std::make_shared<::app::GroupCoordinator>(control);
     coordinator->RegisterWorker(*worker0);
     coordinator->RegisterWorker(*worker1);
 
@@ -272,14 +272,14 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
         worker1.reset();
     });
 
-    struct OriginBoundSink final : ::InboundTransportStreamHandler {
+    struct OriginBoundSink final : ::transport::internet::InboundTransportStreamHandler {
         explicit OriginBoundSink(std::thread::id owner)
             : owner_thread(owner), local_tag(128, 'x') {}
         ~OriginBoundSink() noexcept override {
             EXPECT_EQ(std::this_thread::get_id(), owner_thread);
         }
         net::awaitable<void> OnInboundTransportStream(
-            std::unique_ptr<::AsyncStream> s, ::InboundTransportMetadata) override {
+            std::unique_ptr<::transport::AsyncStream> s, ::transport::internet::InboundTransportMetadata) override {
             logical = std::move(s);
             co_return;
         }
@@ -287,15 +287,15 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
         std::chrono::seconds TransportIdleTimeout() const noexcept override { return 10s; }
         std::thread::id owner_thread;
         ::memory::String local_tag;
-        std::unique_ptr<::AsyncStream> logical;
+        std::unique_ptr<::transport::AsyncStream> logical;
     };
 
-    ::HttpConfig http_cfg;
+    ::transport::internet::HttpConfig http_cfg;
     http_cfg.path = "/fixture";
-    ::XHttpConfig xhttp_cfg;
+    ::transport::internet::XHttpConfig xhttp_cfg;
     xhttp_cfg.path = "/fixture";
     xhttp_cfg.normalized_path = "/fixture/";
-    xhttp_cfg.mode = ::XHttpMode::PacketUp;
+    xhttp_cfg.mode = ::transport::internet::XHttpMode::PacketUp;
     xhttp_cfg.session_namespace = "cross-worker-handoff";
 
     ::tcp::acceptor acceptor(control, {net::ip::address_v4::loopback(), 0});
@@ -318,7 +318,7 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
             [&, sock = std::move(server_up)]() mutable -> net::awaitable<void> {
                 auto sink = std::make_shared<OriginBoundSink>(std::this_thread::get_id());
                 auto res = co_await DoXHttp1ServerHandshake(
-                    *coordinator,                     *worker1, std::make_unique<::TcpStream>(std::move(sock)),
+                    *coordinator,                     *worker1, std::make_unique<::transport::internet::TcpStream>(std::move(sock)),
                     http_cfg, xhttp_cfg, 1, nullptr, {}, sink);
                 EXPECT_TRUE(res.has_value() && !*res) << "packet-up handoff failed";
             }, net::use_future);
@@ -335,7 +335,7 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
             [&, sock = std::move(server_down)]() mutable -> net::awaitable<std::string> {
                 auto sink = std::make_shared<OriginBoundSink>(std::this_thread::get_id());
                 auto res = co_await DoXHttp1ServerHandshake(
-                    *coordinator,                     *worker0, std::make_unique<::TcpStream>(std::move(sock)),
+                    *coordinator,                     *worker0, std::make_unique<::transport::internet::TcpStream>(std::move(sock)),
                     http_cfg, xhttp_cfg, 2, nullptr, {}, sink);
                 EXPECT_TRUE(res.has_value() && !*res && sink->logical != nullptr) << "packet-down did not produce logical stream";
                 if (!sink->logical) co_return std::string{};

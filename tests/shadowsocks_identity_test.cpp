@@ -14,7 +14,7 @@ protected:
 
 TEST_F(ShadowsocksIdentity, EveryGroupAndHintAuthenticatesItsOwnUser) {
     for (auto method : {"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"}) {
-        const auto cipher = *ss::ParseCipherMethod(method);
+        const auto cipher = *proxy::shadowsocks::ParseCipherMethod(method);
         for (size_t groups : {0u, 1u, 4u}) {
             auto users = Users(19, cipher, groups);
             Install(users);
@@ -39,7 +39,7 @@ TEST_F(ShadowsocksIdentity, EveryGroupAndHintAuthenticatesItsOwnUser) {
 }
 
 TEST_F(ShadowsocksIdentity, HashCollisionStillRequiresFixedHeaderAuthentication) {
-    const auto cipher = *ss::ParseCipherMethod("2022-blake3-aes-128-gcm");
+    const auto cipher = *proxy::shadowsocks::ParseCipherMethod("2022-blake3-aes-128-gcm");
     auto users = Users(7, cipher);
     // Exercise a candidate collision without relying on finding a BLAKE3 collision.
     // The prepared snapshot is the public authentication input contract.
@@ -58,11 +58,11 @@ TEST_F(ShadowsocksIdentity, HashCollisionStillRequiresFixedHeaderAuthentication)
     size_t hint = 0;
     auto rejected = Authenticate(io, wire, cipher, hint);
     ASSERT_FALSE(rejected);
-    EXPECT_EQ(rejected.error(), ErrorCode::PROTOCOL_AUTH_FAILED);
+    EXPECT_EQ(rejected.error(), common::ErrorCode::PROTOCOL_AUTH_FAILED);
 }
 
 TEST_F(ShadowsocksIdentity, LastGroupHintMissAndCollisionPreserveAuthentication) {
-    const auto cipher = *ss::ParseCipherMethod("2022-blake3-aes-128-gcm");
+    const auto cipher = *proxy::shadowsocks::ParseCipherMethod("2022-blake3-aes-128-gcm");
     auto users = Users(12, cipher, 3);
     for (size_t i = 2; i < users.size(); i += 3) users[i].psk_hash = users[11].psk_hash;
     Install(users);
@@ -84,7 +84,7 @@ TEST_F(ShadowsocksIdentity, LastGroupHintMissAndCollisionPreserveAuthentication)
 }
 
 TEST_F(ShadowsocksIdentity, SnapshotReplacementRetainsOldOwnershipNotOldHints) {
-    const auto cipher = *ss::ParseCipherMethod("2022-blake3-aes-256-gcm");
+    const auto cipher = *proxy::shadowsocks::ParseCipherMethod("2022-blake3-aes-256-gcm");
     auto users = Users(17, cipher, 3);
     Install(users);
     Wire wire;
@@ -107,7 +107,7 @@ TEST_F(ShadowsocksIdentity, SnapshotReplacementRetainsOldOwnershipNotOldHints) {
 }
 
 TEST_F(ShadowsocksIdentity, InvalidCredentialCannotBorrowAnotherUsersIdentity) {
-    const auto cipher = *ss::ParseCipherMethod("2022-blake3-aes-128-gcm");
+    const auto cipher = *proxy::shadowsocks::ParseCipherMethod("2022-blake3-aes-128-gcm");
     auto users = Users(5, cipher, 2);
     const auto client = users[2];
     Wire wire;
@@ -123,7 +123,7 @@ TEST_F(ShadowsocksIdentity, InvalidCredentialCannotBorrowAnotherUsersIdentity) {
 }
 
 TEST_F(ShadowsocksIdentity, DuplicateCredentialsFailBeforePublication) {
-    const auto cipher = *ss::ParseCipherMethod("2022-blake3-aes-128-gcm");
+    const auto cipher = *proxy::shadowsocks::ParseCipherMethod("2022-blake3-aes-128-gcm");
     auto users = Users(4, cipher, 2);
     Install(users);
     const auto before = UserStore::ShadowsocksUsers(kTag);
@@ -134,7 +134,7 @@ TEST_F(ShadowsocksIdentity, DuplicateCredentialsFailBeforePublication) {
 }
 
 TEST_F(ShadowsocksIdentity, InvalidPreparedIdentityLengthDoesNotReplaceSnapshot) {
-    const auto cipher = *ss::ParseCipherMethod("2022-blake3-aes-128-gcm");
+    const auto cipher = *proxy::shadowsocks::ParseCipherMethod("2022-blake3-aes-128-gcm");
     auto users = Users(4, cipher);
     Install(users);
     const auto before = UserStore::ShadowsocksUsers(kTag);
@@ -144,33 +144,33 @@ TEST_F(ShadowsocksIdentity, InvalidPreparedIdentityLengthDoesNotReplaceSnapshot)
 }
 
 TEST_F(ShadowsocksIdentity, SortedSnapshotPreservesUdpOwnerAndReplayIsolation) {
-    const auto cipher = *ss::ParseCipherMethod("2022-blake3-aes-128-gcm");
+    const auto cipher = *proxy::shadowsocks::ParseCipherMethod("2022-blake3-aes-128-gcm");
     const auto users = Users(17, cipher, 3);
     Install(users);
     const auto view = UserStore::ShadowsocksUsers(kTag);
-    ss::Ss2022UdpReplayCache replay;
+    proxy::shadowsocks::Ss2022UdpReplayCache replay;
     for (size_t index : {0u, 8u, 16u}) {
-        ss::KeyBytes key;
+        proxy::shadowsocks::KeyBytes key;
         ASSERT_TRUE(key.assign(users[index].derived_key.span()));
-        std::array<ss::KeyBytes, 2> chain;
+        std::array<proxy::shadowsocks::KeyBytes, 2> chain;
         ASSERT_TRUE(chain[0].assign(users[index].identity_key.span()));
         chain[1] = key;
-        ss::Ss2022UdpSessionState state;
-        ASSERT_TRUE(ss::Init2022UdpSessionState(state, cipher, key));
+        proxy::shadowsocks::Ss2022UdpSessionState state;
+        ASSERT_TRUE(proxy::shadowsocks::Init2022UdpSessionState(state, cipher, key));
         state.client_session_id = {1, 2, 3, 4, 5, 6, 7, 8};
-        const TargetAddress target("127.0.0.1", 443);
+        const common::TargetAddress target("127.0.0.1", 443);
         const std::array<uint8_t, 3> payload{1, 2, 3};
-        const auto size = ss::Encode2022UdpRequestPacketTo(
+        const auto size = proxy::shadowsocks::Encode2022UdpRequestPacketTo(
             target, payload.data(), payload.size(), state, chain, nullptr, 0);
         std::vector<uint8_t> packet(size);
-        ASSERT_EQ(ss::Encode2022UdpRequestPacketTo(target, payload.data(), payload.size(),
+        ASSERT_EQ(proxy::shadowsocks::Encode2022UdpRequestPacketTo(target, payload.data(), payload.size(),
             state, chain, packet.data(), packet.size()), size);
-        auto result = ss::DecodeUdpPacket(packet.data(), packet.size(), view,
+        auto result = proxy::shadowsocks::DecodeUdpPacket(packet.data(), packet.size(), view,
             cipher.type, cipher.key_size, cipher.salt_size, replay, false);
         ASSERT_TRUE(result);
         ASSERT_LT(result->user_index, view.size());
         EXPECT_EQ(view[result->user_index].profile.user_id, users[index].profile.user_id);
-        EXPECT_FALSE(ss::DecodeUdpPacket(packet.data(), packet.size(), view,
+        EXPECT_FALSE(proxy::shadowsocks::DecodeUdpPacket(packet.data(), packet.size(), view,
             cipher.type, cipher.key_size, cipher.salt_size, replay, false));
     }
 }

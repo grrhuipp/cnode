@@ -43,7 +43,7 @@ TEST_P(QuicUdpCancellation, ReturnsUnreadBuffersBeforeNotifyingSubscribers) {
     const bool destroy_host = GetParam();
     RunInDomain([destroy_host](net::io_context& io) -> net::awaitable<void> {
         const auto baseline = memory::detail::test_buffers_live;
-        const TargetAddress target("127.0.0.1", 12345);
+        const common::TargetAddress target("127.0.0.1", 12345);
         auto stream = std::make_unique<UdpSessionStream>(io, 7,
             std::weak_ptr<transport::internet::hysteria::Connection>{});
         constexpr std::array<std::string_view, 3> input{
@@ -64,7 +64,7 @@ TEST_P(QuicUdpCancellation, ReturnsUnreadBuffersBeforeNotifyingSubscribers) {
             bool destroy;
             bool notified = false;
             uint64_t buffers_at_notification = 0;
-            ErrorCode reason = ErrorCode::OK;
+            common::ErrorCode reason = common::ErrorCode::OK;
             Observer(std::unique_ptr<UdpSessionStream>& host, bool destroy)
                 : host(host), destroy(destroy) {}
             void OnCancellation(transport::Cancellation cancellation) noexcept override {
@@ -81,7 +81,7 @@ TEST_P(QuicUdpCancellation, ReturnsUnreadBuffersBeforeNotifyingSubscribers) {
         memory::reject_next_process_allocation = false;
         EXPECT_EQ(memory::rejected_process_allocations, rejected);
         EXPECT_TRUE(observer.notified);
-        EXPECT_EQ(observer.reason, ErrorCode::CANCELLED);
+        EXPECT_EQ(observer.reason, common::ErrorCode::CANCELLED);
         EXPECT_EQ(observer.buffers_at_notification, baseline + delivered.size())
             << "unread input was still owned during cancellation delivery";
         EXPECT_EQ(memory::detail::test_buffers_live, baseline + delivered.size())
@@ -102,7 +102,7 @@ TEST_P(QuicUdpCancellation, ReturnsUnreadBuffersBeforeNotifyingSubscribers) {
 TEST(QuicUdpQueue, BoundsBufferCapacityAndReturnsAdmissionOnRead) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
         const auto baseline = memory::detail::test_buffers_live;
-        const TargetAddress target("127.0.0.1", 12345);
+        const common::TargetAddress target("127.0.0.1", 12345);
         UdpSessionStream stream(io, 9, {});
         constexpr size_t limit = UdpSessionStream::kMaxQueuedBytes / buf::Buffer::kSize;
         size_t accepted = 0;
@@ -177,7 +177,7 @@ TEST(QuicUdpQueue, BoundsBufferCapacityAndReturnsAdmissionOnRead) {
 TEST(QuicUdpQueue, OversizedDatagramIsRejectedBeforeAllocation) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
         const auto baseline = memory::detail::test_buffers_live;
-        const TargetAddress target("127.0.0.1", 12345);
+        const common::TargetAddress target("127.0.0.1", 12345);
         UdpSessionStream stream(io, 11, {});
         const std::vector<uint8_t> oversized(UdpSessionStream::kMaxQueuedBytes + 1, 0x7a);
         const auto rejected_before_oversized = memory::rejected_process_allocations;
@@ -195,7 +195,7 @@ TEST(QuicUdpQueue, OversizedDatagramIsRejectedBeforeAllocation) {
 TEST(QuicUdpQueue, EmptyMessagesConsumeBufferAdmissionAndRemainReadable) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
         const auto baseline = memory::detail::test_buffers_live;
-        const TargetAddress target("127.0.0.1", 12345);
+        const common::TargetAddress target("127.0.0.1", 12345);
         UdpSessionStream stream(io, 10, {});
         constexpr size_t limit = UdpSessionStream::kMaxQueuedBytes / buf::Buffer::kSize;
         size_t admitted = 0;
@@ -232,7 +232,7 @@ TEST(QuicUdpQueue, EmptyMessagesConsumeBufferAdmissionAndRemainReadable) {
 
 struct StreamCancellation final : transport::CancellationSubscription {
     bool notified = false;
-    ErrorCode reason = ErrorCode::OK;
+    common::ErrorCode reason = common::ErrorCode::OK;
     bool terminal = false;
 
     void OnCancellation(transport::Cancellation cancellation) noexcept override {
@@ -295,12 +295,12 @@ TEST(QuicStreamClose, UnreadFinTailIsDiscardedAndCancelled) {
         EXPECT_TRUE(state->PendingInput().empty());
         EXPECT_TRUE(cancellation.notified);
         EXPECT_TRUE(cancellation.terminal);
-        EXPECT_EQ(cancellation.reason, ErrorCode::CANCELLED);
+        EXPECT_EQ(cancellation.reason, common::ErrorCode::CANCELLED);
         try {
             (void)co_await state->ReadMultiBuffer();
             ADD_FAILURE() << "aborted input tail became graceful EOF";
         } catch (const transport::LinkError& error) {
-            EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
+            EXPECT_EQ(error.code(), common::ErrorCode::CANCELLED);
         }
     });
 }
@@ -327,7 +327,7 @@ TEST_P(QuicStreamHalfClose, CloseAbortsIncompleteDuplex) {
         EXPECT_FALSE(state->Open());
         EXPECT_TRUE(cancellation.notified);
         EXPECT_TRUE(cancellation.terminal);
-        EXPECT_EQ(cancellation.reason, ErrorCode::CANCELLED);
+        EXPECT_EQ(cancellation.reason, common::ErrorCode::CANCELLED);
         EXPECT_THROW(state->CheckWriteOpen(), transport::LinkError);
         co_return;
     });
@@ -358,12 +358,12 @@ TEST_P(QuicStreamAbort, ExplicitAbortCancelsEvenCompletedDuplex) {
         EXPECT_FALSE(state->Open());
         EXPECT_TRUE(cancellation.notified);
         EXPECT_TRUE(cancellation.terminal);
-        EXPECT_EQ(cancellation.reason, ErrorCode::CANCELLED);
+        EXPECT_EQ(cancellation.reason, common::ErrorCode::CANCELLED);
         try {
             (void)co_await state->ReadMultiBuffer();
             ADD_FAILURE() << "explicit cancellation became graceful EOF";
         } catch (const transport::LinkError& error) {
-            EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
+            EXPECT_EQ(error.code(), common::ErrorCode::CANCELLED);
         }
     });
 }
@@ -377,7 +377,7 @@ TEST(QuicStreamWriteWait, BroadcastsWithoutLeavingStaleReadiness) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
         QuicStreamState state(io, 4, {});
         const auto executor = co_await net::this_coro::executor;
-        SignalChannel joined(executor, 2);
+        common::SignalChannel joined(executor, 2);
         std::exception_ptr failure;
         size_t started = 0;
         size_t completed = 0;
@@ -421,7 +421,7 @@ TEST_P(QuicStreamWriteWaitEnd, SettlesPendingAndSubsequentWaits) {
         EXPECT_TRUE(admitted);
         if (!admitted) co_return;
         const auto executor = co_await net::this_coro::executor;
-        SignalChannel joined(executor, 1);
+        common::SignalChannel joined(executor, 1);
         bool started = false;
         bool completed = false;
         std::exception_ptr failure;
@@ -435,7 +435,7 @@ TEST_P(QuicStreamWriteWaitEnd, SettlesPendingAndSubsequentWaits) {
                 EXPECT_FALSE(cancelled);
             } catch (const transport::LinkError& error) {
                 EXPECT_TRUE(cancelled);
-                EXPECT_EQ(error.code(), ErrorCode::CANCELLED);
+                EXPECT_EQ(error.code(), common::ErrorCode::CANCELLED);
             }
         };
         auto wait = [&]() -> net::awaitable<void> {
@@ -501,7 +501,7 @@ TEST(QuicStreamWriteWait, RemoteFinLeavesWriterWaitingForOutputCredit) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
         QuicStreamState state(io, 12, {});
         const auto executor = co_await net::this_coro::executor;
-        SignalChannel joined(executor, 1);
+        common::SignalChannel joined(executor, 1);
         std::exception_ptr failure;
         bool started = false;
         bool completed = false;
@@ -534,7 +534,7 @@ TEST(QuicStreamWriteWait, CoroutineCancellationDoesNotBecomeAnAck) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
         QuicStreamState state(io, 16, {});
         const auto executor = co_await net::this_coro::executor;
-        SignalChannel joined(executor, 1);
+        common::SignalChannel joined(executor, 1);
         net::cancellation_signal cancellation;
         std::exception_ptr failure;
         bool started = false;

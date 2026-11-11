@@ -11,7 +11,7 @@
 #include <thread>
 
 namespace {
-using Renewal = ::AutoSignContextRenewal;
+using Renewal = ::transport::internet::AutoSignContextRenewal;
 using namespace std::chrono_literals;
 
 std::shared_ptr<SSL_CTX> Context(long validity_seconds) {
@@ -25,8 +25,8 @@ std::shared_ptr<SSL_CTX> Context(long validity_seconds) {
         throw std::runtime_error("test SSL_CTX construction failed");
     return context;
 }
-::TlsConfig RenewalConfig(std::string server_name) {
-    ::TlsConfig config;
+::transport::internet::TlsConfig RenewalConfig(std::string server_name) {
+    ::transport::internet::TlsConfig config;
     config.server_name = std::move(server_name);
     return config;
 }
@@ -58,8 +58,8 @@ TEST(AutosignContext, FailedRenewalRetainsValidSnapshotButRejectsExpiredSnapshot
     constexpr long kTenDays = 10L * 24 * 60 * 60;
     auto old = Context(kTenDays);
     auto config = RenewalConfig("failing.example");
-    config.min_version = ::TlsVersion::V1_3;
-    config.max_version = ::TlsVersion::V1_2;
+    config.min_version = ::transport::internet::TlsVersion::V1_3;
+    config.max_version = ::transport::internet::TlsVersion::V1_2;
     auto failing = Renewal::Start(old, config);
 
     // The scheduler processes due registrations in order. A later successful

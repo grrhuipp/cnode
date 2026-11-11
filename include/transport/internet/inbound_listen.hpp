@@ -12,6 +12,8 @@
 #include <string_view>
 
 
+namespace transport::internet {
+
 class InboundListen {
 public:
     InboundListen() noexcept {
@@ -25,7 +27,7 @@ public:
     }
 
     [[nodiscard]] static std::optional<InboundListen> Parse(std::string_view value) {
-        if (value.empty() || EqualsAsciiCI(value, constants::binding::kAuto)) {
+        if (value.empty() || common::EqualsAsciiCI(value, constants::binding::kAuto)) {
             return InboundListen{};
         }
         auto address = iputil::ParseLiteral(value);
@@ -66,4 +68,6 @@ private:
     std::array<net::ip::address, 2> candidates_{};
     uint8_t candidate_count_ = 2;
 };
+
+}  // namespace transport::internet
 

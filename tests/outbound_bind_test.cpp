@@ -9,8 +9,8 @@
 #include <string_view>
 
 namespace {
-using Mode = ::OutboundBind::Mode;
-using Policy = ::OutboundBind::ChoicePolicy;
+using Mode = ::transport::internet::OutboundBind::Mode;
+using Policy = ::transport::internet::OutboundBind::ChoicePolicy;
 using ::net::ip::make_address;
 const std::array<std::string_view, 3> entries{
     "2602:2b5:20:0111::/64", "192.0.2.4", "127.0.0.0/24"};
@@ -18,7 +18,7 @@ const std::array<std::string_view, 3> entries{
 struct BindCase { const char* text; Mode mode; };
 class OutboundBindMode : public testing::TestWithParam<BindCase> {};
 TEST_P(OutboundBindMode, ParsesWildcardAndAutomaticModes) {
-    const auto bind = ::OutboundBind::Parse(GetParam().text);
+    const auto bind = ::transport::internet::OutboundBind::Parse(GetParam().text);
     ASSERT_TRUE(bind);
     EXPECT_EQ(bind->GetMode(), GetParam().mode);
     EXPECT_FALSE(bind->ExplicitAddress());
@@ -30,7 +30,7 @@ INSTANTIATE_TEST_SUITE_P(Inputs, OutboundBindMode, testing::Values(
 
 class ExplicitOutboundBind : public testing::TestWithParam<const char*> {};
 TEST_P(ExplicitOutboundBind, PreservesRequestedAddress) {
-    const auto bind = ::OutboundBind::Parse(GetParam());
+    const auto bind = ::transport::internet::OutboundBind::Parse(GetParam());
     ASSERT_TRUE(bind);
     EXPECT_EQ(bind->ExplicitAddress(), make_address(GetParam()));
 }
@@ -39,7 +39,7 @@ INSTANTIATE_TEST_SUITE_P(Families, ExplicitOutboundBind,
 
 class InvalidOutboundBind : public testing::TestWithParam<std::string_view> {};
 TEST_P(InvalidOutboundBind, RejectsNonliteralAndAmbiguousInputs) {
-    EXPECT_FALSE(::OutboundBind::Parse(GetParam()));
+    EXPECT_FALSE(::transport::internet::OutboundBind::Parse(GetParam()));
 }
 INSTANTIATE_TEST_SUITE_P(Inputs, InvalidOutboundBind, testing::Values(
     std::string_view("not-an-ip"), std::string_view("192.0.2.1junk"), std::string_view("  auto"),
@@ -50,7 +50,7 @@ INSTANTIATE_TEST_SUITE_P(Inputs, InvalidOutboundBind, testing::Values(
 class InvalidBindCandidate : public testing::TestWithParam<const char*> {};
 TEST_P(InvalidBindCandidate, RejectsUnusableOrMalformedRanges) {
     const std::array<std::string_view, 1> candidate{GetParam()};
-    EXPECT_FALSE(::OutboundBind::ParseCandidates(candidate, Policy::IpHash));
+    EXPECT_FALSE(::transport::internet::OutboundBind::ParseCandidates(candidate, Policy::IpHash));
 }
 INSTANTIATE_TEST_SUITE_P(Inputs, InvalidBindCandidate, testing::Values(
     "", "auto", "0.0.0.0", "0.0.0.0/32", "::/128", "0.0.0.0/24", "192.0.2.1/0",
@@ -61,7 +61,7 @@ class BindRangeFamily : public testing::TestWithParam<bool> {};
 TEST_P(BindRangeFamily, HashesClientWithinFirstMatchingFamilyRange) {
     const bool ipv6 = GetParam();
     const std::array<std::string_view, 1> range{ipv6 ? "2602:2b5:20:111::/64" : "127.0.0.0/24"};
-    const auto bind = ::OutboundBind::ParseCandidates(range, Policy::IpHash);
+    const auto bind = ::transport::internet::OutboundBind::ParseCandidates(range, Policy::IpHash);
     ASSERT_TRUE(bind);
     const auto remote = make_address(ipv6 ? "2001:db8:1::1" : "198.51.100.1");
     const auto first = bind->Select(remote, "203.0.113.42").address;
@@ -83,7 +83,7 @@ INSTANTIATE_TEST_SUITE_P(Families, BindRangeFamily, testing::Bool());
 struct UserKeyCase { uint64_t uid; const char* email; };
 class BindUserHash : public testing::TestWithParam<UserKeyCase> {};
 TEST_P(BindUserHash, IsStableAcrossClientIpsAndIsolatesPanelNamespaces) {
-    const auto bind = ::OutboundBind::ParseCandidates(entries, Policy::UserHash);
+    const auto bind = ::transport::internet::OutboundBind::ParseCandidates(entries, Policy::UserHash);
     ASSERT_TRUE(bind);
     const auto remote = make_address("2001:db8:1::1");
     const auto first = bind->Select(remote, "203.0.113.1", GetParam().uid, GetParam().email, "panel/site-a").address;
@@ -119,19 +119,19 @@ INSTANTIATE_TEST_SUITE_P(Inputs, InvalidBindConfig, testing::Values(
 }  // namespace
 
 TEST(OutboundBind, OrderedCandidatesPreserveExactAddressInsteadOfFallingThrough) {
-    const auto bind = ::OutboundBind::ParseCandidates(entries, Policy::IpHash);
+    const auto bind = ::transport::internet::OutboundBind::ParseCandidates(entries, Policy::IpHash);
     ASSERT_TRUE(bind);
     EXPECT_TRUE(bind->PrefersIPv6());
     EXPECT_EQ(bind->Select(make_address("198.51.100.1"), "client").address, make_address("192.0.2.4"));
     const std::array<std::string_view, 1> unassigned{"2602:2b5:20:111::1234"};
-    const auto exact = ::OutboundBind::ParseCandidates(unassigned, Policy::IpHash);
+    const auto exact = ::transport::internet::OutboundBind::ParseCandidates(unassigned, Policy::IpHash);
     ASSERT_TRUE(exact);
     EXPECT_EQ(exact->Select(make_address("2001:db8:1::1"), "client").address, make_address(unassigned[0]));
     EXPECT_FALSE(exact->Select(make_address("198.51.100.1"), "client").address);
 }
 
 TEST(OutboundBind, RandomSelectionStaysInRangeAndVaries) {
-    const auto bind = ::OutboundBind::ParseCandidates(entries, Policy::Random);
+    const auto bind = ::transport::internet::OutboundBind::ParseCandidates(entries, Policy::Random);
     ASSERT_TRUE(bind);
     const auto remote = make_address("2001:db8:1::1");
     const auto first = bind->Select(remote, "client", 80).address;
@@ -147,7 +147,7 @@ TEST(OutboundBind, RandomSelectionStaysInRangeAndVaries) {
 }
 
 TEST(OutboundBind, AutomaticBindingAvoidsInappropriateSourceScope) {
-    const auto bind = ::OutboundBind::Parse("auto");
+    const auto bind = ::transport::internet::OutboundBind::Parse("auto");
     ASSERT_TRUE(bind);
     const ::tcp::endpoint public_inbound(make_address("192.0.2.10"), 443);
     EXPECT_FALSE(bind->BindAddressFor(&public_inbound, make_address("127.0.0.1")));
@@ -156,5 +156,5 @@ TEST(OutboundBind, AutomaticBindingAvoidsInappropriateSourceScope) {
 }
 
 TEST(OutboundBind, RejectsEmptyCandidateSet) {
-    EXPECT_FALSE(::OutboundBind::ParseCandidates(std::span<const std::string_view>{}, Policy::IpHash));
+    EXPECT_FALSE(::transport::internet::OutboundBind::ParseCandidates(std::span<const std::string_view>{}, Policy::IpHash));
 }

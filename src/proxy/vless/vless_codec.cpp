@@ -17,7 +17,7 @@
 #include <openssl/mem.h>
 #include <openssl/rand.h>
 
-namespace vless {
+namespace proxy::vless {
 
 namespace {
 
@@ -26,7 +26,7 @@ constexpr uint64_t kProtoAddonsFlowField = 1;
 
 bool ParseHeaderAddons(std::span<const uint8_t> data,
                        RequestHeader& request) {
-    ByteReader reader(data);
+    common::ByteReader reader(data);
     bool seen_flow = false;
     while (!reader.Empty()) {
         auto tag = reader.ReadVarintU64();
@@ -58,10 +58,10 @@ size_t EncodedAddonsSize(std::string_view flow) noexcept {
     if (flow.empty()) {
         return 0;
     }
-    return 1 + VarintU64Size(flow.size()) + flow.size();
+    return 1 + common::VarintU64Size(flow.size()) + flow.size();
 }
 
-bool WriteHeaderAddons(ByteWriter& writer, std::string_view flow) noexcept {
+bool WriteHeaderAddons(common::ByteWriter& writer, std::string_view flow) noexcept {
     const size_t addons_len = EncodedAddonsSize(flow);
     if (addons_len > std::numeric_limits<uint8_t>::max()) {
         return false;
@@ -85,11 +85,11 @@ constexpr size_t kPacketAddrV6HeaderSize = 1 + sizeof(net::ip::address_v6::bytes
 constexpr size_t kMaxUdpHeaderSize = sizeof(uint16_t) + kPacketAddrV6HeaderSize;
 
 struct PacketAddrHeader {
-    TargetAddress target;
+    common::TargetAddress target;
     size_t consumed = 0;
 };
 
-size_t EncodePacketAddrHeaderTo(const TargetAddress& target,
+size_t EncodePacketAddrHeaderTo(const common::TargetAddress& target,
                                 uint8_t* out,
                                 size_t capacity) noexcept {
     if (!target.resolved_addr) {
@@ -132,9 +132,9 @@ std::optional<PacketAddrHeader> DecodePacketAddrHeader(
         }
         net::ip::address_v4::bytes_type bytes{};
         std::memcpy(bytes.data(), data.data() + 1, bytes.size());
-        const uint16_t port = LoadU16BE(&data[5]);
+        const uint16_t port = common::LoadU16BE(&data[5]);
         return PacketAddrHeader{
-            TargetAddress(net::ip::make_address_v4(bytes), port), 7};
+            common::TargetAddress(net::ip::make_address_v4(bytes), port), 7};
     }
 
     if (data[0] == 0x02) {
@@ -143,31 +143,31 @@ std::optional<PacketAddrHeader> DecodePacketAddrHeader(
         }
         net::ip::address_v6::bytes_type bytes{};
         std::memcpy(bytes.data(), data.data() + 1, bytes.size());
-        const uint16_t port = LoadU16BE(&data[17]);
+        const uint16_t port = common::LoadU16BE(&data[17]);
         return PacketAddrHeader{
-            TargetAddress(net::ip::make_address_v6(bytes), port), 19};
+            common::TargetAddress(net::ip::make_address_v6(bytes), port), 19};
     }
 
     return std::nullopt;
 }
 
-size_t EncodeRequiredUdpHeaderTo(const TargetAddress& target,
+size_t EncodeRequiredUdpHeaderTo(const common::TargetAddress& target,
                          bool packet_addr,
                          size_t payload_size,
                          std::span<uint8_t> out) {
-    if (!target.IsValid()) throw transport::LinkError(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    if (!target.IsValid()) throw transport::LinkError(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
     if (payload_size > proxy::kMaxFramedDatagramPayload)
-        throw transport::LinkError(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
 
     std::array<uint8_t, kPacketAddrV6HeaderSize> address{};
     const size_t address_size = packet_addr
         ? EncodePacketAddrHeaderTo(target, address.data(), address.size())
         : 0;
     if (packet_addr && address_size == 0)
-        throw transport::LinkError(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
     if (address_size > std::numeric_limits<uint16_t>::max() - payload_size ||
         out.size() < address_size + 2)
-        throw transport::LinkError(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
 
     const size_t frame_payload_size = address_size + payload_size;
     out[0] = static_cast<uint8_t>(frame_payload_size >> 8);
@@ -260,7 +260,7 @@ struct CompleteRecords {
             bytes = bytes.subspan(n);
             if (header_bytes == header.size()) {
                 valid = StartsWith(header, kTlsApplicationDataStart);
-                remaining = LoadU16BE(header.data() + 3);
+                remaining = common::LoadU16BE(header.data() + 3);
                 valid = valid && remaining != 0;
                 header_bytes = 0;
             }
@@ -274,7 +274,7 @@ struct CompleteRecords {
 
 
 using VisionFrameBufferBuilder =
-    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity * 3>;
+    common::ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity * 3>;
 
 class VisionHeaderArena {
 public:
@@ -323,9 +323,9 @@ void AppendVisionFrameBuffers(
         send_uuid = false;
     }
     tail[pos++] = command;
-    StoreU16BE(tail + pos, static_cast<uint16_t>(content.size()));
+    common::StoreU16BE(tail + pos, static_cast<uint16_t>(content.size()));
     pos += 2;
-    StoreU16BE(tail + pos, padding_len);
+    common::StoreU16BE(tail + pos, padding_len);
     pos += 2;
     out.Append(net::const_buffer(tail, pos));
     if (!content.empty()) {
@@ -461,17 +461,17 @@ RequestHeaderDecodeResult DecodeRequestHeader(std::span<const uint8_t> data) {
     const uint8_t command = data[command_offset];
     size_t consumed = command_offset + 1;
     if (command == static_cast<uint8_t>(Command::MUX)) {
-        header.target = TargetAddress("v1.mux.cool", 9527);
+        header.target = common::TargetAddress("v1.mux.cool", 9527);
     } else if (command == static_cast<uint8_t>(Command::TCP) ||
                command == static_cast<uint8_t>(Command::UDP)) {
-        auto address = DecodeAddress(
-            data.subspan(consumed), AddressWireFormat::PortFirst,
+        auto address = common::DecodeAddress(
+            data.subspan(consumed), common::AddressWireFormat::PortFirst,
             {.require_non_empty_domain = true, .allow_metadata = true});
-        if (address.status == AddressDecodeStatus::Invalid) {
+        if (address.status == common::AddressDecodeStatus::Invalid) {
             result.status = RequestHeaderDecodeStatus::InvalidAddress;
             return result;
         }
-        if (address.status == AddressDecodeStatus::Incomplete) {
+        if (address.status == common::AddressDecodeStatus::Incomplete) {
             result.required = consumed + address.required;
             return result;
         }
@@ -503,11 +503,11 @@ RequestHeaderDecodeResult DecodeRequestHeader(std::span<const uint8_t> data) {
 size_t EncodeRequestHeaderTo(
     const std::array<uint8_t, 16>& uuid,
     Command command,
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     uint8_t* output,
     size_t output_size,
     std::string_view flow,
-    ForwardedMetadataView forwarded) {
+    common::ForwardedMetadataView forwarded) {
     const size_t addons_len = EncodedAddonsSize(flow);
     if (addons_len > std::numeric_limits<uint8_t>::max()) {
         return 0;
@@ -517,7 +517,7 @@ size_t EncodeRequestHeaderTo(
         if (target.IsDomain() && (target.host.empty() || target.host.size() > 253)) {
             return 0;
         }
-        address_size = AddressEncodedSize(target, forwarded);
+        address_size = common::AddressEncodedSize(target, forwarded);
         if (address_size == 0) {
             return 0;
         }
@@ -526,7 +526,7 @@ size_t EncodeRequestHeaderTo(
         return 0;
     }
 
-    ByteWriter writer(output, output_size);
+    common::ByteWriter writer(output, output_size);
     writer.WriteU8(kVersion);
     writer.WriteBytes(uuid.data(), uuid.size());
     if (!WriteHeaderAddons(writer, flow)) {
@@ -539,19 +539,19 @@ size_t EncodeRequestHeaderTo(
     if (command == Command::MUX) {
         return writer.Position();
     }
-    const size_t encoded = EncodeAddressTo(target, output + writer.Position(),
-        output_size - writer.Position(), AddressWireFormat::PortFirst, forwarded);
+    const size_t encoded = common::EncodeAddressTo(target, output + writer.Position(),
+        output_size - writer.Position(), common::AddressWireFormat::PortFirst, forwarded);
     return encoded == 0 ? 0 : writer.Position() + encoded;
 }
 
 
-bool IsPacketAddrMagic(const TargetAddress& target) noexcept {
+bool IsPacketAddrMagic(const common::TargetAddress& target) noexcept {
     return target.IsDomain() && target.host == kPacketAddrMagicAddress;
 }
 
 void UdpFramer::Feed(buf::MultiBuffer input) {
     if (!pending_.Append(std::move(input))) {
-        throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 }
 
@@ -563,7 +563,7 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
     case buf::LengthPrefixedPacketBuffer::PopResult::Finished:
         return false;
     case buf::LengthPrefixedPacketBuffer::PopResult::Invalid:
-        throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     case buf::LengthPrefixedPacketBuffer::PopResult::Packet:
         break;
     }
@@ -574,7 +574,7 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
             std::span<const uint8_t>(address.data(), copied));
         if (!header || !header->target.IsValid()) {
             pending_.Fail();
-            throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
+            throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         out.target = std::move(header->target);
         (void)payload.DropPrefixBytes(header->consumed);
@@ -585,18 +585,18 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
 
 void UdpFramer::Finish() {
     if (!pending_.Finish()) {
-        throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 }
 
 net::awaitable<buf::MultiBuffer> UdpFramer::ReadDatagram(
     transport::MultiBufferReader& src,
-    const TargetAddress& session_target) {
+    const common::TargetAddress& session_target) {
     if (pending_.Finished()) co_return buf::MultiBuffer{};
     for (;;) {
         FramedUdpPacket packet;
         if (Next(packet)) {
-            const TargetAddress& target = packet.target
+            const common::TargetAddress& target = packet.target
                 ? *packet.target
                 : session_target;
             if (!buf::SetUdpTarget(packet.payload, target)) {
@@ -608,7 +608,7 @@ net::awaitable<buf::MultiBuffer> UdpFramer::ReadDatagram(
 
         buf::MultiBuffer raw = co_await src.ReadMultiBuffer();
         if (raw.byte_size() == 0) {
-            co_await ThrowIfCancelledOnEof();
+            co_await common::ThrowIfCancelledOnEof();
             Finish();
             co_return buf::MultiBuffer{};
         }
@@ -618,7 +618,7 @@ net::awaitable<buf::MultiBuffer> UdpFramer::ReadDatagram(
 
 net::awaitable<void> WriteUdpDatagram(
     transport::MultiBufferWriter& writer, buf::MultiBuffer payload,
-    bool packet_addr, const TargetAddress* fixed_target) {
+    bool packet_addr, const common::TargetAddress* fixed_target) {
     const auto datagram = proxy::RequireUdpDatagram(
         payload, packet_addr ? nullptr : fixed_target);
     if (!datagram) co_return;
@@ -629,7 +629,7 @@ net::awaitable<void> WriteUdpDatagram(
 }
 
 net::awaitable<void> WriteUdpDatagram(
-    transport::MultiBufferWriter& writer, const TargetAddress& target,
+    transport::MultiBufferWriter& writer, const common::TargetAddress& target,
     bool packet_addr, std::span<const net::const_buffer> payload) {
     const auto payload_size = proxy::RequireUdpPayloadSize(payload);
     std::array<uint8_t, kMaxUdpHeaderSize> header{};
@@ -707,8 +707,8 @@ void VisionReader::Decode(buf::MultiBuffer& out) {
             command_ != kCommandPaddingDirect) {
             throw IoSystemError(io_error::connection_reset, "VLESS Vision command invalid");
         }
-        content_remaining_ = LoadU16BE(fields + 1);
-        padding_remaining_ = LoadU16BE(fields + 3);
+        content_remaining_ = common::LoadU16BE(fields + 1);
+        padding_remaining_ = common::LoadU16BE(fields + 3);
         frame_active_ = true;
     }
     // After the final padded frame the rest of the stream is raw.
@@ -739,14 +739,14 @@ net::awaitable<buf::MultiBuffer> VisionReader::ReadFramedMultiBuffer() {
         if (!read_process_) {
             buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
             if (raw.byte_size() == 0) {
-                co_await ThrowIfCancelledOnEof();
+                co_await common::ThrowIfCancelledOnEof();
             }
             co_return raw;
         }
 
         buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
         if (raw.byte_size() == 0) {
-            co_await ThrowIfCancelledOnEof();
+            co_await common::ThrowIfCancelledOnEof();
             if (read_process_ && (header_read_ != 0 || frame_active_ || expect_uuid_)) {
                 throw IoSystemError(io_error::connection_reset, "VLESS Vision frame truncated");
             }
@@ -770,7 +770,7 @@ void VisionTrafficState::FilterTLS(std::span<const uint8_t> data) noexcept {
     --packets_to_filter;
     if (data.size() >= 6) {
         if (StartsWith(data, kTlsServerHandshakeStart) && data[5] == 0x02) {
-            remaining_server_hello = LoadU16BE(data.data() + 3) + 5;
+            remaining_server_hello = common::LoadU16BE(data.data() + 3) + 5;
             is_tls12_or_above = true;
             is_tls = true;
         } else if (StartsWith(data, kTlsClientHandshakeStart) && data[5] == 0x01) {
@@ -817,4 +817,4 @@ net::awaitable<void> VisionWriter::WriteFramedBuffers(std::span<const net::const
 net::awaitable<void> VisionWriter::AsyncShutdownWrite() {
     return dst_.AsyncShutdownWrite();
 }
-}  // namespace vless
+}  // namespace proxy::vless

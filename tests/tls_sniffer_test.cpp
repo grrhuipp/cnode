@@ -85,25 +85,25 @@ ClientHelloFixture BuildClientHello(
 }  // namespace
 
 TEST(TlsSniffer, ExtractsCanonicalClientHelloServerName) {
-    const auto result = ::SniffTls(BuildClientHello().bytes);
+    const auto result = ::sniff::SniffTls(BuildClientHello().bytes);
     ASSERT_TRUE(result.success);
     EXPECT_EQ(result.domain, "example.com");
 }
 
 TEST(TlsSniffer, RejectsTrailingMalformedSniBytes) {
-    EXPECT_FALSE(::SniffTls(BuildClientHello(true).bytes).success);
+    EXPECT_FALSE(::sniff::SniffTls(BuildClientHello(true).bytes).success);
 }
 
 TEST(TlsSniffer, DoesNotReadBeyondDeclaredRecord) {
     auto hello = BuildClientHello();
     SetU16(hello.bytes, 3, hello.bytes.size() - 6);
-    EXPECT_FALSE(::SniffTls(hello.bytes).success);
+    EXPECT_FALSE(::sniff::SniffTls(hello.bytes).success);
 }
 
 TEST(TlsSniffer, IncompleteRecordRequestsMoreBytes) {
     auto hello = BuildClientHello();
     SetU16(hello.bytes, 3, hello.bytes.size() - 4);
-    const auto result = ::SniffTls(hello.bytes);
+    const auto result = ::sniff::SniffTls(hello.bytes);
     EXPECT_FALSE(result.success);
     EXPECT_TRUE(result.need_more);
     EXPECT_EQ(result.protocol, "tls");
@@ -112,19 +112,19 @@ TEST(TlsSniffer, IncompleteRecordRequestsMoreBytes) {
 TEST(TlsSniffer, DoesNotReadBeyondDeclaredHandshake) {
     auto hello = BuildClientHello();
     SetU24(hello.bytes, 6, hello.bytes.size() - 10);
-    EXPECT_FALSE(::SniffTls(hello.bytes).success);
+    EXPECT_FALSE(::sniff::SniffTls(hello.bytes).success);
 }
 
 TEST(TlsSniffer, RejectsTruncatedExtensionList) {
     auto hello = BuildClientHello();
     SetU16(hello.bytes, hello.extensions_length_offset, hello.bytes.size());
-    EXPECT_FALSE(::SniffTls(hello.bytes).success);
+    EXPECT_FALSE(::sniff::SniffTls(hello.bytes).success);
 }
 
 namespace {
 class TlsInvalidHostName : public testing::TestWithParam<const char*> {};
 TEST_P(TlsInvalidHostName, RejectsNonDnsSniIdentity) {
-    EXPECT_FALSE(::SniffTls(BuildClientHello(false, GetParam()).bytes).success);
+    EXPECT_FALSE(::sniff::SniffTls(BuildClientHello(false, GetParam()).bytes).success);
 }
 INSTANTIATE_TEST_SUITE_P(Identities, TlsInvalidHostName, testing::Values(
     "192.0.2.1", "example.com.", "bad..example", "bad_name.example"));
@@ -142,7 +142,7 @@ TEST(TlsSniffer, ReassemblesClientHelloAcrossTlsRecords) {
     AppendU16(wire, 0x0303);
     AppendU16(wire, handshake.size() - split);
     wire.insert(wire.end(), handshake.begin() + split, handshake.end());
-    const auto result = ::SniffTls(wire);
+    const auto result = ::sniff::SniffTls(wire);
     ASSERT_TRUE(result.success);
     EXPECT_EQ(result.domain, "example.com");
 }

@@ -37,13 +37,13 @@ std::shared_ptr<const NodeSnapshot> Snapshot(uint16_t port, size_t version = 1) 
     snapshot->users_etag = "users-" + std::to_string(version);
     snapshot->config_etag = "config-" + std::to_string(version);
     snapshot->rules = std::make_shared<const std::vector<::rule::DetectRule>>(version);
-    ::StreamSettings stream;
+    ::transport::internet::StreamSettings stream;
     stream.ws.path = snapshot->config.Path;
-    snapshot->inbound = std::make_shared<const ::PreparedInbound>(::PreparedInbound{
+    snapshot->inbound = std::make_shared<const ::app::PreparedInbound>(::app::PreparedInbound{
         .binding = {.port = port, .protocol = snapshot->config.NodeType, .tag = snapshot->tag, .listen = {}},
         .receiver = ::proxyman::inbound::MakeReceiverSettings(
             snapshot->tag, {}, snapshot->config.NodeType, std::move(stream), {},
-            ::ProxyProtocolMode::Auto, ::routing::RouteWithFallback(snapshot->tag), {}),
+            ::transport::internet::ProxyProtocolMode::Auto, ::routing::RouteWithFallback(snapshot->tag), {}),
         .build_request = {},
         .users = std::make_shared<const UserSet>(
             ::proxyman::inbound::PreparedVmessUsers(version)),
@@ -56,7 +56,7 @@ std::shared_ptr<const NodeSnapshot> Snapshot(uint16_t port, size_t version = 1) 
 
 // A users-only change keeps every prepared setting and replaces the users.
 void ReplaceUsers(NodeSnapshot& snapshot, size_t count) {
-    auto inbound = std::make_shared<::PreparedInbound>(*snapshot.inbound);
+    auto inbound = std::make_shared<::app::PreparedInbound>(*snapshot.inbound);
     inbound->users = std::make_shared<const UserSet>(
         ::proxyman::inbound::PreparedVmessUsers(count));
     snapshot.inbound = std::move(inbound);
@@ -134,7 +134,7 @@ struct Runtime {
         co_await net::post(net::use_awaitable);
         Step("remove-out:" + tag, [&] { resources[tag].outbound = false; });
     }
-    net::awaitable<bool> AddInbound(const ::PreparedInbound& inbound) {
+    net::awaitable<bool> AddInbound(const ::app::PreparedInbound& inbound) {
         ++operations_started;
         co_await net::post(net::use_awaitable);
         if (inbound_gate) {

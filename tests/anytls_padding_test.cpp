@@ -25,7 +25,7 @@ public:
     ~AllocationMeasurement() { measuring = false; }
 };
 
-using namespace ::anytls;
+using namespace ::proxy::anytls;
 constexpr std::array invalid{
     "", "stop=0\n0=30-30", "stop=-1\n0=30-30", "stop=4294967296\n0=30-30",
     "stop=\n0=30-30", "stop=+1\n0=30-30", "stop=1x\n0=30-30",

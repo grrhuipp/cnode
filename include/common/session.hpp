@@ -13,7 +13,11 @@
 #include <vector>
 
 
+namespace app {
+
 struct ConnectionFamily;
+
+}  // namespace app
 
 namespace session {
 
@@ -64,9 +68,9 @@ struct Inbound {
     // Connection-limit family lease of the physical connection this request
     // arrived on. Set by the inbound handler; substreams inherit it and take
     // their logical admission against it.
-    std::shared_ptr<ConnectionFamily> connection_family;
+    std::shared_ptr<app::ConnectionFamily> connection_family;
 
-    void ApplyForwardedMetadata(const ForwardedMetadata& metadata) {
+    void ApplyForwardedMetadata(const common::ForwardedMetadata& metadata) {
         if (!metadata.inbound_tag.empty()) {
             origin_tag.assign(metadata.inbound_tag.data(), metadata.inbound_tag.size());
         } else {
@@ -122,7 +126,7 @@ struct Inbound {
     }
     std::string_view EffectiveClientIp() const&& = delete;
 
-    [[nodiscard]] ForwardedMetadataView MakeForwardedMetadata() const& noexcept {
+    [[nodiscard]] common::ForwardedMetadataView MakeForwardedMetadata() const& noexcept {
         std::optional<net::ip::address> client_ip;
         const auto& addr = EffectiveClientAddress();
         if (!addr.is_unspecified()) {
@@ -133,14 +137,14 @@ struct Inbound {
                 client_ip = normalized;
             }
         }
-        return ForwardedMetadataView{
+        return common::ForwardedMetadataView{
             .user_id = EffectiveUserId(),
             .user_email = EffectiveUserEmail(),
             .client_ip = client_ip,
             .inbound_tag = EffectiveInboundTag(),
         };
     }
-    ForwardedMetadataView MakeForwardedMetadata() const&& = delete;
+    common::ForwardedMetadataView MakeForwardedMetadata() const&& = delete;
 };
 using ClientIpSource = Inbound::ClientIpSource;
 
@@ -148,9 +152,9 @@ using ClientIpSource = Inbound::ClientIpSource;
 // xray-core common/session.Outbound 对应的出站目标/路由元数据。
 struct Outbound {
     // 仅当嗅探改写了 target 时保存改写前的请求目标；否则为空（与 target 相同）。
-    TargetAddress original_target;
-    TargetAddress target;
-    TargetAddress route_target;
+    common::TargetAddress original_target;
+    common::TargetAddress target;
+    common::TargetAddress route_target;
     // Local egress address of the established outbound socket. Unlike the
     // remote field this is meaningful for direct and proxy next-hop sockets.
     std::optional<net::ip::address> connected_local_addr;
@@ -162,7 +166,7 @@ struct Content {
     Content() : Content(nullptr) {}
     explicit Content(std::pmr::memory_resource* resource)
         : protocol(resource) {}
-    Network network = Network::TCP;
+    common::Network network = common::Network::TCP;
     memory::String protocol;
     uint64_t speed_limit = 0;
 };
@@ -196,10 +200,14 @@ struct Context {
 
 }  // namespace session
 
+namespace common {
+
 enum class AccessStatus { Accepted, Rejected };
 
 std::string FormatAccessLog(
     const session::Context& ctx,
     AccessStatus status = AccessStatus::Accepted,
     std::string_view reason = {});
+
+}  // namespace common
 

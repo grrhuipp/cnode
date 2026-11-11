@@ -18,7 +18,7 @@ class OutboundStreamEndpointBase
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
-    explicit OutboundStreamEndpointBase(AsyncStream& stream) noexcept
+    explicit OutboundStreamEndpointBase(transport::AsyncStream& stream) noexcept
         : stream_(stream) {}
 
     bool ConsumeIdleTimeout() noexcept {
@@ -33,7 +33,7 @@ public:
         return stream_.ConsumeWriteTimeout();
     }
 
-    PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
+    transport::PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
         return stream_.StartPhaseDeadline(timeout);
     }
 
@@ -74,7 +74,7 @@ public:
     }
 
 protected:
-    AsyncStream& stream_;
+    transport::AsyncStream& stream_;
 };
 
 class OutboundDatagramEndpointBase
@@ -117,7 +117,7 @@ public:
         socket_.SetWriteTimeout(value);
     }
 
-    PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds value) {
+    transport::PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds value) {
         return socket_.StartPhaseDeadline(value);
     }
 

@@ -54,7 +54,7 @@ struct NodeInfo {
     bool EnableReality = false;
     std::string Flow;
     std::string ServiceName;
-    RealityConfig Reality;
+    transport::internet::RealityConfig Reality;
     std::string CypherMethod;
     std::string ShadowsocksServerKey;
     std::string PaddingScheme;
@@ -80,14 +80,16 @@ struct OnlineUser {
 
 }  // namespace api
 
-struct NodeInfoFetchResult : ResultStatus {
+namespace api {
+
+struct NodeInfoFetchResult : common::ResultStatus {
     std::optional<api::NodeInfo> node_info;
     std::vector<rule::DetectRule> rules;
     std::string etag;
     bool not_modified = false;
 
     [[nodiscard]] bool Ok() const noexcept {
-        return ResultStatus::Ok() && (not_modified || node_info.has_value());
+        return common::ResultStatus::Ok() && (not_modified || node_info.has_value());
     }
 
     [[nodiscard]] static NodeInfoFetchResult Success(
@@ -99,7 +101,7 @@ struct NodeInfoFetchResult : ResultStatus {
         return result;
     }
 
-    [[nodiscard]] static NodeInfoFetchResult Fail(ErrorCode code, std::string msg = {}) {
+    [[nodiscard]] static NodeInfoFetchResult Fail(common::ErrorCode code, std::string msg = {}) {
         NodeInfoFetchResult result;
         result.SetError(code, msg);
         return result;
@@ -112,7 +114,7 @@ struct NodeInfoFetchResult : ResultStatus {
     }
 };
 
-struct UserListFetchResult : ResultStatus {
+struct UserListFetchResult : common::ResultStatus {
     std::vector<api::UserInfo> users;
     std::string etag;
     bool not_modified = false;
@@ -125,7 +127,7 @@ struct UserListFetchResult : ResultStatus {
         return result;
     }
 
-    [[nodiscard]] static UserListFetchResult Fail(ErrorCode code, std::string msg = {}) {
+    [[nodiscard]] static UserListFetchResult Fail(common::ErrorCode code, std::string msg = {}) {
         UserListFetchResult result;
         result.SetError(code, msg);
         return result;
@@ -137,6 +139,8 @@ struct UserListFetchResult : ResultStatus {
         return result;
     }
 };
+
+}  // namespace api
 
 
 namespace api {

@@ -28,7 +28,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace worker_detail {
+namespace app::worker_detail {
 
 namespace {
 // Rows inspected per wake; further due rows wait for the next event-loop turn.
@@ -48,7 +48,7 @@ UdpAssociationHook::TimePoint UdpAssociationExpiry(
 }
 
 UdpAssociationReclaimer::UdpAssociationReclaimer(
-    TimeoutScheduler& scheduler,
+    transport::internet::TimeoutScheduler& scheduler,
     void* failure_context,
     FailureCallback on_failure) noexcept
     : scheduler_(scheduler)
@@ -67,13 +67,13 @@ void UdpAssociationReclaimer::Register(
     const ClientSessionKey& client_key, std::chrono::seconds idle_timeout,
     TimePoint deadline) noexcept {
     if (stopped_) {
-        FailRuntime("udp-maintenance", "association registered after reclaimer stop");
+        common::FailRuntime("udp-maintenance", "association registered after reclaimer stop");
     }
     if (hook.owner) {
-        FailRuntime("udp-maintenance", "association hook registered twice");
+        common::FailRuntime("udp-maintenance", "association hook registered twice");
     }
     if (heap_.size() == heap_.capacity()) {
-        FailRuntime("udp-maintenance", "association registered without reserved capacity");
+        common::FailRuntime("udp-maintenance", "association registered without reserved capacity");
     }
     hook.owner = &owner;
     hook.socket = &socket;
@@ -146,7 +146,7 @@ void UdpAssociationReclaimer::Schedule() noexcept {
         : std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
     try {
         if (!scheduler_.ScheduleAfter(delay, *this))
-            FailRuntime("udp-maintenance", "association schedule refused after release");
+            common::FailRuntime("udp-maintenance", "association schedule refused after release");
         armed_deadline_ = deadline;
     } catch (...) {
         failed_ = true;
@@ -248,7 +248,7 @@ template <class Function>
 
 }  // namespace
 
-bool UdpIngress::ReplyRoute::Send(UDPPacketView packet, const udp::endpoint& endpoint) {
+bool UdpIngress::ReplyRoute::Send(proxy::UDPPacketView packet, const udp::endpoint& endpoint) {
     auto payload = response->Encode(packet);
     if (payload.empty()) return false;
     return owner->SendReply(socket, endpoint, std::move(payload), worker_id);
@@ -258,7 +258,7 @@ UdpIngress::ClientSession::ClientSession(
     net::io_context& io_context,
     ReplyRoute reply,
     udp::endpoint reply_endpoint,
-    InboundDatagramOwner session_owner,
+    proxy::InboundDatagramOwner session_owner,
     UdpResourceBudget& budget,
     UdpResourceBudget::AssociationLease association,
     std::shared_ptr<UdpHandoffRecord> record)
@@ -288,7 +288,7 @@ bool UdpIngress::ClientSession::Closed() const noexcept {
 }
 
 bool UdpIngress::ClientSession::Owns(
-    const InboundDatagramOwner& owner) const noexcept {
+    const proxy::InboundDatagramOwner& owner) const noexcept {
     return session_owner_.Same(owner);
 }
 
@@ -298,7 +298,7 @@ void UdpIngress::ClientSession::UpdateReplyEndpoint(
 }
 
 bool UdpIngress::ClientSession::Push(
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     buf::MultiBuffer payload) {
     const size_t payload_size = payload.byte_size();
     if (Closed()) {
@@ -308,7 +308,7 @@ bool UdpIngress::ClientSession::Push(
     if (WouldOverflowUdpQueue(
             input_queue_.size(), queued_bytes_, payload_size)) {
         payload.clear();
-        CloseWithError(ErrorCode::RESOURCE_EXHAUSTED);
+        CloseWithError(common::ErrorCode::RESOURCE_EXHAUSTED);
         return false;
     }
 
@@ -324,7 +324,7 @@ bool UdpIngress::ClientSession::Push(
 }
 
 void UdpIngress::ClientSession::Close() noexcept {
-    CloseWithError(ErrorCode::OK);
+    CloseWithError(common::ErrorCode::OK);
 }
 
 net::awaitable<buf::MultiBuffer>
@@ -338,12 +338,12 @@ UdpIngress::ClientSession::ReadMultiBuffer() {
         }
 
         if (closed_) {
-            if (terminal_error_ == ErrorCode::RESOURCE_EXHAUSTED) {
+            if (terminal_error_ == common::ErrorCode::RESOURCE_EXHAUSTED) {
                 throw IoSystemError(
                     io_error::no_buffer_space,
                     "UDP client input queue full");
             }
-            if (terminal_error_ != ErrorCode::OK) {
+            if (terminal_error_ != common::ErrorCode::OK) {
                 throw transport::LinkError(terminal_error_);
             }
             co_return buf::MultiBuffer{};
@@ -381,7 +381,7 @@ UdpIngress::ClientSession::WriteMultiBuffer(buf::MultiBuffer mb) {
     }
 
     const buf::ContiguousBufferView payload(mb);
-    if (!reply_.Send(UDPPacketView{*datagram.target, payload.Bytes()}, reply_endpoint_)) {
+    if (!reply_.Send(proxy::UDPPacketView{*datagram.target, payload.Bytes()}, reply_endpoint_)) {
         mb.clear();
         throw IoSystemError(
             io_error::fault, "UDP client reply was rejected");
@@ -422,12 +422,12 @@ void UdpIngress::Link(UdpClientSession& row, SocketState& socket,
 }
 
 void UdpIngress::SetLocalAssociation(const UdpAssociationHook& hook,
-                                     InboundDatagramAssociation* association) noexcept {
+                                     proxy::InboundDatagramAssociation* association) noexcept {
     if (!hook.client_key || !hook.client_key->session_id) return;
     if (!hook.socket) return;
     const auto& key = *hook.client_key;
     auto entry = hook.socket->associations.find(
-        InboundDatagramAssociationKey{key.owner, *key.session_id, key.configuration});
+        proxy::InboundDatagramAssociationKey{key.owner, *key.session_id, key.configuration});
     if (entry != hook.socket->associations.end()) entry->second = association;
 }
 
@@ -437,14 +437,14 @@ void UdpIngress::Unlink(UdpClientSession& row) noexcept {
         if (hook.socket) {
             const auto& key = *hook.client_key;
             hook.socket->associations.erase(
-                InboundDatagramAssociationKey{key.owner, *key.session_id, key.configuration});
+                proxy::InboundDatagramAssociationKey{key.owner, *key.session_id, key.configuration});
         }
     }
     reclaimer_.Unregister(row.reclaim_hook);
     if (row.link) row.link->association_hook_ = nullptr;
 }
 
-void UdpIngress::ClientSession::CloseWithError(ErrorCode error) noexcept {
+void UdpIngress::ClientSession::CloseWithError(common::ErrorCode error) noexcept {
     if (closed_) {
         return;
     }
@@ -464,7 +464,7 @@ void UdpIngress::ClientSession::CloseWithError(ErrorCode error) noexcept {
 
 UdpIngress::UdpIngress(
     std::string_view tag,
-    std::unique_ptr<::Inbound> proxy,
+    std::unique_ptr<::proxy::Inbound> proxy,
     UdpAssociationReclaimer& reclaimer,
     UdpResourceBudget& budget,
     net::io_context& io_context)
@@ -477,7 +477,7 @@ UdpIngress::UdpIngress(
 
 UdpIngress::~UdpIngress() noexcept {
     if (outstanding_jobs_ != 0 || reply_senders_ != 0) {
-        FailRuntime("udp-ingress", "destroyed with native dispatch jobs outstanding");
+        common::FailRuntime("udp-ingress", "destroyed with native dispatch jobs outstanding");
     }
     RequestStop();
 }
@@ -511,7 +511,7 @@ UdpIngress::ResourceStats UdpIngress::GetResourceStats() const noexcept {
 }
 
 bool UdpIngress::ReplaceHandler(
-    std::unique_ptr<::Inbound> proxy) noexcept {
+    std::unique_ptr<::proxy::Inbound> proxy) noexcept {
     if (!proxy) {
         return false;
     }
@@ -593,7 +593,7 @@ void UdpIngress::DetachNativeJob(ClientSession& session) noexcept {
     session.job_registered_ = false;
     session.job_linked_ = false;
     if (outstanding_jobs_ == 0) {
-        FailRuntime("udp-ingress", "native dispatch completion underflow");
+        common::FailRuntime("udp-ingress", "native dispatch completion underflow");
     }
     --outstanding_jobs_;
     NotifyCompletion();
@@ -642,11 +642,11 @@ net::awaitable<void> UdpIngress::RunNativeDispatch(ClientSessionPtr client_sessi
         RelayResult result = co_await request.dispatcher->Dispatch(
             *request.io_context, request.policy, nullptr,
             transport::Link{client_session.get(), client_session.get()},
-            InitialPayload{}, request.context, request.admission->stats, request.timeouts);
-        if (result.error != ErrorCode::OK) {
+            common::InitialPayload{}, request.context, request.admission->stats, request.timeouts);
+        if (result.error != common::ErrorCode::OK) {
             LOG_CONN_DEBUG(request.context,
                 "UDP dispatcher ended > {} up={}B down={}B",
-                ErrorCodeToString(result.error), result.bytes_up,
+                common::ErrorCodeToString(result.error), result.bytes_up,
                 result.bytes_down);
         }
     } catch (const IoSystemError& error) {
@@ -683,7 +683,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
 
     const auto normalized_client_addr =
         iputil::NormalizeAddress(datagram.client_endpoint.address());
-    auto decoded = proxy_->Process(InboundDatagramRequest{
+    auto decoded = proxy_->Process(proxy::InboundDatagramRequest{
         .tag = tag_,
         .payload = datagram.payload,
         .associations = &socket.associations,
@@ -693,7 +693,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         .client_endpoint = datagram.client_endpoint,
     });
     if (!decoded) {
-        if (decoded.error() == ErrorCode::PROTOCOL_AUTH_FAILED) {
+        if (decoded.error() == common::ErrorCode::PROTOCOL_AUTH_FAILED) {
             // Datagram sources are socket peers, never PROXY protocol clients,
             // so a credential failure is logged without feeding the ban table.
             session::Context rejected;
@@ -702,7 +702,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
             rejected.inbound.source_addr = normalized_client_addr;
             rejected.inbound.source_ip = iputil::AddressText(normalized_client_addr).View();
             rejected.inbound.source_port = datagram.client_endpoint.port();
-            rejected.content.network = Network::UDP;
+            rejected.content.network = common::Network::UDP;
             ::proxy::LogInboundAuthFailure(
                 rejected, "datagram authentication or validation failed");
         }
@@ -743,7 +743,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         if (auto session = record->session.lock()) {
             if (session->Closed() ||
                 !record->association->Check(*decoded->packet_id, datagram.worker_id,
-                    datagram.client_endpoint, InboundDatagramCheck::Commit)) {
+                    datagram.client_endpoint, proxy::InboundDatagramCheck::Commit)) {
                 return;
             }
             session->UpdateReplyEndpoint(datagram.client_endpoint);
@@ -754,7 +754,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
             return;
         }
         if (!record->association->Check(*decoded->packet_id, datagram.worker_id,
-                datagram.client_endpoint, InboundDatagramCheck::Commit)) {
+                datagram.client_endpoint, proxy::InboundDatagramCheck::Commit)) {
             return;
         }
         ProcessDecoded(datagram, normalized_client_addr, std::move(*decoded), now, std::move(record));
@@ -765,13 +765,13 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
 
 void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
     const net::ip::address& client_address,
-    InboundDatagramResult result, std::chrono::steady_clock::time_point now,
+    proxy::InboundDatagramResult result, std::chrono::steady_clock::time_point now,
     std::shared_ptr<UdpHandoffRecord> record) {
     auto* decoded = &result;
     auto& socket = *datagram.socket;
 
     auto client_key_log = [&]() {
-        return TargetAddress(client_address, datagram.client_endpoint.port());
+        return common::TargetAddress(client_address, datagram.client_endpoint.port());
     };
     const ClientSessionKey client_session_key{
         decoded->session_owner, decoded->session_id, datagram.client_endpoint,
@@ -850,7 +850,7 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
         if (record) {
             if (!OwnsSocket(socket)) return;
             socket.associations.insert_or_assign(
-                InboundDatagramAssociationKey{decoded->session_owner, *decoded->session_id,
+                proxy::InboundDatagramAssociationKey{decoded->session_owner, *decoded->session_id,
                     client_session_key.configuration},
                 record->association.get());
         }
@@ -882,7 +882,7 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
         ::proxy::BindInboundRequestTarget(
             ctx,
             ::proxy::InboundRequestTarget{
-                Network::UDP,
+                common::Network::UDP,
                 decoded->target,
                 std::move(decoded->forwarded)});
         request.io_context = &datagram.io_context;
@@ -1027,16 +1027,16 @@ void UdpIngress::NotifyCompletion() noexcept {
     if (join_observers_ == 0) return;
     try {
         if (!completion_signal_.try_send(IoErrorCode{}))
-            FailRuntime("udp-ingress-join", "completion channel full");
+            common::FailRuntime("udp-ingress-join", "completion channel full");
     } catch (...) {
-        FailRuntime("udp-ingress-join", "completion signal failed");
+        common::FailRuntime("udp-ingress-join", "completion signal failed");
     }
 }
 
 UdpIngress::ClientSessionPtr UdpIngress::CreateClientSession(
     const SocketStatePtr& socket, const ClientSessionKey& client_key,
     net::io_context& io_context, ReplyRoute reply, udp::endpoint reply_endpoint,
-    InboundDatagramOwner owner, std::chrono::steady_clock::time_point last_active,
+    proxy::InboundDatagramOwner owner, std::chrono::steady_clock::time_point last_active,
     std::chrono::seconds idle_timeout, std::shared_ptr<UdpHandoffRecord> record) {
     if (state_ != State::Running || !socket || !OwnsSocket(*socket) ||
         client_key.owner.size == 0 || !client_key.owner.Same(owner)) return nullptr;
@@ -1080,7 +1080,7 @@ void UdpIngress::ReclaimAssociation(
     auto session = row->second.link;
     Unlink(row->second);
     socket->sessions.erase(row);
-    MaybeShrinkHashContainer(socket->sessions);
+    common::MaybeShrinkHashContainer(socket->sessions);
     if (session) session->Close();
 }
 
@@ -1169,8 +1169,8 @@ void UdpIngress::CloseSocket(SocketState& socket) noexcept {
 std::shared_ptr<UdpHandoffRecord> UdpHandoffDirectory::Claim(
     const UdpHandoffIdentity& key,
     std::shared_ptr<const proxyman::inbound::ProtocolSettings> configuration,
-    const InboundDatagramAssociationPolicy& policy) {
-    using Clock = InboundDatagramAssociation::Clock;
+    const proxy::InboundDatagramAssociationPolicy& policy) {
+    using Clock = proxy::InboundDatagramAssociation::Clock;
     if (auto found = records_.find(key); found != records_.end()) {
         auto& record = found->second;
         if (&record->association->Policy() != &policy || record->association->claimed) return {};
@@ -1221,4 +1221,4 @@ std::shared_ptr<UdpHandoffRecord> UdpHandoffDirectory::Claim(
     return record;
 }
 
-}  // namespace worker_detail
+}  // namespace app::worker_detail

@@ -25,7 +25,7 @@ private:
 TEST(XhttpUploadStreamSlot, RejectsSecondOwnerAndRetainsInFlightSnapshotUntilReleased) {
     size_t first_destructions = 0;
     size_t rejected_destructions = 0;
-    ::detail::BasicXHttpUploadStreamSlot<TestStream> slot;
+    ::transport::internet::detail::BasicXHttpUploadStreamSlot<TestStream> slot;
     ASSERT_TRUE(slot.Attach(std::make_unique<TestStream>(first_destructions)));
     auto in_flight = slot.Snapshot();
     const bool attached_again = slot.Attach(std::make_unique<TestStream>(rejected_destructions));
@@ -46,7 +46,7 @@ TEST(XhttpUploadStreamSlot, RejectsSecondOwnerAndRetainsInFlightSnapshotUntilRel
 
 TEST(XhttpUploadStreamSlot, AllocationFailurePreservesCallerOwnershipAndAllowsRetry) {
     size_t destructions = 0;
-    ::detail::BasicXHttpUploadStreamSlot<TestStream> slot;
+    ::transport::internet::detail::BasicXHttpUploadStreamSlot<TestStream> slot;
     auto retained = std::make_unique<TestStream>(destructions);
     bool allocation_failed = false;
     {

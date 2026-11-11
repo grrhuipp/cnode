@@ -17,24 +17,24 @@ namespace {
 
 void AppendU16(memory::ByteVector& output, uint16_t value) {
     std::array<uint8_t, 2> bytes{};
-    StoreU16BE(bytes.data(), value);
+    common::StoreU16BE(bytes.data(), value);
     output.insert(output.end(), bytes.begin(), bytes.end());
 }
 
 void AppendU32(memory::ByteVector& output, uint32_t value) {
     std::array<uint8_t, 4> bytes{};
-    StoreU32BE(bytes.data(), value);
+    common::StoreU32BE(bytes.data(), value);
     output.insert(output.end(), bytes.begin(), bytes.end());
 }
 
 void AppendU64(memory::ByteVector& output, uint64_t value) {
     std::array<uint8_t, 8> bytes{};
-    StoreU64BE(bytes.data(), value);
+    common::StoreU64BE(bytes.data(), value);
     output.insert(output.end(), bytes.begin(), bytes.end());
 }
 
 bool AppendVarint(memory::ByteVector& output, uint64_t value) {
-    const size_t width = QuicVarintSize(value);
+    const size_t width = common::QuicVarintSize(value);
     if (width == 0) return false;
     const uint8_t prefix = static_cast<uint8_t>(
         (width == 1 ? 0 : width == 2 ? 1 : width == 4 ? 2 : 3) << 6);
@@ -45,18 +45,18 @@ bool AppendVarint(memory::ByteVector& output, uint64_t value) {
 }
 
 [[nodiscard]] std::string_view TargetHost(
-    const TargetAddress& target, std::optional<iputil::AddressText>& storage) {
+    const common::TargetAddress& target, std::optional<iputil::AddressText>& storage) {
     if (target.IsDomain()) return {target.host.data(), target.host.size()};
     if (!target.resolved_addr) return {};
     storage.emplace(*target.resolved_addr);
     return storage->View();
 }
 
-[[nodiscard]] tl::expected<TargetAddress, ProtocolError>
+[[nodiscard]] tl::expected<common::TargetAddress, ProtocolError>
 ParseV1Target(std::span<const uint8_t> host, uint16_t port) {
     if (host.empty() || host.size() > kMaxAddressLength || port == 0)
         return tl::unexpected(ProtocolError::Invalid);
-    TargetAddress target(
+    common::TargetAddress target(
         std::string_view(reinterpret_cast<const char*>(host.data()), host.size()), port);
     if (!target.IsValid()) return tl::unexpected(ProtocolError::Invalid);
     return target;
@@ -74,7 +74,7 @@ ParseV1Target(std::span<const uint8_t> host, uint16_t port) {
 }  // namespace
 
 tl::expected<UdpTargetText, ProtocolError> PrepareUdpTargetText(
-    Version version, const TargetAddress& target,
+    Version version, const common::TargetAddress& target,
     std::optional<iputil::AddressText>& address_storage) {
     UdpTargetText text;
     text.port = target.port;
@@ -100,7 +100,7 @@ tl::expected<UdpTargetText, ProtocolError> PrepareUdpTargetText(
 tl::expected<size_t, ProtocolError> UdpTargetHeaderSize(
     Version version, const UdpTargetText& text) {
     if (version == Version::V1) return 14 + text.host.size();
-    const size_t width = QuicVarintSize(text.authority_size);
+    const size_t width = common::QuicVarintSize(text.authority_size);
     if (width == 0 ||
         text.authority_size > std::numeric_limits<size_t>::max() - 8 - width)
         return tl::unexpected(ProtocolError::TooLarge);
@@ -142,7 +142,7 @@ tl::expected<memory::ByteVector, ProtocolError> EncodeUdpFragment(
 
 tl::expected<V1ClientHello, ProtocolError>
 ParseV1ClientHello(std::span<const uint8_t> input) {
-    ByteReader reader(input);
+    common::ByteReader reader(input);
     const uint8_t version = reader.ReadU8();
     if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
     if (version != kV1ProtocolVersion)
@@ -177,7 +177,7 @@ memory::ByteVector EncodeV1ServerHello(
 
 tl::expected<V1Request, ProtocolError>
 ParseV1Request(std::span<const uint8_t> input) {
-    ByteReader reader(input);
+    common::ByteReader reader(input);
     const uint8_t udp = reader.ReadU8();
     if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
     if (udp > 1) return tl::unexpected(ProtocolError::Invalid);
@@ -210,7 +210,7 @@ memory::ByteVector EncodeV1Response(
 
 tl::expected<V2TcpRequest, ProtocolError>
 ParseV2TcpRequest(std::span<const uint8_t> input) {
-    ByteReader reader(input);
+    common::ByteReader reader(input);
     const auto request_type = reader.ReadQuicVarint();
     if (!request_type) return tl::unexpected(ProtocolError::Incomplete);
     if (*request_type != kV2TcpRequestType) return tl::unexpected(ProtocolError::Invalid);
@@ -227,14 +227,14 @@ ParseV2TcpRequest(std::span<const uint8_t> input) {
         return tl::unexpected(ProtocolError::Incomplete);
     const auto text = std::string_view(
         reinterpret_cast<const char*>(address.data()), address.size());
-    auto target = TargetAddress::Parse(text);
+    auto target = common::TargetAddress::Parse(text);
     if (!target) return tl::unexpected(ProtocolError::Invalid);
     return V2TcpRequest{std::move(*target), reader.Position()};
 }
 
 tl::expected<UdpMessage, ProtocolError>
 ParseUdpMessage(Version version, std::span<const uint8_t> input) {
-    ByteReader reader(input);
+    common::ByteReader reader(input);
     const uint32_t session_id = reader.ReadU32BE();
     if (!reader.Ok()) return tl::unexpected(ProtocolError::Incomplete);
 
@@ -286,7 +286,7 @@ ParseUdpMessage(Version version, std::span<const uint8_t> input) {
     if (!address.empty()) {
         const auto text = std::string_view(
             reinterpret_cast<const char*>(address.data()), address.size());
-        auto target = TargetAddress::Parse(text);
+        auto target = common::TargetAddress::Parse(text);
         if (!target) return tl::unexpected(ProtocolError::Invalid);
         result.target = std::move(*target);
     } else if (RequiresUdpTarget(version, fragment_id, fragment_count)) {
@@ -302,7 +302,7 @@ ParseUdpMessage(Version version, std::span<const uint8_t> input) {
 }
 
 tl::expected<size_t, ProtocolError>
-UdpMessageHeaderSize(Version version, const TargetAddress& target) {
+UdpMessageHeaderSize(Version version, const common::TargetAddress& target) {
     std::optional<iputil::AddressText> address_storage;
     const auto text = PrepareUdpTargetText(version, target, address_storage);
     if (!text) return tl::unexpected(text.error());

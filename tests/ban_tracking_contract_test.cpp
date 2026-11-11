@@ -11,19 +11,19 @@
 #include <vector>
 
 namespace {
-using Core = ConnectionLimiterCore;
-using Reason = ConnectionLimiter::RejectReason;
+using Core = app::ConnectionLimiterCore;
+using Reason = app::ConnectionLimiter::RejectReason;
 constexpr std::string_view kTag = "panel|vless|443";
 constexpr std::string_view kOtherTag = "panel|vless|8443";
 constexpr std::string_view kIP = "192.0.2.1";
 
 // 封禁键与生产协调器一致：未启用 IP 封禁或来源为空时没有键，也就不会被封禁。
-bool IsIPBanned(const Core& core, const std::optional<AuthCredentialKey>& ip_key, uint64_t now) {
+bool IsIPBanned(const Core& core, const std::optional<app::AuthCredentialKey>& ip_key, uint64_t now) {
     return ip_key && core.CheckIPBan(*ip_key, now) == Reason::IP_BANNED;
 }
 
-AuthCredentialKey Key(uint64_t value) {
-    AuthCredentialKey key{};
+app::AuthCredentialKey Key(uint64_t value) {
+    app::AuthCredentialKey key{};
     for (size_t i = 0; i < sizeof(value); ++i, value >>= 8)
         key[i] = static_cast<uint8_t>(value);
     return key;
@@ -31,7 +31,7 @@ AuthCredentialKey Key(uint64_t value) {
 } // namespace
 
 TEST(BanTrackingContract, FixedWindowResetsAtBoundaryForBothRules) {
-    RateLimitConfig config;
+    app::RateLimitConfig config;
     config.ip_ban = {.enabled = true, .failure_limit = 10,
                      .window_seconds = 60, .ban_seconds = 180};
     Core limiter(config);
@@ -64,7 +64,7 @@ TEST(BanTrackingContract, FixedWindowResetsAtBoundaryForBothRules) {
 }
 
 TEST(BanTrackingContract, BannedFailuresNeverExtendExpiryOrAccumulate) {
-    RateLimitConfig config;
+    app::RateLimitConfig config;
     config.ip_ban = {.enabled = true, .failure_limit = 10,
                      .window_seconds = 60, .ban_seconds = 180};
     Core limiter(config);
@@ -89,7 +89,7 @@ TEST(BanTrackingContract, BannedFailuresNeverExtendExpiryOrAccumulate) {
 }
 
 TEST(BanTrackingContract, MonotonicSecondsDoNotWrapAtUint32Boundary) {
-    RateLimitConfig config;
+    app::RateLimitConfig config;
     config.ip_ban = {.enabled = true, .failure_limit = 10,
                      .window_seconds = 60, .ban_seconds = 180};
     Core limiter(config);
@@ -106,7 +106,7 @@ TEST(BanTrackingContract, MonotonicSecondsDoNotWrapAtUint32Boundary) {
 }
 
 TEST(BanTrackingContract, TagsCredentialsAndIPRulesAreIndependent) {
-    RateLimitConfig config;
+    app::RateLimitConfig config;
     config.ip_ban = {.enabled = true, .failure_limit = 2,
                      .window_seconds = 60, .ban_seconds = 180};
     Core limiter(config);
@@ -138,11 +138,11 @@ TEST(BanTrackingContract, TagsCredentialsAndIPRulesAreIndependent) {
 }
 
 TEST(BanTrackingContract, ExactCredentialKeysHaveIndependentFailureCounters) {
-    RateLimitConfig config;
+    app::RateLimitConfig config;
     config.ip_ban.enabled = false;
     Core limiter(config);
-    AuthCredentialKey first{};
-    AuthCredentialKey second{};
+    app::AuthCredentialKey first{};
+    app::AuthCredentialKey second{};
     second.back() = 1; // Identical prefixes are not sufficient to identify a key.
     for (unsigned i = 0; i < 9; ++i)
         limiter.OnAuthFailTracked(std::nullopt, first, 100);
@@ -156,11 +156,11 @@ TEST(BanTrackingContract, ExactCredentialKeysHaveIndependentFailureCounters) {
 
 TEST(BanTrackingContract, CredentialFingerprintUsesTagBinaryInputAndPrivateSalt) {
     net::io_context io, other_io;
-    auto coordinator = std::make_shared<GroupCoordinator>(io);
-    auto other_coordinator = std::make_shared<GroupCoordinator>(other_io);
-    const RateLimitConfig config;
-    auto limiter = ConnectionLimiter::Acquire(config, coordinator);
-    auto other_limiter = ConnectionLimiter::Acquire(config, other_coordinator);
+    auto coordinator = std::make_shared<app::GroupCoordinator>(io);
+    auto other_coordinator = std::make_shared<app::GroupCoordinator>(other_io);
+    const app::RateLimitConfig config;
+    auto limiter = app::ConnectionLimiter::Acquire(config, coordinator);
+    auto other_limiter = app::ConnectionLimiter::Acquire(config, other_coordinator);
     const std::array<uint8_t, 3> credential{'a', 0, 'b'};
     const auto key = limiter->FingerprintCredential(kTag, credential, 1);
 
@@ -192,7 +192,7 @@ TEST(BanTrackingContract, CredentialFingerprintUsesTagBinaryInputAndPrivateSalt)
 }
 
 TEST(BanTrackingContract, DisabledIPBanDoesNotAffectConnectionQuotas) {
-    RateLimitConfig config;
+    app::RateLimitConfig config;
     config.max_connections = 1;
     config.max_conn_per_ip = 1;
     config.ip_ban = {.enabled = false, .failure_limit = 1,
@@ -220,7 +220,7 @@ TEST(BanTrackingContract, DisabledIPBanDoesNotAffectConnectionQuotas) {
 }
 
 TEST(BanTrackingContract, ExplicitIPBanBypassStillEnforcesConnectionQuota) {
-    RateLimitConfig config;
+    app::RateLimitConfig config;
     config.max_conn_per_ip = 1;
     config.ip_ban = {.enabled = true, .failure_limit = 1,
                      .window_seconds = 60, .ban_seconds = 180};
@@ -237,10 +237,10 @@ TEST(BanTrackingContract, ExplicitIPBanBypassStillEnforcesConnectionQuota) {
 
 TEST(BanTrackingContract, DisabledIPOnlyOperationsSkipClosedMailbox) {
     net::io_context io;
-    auto coordinator = std::make_shared<GroupCoordinator>(io);
-    RateLimitConfig config;
+    auto coordinator = std::make_shared<app::GroupCoordinator>(io);
+    app::RateLimitConfig config;
     config.ip_ban.enabled = false;
-    auto limiter = ConnectionLimiter::Acquire(config, coordinator);
+    auto limiter = app::ConnectionLimiter::Acquire(config, coordinator);
     coordinator->CloseAdmission();
     bool completed = false;
     std::exception_ptr failure;
@@ -256,7 +256,7 @@ TEST(BanTrackingContract, DisabledIPOnlyOperationsSkipClosedMailbox) {
 }
 
 TEST(BanTrackingContract, ConnectionCapacityRejectsAndReclaimsReleasedSlots) {
-    RateLimitConfig config;
+    app::RateLimitConfig config;
     config.max_conn_per_ip = 1;
     config.ip_ban.enabled = false;
     Core limiter(config);
@@ -283,7 +283,7 @@ TEST(BanTrackingContract, ConnectionCapacityRejectsAndReclaimsReleasedSlots) {
 }
 
 TEST(BanTrackingContract, CredentialQueriesDoNotInsertAndSaturationFailsClosedUntilExpiry) {
-    RateLimitConfig config;
+    app::RateLimitConfig config;
     config.ip_ban.enabled = false;
     config.max_conn_per_ip = 1;
     Core limiter(config);
@@ -315,7 +315,7 @@ TEST(BanTrackingContract, CredentialQueriesDoNotInsertAndSaturationFailsClosedUn
 }
 
 TEST(BanTrackingContract, IPFailureCapacityIsIndependentAndExpiredSlotsAreReusable) {
-    RateLimitConfig config;
+    app::RateLimitConfig config;
     config.max_conn_per_ip = 1;
     config.ip_ban = {.enabled = true, .failure_limit = 1,
                      .window_seconds = 60, .ban_seconds = 180};
@@ -351,7 +351,7 @@ TEST(BanTrackingContract, IPFailureCapacityIsIndependentAndExpiredSlotsAreReusab
 }
 
 TEST(BanTrackingContract, ReconstructedLimiterStartsWithoutQuotasOrBans) {
-    RateLimitConfig config;
+    app::RateLimitConfig config;
     config.max_connections = 1;
     config.max_conn_per_ip = 1;
     config.ip_ban = {.enabled = true, .failure_limit = 1,

@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <limits>
 
+namespace app {
+
 std::chrono::milliseconds TokenBucket::Consume(size_t bytes, Clock::time_point now) noexcept {
     if (rate_ == 0 || bytes == 0) return std::chrono::milliseconds::zero();
     const int64_t now_ms = Millis(now);
@@ -77,13 +79,15 @@ std::chrono::milliseconds TokenBucket::DelayFrom(int64_t now) const noexcept {
         delay, std::numeric_limits<int64_t>::max()))};
 }
 
-namespace relay_detail {
+}  // namespace app
+
+namespace app::relay_detail {
 
 struct RelayRateLimits {
     TokenBucket up;
     TokenBucket down;
-    AsyncDelay up_wait;
-    AsyncDelay down_wait;
+    transport::internet::AsyncDelay up_wait;
+    transport::internet::AsyncDelay down_wait;
 
     RelayRateLimits(net::io_context& io, uint64_t rate)
         : up(rate), down(rate), up_wait(io), down_wait(io) {}
@@ -129,15 +133,15 @@ void RelayState::Mark(bool client_side) noexcept {
     }
 }
 
-void RelayState::Stop(ErrorCode error) noexcept {
-    if (reason == ErrorCode::OK || (reason == ErrorCode::CANCELLED && error != ErrorCode::CANCELLED))
+void RelayState::Stop(common::ErrorCode error) noexcept {
+    if (reason == common::ErrorCode::OK || (reason == common::ErrorCode::CANCELLED && error != common::ErrorCode::CANCELLED))
         reason = error;
     phase = RelayPhase::Stopping;
     wake.close();
 }
 
 void RelayState::Complete() noexcept {
-    if (reason != ErrorCode::OK) return;
+    if (reason != common::ErrorCode::OK) return;
     phase = RelayPhase::Completing;
     wake.close();
 }

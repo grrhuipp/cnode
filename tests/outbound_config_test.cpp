@@ -63,10 +63,10 @@ TEST(OutboundConfig, NestedSchemasDoNotFallbackToTopLevelCredentials) {
 }
 
 TEST(OutboundConfig, VmessUsesItsOwnSecurityNamesAndRetainsImplementedModes) {
-    struct Case { std::string_view spelling; vmess::Security security; };
+    struct Case { std::string_view spelling; proxy::vmess::Security security; };
     for (const auto& test : {
-        Case{"chacha20-poly1305", vmess::Security::CHACHA20_POLY1305},
-        Case{"none", vmess::Security::NONE}, Case{"zero", vmess::Security::ZERO}}) {
+        Case{"chacha20-poly1305", proxy::vmess::Security::CHACHA20_POLY1305},
+        Case{"none", proxy::vmess::Security::NONE}, Case{"zero", proxy::vmess::Security::ZERO}}) {
         const auto settings = std::get<infra::VmessSettings>(Parse("vmess",
             std::string(R"({"address":"example.com","id":"b831381d-6324-4d53-ad4f-8cda48b30811","security":")") +
             std::string(test.spelling) + R"("})"));

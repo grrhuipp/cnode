@@ -34,7 +34,7 @@ public:
     void ConsumeStream(int64_t stream_id, size_t bytes) noexcept;
     void ShutdownStreamWrite(int64_t stream_id) noexcept;
     void CancelStream(int64_t stream_id) noexcept;
-    [[nodiscard]] bool SendUdpMessage(uint32_t session_id, const TargetAddress& target,
+    [[nodiscard]] bool SendUdpMessage(uint32_t session_id, const common::TargetAddress& target,
                                       std::span<const uint8_t> payload);
     void CloseUdpSession(uint32_t session_id) noexcept;
 private:
@@ -84,7 +84,7 @@ private:
         memory::UnorderedMap<uint32_t, UdpSessionStream*> udp_sessions;
     };
     struct PendingFragments {
-        TargetAddress target;
+        common::TargetAddress target;
         memory::Vector<memory::ByteVector> payloads;
         std::array<uint8_t, 256> payload_slots{};
         std::bitset<256> received_fragments;
@@ -123,7 +123,7 @@ private:
     void OnHttpHeader(int64_t stream_id, int32_t token, nghttp3_rcbuf* name, nghttp3_rcbuf* value);
     void HandleUdpMessage(const UdpMessage& message);
     void ExpireUdpFragments(ngtcp2_tstamp now) noexcept;
-    void DeliverUdpPacket(uint32_t session_id, const TargetAddress& target,
+    void DeliverUdpPacket(uint32_t session_id, const common::TargetAddress& target,
                           std::span<const uint8_t> payload);
     static int ReceiveStreamData(ngtcp2_conn*, uint32_t flags, int64_t stream_id,
         uint64_t, const uint8_t* data, size_t length, void* user_data, void*) {
@@ -162,13 +162,13 @@ private:
         ngtcp2_path_validation_result, void*);
     HysteriaIngress* listener_;
     memory::Vector<ConnectionId> connection_ids_;
-    AwaitableTaskGroup* tasks_ = nullptr;
-    SignalChannel closed_signal_;
+    common::AwaitableTaskGroup* tasks_ = nullptr;
+    common::SignalChannel closed_signal_;
     std::optional<Core> core_;
     session::Context base_context_;
-    SignalChannel physical_ready_;
-    ConnectionLimiter::Reservation physical_reservation_;
-    std::optional<UserOnlineSessionGuard> online_session_;
+    common::SignalChannel physical_ready_;
+    app::ConnectionLimiter::Reservation physical_reservation_;
+    std::optional<common::UserOnlineSessionGuard> online_session_;
     std::shared_ptr<InboundTransportStreamHandler> stream_sink_;
     memory::UnorderedMap<uint64_t, PendingFragments> fragments_;
     ngtcp2_tstamp fragment_expiry_ = std::numeric_limits<ngtcp2_tstamp>::max();

@@ -12,10 +12,12 @@
 #include <thread>
 #include <utility>
 
+namespace transport::internet {
+
 namespace {
 
 uint64_t IpKeyHash(std::string_view ip) noexcept {
-    return Mix64(Fnv1a64(ip));
+    return common::Mix64(common::Fnv1a64(ip));
 }
 
 uint64_t UserKeyHash(
@@ -26,12 +28,12 @@ uint64_t UserKeyHash(
     if (user_id <= 0 && user_email.empty()) {
         return IpKeyHash(fallback_ip);
     }
-    uint64_t value = Fnv1a64Step(Fnv1a64(inbound_tag), 0xff);
+    uint64_t value = common::Fnv1a64Step(common::Fnv1a64(inbound_tag), 0xff);
     const uint64_t uid = user_id > 0 ? static_cast<uint64_t>(user_id) : 0;
     for (unsigned shift = 0; shift < 64; shift += 8) {
-        value = Fnv1a64Step(value, static_cast<uint8_t>(uid >> shift));
+        value = common::Fnv1a64Step(value, static_cast<uint8_t>(uid >> shift));
     }
-    return Mix64(Fnv1a64(user_email, Fnv1a64Step(value, 0xff)));
+    return common::Mix64(common::Fnv1a64(user_email, common::Fnv1a64Step(value, 0xff)));
 }
 
 uint64_t RandomIndex() noexcept {
@@ -80,7 +82,7 @@ std::optional<net::ip::address> OutboundBind::BindAddressFor(
 std::optional<OutboundBind> OutboundBind::Parse(std::string_view value) {
     OutboundBind bind;
     if (value.empty()) return bind;
-    if (EqualsAsciiCI(value, constants::binding::kAuto)) return Auto();
+    if (common::EqualsAsciiCI(value, constants::binding::kAuto)) return Auto();
 
     auto address = iputil::ParseLiteral(value);
     if (!address) return std::nullopt;
@@ -143,7 +145,7 @@ OutboundBind::Selection OutboundBind::Select(
         const auto v6 = entry.network_or_ip.to_v6();
         auto bytes = v6.to_bytes();
         const uint64_t high = key;
-        const uint64_t low = policy_ == ChoicePolicy::Random ? RandomIndex() : Mix64(key);
+        const uint64_t low = policy_ == ChoicePolicy::Random ? RandomIndex() : common::Mix64(key);
         for (size_t i = 0; i < bytes.size(); ++i) {
             const unsigned bits = entry.prefix_length > i * 8
                 ? std::min<unsigned>(8, entry.prefix_length - static_cast<unsigned>(i * 8))
@@ -158,3 +160,5 @@ OutboundBind::Selection OutboundBind::Select(
     }
     return {};
 }
+
+}  // namespace transport::internet

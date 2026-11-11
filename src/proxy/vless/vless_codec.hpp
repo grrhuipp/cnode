@@ -25,12 +25,12 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-namespace vless {
+namespace proxy::vless {
 
 // Parses a UUID string, or maps a 1-30 byte VLESS custom id to UUIDv5.
 [[nodiscard]] inline std::optional<std::array<uint8_t, 16>>
 ParseUuidBytes(std::string_view uuid) noexcept {
-    if (auto parsed = ::ParseUuid(uuid)) {
+    if (auto parsed = ::common::ParseUuid(uuid)) {
         return parsed;
     }
     if (!uuid.empty() && uuid.size() <= 30) {
@@ -50,14 +50,14 @@ ParseUuidBytes(std::string_view uuid) noexcept {
 }
 
 [[nodiscard]] inline std::string NormalizeFlow(std::string_view flow) {
-    return LowerAscii(std::string(flow));
+    return common::LowerAscii(std::string(flow));
 }
 
 inline constexpr uint8_t kVersion = 0x00;
 
 // Version, UUID, addons length, 255 addon bytes, command and the largest
 // port-first address (port, type, length, 253-byte domain).
-inline constexpr size_t kMaxRequestHeaderSize = 1 + 16 + 1 + 255 + 1 + kMaxEncodedAddressSize;
+inline constexpr size_t kMaxRequestHeaderSize = 1 + 16 + 1 + 255 + 1 + common::kMaxEncodedAddressSize;
 
 // The server never sends response addons.
 inline constexpr std::array<uint8_t, 2> kResponseHeader{kVersion, 0};
@@ -72,8 +72,8 @@ struct RequestHeader {
     std::array<uint8_t, 16> uuid{};
     memory::String flow;
     Command command = Command::TCP;
-    TargetAddress target;
-    std::optional<ForwardedMetadata> forwarded;
+    common::TargetAddress target;
+    std::optional<common::ForwardedMetadata> forwarded;
 };
 
 enum class RequestHeaderDecodeStatus : uint8_t {
@@ -102,20 +102,20 @@ struct RequestHeaderDecodeResult {
 [[nodiscard]] size_t EncodeRequestHeaderTo(
     const std::array<uint8_t, 16>& uuid,
     Command command,
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     uint8_t* output,
     size_t output_size,
     std::string_view flow = {},
-    ForwardedMetadataView forwarded = {});
+    common::ForwardedMetadataView forwarded = {});
 
 
 inline constexpr std::string_view kPacketAddrMagicAddress =
     "sp.packet-addr.v2fly.arpa";
 
-[[nodiscard]] bool IsPacketAddrMagic(const TargetAddress& target) noexcept;
+[[nodiscard]] bool IsPacketAddrMagic(const common::TargetAddress& target) noexcept;
 
 struct FramedUdpPacket {
-    std::optional<TargetAddress> target;
+    std::optional<common::TargetAddress> target;
     buf::MultiBuffer payload;
 };
 
@@ -136,7 +136,7 @@ public:
     // in this framer when `src` throws or is cancelled.
     net::awaitable<buf::MultiBuffer> ReadDatagram(
         transport::MultiBufferReader& src,
-        const TargetAddress& session_target);
+        const common::TargetAddress& session_target);
 
 private:
     bool packet_addr_ = false;
@@ -147,11 +147,11 @@ net::awaitable<void> WriteUdpDatagram(
     transport::MultiBufferWriter& writer,
     buf::MultiBuffer payload,
     bool packet_addr,
-    const TargetAddress* fixed_target = nullptr);
+    const common::TargetAddress* fixed_target = nullptr);
 
 net::awaitable<void> WriteUdpDatagram(
     transport::MultiBufferWriter& writer,
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     bool packet_addr,
     std::span<const net::const_buffer> payload);
 
@@ -161,11 +161,11 @@ class UdpStreamEndpoint final
 public:
     UdpStreamEndpoint(transport::MultiBufferReader& src,
                       transport::MultiBufferWriter& dst,
-                      const TargetAddress& target,
+                      const common::TargetAddress& target,
                       bool packet_addr)
         : src_(src)
         , dst_(dst)
-        , target_(packet_addr ? TargetAddress{} : target)
+        , target_(packet_addr ? common::TargetAddress{} : target)
         , framer_(packet_addr)
         , packet_addr_(packet_addr) {}
 
@@ -205,7 +205,7 @@ public:
 private:
     transport::MultiBufferReader& src_;
     transport::MultiBufferWriter& dst_;
-    TargetAddress target_;
+    common::TargetAddress target_;
     UdpFramer framer_;
     bool packet_addr_ = false;
 };
@@ -299,4 +299,4 @@ private:
     bool send_uuid_ = true;
     VisionTrafficState& traffic_;
 };
-}  // namespace vless
+}  // namespace proxy::vless

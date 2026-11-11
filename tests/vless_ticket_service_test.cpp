@@ -9,9 +9,9 @@
 #include <thread>
 
 namespace {
-using namespace ::vless;
+using namespace ::proxy::vless;
 using Ticket = std::array<uint8_t, 16>;
-net::awaitable<bool> Seed(GroupCoordinator& coordinator,
+net::awaitable<bool> Seed(app::GroupCoordinator& coordinator,
                          std::shared_ptr<const VlessEncryptionConfig> config,
                          Ticket ticket, Ticket identity, bool expired = false) {
     VlessEncryptionIssuedTicket issued;
@@ -29,7 +29,7 @@ protected:
     net::executor_work_guard<net::io_context::executor_type> work0{io0.get_executor()};
     net::executor_work_guard<net::io_context::executor_type> work1{io1.get_executor()};
     net::executor_work_guard<net::io_context::executor_type> workc{control.get_executor()};
-    std::shared_ptr<GroupCoordinator> coordinator;
+    std::shared_ptr<app::GroupCoordinator> coordinator;
     std::thread worker0, worker1, manager;
     std::shared_ptr<const VlessEncryptionConfig> config = std::make_shared<const VlessEncryptionConfig>();
     Ticket ticket{}, identity{};
@@ -38,7 +38,7 @@ protected:
     void SetUp() override {
         identity[0] = 7;
         nfs.bytes[0] = 31;
-        coordinator = std::make_shared<GroupCoordinator>(control, 1);
+        coordinator = std::make_shared<app::GroupCoordinator>(control, 1);
         coordinator->RegisterWorker(io0);
         coordinator->RegisterWorker(io1);
         worker0 = std::thread([this] { io0.run(); });
@@ -46,7 +46,7 @@ protected:
         manager = std::thread([this] { control.run(); });
     }
     void TearDown() override {
-        auto stop = [](std::shared_ptr<GroupCoordinator> owner) -> net::awaitable<void> {
+        auto stop = [](std::shared_ptr<app::GroupCoordinator> owner) -> net::awaitable<void> {
             owner->CloseAdmission();
             co_await owner->AsyncJoin();
             owner->ReleaseServices();
@@ -110,7 +110,7 @@ TEST_F(VlessTicketService, FullMailboxRejectsWithoutWaitingForHeldCall) {
     entered_future.get();
     auto overflow = net::co_spawn(io0,
         LookupVlessTicket(*coordinator, config, "ticket-in", ticket, nfs), net::use_future);
-    EXPECT_THROW((void)overflow.get(), WorkerMailboxFull);
+    EXPECT_THROW((void)overflow.get(), app::WorkerMailboxFull);
     release.set_value();
     guard.active = false;
     EXPECT_TRUE(holder.get());

@@ -43,7 +43,7 @@ void ApplyHttpRealIp(
 
 void ApplyProxyProtocolResult(
     session::Context& ctx,
-    const ProxyProtocolResult& result) {
+    const transport::internet::ProxyProtocolResult& result) {
     if (!result.success() || !result.src_addr) {
         return;
     }
@@ -65,7 +65,7 @@ void ApplyProxyProtocolResult(
 // 物理连接与逻辑子流共用的协议处理收尾：Process 自身已分类上报结果，
 // 这里只把逃逸的异常收敛为一次错误统计，非预期异常额外记录。
 // 只能在 catch 块内调用。
-void CountEscapedInboundFailure(const session::Context& ctx, StatsShard& stats) {
+void CountEscapedInboundFailure(const session::Context& ctx, app::StatsShard& stats) {
     try {
         throw;
     } catch (const transport::LinkError&) {
@@ -83,7 +83,7 @@ void CountEscapedInboundFailure(const session::Context& ctx, StatsShard& stats) 
 }  // namespace
 
 class Handler::LogicalTransportStreamSink final
-    : public InboundTransportStreamHandler {
+    : public transport::internet::InboundTransportStreamHandler {
 public:
     // HTTP/2-family transports authenticate per stream in the protocol, so
     // their children start anonymous; a transport that authenticated the
@@ -91,12 +91,12 @@ public:
     LogicalTransportStreamSink(std::shared_ptr<Handler> handler,
                                net::io_context& io_context,
                                routing::Dispatcher& dispatcher,
-                               StatsShard& stats,
+                               app::StatsShard& stats,
                                app::RequestLoadState& request_load,
-                               const TimeoutsConfig& timeouts,
+                               const infra::TimeoutsConfig& timeouts,
                                const session::Context& base_ctx,
                                bool authenticated,
-                               std::shared_ptr<ConnectionLimiter::Family> family)
+                               std::shared_ptr<app::ConnectionLimiter::Family> family)
         : handler_(std::move(handler))
         , io_context_(io_context)
         , dispatcher_(dispatcher)
@@ -113,15 +113,15 @@ public:
             base_ctx_.inbound.user_email.clear();
         }
     }
-    void OnInboundTransportReady(AsyncStream& stream) override {
+    void OnInboundTransportReady(transport::AsyncStream& stream) override {
         if (stream.ConsumePhaseDeadline()) {
-            throw transport::LinkError(ErrorCode::TIMEOUT);
+            throw transport::LinkError(common::ErrorCode::TIMEOUT);
         }
         stream.ClearPhaseDeadline();
         stream.SetIdleTimeout(timeouts_.IdleTimeout());
     }
 
-    void OnInboundTransportRequest(AsyncStream& stream) override {
+    void OnInboundTransportRequest(transport::AsyncStream& stream) override {
         stream.SetIdleTimeout(timeouts_.HandshakeTimeout());
         (void)stream.StartPhaseDeadline(timeouts_.HandshakeTimeout());
     }
@@ -135,8 +135,8 @@ public:
     }
 
     net::awaitable<void> OnInboundTransportStream(
-        std::unique_ptr<AsyncStream> stream,
-        InboundTransportMetadata metadata) override {
+        std::unique_ptr<transport::AsyncStream> stream,
+        transport::internet::InboundTransportMetadata metadata) override {
         if (!stream) {
             co_return;
         }
@@ -145,7 +145,7 @@ public:
         ApplyHttpRealIp(ctx, metadata.real_ip);
         // 传输层已识别的原生 UDP 会话（Hysteria）在入站处理前即确定网络与首个目标。
         if (metadata.udp_session_target) {
-            ctx.content.network = Network::UDP;
+            ctx.content.network = common::Network::UDP;
             ctx.outbound.target = std::move(*metadata.udp_session_target);
         }
 
@@ -159,10 +159,10 @@ public:
         (void)stream->StartPhaseDeadline(timeouts_.HandshakeTimeout());
 
         LOG_CONN_DEBUG(ctx, "logical transport stream ready security={} network={}",
-                       SecurityModeName(listener.stream_settings.security_mode),
+                       transport::internet::SecurityModeName(listener.stream_settings.security_mode),
                        listener.stream_settings.NetworkName());
 
-        Inbound& proxy = handler.Proxy();
+        proxy::Inbound& proxy = handler.Proxy();
         try {
             (void)co_await proxy.Process(
                 std::move(stream), dispatcher_, listener, io_context_, ctx, timeouts_,
@@ -176,31 +176,31 @@ private:
     std::shared_ptr<Handler> handler_;
     net::io_context& io_context_;
     routing::Dispatcher& dispatcher_;
-    StatsShard& stats_;
+    app::StatsShard& stats_;
     app::RequestLoadState& request_load_;
-    TimeoutsConfig timeouts_;
+    infra::TimeoutsConfig timeouts_;
     session::Context base_ctx_;
 };
 
-Handler::Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy,
+Handler::Handler(inbound::ReceiverSettings receiver, std::unique_ptr<proxy::Inbound> proxy,
                  const AdmissionEnvironment& environment)
     : receiver_(std::move(receiver))
-    , security_(receiver_.stream_settings, StreamEndpointRole::Inbound)
+    , security_(receiver_.stream_settings, transport::internet::StreamEndpointRole::Inbound)
     , proxy_(std::move(proxy))
     , environment_(environment) {}
 
-Inbound& Handler::Proxy() {
+proxy::Inbound& Handler::Proxy() {
     if (!proxy_) throw std::logic_error("inbound handler has no protocol");
     return *proxy_;
 }
-std::shared_ptr<InboundTransportStreamHandler> Handler::NewAuthenticatedStreamSink(
+std::shared_ptr<transport::internet::InboundTransportStreamHandler> Handler::NewAuthenticatedStreamSink(
     net::io_context& io_context,
     routing::Dispatcher& dispatcher,
-    StatsShard& stats,
+    app::StatsShard& stats,
     app::RequestLoadState& request_load,
-    const TimeoutsConfig& timeouts,
+    const infra::TimeoutsConfig& timeouts,
     const session::Context& session_ctx,
-    std::shared_ptr<ConnectionLimiter::Family> family) {
+    std::shared_ptr<app::ConnectionLimiter::Family> family) {
     return std::make_shared<LogicalTransportStreamSink>(
         shared_from_this(), io_context, dispatcher, stats, request_load, timeouts,
         session_ctx, true, std::move(family));
@@ -209,14 +209,14 @@ std::shared_ptr<InboundTransportStreamHandler> Handler::NewAuthenticatedStreamSi
 net::awaitable<void> Handler::ProcessAcceptedTCP(
     net::io_context& io_context,
     routing::Dispatcher& dispatcher,
-    StatsShard& stats,
+    app::StatsShard& stats,
     app::RequestLoadState& request_load,
-    const TimeoutsConfig& timeouts,
-    std::unique_ptr<AsyncStream> raw_conn,
+    const infra::TimeoutsConfig& timeouts,
+    std::unique_ptr<transport::AsyncStream> raw_conn,
     session::Context& ctx,
     app::dns::DNS* dns_service) {
     const inbound::ReceiverSettings& listener = receiver_;
-    ConnectionStatsScope connection_stats(stats);
+    app::ConnectionStatsScope connection_stats(stats);
 
     ctx.inbound.accounting_key.assign(listener.accounting_key);
 
@@ -225,20 +225,20 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         co_return;
     }
 
-    if (listener.proxy_protocol != ProxyProtocolMode::Off) {
-        auto proxy_read = co_await ReadInboundProxyProtocol(
+    if (listener.proxy_protocol != transport::internet::ProxyProtocolMode::Off) {
+        auto proxy_read = co_await transport::internet::ReadInboundProxyProtocol(
             *raw_conn,
             timeouts.HandshakeTimeout());
         if (!proxy_read.ok()) {
             switch (proxy_read.status) {
-                case ProxyProtocolReadStatus::TimedOut:
+                case transport::internet::ProxyProtocolReadStatus::TimedOut:
                     LOG_CONN_WARN(
                         ctx,
                         "failed to read PROXY protocol client={} > i/o timeout",
                         ctx.inbound.source_ip);
                     break;
-                case ProxyProtocolReadStatus::Truncated:
-                    if (proxy_read.result.status == ProxyProtocolParseStatus::NotProxy) {
+                case transport::internet::ProxyProtocolReadStatus::Truncated:
+                    if (proxy_read.result.status == transport::internet::ProxyProtocolParseStatus::NotProxy) {
                         LOG_CONN_DEBUG(ctx, "connection ended before PROXY protocol header from {}:{}",
                                        ctx.inbound.source_ip, ctx.inbound.source_port);
                     } else {
@@ -246,16 +246,16 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
                                       ctx.inbound.source_ip, ctx.inbound.source_port);
                     }
                     break;
-                case ProxyProtocolReadStatus::TooLarge:
+                case transport::internet::ProxyProtocolReadStatus::TooLarge:
                     LOG_CONN_WARN(
                         ctx,
                         "failed to read PROXY protocol > header too large limit={}B",
-                        kProxyHeaderMaxBytes);
+                        transport::internet::kProxyHeaderMaxBytes);
                     break;
-                case ProxyProtocolReadStatus::Invalid:
+                case transport::internet::ProxyProtocolReadStatus::Invalid:
                     LOG_CONN_WARN(ctx, "failed to read PROXY protocol > invalid header");
                     break;
-                case ProxyProtocolReadStatus::Ok:
+                case transport::internet::ProxyProtocolReadStatus::Ok:
                     break;
             }
             stats.OnError();
@@ -263,7 +263,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
             co_return;
         }
 
-        if (listener.proxy_protocol == ProxyProtocolMode::On &&
+        if (listener.proxy_protocol == transport::internet::ProxyProtocolMode::On &&
             !proxy_read.result.success()) {
             LOG_CONN_WARN(
                 ctx,
@@ -277,12 +277,12 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         ApplyProxyProtocolResult(ctx, proxy_read.result);
     }
 
-    ConnectionLimiter::Admission physical_admission;
-    if (auto pending = proxy::ReserveInboundConnection(environment_, ConnectionLimiter::ReservationScope::Physical, ctx)) {
+    app::ConnectionLimiter::Admission physical_admission;
+    if (auto pending = proxy::ReserveInboundConnection(environment_, app::ConnectionLimiter::ReservationScope::Physical, ctx)) {
         physical_admission = co_await std::move(*pending);
     }
     auto reject = physical_admission.reason;
-    if (reject != ConnectionLimiter::RejectReason::NONE) {
+    if (reject != app::ConnectionLimiter::RejectReason::NONE) {
         proxy::RejectInboundAdmission(ctx, stats, reject);
         co_return;
     }
@@ -293,10 +293,10 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     (void)raw_conn->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
     LOG_CONN_DEBUG(ctx, "building transport security={} network={}",
-                   SecurityModeName(listener.stream_settings.security_mode),
+                   transport::internet::SecurityModeName(listener.stream_settings.security_mode),
                    listener.stream_settings.NetworkName());
 
-    InboundTransportMetadata local_metadata;
+    transport::internet::InboundTransportMetadata local_metadata;
     std::shared_ptr<LogicalTransportStreamSink> logical_stream_handler;
     if (listener.stream_settings.IsGrpc() ||
         listener.stream_settings.IsHttp() ||
@@ -314,9 +314,9 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     }
     // The physical reservation above stays held while a REALITY fallback runs
     // inside the transport build.
-    const InboundFallbackContext fallback{
+    const transport::internet::InboundFallbackContext fallback{
         .ctx = ctx, .stats = stats, .timeouts = timeouts, .dns_service = dns_service};
-    auto build_result = co_await BuildInboundTransport(
+    auto build_result = co_await transport::internet::BuildInboundTransport(
         environment_.coordinator,
         io_context,
         std::move(raw_conn),
@@ -328,7 +328,7 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
         &fallback);
     if (!build_result) {
         LOG_CONN_DEBUG(ctx, "transport handshake failed security={} network={}",
-                       SecurityModeName(listener.stream_settings.security_mode),
+                       transport::internet::SecurityModeName(listener.stream_settings.security_mode),
                        listener.stream_settings.NetworkName());
         stats.OnError();
         co_return;
@@ -336,29 +336,29 @@ net::awaitable<void> Handler::ProcessAcceptedTCP(
     auto stream = std::move(*build_result);
     if (!stream) {
         LOG_CONN_DEBUG(ctx, "transport consumed connection security={} network={}",
-                       SecurityModeName(listener.stream_settings.security_mode),
+                       transport::internet::SecurityModeName(listener.stream_settings.security_mode),
                        listener.stream_settings.NetworkName());
         co_return;
     }
 
     ApplyHttpRealIp(ctx, local_metadata.real_ip);
     local_metadata = {};
-    ConnectionLimiter::Admission ip_admission;
-    if (auto pending = proxy::ReserveInboundConnection(environment_, ConnectionLimiter::ReservationScope::ClientIp, ctx)) {
+    app::ConnectionLimiter::Admission ip_admission;
+    if (auto pending = proxy::ReserveInboundConnection(environment_, app::ConnectionLimiter::ReservationScope::ClientIp, ctx)) {
         ip_admission = co_await std::move(*pending);
     }
     reject = ip_admission.reason;
-    if (reject != ConnectionLimiter::RejectReason::NONE) {
+    if (reject != app::ConnectionLimiter::RejectReason::NONE) {
         proxy::RejectInboundAdmission(ctx, stats, reject);
         co_return;
     }
     auto ip_limit = std::move(ip_admission.reservation);
 
     LOG_CONN_DEBUG(ctx, "transport ready security={} network={}",
-                   SecurityModeName(listener.stream_settings.security_mode),
+                   transport::internet::SecurityModeName(listener.stream_settings.security_mode),
                    listener.stream_settings.NetworkName());
 
-    Inbound& proxy = Proxy();
+    proxy::Inbound& proxy = Proxy();
     try {
         (void)co_await proxy.Process(
             std::move(stream), dispatcher, listener, io_context, ctx, timeouts,
@@ -451,7 +451,7 @@ std::unique_ptr<transport::internet::QuicListener> NewQuicListener(
 std::optional<BuildRequest> PrepareBuildRequest(
     std::string_view protocol,
     std::string_view tag,
-    const ::InboundProtocolSettings& settings) {
+    const ::infra::InboundProtocolSettings& settings) {
     const auto* registration = FindRegistration(protocol);
     if (!registration) {
         return std::nullopt;
@@ -474,7 +474,7 @@ std::optional<BuildRequest> PrepareBuildRequest(
 
 std::optional<UserSet> BuildUsers(
     const BuildRequest& req,
-    std::span<const ::InboundUserSpec> users) {
+    std::span<const ::infra::InboundUserSpec> users) {
     const auto* registration = FindRegistration(req.protocol);
     if (!registration || !registration->build_users) {
         return std::nullopt;
@@ -500,7 +500,7 @@ HandlerRegistry::HandlerPtr HandlerRegistry::GetHandler(std::string_view tag) no
     return it == handlers_.end() ? nullptr : it->second;
 }
 
-std::unique_ptr<::Inbound> HandlerRegistry::NewHandler(
+std::unique_ptr<::proxy::Inbound> HandlerRegistry::NewHandler(
     const BuildRequest& req) {
     const auto* registration = FindRegistration(req.protocol);
     if (!registration) return nullptr;
@@ -550,7 +550,7 @@ void HandlerRegistry::RemoveHandler(std::string_view tag) {
     handlers_.erase(it);
 }
 
-std::vector<::OnlineDevice>
+std::vector<::common::OnlineDevice>
 HandlerRegistry::GetOnlineDevices(std::string_view tag) const {
     return environment_.online_users.GetOnlineDevices(tag);
 }

@@ -12,7 +12,7 @@ class TransportCoordinatorFixture {
 public:
     explicit TransportCoordinatorFixture(net::io_context& worker)
         : guard_(net::make_work_guard(control_)),
-          coordinator_(std::make_shared<GroupCoordinator>(control_)) {
+          coordinator_(std::make_shared<app::GroupCoordinator>(control_)) {
         coordinator_->RegisterWorker(worker);
         thread_ = std::thread([this] { control_.run(); });
     }
@@ -24,7 +24,7 @@ public:
         thread_.join();
         EXPECT_NO_THROW(joined.get());
     }
-    GroupCoordinator& Coordinator() noexcept { return *coordinator_; }
+    app::GroupCoordinator& Coordinator() noexcept { return *coordinator_; }
 private:
     net::io_context control_;
     net::awaitable<void> Shutdown() {
@@ -33,6 +33,6 @@ private:
         co_await coordinator_->Finalize();
     }
     net::executor_work_guard<net::io_context::executor_type> guard_;
-    std::shared_ptr<GroupCoordinator> coordinator_;
+    std::shared_ptr<app::GroupCoordinator> coordinator_;
     std::thread thread_;
 };

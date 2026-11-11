@@ -21,6 +21,8 @@
 // Each process or panel monitor has its own completion boundary. The factory owns its
 // context, and co_spawn retains this state until this loop's exit is reported.
 // Construction, Start, stop, join and completion belong to the main executor.
+namespace common {
+
 class MonitorLoop final : public std::enable_shared_from_this<MonitorLoop> {
 public:
     using Factory = std::function<net::awaitable<void>()>;
@@ -81,3 +83,5 @@ private:
     net::steady_timer completion_;
     bool stopping_ = false;
 };
+
+}  // namespace common

@@ -93,11 +93,11 @@ public:
         const auto front = pending_.FrontSpan();
         size_t bytes = 0;
         if (front.size() >= 2) {
-            bytes = LoadU16BE(front.data());
+            bytes = common::LoadU16BE(front.data());
         } else {
             std::array<uint8_t, 2> length{};
             (void)pending_.CopyPrefixTo(length);
-            bytes = LoadU16BE(length.data());
+            bytes = common::LoadU16BE(length.data());
         }
         if (pending_.byte_size() < bytes + 2) return PopResult::NeedMore;
         (void)pending_.DropPrefixBytes(2);

@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace vmess {
+namespace proxy::vmess {
 // 请求头 security 半字节的线上取值。
 
 enum class Security : uint8_t {
@@ -12,4 +12,4 @@ enum class Security : uint8_t {
     ZERO = 6,
 };
 
-}  // namespace vmess
+}  // namespace proxy::vmess

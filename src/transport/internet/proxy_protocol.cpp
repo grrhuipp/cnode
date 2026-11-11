@@ -11,6 +11,8 @@
 #include <string_view>
 
 
+namespace transport::internet {
+
 namespace {
 
 constexpr uint8_t kSignatureV2[12] = {
@@ -34,7 +36,7 @@ ProxyProtocolResult MakeInvalid() {
 }
 
 void LogProxySource(std::string_view version, const ProxyProtocolResult& result) {
-    if (!Log::ShouldLog(LogLevel::DEBUG)) return;
+    if (!infra::Log::ShouldLog(infra::LogLevel::DEBUG)) return;
     std::optional<iputil::AddressText> numeric;
     std::string_view source = "-";
     if (result.src_addr) {
@@ -171,7 +173,7 @@ ProxyProtocolResult ParseV2(const uint8_t* data, size_t len) {
         return MakeInvalid();
     }
 
-    const uint16_t extra_len = LoadU16BE(data + 14);
+    const uint16_t extra_len = common::LoadU16BE(data + 14);
     const size_t total = kHeaderSize + extra_len;
     if (total > kProxyHeaderMaxBytes) return MakeInvalid();
     if (len < total) return MakeIncomplete();
@@ -191,7 +193,7 @@ ProxyProtocolResult ParseV2(const uint8_t* data, size_t len) {
         if (extra_len < 12) return MakeInvalid();
         net::ip::address_v4::bytes_type bytes{addr[0], addr[1], addr[2], addr[3]};
         r.src_addr = iputil::NormalizeAddress(net::ip::address_v4(bytes));
-        r.src_port = LoadU16BE(addr + 8);
+        r.src_port = common::LoadU16BE(addr + 8);
 
     } else if (family == 0x02) {
         // IPv6：src(16) + dst(16) + src_port(2) + dst_port(2) = 36B
@@ -199,7 +201,7 @@ ProxyProtocolResult ParseV2(const uint8_t* data, size_t len) {
         net::ip::address_v6::bytes_type bytes{};
         std::copy_n(addr, bytes.size(), bytes.begin());
         r.src_addr = iputil::NormalizeAddress(net::ip::address_v6(bytes));
-        r.src_port = LoadU16BE(addr + 32);
+        r.src_port = common::LoadU16BE(addr + 32);
     }
     // UNSPEC and UNIX carry no network source: keep the real peer.
 
@@ -304,13 +306,13 @@ size_t EncodeProxyProtocolHeader(
         out[12] = 0x21;  // v2 + PROXY command
         if (src_addr.is_v4() && dst_addr.is_v4()) {
             out[13] = 0x11;  // AF_INET + STREAM
-            StoreU16BE(out.data() + 14, 12);
+            common::StoreU16BE(out.data() + 14, 12);
             const auto src_bytes = src_addr.to_v4().to_bytes();
             const auto dst_bytes = dst_addr.to_v4().to_bytes();
             std::memcpy(out.data() + 16, src_bytes.data(), 4);
             std::memcpy(out.data() + 20, dst_bytes.data(), 4);
-            StoreU16BE(out.data() + 24, src_port);
-            StoreU16BE(out.data() + 26, dst_port);
+            common::StoreU16BE(out.data() + 24, src_port);
+            common::StoreU16BE(out.data() + 26, dst_port);
             return 28;
         }
         const auto src_v6 = src_addr.is_v6()
@@ -320,16 +322,18 @@ size_t EncodeProxyProtocolHeader(
             ? dst_addr.to_v6()
             : net::ip::make_address_v6(net::ip::v4_mapped, dst_addr.to_v4());
         out[13] = 0x21;  // AF_INET6 + STREAM
-        StoreU16BE(out.data() + 14, 36);
+        common::StoreU16BE(out.data() + 14, 36);
         const auto src_bytes = src_v6.to_bytes();
         const auto dst_bytes = dst_v6.to_bytes();
         std::memcpy(out.data() + 16, src_bytes.data(), 16);
         std::memcpy(out.data() + 32, dst_bytes.data(), 16);
-        StoreU16BE(out.data() + 48, src_port);
-        StoreU16BE(out.data() + 50, dst_port);
+        common::StoreU16BE(out.data() + 48, src_port);
+        common::StoreU16BE(out.data() + 50, dst_port);
         return 52;
     }
 
     return 0;
 }
+
+}  // namespace transport::internet
 

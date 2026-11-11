@@ -8,6 +8,8 @@
 
 // Worker-local byte reservations. Initial credit is one second of traffic;
 // idle credit is capped at two seconds. Waiting cannot earn reserved bytes again.
+namespace app {
+
 class TokenBucket {
 public:
     using Clock = std::chrono::steady_clock;
@@ -38,3 +40,5 @@ private:
     uint64_t fraction_ = 0; // Thousandths of one byte, not yet spendable.
     int64_t last_ms_;      // Includes credit reserved in future waits.
 };
+
+}  // namespace app

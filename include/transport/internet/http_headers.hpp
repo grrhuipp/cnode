@@ -29,7 +29,7 @@ using HttpHeaders = std::unordered_map<std::string, std::string>;
 [[nodiscard]] inline const std::string* FindHttpHeader(
     const HttpHeaders& headers, std::string_view name) noexcept {
     for (const auto& [key, value] : headers) {
-        if (EqualsAsciiCI(key, name)) return &value;
+        if (common::EqualsAsciiCI(key, name)) return &value;
     }
     return nullptr;
 }
@@ -44,7 +44,7 @@ using HttpHeaders = std::unordered_map<std::string, std::string>;
             raw = *header_host;
         }
     }
-    const std::string_view trimmed = TrimAscii(raw);
+    const std::string_view trimmed = common::TrimAscii(raw);
     return trimmed.empty() ? fallback : trimmed;
 }
 
@@ -78,7 +78,7 @@ using HttpHeaders = std::unordered_map<std::string, std::string>;
     size_t pos = 0;
     size_t size = 0;
     while (pos < line.size()) {
-        const int digit = HexDigitValue(line[pos]);
+        const int digit = common::HexDigitValue(line[pos]);
         if (digit < 0) break;
         if (size > (std::numeric_limits<size_t>::max() -
                     static_cast<size_t>(digit)) / 16) return std::nullopt;

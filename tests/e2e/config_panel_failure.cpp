@@ -15,7 +15,7 @@ constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = RejectWhen
 TEST(RuntimeFailure, FatalInfrastructureReportingDoesNotAllocateOrUnwindLiveOwners) {
     ASSERT_EXIT({
         reject_allocations = true;
-        ::FailRuntime("udp-receive", "registered socket receive loop stopped");
+        ::common::FailRuntime("udp-receive", "registered socket receive loop stopped");
     }, testing::ExitedWithCode(1),
        "runtime failed phase=udp-receive error=registered socket receive loop stopped status=forced");
 }

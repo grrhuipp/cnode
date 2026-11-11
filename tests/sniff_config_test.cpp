@@ -4,7 +4,7 @@
 namespace {
 class ExcludedDomain : public testing::TestWithParam<const char*> {};
 TEST_P(ExcludedDomain, MatchesCaseInsensitivelyAndIgnoresRootDot) {
-    ::SniffConfig config;
+    ::routing::SniffConfig config;
     config.domains_excluded = {"Blocked.Example", "safe.example"};
     EXPECT_TRUE(config.IsDomainExcluded(GetParam()));
     EXPECT_FALSE(config.IsDomainExcluded("not-safe.example"));
@@ -14,7 +14,7 @@ INSTANTIATE_TEST_SUITE_P(Names, ExcludedDomain,
 }
 
 TEST(SniffConfig, OverridesOnlySupportedSelectedProtocols) {
-    ::SniffConfig config;
+    ::routing::SniffConfig config;
     config.dest_override = ::routing::SniffedProtocolBit("quic");
     EXPECT_TRUE(config.MatchesDestOverride("quic"));
     EXPECT_FALSE(config.MatchesDestOverride("tls"));

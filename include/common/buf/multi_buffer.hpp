@@ -36,7 +36,7 @@ struct Buffer {
     // UDP 数据面：本 Buffer 数据对应的对端地址（Full Cone 逐包目标/来源），
     // 对齐 xray-core buf.Buffer.UDP 的 "buffer 携带 endpoint" 语义。上行=目标，
     // 回包=来源。TCP relay 路径通常不携带 endpoint，因此懒构造 TargetAddress。
-    std::optional<TargetAddress> udp_;
+    std::optional<common::TargetAddress> udp_;
 
     // 有效数据视图 [start, end)
     std::span<uint8_t> Bytes() noexcept {
@@ -80,18 +80,18 @@ struct Buffer {
     }
 
     // 设置/清除本 Buffer 的 UDP 对端地址。
-    void SetUDP(const TargetAddress& dest) {
+    void SetUDP(const common::TargetAddress& dest) {
         udp_ = dest;
     }
-    void SetUDP(TargetAddress&& dest) {
+    void SetUDP(common::TargetAddress&& dest) {
         udp_ = std::move(dest);
     }
     void ClearUDP() noexcept {
         udp_.reset();
     }
     [[nodiscard]] bool HasUDP() const noexcept { return udp_.has_value(); }
-    [[nodiscard]] TargetAddress& UDP() noexcept { return *udp_; }
-    [[nodiscard]] const TargetAddress& UDP() const noexcept { return *udp_; }
+    [[nodiscard]] common::TargetAddress& UDP() noexcept { return *udp_; }
+    [[nodiscard]] const common::TargetAddress& UDP() const noexcept { return *udp_; }
 
     // 默认初始化不清零 payload；分配失败保持非抛出入口的 nullptr 语义。
     [[nodiscard]] static Buffer* New() noexcept {
@@ -752,7 +752,7 @@ private:
 
 // A completed UDP message owns a buffer even when it carries no data. An empty
 // container remains EOF/no message; callers must not tag an uncompleted read.
-[[nodiscard]] inline bool SetUdpTarget(MultiBuffer& packet, const TargetAddress& target) {
+[[nodiscard]] inline bool SetUdpTarget(MultiBuffer& packet, const common::TargetAddress& target) {
     if (packet.empty()) {
         BufferGuard buffer{Buffer::New()};
         if (!buffer) return false;
@@ -778,7 +778,7 @@ enum class UdpDatagramStatus : uint8_t {
 // 只是同一报文的存储分块。返回的指针仅在 MultiBuffer 未修改期间有效。
 struct UdpDatagramInfo {
     UdpDatagramStatus status = UdpDatagramStatus::Empty;
-    const TargetAddress* target = nullptr;
+    const common::TargetAddress* target = nullptr;
     const Buffer* single_buffer = nullptr;
     size_t buffer_count = 0;
     size_t payload_size = 0;

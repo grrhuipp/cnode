@@ -92,8 +92,8 @@ struct FixtureState {
 
 struct DelayedRetirementResult {
     ProcessEntered process;
-    ::WorkerRuntimeStatsSnapshot held_stats;
-    ::WorkerRuntimeStatsSnapshot final_stats;
+    ::app::WorkerRuntimeStatsSnapshot held_stats;
+    ::app::WorkerRuntimeStatsSnapshot final_stats;
     unsigned response_created_before_release = 0;
     unsigned response_destroyed_before_release = 0;
     unsigned response_created_after_join = 0;
@@ -106,7 +106,7 @@ struct DelayedRetirementResult {
     bool post_drain_mutations_succeeded = false;
 };
 
-class TrackedResponse final : public ::InboundDatagramResponse {
+class TrackedResponse final : public ::proxy::InboundDatagramResponse {
 public:
     explicit TrackedResponse(FixtureState& state) : state_(state) {
         ++state_.created;
@@ -116,14 +116,14 @@ public:
             state_.wrong_destructor_thread = true;
         ++state_.destroyed;
     }
-    ::buf::MultiBuffer Encode(::UDPPacketView) override { return {}; }
+    ::buf::MultiBuffer Encode(::proxy::UDPPacketView) override { return {}; }
 private:
     FixtureState& state_;
 };
 
 struct Settings final : ::proxyman::inbound::ProtocolSettings {};
 
-class NativeDecoder final : public ::Inbound {
+class NativeDecoder final : public ::proxy::Inbound {
 public:
     NativeDecoder(FixtureState& state)
         : state_(state) {
@@ -136,20 +136,20 @@ public:
             state_.wrong_destructor_thread = true;
         ++state_.handlers_destroyed;
     }
-    ::net::awaitable<::RelayResult> Process(
-        std::unique_ptr<::AsyncStream>, ::routing::Dispatcher&,
+    ::net::awaitable<::app::RelayResult> Process(
+        std::unique_ptr<::transport::AsyncStream>, ::routing::Dispatcher&,
         const ::proxyman::inbound::ReceiverSettings&, ::net::io_context&,
-        ::session::Context&, const ::TimeoutsConfig&, uint32_t) override {
-        co_return ::RelayResult{};
+        ::session::Context&, const ::infra::TimeoutsConfig&, uint32_t) override {
+        co_return ::app::RelayResult{};
     }
-    tl::expected<::InboundDatagramResult, ::ErrorCode> Process(
-        const ::InboundDatagramRequest& request) override {
+    tl::expected<::proxy::InboundDatagramResult, ::common::ErrorCode> Process(
+        const ::proxy::InboundDatagramRequest& request) override {
         if (request.payload.size() != 1 || request.payload.front() != kMarker)
-            return tl::unexpected(::ErrorCode::PROTOCOL_AUTH_FAILED);
-        ::InboundDatagramResult decoded;
+            return tl::unexpected(::common::ErrorCode::PROTOCOL_AUTH_FAILED);
+        ::proxy::InboundDatagramResult decoded;
         decoded.target = state_.delayed_mode
-            ? ::TargetAddress(::net::ip::address_v4::loopback(), state_.target_port)
-            : ::TargetAddress(kDomain, state_.target_port);
+            ? ::common::TargetAddress(::net::ip::address_v4::loopback(), state_.target_port)
+            : ::common::TargetAddress(kDomain, state_.target_port);
         decoded.session_id = 0x444e532d73657373;
         const std::array<uint8_t, 8> owner{0x44, 0x4e, 0x53, 0x2d, 0x6f, 0x77, 0x6e, 0x72};
         if (!decoded.session_owner.Assign(owner)) throw std::bad_alloc();
@@ -162,17 +162,17 @@ public:
         decoded.payload.push_back(::buf::BufferGuard(first));
         return decoded;
     }
-    tl::expected<std::shared_ptr<::InboundDatagramResponse>, ::ErrorCode>
-    CreateDatagramResponse(const ::InboundDatagramResult&) override {
+    tl::expected<std::shared_ptr<::proxy::InboundDatagramResponse>, ::common::ErrorCode>
+    CreateDatagramResponse(const ::proxy::InboundDatagramResult&) override {
         return std::make_shared<TrackedResponse>(state_);
     }
 private:
     FixtureState& state_;
-    ::UserProfile profile_;
+    ::common::UserProfile profile_;
 };
 
 thread_local FixtureState* g_state = nullptr;
-std::unique_ptr<::Inbound> MakeHandler(
+std::unique_ptr<::proxy::Inbound> MakeHandler(
     const ::proxyman::inbound::AdmissionEnvironment&,
     const ::proxyman::inbound::BuildRequest&) {
     if (!g_state) throw std::logic_error("fixture state not installed on Worker thread");
@@ -201,15 +201,15 @@ private:
     }
 };
 
-class DelayedOutbound final : public ::Outbound {
+class DelayedOutbound final : public ::proxy::Outbound {
 public:
     DelayedOutbound(std::string tag, FixtureState& state)
         : tag_(std::move(tag)), state_(state) {}
 
-    ::net::awaitable<::OutboundProcessResult> Process(
+    ::net::awaitable<::proxy::OutboundProcessResult> Process(
         ::session::Context& ctx, ::transport::Link inbound,
-        ::OutboundDialer&, const ::TimeoutsConfig&, ::StatsShard&,
-        const ::RelayConfig&, ::buf::MultiBufferBatch first_payload) override {
+        ::transport::internet::OutboundDialer&, const ::infra::TimeoutsConfig&, ::app::StatsShard&,
+        const ::app::RelayConfig&, ::buf::MultiBufferBatch first_payload) override {
         if (!inbound.reader || !state_.cleanup_gate)
             throw std::logic_error("delayed outbound missing owner-local link/gate");
         std::array<uint8_t, 2> bytes{};
@@ -255,8 +255,8 @@ public:
         const auto cancellation = co_await ::net::this_coro::cancellation_state;
         if (state_.stop_observed ||
             cancellation.cancelled() != ::net::cancellation_type::none)
-            co_return tl::unexpected(::ErrorCode::CANCELLED);
-        co_return ::RelayResult{};
+            co_return tl::unexpected(::common::ErrorCode::CANCELLED);
+        co_return ::app::RelayResult{};
     }
 
 private:
@@ -280,7 +280,7 @@ private:
             +[](std::string_view requested_tag,
                 std::shared_ptr<const DelayedState> s,
                 ::net::io_context&,
-                ::AwaitableTaskGroup&) -> std::unique_ptr<::Outbound> {
+                ::common::AwaitableTaskGroup&) -> std::unique_ptr<::proxy::Outbound> {
                 if (requested_tag != s->prepared_tag)
                     throw std::logic_error("prepared delayed outbound tag mismatch");
                 return std::make_unique<DelayedOutbound>(std::string(requested_tag), *s->owner_state);
@@ -334,7 +334,7 @@ void SendLateDnsReply(::udp::socket& socket, DnsPacket& query) {
 }
 
 ::net::awaitable<void> WorkerJob(
-    ::net::io_context& io, ::Worker& worker, FixtureState& state,
+    ::net::io_context& io, ::app::Worker& worker, FixtureState& state,
     uint16_t inbound_port, uint16_t target_port, RuntimeMode mode,
     std::promise<std::future<ProcessEntered>>& entered_handoff,
     std::promise<void>& ready) {
@@ -372,10 +372,10 @@ void SendLateDnsReply(::udp::socket& socket, DnsPacket& query) {
         .dispatch_policy = {.sniffing = {.enabled = false, .domains_excluded = {}}, .outbound = ::routing::ForceOutbound{"native-test"}}};
     if (!worker.RegisterInbound(request, receiver))
         Fail("real native inbound registration failed");
-    const auto listen = ::InboundListen::Parse("127.0.0.1");
+    const auto listen = ::transport::internet::InboundListen::Parse("127.0.0.1");
     if (!listen) Fail("loopback inbound address could not be parsed");
     if (!co_await worker.AddUdpListenerTask(
-            ::PortBinding{.port = inbound_port, .protocol = std::string(kProtocol), .tag = std::string(kTag), .listen = *listen}, request))
+            ::app::PortBinding{.port = inbound_port, .protocol = std::string(kProtocol), .tag = std::string(kTag), .listen = *listen}, request))
         Fail("real native UDP listener failed to bind");
     state.shutdown_signal->expires_at(::net::steady_timer::time_point::max());
     ready.set_value();
@@ -447,7 +447,7 @@ struct UnregisterCompletion {
 };
 
 ::net::awaitable<DelayedRetirementResult> RunDelayedRetirementOwner(
-    ::Worker& worker) {
+    ::app::Worker& worker) {
     if (!g_state || !g_state->owner_io || !g_state->cleanup_gate)
         Fail("delayed fixture state is not initialized on Worker owner");
     FixtureState& state = *g_state;
@@ -562,14 +562,14 @@ struct UnregisterCompletion {
 }
 
 struct RetirementSnapshot {
-    ::WorkerRuntimeStatsSnapshot stats;
+    ::app::WorkerRuntimeStatsSnapshot stats;
     unsigned responses_created = 0;
     unsigned responses_destroyed = 0;
     bool wrong_destructor_thread = false;
 };
 
 ::net::awaitable<RetirementSnapshot> UnregisterAndSnapshot(
-    ::Worker& worker) {
+    ::app::Worker& worker) {
     co_await worker.UnregisterListenerTask(std::string(kTag));
     if (!g_state || !g_state->owner_io)
         Fail("Worker-local fixture state is unavailable during retirement");
@@ -605,7 +605,7 @@ void StopOwner() {
     g_state->shutdown_signal->cancel();
 }
 
-::net::awaitable<void> AbortWorkerTask(::Worker& worker) {
+::net::awaitable<void> AbortWorkerTask(::app::Worker& worker) {
     if (!g_state) Fail("Worker-local fixture state is unavailable during abort cleanup");
     FixtureState& state = *g_state;
     std::exception_ptr failure;
@@ -643,7 +643,7 @@ uint16_t BindUdp(::net::io_context& io, ::udp::socket& socket) {
 
 ::net::awaitable<void> RunControl(
     ::net::io_context& control_io, ::app::dns::DNSWorker& dns,
-    ::Worker& worker, ::udp::socket& dns_peer, DnsPacket& held_query,
+    ::app::Worker& worker, ::udp::socket& dns_peer, DnsPacket& held_query,
     uint16_t inbound_port, ::udp::socket& echo_observer, bool shutdown_worker) {
     // Send one valid datagram through the real listener; its owned first Link
     // payload enters DefaultDispatcher and the frozen Freedom outbound.
@@ -692,7 +692,7 @@ uint16_t BindUdp(::net::io_context& io, ::udp::socket& socket) {
 struct SharedWorker {
     // The Worker remains constructed, used and destroyed on the data thread.
     // Cross-thread callers only use its public bounded mailbox entrypoints.
-    ::Worker* worker = nullptr;
+    ::app::Worker* worker = nullptr;
     std::promise<std::future<ProcessEntered>> entered_handoff;
     std::future<std::future<ProcessEntered>> entered_handoff_future =
         entered_handoff.get_future();
@@ -744,16 +744,16 @@ TEST_P(WorkerUdpRetirementRuntime, Lifecycle) {
         const auto inbound_port = BindUdp(control_io, reservation);
         reservation.close();
 
-        ::WorkerRuntimeConfig runtime;
+        ::app::WorkerRuntimeConfig runtime;
         runtime.timeouts.idle = 0;
         runtime.timeouts.read = 0;
         SharedWorker shared;
         std::thread data_thread([&] {
             try {
                 ::net::io_context data_io;
-                ::StatsShard stats;
+                ::app::StatsShard stats;
                 FixtureState fixture;
-                auto worker = std::make_unique<::Worker>(
+                auto worker = std::make_unique<::app::Worker>(
                     1, data_io, runtime, stats, dns, coordinator.Get());
                 shared.worker = worker.get();
                 std::string runtime_error;

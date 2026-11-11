@@ -25,8 +25,8 @@ public:
     using InboundRule = memory::UnorderedMap<
         memory::String,
         RuleListPtr,
-        TransparentStringHash,
-        TransparentStringEq>;
+        common::TransparentStringHash,
+        common::TransparentStringEq>;
 
     DetectRulePolicy();
     ~DetectRulePolicy();

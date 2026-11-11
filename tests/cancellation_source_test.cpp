@@ -8,7 +8,6 @@
 
 
 constinit allocation_hook::Hooks allocation_hook::hooks{};
-using ::ErrorCode;
 using ::transport::CancellationSource;
 using ::transport::Cancellation;
 using ::transport::CancellationSubscription;
@@ -16,7 +15,7 @@ using ::transport::CancellationSubscription;
 namespace {
 struct Counter {
     int calls = 0;
-    ErrorCode reason = ErrorCode::OK;
+    common::ErrorCode reason = common::ErrorCode::OK;
     bool terminal = false;
     void Record(Cancellation cancellation) noexcept {
         ++calls;
@@ -45,14 +44,14 @@ TEST(CancellationSource, ScopedListenersUnsubscribeBeforeSourceDestruction) {
             RecordingListener second(removed);
             second.Resubscribe(source);
         }
-        source.CancelPending(ErrorCode::RESOURCE_EXHAUSTED);
+        source.CancelPending(common::ErrorCode::RESOURCE_EXHAUSTED);
         source.CancelPending();
         orphan.emplace(orphaned);
         orphan->Resubscribe(source);
     }
     orphan.reset();
     EXPECT_EQ(retained.calls, 1);
-    EXPECT_EQ(retained.reason, ErrorCode::RESOURCE_EXHAUSTED);
+    EXPECT_EQ(retained.reason, common::ErrorCode::RESOURCE_EXHAUSTED);
     EXPECT_EQ(removed.calls, 0);
     EXPECT_EQ(orphaned.calls, 0);
 }
@@ -74,7 +73,7 @@ TEST_P(CancellationMutation, AllowsListenerRemovalAdditionAndReentrantDelivery) 
                 mutation.self.reset();
                 mutation.added.emplace(mutation.fresh);
                 mutation.added->Resubscribe(mutation.source);
-                if (mutation.reentrant) mutation.source.CancelPending(ErrorCode::RELAY_TIMEOUT);
+                if (mutation.reentrant) mutation.source.CancelPending(common::ErrorCode::RELAY_TIMEOUT);
             }
         };
         CancellationSource& source;
@@ -89,14 +88,14 @@ TEST_P(CancellationMutation, AllowsListenerRemovalAdditionAndReentrantDelivery) 
     mutation.victim->Resubscribe(source);
     mutation.self.emplace(mutation);
     mutation.self->Resubscribe(source);
-    source.CancelPending(ErrorCode::RESOURCE_EXHAUSTED);
+    source.CancelPending(common::ErrorCode::RESOURCE_EXHAUSTED);
     EXPECT_EQ(mutator.calls, 1);
     EXPECT_EQ(victim.calls, 0);
     EXPECT_EQ(fresh.calls, reentrant ? 1 : 0);
-    source.CancelPending(ErrorCode::RELAY_TIMEOUT);
+    source.CancelPending(common::ErrorCode::RELAY_TIMEOUT);
     source.CancelPending();
     EXPECT_EQ(fresh.calls, 1);
-    EXPECT_EQ(fresh.reason, ErrorCode::RELAY_TIMEOUT);
+    EXPECT_EQ(fresh.reason, common::ErrorCode::RELAY_TIMEOUT);
 }
 
 INSTANTIATE_TEST_SUITE_P(Delivery, CancellationMutation, testing::Bool(),
@@ -125,17 +124,17 @@ TEST(CancellationSource, TerminalStopIsStickyForCurrentAndLateListeners) {
     RecordingListener first(current);
     first.Resubscribe(source);
     EXPECT_EQ(current.calls, 0);
-    source.Stop(ErrorCode::RESOURCE_EXHAUSTED);
+    source.Stop(common::ErrorCode::RESOURCE_EXHAUSTED);
     source.Stop();
     source.CancelPending();
     RecordingListener second(late);
     second.Resubscribe(source);
     EXPECT_EQ(current.calls, 1);
     EXPECT_TRUE(current.terminal);
-    EXPECT_EQ(current.reason, ErrorCode::RESOURCE_EXHAUSTED);
+    EXPECT_EQ(current.reason, common::ErrorCode::RESOURCE_EXHAUSTED);
     EXPECT_EQ(late.calls, 1);
     EXPECT_TRUE(late.terminal);
-    EXPECT_EQ(late.reason, ErrorCode::RESOURCE_EXHAUSTED);
+    EXPECT_EQ(late.reason, common::ErrorCode::RESOURCE_EXHAUSTED);
 }
 
 struct Forwarding final : CancellationSubscription {
@@ -161,7 +160,7 @@ class CancellationForwarding : public testing::TestWithParam<bool> {};
 TEST_P(CancellationForwarding, PropagatesPendingAndTerminalCancellation) {
     const bool stopped_before_construction = GetParam();
     CancellationSource upstream, downstream;
-    if (stopped_before_construction) upstream.Stop(ErrorCode::RESOURCE_EXHAUSTED);
+    if (stopped_before_construction) upstream.Stop(common::ErrorCode::RESOURCE_EXHAUSTED);
     Forwarding forward(upstream, downstream);
     if (!stopped_before_construction) {
         for (int i = 0; i < 4; ++i) {
@@ -173,14 +172,14 @@ TEST_P(CancellationForwarding, PropagatesPendingAndTerminalCancellation) {
             EXPECT_EQ(current.calls, 1);
             EXPECT_FALSE(current.terminal);
         }
-        upstream.Stop(ErrorCode::RESOURCE_EXHAUSTED);
+        upstream.Stop(common::ErrorCode::RESOURCE_EXHAUSTED);
     }
     Counter late;
     RecordingListener subscription(late);
     subscription.Resubscribe(downstream);
     EXPECT_EQ(late.calls, 1);
     EXPECT_TRUE(late.terminal);
-    EXPECT_EQ(late.reason, ErrorCode::RESOURCE_EXHAUSTED);
+    EXPECT_EQ(late.reason, common::ErrorCode::RESOURCE_EXHAUSTED);
 }
 
 INSTANTIATE_TEST_SUITE_P(UpstreamState, CancellationForwarding, testing::Bool(),
@@ -201,10 +200,10 @@ TEST(CancellationSource, UnsubscribeAndRebindLeaveOnlyCurrentSourceActive) {
     subscription.Resubscribe(second);
     first.Stop();
     EXPECT_EQ(counter.calls, 0);
-    second.CancelPending(ErrorCode::RELAY_TIMEOUT);
+    second.CancelPending(common::ErrorCode::RELAY_TIMEOUT);
     EXPECT_EQ(counter.calls, 1);
     EXPECT_FALSE(counter.terminal);
-    EXPECT_EQ(counter.reason, ErrorCode::RELAY_TIMEOUT);
+    EXPECT_EQ(counter.reason, common::ErrorCode::RELAY_TIMEOUT);
 }
 
 TEST(CancellationSource, SourceCanBeDestroyedDuringDelivery) {
@@ -223,11 +222,11 @@ TEST(CancellationSource, SourceCanBeDestroyedDuringDelivery) {
         }
     } destroy(source);
     destroy.Resubscribe(*source);
-    source->CancelPending(ErrorCode::RESOURCE_EXHAUSTED);
+    source->CancelPending(common::ErrorCode::RESOURCE_EXHAUSTED);
     EXPECT_TRUE(destroy.called);
     EXPECT_FALSE(source);
     EXPECT_EQ(delivered.calls, 1);
-    EXPECT_EQ(delivered.reason, ErrorCode::RESOURCE_EXHAUSTED);
+    EXPECT_EQ(delivered.reason, common::ErrorCode::RESOURCE_EXHAUSTED);
 }
 }  // namespace
 
@@ -245,7 +244,7 @@ TEST(CancellationBridge, MergesSignalsAndUnsubscribesAtScopeEnd) {
         parent.emit(net::cancellation_type::terminal);
         EXPECT_TRUE(bridge.Cancelled());
         EXPECT_EQ(deliveries, 2);
-        source.Stop(ErrorCode::TIMEOUT);
+        source.Stop(common::ErrorCode::TIMEOUT);
         EXPECT_EQ(deliveries, 3);
     }
     parent.emit(net::cancellation_type::all);
@@ -255,7 +254,7 @@ TEST(CancellationBridge, MergesSignalsAndUnsubscribesAtScopeEnd) {
 
 TEST(CancellationBridge, ObservesSourceStoppedBeforeConstruction) {
     CancellationSource source;
-    source.Stop(ErrorCode::TIMEOUT);
+    source.Stop(common::ErrorCode::TIMEOUT);
     transport::CancellationBridge stopped({}, source);
     EXPECT_TRUE(stopped.Cancelled());
 }

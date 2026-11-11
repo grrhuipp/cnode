@@ -29,27 +29,27 @@
 namespace {
 
 constexpr size_t kMaxTrojanHandshakeBytes =
-    ::trojan::kRequestPrefixSize + kMaxEncodedAddressSize + 2;
+    ::proxy::trojan::kRequestPrefixSize + common::kMaxEncodedAddressSize + 2;
 
 struct TrojanHandshakeResult {
     std::shared_ptr<const proxyman::inbound::UserStore::TrojanCredential> user;
-    ::trojan::TrojanCommand command = ::trojan::TrojanCommand::CONNECT;
-    TargetAddress target;
-    std::optional<ForwardedMetadata> forwarded;
+    ::proxy::trojan::TrojanCommand command = ::proxy::trojan::TrojanCommand::CONNECT;
+    common::TargetAddress target;
+    std::optional<common::ForwardedMetadata> forwarded;
 };
 
-net::awaitable<tl::expected<TrojanHandshakeResult, ErrorCode>>
-ParseTrojanRequest(AsyncStream& stream,
+net::awaitable<tl::expected<TrojanHandshakeResult, common::ErrorCode>>
+ParseTrojanRequest(transport::AsyncStream& stream,
                    session::Context& ctx,
                    proxy::InboundAuthentication& authentication) {
     std::array<uint8_t, kMaxTrojanHandshakeBytes> handshake_buf{};
     size_t total_read = 0;
-    size_t required = ::trojan::kRequestPrefixSize;
-    ::trojan::RequestDecodeResult decoded;
-    ScopedCleanse cleanse_handshake{handshake_buf, decoded.request.password_hash};
+    size_t required = ::proxy::trojan::kRequestPrefixSize;
+    ::proxy::trojan::RequestDecodeResult decoded;
+    common::ScopedCleanse cleanse_handshake{handshake_buf, decoded.request.password_hash};
     while (true) {
         if (required > kMaxTrojanHandshakeBytes) {
-            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         if (total_read < required) {
             const auto progress = total_read == 0 ? proxy::HandshakeProgress::NotStarted
@@ -61,18 +61,18 @@ ParseTrojanRequest(AsyncStream& stream,
             if (!read) co_return tl::unexpected(read.error());
             total_read = required;
         }
-        decoded = ::trojan::DecodeRequest(
+        decoded = ::proxy::trojan::DecodeRequest(
             std::span<const uint8_t>(handshake_buf.data(), total_read));
-        if (decoded.status == ::trojan::RequestDecodeStatus::Complete) {
+        if (decoded.status == ::proxy::trojan::RequestDecodeStatus::Complete) {
             break;
         }
-        if (decoded.status == ::trojan::RequestDecodeStatus::InvalidAddress) {
-            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid target address"));
-            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        if (decoded.status == ::proxy::trojan::RequestDecodeStatus::InvalidAddress) {
+            LOG_ACCESS(common::FormatAccessLog(ctx, common::AccessStatus::Rejected, "invalid target address"));
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
         }
-        if (decoded.status == ::trojan::RequestDecodeStatus::InvalidHeader) {
-            LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "invalid request header"));
-            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        if (decoded.status == ::proxy::trojan::RequestDecodeStatus::InvalidHeader) {
+            LOG_ACCESS(common::FormatAccessLog(ctx, common::AccessStatus::Rejected, "invalid request header"));
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         required = decoded.required;
     }
@@ -82,7 +82,7 @@ ParseTrojanRequest(AsyncStream& stream,
     const auto credential = co_await authentication.VerifyCredential({
         proxy::KeyedInboundProtocol::Trojan,
         {reinterpret_cast<const uint8_t*>(request.password_hash.data()), request.password_hash.size()}});
-    if (credential != ErrorCode::OK) co_return tl::unexpected(credential);
+    if (credential != common::ErrorCode::OK) co_return tl::unexpected(credential);
     auto user_info = proxyman::inbound::UserStore::FindTrojanUser(
         ctx.inbound.tag, request.PasswordHashView());
     if (!user_info) {
@@ -101,17 +101,17 @@ ParseTrojanRequest(AsyncStream& stream,
 
 namespace proxy::trojan::inbound {
 
-class Handler final : public ::Inbound {
+class Handler final : public ::proxy::Inbound {
 public:
     explicit Handler(const ::proxyman::inbound::AdmissionEnvironment& environment);
 
-    ::net::awaitable<::RelayResult> Process(
-        std::unique_ptr<::AsyncStream> stream,
+    ::net::awaitable<::app::RelayResult> Process(
+        std::unique_ptr<::transport::AsyncStream> stream,
         ::routing::Dispatcher& dispatcher,
         const ::proxyman::inbound::ReceiverSettings& receiver,
         ::net::io_context& io_context,
         ::session::Context& ctx,
-        const ::TimeoutsConfig& timeouts,
+        const ::infra::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) override;
 
 private:
@@ -129,14 +129,14 @@ proxy::trojan::inbound::Handler::Handler(
     : environment_(environment)
 {}
 
-net::awaitable<RelayResult>
+net::awaitable<app::RelayResult>
 proxy::trojan::inbound::Handler::Process(
-    std::unique_ptr<AsyncStream> stream,
+    std::unique_ptr<transport::AsyncStream> stream,
     routing::Dispatcher& dispatcher,
     const proxyman::inbound::ReceiverSettings& receiver,
     net::io_context& io_context,
     session::Context& ctx,
-    const TimeoutsConfig& timeouts,
+    const infra::TimeoutsConfig& timeouts,
     uint32_t /*pressure_idle_timeout*/)
 {
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}",
@@ -144,15 +144,15 @@ proxy::trojan::inbound::Handler::Process(
 
     auto authentication = co_await proxy::BeginInboundAuthentication(environment_, ctx);
     if (!authentication) co_return proxy::RejectInbound(environment_.stats, stream.get(), authentication.error());
-    std::optional<UserOnlineSessionGuard> user_session;
-    Network net = Network::TCP;
+    std::optional<common::UserOnlineSessionGuard> user_session;
+    common::Network net = common::Network::TCP;
     {
         auto handshake = co_await ParseTrojanRequest(*stream, ctx, *authentication);
         if (!handshake) {
             co_return proxy::RejectInbound(environment_.stats, stream.get(), handshake.error());
         }
-        net = (handshake->command == ::trojan::TrojanCommand::UDP_ASSOCIATE)
-              ? Network::UDP : Network::TCP;
+        net = (handshake->command == ::proxy::trojan::TrojanCommand::UDP_ASSOCIATE)
+              ? common::Network::UDP : common::Network::TCP;
         auto admitted = co_await proxy::AuthenticateAndAdmit(
             std::move(*authentication), &handshake->user->profile, "no matching credential",
             proxy::InboundRequestTarget{net, std::move(handshake->target), std::move(handshake->forwarded)});
@@ -162,14 +162,14 @@ proxy::trojan::inbound::Handler::Process(
         handshake->user.reset();
     }
 
-    if (net == Network::UDP) {
-        ::trojan::UdpStreamEndpoint udp_endpoint(*stream);
+    if (net == common::Network::UDP) {
+        ::proxy::trojan::UdpStreamEndpoint udp_endpoint(*stream);
         co_return co_await dispatcher.Dispatch(
             io_context,
             receiver.dispatch_policy,
             std::move(stream),
             transport::Link{&udp_endpoint, &udp_endpoint},
-            InitialPayload{},
+            common::InitialPayload{},
             ctx,
             environment_.stats,
             timeouts);
@@ -181,7 +181,7 @@ proxy::trojan::inbound::Handler::Process(
         receiver.dispatch_policy,
         std::move(stream),
         transport::Link{tcp_stream, tcp_stream},
-        InitialPayload{},
+        common::InitialPayload{},
         ctx,
         environment_.stats,
         timeouts);
@@ -200,18 +200,18 @@ const bool kTrojanInboundRegistered = [] {
 
     reg.create_tcp_handler =
         [](const ::proxyman::inbound::AdmissionEnvironment& environment,
-           const ::proxyman::inbound::BuildRequest&) -> std::unique_ptr<::Inbound> {
+           const ::proxyman::inbound::BuildRequest&) -> std::unique_ptr<::proxy::Inbound> {
             return std::make_unique<::proxy::trojan::inbound::Handler>(environment);
         };
 
     reg.build_users =
         [](const ::proxyman::inbound::BuildRequest& req,
-           std::span<const ::InboundUserSpec> specs) {
+           std::span<const ::infra::InboundUserSpec> specs) {
             return ::proxy::BuildHashedInboundUsers<
                 ::proxyman::inbound::PreparedTrojanUser>(
                 "Trojan", req, specs,
                 [](auto& info, std::string_view credential) {
-                    const auto hash = ::trojan::HashPassword(credential);
+                    const auto hash = ::proxy::trojan::HashPassword(credential);
                     info.password_hash.assign(hash.data(), hash.size());
                 });
         };

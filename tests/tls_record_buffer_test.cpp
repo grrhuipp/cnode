@@ -111,19 +111,19 @@ public:
 
 struct Fixture {
     explicit Fixture(bool product_server = false, bool large_chain = false) {
-        ::TlsStream::InitializeIo();
+        ::transport::internet::TlsStream::InitializeIo();
         const auto dir = std::filesystem::path(CNODE_TEST_SOURCE_DIR) / "tests/fixtures/anytls-pool";
-        ::TlsConfig server_config;
+        ::transport::internet::TlsConfig server_config;
         server_config.cert_file = (dir / "cert.pem").string();
         server_config.key_file = (dir / "key.pem").string();
-        ::LoadTlsPemMaterial(server_config);
+        ::transport::internet::LoadTlsPemMaterial(server_config);
         server_config.alpn = {"h2"};
-        server_config.min_version = ::TlsVersion::V1_3;
-        server = ::SslContext::CreateServer(server_config);
-        ::TlsConfig client_config;
+        server_config.min_version = ::transport::internet::TlsVersion::V1_3;
+        server = ::transport::internet::SslContext::CreateServer(server_config);
+        ::transport::internet::TlsConfig client_config;
         client_config.allow_insecure = true;
         client_config.alpn = {"h2"};
-        client = ::SslContext::CreateClient(client_config);
+        client = ::transport::internet::SslContext::CreateClient(client_config);
         if (!server || !client) throw std::runtime_error("TLS fixture contexts failed");
         SSL_CTX_set_num_tickets(server->Native(), 0);
         SSL_CTX_set_max_cert_list(client->Native(), 512 * 1024);
@@ -144,8 +144,8 @@ struct Fixture {
         other.set_option(net::socket_base::receive_buffer_size(32768));
         peer = std::make_unique<Peer>(std::move(other),
             product_server ? client->Native() : server->Native(), !product_server);
-        stream = std::make_unique<::TlsStream>(
-            std::make_unique<::TcpStream>(std::move(socket)),
+        stream = std::make_unique<::transport::internet::TlsStream>(
+            std::make_unique<::transport::internet::TcpStream>(std::move(socket)),
             product_server ? *server : *client, product_server);
         relay_buffers_before_handshake = ::memory::detail::test_buffers_live;
         try {
@@ -186,9 +186,9 @@ struct Fixture {
     }
 
     net::io_context io;
-    std::unique_ptr<::SslContext> server, client;
+    std::unique_ptr<::transport::internet::SslContext> server, client;
     std::unique_ptr<Peer> peer;
-    std::unique_ptr<::TlsStream> stream;
+    std::unique_ptr<::transport::internet::TlsStream> stream;
     std::size_t relay_buffers_before_handshake = 0;
     const bool previous_reject = ::memory::reject_next_process_allocation;
 };
@@ -208,7 +208,7 @@ std::string Flatten(::buf::MultiBuffer data) {
     return result;
 }
 
-net::awaitable<std::string> ReadBytes(::TlsStream& stream, std::size_t count) {
+net::awaitable<std::string> ReadBytes(::transport::internet::TlsStream& stream, std::size_t count) {
     std::string result;
     while (result.size() < count) {
         auto data = co_await stream.ReadMultiBuffer();
@@ -410,7 +410,7 @@ INSTANTIATE_TEST_SUITE_P(WriteStates, TlsWriteReset, testing::Bool(),
     });
 
 TEST(TlsRecordBuffer, PeerResetCannotBecomeSuccessfulCloseNotify) {
-    TlsStream::InitializeIo();
+    transport::internet::TlsStream::InitializeIo();
     Fixture fixture;
     JoinPending join{fixture};
     fixture.peer->socket.set_option(net::socket_base::linger(true, 0));
@@ -432,7 +432,7 @@ namespace {
 class TlsReadShutdown : public testing::TestWithParam<std::string> {};
 
 TEST_P(TlsReadShutdown, PendingReadEndsWithoutClosingWriteDirection) {
-    TlsStream::InitializeIo();
+    transport::internet::TlsStream::InitializeIo();
     Fixture fixture;
     const bool multi_buffer = GetParam().starts_with("multi");
     if (GetParam().ends_with("partial")) {

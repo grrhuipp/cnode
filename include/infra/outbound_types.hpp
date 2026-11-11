@@ -17,14 +17,14 @@
 #include <variant>
 #include <vector>
 
-namespace vless { struct VlessEncryptionConfig; }
+namespace proxy::vless { struct VlessEncryptionConfig; }
 
 namespace infra {
 
 struct FreedomSettings {
     proxy::freedom::outbound::DomainStrategy domain_strategy =
         proxy::freedom::outbound::DomainStrategy::AsIs;
-    std::optional<TargetAddress> redirect{};
+    std::optional<common::TargetAddress> redirect{};
 };
 
 struct BlackholeSettings {
@@ -32,14 +32,14 @@ struct BlackholeSettings {
 };
 
 struct ShadowsocksSettings {
-    OutboundServer server;
-    ss::SsCipherInfo cipher{ss::SsCipherType::AES_256_GCM, 32, 32};
+    transport::internet::OutboundServer server;
+    proxy::shadowsocks::SsCipherInfo cipher{proxy::shadowsocks::SsCipherType::AES_256_GCM, 32, 32};
     std::string password;
     std::optional<proxy::uot::Version> uot_version;
 };
 
 struct TrojanSettings {
-    OutboundServer server;
+    transport::internet::OutboundServer server;
     std::string password;
     std::string server_name;
     bool allow_insecure = false;
@@ -49,21 +49,21 @@ struct TrojanSettings {
 enum class PacketEncoding : uint8_t { None, PacketAddr, Xudp };
 
 struct VlessSettings {
-    OutboundServer server;
+    transport::internet::OutboundServer server;
     std::array<uint8_t, 16> id{};
     std::string flow;
-    std::shared_ptr<const vless::VlessEncryptionConfig> encryption;
+    std::shared_ptr<const proxy::vless::VlessEncryptionConfig> encryption;
     PacketEncoding packet_encoding = PacketEncoding::Xudp;
 };
 
 struct VmessSettings {
-    OutboundServer server;
+    transport::internet::OutboundServer server;
     std::array<uint8_t, 16> id{};
-    vmess::Security security = vmess::Security::AES_128_GCM;
+    proxy::vmess::Security security = proxy::vmess::Security::AES_128_GCM;
 };
 
 struct AnyTlsSettings {
-    OutboundServer server;
+    transport::internet::OutboundServer server;
     std::array<uint8_t, 32> password_hash{};
     std::chrono::seconds idle_session_check_interval{30};
     std::chrono::seconds idle_session_timeout{60};

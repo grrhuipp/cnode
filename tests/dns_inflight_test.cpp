@@ -113,7 +113,7 @@ TEST_P(DnsInflightCompletion, SharesQueryOutcomeAndReleasesGenerationForRetry) {
                 ++copy_failures;
             }
         } else if (failure == Failure::CancelledQuery) {
-            EXPECT_EQ(results[i].error, ::ErrorCode::CANCELLED);
+            EXPECT_EQ(results[i].error, ::common::ErrorCode::CANCELLED);
         } else {
             EXPECT_TRUE(results[i].Ok());
             EXPECT_EQ(results[i].addresses.size(), 400u);
@@ -184,7 +184,7 @@ TEST(DnsInflight, CancellingSubscriberPreservesOwnerAndOtherSubscribers) {
     EXPECT_FALSE(errors[2]);
     EXPECT_TRUE(results[0].Ok());
     EXPECT_TRUE(results[2].Ok());
-    EXPECT_TRUE(errors[1] || results[1].error == ::ErrorCode::CANCELLED) << "the cancelled subscriber must observe cancellation";
+    EXPECT_TRUE(errors[1] || results[1].error == ::common::ErrorCode::CANCELLED) << "the cancelled subscriber must observe cancellation";
 }
 
 net::awaitable<DnsResult> DelayedCancellationQuery(
@@ -207,7 +207,7 @@ TEST(DnsInflight, RetiredGenerationKeepsCapacityUntilCompletionWithoutRetiringRe
     net::co_spawn(io, inflight.Run("generation.example", old_query),
         net::bind_cancellation_slot(cancel.slot(),
             [&](std::exception_ptr error, DnsResult result) {
-                cancelled = error || result.error == ::ErrorCode::CANCELLED;
+                cancelled = error || result.error == ::common::ErrorCode::CANCELLED;
             }));
     io.poll();
     cancel.emit(net::cancellation_type::terminal);
@@ -223,7 +223,7 @@ TEST(DnsInflight, RetiredGenerationKeepsCapacityUntilCompletionWithoutRetiringRe
     EXPECT_EQ(calls, 2) << "a new waiter must not attach to a cancelled generation";
     net::co_spawn(io, inflight.Run("capacity.example", new_query),
         [&](std::exception_ptr error, DnsResult result) {
-            rejected = !error && result.error == ::ErrorCode::RESOURCE_EXHAUSTED;
+            rejected = !error && result.error == ::common::ErrorCode::RESOURCE_EXHAUSTED;
         });
     io.poll();
     EXPECT_TRUE(rejected);
@@ -410,7 +410,7 @@ TEST_P(DnsWorkerCapacity, FullMailboxRejectsRequestsAndCancellationReturnsSlot) 
                         failure = error;
                         try {
                             if (error) std::rethrow_exception(error);
-                        } catch (const ::WorkerMailboxFull&) {
+                        } catch (const ::app::WorkerMailboxFull&) {
                             rejected = true;
                             failure = {};
                         } catch (...) {}
@@ -421,7 +421,7 @@ TEST_P(DnsWorkerCapacity, FullMailboxRejectsRequestsAndCancellationReturnsSlot) 
                 net::co_spawn(main_context, client.Resolve("192.0.2.4"),
                     [&](std::exception_ptr error, DnsResult result) {
                         failure = error;
-                        rejected = result.error == ::ErrorCode::RESOURCE_EXHAUSTED;
+                        rejected = result.error == ::common::ErrorCode::RESOURCE_EXHAUSTED;
                         cancel.emit(net::cancellation_type::terminal);
                         watchdog.cancel();
                     });
@@ -490,7 +490,7 @@ TEST(DnsInflight, StopJoinsLeaderAndSubscribersBeforeDestruction) {
     EXPECT_EQ(calls, 1u);
     for (size_t i = 0; i < results.size(); ++i) {
         EXPECT_FALSE(errors[i]) << i;
-        EXPECT_EQ(results[i].error, ::ErrorCode::CANCELLED) << i;
+        EXPECT_EQ(results[i].error, ::common::ErrorCode::CANCELLED) << i;
     }
 }
 
@@ -505,7 +505,7 @@ TEST(DnsWorker, StopBeforeFirstQueryRejectsAdmissionAndJoinsIdempotently) {
     std::exception_ptr failure;
     auto stop = [&]() -> net::awaitable<void> {
         const auto result = co_await worker->Resolve("192.0.2.1");
-        EXPECT_EQ(result.error, ::ErrorCode::CANCELLED) << "an unused stopped service must reject queries without starting I/O";
+        EXPECT_EQ(result.error, ::common::ErrorCode::CANCELLED) << "an unused stopped service must reject queries without starting I/O";
         co_await worker->AsyncJoin();
         co_await worker->AsyncJoin();
         worker.reset();
@@ -593,7 +593,7 @@ TEST(DnsWorker, CrossExecutorStopJoinsUdpQueriesAndCallerCompletions) {
     if (join_error) std::rethrow_exception(join_error);
     for (size_t i = 0; i < results.size(); ++i) {
         EXPECT_FALSE(errors[i]) << i;
-        EXPECT_EQ(results[i].error, ::ErrorCode::CANCELLED) << i;
+        EXPECT_EQ(results[i].error, ::common::ErrorCode::CANCELLED) << i;
     }
 }
 

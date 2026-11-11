@@ -19,7 +19,7 @@ enum class TlsServerNameExtensionError {
 // 嗅探与 REALITY 服务端共用；名称类型重复、空名或含 NUL 均视为格式错误。
 [[nodiscard]] inline tl::expected<std::string_view, TlsServerNameExtensionError>
 ParseTlsServerNameExtension(std::span<const uint8_t> extension) noexcept {
-    ByteReader outer(extension);
+    common::ByteReader outer(extension);
     const auto list = outer.ReadBytes(outer.ReadU16BE());
     if (!outer.Ok() || !outer.Empty()) {
         return tl::unexpected(TlsServerNameExtensionError::InvalidFormat);
@@ -27,7 +27,7 @@ ParseTlsServerNameExtension(std::span<const uint8_t> extension) noexcept {
 
     std::bitset<256> seen_types;
     std::string_view host_name;
-    ByteReader reader(list);
+    common::ByteReader reader(list);
     while (!reader.Empty()) {
         const uint8_t name_type = reader.ReadU8();
         const uint16_t name_size = reader.ReadU16BE();

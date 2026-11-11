@@ -12,6 +12,8 @@
 #include <utility>
 
 
+namespace infra {
+
 enum class LogLevel {
     TRACE,
     DEBUG,
@@ -131,11 +133,13 @@ private:
     static std::atomic_bool initialized_;
 };
 
+}  // namespace infra
+
 // 内部宏：只有级别启用时才格式化消息；位置信息由 Write* 的默认实参在调用处取得。
 #define CNODE_LOG_IF(level, write, ...) \
     do { \
-        if (::Log::ShouldLog(::LogLevel::level)) \
-            ::Log::write(::LogLevel::level, __VA_ARGS__); \
+        if (::infra::Log::ShouldLog(::infra::LogLevel::level)) \
+            ::infra::Log::write(::infra::LogLevel::level, __VA_ARGS__); \
     } while (0)
 
 #define LOG_CONSOLE(fmt_str, ...) CNODE_LOG_IF(INFO, WriteConsole, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
@@ -164,6 +168,6 @@ private:
 
 #define LOG_ACCESS(message) \
     do { \
-        ::Log::WriteAccess((message)); \
+        ::infra::Log::WriteAccess((message)); \
     } while (0)
 

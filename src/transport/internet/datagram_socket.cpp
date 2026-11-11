@@ -33,13 +33,13 @@ std::size_t MaxUdpPayload(bool ipv6) noexcept {
     return ipv6 ? kMaxUdpPayloadV6 : kMaxUdpPayloadV4;
 }
 
-[[noreturn]] void ThrowCancelled(ErrorCode reason) {
-    throw LinkError(reason == ErrorCode::OK ? ErrorCode::CANCELLED : reason);
+[[noreturn]] void ThrowCancelled(common::ErrorCode reason) {
+    throw LinkError(reason == common::ErrorCode::OK ? common::ErrorCode::CANCELLED : reason);
 }
 
 void ValidateDestination(const udp::endpoint& destination, bool ipv6) {
     if (destination.port() == 0 || destination.address().is_v6() != ipv6)
-        throw LinkError(ErrorCode::INVALID_ARGUMENT);
+        throw LinkError(common::ErrorCode::INVALID_ARGUMENT);
 }
 
 
@@ -48,9 +48,9 @@ void ValidateBuffers(
     total = 0;
     for (const auto& buffer : buffers) {
         if (buffer.size() != 0 && buffer.data() == nullptr)
-            throw LinkError(ErrorCode::INVALID_ARGUMENT);
+            throw LinkError(common::ErrorCode::INVALID_ARGUMENT);
         if (buffer.size() > maximum - total)
-            throw LinkError(ErrorCode::INVALID_ARGUMENT);
+            throw LinkError(common::ErrorCode::INVALID_ARGUMENT);
         total += buffer.size();
     }
 }
@@ -127,7 +127,7 @@ struct DatagramSocket::Impl final {
         , timeouts(io_context, *this)
         , ipv6(bind_address.is_v6()) {
         if (active_sockets >= kMaxActiveSockets)
-            throw LinkError(ErrorCode::RESOURCE_EXHAUSTED);
+            throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED);
         IoErrorCode ec;
         socket.open(ipv6 ? udp::v6() : udp::v4(), ec);
         if (ec) throw IoSystemError(ec);
@@ -145,9 +145,9 @@ struct DatagramSocket::Impl final {
         counted = true;
     }
 
-    ~Impl() noexcept { Close(ErrorCode::CANCELLED); }
+    ~Impl() noexcept { Close(common::ErrorCode::CANCELLED); }
 
-    void OnTimeout(ErrorCode reason) noexcept { Close(reason); }
+    void OnTimeout(common::ErrorCode reason) noexcept { Close(reason); }
 
     static constexpr uint8_t kReadDrainBudget = 16;
 
@@ -160,10 +160,10 @@ struct DatagramSocket::Impl final {
         udp::socket::wait_type type, net::cancellation_slot cancellation) {
         return detail::WaitSocket(socket, type, cancellation, cancellation_epoch_);
     }
-    void Close(ErrorCode reason) noexcept {
+    void Close(common::ErrorCode reason) noexcept {
         if (closed) return;
         closed = true;
-        cancellation_reason = reason == ErrorCode::OK ? ErrorCode::CANCELLED : reason;
+        cancellation_reason = reason == common::ErrorCode::OK ? common::ErrorCode::CANCELLED : reason;
         MarkCancelled();
         ++generation;
         cancellation.Stop(cancellation_reason);
@@ -180,7 +180,7 @@ struct DatagramSocket::Impl final {
     void Cancel() noexcept {
         if (closed) return;
         MarkCancelled();
-        cancellation_reason = ErrorCode::CANCELLED;
+        cancellation_reason = common::ErrorCode::CANCELLED;
         ++generation;
         cancellation.CancelPending(cancellation_reason);
         IoErrorCode ignored;
@@ -190,9 +190,9 @@ struct DatagramSocket::Impl final {
     [[nodiscard]] bool OperationCancelled(uint64_t captured) const noexcept {
         return closed || generation != captured;
     }
-    [[nodiscard]] ErrorCode OperationReason(uint64_t captured) const noexcept {
-        if (!OperationCancelled(captured)) return ErrorCode::OK;
-        return cancellation_reason == ErrorCode::OK ? ErrorCode::CANCELLED : cancellation_reason;
+    [[nodiscard]] common::ErrorCode OperationReason(uint64_t captured) const noexcept {
+        if (!OperationCancelled(captured)) return common::ErrorCode::OK;
+        return cancellation_reason == common::ErrorCode::OK ? common::ErrorCode::CANCELLED : cancellation_reason;
     }
 
     net::awaitable<ReceivedDatagram> Receive(ReadOperation& operation);
@@ -210,7 +210,7 @@ struct DatagramSocket::Impl final {
     transport::CancellationSource cancellation;
     uint64_t generation = 0;
     uint64_t cancellation_epoch_ = 0;
-    ErrorCode cancellation_reason = ErrorCode::OK;
+    common::ErrorCode cancellation_reason = common::ErrorCode::OK;
     uint8_t read_drain_budget = 0;
     bool ipv6 = false;
     bool closed = false;
@@ -264,7 +264,7 @@ net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& op
             guards[i] = buf::BufferGuard(buf::Buffer::New());
             if (!guards[i]) {
                 read_drain_budget = 0;
-                throw LinkError(ErrorCode::RESOURCE_EXHAUSTED);
+                throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED);
             }
             buffers[i] = net::buffer(guards[i]->Tail().data(), guards[i]->Available());
         }
@@ -289,7 +289,7 @@ net::awaitable<ReceivedDatagram> DatagramSocket::Impl::Receive(ReadOperation& op
             read_drain_budget = kReadDrainBudget - 1;
         }
         if (received > count * buf::Buffer::kSize) continue;
-        if (source.address().is_v6() != ipv6) throw LinkError(ErrorCode::INTERNAL);
+        if (source.address().is_v6() != ipv6) throw LinkError(common::ErrorCode::INTERNAL);
 
         buf::MultiBuffer payload;
         std::size_t remaining = received;
@@ -323,7 +323,7 @@ net::awaitable<void> DatagramSocket::Impl::SendBuffers(
                 merged.insert(merged.end(), first, first + buffer.size());
             }
         } catch (const std::bad_alloc&) {
-            throw LinkError(ErrorCode::RESOURCE_EXHAUSTED);
+            throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED);
         }
         single[0] = net::buffer(merged.data(), merged.size());
         buffers = single;
@@ -340,7 +340,7 @@ net::awaitable<void> DatagramSocket::Impl::SendBuffers(
             // only for backpressure and never retains payload pointers.
             const auto sent = socket.send_to(buffers, destination, 0, send_ec);
             if (!send_ec) {
-                if (sent != total) throw LinkError(ErrorCode::INTERNAL);
+                if (sent != total) throw LinkError(common::ErrorCode::INTERNAL);
                 break;
             }
             if (send_ec != io_error::would_block && send_ec != io_error::try_again)
@@ -360,14 +360,14 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
     ValidateDestination(destination, ipv6);
     const auto maximum = MaxUdpPayload(ipv6);
     if (payload.byte_size() > maximum)
-        throw LinkError(ErrorCode::INVALID_ARGUMENT);
+        throw LinkError(common::ErrorCode::INVALID_ARGUMENT);
     std::size_t total = 0;
     for (const auto* buffer : payload) {
         if (!buffer || buffer->Bytes().size() > maximum - total)
-            throw LinkError(ErrorCode::INVALID_ARGUMENT);
+            throw LinkError(common::ErrorCode::INVALID_ARGUMENT);
         total += buffer->Bytes().size();
     }
-    if (total != payload.byte_size()) throw LinkError(ErrorCode::INVALID_ARGUMENT);
+    if (total != payload.byte_size()) throw LinkError(common::ErrorCode::INVALID_ARGUMENT);
 
     const auto cancellation_state = co_await net::this_coro::cancellation_state;
     if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
@@ -392,7 +392,7 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
                 destination, 0, send_ec);
         }
         if (!send_ec) {
-            if (sent != total) throw LinkError(ErrorCode::INTERNAL);
+            if (sent != total) throw LinkError(common::ErrorCode::INTERNAL);
             timeouts.TouchActivity();
             co_return;
         }
@@ -403,11 +403,11 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
         co_await SendBuffers(operation, std::move(destination), buffers, true);
         co_return;
     }
-    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> spans;
+    common::ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> spans;
     try {
         spans.AppendMultiBuffer(payload);
     } catch (const std::bad_alloc&) {
-        throw LinkError(ErrorCode::RESOURCE_EXHAUSTED);
+        throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED);
     }
     co_await SendBuffers(operation, std::move(destination), spans.Span(), false);
 }
@@ -416,11 +416,11 @@ DatagramSocket::ReadOperation::ReadOperation(Impl& impl)
     : impl_(&impl)
     , generation_(impl.generation) {
     if (impl.closed) ThrowCancelled(impl.cancellation_reason);
-    if (impl.read_active) throw LinkError(ErrorCode::INVALID_ARGUMENT);
+    if (impl.read_active) throw LinkError(common::ErrorCode::INVALID_ARGUMENT);
     try {
         impl.timeouts.BeginRead();
     } catch (const std::bad_alloc&) {
-        throw LinkError(ErrorCode::RESOURCE_EXHAUSTED);
+        throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED);
     }
     impl.read_active = true;
 }
@@ -435,7 +435,7 @@ bool DatagramSocket::ReadOperation::Cancelled() const noexcept {
     return impl_->OperationCancelled(generation_);
 }
 
-ErrorCode DatagramSocket::ReadOperation::CancellationReason() const noexcept {
+common::ErrorCode DatagramSocket::ReadOperation::CancellationReason() const noexcept {
     return impl_->OperationReason(generation_);
 }
 
@@ -447,11 +447,11 @@ DatagramSocket::WriteOperation::WriteOperation(Impl& impl)
     : impl_(&impl)
     , generation_(impl.generation) {
     if (impl.closed) ThrowCancelled(impl.cancellation_reason);
-    if (impl.write_active) throw LinkError(ErrorCode::INVALID_ARGUMENT);
+    if (impl.write_active) throw LinkError(common::ErrorCode::INVALID_ARGUMENT);
     try {
         impl.timeouts.BeginWrite();
     } catch (const std::bad_alloc&) {
-        throw LinkError(ErrorCode::RESOURCE_EXHAUSTED);
+        throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED);
     }
     impl.write_active = true;
 }
@@ -464,7 +464,7 @@ DatagramSocket::WriteOperation::~WriteOperation() noexcept {
 
 void DatagramSocket::WriteOperation::CheckAvailable() {
     if (Cancelled()) ThrowCancelled(CancellationReason());
-    if (send_started_) throw LinkError(ErrorCode::INVALID_ARGUMENT);
+    if (send_started_) throw LinkError(common::ErrorCode::INVALID_ARGUMENT);
     send_started_ = true;
 }
 
@@ -472,7 +472,7 @@ bool DatagramSocket::WriteOperation::Cancelled() const noexcept {
     return impl_->OperationCancelled(generation_);
 }
 
-ErrorCode DatagramSocket::WriteOperation::CancellationReason() const noexcept {
+common::ErrorCode DatagramSocket::WriteOperation::CancellationReason() const noexcept {
     return impl_->OperationReason(generation_);
 }
 
@@ -499,19 +499,19 @@ DatagramSocket::WriteOperation DatagramSocket::StartWrite() { return WriteOperat
 
 void DatagramSocket::SetIdleTimeout(std::chrono::seconds timeout) {
     try { impl_->timeouts.SetIdleTimeout(timeout); }
-    catch (const std::bad_alloc&) { throw LinkError(ErrorCode::RESOURCE_EXHAUSTED); }
+    catch (const std::bad_alloc&) { throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED); }
 }
 void DatagramSocket::SetReadTimeout(std::chrono::seconds timeout) {
     try { impl_->timeouts.SetReadTimeout(timeout); }
-    catch (const std::bad_alloc&) { throw LinkError(ErrorCode::RESOURCE_EXHAUSTED); }
+    catch (const std::bad_alloc&) { throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED); }
 }
 void DatagramSocket::SetWriteTimeout(std::chrono::seconds timeout) {
     try { impl_->timeouts.SetWriteTimeout(timeout); }
-    catch (const std::bad_alloc&) { throw LinkError(ErrorCode::RESOURCE_EXHAUSTED); }
+    catch (const std::bad_alloc&) { throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED); }
 }
 PhaseDeadlineHandle DatagramSocket::StartPhaseDeadline(std::chrono::seconds timeout) {
     try { return impl_->timeouts.StartPhaseDeadline(timeout); }
-    catch (const std::bad_alloc&) { throw LinkError(ErrorCode::RESOURCE_EXHAUSTED); }
+    catch (const std::bad_alloc&) { throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED); }
 }
 void DatagramSocket::ClearPhaseDeadline() noexcept { impl_->timeouts.ClearPhaseDeadline(); }
 bool DatagramSocket::ConsumeIdleTimeout() noexcept { return impl_->timeouts.ConsumeIdleTimeout(); }
@@ -521,7 +521,7 @@ bool DatagramSocket::ConsumePhaseDeadline() noexcept { return impl_->timeouts.Co
 void DatagramSocket::TouchActivity() noexcept { impl_->timeouts.TouchActivity(); }
 CancellationSource& DatagramSocket::Cancellation() noexcept { return impl_->cancellation; }
 void DatagramSocket::Cancel() noexcept { impl_->Cancel(); }
-void DatagramSocket::Close() noexcept { impl_->Close(ErrorCode::CANCELLED); }
+void DatagramSocket::Close() noexcept { impl_->Close(common::ErrorCode::CANCELLED); }
 bool DatagramSocket::IsIPv6() const noexcept { return impl_->ipv6; }
 
 udp::endpoint DatagramSocket::LocalEndpoint() const {

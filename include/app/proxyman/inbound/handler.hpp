@@ -27,16 +27,28 @@
 #include <utility>
 #include <vector>
 
+namespace infra {
+
 struct InboundProtocolSettings;
 struct InboundUserSpec;
+
+}  // namespace infra
+namespace common {
+
 struct OnlineDevice;
+
+}  // namespace common
 namespace app {
 namespace dns {
 class DNS;
 }  // namespace dns
 }  // namespace app
 
+namespace transport::internet {
+
 class InboundTransportStreamHandler;
+
+}  // namespace transport::internet
 
 namespace proxyman::inbound {
 
@@ -52,9 +64,9 @@ struct ReceiverSettings {
     std::vector<std::string> inbound_tags;   // 所有标签（路由匹配任一）
     std::string      protocol;          // "vmess" / "trojan" 等协议名
     std::string      accounting_key{};  // Opaque stable reporting identity; empty disables per-user reporting.
-    StreamSettings   stream_settings;  // 传输层配置（network/security）
+    transport::internet::StreamSettings   stream_settings;  // 传输层配置（network/security）
     routing::DispatchPolicy dispatch_policy;
-    ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto;
+    transport::internet::ProxyProtocolMode proxy_protocol = transport::internet::ProxyProtocolMode::Auto;
 
     [[nodiscard]] const std::vector<std::string>* RouteInboundTags() const noexcept {
         return inbound_tags.empty() ? nullptr : &inbound_tags;
@@ -65,9 +77,9 @@ struct ReceiverSettings {
     std::string inbound_tag,
     std::vector<std::string> inbound_tags,
     std::string protocol,
-    StreamSettings stream_settings,
-    SniffConfig sniff_config,
-    ProxyProtocolMode proxy_protocol,
+    transport::internet::StreamSettings stream_settings,
+    routing::SniffConfig sniff_config,
+    transport::internet::ProxyProtocolMode proxy_protocol,
     routing::OutboundSelectionPolicy outbound_policy,
     std::string accounting_key) {
     std::erase(inbound_tags, inbound_tag);
@@ -100,15 +112,15 @@ enum class DatagramTransport : uint8_t {
 struct DatagramHandlerBuildResult {
     DatagramHandlerBuildStatus status =
         DatagramHandlerBuildStatus::Unsupported;
-    std::unique_ptr<::Inbound> handler;
+    std::unique_ptr<::proxy::Inbound> handler;
 };
 
 // Worker-owned capabilities, borrowed by every inbound entry point.
 struct AdmissionEnvironment final {
-    GroupCoordinator& coordinator;
-    ConnectionLimiter& limiter;
-    UserOnlineTracker& online_users;
-    StatsShard& stats;
+    app::GroupCoordinator& coordinator;
+    app::ConnectionLimiter& limiter;
+    common::UserOnlineTracker& online_users;
+    app::StatsShard& stats;
 };
 
 struct InboundProtocolTraits final {
@@ -129,12 +141,12 @@ struct ProxyRegistration {
     InboundProtocolTraits traits{};
 
     // 创建 TCP 入站处理器（必须）
-    std::unique_ptr<::Inbound> (*create_tcp_handler)(
+    std::unique_ptr<::proxy::Inbound> (*create_tcp_handler)(
         const AdmissionEnvironment& environment,
         const BuildRequest& req) = nullptr;
 
     // 创建 UDP 入站处理器（可选）
-    std::unique_ptr<::Inbound> (*create_datagram_handler)(
+    std::unique_ptr<::proxy::Inbound> (*create_datagram_handler)(
         const AdmissionEnvironment& environment,
         const BuildRequest& req) = nullptr;
     std::unique_ptr<transport::internet::QuicListener> (*create_quic_listener)(
@@ -146,13 +158,13 @@ struct ProxyRegistration {
     std::optional<std::shared_ptr<const ProtocolSettings>>
     (*prepare_settings)(
         std::string_view tag,
-        const ::InboundProtocolSettings& settings) = nullptr;
+        const ::infra::InboundProtocolSettings& settings) = nullptr;
 
     // 用户构建属于冷路径，结果发布到进程级只读 UserStore 快照。所有来源共用；
     // 来源间的凭据差异只存在于 InboundProtocolSettings / InboundUserSpec 数据中。
     std::optional<UserSet> (*build_users)(
         const BuildRequest& req,
-        std::span<const ::InboundUserSpec> users) = nullptr;
+        std::span<const ::infra::InboundUserSpec> users) = nullptr;
 };
 
 // Registration errors are programming errors during static initialization and
@@ -175,11 +187,11 @@ void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
 [[nodiscard]] std::optional<BuildRequest> PrepareBuildRequest(
     std::string_view protocol,
     std::string_view tag,
-    const ::InboundProtocolSettings& settings);
+    const ::infra::InboundProtocolSettings& settings);
 
 [[nodiscard]] std::optional<UserSet> BuildUsers(
     const BuildRequest& req,
-    std::span<const ::InboundUserSpec> users);
+    std::span<const ::infra::InboundUserSpec> users);
 
 // ============================================================================
 // Handler - address-stable Worker inbound transport host.
@@ -191,7 +203,7 @@ class Handler final : public std::enable_shared_from_this<Handler> {
 public:
     // Prepared TransportSecurity is shared; SSL contexts are never rebuilt for
     // each short HTTP packet upload.
-    Handler(inbound::ReceiverSettings receiver, std::unique_ptr<Inbound> proxy,
+    Handler(inbound::ReceiverSettings receiver, std::unique_ptr<proxy::Inbound> proxy,
             const AdmissionEnvironment& environment);
 
     Handler(const Handler&) = delete;
@@ -209,10 +221,10 @@ public:
     net::awaitable<void> ProcessAcceptedTCP(
         net::io_context& io_context,
         routing::Dispatcher& dispatcher,
-        StatsShard& stats,
+        app::StatsShard& stats,
         app::RequestLoadState& request_load,
-        const TimeoutsConfig& timeouts,
-        std::unique_ptr<AsyncStream> raw_conn,
+        const infra::TimeoutsConfig& timeouts,
+        std::unique_ptr<transport::AsyncStream> raw_conn,
         session::Context& ctx,
         app::dns::DNS* dns_service = nullptr);
 
@@ -221,25 +233,25 @@ public:
     // stream runs the inbound protocol with a child of |session_ctx|
     // that keeps the session's identity and client endpoint, and takes a
     // logical admission under the session's physical |family|.
-    [[nodiscard]] std::shared_ptr<InboundTransportStreamHandler>
+    [[nodiscard]] std::shared_ptr<transport::internet::InboundTransportStreamHandler>
     NewAuthenticatedStreamSink(
         net::io_context& io_context,
         routing::Dispatcher& dispatcher,
-        StatsShard& stats,
+        app::StatsShard& stats,
         app::RequestLoadState& request_load,
-        const TimeoutsConfig& timeouts,
+        const infra::TimeoutsConfig& timeouts,
         const session::Context& session_ctx,
-        std::shared_ptr<ConnectionLimiter::Family> family);
+        std::shared_ptr<app::ConnectionLimiter::Family> family);
 
 
 private:
     class LogicalTransportStreamSink;
 
-    Inbound& Proxy();
+    proxy::Inbound& Proxy();
 
     const inbound::ReceiverSettings receiver_;
-    TransportSecurity security_;
-    std::unique_ptr<Inbound> proxy_;
+    transport::internet::TransportSecurity security_;
+    std::unique_ptr<proxy::Inbound> proxy_;
     const AdmissionEnvironment& environment_;
 };
 
@@ -261,7 +273,7 @@ public:
 
     [[nodiscard]] HandlerPtr GetHandler(std::string_view tag) noexcept;
 
-    [[nodiscard]] std::unique_ptr<::Inbound> NewHandler(
+    [[nodiscard]] std::unique_ptr<::proxy::Inbound> NewHandler(
         const BuildRequest& req);
 
     [[nodiscard]] DatagramHandlerBuildResult NewDatagramHandler(
@@ -274,15 +286,15 @@ public:
     // RemoveHandler 只撤销 registry 所有权；在途请求按 shared_ptr 自然收尾。
     void RemoveHandler(std::string_view tag);
 
-    [[nodiscard]] std::vector<::OnlineDevice>
+    [[nodiscard]] std::vector<::common::OnlineDevice>
     GetOnlineDevices(std::string_view tag) const;
 
 private:
     using HandlerMap = memory::UnorderedMap<
         memory::String,
         std::shared_ptr<Handler>,
-        TransparentStringHash,
-        TransparentStringEq>;
+        common::TransparentStringHash,
+        common::TransparentStringEq>;
 
     const AdmissionEnvironment& environment_;
     HandlerMap handlers_;

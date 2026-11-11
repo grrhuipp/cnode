@@ -138,10 +138,10 @@ struct GrpcHunkPrefix {
     size_t size = 0;
 
     explicit GrpcHunkPrefix(size_t data_size) noexcept {
-        const uint64_t hunk_len = 1 + VarintU64Size(data_size) + data_size;
+        const uint64_t hunk_len = 1 + common::VarintU64Size(data_size) + data_size;
         bytes[0] = 0;
-        StoreU32BE(bytes.data() + 1, static_cast<uint32_t>(hunk_len));
-        ByteWriter writer(bytes.data() + 5, bytes.size() - 5);
+        common::StoreU32BE(bytes.data() + 1, static_cast<uint32_t>(hunk_len));
+        common::ByteWriter writer(bytes.data() + 5, bytes.size() - 5);
         (void)writer.WriteU8(0x0a); // Hunk.data field, length-delimited.
         (void)writer.WriteVarintU64(data_size);
         size = 5 + writer.Position();
@@ -213,12 +213,12 @@ inline constexpr std::array<uint8_t, 15> kGrpcTrailerBlock{
     0x01, '0',
 };
 [[nodiscard]] inline bool IsConnectionSpecificHttp2Header(std::string_view key) noexcept {
-    return EqualsAsciiCI(key, "host") ||
-          EqualsAsciiCI(key, "connection") ||
-          EqualsAsciiCI(key, "keep-alive") ||
-          EqualsAsciiCI(key, "proxy-connection") ||
-          EqualsAsciiCI(key, "transfer-encoding") ||
-          EqualsAsciiCI(key, "upgrade");
+    return common::EqualsAsciiCI(key, "host") ||
+          common::EqualsAsciiCI(key, "connection") ||
+          common::EqualsAsciiCI(key, "keep-alive") ||
+          common::EqualsAsciiCI(key, "proxy-connection") ||
+          common::EqualsAsciiCI(key, "transfer-encoding") ||
+          common::EqualsAsciiCI(key, "upgrade");
 }
 
 [[nodiscard]] constexpr bool IsValidHttp2HeaderName(std::string_view name) noexcept {
@@ -287,9 +287,9 @@ struct H2RequestHeaders {
 // malformed (8.1.1) rather than resolved by field order.
 [[nodiscard]] inline bool AuthorityMatchesHost(std::string_view authority,
                                         std::string_view expected_host) noexcept {
-    authority = TrimAscii(authority);
-    expected_host = TrimAscii(expected_host);
-    if (EqualsAsciiCI(authority, expected_host)) {
+    authority = common::TrimAscii(authority);
+    expected_host = common::TrimAscii(expected_host);
+    if (common::EqualsAsciiCI(authority, expected_host)) {
         return true;
     }
     const auto strip_port = [](std::string_view value) noexcept {
@@ -308,7 +308,7 @@ struct H2RequestHeaders {
         return value;
     };
     return strip_port(expected_host) == expected_host &&
-           EqualsAsciiCI(strip_port(authority), expected_host);
+           common::EqualsAsciiCI(strip_port(authority), expected_host);
 }
 
 tl::expected<std::optional<uint32_t>, H2Error> PeerInitialWindowSetting(
@@ -320,7 +320,7 @@ memory::ByteVector EncodeHttpResponseHeaders(const HttpHeaders&);
 net::awaitable<tl::expected<std::optional<H2RequestHeaders>, H2Error>> ParseH2RequestHeaders(
     AsyncStream&, HpackDecoder&, H2Frame, std::string_view, bool);
 net::awaitable<TransportBuildResult> StartHttp2ServerSession(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream>, uint32_t, H2PayloadCodec, net::io_context&,
     std::shared_ptr<InboundTransportStreamHandler>, uint64_t,
     const HttpConfig*, const XHttpConfig*, const GrpcConfig*);
@@ -331,8 +331,8 @@ net::awaitable<TransportBuildResult> OpenHttp2ClientStream(
 [[nodiscard]] inline std::array<uint8_t, 8> EncodeGoaway(
     uint32_t last_stream, H2Error error) noexcept {
     std::array<uint8_t, 8> payload{};
-    StoreU32BE(payload.data(), last_stream);
-    StoreU32BE(payload.data() + 4, static_cast<uint32_t>(error));
+    common::StoreU32BE(payload.data(), last_stream);
+    common::StoreU32BE(payload.data() + 4, static_cast<uint32_t>(error));
     return payload;
 }
 

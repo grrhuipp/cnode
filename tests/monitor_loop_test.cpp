@@ -13,7 +13,7 @@
 namespace {
 
 namespace net = ::net;
-using ::MonitorLoop;
+using ::common::MonitorLoop;
 
 
 struct Lifetime {
@@ -50,11 +50,11 @@ TEST(MonitorLoop, IndependentCompletionAndOwnership) {
     auto report = [&](std::string_view name, std::exception_ptr error) {
         exits.push_back({std::string(name), error});
     };
-    auto failing = std::make_shared<MonitorLoop>(io.get_executor(), "failing",
+    auto failing = std::make_shared<common::MonitorLoop>(io.get_executor(), "failing",
         [&] { return FailLoop(failing_starts); }, report);
-    auto waiting = std::make_shared<MonitorLoop>(io.get_executor(), "waiting",
+    auto waiting = std::make_shared<common::MonitorLoop>(io.get_executor(), "waiting",
         [context, &gate, &waiting_starts] { return WaitLoop(gate, waiting_starts); }, report);
-    std::weak_ptr<MonitorLoop> waiting_owner = waiting;
+    std::weak_ptr<common::MonitorLoop> waiting_owner = waiting;
     failing->Start();
     waiting->Start();
     waiting->Start();
@@ -92,7 +92,7 @@ TEST(MonitorLoop, IndependentCompletionAndOwnership) {
 TEST(MonitorLoop, FactoryFailureAllowsRestart) {
     net::io_context io;
     int reports = 0;
-    auto loop = std::make_shared<MonitorLoop>(io.get_executor(), "factory",
+    auto loop = std::make_shared<common::MonitorLoop>(io.get_executor(), "factory",
         []() -> net::awaitable<void> { throw std::runtime_error("factory failed"); },
         [&](std::string_view name, std::exception_ptr failure) {
             if (name == "factory" && failure) ++reports;
@@ -110,7 +110,7 @@ TEST(MonitorLoop, WeakLoopSlotsPreserveOwnerUntilLastExit) {
         explicit Owner(bool& destroyed) : destroyed(destroyed) {}
         ~Owner() { destroyed = true; }
         bool& destroyed;
-        std::weak_ptr<MonitorLoop> loops[2];
+        std::weak_ptr<common::MonitorLoop> loops[2];
     };
 
     net::io_context io;
@@ -121,7 +121,7 @@ TEST(MonitorLoop, WeakLoopSlotsPreserveOwnerUntilLastExit) {
     int starts[2] = {};
     std::vector<Exit> exits;
     for (size_t i = 0; i < 2; ++i) {
-        auto loop = std::make_shared<MonitorLoop>(io.get_executor(), std::to_string(i),
+        auto loop = std::make_shared<common::MonitorLoop>(io.get_executor(), std::to_string(i),
             [owner, i, &gate, &starts] {
                 return i == 0 ? FailLoop(starts[i]) : WaitLoop(gate, starts[i]);
             },
@@ -168,7 +168,7 @@ TEST(MonitorLoop, StopJoinsActualCleanup) {
     bool cleaning = false;
     bool cleaned = false;
     bool joined = false;
-    auto loop = std::make_shared<MonitorLoop>(io.get_executor(), "cleanup",
+    auto loop = std::make_shared<common::MonitorLoop>(io.get_executor(), "cleanup",
         [&] { return CleanupLoop(work, cleanup, starts, cleaning, cleaned); },
         [&](std::string_view, std::exception_ptr) { ++reports; });
     loop->Start();
@@ -203,7 +203,7 @@ TEST(MonitorLoop, StopBeforeExecutionPreventsWork) {
     net::io_context io;
     int starts = 0;
     int reports = 0;
-    auto loop = std::make_shared<MonitorLoop>(io.get_executor(), "queued",
+    auto loop = std::make_shared<common::MonitorLoop>(io.get_executor(), "queued",
         [&] { return FailLoop(starts); },
         [&](std::string_view, std::exception_ptr) { ++reports; });
     loop->Start();
@@ -226,7 +226,7 @@ TEST(MonitorLoop, PartialStartFailureLeavesStartedLoopsJoinable) {
     net::io_context io;
     net::steady_timer work(io, net::steady_timer::time_point::max());
     int starts = 0;
-    auto first = std::make_shared<MonitorLoop>(io.get_executor(), "first",
+    auto first = std::make_shared<common::MonitorLoop>(io.get_executor(), "first",
         [&] { return WaitLoop(work, starts); },
         [](std::string_view, std::exception_ptr) {});
     first->Start();
@@ -234,7 +234,7 @@ TEST(MonitorLoop, PartialStartFailureLeavesStartedLoopsJoinable) {
     bool start_failed = false;
     try {
         const FailingFactory factory;
-        auto second = std::make_shared<MonitorLoop>(
+        auto second = std::make_shared<common::MonitorLoop>(
             io.get_executor(), "second", factory,
             [](std::string_view, std::exception_ptr) {});
         second->Start();
@@ -258,12 +258,12 @@ TEST(MonitorLoop, StopJoinsEveryAcceptedBatchChild) {
     int first_starts = 0;
     int second_starts = 0;
     int reports = 0;
-    auto loop = std::make_shared<MonitorLoop>(io.get_executor(), "batch",
+    auto loop = std::make_shared<common::MonitorLoop>(io.get_executor(), "batch",
         [&] {
             std::vector<net::awaitable<void>> tasks;
             tasks.push_back(WaitLoop(first, first_starts));
             tasks.push_back(WaitLoop(second, second_starts));
-            return ::RunAwaitableBatch(io.get_executor(), std::move(tasks));
+            return ::common::RunAwaitableBatch(io.get_executor(), std::move(tasks));
         },
         [&](std::string_view, std::exception_ptr) { ++reports; });
     loop->Start();

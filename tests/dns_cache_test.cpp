@@ -65,7 +65,7 @@ TEST_P(DnsCacheInsertion, FailedInsertionRetainsIndexedAnswerAndAllowsLaterEvict
     auto candidate = new_answer;
     if (negative) {
         candidate.addresses.clear();
-        candidate.error = ::ErrorCode::DNS_NO_RECORD;
+        candidate.error = ::common::ErrorCode::DNS_NO_RECORD;
     }
     int failures = 0;
     bool completed = false;
@@ -135,12 +135,12 @@ TEST(DnsCache, PositiveAndNegativeReplacementClampTtlAndIgnoreTemporaryFailure) 
     cache.Store("two.example", answer);
 
     DnsResult negative;
-    negative.error = ::ErrorCode::DNS_NO_RECORD;
+    negative.error = ::common::ErrorCode::DNS_NO_RECORD;
     negative.ttl = 1;
     cache.Store("two.example", negative);
     const auto cached_negative = cache.GetResult("two.example");
     ASSERT_TRUE(cached_negative);
-    EXPECT_EQ(cached_negative->error, ::ErrorCode::DNS_NO_RECORD);
+    EXPECT_EQ(cached_negative->error, ::common::ErrorCode::DNS_NO_RECORD);
     EXPECT_TRUE(cached_negative->addresses.empty());
     EXPECT_LE(cached_negative->ttl, 10u);
     auto cached_answer = answer;
@@ -152,7 +152,7 @@ TEST(DnsCache, PositiveAndNegativeReplacementClampTtlAndIgnoreTemporaryFailure) 
     EXPECT_LE(positive->ttl, 10u);
 
     DnsResult temporary_failure;
-    temporary_failure.error = ::ErrorCode::DNS_RESOLVE_FAILED;
+    temporary_failure.error = ::common::ErrorCode::DNS_RESOLVE_FAILED;
     cache.Store("two.example", temporary_failure);
     EXPECT_TRUE(cache.GetResult("two.example"));
 }
@@ -213,7 +213,7 @@ TEST(DnsCache, NegativeDiagnosticsSummarizeRecoveryExpiryEvictionAndShutdown) {
         ~ClearEvents() { negative_events.clear(); }
     } clear_events;
     DnsResult negative;
-    negative.error = ::ErrorCode::DNS_NO_RECORD;
+    negative.error = ::common::ErrorCode::DNS_NO_RECORD;
     negative.error_msg = "NXDOMAIN";
     negative.ttl = 60;
     {
@@ -277,7 +277,7 @@ TEST(DnsCache, ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage) {
         EXPECT_EQ(cache.GetStats().entries, 0);
 
         DnsResult negative;
-        negative.error = ErrorCode::DNS_NO_RECORD;
+        negative.error = common::ErrorCode::DNS_NO_RECORD;
         negative.error_msg = "NODATA";
         negative.ttl = 0;
         cache.Store("ttl.example", negative);

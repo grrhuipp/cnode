@@ -9,16 +9,34 @@
 #include <span>
 #include <string_view>
 
+namespace app {
+
 class GroupCoordinator;
+
+}  // namespace app
+namespace transport::internet {
+
 class SslContext;
+
+}  // namespace transport::internet
+namespace app {
+
 struct StatsShard;
+
+}  // namespace app
+namespace infra {
+
 struct TimeoutsConfig;
+
+}  // namespace infra
 namespace app::dns {
 class DNS;
 }  // namespace app::dns
 namespace session {
 struct Context;
 }  // namespace session
+
+namespace transport::internet {
 
 class InboundTransportStreamHandler {
 public:
@@ -46,8 +64,8 @@ public:
 // covers the whole fallback relay.
 struct InboundFallbackContext {
     session::Context& ctx;
-    StatsShard& stats;
-    const TimeoutsConfig& timeouts;
+    app::StatsShard& stats;
+    const infra::TimeoutsConfig& timeouts;
     app::dns::DNS* dns_service = nullptr;
 };
 
@@ -65,7 +83,7 @@ net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
 // required for REALITY with dest; an unauthenticated ClientHello is then
 // relayed to dest and the call yields a null stream.
 net::awaitable<TransportBuildResult> BuildInboundTransport(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> raw,
     const StreamSettings& s,
@@ -99,4 +117,6 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
     XHttpClientRequestKind kind,
     std::span<const net::const_buffer> packet_payload = {},
     uint64_t trace_conn_id = 0);
+
+}  // namespace transport::internet
 

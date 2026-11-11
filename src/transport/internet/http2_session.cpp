@@ -10,7 +10,7 @@ namespace transport::internet {
 using namespace h2;
 
 net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
     const GrpcConfig& cfg,
     net::io_context& io_context,
@@ -21,7 +21,7 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
         std::string_view(unsafe::ptr_cast<const char>(preface.data()), preface.size()) !=
             kHttp2ClientPreface) {
         LOG_CONN_DEBUG(conn_id, "gRPC server received invalid HTTP/2 client preface");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     co_return co_await StartHttp2ServerSession(coordinator, 
@@ -37,7 +37,7 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
 }
 
 net::awaitable<TransportBuildResult> RunHttp2ServerSession(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
     const HttpConfig& cfg,
     const XHttpConfig* xhttp_cfg,
@@ -88,7 +88,7 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
     bool tls,
     uint64_t conn_id) {
     const auto headers = EncodeHttpRequestHeaders(authority, tls, cfg);
-    const bool end_stream = EqualsAsciiCI(cfg.method, "GET");
+    const bool end_stream = common::EqualsAsciiCI(cfg.method, "GET");
     co_return co_await OpenHttp2ClientStream(
         std::move(stream),
         cfg.initial_window_size,

@@ -6,20 +6,20 @@
 #include <utility>
 
 // 每个协调器服务域至多发布一个限流器；各 Worker 在冷路径 Acquire 同一实例。
-class ConnectionLimiter::Service final : public net::execution_context::service {
+class app::ConnectionLimiter::Service final : public net::execution_context::service {
 public:
     inline static net::execution_context::id id;
     explicit Service(net::execution_context& context) : service(context) {}
-    std::shared_ptr<ConnectionLimiter> Acquire(
-        const RateLimitConfig& config, std::shared_ptr<GroupCoordinator> coordinator) {
+    std::shared_ptr<app::ConnectionLimiter> Acquire(
+        const app::RateLimitConfig& config, std::shared_ptr<app::GroupCoordinator> coordinator) {
         const std::lock_guard lock(mutex_);
         if (auto existing = published_.lock()) {
             if (existing->coordinator_ != coordinator)
                 throw std::logic_error("connection limiter coordinator mismatch");
             return existing;
         }
-        auto limiter = std::shared_ptr<ConnectionLimiter>(
-            new ConnectionLimiter(config, std::move(coordinator)));
+        auto limiter = std::shared_ptr<app::ConnectionLimiter>(
+            new app::ConnectionLimiter(config, std::move(coordinator)));
         published_ = limiter;
         return limiter;
     }
@@ -29,8 +29,10 @@ private:
         published_.reset();
     }
     std::mutex mutex_;
-    std::weak_ptr<ConnectionLimiter> published_;
+    std::weak_ptr<app::ConnectionLimiter> published_;
 };
+
+namespace app {
 
 const char* ConnectionLimiter::RejectReasonToString(RejectReason reason) noexcept {
     static constexpr const char* names[] = {
@@ -188,3 +190,5 @@ net::awaitable<ConnectionLimiter::Admission> ConnectionLimiter::Reserve(
         return Admission{reason, std::move(reservation)};
     });
 }
+
+}  // namespace app

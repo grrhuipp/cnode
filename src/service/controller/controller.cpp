@@ -41,20 +41,20 @@ namespace controller {
 
 namespace {
 
-[[nodiscard]] StreamSettings MapPanelStreamSettings(
-    const PanelConfig& panel_config,
+[[nodiscard]] transport::internet::StreamSettings MapPanelStreamSettings(
+    const infra::PanelConfig& panel_config,
     const api::NodeInfo& node_config) {
-    StreamSettings stream;
-    stream.network_mode = ParseNetworkMode(node_config.TransportProtocol);
-    stream.http.force_http2 = EqualsAsciiCI(node_config.TransportProtocol, "h2");
+    transport::internet::StreamSettings stream;
+    stream.network_mode = transport::internet::ParseNetworkMode(node_config.TransportProtocol);
+    stream.http.force_http2 = common::EqualsAsciiCI(node_config.TransportProtocol, "h2");
 
     // The panel permits local TLS termination; the protocol's registered
     // requirement and node setting decide whether this inbound uses it.
     if (node_config.EnableReality) {
-        stream.security_mode = SecurityMode::Reality;
+        stream.security_mode = transport::internet::SecurityMode::Reality;
         stream.reality = node_config.Reality;
     } else if (ShouldEnableInboundTls(panel_config, node_config)) {
-        stream.security_mode = SecurityMode::Tls;
+        stream.security_mode = transport::internet::SecurityMode::Tls;
         stream.tls.cert_file = panel_config.TLSCert;
         stream.tls.key_file = panel_config.TLSKey;
         stream.tls.server_name = node_config.TLSServerName;
@@ -64,27 +64,27 @@ namespace {
     // Fill the transport sub-config first: normalization derives cached
     // fields (gRPC request path, XHTTP path, Host) from it.
     switch (stream.network_mode) {
-    case NetworkMode::Ws:
+    case transport::internet::NetworkMode::Ws:
         stream.ws.path = node_config.Path;
         if (!node_config.Host.empty()) {
             stream.ws.headers.emplace(
-                LowerAscii("Host"),
+                common::LowerAscii("Host"),
                 node_config.Host);
         }
         break;
-    case NetworkMode::HttpUpgrade:
+    case transport::internet::NetworkMode::HttpUpgrade:
         stream.http_upgrade.path = node_config.Path;
         stream.http_upgrade.host = node_config.Host;
         break;
-    case NetworkMode::Http:
+    case transport::internet::NetworkMode::Http:
         stream.http.path = node_config.Path;
         stream.http.host = node_config.Host;
         break;
-    case NetworkMode::Grpc:
+    case transport::internet::NetworkMode::Grpc:
         stream.grpc.service_name = node_config.ServiceName;
         stream.grpc.authority = node_config.Host;
         break;
-    case NetworkMode::XHttp:
+    case transport::internet::NetworkMode::XHttp:
         stream.xhttp.path = node_config.Path;
         stream.xhttp.host = node_config.Host;
         break;
@@ -92,22 +92,22 @@ namespace {
         break;
     }
 
-    stream = NormalizeStreamSettings(stream);
-    if (stream.network_mode == NetworkMode::Unsupported ||
-        stream.security_mode == SecurityMode::Unsupported) {
+    stream = transport::internet::NormalizeStreamSettings(stream);
+    if (stream.network_mode == transport::internet::NetworkMode::Unsupported ||
+        stream.security_mode == transport::internet::SecurityMode::Unsupported) {
         throw std::invalid_argument("panel inbound has unsupported stream settings");
     }
     return stream;
 }
 }  // namespace
 
-std::vector<InboundUserSpec> MapPanelUsers(
+std::vector<infra::InboundUserSpec> MapPanelUsers(
     const api::NodeInfo& node_config,
     std::span<const api::UserInfo> users) {
-    std::vector<InboundUserSpec> specs;
+    std::vector<infra::InboundUserSpec> specs;
     specs.reserve(users.size());
     for (const auto& user : users) {
-        specs.push_back(InboundUserSpec{
+        specs.push_back(infra::InboundUserSpec{
             .user_id = user.UID,
             .email = user.Email,
             .credential = user.UUID,
@@ -119,8 +119,8 @@ std::vector<InboundUserSpec> MapPanelUsers(
     return specs;
 }
 
-InboundSpec MapPanelInbound(
-    const PanelConfig& panel_config,
+infra::InboundSpec MapPanelInbound(
+    const infra::PanelConfig& panel_config,
     const api::NodeInfo& node_config,
     std::span<const api::UserInfo> users) {
     const int node_id = panel_config.NodeIDs.Front();
@@ -128,7 +128,7 @@ InboundSpec MapPanelInbound(
         panel_config.Name, node_id, node_config.NodeType, node_config.Port);
     std::vector<std::string> all_tags{tag, std::string(constants::protocol::kNode)};
     routing::OutboundSelectionPolicy outbound_policy{routing::RouteWithFallback(tag)};
-    return InboundSpec{
+    return infra::InboundSpec{
         .tag = std::move(tag),
         .all_tags = std::move(all_tags),
         .accounting_key = naming::BuildPanelNodeAccountingKey(panel_config.Name, node_id),
@@ -136,10 +136,10 @@ InboundSpec MapPanelInbound(
         .listen = panel_config.ListenIP,
         .port = node_config.Port,
         .proxy_protocol = panel_config.ProxyProtocol,
-        .settings = InboundProtocolSettings{
+        .settings = infra::InboundProtocolSettings{
             .method = node_config.CypherMethod,
             .identity_password = node_config.ShadowsocksServerKey,
-            .ss2022_user_key = Ss2022UserKey::UuidDerived,
+            .ss2022_user_key = infra::Ss2022UserKey::UuidDerived,
             .padding_scheme = node_config.PaddingScheme,
             .vless_decryption = std::string(constants::protocol::kNone),
             .hysteria_up_mbps = node_config.HysteriaUpMbps,
@@ -147,25 +147,25 @@ InboundSpec MapPanelInbound(
         },
         .users = MapPanelUsers(node_config, users),
         .stream_settings = MapPanelStreamSettings(panel_config, node_config),
-        .sniffing = SniffConfig{},
+        .sniffing = routing::SniffConfig{},
         .outbound_policy = std::move(outbound_policy),
     };
 }
 }  // namespace controller
 
-struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
+struct controller::Controller::Impl : std::enable_shared_from_this<controller::Controller::Impl> {
     struct PanelRuntime;
     class NodeRuntime;
     Impl(net::io_context& io_context,
-         const std::vector<std::unique_ptr<Worker>>& workers);
+         const std::vector<std::unique_ptr<app::Worker>>& workers);
 
-    void AddPanel(std::unique_ptr<api::API> panel, const PanelConfig& panel_config);
+    void AddPanel(std::unique_ptr<api::API> panel, const infra::PanelConfig& panel_config);
     void Start();
     void RequestStop() noexcept;
     net::awaitable<void> AsyncJoin();
     net::awaitable<void> FlushTraffic();
 
-    [[nodiscard]] std::vector<Controller::NodeStatsInfo> GetNodeStats() const;
+    [[nodiscard]] std::vector<controller::Controller::NodeStatsInfo> GetNodeStats() const;
 
     net::awaitable<void> PanelSyncLoop(PanelRuntime& panel);
     net::awaitable<void> PanelStatusLoop(const PanelRuntime& panel) const;
@@ -180,7 +180,7 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
     GetOnlineSnapshot(const std::string& tag);
 
     net::io_context&                       io_context_;
-    const std::vector<std::unique_ptr<Worker>>&  workers_;
+    const std::vector<std::unique_ptr<app::Worker>>&  workers_;
     bool stopping_ = false;
     controller::NodeMutationGate node_mutations_;
     std::unique_ptr<controller::JournalExecutor> journal_executor_;
@@ -198,13 +198,13 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
         uint64_t bytes_down   = 0;
     };
     struct PanelRuntime {
-        PanelRuntime(std::unique_ptr<api::API> api, const PanelConfig& source,
+        PanelRuntime(std::unique_ptr<api::API> api, const infra::PanelConfig& source,
                      controller::NodeMutationGate& gate, net::any_io_executor executor);
 
         const std::unique_ptr<api::API> client;
-        const PanelConfig config;
+        const infra::PanelConfig config;
         const int node_id;
-        const PanelLogContext log_context;
+        const infra::PanelLogContext log_context;
         const std::string accounting_key;
         PanelState state = PanelState::Connecting;
         controller::NodeState node;
@@ -212,17 +212,19 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
         NodeStats stats;
         std::unique_ptr<controller::TrafficJournal> traffic_journal;
         // Active loops retain Impl, which owns these address-stable entities.
-        std::weak_ptr<MonitorLoop> sync_loop;
-        std::weak_ptr<MonitorLoop> status_loop;
+        std::weak_ptr<common::MonitorLoop> sync_loop;
+        std::weak_ptr<common::MonitorLoop> status_loop;
     };
     std::vector<std::unique_ptr<PanelRuntime>> panels_;
 };
+namespace controller {
+
 namespace {
 
 
 [[nodiscard]] proxyman::outbound::PreparedOutboundConfig BuildPanelAutoOutbound(
     const std::string& tag,
-    const PanelConfig& panel_config) {
+    const infra::PanelConfig& panel_config) {
     const auto strategy = panel_config.EnableDNS
         ? panel_config.DNSType
         : proxy::freedom::outbound::DomainStrategy::AsIs;
@@ -243,7 +245,7 @@ namespace {
 }
 
 std::unique_ptr<api::API> ValidatePanelRuntimeArgs(
-    std::unique_ptr<api::API> api, const PanelConfig& source) {
+    std::unique_ptr<api::API> api, const infra::PanelConfig& source) {
     if (!api || source.Name.empty() || source.NodeIDs.Values().size() != 1) {
         throw std::invalid_argument("panel runtime requires a client, a name and one node ID");
     }
@@ -262,42 +264,44 @@ std::unique_ptr<api::API> ValidatePanelRuntimeArgs(
 
 }  // namespace
 
+}  // namespace controller
+
 // The concrete cold-path boundary for all-Worker mutations. Each asynchronous
 // operation joins every started Worker task before it completes or throws.
-class Controller::Impl::NodeRuntime {
+class controller::Controller::Impl::NodeRuntime {
 public:
     NodeRuntime(net::io_context& io_context,
-                const std::vector<std::unique_ptr<Worker>>& workers,
+                const std::vector<std::unique_ptr<app::Worker>>& workers,
                 PanelRuntime& panel,
                 const bool& stopping)
         : io_context_(io_context), workers_(workers), panel_(panel),
           stopping_(stopping) {}
 
     net::awaitable<void> RemoveInbound(const std::string& tag) {
-        co_await PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
-            [&tag](Worker& worker, size_t) {
+        co_await app::PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
+            [&tag](app::Worker& worker, size_t) {
                 return worker.PostTask(worker.UnregisterListenerTask(tag));
             });
     }
 
     net::awaitable<void> RemoveOutbound(const std::string& tag) {
-        co_await PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
-            [&tag](Worker& worker, size_t) {
+        co_await app::PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
+            [&tag](app::Worker& worker, size_t) {
                 return worker.PostCall([&worker, tag] { worker.RemoveOutbound(tag); });
             });
     }
 
     net::awaitable<void> AddOutbound(
         const proxyman::outbound::PreparedOutboundConfig& prepared) {
-        co_await PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
-            [&prepared](Worker& worker, size_t) {
+        co_await app::PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
+            [&prepared](app::Worker& worker, size_t) {
                 return worker.PostCall([&worker, config = prepared]() mutable {
                     worker.AddOutbound(std::move(config));
                 });
             });
     }
 
-    net::awaitable<bool> AddInbound(const PreparedInbound& inbound) {
+    net::awaitable<bool> AddInbound(const app::PreparedInbound& inbound) {
         const auto& log_context = panel_.log_context;
         const auto& tag = inbound.binding.tag;
 
@@ -305,18 +309,18 @@ public:
         try {
             // Every Worker attempts the install even after another failed, so
             // the single RemoveInbound below sees one consistent outcome.
-            const auto installed = co_await PostToEachWorkerInOrder(workers_, stopping_,
-                [&inbound](Worker& worker, size_t) {
-                    return worker.PostTask(InstallInbound(worker, inbound));
+            const auto installed = co_await app::PostToEachWorkerInOrder(workers_, stopping_,
+                [&inbound](app::Worker& worker, size_t) {
+                    return worker.PostTask(app::InstallInbound(worker, inbound));
                 });
 
             const auto failed = std::ranges::find_if(
-                installed, [](InboundInstallFailure result) {
-                    return result != InboundInstallFailure::None;
+                installed, [](app::InboundInstallFailure result) {
+                    return result != app::InboundInstallFailure::None;
                 });
             if (failed != installed.end()) {
                 LOG_PANEL_WARN(log_context, "Inbound install failed: stage={} protocol={} tag={}",
-                         InboundInstallFailureName(*failed), inbound.binding.protocol, tag);
+                         app::InboundInstallFailureName(*failed), inbound.binding.protocol, tag);
                 co_await RemoveInbound(tag);
                 co_return false;
             }
@@ -335,7 +339,7 @@ public:
             }
             std::rethrow_exception(publish_failure);
         }
-        ThrowIfStopping(stopping_);
+        app::ThrowIfStopping(stopping_);
 
         LOG_PANEL_INFO(log_context, "inbound ready: tag={} port={} protocol={} network={} workers={} accept=SO_REUSEPORT",
                        tag, inbound.binding.port, inbound.binding.protocol,
@@ -346,8 +350,8 @@ public:
     net::awaitable<void> UpdateRules(
         const std::string& tag,
         std::shared_ptr<const std::vector<rule::DetectRule>> new_rule_list) {
-        co_await PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
-            [&tag, &new_rule_list, last = workers_.size() - 1](Worker& worker, size_t index) {
+        co_await app::PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
+            [&tag, &new_rule_list, last = workers_.size() - 1](app::Worker& worker, size_t index) {
                 auto rules = index == last ? std::move(new_rule_list) : new_rule_list;
                 return worker.PostCall([&worker, tag = tag, rules = std::move(rules)]() mutable {
                     worker.UpdateRule(tag, std::move(rules));
@@ -356,7 +360,7 @@ public:
     }
 
     net::awaitable<void> RecoverUsers() {
-        return ::RollbackUsers(
+        return ::app::RollbackUsers(
             io_context_.get_executor(), workers_, panel_.node.user_recovery, stopping_);
     }
 
@@ -364,7 +368,7 @@ public:
         co_await RecoverUsers();
         const auto user_protocol = proxyman::inbound::RegisteredUserProtocol(protocol);
         if (!user_protocol) throw std::logic_error("node has no registered user protocol");
-        co_await ::PublishUsers(io_context_.get_executor(), workers_,
+        co_await ::app::PublishUsers(io_context_.get_executor(), workers_,
             proxyman::inbound::UserStore::PrepareClearUsers(*user_protocol, tag),
             panel_.node.user_recovery, stopping_);
     }
@@ -372,7 +376,7 @@ public:
     net::awaitable<void> ApplyUsers(
         const std::string& tag, const proxyman::inbound::UserSet& users) {
         co_await RecoverUsers();
-        co_await ::PublishUsers(io_context_.get_executor(), workers_,
+        co_await ::app::PublishUsers(io_context_.get_executor(), workers_,
             proxyman::inbound::UserStore::PrepareUsers(tag, users),
             panel_.node.user_recovery, stopping_);
     }
@@ -381,18 +385,20 @@ public:
 
 private:
     net::io_context& io_context_;
-    const std::vector<std::unique_ptr<Worker>>& workers_;
+    const std::vector<std::unique_ptr<app::Worker>>& workers_;
     PanelRuntime& panel_;
     const bool& stopping_;
 };
+namespace controller {
+
 Controller::Controller(net::io_context& io_context,
-                       const std::vector<std::unique_ptr<Worker>>& workers)
+                       const std::vector<std::unique_ptr<app::Worker>>& workers)
     : impl_(std::make_shared<Impl>(io_context, workers)) {}
 
 Controller::~Controller() = default;
 
 void Controller::AddPanel(std::unique_ptr<api::API> panel,
-                          const PanelConfig& panel_config) {
+                          const infra::PanelConfig& panel_config) {
     impl_->AddPanel(std::move(panel), panel_config);
 }
 
@@ -417,12 +423,12 @@ std::vector<Controller::NodeStatsInfo> Controller::GetNodeStats() const {
 }
 
 Controller::Impl::Impl(net::io_context& io_context,
-                       const std::vector<std::unique_ptr<Worker>>& workers)
+                       const std::vector<std::unique_ptr<app::Worker>>& workers)
     : io_context_(io_context)
     , workers_(workers) {}
 
 Controller::Impl::PanelRuntime::PanelRuntime(
-    std::unique_ptr<api::API> api, const PanelConfig& source,
+    std::unique_ptr<api::API> api, const infra::PanelConfig& source,
     controller::NodeMutationGate& gate, net::any_io_executor executor)
     : client(ValidatePanelRuntimeArgs(std::move(api), source))
     , config(source)
@@ -439,8 +445,8 @@ Controller::Impl::PanelRuntime::PanelRuntime(
 }
 
 void Controller::Impl::AddPanel(std::unique_ptr<api::API> panel,
-                                const PanelConfig& panel_config) {
-    ThrowIfStopping(stopping_);
+                                const infra::PanelConfig& panel_config) {
+    app::ThrowIfStopping(stopping_);
     // Construct the complete entity before publishing it to the owner.
     auto runtime = std::make_unique<PanelRuntime>(
         std::move(panel), panel_config, node_mutations_, io_context_.get_executor());
@@ -463,7 +469,7 @@ void Controller::Impl::Start() {
                 panel->config.Name, panel->node_id,
                 kind == LoopKind::Sync ? "sync" : "status");
             auto self = shared_from_this();
-            auto loop = std::make_shared<MonitorLoop>(
+            auto loop = std::make_shared<common::MonitorLoop>(
                 io_context_.get_executor(), name,
                 [self, panel, kind] {
                     return kind == LoopKind::Sync
@@ -654,16 +660,16 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
     // unavailable panel cannot indefinitely retain orphan resources.
     if (panel.node.HasPendingCleanup()) {
         auto lease = co_await node_mutations_.Acquire(panel.mutation);
-        ThrowIfStopping(stopping_);
+        app::ThrowIfStopping(stopping_);
         co_await controller::CleanPendingNodeRuntime(runtime, panel.node);
     }
-    ThrowIfStopping(stopping_);
+    app::ThrowIfStopping(stopping_);
     const auto old_state = panel.node.committed;
     auto config_result = co_await panel.client->GetNodeInfo(
         old_state ? old_state->config_etag : std::string{});
-    ThrowIfStopping(stopping_);
+    app::ThrowIfStopping(stopping_);
     if (!config_result.Ok()) {
-        throw std::runtime_error(ErrorMessage(config_result.error, config_result.error_msg));
+        throw std::runtime_error(common::ErrorMessage(config_result.error, config_result.error_msg));
     }
 
     if (config_result.not_modified && !old_state) {
@@ -694,16 +700,16 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
 
     auto users_result = co_await panel.client->GetUserList(
         old_state ? old_state->users_etag : std::string{});
-    ThrowIfStopping(stopping_);
+    app::ThrowIfStopping(stopping_);
     std::optional<std::vector<api::UserInfo>> next_users;
     if (!users_result.Ok()) {
         if (transitioning) {
-            throw std::runtime_error(ErrorMessage(
+            throw std::runtime_error(common::ErrorMessage(
                 users_result.error, users_result.error_msg));
         }
         LOG_PANEL_WARN(log_context, "Panel sync degraded: operation=pull resource=users reason={}",
                  users_result.error_msg.empty()
-                    ? ErrorCodeToString(users_result.error)
+                    ? common::ErrorCodeToString(users_result.error)
                     : users_result.error_msg);
     } else if (users_result.not_modified) {
         if (!old_state) {
@@ -736,7 +742,7 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
     const bool rebuild_settings = !old_state ||
         controller::NodeConfigChanged(old_state->config, candidate->config);
     if (rebuild_settings) {
-        candidate->inbound = std::make_shared<const PreparedInbound>(PrepareInbound(
+        candidate->inbound = std::make_shared<const app::PreparedInbound>(app::PrepareInbound(
             controller::MapPanelInbound(panel.config, candidate->config, *candidate->users)));
         candidate->outbound =
             std::make_shared<const proxyman::outbound::PreparedOutboundConfig>(
@@ -744,8 +750,8 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
     } else if (next_users) {
         // Only the users changed: keep every prepared setting and rebuild the
         // authentication payload through the same per-protocol builder.
-        auto inbound = std::make_shared<PreparedInbound>(*old_state->inbound);
-        inbound->users = PrepareInboundUsers(
+        auto inbound = std::make_shared<app::PreparedInbound>(*old_state->inbound);
+        inbound->users = app::PrepareInboundUsers(
             inbound->build_request,
             controller::MapPanelUsers(candidate->config, *candidate->users));
         candidate->inbound = std::move(inbound);
@@ -763,7 +769,7 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
     // Hold fair admission before checking endpoints: another panel may
     // commit or retain recovery reservations while this one waits.
     auto lease = co_await node_mutations_.Acquire(panel.mutation);
-    ThrowIfStopping(stopping_);
+    app::ThrowIfStopping(stopping_);
     if (panel.node.HasPendingCleanup()) {
         throw std::logic_error("node admission requires completed local cleanup");
     }
@@ -776,7 +782,7 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
         }
     }
     co_await controller::ApplyNodeChange(runtime, panel.node, std::move(change));
-    ThrowIfStopping(stopping_);
+    app::ThrowIfStopping(stopping_);
     if (transitioning) {
         LOG_PANEL_INFO(log_context, "Panel configuration ready: tag={} replaced={}",
             tag, old_state ? "yes" : "no");
@@ -900,20 +906,20 @@ net::awaitable<void> Controller::Impl::FlushTraffic() {
 
 net::awaitable<controller::OnlineSnapshot>
 Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
-    auto per_worker = co_await PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
-        [&tag](Worker& worker, size_t) {
+    auto per_worker = co_await app::PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
+        [&tag](app::Worker& worker, size_t) {
             return worker.PostCall([&worker, t = std::string_view(tag)] {
                 return worker.GetOnlineDevices(t);
             });
         });
-    ThrowIfStopping(stopping_);
+    app::ThrowIfStopping(stopping_);
 
     size_t total_online = 0;
     for (const auto& online : per_worker) {
         total_online += online.size();
     }
 
-    std::vector<OnlineDevice> devices;
+    std::vector<common::OnlineDevice> devices;
     devices.reserve(total_online);
     for (auto& online : per_worker) {
         devices.insert(devices.end(),
@@ -927,7 +933,7 @@ net::awaitable<void> Controller::Impl::UserInfoMonitor(PanelRuntime& panel,
                                                        std::string tag) {
     const auto& log_context = panel.log_context;
 
-    ThrowIfStopping(stopping_);
+    app::ThrowIfStopping(stopping_);
     // Drain never-attempted crash/backpressure records before collecting more;
     // otherwise a full journal of ready records could never free its capacity.
     auto& ns = panel.stats;
@@ -953,14 +959,14 @@ net::awaitable<void> Controller::Impl::UserInfoMonitor(PanelRuntime& panel,
                 journal_ok = false;
                 LOG_PANEL_WARN(log_context, "Traffic collection failed: operation=push reason={}", e.what());
             }
-            ThrowIfStopping(stopping_);
+            app::ThrowIfStopping(stopping_);
             if (appended) {
                 batch = co_await journal_executor_->Run([&panel] {
                     return panel.traffic_journal->Prepare();
                 });
             }
         }
-        ThrowIfStopping(stopping_);
+        app::ThrowIfStopping(stopping_);
         if (!batch.records.empty()) {
             co_await journal_executor_->Run([&panel, &batch] {
                 panel.traffic_journal->Begin(batch);
@@ -1005,7 +1011,7 @@ net::awaitable<void> Controller::Impl::UserInfoMonitor(PanelRuntime& panel,
                 });
             }
         }
-        ThrowIfStopping(stopping_);
+        app::ThrowIfStopping(stopping_);
         if (traffic_ok) {
             LOG_PANEL_DEBUG(log_context, "Traffic report accepted: users={}", traffic_data.size());
         }
@@ -1019,11 +1025,11 @@ net::awaitable<void> Controller::Impl::UserInfoMonitor(PanelRuntime& panel,
     ns.online_count = online.user_count;
     const auto& traffic_data = batch.traffic;
 
-    ThrowIfStopping(stopping_);
+    app::ThrowIfStopping(stopping_);
     bool online_ok = false;
     try {
         online_ok = co_await panel.client->ReportNodeOnlineUsers(online.entries);
-        ThrowIfStopping(stopping_);
+        app::ThrowIfStopping(stopping_);
     } catch (const std::exception& e) {
         if (stopping_) throw;
         LOG_PANEL_WARN(log_context, "Online report failed: operation=push reason={}", e.what());
@@ -1040,4 +1046,6 @@ net::awaitable<void> Controller::Impl::UserInfoMonitor(PanelRuntime& panel,
         online.entries.size());
     co_return;
 }
+
+}  // namespace controller
 

@@ -9,8 +9,8 @@
 
 namespace {
 using proxy::shadowsocks::outbound::Credentials;
-using ss::SsCipherInfo;
-using ss::SsCipherType;
+using proxy::shadowsocks::SsCipherInfo;
+using proxy::shadowsocks::SsCipherType;
 
 constexpr SsCipherInfo kAes128{SsCipherType::AES_128_GCM, 16, 16};
 constexpr SsCipherInfo kAes256{SsCipherType::AES_256_GCM, 32, 32};

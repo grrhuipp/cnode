@@ -7,12 +7,12 @@
 #include <unistd.h>
 
 TEST(ProcessResources, DescriptorCountTracksOpenAndClose) {
-    const auto before = ::ReadProcessDescriptors();
+    const auto before = ::app::ReadProcessDescriptors();
     const int descriptor = ::open("/dev/null", O_RDONLY);
     ASSERT_GE(descriptor, 0);
-    const auto during = ::ReadProcessDescriptors();
+    const auto during = ::app::ReadProcessDescriptors();
     const int closed = ::close(descriptor);
-    const auto after = ::ReadProcessDescriptors();
+    const auto after = ::app::ReadProcessDescriptors();
     EXPECT_EQ(closed, 0);
     ASSERT_TRUE(before.open);
     ASSERT_TRUE(during.open);
@@ -24,7 +24,7 @@ TEST(ProcessResources, DescriptorCountTracksOpenAndClose) {
 TEST(ProcessResources, ReportsOperatingSystemSoftLimit) {
     rlimit limits{};
     ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &limits), 0);
-    const auto sample = ::ReadProcessDescriptors();
+    const auto sample = ::app::ReadProcessDescriptors();
     if (limits.rlim_cur == RLIM_INFINITY) {
         EXPECT_TRUE(sample.soft_limit_unlimited);
         EXPECT_FALSE(sample.soft_limit);

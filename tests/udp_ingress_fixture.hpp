@@ -9,7 +9,7 @@
 // 名称仅用于组织测试场景；生产入口只接收地址稳定的 socket 状态。
 class UdpSocketFixtures final {
 public:
-    using Ingress = worker_detail::UdpIngress;
+    using Ingress = app::worker_detail::UdpIngress;
     explicit UdpSocketFixtures(net::io_context& io) : io_(io) {}
 
     Ingress::SocketStatePtr Get(Ingress& ingress, std::string_view name) {

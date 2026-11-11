@@ -19,7 +19,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <utility>
-namespace vmess {
+namespace proxy::vmess {
 
 std::array<uint8_t, 16> MD5Hash(const uint8_t* data, size_t len) {
     const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>
@@ -228,7 +228,7 @@ HeaderAeadKey ResponseHeaderPayloadKey(std::span<const uint8_t, 16> response_key
 }
 
 std::optional<MemoryAccount> MemoryAccount::FromUUID(std::string_view uuid_str) {
-    auto uuid_bytes = ::ParseUuid(uuid_str);
+    auto uuid_bytes = ::common::ParseUuid(uuid_str);
     if (!uuid_bytes) {
         return std::nullopt;
     }
@@ -382,8 +382,8 @@ uint16_t ShakeMask::NextMask() {
         Refill();
     }
 
-    uint16_t result = LoadU16BE(&buffer_[offset_]);
+    uint16_t result = common::LoadU16BE(&buffer_[offset_]);
     offset_ += 2;
     return result;
 }
-}  // namespace vmess
+}  // namespace proxy::vmess

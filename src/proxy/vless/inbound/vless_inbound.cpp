@@ -77,7 +77,7 @@ private:
             co_return;
         }
         header_sent_ = true;
-        ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> out;
+        common::ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> out;
         out.Append(HeaderBuffer());
         out.AppendMultiBuffer(mb);
         co_await dst_.WriteBuffers(out.Span());
@@ -89,15 +89,15 @@ private:
             co_return;
         }
         header_sent_ = true;
-        ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> out;
+        common::ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> out;
         out.Append(HeaderBuffer());
         out.AppendBuffers(buffers);
         co_await dst_.WriteBuffers(out.Span());
     }
 
     [[nodiscard]] static net::const_buffer HeaderBuffer() noexcept {
-        return net::const_buffer(::vless::kResponseHeader.data(),
-                                 ::vless::kResponseHeader.size());
+        return net::const_buffer(::proxy::vless::kResponseHeader.data(),
+                                 ::proxy::vless::kResponseHeader.size());
     }
 
     transport::MultiBufferWriter& dst_;
@@ -105,15 +105,15 @@ private:
 };
 
 
-net::awaitable<tl::expected<::vless::RequestHeader, ErrorCode>>
+net::awaitable<tl::expected<::proxy::vless::RequestHeader, common::ErrorCode>>
 ReadVlessRequestHeader(proxy::BufferedStreamReader& active_reader,
-                       AsyncStream& stream,
+                       transport::AsyncStream& stream,
                        session::Context& ctx) {
     const auto& client_ip = ctx.inbound.source_ip;
-    using ::vless::RequestHeaderDecodeStatus;
-    std::array<uint8_t, ::vless::kMaxRequestHeaderSize> handshake{};
+    using ::proxy::vless::RequestHeaderDecodeStatus;
+    std::array<uint8_t, ::proxy::vless::kMaxRequestHeaderSize> handshake{};
     size_t total_read = 0;
-    ScopedCleanse cleanse_handshake{handshake};
+    common::ScopedCleanse cleanse_handshake{handshake};
     size_t required = 1;
     for (;;) {
         bool read_ok = false;
@@ -127,9 +127,9 @@ ReadVlessRequestHeader(proxy::BufferedStreamReader& active_reader,
                           handshake.data() + total_read,
                           required - total_read, &step_read);
         } catch (const IoSystemError& error) {
-            const ErrorCode classified =
+            const common::ErrorCode classified =
                 proxy::ClassifyHandshakeReadException(stream, error);
-            if (classified == ErrorCode::TIMEOUT) {
+            if (classified == common::ErrorCode::TIMEOUT) {
                 LOG_CONN_WARN(ctx, "handshake phase deadline from {}:{}",
                               client_ip, ctx.inbound.source_port);
             }
@@ -140,12 +140,12 @@ ReadVlessRequestHeader(proxy::BufferedStreamReader& active_reader,
                 proxy::ResolveHandshakeReadFailure(
                     stream,
                     total_read == 0 && step_read == 0
-                        ? ErrorCode::SOCKET_EOF
-                        : ErrorCode::PROTOCOL_DECODE_FAILED));
+                        ? common::ErrorCode::SOCKET_EOF
+                        : common::ErrorCode::PROTOCOL_DECODE_FAILED));
         }
         total_read = required;
 
-        auto decoded = ::vless::DecodeRequestHeader(
+        auto decoded = ::proxy::vless::DecodeRequestHeader(
             std::span<const uint8_t>(handshake.data(), total_read));
         switch (decoded.status) {
         case RequestHeaderDecodeStatus::Complete:
@@ -155,35 +155,35 @@ ReadVlessRequestHeader(proxy::BufferedStreamReader& active_reader,
             continue;
         case RequestHeaderDecodeStatus::InvalidVersion:
             proxy::LogInboundRequestRejected(ctx, "invalid protocol version");
-            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_VERSION);
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_INVALID_VERSION);
         case RequestHeaderDecodeStatus::InvalidAddress:
             proxy::LogInboundRequestRejected(ctx, "invalid target address");
-            co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
         case RequestHeaderDecodeStatus::InvalidCommand:
         case RequestHeaderDecodeStatus::InvalidAddons:
             break;
         }
         proxy::LogInboundRequestRejected(ctx, "invalid request header");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 }
 
 struct VlessHandshakeOutcome {
-    UserOnlineSessionGuard user_session;
-    Network net = Network::TCP;
+    common::UserOnlineSessionGuard user_session;
+    common::Network net = common::Network::TCP;
     bool packet_addr_udp = false;
     bool use_vision = false;
     std::array<uint8_t, 16> request_uuid{};
-    ::vless::VlessActiveIo active;
+    ::proxy::vless::VlessActiveIo active;
 };
 
-net::awaitable<tl::expected<VlessHandshakeOutcome, ErrorCode>>
+net::awaitable<tl::expected<VlessHandshakeOutcome, common::ErrorCode>>
 CompleteVlessInboundHandshake(
-    AsyncStream& stream,
-    const std::shared_ptr<const ::vless::VlessEncryptionConfig>& decryption,
+    transport::AsyncStream& stream,
+    const std::shared_ptr<const ::proxy::vless::VlessEncryptionConfig>& decryption,
     proxy::BufferedStreamReader& protocol_reader,
     transport::MultiBufferWriter& protocol_writer,
-    std::optional<::vless::VlessEncryptedIo>& encrypted_io,
+    std::optional<::proxy::vless::VlessEncryptedIo>& encrypted_io,
     const proxyman::inbound::AdmissionEnvironment& environment,
     proxy::InboundAuthentication authentication,
     const proxyman::inbound::ReceiverSettings& receiver,
@@ -192,12 +192,12 @@ CompleteVlessInboundHandshake(
     const auto& client_ip = ctx.inbound.source_ip;
     auto* active_reader = &protocol_reader;
     auto* active_writer = &protocol_writer;
-    std::optional<::vless::VlessEncryptionIssuedTicket> issued_ticket;
+    std::optional<::proxy::vless::VlessEncryptionIssuedTicket> issued_ticket;
     std::optional<std::array<uint8_t, 16>> resumed_identity;
     if (decryption) {
         try {
             auto runtime =
-                co_await ::vless::RunVlessEncryptionServerHandshake(
+                co_await ::proxy::vless::RunVlessEncryptionServerHandshake(
                     environment.coordinator,
                     protocol_reader,
                     protocol_writer,
@@ -207,13 +207,13 @@ CompleteVlessInboundHandshake(
                 if (proxy::ConsumeStreamReadTimeout(stream)) {
                     LOG_CONN_WARN(ctx, "encryption handshake timed out from {}:{}",
                                   client_ip, ctx.inbound.source_port);
-                    co_return tl::unexpected(ErrorCode::TIMEOUT);
+                    co_return tl::unexpected(common::ErrorCode::TIMEOUT);
                 }
-                if (runtime.error() == ::vless::VlessEncryptionHandshakeFailure::Closed) {
-                    co_return tl::unexpected(ErrorCode::SOCKET_EOF);
+                if (runtime.error() == ::proxy::vless::VlessEncryptionHandshakeFailure::Closed) {
+                    co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
                 }
                 const bool truncated =
-                    runtime.error() == ::vless::VlessEncryptionHandshakeFailure::Truncated;
+                    runtime.error() == ::proxy::vless::VlessEncryptionHandshakeFailure::Truncated;
                 const auto reason = truncated
                     ? "encryption handshake truncated" : "encryption handshake rejected";
                 if (truncated) {
@@ -221,7 +221,7 @@ CompleteVlessInboundHandshake(
                 } else {
                     proxy::LogInboundRequestRejected(ctx, reason);
                 }
-                co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+                co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
             }
             issued_ticket = std::move(runtime->issued_ticket);
             resumed_identity = runtime->resumed_identity;
@@ -230,22 +230,22 @@ CompleteVlessInboundHandshake(
             active_reader = &encrypted_io->plain_reader;
             active_writer = &encrypted_io->writer;
         } catch (const IoSystemError& error) {
-            const ErrorCode classified =
+            const common::ErrorCode classified =
                 proxy::ClassifyHandshakeReadException(stream, error);
-            if (classified == ErrorCode::CANCELLED) {
+            if (classified == common::ErrorCode::CANCELLED) {
                 LOG_CONN_DEBUG(ctx, "encryption handshake cancelled from {}:{}",
                                client_ip, ctx.inbound.source_port);
             } else {
                 LOG_CONN_WARN(ctx, "encryption handshake failed from {}:{} > {}",
                               client_ip, ctx.inbound.source_port,
-                              classified == ErrorCode::TIMEOUT ? "timeout" : "transport error");
+                              classified == common::ErrorCode::TIMEOUT ? "timeout" : "transport error");
             }
             co_return tl::unexpected(classified);
-        } catch (const WorkerMailboxFull&) {
-            co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        } catch (const app::WorkerMailboxFull&) {
+            co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
         } catch (...) {
             proxy::LogInboundRequestRejected(ctx, "encryption handshake exception");
-            co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         }
     }
 
@@ -256,20 +256,20 @@ CompleteVlessInboundHandshake(
     }
     auto& request = *parsed_request;
     const auto credential = co_await authentication.VerifyCredential({proxy::KeyedInboundProtocol::Vless, request.uuid});
-    if (credential != ErrorCode::OK) co_return tl::unexpected(credential);
+    if (credential != common::ErrorCode::OK) co_return tl::unexpected(credential);
     auto user_info = proxyman::inbound::UserStore::FindVlessUser(tag, request.uuid);
     if (!user_info) {
         co_return tl::unexpected(co_await authentication.RejectCredential("no matching user"));
     }
-    Network net = Network::TCP;
-    if (request.command == ::vless::Command::UDP) {
-        net = Network::UDP;
-    } else if (request.command == ::vless::Command::MUX) {
-        net = Network::MUX;
+    common::Network net = common::Network::TCP;
+    if (request.command == ::proxy::vless::Command::UDP) {
+        net = common::Network::UDP;
+    } else if (request.command == ::proxy::vless::Command::MUX) {
+        net = common::Network::MUX;
     }
     const bool packet_addr_udp =
-        request.command == ::vless::Command::UDP &&
-        ::vless::IsPacketAddrMagic(request.target);
+        request.command == ::proxy::vless::Command::UDP &&
+        ::proxy::vless::IsPacketAddrMagic(request.target);
     // Published before flow/transport validation so those rejections log the
     // authenticated user and the requested target.
     auto bound = std::move(authentication).Bind(user_info->profile,
@@ -279,30 +279,30 @@ CompleteVlessInboundHandshake(
             std::move(request.forwarded)});
     if (resumed_identity &&
         CRYPTO_memcmp(resumed_identity->data(), request.uuid.data(), request.uuid.size()) != 0) {
-        co_return tl::unexpected(std::move(bound).Reject("resumed identity mismatch", ErrorCode::PROTOCOL_AUTH_FAILED));
+        co_return tl::unexpected(std::move(bound).Reject("resumed identity mismatch", common::ErrorCode::PROTOCOL_AUTH_FAILED));
     }
-    const bool use_vision = ::vless::IsVisionFlow(request.flow);
+    const bool use_vision = ::proxy::vless::IsVisionFlow(request.flow);
     if (!request.flow.empty()) {
         if (std::string_view(request.flow) != user_info->flow) {
-            co_return tl::unexpected(std::move(bound).Reject("request flow not allowed", ErrorCode::PROTOCOL_UNSUPPORTED));
+            co_return tl::unexpected(std::move(bound).Reject("request flow not allowed", common::ErrorCode::PROTOCOL_UNSUPPORTED));
         }
         if (!use_vision) {
-            co_return tl::unexpected(std::move(bound).Reject("unknown request flow", ErrorCode::PROTOCOL_UNSUPPORTED));
+            co_return tl::unexpected(std::move(bound).Reject("unknown request flow", common::ErrorCode::PROTOCOL_UNSUPPORTED));
         }
     }
-    if (!user_info->flow.empty() && !::vless::IsVisionFlow(user_info->flow)) {
-        co_return tl::unexpected(std::move(bound).Reject("unsupported configured flow", ErrorCode::PROTOCOL_UNSUPPORTED));
+    if (!user_info->flow.empty() && !::proxy::vless::IsVisionFlow(user_info->flow)) {
+        co_return tl::unexpected(std::move(bound).Reject("unsupported configured flow", common::ErrorCode::PROTOCOL_UNSUPPORTED));
     }
-    if (request.flow.empty() && ::vless::IsVisionFlow(user_info->flow)) {
-        co_return tl::unexpected(std::move(bound).Reject("missing required flow", ErrorCode::PROTOCOL_UNSUPPORTED));
+    if (request.flow.empty() && ::proxy::vless::IsVisionFlow(user_info->flow)) {
+        co_return tl::unexpected(std::move(bound).Reject("missing required flow", common::ErrorCode::PROTOCOL_UNSUPPORTED));
     }
-    if (use_vision && request.command != ::vless::Command::TCP) {
-        co_return tl::unexpected(std::move(bound).Reject("flow only supports TCP", ErrorCode::PROTOCOL_UNSUPPORTED));
+    if (use_vision && request.command != ::proxy::vless::Command::TCP) {
+        co_return tl::unexpected(std::move(bound).Reject("flow only supports TCP", common::ErrorCode::PROTOCOL_UNSUPPORTED));
     }
     if (use_vision &&
         (!(receiver.stream_settings.IsTlsLike() || decryption != nullptr) ||
-         receiver.stream_settings.network_mode != NetworkMode::Tcp)) {
-        co_return tl::unexpected(std::move(bound).Reject("flow requires raw TCP TLS-like transport", ErrorCode::PROTOCOL_UNSUPPORTED));
+         receiver.stream_settings.network_mode != transport::internet::NetworkMode::Tcp)) {
+        co_return tl::unexpected(std::move(bound).Reject("flow requires raw TCP TLS-like transport", common::ErrorCode::PROTOCOL_UNSUPPORTED));
     }
 
     auto user_session = co_await std::move(bound).Admit();
@@ -314,12 +314,12 @@ CompleteVlessInboundHandshake(
 
     if (issued_ticket) {
         try {
-            (void)co_await ::vless::AuthenticateVlessTicket(
+            (void)co_await ::proxy::vless::AuthenticateVlessTicket(
                 environment.coordinator, decryption, tag, std::move(*issued_ticket), request.uuid);
-        } catch (const WorkerMailboxFull&) {
-            co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        } catch (const app::WorkerMailboxFull&) {
+            co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
         } catch (const IoSystemError&) {
-            co_return tl::unexpected(ErrorCode::CANCELLED);
+            co_return tl::unexpected(common::ErrorCode::CANCELLED);
         }
     }
 
@@ -336,49 +336,49 @@ CompleteVlessInboundHandshake(
 
 namespace proxy::vless::inbound {
 
-class Handler final : public ::Inbound {
+class Handler final : public ::proxy::Inbound {
 public:
     Handler(const ::proxyman::inbound::AdmissionEnvironment& environment,
             std::shared_ptr<
-                const ::vless::VlessEncryptionConfig> decryption = {});
+                const ::proxy::vless::VlessEncryptionConfig> decryption = {});
     ~Handler() override;
 
-    ::net::awaitable<::RelayResult> Process(
-        std::unique_ptr<::AsyncStream> stream,
+    ::net::awaitable<::app::RelayResult> Process(
+        std::unique_ptr<::transport::AsyncStream> stream,
         ::routing::Dispatcher& dispatcher,
         const ::proxyman::inbound::ReceiverSettings& receiver,
         ::net::io_context& io_context,
         ::session::Context& ctx,
-        const ::TimeoutsConfig& timeouts,
+        const ::infra::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) override;
 
 private:
     const ::proxyman::inbound::AdmissionEnvironment& environment_;
-    std::shared_ptr<const ::vless::VlessEncryptionConfig> decryption_;
+    std::shared_ptr<const ::proxy::vless::VlessEncryptionConfig> decryption_;
 };
 
 }  // namespace proxy::vless::inbound
 
 proxy::vless::inbound::Handler::Handler(
     const ::proxyman::inbound::AdmissionEnvironment& environment,
-    std::shared_ptr<const ::vless::VlessEncryptionConfig> decryption)
+    std::shared_ptr<const ::proxy::vless::VlessEncryptionConfig> decryption)
     : environment_(environment)
     , decryption_(std::move(decryption)) {}
 
 proxy::vless::inbound::Handler::~Handler() = default;
 
-net::awaitable<RelayResult>
+net::awaitable<app::RelayResult>
 proxy::vless::inbound::Handler::Process(
-    std::unique_ptr<AsyncStream> stream,
+    std::unique_ptr<transport::AsyncStream> stream,
     routing::Dispatcher& dispatcher,
     const proxyman::inbound::ReceiverSettings& receiver,
     net::io_context& io_context,
     session::Context& ctx,
-    const TimeoutsConfig& timeouts,
+    const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
 
 
-    auto fail_abortive = [&](ErrorCode error) {
+    auto fail_abortive = [&](common::ErrorCode error) {
         return proxy::RejectInbound(environment_.stats, stream.get(), error);
     };
 
@@ -389,10 +389,10 @@ proxy::vless::inbound::Handler::Process(
     transport::MultiBufferWriter& protocol_writer = *stream;
     proxy::BufferedStreamReader* active_reader = &protocol_reader;
     transport::MultiBufferWriter* active_writer = &protocol_writer;
-    std::optional<::vless::VlessEncryptedIo> encrypted_io;
+    std::optional<::proxy::vless::VlessEncryptedIo> encrypted_io;
 
-    UserOnlineSessionGuard user_session;
-    Network net = Network::TCP;
+    common::UserOnlineSessionGuard user_session;
+    common::Network net = common::Network::TCP;
     bool packet_addr_udp = false;
     bool use_vision = false;
     std::array<uint8_t, 16> request_uuid{};
@@ -424,7 +424,7 @@ proxy::vless::inbound::Handler::Process(
     VlessResponseHeaderWriter response_writer(*active_writer);
     active_writer = &response_writer;
 
-    if (net == Network::MUX) {
+    if (net == common::Network::MUX) {
         co_return co_await proxy::ServeMuxInbound(
             io_context,
             transport::Link{active_reader, active_writer},
@@ -438,20 +438,20 @@ proxy::vless::inbound::Handler::Process(
             pressure_idle_timeout);
     }
 
-    if (net == Network::UDP) {
-        ::vless::UdpStreamEndpoint udp_endpoint(
+    if (net == common::Network::UDP) {
+        ::proxy::vless::UdpStreamEndpoint udp_endpoint(
             *active_reader, *active_writer, ctx.outbound.target, packet_addr_udp);
-        InitialPayload first_datagram;
+        common::InitialPayload first_datagram;
         if (packet_addr_udp) {
             auto packet = co_await udp_endpoint.ReadMultiBuffer();
-            if (packet.empty()) co_return RelayResult{};
+            if (packet.empty()) co_return app::RelayResult{};
             const auto datagram = buf::InspectUdpDatagram(packet);
             if (!datagram.Valid() || !datagram.target || !datagram.target->IsValid())
-                co_return fail_abortive(ErrorCode::PROTOCOL_DECODE_FAILED);
+                co_return fail_abortive(common::ErrorCode::PROTOCOL_DECODE_FAILED);
             // The magic address selects framing, not a routable destination.
             proxy::BindInboundRequestTarget(
-                ctx, proxy::InboundRequestTarget{Network::UDP, *datagram.target});
-            first_datagram = InitialPayload(std::move(packet));
+                ctx, proxy::InboundRequestTarget{common::Network::UDP, *datagram.target});
+            first_datagram = common::InitialPayload(std::move(packet));
         }
         co_return co_await dispatcher.Dispatch(
             io_context,
@@ -465,19 +465,19 @@ proxy::vless::inbound::Handler::Process(
     }
 
     if (use_vision) {
-        ::vless::VisionTrafficState traffic;
-        ::vless::VisionReader vision_reader(
+        ::proxy::vless::VisionTrafficState traffic;
+        ::proxy::vless::VisionReader vision_reader(
             *active_reader,
             request_uuid,
             traffic);
-        ::vless::VisionWriter vision_writer(*active_writer, request_uuid, traffic);
+        ::proxy::vless::VisionWriter vision_writer(*active_writer, request_uuid, traffic);
         OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
         co_return co_await dispatcher.Dispatch(
             io_context,
             receiver.dispatch_policy,
             std::move(stream),
             transport::Link{&vision_reader, &vision_writer},
-            InitialPayload{},
+            common::InitialPayload{},
             ctx,
             environment_.stats,
             timeouts);
@@ -488,7 +488,7 @@ proxy::vless::inbound::Handler::Process(
         receiver.dispatch_policy,
         std::move(stream),
         transport::Link{active_reader, active_writer},
-        InitialPayload{},
+        common::InitialPayload{},
         ctx,
         environment_.stats,
         timeouts);
@@ -499,7 +499,7 @@ namespace {
 class VlessSettings final
     : public ::proxyman::inbound::ProtocolSettings {
 public:
-    std::shared_ptr<const ::vless::VlessEncryptionConfig> decryption;
+    std::shared_ptr<const ::proxy::vless::VlessEncryptionConfig> decryption;
 };
 
 [[nodiscard]] const VlessSettings* GetVlessSettings(
@@ -508,14 +508,14 @@ public:
 }
 
 [[nodiscard]] std::optional<::proxyman::inbound::PreparedVlessUser>
-BuildPreparedVlessUser(const ::InboundUserSpec& spec) {
-    auto uuid_bytes = ::vless::ParseUuidBytes(spec.credential);
+BuildPreparedVlessUser(const ::infra::InboundUserSpec& spec) {
+    auto uuid_bytes = ::proxy::vless::ParseUuidBytes(spec.credential);
     if (!uuid_bytes) {
         return std::nullopt;
     }
     ::proxyman::inbound::PreparedVlessUser info;
     info.uuid_bytes = *uuid_bytes;
-    info.flow = ::vless::NormalizeFlow(spec.flow);
+    info.flow = ::proxy::vless::NormalizeFlow(spec.flow);
     info.profile = ::proxy::MakeUserProfile(spec);
     return info;
 }
@@ -528,7 +528,7 @@ const bool kVlessInboundRegistered = [] {
     reg.create_tcp_handler =
         [](const ::proxyman::inbound::AdmissionEnvironment& environment,
            const ::proxyman::inbound::BuildRequest& req)
-            -> std::unique_ptr<::Inbound> {
+            -> std::unique_ptr<::proxy::Inbound> {
             const auto* settings = GetVlessSettings(req);
             if (!settings) {
                 return nullptr;
@@ -539,21 +539,21 @@ const bool kVlessInboundRegistered = [] {
         };
 
     reg.prepare_settings =
-        [](std::string_view tag, const ::InboundProtocolSettings& config)
+        [](std::string_view tag, const ::infra::InboundProtocolSettings& config)
             -> std::optional<std::shared_ptr<
                 const ::proxyman::inbound::ProtocolSettings>> {
             auto settings = std::make_shared<VlessSettings>();
-                auto parsed = ::vless::ParseVlessServerDecryption(
+                auto parsed = ::proxy::vless::ParseVlessServerDecryption(
                     config.vless_decryption);
                 if (!parsed) {
                     LOG_WARN("VLESS inbound '{}': invalid decryption: {}",
                              tag,
-                             ::vless::VlessEncryptionParseErrorMessage(
+                             ::proxy::vless::VlessEncryptionParseErrorMessage(
                                  parsed.error()));
                     return std::nullopt;
                 }
                 if (*parsed) settings->decryption =
-                    std::make_shared<::vless::VlessEncryptionConfig>(
+                    std::make_shared<::proxy::vless::VlessEncryptionConfig>(
                         std::move(**parsed));
             return settings;
         };
@@ -562,7 +562,7 @@ const bool kVlessInboundRegistered = [] {
     // preparation runs it before building users.
     reg.build_users =
         [](const ::proxyman::inbound::BuildRequest& req,
-           std::span<const ::InboundUserSpec> specs)
+           std::span<const ::infra::InboundUserSpec> specs)
             -> std::optional<::proxyman::inbound::UserSet> {
             std::vector<::proxyman::inbound::PreparedVlessUser> users;
             users.reserve(specs.size());

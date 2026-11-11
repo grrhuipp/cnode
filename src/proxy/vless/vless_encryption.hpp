@@ -33,9 +33,13 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+namespace app {
+
 class GroupCoordinator;
 
-namespace vless {
+}  // namespace app
+
+namespace proxy::vless {
 
 
 // ============================================================================
@@ -655,7 +659,7 @@ RunVlessEncryptionClientHandshake(
 
 [[nodiscard]] net::awaitable<VlessEncryptionHandshakeResult>
 RunVlessEncryptionServerHandshake(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     proxy::BufferedStreamReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
     std::shared_ptr<const VlessEncryptionConfig> config,
@@ -665,7 +669,7 @@ RunVlessEncryptionServerHandshake(
 // mutable replay set are accessed exclusively on the ticket owner's domain.
 
 [[nodiscard]] net::awaitable<bool> AuthenticateVlessTicket(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     std::shared_ptr<const VlessEncryptionConfig> config,
     std::string_view inbound_tag,
     VlessEncryptionIssuedTicket ticket,
@@ -673,9 +677,9 @@ RunVlessEncryptionServerHandshake(
 
 [[nodiscard]] net::awaitable<std::optional<VlessEncryptionServerTicketStore::ResumedSession>>
 LookupVlessTicket(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     std::shared_ptr<const VlessEncryptionConfig> config,
     std::string_view inbound_tag,
     std::array<uint8_t, kVlessEncryptionTicketSize> ticket,
     VlessEncryptionNfsKey nfs_key);
-}  // namespace vless
+}  // namespace proxy::vless

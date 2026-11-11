@@ -24,7 +24,7 @@ namespace proxy::uot {
 
 inline constexpr std::string_view kMagicAddress = "sp.v2.udp-over-tcp.arpa";
 inline constexpr std::string_view kV1MagicAddress = "sp.udp-over-tcp.arpa";
-inline constexpr size_t kMaxAddressSize = kMaxEncodedAddressSize;
+inline constexpr size_t kMaxAddressSize = common::kMaxEncodedAddressSize;
 inline constexpr size_t kMaxRequestSize = 1 + kMaxAddressSize;
 
 
@@ -42,42 +42,42 @@ struct EncodedRequest {
 };
 
 [[nodiscard]] std::optional<Version> VersionFromMagicAddress(
-    const TargetAddress& target) noexcept;
+    const common::TargetAddress& target) noexcept;
 
-[[nodiscard]] tl::expected<EncodedRequest, ErrorCode> EncodeRequest(
+[[nodiscard]] tl::expected<EncodedRequest, common::ErrorCode> EncodeRequest(
     bool is_connect,
-    const TargetAddress& destination,
-    ForwardedMetadataView forwarded = {});
+    const common::TargetAddress& destination,
+    common::ForwardedMetadataView forwarded = {});
 
 // One UoT request header: the V2 request or, for V1, the first packet's
 // target with that packet already decoded.
 struct PreparedRequest {
     bool is_connect = false;
-    TargetAddress destination;
-    std::optional<ForwardedMetadata> forwarded;
+    common::TargetAddress destination;
+    std::optional<common::ForwardedMetadata> forwarded;
     buf::MultiBuffer pending;
     buf::MultiBuffer initial_decoded;
 };
 
 // EOF before the first UoT byte is the peer's normal close → SOCKET_EOF;
 // EOF or malformed bytes after it → PROTOCOL_DECODE_FAILED.
-[[nodiscard]] net::awaitable<tl::expected<PreparedRequest, ErrorCode>>
+[[nodiscard]] net::awaitable<tl::expected<PreparedRequest, common::ErrorCode>>
 ReadUotRequestHeader(
     Version version,
     transport::MultiBufferReader& reader,
     buf::MultiBuffer pending);
 
-[[nodiscard]] net::awaitable<RelayResult> DispatchPreparedUotRequest(
+[[nodiscard]] net::awaitable<app::RelayResult> DispatchPreparedUotRequest(
     PreparedRequest prepared,
-    std::unique_ptr<AsyncStream> stream,
+    std::unique_ptr<transport::AsyncStream> stream,
     transport::MultiBufferReader& request_reader,
     transport::MultiBufferWriter& response_writer,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& dispatch_policy,
     net::io_context& io_context,
     session::Context& ctx,
-    StatsShard& stats,
-    const TimeoutsConfig& timeouts);
+    app::StatsShard& stats,
+    const infra::TimeoutsConfig& timeouts);
 class PacketReader final : public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return reader_.Cancellation(); }
@@ -88,7 +88,7 @@ public:
 
     PacketReader(transport::MultiBufferReader& reader,
                  bool is_connect,
-                 TargetAddress destination,
+                 common::TargetAddress destination,
                  buf::MultiBuffer pending = {});
 
     PacketReader(transport::MultiBufferReader& reader,
@@ -101,7 +101,7 @@ private:
     transport::MultiBufferReader& reader_;
     bool is_connect_ = false;
     // 非 connect 仅使用帧内地址，请求目标已由会话上下文拥有。
-    TargetAddress destination_;
+    common::TargetAddress destination_;
     buf::MultiBuffer pending_;
 };
 
@@ -109,7 +109,7 @@ class PacketWriter final : public transport::MultiBufferWriter {
 public:
     PacketWriter(transport::MultiBufferWriter& writer,
                  bool is_connect,
-                 TargetAddress destination);
+                 common::TargetAddress destination);
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(
@@ -120,7 +120,7 @@ public:
 private:
     transport::MultiBufferWriter& writer_;
     bool is_connect_ = false;
-    TargetAddress destination_;
+    common::TargetAddress destination_;
 };
 
 template <typename Underlying>
@@ -130,10 +130,10 @@ class FramedEndpoint final
 public:
     FramedEndpoint(Underlying& underlying,
                    bool is_connect,
-                   TargetAddress destination,
+                   common::TargetAddress destination,
                    buf::MultiBuffer pending = {})
         : underlying_(underlying)
-        , reader_(underlying, is_connect, is_connect ? destination : TargetAddress{},
+        , reader_(underlying, is_connect, is_connect ? destination : common::TargetAddress{},
                   std::move(pending))
         , writer_(underlying, is_connect, std::move(destination)) {}
 
@@ -224,7 +224,7 @@ public:
         }
     }
 
-    PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
+    transport::PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
         if constexpr (requires(Underlying& endpoint) {
                 endpoint.StartPhaseDeadline(timeout);
             }) {

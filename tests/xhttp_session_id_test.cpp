@@ -11,7 +11,7 @@ TEST(XHttpSessionId, IsRandomLowercaseHex) {
     constexpr int kSamples = 256;
     std::set<std::string> seen;
     for (int i = 0; i < kSamples; ++i) {
-        const XHttpSessionId id = GenerateXHttpSessionId();
+        const transport::internet::XHttpSessionId id = transport::internet::GenerateXHttpSessionId();
         ASSERT_EQ(id.size(), 32u);
         for (const char ch : id) {
             ASSERT_TRUE((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) << ch;

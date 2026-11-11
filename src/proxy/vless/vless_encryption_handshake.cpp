@@ -9,7 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <utility>
-namespace vless {
+namespace proxy::vless {
 namespace {
 
 constexpr size_t kHashSize = 32;
@@ -990,7 +990,7 @@ RunVlessEncryptionClientHandshake(
 
 namespace {
 net::awaitable<VlessEncryptionHandshakeResult> ResumeServerTicket(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     proxy::BufferedStreamReader& raw_reader, transport::MultiBufferWriter& raw_writer,
     const std::shared_ptr<const VlessEncryptionConfig>& namespace_config,
     std::string_view inbound_tag, const VlessEncryptionServerNfsOpenResult& nfs,
@@ -1100,7 +1100,7 @@ net::awaitable<VlessEncryptionHandshakeResult> CompleteServerPfs(
 
 net::awaitable<VlessEncryptionHandshakeResult>
 RunVlessEncryptionServerHandshake(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     proxy::BufferedStreamReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
     std::shared_ptr<const VlessEncryptionConfig> namespace_config,
@@ -1159,4 +1159,4 @@ RunVlessEncryptionServerHandshake(
     }
     co_return co_await CompleteServerPfs(raw_reader, raw_writer, config, *nfs, *nfs_aead, cipher);
 }
-}  // namespace vless
+}  // namespace proxy::vless

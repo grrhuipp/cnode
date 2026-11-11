@@ -9,6 +9,8 @@
 #include <unordered_map>
 
 
+namespace common {
+
 namespace {
 template <typename Map>
 bool AcquireDeviceCount(Map& devices,
@@ -94,8 +96,8 @@ struct DeviceQuotaService final : net::execution_context::service {
     std::shared_ptr<DeviceQuota> quota;
 };
 
-struct DeviceReturn final : GroupCoordinator::ReservedOperation {
-    GroupCoordinator* coordinator = nullptr;
+struct DeviceReturn final : app::GroupCoordinator::ReservedOperation {
+    app::GroupCoordinator* coordinator = nullptr;
     std::shared_ptr<DeviceQuota> quota;
     std::string tag;
     std::string ip;
@@ -106,7 +108,9 @@ struct DeviceReturn final : GroupCoordinator::ReservedOperation {
 
 } // namespace
 
-struct UserOnlineTracker::DeviceReservation {
+}  // namespace common
+
+struct common::UserOnlineTracker::DeviceReservation {
     std::unique_ptr<DeviceReturn> node;
     ~DeviceReservation() {
         if (node && node->admitted) {
@@ -115,6 +119,8 @@ struct UserOnlineTracker::DeviceReservation {
         }
     }
 };
+
+namespace common {
 
 void UserOnlineSessionGuard::Reset() noexcept {
     if (auto* tracker = std::exchange(tracker_, nullptr)) {
@@ -203,4 +209,6 @@ UserOnlineTracker::GetOnlineDevices(std::string_view tag) const {
     }
     return result;
 }
+
+}  // namespace common
 

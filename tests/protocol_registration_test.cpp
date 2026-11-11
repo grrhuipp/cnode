@@ -18,54 +18,54 @@ namespace {
 
 
 
-class DummyDatagramHandler final : public ::Inbound {
+class DummyDatagramHandler final : public ::proxy::Inbound {
 public:
-    ::net::awaitable<::RelayResult> Process(
-        std::unique_ptr<::AsyncStream>,
+    ::net::awaitable<::app::RelayResult> Process(
+        std::unique_ptr<::transport::AsyncStream>,
         ::routing::Dispatcher&,
         const ::proxyman::inbound::ReceiverSettings&,
         ::net::io_context&,
         ::session::Context&,
-        const ::TimeoutsConfig&,
+        const ::infra::TimeoutsConfig&,
         uint32_t) override {
-        co_return ::RelayResult{};
+        co_return ::app::RelayResult{};
     }
 
     tl::expected<
-        ::InboundDatagramResult,
-        ::ErrorCode> Process(
-        const ::InboundDatagramRequest&) override {
-        return tl::unexpected(::ErrorCode::PROTOCOL_AUTH_FAILED);
+        ::proxy::InboundDatagramResult,
+        ::common::ErrorCode> Process(
+        const ::proxy::InboundDatagramRequest&) override {
+        return tl::unexpected(::common::ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 };
 
-class DummyOutbound final : public ::Outbound {
+class DummyOutbound final : public ::proxy::Outbound {
 public:
-    ::net::awaitable<::OutboundProcessResult> Process(
+    ::net::awaitable<::proxy::OutboundProcessResult> Process(
         ::session::Context&,
         ::transport::Link,
-        ::OutboundDialer&,
-        const ::TimeoutsConfig&,
-        ::StatsShard&,
-        const ::RelayConfig&,
+        ::transport::internet::OutboundDialer&,
+        const ::infra::TimeoutsConfig&,
+        ::app::StatsShard&,
+        const ::app::RelayConfig&,
         ::buf::MultiBufferBatch) override {
-        co_return ::RelayResult{};
+        co_return ::app::RelayResult{};
     }
 };
 
-std::unique_ptr<::Inbound> CreateInboundHandler(
+std::unique_ptr<::proxy::Inbound> CreateInboundHandler(
     const ::proxyman::inbound::AdmissionEnvironment&,
     const ::proxyman::inbound::BuildRequest&) {
     return std::make_unique<DummyDatagramHandler>();
 }
 
-std::unique_ptr<::Inbound> FailDatagramHandler(
+std::unique_ptr<::proxy::Inbound> FailDatagramHandler(
     const ::proxyman::inbound::AdmissionEnvironment&,
     const ::proxyman::inbound::BuildRequest&) {
     return nullptr;
 }
 
-std::unique_ptr<::Inbound> CreateDatagramHandler(
+std::unique_ptr<::proxy::Inbound> CreateDatagramHandler(
     const ::proxyman::inbound::AdmissionEnvironment&,
     const ::proxyman::inbound::BuildRequest&) {
     return std::make_unique<DummyDatagramHandler>();
@@ -73,7 +73,7 @@ std::unique_ptr<::Inbound> CreateDatagramHandler(
 
 std::optional<::proxyman::inbound::UserSet> BuildVmessUsers(
     const ::proxyman::inbound::BuildRequest&,
-    std::span<const ::InboundUserSpec>) {
+    std::span<const ::infra::InboundUserSpec>) {
     return ::proxyman::inbound::UserSet{
         ::proxyman::inbound::PreparedVmessUsers{
             ::proxyman::inbound::PreparedVmessUser{.profile = {}}}};
@@ -81,7 +81,7 @@ std::optional<::proxyman::inbound::UserSet> BuildVmessUsers(
 
 std::optional<::proxyman::inbound::UserSet> BuildTrojanUsers(
     const ::proxyman::inbound::BuildRequest&,
-    std::span<const ::InboundUserSpec>) {
+    std::span<const ::infra::InboundUserSpec>) {
     return ::proxyman::inbound::UserSet{
         ::proxyman::inbound::PreparedTrojanUsers{}};
 }
@@ -95,10 +95,10 @@ CreateOutboundConfig(
             [](std::string_view,
                const std::shared_ptr<const ::proxyman::outbound::OutboundProtocolSettings>&,
                ::net::io_context&,
-               ::AwaitableTaskGroup&) -> std::unique_ptr<::Outbound> {
+               ::common::AwaitableTaskGroup&) -> std::unique_ptr<::proxy::Outbound> {
                 return std::make_unique<DummyOutbound>();
             }},
-        .sender = {.stream_settings = {}, .send_through = ::OutboundBind::Auto()},
+        .sender = {.stream_settings = {}, .send_through = ::transport::internet::OutboundBind::Auto()},
     };
 }
 
@@ -111,7 +111,7 @@ CreateNullOutboundConfig(
             [](std::string_view,
                const std::shared_ptr<const ::proxyman::outbound::OutboundProtocolSettings>&,
                ::net::io_context&,
-               ::AwaitableTaskGroup&) -> std::unique_ptr<::Outbound> {
+               ::common::AwaitableTaskGroup&) -> std::unique_ptr<::proxy::Outbound> {
                 return nullptr;
             }},
         .sender = {},
@@ -186,9 +186,9 @@ TEST(ProtocolRegistration, DuplicateInboundDoesNotReplacePublishedFactory) {
                  std::logic_error);
     ::net::io_context io;
     ::WorkerCoordinatorFixture coordinator(io);
-    auto limiter = ::ConnectionLimiter::Acquire({}, coordinator.Get());
-    ::UserOnlineTracker tracker(*coordinator.Get());
-    ::StatsShard stats;
+    auto limiter = ::app::ConnectionLimiter::Acquire({}, coordinator.Get());
+    ::common::UserOnlineTracker tracker(*coordinator.Get());
+    ::app::StatsShard stats;
     const ::proxyman::inbound::AdmissionEnvironment environment{
         *coordinator.Get(), *limiter, tracker, stats};
     ::proxyman::inbound::HandlerRegistry registry(environment);
@@ -247,9 +247,9 @@ TEST_P(DatagramRegistration, ReportsCapabilityAndConstructionOutcome) {
     if (GetParam() != DatagramBuild::Unknown) RegisterProxy(protocol, registration);
     ::net::io_context io;
     ::WorkerCoordinatorFixture coordinator(io);
-    auto limiter = ::ConnectionLimiter::Acquire({}, coordinator.Get());
-    ::UserOnlineTracker tracker(*coordinator.Get());
-    ::StatsShard stats;
+    auto limiter = ::app::ConnectionLimiter::Acquire({}, coordinator.Get());
+    ::common::UserOnlineTracker tracker(*coordinator.Get());
+    ::app::StatsShard stats;
     const AdmissionEnvironment environment{*coordinator.Get(), *limiter, tracker, stats};
     HandlerRegistry registry(environment);
     const BuildRequest request{.tag = {}, .protocol = protocol, .settings = {}};
@@ -330,7 +330,7 @@ TEST(ProtocolRegistration, DuplicateOutboundDoesNotReplacePublishedCreator) {
     auto prepared = PrepareOutboundConfig(source);
     ASSERT_TRUE(prepared);
     ::net::io_context io;
-    ::ResidentTaskGroup tasks(io.get_executor());
+    ::common::ResidentTaskGroup tasks(io.get_executor());
     EXPECT_TRUE(NewProxy(*prepared, io, tasks.Tasks()));
 }
 
@@ -340,10 +340,10 @@ TEST(ProtocolRegistration, ExplicitSendThroughOverridesProtocolBinding) {
     ::infra::OutboundSourceConfig source;
     source.tag = "lifecycle-bound-tag";
     source.protocol = "lifecycle-bound-outbound";
-    source.send_through = ::OutboundBind{};
+    source.send_through = ::transport::internet::OutboundBind{};
     const auto prepared = PrepareOutboundConfig(source);
     ASSERT_TRUE(prepared);
-    EXPECT_EQ(prepared->sender.send_through.GetMode(), ::OutboundBind::Mode::None);
+    EXPECT_EQ(prepared->sender.send_through.GetMode(), ::transport::internet::OutboundBind::Mode::None);
 }
 
 class InvalidRuntimeCreator : public ::testing::TestWithParam<bool> {};
@@ -351,7 +351,7 @@ class InvalidRuntimeCreator : public ::testing::TestWithParam<bool> {};
 TEST_P(InvalidRuntimeCreator, RejectsMissingOrNullRuntimeCreator) {
     using namespace ::proxyman::outbound;
     ::net::io_context io;
-    ::ResidentTaskGroup tasks(io.get_executor());
+    ::common::ResidentTaskGroup tasks(io.get_executor());
     PreparedOutboundConfig config;
     config.tag = "lifecycle-invalid-runtime";
     if (GetParam()) {
@@ -400,7 +400,7 @@ TEST_P(BuiltinOutboundSettings, CreatesOnlyProtocolMatchingTypedSettings) {
     }
     ASSERT_TRUE(prepared);
     net::io_context io;
-    ResidentTaskGroup tasks(io.get_executor());
+    common::ResidentTaskGroup tasks(io.get_executor());
     EXPECT_TRUE(proxyman::outbound::NewProxy(*prepared, io, tasks.Tasks()));
 }
 

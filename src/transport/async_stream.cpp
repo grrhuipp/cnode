@@ -6,6 +6,8 @@
 #include <new>
 
 
+namespace transport {
+
 StreamPhaseDeadline::StreamPhaseDeadline(net::io_context& io_context, AsyncStream& owner)
     : TimeoutEvent(io_context), owner_(owner) {}
 
@@ -17,7 +19,7 @@ PhaseDeadlineHandle StreamPhaseDeadline::Start(std::chrono::seconds timeout) {
     ++generation_;
     expired_ = 0;
     if (timeout <= std::chrono::seconds::zero() || !owner_.IsOpen()) {
-        TimeoutEvent::Cancel();
+        transport::internet::TimeoutEvent::Cancel();
         return {};
     }
     constexpr auto maximum =
@@ -26,14 +28,14 @@ PhaseDeadlineHandle StreamPhaseDeadline::Start(std::chrono::seconds timeout) {
         ? std::chrono::milliseconds::max()
         : std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
     if (!ScheduleAfter(delay)) {
-        TimeoutEvent::Cancel();
+        transport::internet::TimeoutEvent::Cancel();
         return {};
     }
     return {&expired_, 1, &generation_, generation_};
 }
 
 void StreamPhaseDeadline::Clear() noexcept {
-    TimeoutEvent::Cancel();
+    transport::internet::TimeoutEvent::Cancel();
     ++generation_;
     expired_ = 0;
 }
@@ -58,7 +60,7 @@ net::awaitable<void> AsyncStream::WriteMultiBuffer(buf::MultiBuffer mb) {
         mb.clear();
         co_return;
     }
-    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> buffers;
+    common::ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> buffers;
     buffers.AppendMultiBuffer(mb);
     try {
         co_await WriteBuffers(buffers.Span());
@@ -138,12 +140,16 @@ void AsyncStream::PrependReadMultiBuffer(buf::MultiBuffer&& mb) {
         "HTTP handshake requires a TCP or TLS byte stream");
 }
 
-transport::CancellationSource& AsyncStream::Cancellation() noexcept {
+}  // namespace transport
+
+transport::CancellationSource& transport::AsyncStream::Cancellation() noexcept {
     if (LogicalPhaseDeadline()) return cancellation_;
-    if (auto* tcp = BaseTcpStream(); tcp && static_cast<AsyncStream*>(tcp) != this)
+    if (auto* tcp = BaseTcpStream(); tcp && static_cast<transport::AsyncStream*>(tcp) != this)
         return tcp->Cancellation();
     return cancellation_;
 }
+
+namespace transport {
 
 bool AsyncStream::ConsumeIdleTimeout() noexcept {
     auto* tcp = BaseTcpStream();
@@ -201,4 +207,6 @@ std::optional<tcp::endpoint> AsyncStream::RemoteEndpoint() const {
     }
     return std::nullopt;
 }
+
+}  // namespace transport
 

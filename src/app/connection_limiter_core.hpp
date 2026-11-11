@@ -24,7 +24,7 @@
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 
-namespace auth_limit_detail {
+namespace app::auth_limit_detail {
 // OpenSSL 的低层 SHA256 上下文可在栈上复制；EVP 每次构造上下文会分配内存。
 class Fingerprint {
 public:
@@ -77,11 +77,13 @@ private:
 
 // Sans-I/O bounded model; mutable state belongs exclusively to the coordinator.
 // 两个指纹上下文构造后只读，凭据指纹可由任意 Worker 线程计算。
+namespace app {
+
 class ConnectionLimiterCore {
 public:
     static constexpr size_t kSlotCount = 16384;
     static constexpr size_t kProbe = 32;
-    static constexpr AuthFailureLimitConfig kCredentialBan{
+    static constexpr infra::AuthFailureLimitConfig kCredentialBan{
         .enabled = true, .failure_limit = 10, .window_seconds = 60, .ban_seconds = 180};
 
     using RejectReason = ConnectionLimiter::RejectReason;
@@ -89,7 +91,7 @@ public:
     [[nodiscard]] static uint64_t NowSeconds() noexcept {
         using namespace std::chrono;
         return static_cast<uint64_t>(
-            duration_cast<seconds>(steady_clock::now().time_since_epoch()).count());
+            duration_cast<seconds>(common::steady_clock::now().time_since_epoch()).count());
     }
 
     explicit ConnectionLimiterCore(const RateLimitConfig& cfg)
@@ -97,7 +99,7 @@ public:
           connections_(cfg.max_conn_per_ip ? AllocateZeroedTable<ConnectionSlots>() : nullptr),
           ip_failures_(cfg.ip_ban.enabled ? AllocateZeroedTable<FailureTable>() : nullptr),
           ip_fingerprint_(cfg.ip_ban.enabled
-              ? std::optional<auth_limit_detail::Fingerprint>(std::in_place, false)
+              ? std::optional<app::auth_limit_detail::Fingerprint>(std::in_place, false)
               : std::nullopt),
           credential_fingerprint_(true),
           credential_failures_(AllocateZeroedTable<FailureTable>()) {}
@@ -112,7 +114,7 @@ public:
 
     // 原连接配额表仍为 16384 槽、最多 32 次探测，与两张失败表完全独立。
     [[nodiscard]] static constexpr uint64_t IpHash(std::string_view ip) noexcept {
-        const auto hash = Fnv1a64(ip);
+        const auto hash = common::Fnv1a64(ip);
         return hash == 0 ? 1 : hash;
     }
 
@@ -208,11 +210,11 @@ private:
 
         [[nodiscard]] bool Banned(uint64_t now) const noexcept { return now < ban_until; }
         [[nodiscard]] bool Expired(
-            const AuthFailureLimitConfig& config, uint64_t now) const noexcept {
+            const infra::AuthFailureLimitConfig& config, uint64_t now) const noexcept {
             return !Banned(now) &&
                 (failures == 0 || now - window_start >= config.window_seconds);
         }
-        void Record(const AuthFailureLimitConfig& config, uint64_t now) noexcept {
+        void Record(const infra::AuthFailureLimitConfig& config, uint64_t now) noexcept {
             if (Banned(now)) return; // 拒绝期内既不计数，也不续封。
             if (failures == 0 || now - window_start >= config.window_seconds) {
                 failures = 0;
@@ -242,7 +244,7 @@ private:
         }
     public:
         [[nodiscard]] RejectReason Check(
-            const AuthCredentialKey& key, const AuthFailureLimitConfig& config,
+            const AuthCredentialKey& key, const infra::AuthFailureLimitConfig& config,
             uint64_t now, RejectReason banned) const noexcept {
             const size_t index = Index(key);
             bool available = false;
@@ -255,7 +257,7 @@ private:
             }
             return available ? RejectReason::NONE : RejectReason::TRACKING_CAPACITY;
         }
-        void Record(const AuthCredentialKey& key, const AuthFailureLimitConfig& config,
+        void Record(const AuthCredentialKey& key, const infra::AuthFailureLimitConfig& config,
                     uint64_t now) noexcept {
             const size_t index = Index(key);
             Slot* reusable = nullptr;
@@ -318,7 +320,9 @@ private:
     uint32_t total_ = 0;
     ZeroedTable<ConnectionSlots> connections_;
     ZeroedTable<FailureTable> ip_failures_;
-    const std::optional<auth_limit_detail::Fingerprint> ip_fingerprint_;
-    const auth_limit_detail::Fingerprint credential_fingerprint_;
+    const std::optional<app::auth_limit_detail::Fingerprint> ip_fingerprint_;
+    const app::auth_limit_detail::Fingerprint credential_fingerprint_;
     ZeroedTable<FailureTable> credential_failures_;
 };
+
+}  // namespace app

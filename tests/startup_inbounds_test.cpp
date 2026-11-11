@@ -26,7 +26,7 @@ std::array<uint8_t, 16> CredentialMarker(std::string_view credential) {
     return marker;
 }
 
-std::optional<UserSet> FakeBuildUsers(const BuildRequest&, std::span<const InboundUserSpec> specs) {
+std::optional<UserSet> FakeBuildUsers(const BuildRequest&, std::span<const infra::InboundUserSpec> specs) {
     ++user_builds;
     PreparedVmessUsers users;
     for (const auto& spec : specs) {
@@ -36,13 +36,13 @@ std::optional<UserSet> FakeBuildUsers(const BuildRequest&, std::span<const Inbou
     return users;
 }
 
-StaticInboundConfig Source(std::string tag, uint16_t port, std::string user = "static-user") {
-    StaticInboundConfig source;
+infra::StaticInboundConfig Source(std::string tag, uint16_t port, std::string user = "static-user") {
+    infra::StaticInboundConfig source;
     source.protocol = "vmess";
     source.tags.push_back(std::move(tag));
     source.port = port;
-    source.listen = *InboundListen::Parse("127.0.0.1");
-    source.users.push_back(InboundUserSpec{.user_id = 0, .email = {}, .credential = std::move(user), .flow = {}, .speed_limit = 0, .device_limit = 0});
+    source.listen = *transport::internet::InboundListen::Parse("127.0.0.1");
+    source.users.push_back(infra::InboundUserSpec{.user_id = 0, .email = {}, .credential = std::move(user), .flow = {}, .speed_limit = 0, .device_limit = 0});
     return source;
 }
 
@@ -53,7 +53,7 @@ protected:
             ProxyRegistration registration;
             registration.user_protocol = UserProtocol::Vmess;
             registration.create_tcp_handler = [](const AdmissionEnvironment&,
-                const BuildRequest&) -> std::unique_ptr<Inbound> { return {}; };
+                const BuildRequest&) -> std::unique_ptr<proxy::Inbound> { return {}; };
             registration.build_users = &FakeBuildUsers;
             RegisterProxy("vmess", registration);
             return true;
@@ -85,7 +85,7 @@ TEST_P(StartupReservedBinding, RejectsCollisionBeforeBuildingCredentials) {
     auto source = GetParam()
         ? Source(std::string(constants::test::kTestInboundTag), 12000)
         : Source("static-owner", constants::test::kTestPort);
-    EXPECT_THROW((void)PrepareStartupInbounds({source}, true), std::invalid_argument);
+    EXPECT_THROW((void)app::PrepareStartupInbounds({source}, true), std::invalid_argument);
     EXPECT_EQ(user_builds, 0u);
 }
 
@@ -96,7 +96,7 @@ INSTANTIATE_TEST_SUITE_P(TestMode, StartupReservedBinding, ::testing::Bool(),
 
 TEST_F(StartupInboundTest, PreparationAddsTestInboundWithoutPublishingUsers) {
     const auto old = UserStore::VmessUsers("static-owner").users;
-    const auto prepared = PrepareStartupInbounds({Source("static-owner", 12000)}, true);
+    const auto prepared = app::PrepareStartupInbounds({Source("static-owner", 12000)}, true);
     ASSERT_EQ(prepared.size(), 2u);
     EXPECT_EQ(prepared[1].binding.tag, constants::test::kTestInboundTag);
     EXPECT_EQ(prepared[1].binding.port, constants::test::kTestPort);
@@ -106,7 +106,7 @@ TEST_F(StartupInboundTest, PreparationAddsTestInboundWithoutPublishingUsers) {
 
 TEST_F(StartupInboundTest, InvalidCredentialsLeavePublishedUsersUntouched) {
     const auto old = UserStore::VmessUsers("static-owner").users;
-    EXPECT_THROW((void)PrepareStartupInbounds(
+    EXPECT_THROW((void)app::PrepareStartupInbounds(
         {Source("static-owner", 12000), Source("invalid-users", 12001, "reject")}, false),
         std::invalid_argument);
     EXPECT_EQ(UserStore::VmessUsers("static-owner").users, old);
@@ -119,11 +119,11 @@ class StartupDispatchPolicy : public StartupInboundTest,
 TEST_P(StartupDispatchPolicy, PreservesExplicitRoutingAndOutboundSelection) {
     auto source = Source("configured", 12002);
     source.routing_enabled = GetParam() != StartupPolicy::Forced;
-    source.proxy_protocol = ProxyProtocolMode::On;
+    source.proxy_protocol = transport::internet::ProxyProtocolMode::On;
     if (GetParam() != StartupPolicy::Routed) source.outbound_tag = "custom-out";
-    const auto prepared = PrepareStartupInbounds({source}, false);
+    const auto prepared = app::PrepareStartupInbounds({source}, false);
     ASSERT_EQ(prepared.size(), 1u);
-    EXPECT_EQ(prepared[0].receiver.proxy_protocol, ProxyProtocolMode::On);
+    EXPECT_EQ(prepared[0].receiver.proxy_protocol, transport::internet::ProxyProtocolMode::On);
     const auto& policy = prepared[0].receiver.dispatch_policy.outbound;
     if (GetParam() == StartupPolicy::Routed) {
         EXPECT_TRUE(std::holds_alternative<routing::RouteWithFallback>(policy));

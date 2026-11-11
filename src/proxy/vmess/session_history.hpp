@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <variant>
 
-namespace vmess {
+namespace proxy::vmess {
 
 // Coordinator-owned, Sans-I/O AEAD request tuple history. A full table rejects
 // new tuples rather than forgetting requests still inside the replay window.
@@ -42,4 +42,4 @@ private:
     int64_t last_cleanup_ = 0;
 };
 
-}  // namespace vmess
+}  // namespace proxy::vmess

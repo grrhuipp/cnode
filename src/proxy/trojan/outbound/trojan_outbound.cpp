@@ -26,9 +26,11 @@
 #include <chrono>
 #include <memory>
 
+namespace proxy::trojan::outbound {
+
 struct TrojanOutboundConfig {
-    OutboundServer server;
-    trojan::PasswordHash password_hash{};
+    transport::internet::OutboundServer server;
+    proxy::trojan::PasswordHash password_hash{};
 
     TrojanOutboundConfig() = default;
     TrojanOutboundConfig(const TrojanOutboundConfig&) = default;
@@ -40,64 +42,68 @@ struct TrojanOutboundConfig {
     }
 };
 
+}  // namespace proxy::trojan::outbound
+
 namespace proxy::trojan::outbound {
 
-class Handler final : public ::Outbound {
+class Handler final : public ::proxy::Outbound {
 public:
-    explicit Handler(std::shared_ptr<const ::TrojanOutboundConfig> config);
+    explicit Handler(std::shared_ptr<const ::proxy::trojan::outbound::TrojanOutboundConfig> config);
 
     ~Handler() override;
 
-    ::net::awaitable<::OutboundProcessResult> Process(
+    ::net::awaitable<::proxy::OutboundProcessResult> Process(
         ::session::Context& ctx,
         ::transport::Link inbound,
-        ::OutboundDialer& dialer,
-        const ::TimeoutsConfig& timeouts,
-        ::StatsShard& stats,
-        const ::RelayConfig& relay_config,
+        ::transport::internet::OutboundDialer& dialer,
+        const ::infra::TimeoutsConfig& timeouts,
+        ::app::StatsShard& stats,
+        const ::app::RelayConfig& relay_config,
         ::buf::MultiBufferBatch first_payload) override;
 
 private:
-    std::shared_ptr<const ::TrojanOutboundConfig> config_;
+    std::shared_ptr<const ::proxy::trojan::outbound::TrojanOutboundConfig> config_;
 };
 
 }  // namespace proxy::trojan::outbound
 
+namespace proxy::trojan::outbound {
+
 namespace {
 
-net::awaitable<tl::expected<void, ErrorCode>>
+net::awaitable<tl::expected<void, common::ErrorCode>>
 SendTrojanHandshake(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     const TrojanOutboundConfig& config,
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     bool is_udp,
     std::chrono::seconds handshake_timeout,
     session::Context& ctx,
-    const OutboundDialer& dialer) {
+    const transport::internet::OutboundDialer& dialer) {
     stream.SetIdleTimeout(handshake_timeout);
-    PhaseDeadlineHandle outbound_protocol_deadline =
+    transport::PhaseDeadlineHandle outbound_protocol_deadline =
         stream.StartPhaseDeadline(handshake_timeout);
 
-    std::array<uint8_t, ::trojan::kRequestPrefixSize + kMaxEncodedAddressSize + 2> header_buf{};
-    ScopedCleanse cleanse_header{header_buf};
-    const size_t header_len = ::trojan::EncodeRequestTo(
+    std::array<uint8_t, ::proxy::trojan::kRequestPrefixSize + common::kMaxEncodedAddressSize + 2> header_buf{};
+    common::ScopedCleanse cleanse_header{header_buf};
+    const size_t header_len = ::proxy::trojan::EncodeRequestTo(
         config.password_hash,
-        is_udp ? ::trojan::TrojanCommand::UDP_ASSOCIATE
-               : ::trojan::TrojanCommand::CONNECT,
+        is_udp ? ::proxy::trojan::TrojanCommand::UDP_ASSOCIATE
+               : ::proxy::trojan::TrojanCommand::CONNECT,
         target,
         header_buf.data(),
         header_buf.size(),
         dialer.ForwardedMetadata(ctx));
     if (header_len == 0) {
         LOG_CONN_WARN(ctx, "handshake encode failed");
-        co_return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
     try {
         const net::const_buffer header_buffer(header_buf.data(), header_len);
         co_await stream.WriteBuffers({&header_buffer, 1});
         LOG_CONN_DEBUG(ctx, "handshake sent {} bytes", header_len);
-        co_return tl::expected<void, ErrorCode>{};
+        co_return tl::expected<void, common::ErrorCode>{};
     } catch (...) {
         co_return tl::unexpected(
             proxy::ClassifyOutboundHandshakeException(
@@ -121,13 +127,13 @@ net::awaitable<OutboundProcessResult>
 proxy::trojan::outbound::Handler::Process(
     session::Context& ctx,
     transport::Link inbound,
-    OutboundDialer& dialer,
-    const TimeoutsConfig& timeouts,
-    StatsShard& stats,
-    const RelayConfig& relay_config,
+    transport::internet::OutboundDialer& dialer,
+    const infra::TimeoutsConfig& timeouts,
+    app::StatsShard& stats,
+    const app::RelayConfig& relay_config,
     buf::MultiBufferBatch first_payload) {
     if (!inbound.Valid()) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     const auto& target = ctx.outbound.target;
@@ -137,7 +143,7 @@ proxy::trojan::outbound::Handler::Process(
         co_return tl::unexpected(dialed.error());
     }
     auto stream = std::move(*dialed);
-    const bool is_udp = ctx.content.network == Network::UDP;
+    const bool is_udp = ctx.content.network == common::Network::UDP;
     if (auto ok = co_await SendTrojanHandshake(
             *stream, *config_, target, is_udp, timeouts.HandshakeTimeout(),
             ctx, dialer); !ok) {
@@ -151,14 +157,14 @@ proxy::trojan::outbound::Handler::Process(
     stream->ClearPhaseDeadline();
 
     if (is_udp) {
-        ::trojan::UdpStreamEndpoint udp_endpoint(
+        ::proxy::trojan::UdpStreamEndpoint udp_endpoint(
             *stream, target, transport::EofAction::WaitForPeer);
-        co_return co_await DoRelayLink(
+        co_return co_await app::DoRelayLink(
             dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
             udp_endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
 
-    co_return co_await DoRelayLink(
+    co_return co_await app::DoRelayLink(
         dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
         *stream, ctx, stats, relay_config, std::move(first_payload));
 }
@@ -176,7 +182,7 @@ const bool kTrojanRegistered = (::proxyman::outbound::RegisterProxy(
         if (!settings) return std::nullopt;
         auto next_hop = ::proxy::PrepareNextHop(
             cfg, settings->server,
-            ::OutboundStreamDefaults{
+            ::transport::internet::OutboundStreamDefaults{
                 .require_tls = true,
                 .fallback_server_name = settings->server_name,
                 .allow_insecure = settings->allow_insecure,
@@ -185,20 +191,22 @@ const bool kTrojanRegistered = (::proxyman::outbound::RegisterProxy(
 
         return ::proxyman::outbound::PreparedOutboundProxy{
             .create = ::proxyman::outbound::MakePreparedOutboundCreator<
-                ::TrojanOutboundConfig,
+                ::proxy::trojan::outbound::TrojanOutboundConfig,
                 +[](std::string_view,
-                    std::shared_ptr<const ::TrojanOutboundConfig> cfg_state,
+                    std::shared_ptr<const ::proxy::trojan::outbound::TrojanOutboundConfig> cfg_state,
                     ::net::io_context& /*io_context*/,
-                    ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
+                    ::common::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::proxy::Outbound> {
                     return std::make_unique<::proxy::trojan::outbound::Handler>(
                         std::move(cfg_state));
-                }>([] (::OutboundServer srv, const std::string& pwd) {
-                    ::TrojanOutboundConfig cfg_val;
+                }>([] (::transport::internet::OutboundServer srv, const std::string& pwd) {
+                    ::proxy::trojan::outbound::TrojanOutboundConfig cfg_val;
                     cfg_val.server = std::move(srv);
-                    cfg_val.password_hash = ::trojan::HashPassword(pwd);
+                    cfg_val.password_hash = ::proxy::trojan::HashPassword(pwd);
                     return cfg_val;
                 }(std::move(next_hop.server), settings->password)),
             .sender = std::move(next_hop.sender),
         };
     }), true);
 }  // namespace
+
+}  // namespace proxy::trojan::outbound

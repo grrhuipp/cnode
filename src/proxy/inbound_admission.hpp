@@ -29,20 +29,20 @@ namespace proxy {
 using proxyman::inbound::AdmissionEnvironment;
 
 struct InboundRequestTarget {
-    Network network = Network::TCP;
-    TargetAddress target;
-    std::optional<ForwardedMetadata> forwarded = std::nullopt;
+    common::Network network = common::Network::TCP;
+    common::TargetAddress target;
+    std::optional<common::ForwardedMetadata> forwarded = std::nullopt;
 };
 
 // Malformed requests can be rejected before an authenticated identity exists.
 inline void LogInboundRequestRejected(const session::Context& ctx, std::string_view reason) {
     LOG_CONN_WARN(ctx, "request rejected from {}:{} > {}", ctx.inbound.source_ip, ctx.inbound.source_port, reason);
-    LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+    LOG_ACCESS(common::FormatAccessLog(ctx, common::AccessStatus::Rejected, reason));
 }
 
 inline void LogInboundAuthFailure(const session::Context& ctx, std::string_view reason) {
     LOG_CONN_WARN(ctx, "authentication failed from {}:{} > {}", ctx.inbound.source_ip, ctx.inbound.source_port, reason);
-    LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, reason));
+    LOG_ACCESS(common::FormatAccessLog(ctx, common::AccessStatus::Rejected, reason));
 }
 
 inline void BindInboundRequestTarget(session::Context& ctx, InboundRequestTarget request) {
@@ -53,9 +53,9 @@ inline void BindInboundRequestTarget(session::Context& ctx, InboundRequestTarget
     ctx.outbound.route_target = {};
 }
 
-[[nodiscard]] inline std::optional<net::awaitable<ConnectionLimiter::Admission>>
+[[nodiscard]] inline std::optional<net::awaitable<app::ConnectionLimiter::Admission>>
 ReserveInboundConnection(const AdmissionEnvironment& environment,
-                         ConnectionLimiter::ReservationScope scope,
+                         app::ConnectionLimiter::ReservationScope scope,
                          const session::Context& ctx) {
     return environment.limiter.TryReserve({
         .scope = scope, .family = ctx.inbound.connection_family,
@@ -63,12 +63,12 @@ ReserveInboundConnection(const AdmissionEnvironment& environment,
         .check_ban = ctx.inbound.HasProxyProtocolClientIP()});
 }
 
-inline void RejectInboundAdmission(const session::Context& ctx, StatsShard& stats,
-                                  ConnectionLimiter::RejectReason reason) {
-    const auto* text = ConnectionLimiter::RejectReasonToString(reason);
+inline void RejectInboundAdmission(const session::Context& ctx, app::StatsShard& stats,
+                                  app::ConnectionLimiter::RejectReason reason) {
+    const auto* text = app::ConnectionLimiter::RejectReasonToString(reason);
     LOG_CONN_DEBUG(ctx, "connection rejected from {}:{} > {}",
                    ctx.inbound.source_ip, ctx.inbound.source_port, text);
-    LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, text));
+    LOG_ACCESS(common::FormatAccessLog(ctx, common::AccessStatus::Rejected, text));
     stats.OnError();
 }
 
@@ -85,7 +85,7 @@ class InboundAuthentication {
 public:
     InboundAuthentication(InboundAuthentication&&) noexcept = default;
     InboundAuthentication(const InboundAuthentication&) = delete;
-    [[nodiscard]] net::awaitable<ErrorCode> VerifyCredential(KeyedInboundCredential credential) {
+    [[nodiscard]] net::awaitable<common::ErrorCode> VerifyCredential(KeyedInboundCredential credential) {
         using proxyman::inbound::UserProtocol;
         const auto protocol = [](KeyedInboundProtocol value) {
             switch (value) {
@@ -102,36 +102,36 @@ public:
         // or this movable phase value.
         return CheckCredentialAdmission(*environment_, *ctx_, *credential_, protocol, revision);
     }
-    [[nodiscard]] net::awaitable<ErrorCode> RejectCredential(std::string_view reason) {
-        return RecordFailure(*environment_, *ctx_, reason, credential_, ErrorCode::PROTOCOL_AUTH_FAILED);
+    [[nodiscard]] net::awaitable<common::ErrorCode> RejectCredential(std::string_view reason) {
+        return RecordFailure(*environment_, *ctx_, reason, credential_, common::ErrorCode::PROTOCOL_AUTH_FAILED);
     }
-    [[nodiscard]] AuthenticatedInbound Bind(const UserProfile& profile,
+    [[nodiscard]] AuthenticatedInbound Bind(const common::UserProfile& profile,
                                            std::optional<InboundRequestTarget> request) &&;
 private:
-    friend net::awaitable<tl::expected<InboundAuthentication, ErrorCode>>
+    friend net::awaitable<tl::expected<InboundAuthentication, common::ErrorCode>>
     BeginInboundAuthentication(const AdmissionEnvironment&, session::Context&);
     InboundAuthentication(const AdmissionEnvironment& environment, session::Context& ctx) noexcept
         : environment_(&environment), ctx_(&ctx) {}
-    static net::awaitable<ErrorCode> CheckCredentialAdmission(
+    static net::awaitable<common::ErrorCode> CheckCredentialAdmission(
         const AdmissionEnvironment& environment, session::Context& ctx,
-        AuthCredentialKey credential, proxyman::inbound::UserProtocol protocol, uint64_t revision) {
+        app::AuthCredentialKey credential, proxyman::inbound::UserProtocol protocol, uint64_t revision) {
         try {
             const auto reason = co_await environment.limiter.CheckCredential(credential);
             if (proxyman::inbound::UserStore::CredentialRevision(protocol, ctx.inbound.tag) != revision ||
-                reason == ConnectionLimiter::RejectReason::NONE) co_return ErrorCode::OK;
+                reason == app::ConnectionLimiter::RejectReason::NONE) co_return common::ErrorCode::OK;
             co_return co_await RecordFailure(environment, ctx,
-                ConnectionLimiter::RejectReasonToString(reason), std::nullopt,
-                reason == ConnectionLimiter::RejectReason::TRACKING_CAPACITY
-                    ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::BLOCKED);
-        } catch (const WorkerMailboxFull&) {
-            co_return ErrorCode::RESOURCE_EXHAUSTED;
+                app::ConnectionLimiter::RejectReasonToString(reason), std::nullopt,
+                reason == app::ConnectionLimiter::RejectReason::TRACKING_CAPACITY
+                    ? common::ErrorCode::RESOURCE_EXHAUSTED : common::ErrorCode::BLOCKED);
+        } catch (const app::WorkerMailboxFull&) {
+            co_return common::ErrorCode::RESOURCE_EXHAUSTED;
         } catch (...) {
-            co_return transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL);
+            co_return transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL);
         }
     }
-    static net::awaitable<ErrorCode> RecordFailure(
+    static net::awaitable<common::ErrorCode> RecordFailure(
         const AdmissionEnvironment& environment, session::Context& ctx, std::string_view reason,
-        std::optional<AuthCredentialKey> credential, ErrorCode error) {
+        std::optional<app::AuthCredentialKey> credential, common::ErrorCode error) {
         LogInboundAuthFailure(ctx, reason);
         reason = {};
         const bool track_ip = environment.limiter.TracksAuthBan() && ctx.inbound.HasProxyProtocolClientIP();
@@ -139,7 +139,7 @@ private:
             try {
                 co_await environment.limiter.OnAuthFailTracked(ctx.inbound.tag,
                     track_ip ? std::string_view(ctx.inbound.source_ip) : std::string_view{}, credential);
-            } catch (const WorkerMailboxFull&) {
+            } catch (const app::WorkerMailboxFull&) {
                 LOG_CONN_WARN(ctx, "authentication failure tracking unavailable > mailbox full");
             } catch (const IoSystemError&) {
                 LOG_CONN_WARN(ctx, "authentication failure tracking unavailable > coordinator I/O error");
@@ -149,27 +149,27 @@ private:
     }
     const AdmissionEnvironment* environment_;
     session::Context* ctx_;
-    std::optional<AuthCredentialKey> credential_;
+    std::optional<app::AuthCredentialKey> credential_;
 };
 
 class AuthenticatedInbound {
 public:
     AuthenticatedInbound(AuthenticatedInbound&&) noexcept = default;
     AuthenticatedInbound(const AuthenticatedInbound&) = delete;
-    [[nodiscard]] ErrorCode Reject(std::string_view reason, ErrorCode error) && {
+    [[nodiscard]] common::ErrorCode Reject(std::string_view reason, common::ErrorCode error) && {
         LOG_CONN_WARN(*ctx_, "request rejected from {}:{} > {}", ctx_->inbound.source_ip, ctx_->inbound.source_port, reason);
-        LOG_ACCESS(FormatAccessLog(*ctx_, AccessStatus::Rejected, reason));
+        LOG_ACCESS(common::FormatAccessLog(*ctx_, common::AccessStatus::Rejected, reason));
         return error;
     }
-    [[nodiscard]] net::awaitable<tl::expected<UserOnlineSessionGuard, ErrorCode>> Admit() && {
+    [[nodiscard]] net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>> Admit() && {
         return AdmitSession(*environment_, *ctx_, user_id_, device_limit_);
     }
 private:
     friend class InboundAuthentication;
     AuthenticatedInbound(const AdmissionEnvironment& environment, session::Context& ctx,
-                         const UserProfile& profile) noexcept
+                         const common::UserProfile& profile) noexcept
         : environment_(&environment), ctx_(&ctx), user_id_(profile.user_id), device_limit_(profile.device_limit) {}
-    static net::awaitable<tl::expected<UserOnlineSessionGuard, ErrorCode>> AdmitSession(
+    static net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>> AdmitSession(
         const AdmissionEnvironment& environment, session::Context& ctx,
         int64_t user_id, uint32_t device_limit) {
         try {
@@ -179,15 +179,15 @@ private:
                 LOG_CONN_DEBUG(ctx, "User {} exceeded device limit ({}/{})", user_id,
                     environment.online_users.OnlineDeviceCount(
                         ctx.inbound.tag, static_cast<uint64_t>(user_id)), device_limit);
-                LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "device limit"));
-                co_return tl::unexpected(ErrorCode::PERMISSION_DENIED);
+                LOG_ACCESS(common::FormatAccessLog(ctx, common::AccessStatus::Rejected, "device limit"));
+                co_return tl::unexpected(common::ErrorCode::PERMISSION_DENIED);
             }
             LOG_CONN_DEBUG(ctx, "authentication succeeded from {}:{}", ctx.inbound.source_ip, ctx.inbound.source_port);
             co_return std::move(*session);
-        } catch (const WorkerMailboxFull&) {
-            co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+        } catch (const app::WorkerMailboxFull&) {
+            co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
         } catch (...) {
-            co_return tl::unexpected(transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL));
+            co_return tl::unexpected(transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL));
         }
     }
     const AdmissionEnvironment* environment_;
@@ -197,7 +197,7 @@ private:
 };
 
 inline AuthenticatedInbound InboundAuthentication::Bind(
-    const UserProfile& profile, std::optional<InboundRequestTarget> request) && {
+    const common::UserProfile& profile, std::optional<InboundRequestTarget> request) && {
     ctx_->inbound.user_id = profile.user_id;
     ctx_->inbound.user_email = profile.email;
     ctx_->content.speed_limit = profile.speed_limit;
@@ -205,26 +205,26 @@ inline AuthenticatedInbound InboundAuthentication::Bind(
     return AuthenticatedInbound(*environment_, *ctx_, profile);
 }
 
-[[nodiscard]] inline net::awaitable<tl::expected<InboundAuthentication, ErrorCode>>
+[[nodiscard]] inline net::awaitable<tl::expected<InboundAuthentication, common::ErrorCode>>
 BeginInboundAuthentication(const AdmissionEnvironment& environment, session::Context& ctx) {
     ctx.inbound.user_id = 0;
     ctx.inbound.user_email.clear();
     try {
     if (environment.limiter.TracksAuthBan() && ctx.inbound.HasProxyProtocolClientIP() &&
         co_await environment.limiter.IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
-        LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "IP banned"));
-        co_return tl::unexpected(ErrorCode::BLOCKED);
+        LOG_ACCESS(common::FormatAccessLog(ctx, common::AccessStatus::Rejected, "IP banned"));
+        co_return tl::unexpected(common::ErrorCode::BLOCKED);
     }
     co_return InboundAuthentication(environment, ctx);
-    } catch (const WorkerMailboxFull&) {
-        co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+    } catch (const app::WorkerMailboxFull&) {
+        co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
     } catch (...) {
-        co_return tl::unexpected(transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL));
+        co_return tl::unexpected(transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL));
     }
 }
 
-[[nodiscard]] inline net::awaitable<tl::expected<UserOnlineSessionGuard, ErrorCode>>
-AuthenticateAndAdmit(InboundAuthentication authentication, const UserProfile* matched,
+[[nodiscard]] inline net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>>
+AuthenticateAndAdmit(InboundAuthentication authentication, const common::UserProfile* matched,
                      std::string_view mismatch_reason, std::optional<InboundRequestTarget> request) {
     if (!matched) {
         auto rejection = authentication.RejectCredential(mismatch_reason);
@@ -240,27 +240,27 @@ AuthenticateAndAdmit(InboundAuthentication authentication, const UserProfile* ma
 }
 
 struct NativeAssociationAdmission {
-    ConnectionLimiter::Reservation connection;
-    ConnectionLimiter::Reservation ip;
-    UserOnlineSessionGuard user_session;
+    app::ConnectionLimiter::Reservation connection;
+    app::ConnectionLimiter::Reservation ip;
+    common::UserOnlineSessionGuard user_session;
 };
 [[nodiscard]] inline net::awaitable<std::optional<NativeAssociationAdmission>>
 AdmitNativeAssociation(const AdmissionEnvironment& environment, session::Context& ctx,
                        AuthenticatedInbound bound) {
     NativeAssociationAdmission admitted;
-    for (auto scope : {ConnectionLimiter::ReservationScope::Physical, ConnectionLimiter::ReservationScope::ClientIp}) {
+    for (auto scope : {app::ConnectionLimiter::ReservationScope::Physical, app::ConnectionLimiter::ReservationScope::ClientIp}) {
         if (auto pending = ReserveInboundConnection(environment, scope, ctx)) {
             auto admission = co_await std::move(*pending);
-            if (admission.reason != ConnectionLimiter::RejectReason::NONE) {
+            if (admission.reason != app::ConnectionLimiter::RejectReason::NONE) {
                 RejectInboundAdmission(ctx, environment.stats, admission.reason);
                 co_return std::nullopt;
             }
-            (scope == ConnectionLimiter::ReservationScope::Physical ? admitted.connection : admitted.ip) = std::move(admission.reservation);
+            (scope == app::ConnectionLimiter::ReservationScope::Physical ? admitted.connection : admitted.ip) = std::move(admission.reservation);
         }
     }
     auto session = co_await std::move(bound).Admit();
     if (!session) {
-        if (session.error() != ErrorCode::CANCELLED && session.error() != ErrorCode::SOCKET_EOF)
+        if (session.error() != common::ErrorCode::CANCELLED && session.error() != common::ErrorCode::SOCKET_EOF)
             environment.stats.OnError();
         co_return std::nullopt;
     }
@@ -270,9 +270,9 @@ AdmitNativeAssociation(const AdmissionEnvironment& environment, session::Context
 
 class InboundSubstreamAdmission {
 public:
-    explicit InboundSubstreamAdmission(StatsShard& stats) noexcept : connection_stats_(stats) {}
-    [[nodiscard]] bool Hold(ConnectionLimiter::Admission admission, const session::Context& ctx, StatsShard& stats) {
-        if (admission.reason != ConnectionLimiter::RejectReason::NONE) {
+    explicit InboundSubstreamAdmission(app::StatsShard& stats) noexcept : connection_stats_(stats) {}
+    [[nodiscard]] bool Hold(app::ConnectionLimiter::Admission admission, const session::Context& ctx, app::StatsShard& stats) {
+        if (admission.reason != app::ConnectionLimiter::RejectReason::NONE) {
             RejectInboundAdmission(ctx, stats, admission.reason);
             return false;
         }
@@ -280,17 +280,17 @@ public:
         return true;
     }
 private:
-    ConnectionStatsScope connection_stats_;
-    ConnectionLimiter::Reservation reservation_;
+    app::ConnectionStatsScope connection_stats_;
+    app::ConnectionLimiter::Reservation reservation_;
 };
 
-[[nodiscard]] inline std::optional<net::awaitable<ConnectionLimiter::Admission>>
+[[nodiscard]] inline std::optional<net::awaitable<app::ConnectionLimiter::Admission>>
 AdmitInboundSubstream(const AdmissionEnvironment& environment, const session::Context& ctx) {
-    return ReserveInboundConnection(environment, ConnectionLimiter::ReservationScope::Logical, ctx);
+    return ReserveInboundConnection(environment, app::ConnectionLimiter::ReservationScope::Logical, ctx);
 }
 
-[[nodiscard]] inline UserProfile MakeUserProfile(const InboundUserSpec& spec) {
-    UserProfile profile;
+[[nodiscard]] inline common::UserProfile MakeUserProfile(const infra::InboundUserSpec& spec) {
+    common::UserProfile profile;
     profile.email = spec.email;
     profile.user_id = spec.user_id;
     profile.speed_limit = spec.speed_limit;
@@ -298,10 +298,10 @@ AdmitInboundSubstream(const AdmissionEnvironment& environment, const session::Co
     return profile;
 }
 
-[[nodiscard]] inline RelayResult RejectInbound(StatsShard& stats, AsyncStream* stream, ErrorCode error) noexcept {
+[[nodiscard]] inline app::RelayResult RejectInbound(app::StatsShard& stats, transport::AsyncStream* stream, common::ErrorCode error) noexcept {
     if (stream) stream->CloseAbortive();
-    if (error != ErrorCode::CANCELLED && error != ErrorCode::SOCKET_EOF) stats.OnError();
-    RelayResult result;
+    if (error != common::ErrorCode::CANCELLED && error != common::ErrorCode::SOCKET_EOF) stats.OnError();
+    app::RelayResult result;
     result.error = error;
     return result;
 }
@@ -309,7 +309,7 @@ AdmitInboundSubstream(const AdmissionEnvironment& environment, const session::Co
 template <typename PreparedUser, typename AssignCredential>
 [[nodiscard]] std::optional<::proxyman::inbound::UserSet>
 BuildHashedInboundUsers(std::string_view protocol_name, const ::proxyman::inbound::BuildRequest& req,
-                        std::span<const ::InboundUserSpec> specs, AssignCredential&& assign_credential) {
+                        std::span<const ::infra::InboundUserSpec> specs, AssignCredential&& assign_credential) {
     std::vector<PreparedUser> users;
     users.reserve(specs.size());
     for (const auto& spec : specs) {

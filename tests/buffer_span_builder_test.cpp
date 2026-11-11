@@ -51,7 +51,7 @@ concept BorrowableDescriptors = requires(T&& builder) {
     std::forward<T>(builder).Span();
 };
 template<class T>
-concept AppendablePacket = requires(::ConstBufferSpanBuilder<2>& builder, T&& payload) {
+concept AppendablePacket = requires(::common::ConstBufferSpanBuilder<2>& builder, T&& payload) {
     builder.AppendMultiBuffer(std::forward<T>(payload));
 };
 template<class T>
@@ -66,18 +66,18 @@ static_assert(BorrowableFront<::buf::MultiBuffer&>);
 static_assert(BorrowableFront<const ::buf::MultiBuffer&>);
 static_assert(!BorrowableFront<::buf::MultiBuffer&&>);
 static_assert(!BorrowableFront<const ::buf::MultiBuffer&&>);
-static_assert(BorrowableDescriptors<::ConstBufferSpanBuilder<2>&>);
-static_assert(BorrowableDescriptors<const ::ConstBufferSpanBuilder<2>&>);
-static_assert(!BorrowableDescriptors<::ConstBufferSpanBuilder<2>&&>);
-static_assert(!BorrowableDescriptors<const ::ConstBufferSpanBuilder<2>&&>);
+static_assert(BorrowableDescriptors<::common::ConstBufferSpanBuilder<2>&>);
+static_assert(BorrowableDescriptors<const ::common::ConstBufferSpanBuilder<2>&>);
+static_assert(!BorrowableDescriptors<::common::ConstBufferSpanBuilder<2>&&>);
+static_assert(!BorrowableDescriptors<const ::common::ConstBufferSpanBuilder<2>&&>);
 static_assert(AppendablePacket<::buf::MultiBuffer&>);
 static_assert(AppendablePacket<const ::buf::MultiBuffer&>);
 static_assert(!AppendablePacket<::buf::MultiBuffer&&>);
 static_assert(!AppendablePacket<const ::buf::MultiBuffer&&>);
-static_assert(ExtractableInitialPayload<::InitialPayload&&>);
-static_assert(!ExtractableInitialPayload<::InitialPayload&>);
-static_assert(!ExtractableInitialPayload<const ::InitialPayload&>);
-static_assert(!ExtractableInitialPayload<const ::InitialPayload&&>);
+static_assert(ExtractableInitialPayload<::common::InitialPayload&&>);
+static_assert(!ExtractableInitialPayload<::common::InitialPayload&>);
+static_assert(!ExtractableInitialPayload<const ::common::InitialPayload&>);
+static_assert(!ExtractableInitialPayload<const ::common::InitialPayload&&>);
 
 // Retain poisoned retired blocks so stale descriptor reads fail deterministically.
 class RetiringResource final : public std::pmr::memory_resource {
@@ -119,7 +119,7 @@ std::string Flatten(std::span<const ::net::const_buffer> buffers) {
 TEST(BufferSpanBuilder, SelfAppendSurvivesInlineAndSpilledGrowth) {
     RetiringResource resource;
     const std::string text = "abc";
-    ::ConstBufferSpanBuilder<2> builder(&resource);
+    ::common::ConstBufferSpanBuilder<2> builder(&resource);
     builder.Append(::net::buffer(text.data(), 1));
     builder.Append(::net::buffer(text.data() + 1, 1));
     builder.AppendBuffers(builder.Span());
@@ -141,7 +141,7 @@ TEST(BufferSpanBuilder, AppendingExternalBuffersPreservesOrderAndSkipsEmptyViews
         ::net::buffer(text.data(), 1), {},
         ::net::buffer(text.data() + 1, 1), {},
         ::net::buffer(text.data() + 2, 1)};
-    ::ConstBufferSpanBuilder<1> builder;
+    ::common::ConstBufferSpanBuilder<1> builder;
     builder.AppendBuffers(buffers);
     builder.AppendBuffers(buffers);
     EXPECT_EQ(Flatten(builder.Span()), "abcabc");
@@ -153,7 +153,7 @@ TEST(BufferSpanBuilder, FailedSpillPreservesBorrowedDescriptorsAndCanRetry) {
     const std::string text = "abc";
     for (const bool already_spilled : {false, true}) {
         SCOPED_TRACE(already_spilled);
-        ::ConstBufferSpanBuilder<2> builder(&resource);
+        ::common::ConstBufferSpanBuilder<2> builder(&resource);
         builder.Append(::net::buffer(text.data(), 1));
         builder.Append(::net::buffer(text.data() + 1, 1));
         if (already_spilled) builder.AppendBuffers(builder.Span());
@@ -174,7 +174,7 @@ TEST(BufferSpanBuilder, FailedSpillPreservesBorrowedDescriptorsAndCanRetry) {
 TEST(BufferSpanBuilder, SelfAppendWithinCapacityKeepsBorrowedStorage) {
     RetiringResource resource;
     const std::string text = "abc";
-    ::ConstBufferSpanBuilder<4> builder(&resource);
+    ::common::ConstBufferSpanBuilder<4> builder(&resource);
     builder.Append(::net::buffer(text.data(), 1));
     builder.Append(::net::buffer(text.data() + 1, 1));
     auto* storage = builder.Span().data();
@@ -206,7 +206,7 @@ TEST(BufferSpanBuilder, SparseExternalAppendUsesOnlyNonemptyCapacity) {
         ::net::buffer(text.data() + 2, 1)};
     const std::array<::net::const_buffer, 3> suffix{
         ::net::const_buffer{}, ::net::buffer(text.data() + 3, 1), {}};
-    ::ConstBufferSpanBuilder<4> builder(&resource);
+    ::common::ConstBufferSpanBuilder<4> builder(&resource);
     builder.AppendBuffers(prefix);
     builder.AppendBuffers(suffix);
     EXPECT_EQ(Flatten(builder.Span()), "abcd");
@@ -218,7 +218,7 @@ TEST(BufferSpanBuilder, SparseExternalAppendUsesOnlyNonemptyCapacity) {
 
 TEST(BufferSpanBuilder, SpillUsesConstructionResourceAndClearReleasesItsStorage) {
     RetiringResource resource;
-    ::ConstBufferSpanBuilder<2> builder(&resource);
+    ::common::ConstBufferSpanBuilder<2> builder(&resource);
     const std::string text = "abc";
     builder.Append(::net::buffer(text.data(), 1));
     builder.Append(::net::buffer(text.data() + 1, 1));
@@ -250,7 +250,7 @@ TEST(BufferSpanBuilder, SparseMultiBufferPreservesSlicesAcrossInlineAndSpilledAp
         }
         payload.push_back(std::move(block));
     }
-    ::ConstBufferSpanBuilder<4> builder(&resource);
+    ::common::ConstBufferSpanBuilder<4> builder(&resource);
     const std::string prefix = "P";
     builder.Append(::net::buffer(prefix));
     std::string expected = prefix;
@@ -282,7 +282,7 @@ TEST(BufferSpanBuilder, FailedMultiBufferAppendPreservesPrefixAndCanRetry) {
     const std::string text = "abc";
     for (const bool already_spilled : {false, true}) {
         SCOPED_TRACE(already_spilled);
-        ::ConstBufferSpanBuilder<2> builder(&resource);
+        ::common::ConstBufferSpanBuilder<2> builder(&resource);
         builder.Append(::net::buffer(text.data(), 1));
         builder.Append(::net::buffer(text.data() + 1, 1));
         if (already_spilled) builder.Append(::net::buffer(text.data() + 2, 1));

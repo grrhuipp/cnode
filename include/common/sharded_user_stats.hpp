@@ -21,6 +21,8 @@
 #include <utility>
 #include <vector>
 
+namespace common {
+
 struct OnlineDevice {
     int64_t user_id = 0;
     std::string ip;
@@ -33,11 +35,19 @@ struct OnlineDevice {
 };
 
 class UserOnlineSessionGuard;
+
+}  // namespace common
+namespace app {
+
 class GroupCoordinator;
+
+}  // namespace app
+
+namespace common {
 
 class UserOnlineTracker {
 public:
-    explicit UserOnlineTracker(GroupCoordinator& coordinator) noexcept : coordinator_(coordinator) {}
+    explicit UserOnlineTracker(app::GroupCoordinator& coordinator) noexcept : coordinator_(coordinator) {}
     ~UserOnlineTracker() = default;
     // UserOnlineSessionGuard 借用本对象地址：禁止拷贝，且不声明移动。
     UserOnlineTracker(const UserOnlineTracker&) = delete;
@@ -74,7 +84,7 @@ private:
                                         TransparentStringHash,
                                         TransparentStringEq>;
 
-    GroupCoordinator& coordinator_;
+    app::GroupCoordinator& coordinator_;
     TagDeviceMap devices_;
 };
 
@@ -111,4 +121,6 @@ private:
     UserOnlineTracker* tracker_ = nullptr;
     std::shared_ptr<UserOnlineTracker::DeviceReservation> quota_reservation_;
 };
+
+}  // namespace common
 

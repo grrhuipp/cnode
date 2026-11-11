@@ -7,7 +7,7 @@
 namespace {
 class AutomaticListen : public testing::TestWithParam<const char*> {};
 TEST_P(AutomaticListen, ExposesBothWildcardFamilies) {
-    const auto listen = ::InboundListen::Parse(GetParam());
+    const auto listen = ::transport::internet::InboundListen::Parse(GetParam());
     ASSERT_TRUE(listen);
     EXPECT_TRUE(listen->IsAuto());
     ASSERT_EQ(listen->Candidates().size(), 2u);
@@ -21,7 +21,7 @@ INSTANTIATE_TEST_SUITE_P(Spellings, AutomaticListen, testing::Values("", "auto",
 struct LiteralCase { const char* text; bool ipv4; };
 class LiteralListen : public testing::TestWithParam<LiteralCase> {};
 TEST_P(LiteralListen, NormalizesLoopbackFamily) {
-    const auto listen = ::InboundListen::Parse(GetParam().text);
+    const auto listen = ::transport::internet::InboundListen::Parse(GetParam().text);
     ASSERT_TRUE(listen);
     EXPECT_FALSE(listen->IsAuto());
     ASSERT_EQ(listen->Candidates().size(), 1u);
@@ -34,7 +34,7 @@ INSTANTIATE_TEST_SUITE_P(Families, LiteralListen, testing::Values(
 
 class InvalidListen : public testing::TestWithParam<std::string_view> {};
 TEST_P(InvalidListen, RejectsNonLiteralAndAmbiguousInputs) {
-    EXPECT_FALSE(::InboundListen::Parse(GetParam()));
+    EXPECT_FALSE(::transport::internet::InboundListen::Parse(GetParam()));
 }
 INSTANTIATE_TEST_SUITE_P(Inputs, InvalidListen, testing::Values(
     std::string_view("not-an-ip"), std::string_view("127.0.0.1junk"), std::string_view(" auto"),
@@ -45,8 +45,8 @@ INSTANTIATE_TEST_SUITE_P(Inputs, InvalidListen, testing::Values(
 struct OverlapCase { const char* left; const char* right; bool overlaps; };
 class ListenOverlap : public testing::TestWithParam<OverlapCase> {};
 TEST_P(ListenOverlap, DetectsConflictsSymmetrically) {
-    const auto left = ::InboundListen::Parse(GetParam().left);
-    const auto right = ::InboundListen::Parse(GetParam().right);
+    const auto left = ::transport::internet::InboundListen::Parse(GetParam().left);
+    const auto right = ::transport::internet::InboundListen::Parse(GetParam().right);
     ASSERT_TRUE(left);
     ASSERT_TRUE(right);
     EXPECT_EQ(left->Overlaps(*right), GetParam().overlaps);
@@ -63,7 +63,7 @@ INSTANTIATE_TEST_SUITE_P(Addresses, ListenOverlap, testing::Values(
 
 TEST(InboundListenerOwner, DuplicateNamePreservesLiveAcceptorAndCloseCancelsAccept) {
     ::net::io_context io;
-    ::worker_detail::TcpListenerOwner owner;
+    ::app::worker_detail::TcpListenerOwner owner;
     auto acceptor = owner.CreateAcceptor("stable", io);
     ASSERT_TRUE(acceptor);
     acceptor->open(::tcp::v4());
@@ -85,10 +85,10 @@ TEST(InboundListenerOwner, DuplicateNamePreservesLiveAcceptorAndCloseCancelsAcce
 
 TEST(InboundListenerOwner, DestructionCancelsAcceptEvenWhenAcceptorIsRetained) {
     ::net::io_context io;
-    ::worker_detail::TcpListenerOwner::AcceptorPtr retained;
+    ::app::worker_detail::TcpListenerOwner::AcceptorPtr retained;
     bool cancelled = false;
     {
-        ::worker_detail::TcpListenerOwner owner;
+        ::app::worker_detail::TcpListenerOwner owner;
         retained = owner.CreateAcceptor("retained", io);
         ASSERT_TRUE(retained);
         retained->open(::tcp::v4());

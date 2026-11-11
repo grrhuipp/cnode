@@ -75,7 +75,7 @@ bool DetectRulePolicy::Blocked(const session::Context& ctx) {
         return false;
     };
 
-    auto matches_target = [&](const TargetAddress& target) {
+    auto matches_target = [&](const common::TargetAddress& target) {
         if (!target.IsValid()) {
             return false;
         }
@@ -93,7 +93,7 @@ bool DetectRulePolicy::Blocked(const session::Context& ctx) {
         return false;
     };
 
-    auto same_target = [](const TargetAddress& a, const TargetAddress& b) {
+    auto same_target = [](const common::TargetAddress& a, const common::TargetAddress& b) {
         return a.SameEndpoint(b) && a.resolved_addr == b.resolved_addr;
     };
 

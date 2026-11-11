@@ -25,10 +25,12 @@
 #include <variant>
 
 
+namespace app {
+
 class WorkerMailboxFull : public std::runtime_error {
 public:
     WorkerMailboxFull()
-        : std::runtime_error(std::string(ErrorCodeToString(ErrorCode::RESOURCE_EXHAUSTED))) {}
+        : std::runtime_error(std::string(common::ErrorCodeToString(common::ErrorCode::RESOURCE_EXHAUSTED))) {}
 };
 
 // Admission and closure have a single atomic linearization point. Accepted
@@ -117,7 +119,7 @@ public:
     }
 
 private:
-    using CompletionChannel = SignalChannel;
+    using CompletionChannel = common::SignalChannel;
     static constexpr size_t kClosed = size_t{1} << (std::numeric_limits<size_t>::digits - 1);
     class Slot {
     public:
@@ -145,12 +147,12 @@ private:
     void ReleaseOnOwner() noexcept {
         const auto previous = state_.fetch_sub(1, std::memory_order_acq_rel);
         if ((previous & ~kClosed) == 0)
-            FailRuntime("mailbox-join", "accepted task completion underflow");
+            common::FailRuntime("mailbox-join", "accepted task completion underflow");
         try {
             if (previous == (kClosed | 1) && !joined_->try_send(IoErrorCode{}))
-                FailRuntime("mailbox-join", "completion channel already occupied");
+                common::FailRuntime("mailbox-join", "completion channel already occupied");
         } catch (...) {
-            FailRuntime("mailbox-join", "cannot signal accepted task completion");
+            common::FailRuntime("mailbox-join", "cannot signal accepted task completion");
         }
     }
     void Release() noexcept {
@@ -159,7 +161,7 @@ private:
             // initiation retains its slot until this bounded notification runs.
             net::dispatch(io_context_, [this]() noexcept { ReleaseOnOwner(); });
         } catch (...) {
-            FailRuntime("mailbox-join", "cannot deliver accepted task completion");
+            common::FailRuntime("mailbox-join", "cannot deliver accepted task completion");
         }
     }
     template <typename T>
@@ -176,4 +178,6 @@ private:
     std::atomic<size_t> state_{0};
     std::unique_ptr<CompletionChannel> joined_;
 };
+
+}  // namespace app
 

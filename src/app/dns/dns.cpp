@@ -100,7 +100,7 @@ net::awaitable<DnsResult> DNSWorker::Impl::ResolveOwned(std::string owned_domain
     std::string_view domain = owned_domain;
     if (stopping) {
         DnsResult cancelled;
-        cancelled.error = ErrorCode::CANCELLED;
+        cancelled.error = common::ErrorCode::CANCELLED;
         co_return cancelled;
     }
     if (const auto address = iputil::ParseLiteral(domain)) {
@@ -112,7 +112,7 @@ net::awaitable<DnsResult> DNSWorker::Impl::ResolveOwned(std::string owned_domain
     if (!::domain::IsValidDnsHostname(
             domain, ::domain::TrailingDotPolicy::Allow)) {
         DnsResult result;
-        result.error = ErrorCode::INVALID_ARGUMENT;
+        result.error = common::ErrorCode::INVALID_ARGUMENT;
         co_return result;
     }
 
@@ -132,26 +132,26 @@ net::awaitable<DnsResult> DNSWorker::Impl::ResolveUncached(std::string_view doma
         result = co_await DoResolve(domain);
     } catch (const IoSystemError& error) {
         result.error = error.code() == io_error::operation_aborted
-            ? ErrorCode::CANCELLED : ErrorCode::DNS_RESOLVE_FAILED;
+            ? common::ErrorCode::CANCELLED : common::ErrorCode::DNS_RESOLVE_FAILED;
         result.error_msg = error.code().message();
     } catch (const std::exception& e) {
-        result.error = ErrorCode::DNS_RESOLVE_FAILED;
+        result.error = common::ErrorCode::DNS_RESOLVE_FAILED;
         result.error_msg = e.what();
     } catch (...) {
-        result.error = ErrorCode::DNS_RESOLVE_FAILED;
+        result.error = common::ErrorCode::DNS_RESOLVE_FAILED;
         result.error_msg = "DNS resolve exception";
     }
 
     if (stopping) {
         result = {};
-        result.error = ErrorCode::CANCELLED;
+        result.error = common::ErrorCode::CANCELLED;
     }
-    if (result.error == ErrorCode::CANCELLED) co_return result;
+    if (result.error == common::ErrorCode::CANCELLED) co_return result;
     // One upstream event per shared query; negative cache hits are counted and
     // summarized by the cache instead of warning once per connection.
     if (!result.Ok()) {
         LOG_WARN("failed to resolve {} (error={} source=upstream) > {}",
-                 domain, ErrorCodeToString(result.error), result.error_msg);
+                 domain, common::ErrorCodeToString(result.error), result.error_msg);
     }
 
     try {
@@ -165,13 +165,13 @@ net::awaitable<DnsResult> DNSWorker::Impl::ResolveUncached(std::string_view doma
 net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
     std::string_view domain) {
     DnsResult last_result;
-    last_result.error = ErrorCode::DNS_RESOLVE_FAILED;
+    last_result.error = common::ErrorCode::DNS_RESOLVE_FAILED;
     last_result.error_msg = "DNS server unavailable";
 
     for (size_t server_index = 0; server_index < upstreams.size(); ++server_index) {
         const auto& server = upstreams[server_index];
         if (stopping) {
-            last_result.error = ErrorCode::CANCELLED;
+            last_result.error = common::ErrorCode::CANCELLED;
             co_return last_result;
         }
         // Preserve three A samples (round-robin answer collection), but do not
@@ -181,18 +181,18 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
         auto collect = [&](size_t index) -> net::awaitable<void> {
             answers[index] = co_await QueryServer(*server, domain, index == kAddressQueryAttempts);
         };
-        co_await RunAwaitableTaskGroup(co_await net::this_coro::executor, [&](AwaitableTaskGroup& group) {
+        co_await common::RunAwaitableTaskGroup(co_await net::this_coro::executor, [&](common::AwaitableTaskGroup& group) {
             for (size_t i = 0; i < answers.size(); ++i) group.Spawn(collect(i));
         });
         if (stopping || std::ranges::any_of(answers, [](const DnsResult& answer) {
-                return answer.error == ErrorCode::CANCELLED;
+                return answer.error == common::ErrorCode::CANCELLED;
             })) {
             DnsResult cancelled;
-            cancelled.error = ErrorCode::CANCELLED;
+            cancelled.error = common::ErrorCode::CANCELLED;
             co_return cancelled;
         }
         DnsResult a_result;
-        a_result.error = ErrorCode::DNS_RESOLVE_FAILED;
+        a_result.error = common::ErrorCode::DNS_RESOLVE_FAILED;
         a_result.error_msg = "DNS A query failed";
 
         for (size_t attempt = 0; attempt < kAddressQueryAttempts; ++attempt) {
@@ -206,7 +206,7 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
                 }
                 continue;
             }
-            if (!a_result.Ok() && a_result.error != ErrorCode::DNS_NO_RECORD) {
+            if (!a_result.Ok() && a_result.error != common::ErrorCode::DNS_NO_RECORD) {
                 a_result = std::move(attempt_result);
             }
         }
@@ -216,7 +216,7 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
         if (a_result.Ok() || aaaa_result.Ok()) {
             DnsResult result;
             result.ttl = UINT32_MAX;
-            result.error = ErrorCode::OK;
+            result.error = common::ErrorCode::OK;
             result.addresses.reserve(
                 (a_result.Ok() ? a_result.addresses.size() : 0) +
                 (aaaa_result.Ok() ? aaaa_result.addresses.size() : 0));
@@ -235,15 +235,15 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
             co_return result;
         }
 
-        const bool no_records = a_result.error == ErrorCode::DNS_NO_RECORD &&
-                                aaaa_result.error == ErrorCode::DNS_NO_RECORD;
+        const bool no_records = a_result.error == common::ErrorCode::DNS_NO_RECORD &&
+                                aaaa_result.error == common::ErrorCode::DNS_NO_RECORD;
         const auto& endpoint = config.servers[server_index];
         auto reason = std::format(
             "server {} port {} > A: {} > {}; AAAA: {} > {}",
             iputil::AddressText(endpoint.address()).View(), endpoint.port(),
-            ErrorCodeToString(a_result.error), a_result.error_msg,
-            ErrorCodeToString(aaaa_result.error), aaaa_result.error_msg);
-        last_result = a_result.error == ErrorCode::DNS_NO_RECORD && !no_records
+            common::ErrorCodeToString(a_result.error), a_result.error_msg,
+            common::ErrorCodeToString(aaaa_result.error), aaaa_result.error_msg);
+        last_result = a_result.error == common::ErrorCode::DNS_NO_RECORD && !no_records
             ? std::move(aaaa_result)
             : std::move(a_result);
         last_result.error_msg = std::move(reason);
@@ -265,14 +265,14 @@ net::awaitable<DnsResult> DNSWorker::Impl::QueryServer(
         std::span<uint8_t>(query.data(), query_size),
         std::chrono::seconds(config.timeout_sec));
     if (response.error) {
-        result.error = response.error == io_error::timed_out ? ErrorCode::DNS_TIMEOUT :
-            response.error == io_error::operation_aborted ? ErrorCode::CANCELLED :
-            response.error == io_error::no_buffer_space ? ErrorCode::RESOURCE_EXHAUSTED :
-            ErrorCode::DNS_RESOLVE_FAILED;
+        result.error = response.error == io_error::timed_out ? common::ErrorCode::DNS_TIMEOUT :
+            response.error == io_error::operation_aborted ? common::ErrorCode::CANCELLED :
+            response.error == io_error::no_buffer_space ? common::ErrorCode::RESOURCE_EXHAUSTED :
+            common::ErrorCode::DNS_RESOLVE_FAILED;
         result.error_msg = response.error.message();
         co_return result;
     }
-    const uint16_t txid = LoadU16BE(query.data());
+    const uint16_t txid = common::LoadU16BE(query.data());
     co_return ParseResponse(
         std::span<const uint8_t>(response.bytes.data(), response.size),
         txid,
@@ -305,8 +305,8 @@ size_t DNSWorker::Impl::BuildQueryTo(
     query[out++] = 0x00;
 
     const uint16_t qtype = query_aaaa ? wire::TYPE_AAAA : wire::TYPE_A;
-    StoreU16BE(query.data() + out, qtype);
-    StoreU16BE(query.data() + out + 2, 1);
+    common::StoreU16BE(query.data() + out, qtype);
+    common::StoreU16BE(query.data() + out + 2, 1);
     return out + 4;
 }
 
@@ -315,21 +315,21 @@ DnsResult DNSWorker::Impl::ParseResponse(
     DnsResult result;
 
     if (response.size() < 12) {
-        result.error = ErrorCode::DNS_FORMAT_ERROR;
+        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS response too short";
         return result;
     }
 
-    const uint16_t txid = LoadU16BE(response.data());
+    const uint16_t txid = common::LoadU16BE(response.data());
     if (txid != expected_txid) {
-        result.error = ErrorCode::DNS_RESOLVE_FAILED;
+        result.error = common::ErrorCode::DNS_RESOLVE_FAILED;
         result.error_msg = "DNS transaction ID mismatch";
         return result;
     }
 
-    const uint16_t flags = LoadU16BE(response.data() + 2);
+    const uint16_t flags = common::LoadU16BE(response.data() + 2);
     if (!(flags & wire::FLAG_QR) || (flags & 0x0200)) {
-        result.error = ErrorCode::DNS_FORMAT_ERROR;
+        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS packet is not a complete response";
         return result;
     }
@@ -338,15 +338,15 @@ DnsResult DNSWorker::Impl::ParseResponse(
     if (rcode != wire::RCODE_OK && rcode != wire::RCODE_NAME_ERROR) {
         switch (rcode) {
             case 2:
-                result.error = ErrorCode::DNS_SERVER_FAILED;
+                result.error = common::ErrorCode::DNS_SERVER_FAILED;
                 result.error_msg = "SERVFAIL";
                 break;
             case 5:
-                result.error = ErrorCode::DNS_REFUSED;
+                result.error = common::ErrorCode::DNS_REFUSED;
                 result.error_msg = "REFUSED";
                 break;
             default:
-                result.error = ErrorCode::DNS_FORMAT_ERROR;
+                result.error = common::ErrorCode::DNS_FORMAT_ERROR;
                 result.error_msg = std::format(
                     "DNS response error rcode={}", rcode);
                 break;
@@ -354,9 +354,9 @@ DnsResult DNSWorker::Impl::ParseResponse(
         return result;
     }
 
-    const uint16_t qdcount = LoadU16BE(response.data() + 4);
+    const uint16_t qdcount = common::LoadU16BE(response.data() + 4);
     if (qdcount != 1) {
-        result.error = ErrorCode::DNS_FORMAT_ERROR;
+        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS question count is not 1";
         return result;
     }
@@ -379,7 +379,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
                 if (current_offset + 1 >= response.size()) {
                     return false;
                 }
-                const size_t ptr = LoadU16BE(response.data() + current_offset) & 0x3FFFu;
+                const size_t ptr = common::LoadU16BE(response.data() + current_offset) & 0x3FFFu;
                 if (ptr < 12 || ptr >= current_offset) {
                     return false;
                 }
@@ -407,34 +407,34 @@ DnsResult DNSWorker::Impl::ParseResponse(
 
     size_t pos = 12;
     if (!skip_dns_name(pos) || pos + 4 > response.size()) {
-        result.error = ErrorCode::DNS_FORMAT_ERROR;
+        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS question section truncated";
         return result;
     }
-    const uint16_t qtype = LoadU16BE(response.data() + pos);
-    const uint16_t qclass = LoadU16BE(response.data() + pos + 2);
+    const uint16_t qtype = common::LoadU16BE(response.data() + pos);
+    const uint16_t qclass = common::LoadU16BE(response.data() + pos + 2);
     if (qtype != (query_aaaa ? wire::TYPE_AAAA : wire::TYPE_A) || qclass != 1) {
-        result.error = ErrorCode::DNS_FORMAT_ERROR;
+        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS question section invalid";
         return result;
     }
     pos += 4;
 
     if (rcode == wire::RCODE_NAME_ERROR) {
-        result.error = ErrorCode::DNS_NO_RECORD;
+        result.error = common::ErrorCode::DNS_NO_RECORD;
         result.error_msg = "NXDOMAIN";
         return result;
     }
 
-    const uint16_t ancount = LoadU16BE(response.data() + 6);
+    const uint16_t ancount = common::LoadU16BE(response.data() + 6);
     if (ancount == 0) {
-        result.error = ErrorCode::DNS_NO_RECORD;
+        result.error = common::ErrorCode::DNS_NO_RECORD;
         result.error_msg = "NODATA";
         return result;
     }
 
     if (ancount > (response.size() - pos) / 11) {
-        result.error = ErrorCode::DNS_FORMAT_ERROR;
+        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS answer count exceeds packet";
         return result;
     }
@@ -444,32 +444,32 @@ DnsResult DNSWorker::Impl::ParseResponse(
 
     for (uint16_t i = 0; i < ancount; ++i) {
         if (!skip_dns_name(pos) || pos + 10 > response.size()) {
-            result.error = ErrorCode::DNS_FORMAT_ERROR;
+            result.error = common::ErrorCode::DNS_FORMAT_ERROR;
             result.error_msg = "DNS answer header truncated";
             return result;
         }
 
-        const uint16_t type = LoadU16BE(response.data() + pos);
+        const uint16_t type = common::LoadU16BE(response.data() + pos);
         if (response[pos + 2] != 0 || response[pos + 3] != 1) {
-            result.error = ErrorCode::DNS_FORMAT_ERROR;
+            result.error = common::ErrorCode::DNS_FORMAT_ERROR;
             result.error_msg = "DNS answer class is not IN";
             return result;
         }
-        const uint32_t wire_ttl = LoadU32BE(response.data() + pos + 4);
+        const uint32_t wire_ttl = common::LoadU32BE(response.data() + pos + 4);
         // RFC 2181 §8：收到最高位置位的 TTL 时，整个值按零处理。
         const uint32_t ttl = (wire_ttl & 0x80000000u) != 0 ? 0 : wire_ttl;
-        const uint16_t rdlength = LoadU16BE(response.data() + pos + 8);
+        const uint16_t rdlength = common::LoadU16BE(response.data() + pos + 8);
 
         pos += 10;
         if (pos + rdlength > response.size()) {
-            result.error = ErrorCode::DNS_FORMAT_ERROR;
+            result.error = common::ErrorCode::DNS_FORMAT_ERROR;
             result.error_msg = "DNS answer data truncated";
             return result;
         }
 
         if ((type == wire::TYPE_A && rdlength != 4) ||
             (type == wire::TYPE_AAAA && rdlength != 16)) {
-            result.error = ErrorCode::DNS_FORMAT_ERROR;
+            result.error = common::ErrorCode::DNS_FORMAT_ERROR;
             result.error_msg = std::format("DNS {} record has invalid RDLENGTH {} (expected {})",
                 type == wire::TYPE_A ? "A" : "AAAA", rdlength,
                 type == wire::TYPE_A ? 4 : 16);
@@ -493,7 +493,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
     }
 
     if (addresses.empty()) {
-        result.error = ErrorCode::DNS_NO_RECORD;
+        result.error = common::ErrorCode::DNS_NO_RECORD;
         result.error_msg = "No supported DNS records in response";
         return result;
     }
@@ -532,12 +532,12 @@ net::awaitable<DnsResult> DNSWorker::Resolve(std::string domain) {
         co_return co_await impl_->mailbox.Post(impl_->ResolveOwned(std::move(domain)));
     } catch (const WorkerMailboxFull&) {
         DnsResult rejected;
-        rejected.error = ErrorCode::RESOURCE_EXHAUSTED;
+        rejected.error = common::ErrorCode::RESOURCE_EXHAUSTED;
         co_return rejected;
     } catch (const IoSystemError& error) {
         if (error.code() != io_error::operation_aborted) throw;
         DnsResult cancelled;
-        cancelled.error = ErrorCode::CANCELLED;
+        cancelled.error = common::ErrorCode::CANCELLED;
         co_return cancelled;
     }
 }

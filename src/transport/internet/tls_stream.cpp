@@ -33,6 +33,8 @@
 // TlsStream 实现
 // ============================================================================
 
+namespace transport::internet {
+
 namespace {
 
 // Populated explicitly before Worker startup. BIO_METHOD and SSL-owned memory
@@ -53,7 +55,9 @@ bool IsBenignServerHandshakeError(unsigned long err_code) {
 
 }  // namespace
 
-struct TlsStream::Impl final : private transport::CancellationSubscription {
+}  // namespace transport::internet
+
+struct transport::internet::TlsStream::Impl final : private transport::CancellationSubscription {
     using Gate = transport::internet::AsyncWriteGate;
     enum class Kind { Handshake, Read, Write, Shutdown };
 
@@ -90,7 +94,7 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
         Impl& owner;
         OutputTurn* previous;
         OutputTurn* next = nullptr;
-        std::optional<SignalChannel> wake;
+        std::optional<common::SignalChannel> wake;
     };
 
     // Registers the wait so BioRead can interrupt it when another SSL call has
@@ -120,7 +124,7 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
         buf::MultiBuffer data;
     };
 
-    Impl(std::unique_ptr<TcpStream> inner, const SslContext& context, bool server)
+    Impl(std::unique_ptr<transport::internet::TcpStream> inner, const transport::internet::SslContext& context, bool server)
         : tcp(std::move(inner))
         , ssl(nullptr, SSL_free) {
         if (!tcp) throw std::invalid_argument("TlsStream requires TcpStream");
@@ -145,7 +149,7 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
         else SSL_set_connect_state(ssl.get());
         Resubscribe(tcp->Cancellation());
     }
-    Impl(std::unique_ptr<TcpStream> inner, SSL* existing_ssl)
+    Impl(std::unique_ptr<transport::internet::TcpStream> inner, SSL* existing_ssl)
         : tcp(std::move(inner))
         , ssl(existing_ssl, SSL_free) {
         if (!tcp || !ssl) throw std::invalid_argument("TlsStream restore requires valid TcpStream and SSL");
@@ -533,7 +537,7 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
             buf::MultiBuffer& mb;
             ~ClearOwned() noexcept { mb.clear(); }
         } clear_owned{owned};
-        ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> owned_spans;
+        common::ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> owned_spans;
         if (!owned.empty()) {
             if (owned.byte_size() == 0) co_return;
             owned_spans.AppendMultiBuffer(owned);
@@ -602,7 +606,7 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
             throw;
         }
     }
-    std::unique_ptr<TcpStream> tcp;
+    std::unique_ptr<transport::internet::TcpStream> tcp;
     std::unique_ptr<SSL, decltype(&SSL_free)> ssl;
     Gate engine_gate;
     Gate input_gate;
@@ -617,6 +621,8 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
     bool handshaking = false;
     bool raw_read = false;
 };
+
+namespace transport::internet {
 
 void TlsStream::InitializeIo() {
     if (tls_bio_method) return;
@@ -649,7 +655,9 @@ DetachedTlsState::DetachedTlsState(DetachedTlsState&& other) noexcept
     , is_server(other.is_server)
     , plaintext_prefix(std::move(other.plaintext_prefix)) {}
 
-DetachedTlsState& DetachedTlsState::operator=(DetachedTlsState&& other) noexcept {
+}  // namespace transport::internet
+
+transport::internet::DetachedTlsState& transport::internet::DetachedTlsState::operator=(transport::internet::DetachedTlsState&& other) noexcept {
     if (this != &other) {
         if (ssl) SSL_free(ssl);
         tcp = std::move(other.tcp);
@@ -659,6 +667,8 @@ DetachedTlsState& DetachedTlsState::operator=(DetachedTlsState&& other) noexcept
     }
     return *this;
 }
+
+namespace transport::internet {
 
 std::optional<DetachedTlsState> TlsStream::DetachForHandoff(
     std::span<const uint8_t> plaintext_prefix) {
@@ -1080,3 +1090,5 @@ net::awaitable<std::unique_ptr<TlsStream>> WrapRealityClient(
 
     co_return stream;
 }
+
+}  // namespace transport::internet

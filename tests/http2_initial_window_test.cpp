@@ -7,7 +7,7 @@
 namespace {
 auto Parse(std::string_view body) {
     const auto parsed = ::json::parse(body);
-    return ::ParseHttp2InitialWindow(parsed.as_object());
+    return ::infra::ParseHttp2InitialWindow(parsed.as_object());
 }
 
 TEST(Http2InitialWindow, MissingWindowDoesNotOverridePeerNegotiation) {
@@ -32,7 +32,7 @@ TEST_P(Http2InitialWindowValue, PreservesConfiguredWindowAndEncodesSettings) {
                   static_cast<uint8_t>(value >> (24 - 8 * index)));
 }
 INSTANTIATE_TEST_SUITE_P(Boundaries, Http2InitialWindowValue,
-    testing::Values(0u, static_cast<uint32_t>(::kHttp2MaxInitialWindow)));
+    testing::Values(0u, static_cast<uint32_t>(::infra::kHttp2MaxInitialWindow)));
 
 class InvalidHttp2InitialWindow : public testing::TestWithParam<const char*> {};
 TEST_P(InvalidHttp2InitialWindow, RejectsInvalidConfiguredWindow) {

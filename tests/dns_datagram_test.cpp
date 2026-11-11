@@ -188,9 +188,9 @@ TEST_P(DnsDatagramQueries, NxDomainIsCachedWithoutRepeatingUpstreamQueries) {
     peer.negative = true;
     auto run = [&]() -> net::awaitable<void> {
         const auto first = co_await dns.Resolve("negative.example");
-        EXPECT_EQ(first.error, ::ErrorCode::DNS_NO_RECORD);
+        EXPECT_EQ(first.error, ::common::ErrorCode::DNS_NO_RECORD);
         const auto cached = co_await dns.Resolve("negative.example");
-        EXPECT_EQ(cached.error, ::ErrorCode::DNS_NO_RECORD);
+        EXPECT_EQ(cached.error, ::common::ErrorCode::DNS_NO_RECORD);
         EXPECT_TRUE(cached.from_cache);
         EXPECT_EQ(peer.packets, 4u);
     };
@@ -201,10 +201,10 @@ TEST_P(DnsDatagramQueries, NoDataReasonSurvivesNegativeCaching) {
     peer.nodata = true;
     auto run = [&]() -> net::awaitable<void> {
         const auto first = co_await dns.Resolve("nodata.example");
-        EXPECT_EQ(first.error, ::ErrorCode::DNS_NO_RECORD);
+        EXPECT_EQ(first.error, ::common::ErrorCode::DNS_NO_RECORD);
         EXPECT_NE(first.error_msg.find("NODATA"), std::string::npos);
         const auto cached = co_await dns.Resolve("nodata.example");
-        EXPECT_EQ(cached.error, ::ErrorCode::DNS_NO_RECORD);
+        EXPECT_EQ(cached.error, ::common::ErrorCode::DNS_NO_RECORD);
         EXPECT_TRUE(cached.from_cache);
         EXPECT_NE(cached.error_msg.find("NODATA"), std::string::npos);
         EXPECT_EQ(cached.error_msg.find("NXDOMAIN"), std::string::npos);
@@ -244,10 +244,10 @@ TEST_P(DnsDatagramIsolation, OneRequestEndingDoesNotCancelAnotherQuery) {
     EXPECT_FALSE(errors[1]);
     EXPECT_TRUE(answers[1].Ok());
     if (cancel) {
-        EXPECT_TRUE(errors[0] || answers[0].error == ::ErrorCode::CANCELLED);
+        EXPECT_TRUE(errors[0] || answers[0].error == ::common::ErrorCode::CANCELLED);
     } else {
         EXPECT_FALSE(errors[0]);
-        EXPECT_EQ(answers[0].error, ::ErrorCode::DNS_TIMEOUT);
+        EXPECT_EQ(answers[0].error, ::common::ErrorCode::DNS_TIMEOUT);
     }
     EXPECT_EQ(peer.ports.size(), 1) << "concurrent requests must multiplex one socket";
 }
@@ -286,7 +286,7 @@ TEST_P(DnsSameDomainCancellation, CancellingOneWaiterPreservesSharedUdpAnswerFor
     io.poll();
     EXPECT_TRUE(completed[cancelled]);
     EXPECT_FALSE(completed[1 - cancelled]);
-    EXPECT_TRUE(errors[cancelled] || answers[cancelled].error == ::ErrorCode::CANCELLED) << "cancelled same-domain waiter must observe cancellation";
+    EXPECT_TRUE(errors[cancelled] || answers[cancelled].error == ::common::ErrorCode::CANCELLED) << "cancelled same-domain waiter must observe cancellation";
     if (!expired) peer.Flush("same.example");
     while (!completed[1 - cancelled] && !expired) io.run_one();
     EXPECT_FALSE(expired);
@@ -336,9 +336,9 @@ TEST_P(DnsMalformedAnswer, RejectsInvalidAddressLengthWithoutPoisoningCache) {
             EXPECT_EQ(first.packets, 4u);
             EXPECT_EQ(second.packets, 4u);
         } else {
-            EXPECT_EQ(result.error, ::ErrorCode::DNS_FORMAT_ERROR);
+            EXPECT_EQ(result.error, ::common::ErrorCode::DNS_FORMAT_ERROR);
             result = co_await worker.Resolve("malformed.example");
-            EXPECT_EQ(result.error, ::ErrorCode::DNS_FORMAT_ERROR);
+            EXPECT_EQ(result.error, ::common::ErrorCode::DNS_FORMAT_ERROR);
             EXPECT_FALSE(result.from_cache);
             EXPECT_EQ(first.packets, 8u);
             EXPECT_EQ(second.packets, 0u);
@@ -488,7 +488,7 @@ TEST(DnsDatagram, ServiceStopJoinsQueriesAndRejectsLateRepliesWithoutFallback) {
     std::exception_ptr join_error;
     auto stop = [&]() -> net::awaitable<void> {
         const auto rejected = co_await worker->Resolve("192.0.2.9");
-        EXPECT_EQ(rejected.error, ::ErrorCode::CANCELLED) << "stopped DNS must reject even a literal without doing new work";
+        EXPECT_EQ(rejected.error, ::common::ErrorCode::CANCELLED) << "stopped DNS must reject even a literal without doing new work";
         co_await worker->AsyncJoin();
         co_await worker->AsyncJoin();
         worker.reset();
@@ -507,7 +507,7 @@ TEST(DnsDatagram, ServiceStopJoinsQueriesAndRejectsLateRepliesWithoutFallback) {
     if (join_error) std::rethrow_exception(join_error);
     for (size_t i = 0; i < answers.size(); ++i) {
         EXPECT_FALSE(errors[i]) << i;
-        EXPECT_EQ(answers[i].error, ::ErrorCode::CANCELLED) << i;
+        EXPECT_EQ(answers[i].error, ::common::ErrorCode::CANCELLED) << i;
     }
     EXPECT_EQ(peer.packets, 12u);
     EXPECT_EQ(fallback.packets, 0u);

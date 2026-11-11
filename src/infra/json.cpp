@@ -22,7 +22,7 @@ namespace {
 
 void NormalizeKey(std::string& key, KeyComparison comparison) noexcept {
     if (comparison != KeyComparison::AsciiCaseInsensitive) return;
-    LowerAsciiInPlace(key);
+    common::LowerAsciiInPlace(key);
 }
 
 }  // namespace
@@ -33,8 +33,8 @@ bool object::key_compare::operator()(std::string_view lhs,
 
     const size_t length = lhs.size() < rhs.size() ? lhs.size() : rhs.size();
     for (size_t i = 0; i < length; ++i) {
-        const auto left = ToLowerAscii(static_cast<unsigned char>(lhs[i]));
-        const auto right = ToLowerAscii(static_cast<unsigned char>(rhs[i]));
+        const auto left = common::ToLowerAscii(static_cast<unsigned char>(lhs[i]));
+        const auto right = common::ToLowerAscii(static_cast<unsigned char>(rhs[i]));
         if (left != right) return left < right;
     }
     return lhs.size() < rhs.size();
@@ -428,7 +428,7 @@ private:
     uint32_t ReadHex4() {
         uint32_t cp = 0;
         for (int i = 0; i < 4; ++i) {
-            const int digit = HexDigitValue(Take());
+            const int digit = common::HexDigitValue(Take());
             if (digit < 0) Fail("invalid unicode escape");
             cp = (cp << 4) | static_cast<uint32_t>(digit);
         }
@@ -585,6 +585,8 @@ std::string serialize(const value& v) {
 
 }  // namespace json
 
+namespace infra {
+
 std::optional<uint64_t> JsonUnsignedInteger(const json::value& value) noexcept {
     if (value.is_uint64()) {
         return value.as_uint64();
@@ -690,7 +692,7 @@ void RequireJsonKeys(
     for (const auto& [key, value] : source) {
         const auto contains = [&key](std::initializer_list<std::string_view> names) {
             for (const auto name : names) {
-                if (EqualsAsciiCI(key, name)) return true;
+                if (common::EqualsAsciiCI(key, name)) return true;
             }
             return false;
         };
@@ -718,3 +720,5 @@ JsonPortResult ReadJsonPort(
         .value = static_cast<uint16_t>(*value),
     };
 }
+
+}  // namespace infra

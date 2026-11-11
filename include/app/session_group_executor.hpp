@@ -13,6 +13,8 @@
 #include <utility>
 
 
+namespace app {
+
 class GroupCoordinator : public std::enable_shared_from_this<GroupCoordinator> {
 public:
     explicit GroupCoordinator(net::io_context& io, size_t capacity = 1024);
@@ -54,3 +56,5 @@ private:
     std::unique_ptr<net::execution_context> services_ =
         std::make_unique<net::execution_context>();
 };
+
+}  // namespace app

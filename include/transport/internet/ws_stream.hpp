@@ -19,7 +19,11 @@
 #include <tl/expected.hpp>
 
 
-using WsHandshakeResult = tl::expected<void, ErrorCode>;
+namespace transport::internet {
+
+using WsHandshakeResult = tl::expected<void, common::ErrorCode>;
+
+}  // namespace transport::internet
 
 // ============================================================================
 // WebSocket 帧工具
@@ -79,11 +83,11 @@ inline EncodedFrameHeader EncodeFrameHeader(
         out[offset++] = static_cast<uint8_t>(len_byte | static_cast<uint8_t>(payload_len));
     } else if (payload_len <= 65535) {
         out[offset++] = static_cast<uint8_t>(len_byte | 126);
-        StoreU16BE(out + offset, static_cast<uint16_t>(payload_len));
+        common::StoreU16BE(out + offset, static_cast<uint16_t>(payload_len));
         offset += 2;
     } else {
         out[offset++] = static_cast<uint8_t>(len_byte | 127);
-        StoreU64BE(out + offset, static_cast<uint64_t>(payload_len));
+        common::StoreU64BE(out + offset, static_cast<uint64_t>(payload_len));
         offset += 8;
     }
 
@@ -103,6 +107,8 @@ inline EncodedFrameHeader EncodeFrameHeader(
 
 // One read operation owns the incremental decoder; one gate owns every complete
 // physical write, including control frames and the closing handshake.
+namespace transport::internet {
+
 class BaseWsStream final : public AsyncStream {
 public:
     static constexpr size_t kMaxFrameSize = 4 * 1024 * 1024;
@@ -198,5 +204,7 @@ private:
     bool closed_ = false;
     WriteGate write_gate_;
 };
+
+}  // namespace transport::internet
 
 

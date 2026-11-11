@@ -38,12 +38,10 @@
 
 namespace proxy::anytls::inbound {
 
-namespace anytls = ::anytls;
-using namespace ::anytls;
 
 namespace {
 
-constexpr size_t kMaxSubStreamQueuedPayloadBytes = anytls::kMaxFramePayload;
+constexpr size_t kMaxSubStreamQueuedPayloadBytes = proxy::anytls::kMaxFramePayload;
 // Includes both pending headers and dispatched requests. At the per-stream
 // queue limit this bounds queued application data to less than 8 MiB/session.
 constexpr size_t kMaxConcurrentSubstreams = 128;
@@ -51,7 +49,7 @@ constexpr size_t kMaxConcurrentSubstreams = 128;
 }  // namespace
 
 Handler::Handler(const proxyman::inbound::AdmissionEnvironment& environment,
-                 std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme)
+                 std::shared_ptr<const ::proxy::anytls::PaddingScheme> padding_scheme)
     : environment_(environment)
     , padding_scheme_(std::move(padding_scheme)) {}
 
@@ -72,7 +70,7 @@ public:
     bool IsClosed() const noexcept { return write_closed_; }
 
     void CheckWrite() const {
-        if (cancelled_) throw transport::LinkError(ErrorCode::CANCELLED);
+        if (cancelled_) throw transport::LinkError(common::ErrorCode::CANCELLED);
         if (write_closed_) throw transport::WriteClosed();
     }
 
@@ -182,8 +180,8 @@ private:
         (void)input_space_signal_.try_send(IoErrorCode{});
     }
 
-    SignalChannel input_signal_;
-    SignalChannel input_space_signal_;
+    common::SignalChannel input_signal_;
+    common::SignalChannel input_space_signal_;
     AnyTLSDemuxSession& session_; // Run joins all users before destroying the session.
     uint32_t sid_ = 0;
     buf::MultiBuffer queued_input_;
@@ -195,13 +193,13 @@ private:
 
 class AnyTLSDemuxSession final {
 public:
-    AnyTLSDemuxSession(std::unique_ptr<AsyncStream> stream,
+    AnyTLSDemuxSession(std::unique_ptr<transport::AsyncStream> stream,
                        routing::Dispatcher& dispatcher,
                        const routing::DispatchPolicy& policy,
                        const proxyman::inbound::AdmissionEnvironment& environment,
                        net::io_context& io_context,
                        const session::Context& session_ctx,
-                       const TimeoutsConfig& timeouts,
+                       const infra::TimeoutsConfig& timeouts,
                        std::chrono::seconds control_idle_timeout,
                        const PaddingScheme* padding_scheme)
         : stream_(std::move(stream))
@@ -221,14 +219,14 @@ public:
     AnyTLSDemuxSession(const AnyTLSDemuxSession&) = delete;
     AnyTLSDemuxSession& operator=(const AnyTLSDemuxSession&) = delete;
 
-    net::awaitable<RelayResult> Run();
+    net::awaitable<app::RelayResult> Run();
 
-    net::awaitable<tl::expected<void, ErrorCode>>
+    net::awaitable<tl::expected<void, common::ErrorCode>>
     WriteFrameSerialized(uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload) {
         const auto sub = sid != 0 ? FindStream(sid) : nullptr;
         struct WriteCancelSubscription final : transport::CancellationSubscription {
             transport::internet::AsyncWriteGate& gate;
-            AsyncStream* stream = nullptr;
+            transport::AsyncStream* stream = nullptr;
             net::cancellation_signal gate_cancel;
             bool writing = false;
             explicit WriteCancelSubscription(transport::internet::AsyncWriteGate& g) noexcept
@@ -238,63 +236,63 @@ public:
                 else if (stream) stream->Cancel();
             }
         } cancel_sub(write_gate_);
-        if (cmd == anytls::kCmdSYNACK && sub) {
+        if (cmd == proxy::anytls::kCmdSYNACK && sub) {
             cancel_sub.Resubscribe(sub->Cancellation());
         }
         auto write_lease = write_gate_.TryAcquire();
         if (!write_lease) {
             write_lease = co_await write_gate_.Acquire(
                 false,
-                (cmd == anytls::kCmdSYNACK && sub)
+                (cmd == proxy::anytls::kCmdSYNACK && sub)
                     ? cancel_sub.gate_cancel.slot()
                     : net::cancellation_slot{});
         }
         if (!write_lease || cancelled_ || !stream_) {
-            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(common::ErrorCode::CONNECTION_CLOSED);
         }
         if (sub) {
-            if (cmd == anytls::kCmdFIN && sub->RemoteClosed())
-                co_return tl::expected<void, ErrorCode>{};
-            if (cmd == anytls::kCmdSYNACK && (sub->IsClosed() || sub->Cancellation().Stopped()))
-                co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
+            if (cmd == proxy::anytls::kCmdFIN && sub->RemoteClosed())
+                co_return tl::expected<void, common::ErrorCode>{};
+            if (cmd == proxy::anytls::kCmdSYNACK && (sub->IsClosed() || sub->Cancellation().Stopped()))
+                co_return tl::unexpected(common::ErrorCode::CONNECTION_CLOSED);
         }
-        if (cmd == anytls::kCmdSYNACK && sub) {
+        if (cmd == proxy::anytls::kCmdSYNACK && sub) {
             cancel_sub.stream = stream_.get();
             cancel_sub.writing = true;
         }
 
         try {
-            auto result = co_await anytls::WriteFrame(*stream_, cmd, sid, payload);
+            auto result = co_await proxy::anytls::WriteFrame(*stream_, cmd, sid, payload);
             if (!result) FailPhysicalWrite(result.error());
             co_return result;
         } catch (...) {
-            FailPhysicalWrite(transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL));
+            FailPhysicalWrite(transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL));
             throw;
         }
     }
 
-    net::awaitable<tl::expected<void, ErrorCode>>
+    net::awaitable<tl::expected<void, common::ErrorCode>>
     WriteMultiBufferSerialized(uint8_t cmd, uint32_t sid, buf::MultiBuffer mb) {
         auto write_lease = write_gate_.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_) {
             mb.clear();
-            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(common::ErrorCode::CONNECTION_CLOSED);
         }
         CheckStreamWrite(sid);
 
         try {
-            auto result = co_await anytls::WriteMultiBufferAsFrameBatch(
+            auto result = co_await proxy::anytls::WriteMultiBufferAsFrameBatch(
                 *stream_, cmd, sid, std::move(mb));
             if (!result) FailPhysicalWrite(result.error());
             co_return result;
         } catch (...) {
-            FailPhysicalWrite(transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL));
+            FailPhysicalWrite(transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL));
             throw;
         }
     }
 
-    net::awaitable<tl::expected<void, ErrorCode>>
+    net::awaitable<tl::expected<void, common::ErrorCode>>
     WriteBuffersSerialized(uint8_t cmd,
                            uint32_t sid,
                            std::span<const net::const_buffer> buffers) {
@@ -306,22 +304,22 @@ public:
             }
         }
         if (!has_data) {
-            co_return tl::expected<void, ErrorCode>{};
+            co_return tl::expected<void, common::ErrorCode>{};
         }
 
         auto write_lease = write_gate_.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate_.Acquire();
         if (!write_lease || cancelled_ || !stream_) {
-            co_return tl::unexpected(ErrorCode::CONNECTION_CLOSED);
+            co_return tl::unexpected(common::ErrorCode::CONNECTION_CLOSED);
         }
 
         CheckStreamWrite(sid);
         try {
-            auto result = co_await anytls::WriteBuffersAsFrameBatch(*stream_, cmd, sid, buffers);
+            auto result = co_await proxy::anytls::WriteBuffersAsFrameBatch(*stream_, cmd, sid, buffers);
             if (!result) FailPhysicalWrite(result.error());
             co_return result;
         } catch (...) {
-            FailPhysicalWrite(transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL));
+            FailPhysicalWrite(transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL));
             throw;
         }
     }
@@ -333,14 +331,14 @@ public:
         }
         auto sub = std::move(it->second);
         streams_.erase(it);
-        MaybeShrinkHashContainer(streams_, 8);
+        common::MaybeShrinkHashContainer(streams_, 8);
         if (sub) {
             sub->Cancel();
         }
     }
 
 private:
-    void FailPhysicalWrite(ErrorCode error) noexcept {
+    void FailPhysicalWrite(common::ErrorCode error) noexcept {
         // A write completing after retirement only reports its consequences.
         // Preserve the frame loop's error (or clean EOF), not that drain error.
         if (cancelled_) return;
@@ -379,10 +377,10 @@ private:
         }
     }
 
-    net::awaitable<RelayResult> RejectSession(std::string_view message, ErrorCode error) {
-        (void)co_await WriteFrameSerialized(anytls::kCmdAlert, 0,
+    net::awaitable<app::RelayResult> RejectSession(std::string_view message, common::ErrorCode error) {
+        (void)co_await WriteFrameSerialized(proxy::anytls::kCmdAlert, 0,
             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(message.data()), message.size()));
-        RelayResult result;
+        app::RelayResult result;
         result.error = error;
         co_return result;
     }
@@ -391,17 +389,17 @@ private:
     // The phase and its timer are joined before this returns; an expired
     // budget yields TIMEOUT even when the phase itself completed.
     template<class Phase>
-    net::awaitable<ErrorCode> RunHandshakePhase(
+    net::awaitable<common::ErrorCode> RunHandshakePhase(
         AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at, Phase& phase) {
         const auto deadline_tp = opened_at + timeouts_.HandshakeTimeout();
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline_tp) {
             sub.Cancel();
-            co_return ErrorCode::TIMEOUT;
+            co_return common::ErrorCode::TIMEOUT;
         }
         const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline_tp - now);
         bool timed_out = false;
-        struct HandshakeDeadline final : TimeoutEvent {
+        struct HandshakeDeadline final : transport::internet::TimeoutEvent {
             HandshakeDeadline(bool& timed_out, AnyTLSSubStream& sub) noexcept
                 : timed_out(timed_out), sub(sub) {}
             void OnTimeout() override {
@@ -411,9 +409,9 @@ private:
             bool& timed_out;
             AnyTLSSubStream& sub;
         } deadline(timed_out, sub);
-        if (!TimeoutScheduler::ForIoContext(io_context_).ScheduleAfter(remaining, deadline))
+        if (!transport::internet::TimeoutScheduler::ForIoContext(io_context_).ScheduleAfter(remaining, deadline))
             throw IoSystemError(io_error::operation_aborted);
-        ErrorCode phase_error = ErrorCode::INTERNAL;
+        common::ErrorCode phase_error = common::ErrorCode::INTERNAL;
         try {
             phase_error = co_await phase();
         } catch (const IoSystemError&) {
@@ -425,48 +423,48 @@ private:
             timed_out = true;
             sub.Cancel();
         }
-        co_return timed_out ? ErrorCode::TIMEOUT : phase_error;
+        co_return timed_out ? common::ErrorCode::TIMEOUT : phase_error;
     }
 
-    net::awaitable<ErrorCode> ProcessUdpSubstream(
+    net::awaitable<common::ErrorCode> ProcessUdpSubstream(
         AnyTLSSubStream& sub,
         proxy::uot::Version uot_version,
         buf::MultiBuffer pending,
         std::chrono::steady_clock::time_point opened_at);
-    net::awaitable<ErrorCode> ProcessStream(
+    net::awaitable<common::ErrorCode> ProcessStream(
         AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at);
     net::awaitable<void> RunStream(
         std::shared_ptr<AnyTLSSubStream> sub, std::chrono::steady_clock::time_point opened_at);
-    net::awaitable<RelayResult> ReadClientSettings(const anytls::FrameHeader& header);
-    net::awaitable<RelayResult> OpenClientStream(const anytls::FrameHeader& header, AwaitableTaskGroup& tasks);
-    net::awaitable<RelayResult> ReadFrames(AwaitableTaskGroup& tasks);
+    net::awaitable<app::RelayResult> ReadClientSettings(const proxy::anytls::FrameHeader& header);
+    net::awaitable<app::RelayResult> OpenClientStream(const proxy::anytls::FrameHeader& header, common::AwaitableTaskGroup& tasks);
+    net::awaitable<app::RelayResult> ReadFrames(common::AwaitableTaskGroup& tasks);
 
-    std::unique_ptr<AsyncStream> stream_;
+    std::unique_ptr<transport::AsyncStream> stream_;
     routing::Dispatcher& dispatcher_;
     const routing::DispatchPolicy& policy_;
     const proxyman::inbound::AdmissionEnvironment& environment_;
     net::io_context& io_context_;
     const session::Context& session_ctx_;
-    TimeoutsConfig timeouts_;
+    infra::TimeoutsConfig timeouts_;
     std::chrono::seconds control_idle_timeout_{};
     const PaddingScheme* padding_scheme_ = nullptr;
     transport::internet::AsyncWriteGate write_gate_;
     memory::UnorderedMap<uint32_t, std::shared_ptr<AnyTLSSubStream>> streams_;
     uint32_t last_stream_id_ = 0;
     bool cancelled_ = false;
-    std::optional<ErrorCode> physical_write_error_;
-    std::optional<anytls::SessionVersion> session_version_;
+    std::optional<common::ErrorCode> physical_write_error_;
+    std::optional<proxy::anytls::SessionVersion> session_version_;
 };
 
 net::awaitable<void> AnyTLSSubStream::WriteMultiBuffer(buf::MultiBuffer mb) {
     CheckWrite();
-    auto ok = co_await session_.WriteMultiBufferSerialized(anytls::kCmdPSH, sid_, std::move(mb));
+    auto ok = co_await session_.WriteMultiBufferSerialized(proxy::anytls::kCmdPSH, sid_, std::move(mb));
     if (!ok) throw transport::LinkError(ok.error());
 }
 
 net::awaitable<void> AnyTLSSubStream::WriteBuffers(std::span<const net::const_buffer> buffers) {
     CheckWrite();
-    auto ok = co_await session_.WriteBuffersSerialized(anytls::kCmdPSH, sid_, buffers);
+    auto ok = co_await session_.WriteBuffersSerialized(proxy::anytls::kCmdPSH, sid_, buffers);
     if (!ok) throw transport::LinkError(ok.error());
 }
 
@@ -477,36 +475,36 @@ net::awaitable<void> AnyTLSSubStream::AsyncShutdownWrite() {
     queued_input_.clear();
     WakeInputReader();
     WakeInputWriter();
-    if (auto result = co_await session_.WriteFrameSerialized(anytls::kCmdFIN, sid_, {}); !result)
+    if (auto result = co_await session_.WriteFrameSerialized(proxy::anytls::kCmdFIN, sid_, {}); !result)
         throw transport::LinkError(result.error());
 }
 
-net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
+net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
     AnyTLSSubStream& sub,
     proxy::uot::Version uot_version,
     buf::MultiBuffer pending,
     std::chrono::steady_clock::time_point opened_at) {
     std::optional<proxy::uot::PreparedRequest> prepared;
-    auto read_header = [&]() -> net::awaitable<ErrorCode> {
+    auto read_header = [&]() -> net::awaitable<common::ErrorCode> {
         auto uot_header = co_await proxy::uot::ReadUotRequestHeader(
             uot_version, sub, std::move(pending));
         if (!uot_header) co_return uot_header.error();
         prepared.emplace(std::move(*uot_header));
-        co_return ErrorCode::OK;
+        co_return common::ErrorCode::OK;
     };
     if (const auto error = co_await RunHandshakePhase(sub, opened_at, read_header);
-        error != ErrorCode::OK) {
+        error != common::ErrorCode::OK) {
         co_return error;
     }
-    if (sub.IsClosed()) co_return ErrorCode::CONNECTION_CLOSED;
+    if (sub.IsClosed()) co_return common::ErrorCode::CONNECTION_CLOSED;
 
     (void)co_await proxy::uot::DispatchPreparedUotRequest(
         std::move(*prepared), nullptr, sub, sub,
         dispatcher_, policy_, io_context_, sub.ctx, environment_.stats, timeouts_);
-    co_return ErrorCode::OK;
+    co_return common::ErrorCode::OK;
 }
 
-net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
+net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessStream(
     AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at) {
     session::Context& ctx = sub.ctx;
     // Held for the stream's lifetime; a refusal ends only this stream.
@@ -514,17 +512,17 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
     auto pending_admission = proxy::AdmitInboundSubstream(environment_, ctx);
     if (pending_admission &&
         !admission.Hold(co_await std::move(*pending_admission), ctx, environment_.stats)) {
-        if (session_version_ == anytls::SessionVersion::V2) {
+        if (session_version_ == proxy::anytls::SessionVersion::V2) {
             constexpr std::string_view message = "connection rejected";
-            (void)co_await WriteFrameSerialized(anytls::kCmdSYNACK, sub.Sid(),
+            (void)co_await WriteFrameSerialized(proxy::anytls::kCmdSYNACK, sub.Sid(),
                 std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(message.data()), message.size()));
         }
-        co_return ErrorCode::BLOCKED;
+        co_return common::ErrorCode::BLOCKED;
     }
     buf::MultiBuffer pending;
     std::optional<proxy::uot::Version> uot_version;
-    auto prepare = [&]() -> net::awaitable<ErrorCode> {
-        auto parsed = co_await ReadAddress(sub, pending, AddressWireFormat::Socks5,
+    auto prepare = [&]() -> net::awaitable<common::ErrorCode> {
+        auto parsed = co_await common::ReadAddress(sub, pending, common::AddressWireFormat::Socks5,
                                            0,
                                            {.require_non_empty_domain = true,
                                             .allow_metadata = true});
@@ -532,49 +530,49 @@ net::awaitable<ErrorCode> AnyTLSDemuxSession::ProcessStream(
         pending.DropPrefixBytes(parsed->consumed);
         uot_version = proxy::uot::VersionFromMagicAddress(parsed->target);
         if (!parsed->target.IsValid() && !uot_version) {
-            co_return ErrorCode::PROTOCOL_INVALID_ADDRESS;
+            co_return common::ErrorCode::PROTOCOL_INVALID_ADDRESS;
         }
         proxy::BindInboundRequestTarget(
             ctx,
             proxy::InboundRequestTarget{
-                uot_version ? Network::UDP : Network::TCP,
-                uot_version ? TargetAddress{} : std::move(parsed->target),
+                uot_version ? common::Network::UDP : common::Network::TCP,
+                uot_version ? common::TargetAddress{} : std::move(parsed->target),
                 std::move(parsed->forwarded)});
-        if (session_version_ == anytls::SessionVersion::V2) {
-            if (auto ok = co_await WriteFrameSerialized(anytls::kCmdSYNACK, sub.Sid(), {}); !ok)
+        if (session_version_ == proxy::anytls::SessionVersion::V2) {
+            if (auto ok = co_await WriteFrameSerialized(proxy::anytls::kCmdSYNACK, sub.Sid(), {}); !ok)
                 co_return ok.error();
         }
-        co_return ErrorCode::OK;
+        co_return common::ErrorCode::OK;
     };
 
     if (const auto error = co_await RunHandshakePhase(sub, opened_at, prepare);
-        error != ErrorCode::OK) {
+        error != common::ErrorCode::OK) {
         co_return error;
     }
-    if (sub.IsClosed()) co_return ErrorCode::CONNECTION_CLOSED;
+    if (sub.IsClosed()) co_return common::ErrorCode::CONNECTION_CLOSED;
     // Header preparation is joined and its timer removed before Dispatcher.
     if (uot_version) {
         co_return co_await ProcessUdpSubstream(
             sub, *uot_version, std::move(pending), opened_at);
     }
     (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
-        transport::Link{&sub, &sub}, InitialPayload{std::move(pending)},
+        transport::Link{&sub, &sub}, common::InitialPayload{std::move(pending)},
         ctx, environment_.stats, timeouts_);
-    co_return ErrorCode::OK;
+    co_return common::ErrorCode::OK;
 }
 
 net::awaitable<void> AnyTLSDemuxSession::RunStream(
     std::shared_ptr<AnyTLSSubStream> sub, std::chrono::steady_clock::time_point opened_at) {
-    ErrorCode error = ErrorCode::OK;
+    common::ErrorCode error = common::ErrorCode::OK;
     try {
         error = co_await ProcessStream(*sub, opened_at);
     } catch (...) {
-        error = transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL);
+        error = transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL);
     }
-    if (error == ErrorCode::CONNECTION_CLOSED && sub->RemoteClosed()) error = ErrorCode::OK;
-    if (error != ErrorCode::OK) {
+    if (error == common::ErrorCode::CONNECTION_CLOSED && sub->RemoteClosed()) error = common::ErrorCode::OK;
+    if (error != common::ErrorCode::OK) {
         LOG_CONN_DEBUG(sub->ctx, "stream sid={} ended > {}",
-                       sub->Sid(), ErrorCodeToString(error));
+                       sub->Sid(), common::ErrorCodeToString(error));
     }
     // The request owner closes exactly once on every completion path. A remote
     // close is already terminal and produces no FIN reply. A failed FIN write
@@ -583,9 +581,9 @@ net::awaitable<void> AnyTLSDemuxSession::RunStream(
     RemoveStream(sub->Sid());
 }
 
-net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
-    RelayResult result;
-    auto read_frames = [&](AwaitableTaskGroup& tasks) -> net::awaitable<void> {
+net::awaitable<app::RelayResult> AnyTLSDemuxSession::Run() {
+    app::RelayResult result;
+    auto read_frames = [&](common::AwaitableTaskGroup& tasks) -> net::awaitable<void> {
         try {
             result = co_await ReadFrames(tasks);
         } catch (...) {
@@ -598,29 +596,29 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::Run() {
         tasks.Cancel();
     };
     try {
-        co_await RunAwaitableTaskGroup(co_await net::this_coro::executor,
-            [&](AwaitableTaskGroup& tasks) { tasks.Spawn(read_frames(tasks)); });
+        co_await common::RunAwaitableTaskGroup(co_await net::this_coro::executor,
+            [&](common::AwaitableTaskGroup& tasks) { tasks.Spawn(read_frames(tasks)); });
     } catch (...) {
         if (!physical_write_error_) throw;
     }
-    if (result.error == ErrorCode::SOCKET_EOF) result.error = ErrorCode::OK;
+    if (result.error == common::ErrorCode::SOCKET_EOF) result.error = common::ErrorCode::OK;
     if (physical_write_error_) result.error = *physical_write_error_;
     co_return result;
 }
 
-net::awaitable<RelayResult> AnyTLSDemuxSession::ReadClientSettings(const anytls::FrameHeader& header) {
-    RelayResult result;
+net::awaitable<app::RelayResult> AnyTLSDemuxSession::ReadClientSettings(const proxy::anytls::FrameHeader& header) {
+    app::RelayResult result;
             if (header.sid != 0 || session_version_)
-                co_return co_await RejectSession("invalid or repeated client settings", ErrorCode::PROTOCOL_INVALID_COMMAND);
+                co_return co_await RejectSession("invalid or repeated client settings", common::ErrorCode::PROTOCOL_INVALID_COMMAND);
             bool update_padding = false;
-            std::optional<ErrorCode> settings_error;
+            std::optional<common::ErrorCode> settings_error;
             {
-                auto text = co_await anytls::ReadFrameText(*stream_, header.length);
+                auto text = co_await proxy::anytls::ReadFrameText(*stream_, header.length);
                 if (!text) {
                     result.error = proxy::ResolveHandshakeReadFailure(*stream_, text.error());
                     co_return result;
                 }
-                auto parsed = anytls::ParsePeerSettings(*text);
+                auto parsed = proxy::anytls::ParsePeerSettings(*text);
                 if (!parsed) {
                     settings_error = parsed.error();
                 } else {
@@ -633,16 +631,16 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadClientSettings(const anytls:
                 co_return co_await RejectSession("invalid client settings", *settings_error);
             stream_->ClearPhaseDeadline();
             stream_->SetIdleTimeout(control_idle_timeout_);
-            if (session_version_ == anytls::SessionVersion::V2) {
+            if (session_version_ == proxy::anytls::SessionVersion::V2) {
                 constexpr std::string_view kServerSettings = "v=2";
-                if (auto ok = co_await WriteFrameSerialized(anytls::kCmdServerSettings, 0,
+                if (auto ok = co_await WriteFrameSerialized(proxy::anytls::kCmdServerSettings, 0,
                         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kServerSettings.data()), kServerSettings.size())); !ok) {
                     result.error = ok.error();
                     co_return result;
                 }
             }
             if (update_padding) {
-                if (auto ok = co_await WriteFrameSerialized(anytls::kCmdUpdatePaddingScheme, 0,
+                if (auto ok = co_await WriteFrameSerialized(proxy::anytls::kCmdUpdatePaddingScheme, 0,
                         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(padding_scheme_->Raw().data()),
                             padding_scheme_->Raw().size())); !ok) {
                     result.error = ok.error();
@@ -653,26 +651,26 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadClientSettings(const anytls:
     co_return result;
 }
 
-net::awaitable<RelayResult> AnyTLSDemuxSession::OpenClientStream(const anytls::FrameHeader& header, AwaitableTaskGroup& tasks) {
-    RelayResult result;
+net::awaitable<app::RelayResult> AnyTLSDemuxSession::OpenClientStream(const proxy::anytls::FrameHeader& header, common::AwaitableTaskGroup& tasks) {
+    app::RelayResult result;
     const auto sid = header.sid;
             std::string_view rejection;
             if (!session_version_) rejection = "client did not send its settings";
             else if (sid <= last_stream_id_) rejection = "stream IDs must increase";
             else if (header.length != 0) rejection = "SYN must not carry data";
             if (!rejection.empty())
-                co_return co_await RejectSession(rejection, ErrorCode::PROTOCOL_INVALID_COMMAND);
+                co_return co_await RejectSession(rejection, common::ErrorCode::PROTOCOL_INVALID_COMMAND);
             if (streams_.size() >= kMaxConcurrentSubstreams) {
                 proxy::LogInboundRequestRejected(session_ctx_, "concurrent stream limit");
                 last_stream_id_ = sid; // A refused ID is retired, never reusable.
                 environment_.stats.OnError();
-                if (session_version_ == anytls::SessionVersion::V2) {
+                if (session_version_ == proxy::anytls::SessionVersion::V2) {
                     constexpr std::string_view message = "concurrent stream limit";
-                    auto ok = co_await WriteFrameSerialized(anytls::kCmdSYNACK, sid,
+                    auto ok = co_await WriteFrameSerialized(proxy::anytls::kCmdSYNACK, sid,
                         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(message.data()), message.size()));
                     if (!ok) { result.error = ok.error(); co_return result; }
                 }
-                if (auto ok = co_await WriteFrameSerialized(anytls::kCmdFIN, sid, {}); !ok) {
+                if (auto ok = co_await WriteFrameSerialized(proxy::anytls::kCmdFIN, sid, {}); !ok) {
                     result.error = ok.error();
                     co_return result;
                 }
@@ -681,7 +679,7 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::OpenClientStream(const anytls::F
             const auto opened_at = std::chrono::steady_clock::now();
             auto sub = std::make_shared<AnyTLSSubStream>(io_context_, *this, sid);
             sub->ctx.InitSubstreamFrom(session_ctx_);
-            sub->ctx.content.network = Network::TCP;
+            sub->ctx.content.network = common::Network::TCP;
             streams_.emplace(sid, sub);
             last_stream_id_ = sid; // Commit after the complete stream was inserted.
             tasks.Spawn(RunStream(std::move(sub), opened_at));
@@ -689,41 +687,41 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::OpenClientStream(const anytls::F
     co_return result;
 }
 
-net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& tasks) {
-    RelayResult result;
-    auto resolve_handshake_error = [&](ErrorCode error) noexcept {
+net::awaitable<app::RelayResult> AnyTLSDemuxSession::ReadFrames(common::AwaitableTaskGroup& tasks) {
+    app::RelayResult result;
+    auto resolve_handshake_error = [&](common::ErrorCode error) noexcept {
         return !session_version_
             ? proxy::ResolveHandshakeReadFailure(*stream_, error)
             : error;
     };
     while (!cancelled_) {
-        auto header = co_await anytls::ReadFrameHeader(*stream_);
+        auto header = co_await proxy::anytls::ReadFrameHeader(*stream_);
         if (!header) {
             result.error = resolve_handshake_error(header.error());
             break;
         }
 
-        if (header->cmd == anytls::kCmdSettings) {
+        if (header->cmd == proxy::anytls::kCmdSettings) {
             auto settings = co_await ReadClientSettings(*header);
             if (!settings.Ok()) co_return settings;
             continue;
         }
-        if (header->cmd == anytls::kCmdServerSettings || header->cmd == anytls::kCmdUpdatePaddingScheme ||
-            header->cmd == anytls::kCmdSYNACK)
-            co_return co_await RejectSession("server command received from client", ErrorCode::PROTOCOL_INVALID_COMMAND);
-        if (header->cmd == anytls::kCmdHeartRequest || header->cmd == anytls::kCmdHeartResponse) {
-            if (session_version_ != anytls::SessionVersion::V2 || header->sid != 0 || header->length != 0)
-                co_return co_await RejectSession("heartbeat requires negotiated v2", ErrorCode::PROTOCOL_INVALID_COMMAND);
-            if (header->cmd == anytls::kCmdHeartRequest) {
-                if (auto ok = co_await WriteFrameSerialized(anytls::kCmdHeartResponse, 0, {}); !ok) {
+        if (header->cmd == proxy::anytls::kCmdServerSettings || header->cmd == proxy::anytls::kCmdUpdatePaddingScheme ||
+            header->cmd == proxy::anytls::kCmdSYNACK)
+            co_return co_await RejectSession("server command received from client", common::ErrorCode::PROTOCOL_INVALID_COMMAND);
+        if (header->cmd == proxy::anytls::kCmdHeartRequest || header->cmd == proxy::anytls::kCmdHeartResponse) {
+            if (session_version_ != proxy::anytls::SessionVersion::V2 || header->sid != 0 || header->length != 0)
+                co_return co_await RejectSession("heartbeat requires negotiated v2", common::ErrorCode::PROTOCOL_INVALID_COMMAND);
+            if (header->cmd == proxy::anytls::kCmdHeartRequest) {
+                if (auto ok = co_await WriteFrameSerialized(proxy::anytls::kCmdHeartResponse, 0, {}); !ok) {
                     result.error = ok.error();
                     break;
                 }
             }
             continue;
         }
-        if (header->cmd == anytls::kCmdWaste) {
-            if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
+        if (header->cmd == proxy::anytls::kCmdWaste) {
+            if (auto ok = co_await proxy::anytls::DiscardFramePayload(*stream_, header->length); !ok) {
                 result.error = resolve_handshake_error(ok.error());
                 break;
             }
@@ -731,36 +729,36 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& t
         }
 
         const uint32_t sid = header->sid;
-        if (header->cmd == anytls::kCmdSYN) {
+        if (header->cmd == proxy::anytls::kCmdSYN) {
             auto opened = co_await OpenClientStream(*header, tasks);
             if (!opened.Ok()) co_return opened;
             continue;
         }
-        if ((header->cmd != anytls::kCmdFIN && header->cmd != anytls::kCmdPSH) ||
+        if ((header->cmd != proxy::anytls::kCmdFIN && header->cmd != proxy::anytls::kCmdPSH) ||
             sid == 0 || sid > last_stream_id_) {
-            if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
+            if (auto ok = co_await proxy::anytls::DiscardFramePayload(*stream_, header->length); !ok) {
                 result.error = ok.error();
                 break;
             }
-            result.error = ErrorCode::PROTOCOL_INVALID_COMMAND;
+            result.error = common::ErrorCode::PROTOCOL_INVALID_COMMAND;
             break;
         }
 
         // The dispatcher can retire this stream during any following await.
         // Retain the stream itself, never an iterator into the live index.
         const auto sub = FindStream(sid);
-        if (!sub || header->cmd == anytls::kCmdFIN || sub->IsClosed()) {
-            if (auto ok = co_await anytls::DiscardFramePayload(*stream_, header->length); !ok) {
+        if (!sub || header->cmd == proxy::anytls::kCmdFIN || sub->IsClosed()) {
+            if (auto ok = co_await proxy::anytls::DiscardFramePayload(*stream_, header->length); !ok) {
                 result.error = ok.error();
                 break;
             }
-            if (sub && header->cmd == anytls::kCmdFIN) {
+            if (sub && header->cmd == proxy::anytls::kCmdFIN) {
                 sub->CloseRemote();
             }
             continue;
         }
 
-        auto payload = co_await anytls::ReadFramePayload(*stream_, header->length);
+        auto payload = co_await proxy::anytls::ReadFramePayload(*stream_, header->length);
         if (!payload) {
             result.error = payload.error();
             break;
@@ -772,39 +770,39 @@ net::awaitable<RelayResult> AnyTLSDemuxSession::ReadFrames(AwaitableTaskGroup& t
     co_return result;
 }
 
-net::awaitable<tl::expected<void, ErrorCode>> ReadAuth(
-    AsyncStream& stream,
+net::awaitable<tl::expected<void, common::ErrorCode>> ReadAuth(
+    transport::AsyncStream& stream,
     std::array<uint8_t, 32>& hash) {
 
-    std::array<uint8_t, ::anytls::kAuthPrefixSize> auth{};
-    ScopedCleanse cleanse_auth{auth};
+    std::array<uint8_t, ::proxy::anytls::kAuthPrefixSize> auth{};
+    common::ScopedCleanse cleanse_auth{auth};
     auto read = co_await proxy::ReadHandshakeExact(
         stream, auth, proxy::HandshakeProgress::NotStarted);
     if (!read) co_return tl::unexpected(read.error());
     std::copy_n(auth.begin(), hash.size(), hash.begin());
-    const uint16_t padding = LoadU16BE(&auth[32]);
+    const uint16_t padding = common::LoadU16BE(&auth[32]);
     OPENSSL_cleanse(auth.data(), auth.size());
-    if (auto ok = co_await anytls::DiscardFramePayload(stream, padding); !ok) {
+    if (auto ok = co_await proxy::anytls::DiscardFramePayload(stream, padding); !ok) {
         co_return tl::unexpected(
             proxy::ResolveHandshakeReadFailure(stream, ok.error()));
     }
-    co_return tl::expected<void, ErrorCode>{};
+    co_return tl::expected<void, common::ErrorCode>{};
 }
 
-net::awaitable<tl::expected<UserOnlineSessionGuard, ErrorCode>>
+net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>>
 AuthenticateSession(
-    AsyncStream& stream,
+    transport::AsyncStream& stream,
     proxy::InboundAuthentication authentication,
     session::Context& ctx,
-    const TimeoutsConfig& timeouts,
+    const infra::TimeoutsConfig& timeouts,
     std::chrono::seconds control_idle_timeout) {
     std::array<uint8_t, 32> auth_hash{};
-    ScopedCleanse cleanse_hash{auth_hash};
+    common::ScopedCleanse cleanse_hash{auth_hash};
     if (auto ok = co_await ReadAuth(stream, auth_hash); !ok) {
         co_return tl::unexpected(ok.error());
     }
     const auto credential = co_await authentication.VerifyCredential({proxy::KeyedInboundProtocol::AnyTls, auth_hash});
-    if (credential != ErrorCode::OK) co_return tl::unexpected(credential);
+    if (credential != common::ErrorCode::OK) co_return tl::unexpected(credential);
     auto user = proxyman::inbound::UserStore::FindAnyTlsUser(ctx.inbound.tag, auth_hash);
     OPENSSL_cleanse(auth_hash.data(), auth_hash.size());
     if (!user) co_return tl::unexpected(co_await authentication.RejectCredential("no matching credential"));
@@ -820,24 +818,24 @@ AuthenticateSession(
     // Metadata is owned by ctx; authentication must not pin an old user table
     // for the lifetime of this control transport and all its logical streams.
     user.reset();
-    ctx.content.network = Network::MUX;
+    ctx.content.network = common::Network::MUX;
     co_return std::move(*user_session);
 }
 
 }  // namespace
 
-net::awaitable<RelayResult>
+net::awaitable<app::RelayResult>
 Handler::Process(
-    std::unique_ptr<AsyncStream> stream,
+    std::unique_ptr<transport::AsyncStream> stream,
     routing::Dispatcher& dispatcher,
     const proxyman::inbound::ReceiverSettings& receiver,
     net::io_context& io_context,
     session::Context& ctx,
-    const TimeoutsConfig& timeouts,
+    const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
     if (!stream) {
-        RelayResult result;
-        result.error = ErrorCode::PROTOCOL_DECODE_FAILED;
+        app::RelayResult result;
+        result.error = common::ErrorCode::PROTOCOL_DECODE_FAILED;
         co_return result;
     }
 
@@ -852,7 +850,7 @@ Handler::Process(
                 std::chrono::seconds(pressure_idle_timeout));
         }
 
-        UserOnlineSessionGuard user_session;
+        common::UserOnlineSessionGuard user_session;
         {
             auto auth = co_await AuthenticateSession(
                 *stream, std::move(*authentication), ctx, timeouts, control_idle_timeout);
@@ -875,7 +873,7 @@ Handler::Process(
     } catch (...) {
         co_return proxy::RejectInbound(
             environment_.stats, stream.get(),
-            transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL));
+            transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL));
     }
 }
 
@@ -885,7 +883,7 @@ namespace {
 class AnyTlsSettings final
     : public ::proxyman::inbound::ProtocolSettings {
 public:
-    std::shared_ptr<const ::anytls::PaddingScheme> padding_scheme;
+    std::shared_ptr<const ::proxy::anytls::PaddingScheme> padding_scheme;
 };
 
 [[nodiscard]] const AnyTlsSettings* GetAnyTlsSettings(
@@ -901,7 +899,7 @@ const bool kInboundRegistered = [] {
 
     reg.create_tcp_handler =
         [](const ::proxyman::inbound::AdmissionEnvironment& environment,
-           const ::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<::Inbound> {
+           const ::proxyman::inbound::BuildRequest& req) -> std::unique_ptr<::proxy::Inbound> {
             const auto* settings = GetAnyTlsSettings(req);
             if (!settings) {
                 return nullptr;
@@ -912,7 +910,7 @@ const bool kInboundRegistered = [] {
         };
 
     reg.prepare_settings =
-        [](std::string_view tag, const ::InboundProtocolSettings& config)
+        [](std::string_view tag, const ::infra::InboundProtocolSettings& config)
             -> std::optional<std::shared_ptr<
                 const ::proxyman::inbound::ProtocolSettings>> {
             // Text was validated (size and grammar) by infra::ParseAnyTlsPaddingScheme;
@@ -920,26 +918,26 @@ const bool kInboundRegistered = [] {
             auto settings = std::make_shared<AnyTlsSettings>();
             if (!config.padding_scheme.empty()) {
                 auto parsed =
-                    ::anytls::ParsePaddingScheme(config.padding_scheme);
+                    ::proxy::anytls::ParsePaddingScheme(config.padding_scheme);
                 if (!parsed) {
                     LOG_WARN(
                         "AnyTLS inbound '{}': invalid padding scheme", tag);
                     return std::nullopt;
                 }
                 settings->padding_scheme =
-                    std::make_shared<const ::anytls::PaddingScheme>(std::move(*parsed));
+                    std::make_shared<const ::proxy::anytls::PaddingScheme>(std::move(*parsed));
             }
             return settings;
         };
 
     reg.build_users =
         [](const ::proxyman::inbound::BuildRequest& req,
-           std::span<const ::InboundUserSpec> specs) {
+           std::span<const ::infra::InboundUserSpec> specs) {
             return ::proxy::BuildHashedInboundUsers<
                 ::proxyman::inbound::PreparedAnyTlsUser>(
                 "AnyTLS", req, specs,
                 [](auto& info, std::string_view credential) {
-                    info.password_hash = ::anytls::PasswordHash(credential);
+                    info.password_hash = ::proxy::anytls::PasswordHash(credential);
                 });
         };
 

@@ -23,6 +23,8 @@
 #include <string_view>
 #include <utility>
 
+namespace transport::internet {
+
 namespace {
 
 [[nodiscard]] std::optional<OutboundDialCandidate> FirstDialCandidate(
@@ -266,7 +268,7 @@ protected:
         const bool stream_up = kind == XHttpClientRequestKind::StreamUp;
         auto tcp_result = co_await ConnectOutboundCandidate(io_context_, target_, candidate_);
         if (!tcp_result.Ok()) {
-            if (tcp_result.error == ErrorCode::DIAL_TIMEOUT) {
+            if (tcp_result.error == common::ErrorCode::DIAL_TIMEOUT) {
                 upload_write_expired_ = true;
                 throw IoSystemError(io_error::timed_out,
                     stream_up ? "xhttp stream-up dial timed out"
@@ -301,7 +303,7 @@ protected:
                 conn_id_);
         }
         if (!build_result || (stream_up && !*build_result)) {
-            if ((!build_result && build_result.error() == ErrorCode::TIMEOUT) ||
+            if ((!build_result && build_result.error() == common::ErrorCode::TIMEOUT) ||
                 upload_write_expired_) {
                 upload_write_expired_ = true;
                 throw IoSystemError(io_error::timed_out,
@@ -445,7 +447,7 @@ public:
                 TouchDownlinkActivity();
                 co_return;
             }
-            ConstBufferSpanBuilder<16> payloads;
+            common::ConstBufferSpanBuilder<16> payloads;
             payloads.AppendMultiBuffer(mb);
             if (!payloads.empty()) {
                 co_await OpenUploadLocked(payloads.Span());
@@ -624,7 +626,7 @@ private:
     // poisons the stream, since the deferred bytes are gone with it.
     net::awaitable<void> OpenUploadLocked(std::span<const net::const_buffer> payload) {
         const buf::MultiBuffer initial = std::move(pending_initial_);
-        ConstBufferSpanBuilder<16> initial_payload;
+        common::ConstBufferSpanBuilder<16> initial_payload;
         initial_payload.AppendMultiBuffer(initial);
         initial_payload.AppendBuffers(payload);
         if (initial_payload.empty()) co_return;
@@ -790,7 +792,7 @@ net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
     auto stream = std::move(*build_result);
     if (kind != XHttpClientRequestKind::PacketUp && !stream) {
         co_return DialResult::Fail(
-            ErrorCode::SOCKET_EOF,
+            common::ErrorCode::SOCKET_EOF,
             "xhttp client request returned no stream");
     }
     if (stream) {
@@ -824,19 +826,19 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
     const OutboundTransportTarget& target) {
 
     if (!target.stream_settings) {
-        co_return DialResult::Fail(ErrorCode::INVALID_ARGUMENT, "missing stream settings");
+        co_return DialResult::Fail(common::ErrorCode::INVALID_ARGUMENT, "missing stream settings");
     }
 
     const auto mode = ResolveXHttpOutboundMode(*target.stream_settings);
     if (mode != XHttpMode::PacketUp && mode != XHttpMode::StreamUp) {
-        co_return DialResult::Fail(ErrorCode::PROTOCOL_UNSUPPORTED, "unsupported xhttp mode");
+        co_return DialResult::Fail(common::ErrorCode::PROTOCOL_UNSUPPORTED, "unsupported xhttp mode");
     }
 
     const OutboundTransportTarget& downlink_target =
         target.xhttp_download_target ? *target.xhttp_download_target : target;
     if (!downlink_target.stream_settings || !downlink_target.stream_settings->IsXHttp()) {
         co_return DialResult::Fail(
-            ErrorCode::INVALID_ARGUMENT,
+            common::ErrorCode::INVALID_ARGUMENT,
             "invalid xhttp downlink target");
     }
 
@@ -848,7 +850,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
         target.stream_settings->xhttp, session_id_text);
 
     DialResult last_result =
-        DialResult::Fail(ErrorCode::DIAL_CONNECT_FAILED, "all xhttp candidates failed");
+        DialResult::Fail(common::ErrorCode::DIAL_CONNECT_FAILED, "all xhttp candidates failed");
     std::optional<OutboundDialCandidate> selected;
     std::unique_ptr<AsyncStream> downlink;
 
@@ -890,7 +892,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
         target.xhttp_download_target ? FirstDialCandidate(target) : selected;
     if (!upload_candidate) {
         co_return DialResult::Fail(
-            ErrorCode::INVALID_ARGUMENT,
+            common::ErrorCode::INVALID_ARGUMENT,
             "missing xhttp upload candidate");
     }
 
@@ -914,4 +916,6 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
             upload_path,
             ctx.conn_id));
 }
+
+}  // namespace transport::internet
 

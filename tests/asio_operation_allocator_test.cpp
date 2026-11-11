@@ -37,7 +37,7 @@ protected:
     net::io_context io_;
     ::tcp::acceptor acceptor_;
     ::tcp::socket peer_;
-    ::TcpStream stream_;
+    ::transport::internet::TcpStream stream_;
 };
 
 TEST_F(AsioOperationAllocatorTest, NativeWriteDeliversEveryByteToPeer) {

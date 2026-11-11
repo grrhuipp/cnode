@@ -14,7 +14,7 @@
 #include <memory>
 #include <new>
 #include <utility>
-namespace vless {
+namespace proxy::vless {
 namespace {
 
 [[nodiscard]] std::shared_ptr<EVP_PKEY> ShareKey(
@@ -224,7 +224,7 @@ EncodeVlessEncryptionLength(size_t length) noexcept {
 
 uint16_t DecodeVlessEncryptionLength(
     std::span<const uint8_t, kVlessEncryptionLengthSize> encoded) noexcept {
-    return LoadU16BE(encoded.data());
+    return common::LoadU16BE(encoded.data());
 }
 
 bool EncodeVlessEncryptionRecordHeader(
@@ -244,7 +244,7 @@ bool EncodeVlessEncryptionRecordHeader(
 
 std::optional<uint16_t> DecodeVlessEncryptionRecordHeader(
     std::span<const uint8_t, kVlessEncryptionRecordHeaderSize> header) noexcept {
-    const uint16_t length = LoadU16BE(&header[3]);
+    const uint16_t length = common::LoadU16BE(&header[3]);
     if (header[0] != 23 || header[1] != 3 || header[2] != 3 ||
         length < kVlessEncryptionMinRecordCiphertextSize ||
         length > kVlessEncryptionMaxRecordCiphertextSize) {
@@ -553,4 +553,4 @@ bool VlessEncryptionHeaderXor::FinishHeader() noexcept {
 // ============================================================================
 // Handshake Protocol
 // ============================================================================
-}  // namespace vless
+}  // namespace proxy::vless

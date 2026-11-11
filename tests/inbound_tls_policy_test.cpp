@@ -11,7 +11,7 @@ TEST_P(InboundTlsPolicy, RequiresPanelPermissionAndProtocolTls) {
     ::api::NodeInfo node;
     node.NodeType = item.protocol;
     node.EnableTLS = item.node;
-    ::PanelConfig panel;
+    ::infra::PanelConfig panel;
     panel.TLSEnable = item.panel;
     EXPECT_EQ(::controller::ShouldEnableInboundTls(panel, node), item.enabled);
 }

@@ -15,6 +15,8 @@
 
 // Live Worker state cannot be unwound safely after a runtime infrastructure
 // failure. Emit a synchronous allocation-free diagnostic and exit nonzero.
+namespace common {
+
 [[noreturn]] inline void FailRuntime(const char* phase, const char* reason) noexcept {
     // The asynchronous logger may itself have failed. Do not allocate a
     // formatted message or inspect live Worker state from this boundary.
@@ -258,3 +260,5 @@ struct ResultStatus {
     // 默认映射为内部错误
     return ErrorCode::INTERNAL;
 }
+
+}  // namespace common

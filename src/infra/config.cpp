@@ -33,6 +33,8 @@
 #include <vector>
 
 
+namespace infra {
+
 std::optional<RoutingIpNetwork> RoutingIpNetwork::Parse(std::string_view value) {
     const auto parsed = iputil::ParseNetwork(value);
     if (!parsed) return std::nullopt;
@@ -47,17 +49,19 @@ std::optional<RoutingIpNetwork> RoutingIpNetwork::Parse(std::string_view value) 
     return result;
 }
 
+}  // namespace infra
+
 namespace infra {
-ProxyProtocolMode ParseProxyProtocolMode(
+transport::internet::ProxyProtocolMode ParseProxyProtocolMode(
     const json::object& object, std::string_view key,
-    ProxyProtocolMode fallback) {
+    transport::internet::ProxyProtocolMode fallback) {
     const auto* value = object.if_contains(key);
     if (!value) return fallback;
     if (value->is_string()) {
-        const auto mode = LowerAscii(value->as_string());
-        if (mode == "off") return ProxyProtocolMode::Off;
-        if (mode == "auto") return ProxyProtocolMode::Auto;
-        if (mode == "on") return ProxyProtocolMode::On;
+        const auto mode = common::LowerAscii(value->as_string());
+        if (mode == "off") return transport::internet::ProxyProtocolMode::Off;
+        if (mode == "auto") return transport::internet::ProxyProtocolMode::Auto;
+        if (mode == "on") return transport::internet::ProxyProtocolMode::On;
     }
     throw std::invalid_argument(
         "proxyProtocol must be off, auto or on");
@@ -78,14 +82,14 @@ ParseHttp2InitialWindow(const json::object& source) {
     return std::optional<uint32_t>{static_cast<uint32_t>(**parsed)};
 }
 
-OutboundBind ParseOutboundBindConfig(
+transport::internet::OutboundBind ParseOutboundBindConfig(
     const json::value& value, const json::value* strategy) {
     if (value.is_string()) {
         if (strategy) {
             throw std::invalid_argument(
                 "sendThroughStrategy requires an array sendThrough");
         }
-        auto result = OutboundBind::Parse(value.as_string());
+        auto result = transport::internet::OutboundBind::Parse(value.as_string());
         if (!result) {
             throw std::invalid_argument(
                 "sendThrough must be auto, wildcard, an IP address, or an array of IPs/CIDRs");
@@ -96,18 +100,18 @@ OutboundBind ParseOutboundBindConfig(
         throw std::invalid_argument("sendThrough must be a string or an array of IPs/CIDRs");
     }
 
-    auto policy = OutboundBind::ChoicePolicy::Random;
+    auto policy = transport::internet::OutboundBind::ChoicePolicy::Random;
     if (strategy) {
         if (!strategy->is_string()) {
             throw std::invalid_argument(
                 "sendThroughStrategy must be random, ip_hash, or user_hash");
         }
-        if (EqualsAsciiCI(strategy->as_string(), "random")) {
-            policy = OutboundBind::ChoicePolicy::Random;
-        } else if (EqualsAsciiCI(strategy->as_string(), "ip_hash")) {
-            policy = OutboundBind::ChoicePolicy::IpHash;
-        } else if (EqualsAsciiCI(strategy->as_string(), "user_hash")) {
-            policy = OutboundBind::ChoicePolicy::UserHash;
+        if (common::EqualsAsciiCI(strategy->as_string(), "random")) {
+            policy = transport::internet::OutboundBind::ChoicePolicy::Random;
+        } else if (common::EqualsAsciiCI(strategy->as_string(), "ip_hash")) {
+            policy = transport::internet::OutboundBind::ChoicePolicy::IpHash;
+        } else if (common::EqualsAsciiCI(strategy->as_string(), "user_hash")) {
+            policy = transport::internet::OutboundBind::ChoicePolicy::UserHash;
         } else {
             throw std::invalid_argument(
                 "sendThroughStrategy must be random, ip_hash, or user_hash");
@@ -121,14 +125,14 @@ OutboundBind ParseOutboundBindConfig(
         }
         entries.push_back(entry.as_string());
     }
-    auto result = OutboundBind::ParseCandidates(entries, policy);
+    auto result = transport::internet::OutboundBind::ParseCandidates(entries, policy);
     if (!result) {
         throw std::invalid_argument("sendThrough array contains an invalid IP/CIDR or is empty");
     }
     return std::move(*result);
 }
 
-std::optional<OutboundBind> ParseOptionalOutboundBind(
+std::optional<transport::internet::OutboundBind> ParseOptionalOutboundBind(
     const json::object& source, std::string_view context) {
     const auto* send_through = source.if_contains("sendThrough");
     const auto* strategy = source.if_contains("sendThroughStrategy");
@@ -148,14 +152,14 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
     OutboundSourceConfig cfg;
 
     cfg.tag = JsonStringOr(j, "tag", "");
-    cfg.protocol = LowerAscii(JsonStringOr(j, "protocol", ""));
+    cfg.protocol = common::LowerAscii(JsonStringOr(j, "protocol", ""));
 
     const auto* settings = RequireJson(ParseJsonObject(j, "settings"));
     const json::object empty_settings;
     cfg.settings = ParseOutboundSettings(cfg.protocol, settings ? *settings : empty_settings);
     if (const auto* stream_settings = RequireJson(ParseJsonObject(j, "streamSettings"))) {
         cfg.stream_settings = ParseStreamSettings(
-            *stream_settings, StreamEndpointRole::Outbound);
+            *stream_settings, transport::internet::StreamEndpointRole::Outbound);
     }
 
     cfg.send_through = ParseOptionalOutboundBind(j, "outbound");
@@ -170,13 +174,15 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const json::object& j) {
 // JSON 辅助函数
 // ============================================================================
 
+namespace infra {
+
 namespace {
 
 constexpr std::initializer_list<std::string_view> kStreamSettingsKeys{
     "network", "security", "tlsSettings", "realitySettings", "wsSettings", "httpupgradeSettings",
     "httpSettings", "grpcSettings", "xhttpSettings"};
 
-StreamSettings ParseStreamSettingsFields(const json::object& source, StreamEndpointRole role);
+transport::internet::StreamSettings ParseStreamSettingsFields(const json::object& source, transport::internet::StreamEndpointRole role);
 
 [[nodiscard]] RoutingIpNetwork RequireRoutingIpNetwork(
     std::string_view value, std::string_view field) {
@@ -243,7 +249,7 @@ StreamSettings ParseStreamSettingsFields(const json::object& source, StreamEndpo
                 "routing {} contains control characters", field));
         }
         if (lowercase) {
-            ch = ToLowerAscii(byte);
+            ch = common::ToLowerAscii(byte);
         }
     }
     return value;
@@ -321,10 +327,10 @@ std::vector<std::string> JsonStringArrayOrEmpty(
         std::vector<std::string>{});
 }
 
-TlsVersion ParseTlsVersion(
+transport::internet::TlsVersion ParseTlsVersion(
     std::string_view value, std::string_view field) {
-    if (value == "1.2") return TlsVersion::V1_2;
-    if (value == "1.3") return TlsVersion::V1_3;
+    if (value == "1.2") return transport::internet::TlsVersion::V1_2;
+    if (value == "1.3") return transport::internet::TlsVersion::V1_3;
     throw std::invalid_argument(std::format(
         "tls {} must be 1.2 or 1.3", field));
 }
@@ -355,7 +361,7 @@ void parse_http_headers(const json::object& j,
                 "HTTP header '{}' must be a string", name));
         }
         const std::string normalized =
-            LowerAscii(name);
+            common::LowerAscii(name);
         if (!transport::internet::IsValidHttpHeaderValue(raw_value.as_string())) {
             throw std::invalid_argument(std::format(
                 "HTTP header '{}' contains invalid control characters",
@@ -379,7 +385,7 @@ uint16_t ParseRoutingPortNumber(std::string_view value,
                                 std::string_view field) {
     value = transport::internet::TrimHttpOws(value);
     uint16_t port = 0;
-    if (!TargetAddress::ParsePort(value, port)) {
+    if (!common::TargetAddress::ParsePort(value, port)) {
         throw std::invalid_argument(std::format(
             "routing {} value '{}' must be an integer between 1 and 65535",
             field, value));
@@ -483,7 +489,7 @@ void AppendRoutingPortField(const json::object& object,
 LogConfig LogConfig::FromJson(const json::object& j) {
     RequireJsonKeys(j, {"loglevel", "logDir", "access", "error", "maxDays", "rotateDaily", "gzip"}, "log");
     LogConfig cfg;
-    const auto level_name = LowerAscii(JsonStringOr(j, "loglevel", constants::logging::kDefaultLevel));
+    const auto level_name = common::LowerAscii(JsonStringOr(j, "loglevel", constants::logging::kDefaultLevel));
     const auto level = ParseLogLevel(level_name);
     if (!level) {
         throw std::invalid_argument(std::format(
@@ -541,7 +547,7 @@ udp::endpoint ParseDnsServer(std::string_view text) {
         explicit_port = true;
     }
     uint16_t port = 53;
-    const bool valid_port = !explicit_port || TargetAddress::ParsePort(port_text, port);
+    const bool valid_port = !explicit_port || common::TargetAddress::ParsePort(port_text, port);
     if (const auto address = iputil::ParseLiteral(host);
         valid_port && address && (!text.starts_with('[') || address->is_v6())) {
         return {*address, port};
@@ -629,7 +635,7 @@ RouteRuleConfig RouteRuleConfig::FromJson(const json::object& j) {
     RequireJsonKeys(j, {"type", "domain", "domainSuffix", "domainKeyword", "domainFull", "domainRegex",
                        "geosite", "ip", "geoip", "port", "network", "inboundTag", "user", "source",
                        "sourcePort", "protocol", "outboundTag"}, "routing rule");
-    if (LowerAscii(JsonStringOr(j, "type", "field")) != "field") {
+    if (common::LowerAscii(JsonStringOr(j, "type", "field")) != "field") {
         throw std::invalid_argument("routing rule type must be field");
     }
     RouteRuleConfig rule;
@@ -834,36 +840,36 @@ RoutingConfig RoutingConfig::FromJson(const json::object& j) {
 // WsConfig / StreamSettings
 // ============================================================================
 
-WsConfig infra::ParseWsConfig(const json::object& j) {
+transport::internet::WsConfig ParseWsConfig(const json::object& j) {
     RequireJsonKeys(j, {"path", "headers", "realIpHeader"}, "wsSettings");
-    WsConfig cfg;
+    transport::internet::WsConfig cfg;
     cfg.path = RequireJson(infra::NormalizeTransportPath(
         JsonStringOr(j, "path", ""), "ws path"));
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = LowerAscii(
+    cfg.real_ip_header = common::LowerAscii(
         JsonStringOr(j, "realIpHeader", cfg.real_ip_header));
     require_http_header_name(cfg.real_ip_header, "ws realIpHeader");
     return cfg;
 }
 
-HttpUpgradeConfig infra::ParseHttpUpgradeConfig(const json::object& j) {
+transport::internet::HttpUpgradeConfig ParseHttpUpgradeConfig(const json::object& j) {
     RequireJsonKeys(j, {"path", "host", "headers", "realIpHeader"}, "httpupgradeSettings");
-    HttpUpgradeConfig cfg;
+    transport::internet::HttpUpgradeConfig cfg;
     cfg.path = RequireJson(infra::NormalizeTransportPath(
         JsonStringOr(j, "path", ""), "http upgrade path"));
     cfg.host = RequireJson(infra::NormalizeHttpAuthority(
         JsonStringOr(j, "host", ""), "http upgrade host"));
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = LowerAscii(JsonStringOr(j, "realIpHeader", ""));
+    cfg.real_ip_header = common::LowerAscii(JsonStringOr(j, "realIpHeader", ""));
     require_http_header_name(
         cfg.real_ip_header, "http upgrade realIpHeader");
     return cfg;
 }
 
-HttpConfig infra::ParseHttpConfig(const json::object& j) {
+transport::internet::HttpConfig ParseHttpConfig(const json::object& j) {
     RequireJsonKeys(j, {"path", "host", "method", "headers", "realIpHeader", "forceHttp2", "initialWindowSize"},
                     "httpSettings");
-    HttpConfig cfg;
+    transport::internet::HttpConfig cfg;
     cfg.path = RequireJson(infra::NormalizeTransportPath(
         JsonStringOr(j, "path", ""), "http path"));
     cfg.host = RequireJson(infra::NormalizeHttpAuthority(
@@ -874,17 +880,17 @@ HttpConfig infra::ParseHttpConfig(const json::object& j) {
         throw std::invalid_argument("http method must be a valid HTTP token");
     }
     parse_http_headers(j, cfg.headers);
-    cfg.real_ip_header = LowerAscii(JsonStringOr(j, "realIpHeader", ""));
+    cfg.real_ip_header = common::LowerAscii(JsonStringOr(j, "realIpHeader", ""));
     require_http_header_name(cfg.real_ip_header, "http realIpHeader");
     cfg.force_http2 = JsonBoolOr(j, "forceHttp2", false);
     cfg.initial_window_size = RequireJson(ParseHttp2InitialWindow(j));
     return cfg;
 }
 
-GrpcConfig infra::ParseGrpcConfig(const json::object& j) {
+transport::internet::GrpcConfig ParseGrpcConfig(const json::object& j) {
     RequireJsonKeys(j, {"authority", "serviceName", "userAgent", "multiMode", "initialWindowSize"},
                     "grpcSettings");
-    GrpcConfig cfg;
+    transport::internet::GrpcConfig cfg;
     cfg.authority = RequireJson(infra::NormalizeHttpAuthority(
         JsonStringOr(j, "authority", ""), "grpc authority"));
     cfg.service_name = JsonStringOr(j, "serviceName", "");
@@ -900,11 +906,11 @@ GrpcConfig infra::ParseGrpcConfig(const json::object& j) {
     return cfg;
 }
 
-std::shared_ptr<const XHttpDownloadSettings> ParseXHttpDownloadSettings(
+std::shared_ptr<const transport::internet::XHttpDownloadSettings> ParseXHttpDownloadSettings(
     const json::object& j) {
     RequireJsonKeys(j, kStreamSettingsKeys, "xhttpSettings.downloadSettings",
                     {"address", "port", "sendThrough", "sendThroughStrategy"});
-    auto settings = std::make_shared<XHttpDownloadSettings>();
+    auto settings = std::make_shared<transport::internet::XHttpDownloadSettings>();
 
     const auto* address_val = j.if_contains("address");
     if (!address_val) {
@@ -932,7 +938,7 @@ std::shared_ptr<const XHttpDownloadSettings> ParseXHttpDownloadSettings(
     }
 
     settings->stream_settings = ParseStreamSettingsFields(
-        j, StreamEndpointRole::Outbound);
+        j, transport::internet::StreamEndpointRole::Outbound);
     if (settings->stream_settings.xhttp.download_settings) {
         throw std::invalid_argument("nested xhttp downloadSettings is not supported");
     }
@@ -947,19 +953,19 @@ std::shared_ptr<const XHttpDownloadSettings> ParseXHttpDownloadSettings(
 }
 
 // Xray-core SplitHTTPConfig.Build rejects any mode outside this set.
-XHttpMode ParseXHttpMode(std::string_view value) {
-    const std::string mode = LowerAscii(std::string(value));
-    if (mode.empty() || mode == "auto") return XHttpMode::Auto;
-    if (mode == "packet-up") return XHttpMode::PacketUp;
-    if (mode == "stream-up") return XHttpMode::StreamUp;
-    if (mode == "stream-one") return XHttpMode::StreamOne;
+transport::internet::XHttpMode ParseXHttpMode(std::string_view value) {
+    const std::string mode = common::LowerAscii(std::string(value));
+    if (mode.empty() || mode == "auto") return transport::internet::XHttpMode::Auto;
+    if (mode == "packet-up") return transport::internet::XHttpMode::PacketUp;
+    if (mode == "stream-up") return transport::internet::XHttpMode::StreamUp;
+    if (mode == "stream-one") return transport::internet::XHttpMode::StreamOne;
     throw std::invalid_argument(std::format("xhttp mode '{}' is not supported", mode));
 }
 
-XHttpConfig infra::ParseXHttpConfig(const json::object& j) {
+transport::internet::XHttpConfig ParseXHttpConfig(const json::object& j) {
     RequireJsonKeys(j, {"path", "host", "mode", "headers", "noGRPCHeader", "noSSEHeader", "downloadSettings",
                        "extra"}, "xhttpSettings");
-    XHttpConfig cfg;
+    transport::internet::XHttpConfig cfg;
     cfg.path = RequireJson(infra::NormalizeTransportPath(
         JsonStringOr(j, "path", ""), "xhttp path"));
     cfg.host = RequireJson(infra::NormalizeHttpAuthority(
@@ -996,8 +1002,8 @@ XHttpConfig infra::ParseXHttpConfig(const json::object& j) {
     return cfg;
 }
 
-RealityConfig infra::ParseRealityConfig(const json::object& j) {
-    RealityConfig cfg;
+transport::internet::RealityConfig ParseRealityConfig(const json::object& j) {
+    transport::internet::RealityConfig cfg;
     RequireJsonKeys(j, {"dest", "xver", "serverNames", "privateKey", "shortIds", "minClientVer", "maxClientVer",
                        "maxTimeDiff", "mldsa65Seed", "mldsa65Verify", "fingerprint", "serverName", "publicKey",
                        "shortId", "spiderX"}, "realitySettings");
@@ -1042,7 +1048,7 @@ RealityConfig infra::ParseRealityConfig(const json::object& j) {
     } else if (j.contains("fingerprint")) {
         throw std::invalid_argument("realitySettings.fingerprint must not be empty");
     }
-    cfg.server_name = LowerAscii(JsonStringOr(j, "serverName", ""));
+    cfg.server_name = common::LowerAscii(JsonStringOr(j, "serverName", ""));
     if (j.contains("serverName") &&
         !infra::IsValidRealityServerName(cfg.server_name)) {
         throw std::invalid_argument("REALITY serverName is invalid");
@@ -1075,19 +1081,19 @@ RealityConfig infra::ParseRealityConfig(const json::object& j) {
 
 namespace {
 
-StreamSettings ParseStreamSettingsFields(
-    const json::object& j, StreamEndpointRole role) {
-    StreamSettings cfg;
+transport::internet::StreamSettings ParseStreamSettingsFields(
+    const json::object& j, transport::internet::StreamEndpointRole role) {
+    transport::internet::StreamSettings cfg;
     bool min_version_declared = false;
     bool max_version_declared = false;
 
     const auto network = JsonStringOr(j, "network", constants::protocol::kTcp);
-    cfg.network_mode = ParseNetworkMode(network);
-    cfg.security_mode = ParseSecurityMode(JsonStringOr(j, "security", constants::protocol::kNone));
-    if (cfg.network_mode == NetworkMode::Unsupported) {
+    cfg.network_mode = transport::internet::ParseNetworkMode(network);
+    cfg.security_mode = transport::internet::ParseSecurityMode(JsonStringOr(j, "security", constants::protocol::kNone));
+    if (cfg.network_mode == transport::internet::NetworkMode::Unsupported) {
         throw std::invalid_argument("streamSettings.network is unsupported");
     }
-    if (cfg.security_mode == SecurityMode::Unsupported) {
+    if (cfg.security_mode == transport::internet::SecurityMode::Unsupported) {
         throw std::invalid_argument("streamSettings.security is unsupported");
     }
 
@@ -1113,12 +1119,12 @@ StreamSettings ParseStreamSettingsFields(
             JsonStringOr(*tls, "serverName", ""), "tls serverName"));
         cfg.tls.allow_insecure = JsonBoolOr(*tls, "allowInsecure", false);
         cfg.tls.ca_file = JsonStringOr(*tls, "caFile", "");
-        if (role == StreamEndpointRole::Inbound &&
+        if (role == transport::internet::StreamEndpointRole::Inbound &&
             cfg.tls.allow_insecure) {
             throw std::invalid_argument(
                 "inbound tls allowInsecure is not supported");
         }
-        if (role == StreamEndpointRole::Inbound &&
+        if (role == transport::internet::StreamEndpointRole::Inbound &&
             !cfg.tls.ca_file.empty()) {
             throw std::invalid_argument(
                 "inbound tls caFile is not supported");
@@ -1129,7 +1135,7 @@ StreamSettings ParseStreamSettingsFields(
         }
         // ALPN
         cfg.tls.alpn = JsonStringArrayOrEmpty(*tls, "alpn");
-        if (!IsValidTlsAlpn(cfg.tls.alpn)) {
+        if (!transport::internet::IsValidTlsAlpn(cfg.tls.alpn)) {
             throw std::invalid_argument(
                 "tls alpn entries must contain between 1 and 255 bytes "
                 "and must be unique");
@@ -1188,7 +1194,7 @@ StreamSettings ParseStreamSettingsFields(
         }
         // Workers build their contexts from these bytes; no file is opened
         // after configuration load.
-        LoadTlsPemMaterial(cfg.tls);
+        transport::internet::LoadTlsPemMaterial(cfg.tls);
     }
 
     if (const auto* reality = RequireJson(ParseJsonObject(j, "realitySettings"))) {
@@ -1196,13 +1202,13 @@ StreamSettings ParseStreamSettingsFields(
     }
     if (cfg.IsReality()) {
         if ((min_version_declared &&
-             cfg.tls.min_version != TlsVersion::V1_3) ||
+             cfg.tls.min_version != transport::internet::TlsVersion::V1_3) ||
             (max_version_declared &&
-             cfg.tls.max_version != TlsVersion::V1_3)) {
+             cfg.tls.max_version != transport::internet::TlsVersion::V1_3)) {
             throw std::invalid_argument(
                 "reality requires TLS minVersion and maxVersion 1.3");
         }
-        if (role == StreamEndpointRole::Outbound) {
+        if (role == transport::internet::StreamEndpointRole::Outbound) {
             if (!cfg.reality.public_key) {
                 throw std::invalid_argument(
                     "outbound REALITY requires publicKey");
@@ -1232,13 +1238,13 @@ StreamSettings ParseStreamSettingsFields(
         cfg.xhttp = infra::ParseXHttpConfig(*xhttp);
     }
 
-    cfg.http.force_http2 = cfg.http.force_http2 || EqualsAsciiCI(network, "h2");
-    return NormalizeStreamSettings(cfg);
+    cfg.http.force_http2 = cfg.http.force_http2 || common::EqualsAsciiCI(network, "h2");
+    return transport::internet::NormalizeStreamSettings(cfg);
 }
 
 }  // namespace
 
-StreamSettings infra::ParseStreamSettings(const json::object& source, StreamEndpointRole role) {
+transport::internet::StreamSettings ParseStreamSettings(const json::object& source, transport::internet::StreamEndpointRole role) {
     RequireJsonKeys(source, kStreamSettingsKeys, "streamSettings");
     return ParseStreamSettingsFields(source, role);
 }
@@ -1271,10 +1277,10 @@ void ParseStaticSettings(
         RequireJsonKeys(settings, {"clients", "password", "email"}, "inbound.settings");
     }
     auto& config = cfg.settings;
-    config.method = LowerAscii(JsonStringOr(settings, "method", config.method));
+    config.method = common::LowerAscii(JsonStringOr(settings, "method", config.method));
     if (protocol == constants::protocol::kVless) {
         config.vless_decryption = JsonStringOr(settings, "decryption", std::string(constants::protocol::kNone));
-        if (EqualsAsciiCI(config.vless_decryption, constants::protocol::kNone)) {
+        if (common::EqualsAsciiCI(config.vless_decryption, constants::protocol::kNone)) {
             config.vless_decryption = std::string(constants::protocol::kNone);
         }
     }
@@ -1348,7 +1354,7 @@ void ParseStaticSettings(
                 .user_id = 0,
                 .email = JsonStringOr(client_obj, "email", ""),
                 .credential = JsonStringOr(client_obj, credential_field, ""),
-                .flow = vless ? LowerAscii(JsonStringOr(client_obj, "flow", "")) : std::string{},
+                .flow = vless ? common::LowerAscii(JsonStringOr(client_obj, "flow", "")) : std::string{},
                 .speed_limit = 0,
                 .device_limit = 0,
             });
@@ -1394,7 +1400,7 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
         if (!proto->is_string()) {
             throw std::invalid_argument("static inbound protocol must be a string");
         }
-        cfg.protocol = LowerAscii(std::string(proto->as_string()));
+        cfg.protocol = common::LowerAscii(std::string(proto->as_string()));
     }
 
     cfg.listen = ParseInboundListen(j, "listen", "static inbound listen", cfg.listen);
@@ -1408,7 +1414,7 @@ StaticInboundConfig StaticInboundConfig::FromJson(const json::object& j) {
 
     if (const auto* stream_settings = RequireJson(ParseJsonObject(j, "streamSettings"))) {
         cfg.stream_settings = infra::ParseStreamSettings(
-            *stream_settings, StreamEndpointRole::Inbound);
+            *stream_settings, transport::internet::StreamEndpointRole::Inbound);
     }
 
     // Xray sniffing 配置
@@ -2066,13 +2072,13 @@ std::vector<std::string> GetUsedGeoSiteTags(const RoutingConfig& routing) {
 
 namespace {
 
-std::shared_ptr<const TlsPemMaterial> LoadValidatedPanelTlsPem(
+std::shared_ptr<const transport::internet::TlsPemMaterial> LoadValidatedPanelTlsPem(
     std::string cert_file, std::string key_file) {
-    TlsConfig tls;
+    transport::internet::TlsConfig tls;
     tls.cert_file = std::move(cert_file);
     tls.key_file = std::move(key_file);
-    LoadTlsPemMaterial(tls);
-    if (!SslContext::CreateServer(tls)) {
+    transport::internet::LoadTlsPemMaterial(tls);
+    if (!transport::internet::SslContext::CreateServer(tls)) {
         throw std::invalid_argument(
             "Panel TLS certificate or private key is invalid");
     }
@@ -2161,9 +2167,9 @@ std::optional<PanelApiUrlParts> ParsePanelApiUrl(std::string_view url) {
     }
     const std::string_view scheme = url.substr(0, scheme_pos);
     const bool is_http =
-        EqualsAsciiCI(scheme, constants::protocol::kHttp);
+        common::EqualsAsciiCI(scheme, constants::protocol::kHttp);
     const bool is_https =
-        EqualsAsciiCI(scheme, constants::protocol::kHttps);
+        common::EqualsAsciiCI(scheme, constants::protocol::kHttps);
     if (!is_http && !is_https) {
         return std::nullopt;
     }
@@ -2218,7 +2224,7 @@ std::optional<PanelApiUrlParts> ParsePanelApiUrl(std::string_view url) {
         return std::nullopt;
     }
     uint16_t port = use_ssl ? 443 : 80;
-    if (has_explicit_port && !TargetAddress::ParsePort(explicit_port, port)) {
+    if (has_explicit_port && !common::TargetAddress::ParsePort(explicit_port, port)) {
         return std::nullopt;
     }
 
@@ -2263,7 +2269,7 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
         throw std::invalid_argument("Panel name must not be empty");
     }
     cfg.Type = JsonStringOr(j, "type", constants::panel::kV2BoardType);
-    if (EqualsAsciiCI(cfg.Type, constants::panel::kV2BoardType)) {
+    if (common::EqualsAsciiCI(cfg.Type, constants::panel::kV2BoardType)) {
         cfg.Type = std::string(constants::panel::kV2BoardType);
     }
     cfg.APIHost   = JsonStringOr(j, "apiHost", "");
@@ -2279,7 +2285,7 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
         cfg.RequestTimeout = std::chrono::seconds(static_cast<int64_t>(*seconds));
     }
 
-    cfg.NodeType = LowerAscii(
+    cfg.NodeType = common::LowerAscii(
         JsonStringOr(j, "nodeType", constants::panel::kDefaultNodeType));
 
     if (const auto* node_ids = j.if_contains("nodeIDs")) {
@@ -2293,7 +2299,7 @@ PanelConfig PanelConfig::FromJson(const json::object& j) {
         if (!send_ip->is_string()) {
             throw std::invalid_argument("Panel sendIP must be a string");
         }
-        auto parsed = OutboundBind::Parse(send_ip->as_string());
+        auto parsed = transport::internet::OutboundBind::Parse(send_ip->as_string());
         if (!parsed) {
             throw std::invalid_argument(std::format(
                 "Panel sendIP '{}' must be auto, wildcard, or an IP address",
@@ -2400,6 +2406,8 @@ bool PanelConfig::Validate() const {
     return true;
 }
 
+}  // namespace infra
+
 namespace infra {
 
 bool IsValidRealityServerName(std::string_view name) noexcept {
@@ -2408,7 +2416,7 @@ bool IsValidRealityServerName(std::string_view name) noexcept {
 }
 
 tl::expected<void, std::string> ApplyRealityServerInput(
-    const RealityServerInput& input, RealityConfig& out) {
+    const RealityServerInput& input, transport::internet::RealityConfig& out) {
     if (input.private_key) {
         if (input.private_key->empty()) {
             return tl::unexpected("REALITY privateKey must not be empty");
@@ -2428,7 +2436,7 @@ tl::expected<void, std::string> ApplyRealityServerInput(
             return tl::unexpected(
                 "REALITY serverNames contains an invalid hostname");
         }
-        server_names.push_back(LowerAscii(name));
+        server_names.push_back(common::LowerAscii(name));
     }
 
     std::vector<transport::internet::RealityShortId> short_ids;
@@ -2444,7 +2452,7 @@ tl::expected<void, std::string> ApplyRealityServerInput(
     std::string dest_host;
     uint16_t dest_port = 0;
     if (input.dest) {
-        const auto parsed = TargetAddress::Parse(*input.dest);
+        const auto parsed = common::TargetAddress::Parse(*input.dest);
         if (!parsed) {
             return tl::unexpected("REALITY dest is invalid");
         }
@@ -2504,7 +2512,7 @@ tl::expected<void, std::string> ApplyRealityServerInput(
 }
 
 tl::expected<void, std::string> ValidateInboundReality(
-    const RealityConfig& config) {
+    const transport::internet::RealityConfig& config) {
     if (!config.private_key) {
         return tl::unexpected("inbound REALITY requires privateKey");
     }
@@ -2528,7 +2536,7 @@ tl::expected<std::string, std::string> NormalizeTlsServerName(
         return tl::unexpected(std::format(
             "{} must be an IP address or DNS hostname", field));
     }
-    return LowerAscii(std::string(value));
+    return common::LowerAscii(std::string(value));
 }
 
 tl::expected<std::string, std::string> NormalizeTransportPath(
@@ -2552,7 +2560,7 @@ tl::expected<std::string, std::string> NormalizeHttpAuthority(
         return tl::unexpected(std::format(
             "{} must be a valid HTTP authority", field));
     }
-    return LowerAscii(std::string(value));
+    return common::LowerAscii(std::string(value));
 }
 
 tl::expected<void, std::string> ValidateGrpcServiceName(
@@ -2563,7 +2571,7 @@ tl::expected<void, std::string> ValidateGrpcServiceName(
                 "{} contains invalid characters", field));
         }
     }
-    GrpcConfig probe;
+    transport::internet::GrpcConfig probe;
     probe.service_name = std::string(value);
     if (!transport::internet::IsValidHttpRequestTarget(probe.RequestPath())) {
         return tl::unexpected(std::format(
@@ -2576,7 +2584,7 @@ tl::expected<uint8_t, std::string> ParseSniffDestOverride(
     std::span<const std::string> protocols) {
     uint8_t bits = 0;
     for (const auto& raw : protocols) {
-        const std::string protocol = LowerAscii(raw);
+        const std::string protocol = common::LowerAscii(raw);
         if (protocol == "fakedns" || protocol == "fakedns+others") {
             return tl::unexpected(
                 "sniffing destOverride fakedns is not supported");
@@ -2621,21 +2629,21 @@ tl::expected<std::string, std::string> ParseAnyTlsPaddingScheme(
         return scheme;
     }
     // The advertised raw scheme must fit in one UpdatePaddingScheme frame.
-    if (scheme.size() > anytls::kMaxFramePayload) {
+    if (scheme.size() > proxy::anytls::kMaxFramePayload) {
         return tl::unexpected(std::format(
-            "{} exceeds {} bytes", field, anytls::kMaxFramePayload));
+            "{} exceeds {} bytes", field, proxy::anytls::kMaxFramePayload));
     }
-    if (!anytls::ParsePaddingScheme(scheme)) {
+    if (!proxy::anytls::ParsePaddingScheme(scheme)) {
         return tl::unexpected(std::format("{} is invalid", field));
     }
     return scheme;
 }
 
-InboundListen ParseInboundListen(
+transport::internet::InboundListen ParseInboundListen(
     const json::object& object,
     std::string_view key,
     std::string_view field_label,
-    InboundListen fallback) {
+    transport::internet::InboundListen fallback) {
     const auto* value = object.if_contains(key);
     if (!value) {
         return fallback;
@@ -2643,7 +2651,7 @@ InboundListen ParseInboundListen(
     if (!value->is_string()) {
         throw std::invalid_argument(std::format("{} must be a string", field_label));
     }
-    auto parsed = InboundListen::Parse(value->as_string());
+    auto parsed = transport::internet::InboundListen::Parse(value->as_string());
     if (!parsed) {
         throw std::invalid_argument(std::format(
             "{} '{}' must be auto or an IP address",

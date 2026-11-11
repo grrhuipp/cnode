@@ -26,21 +26,21 @@ struct Probe {
     int created = 0;
     int destroyed = 0;
     int processed = 0;
-    ::OutboundDialer* last_dialer = nullptr;
+    ::transport::internet::OutboundDialer* last_dialer = nullptr;
 };
 
-class CountingOutbound final : public ::Outbound {
+class CountingOutbound final : public ::proxy::Outbound {
 public:
     explicit CountingOutbound(Probe& probe) : probe_(probe) { ++probe_.created; }
     ~CountingOutbound() noexcept override { ++probe_.destroyed; }
 
-    ::net::awaitable<::OutboundProcessResult> Process(
-        ::session::Context&, ::transport::Link, ::OutboundDialer& dialer,
-        const ::TimeoutsConfig&, ::StatsShard&, const ::RelayConfig&,
+    ::net::awaitable<::proxy::OutboundProcessResult> Process(
+        ::session::Context&, ::transport::Link, ::transport::internet::OutboundDialer& dialer,
+        const ::infra::TimeoutsConfig&, ::app::StatsShard&, const ::app::RelayConfig&,
         ::buf::MultiBufferBatch) override {
         ++probe_.processed;
         probe_.last_dialer = &dialer;
-        co_return ::RelayResult{};
+        co_return ::app::RelayResult{};
     }
 
 private:
@@ -55,8 +55,8 @@ PreparedOutboundConfig MakeConfig(std::string tag, Probe& probe) {
         .create = ::proxyman::outbound::MakePreparedOutboundCreator<
             Probe*,
             +[](std::string_view, std::shared_ptr<Probe* const> probe,
-                ::net::io_context&, ::AwaitableTaskGroup&)
-                -> std::unique_ptr<::Outbound> {
+                ::net::io_context&, ::common::AwaitableTaskGroup&)
+                -> std::unique_ptr<::proxy::Outbound> {
                 return std::make_unique<CountingOutbound>(**probe);
             }>(&probe),
     };
@@ -69,7 +69,7 @@ protected:
         io, ::app::dns::Config{
             .servers = {{::net::ip::address_v4::loopback(), 9}}}, 8};
     ::app::dns::DNS dns{dns_worker};
-    ::ResidentTaskGroup tasks{io.get_executor()};
+    ::common::ResidentTaskGroup tasks{io.get_executor()};
     Probe first_probe;
     Probe second_probe;
     HandlerRegistry registry{{MakeConfig("direct", first_probe)}, io, dns,
@@ -103,13 +103,13 @@ TEST_F(HandlerRegistryTest, DispatchReachesPublishedProtocol) {
     auto first = registry.GetHandler("direct");
     ASSERT_TRUE(first);
     ::session::Context ctx;
-    ::TimeoutsConfig timeouts;
-    ::StatsShard stats;
-    ::RelayConfig relay;
+    ::infra::TimeoutsConfig timeouts;
+    ::app::StatsShard stats;
+    ::app::RelayConfig relay;
     bool completed = false;
     ::net::co_spawn(io,
         first->Dispatch(ctx, ::transport::Link{}, timeouts, stats, relay, {}),
-        [&](std::exception_ptr error, ::OutboundProcessResult result) {
+        [&](std::exception_ptr error, ::proxy::OutboundProcessResult result) {
             EXPECT_FALSE(error);
             EXPECT_TRUE(result.has_value());
             completed = true;

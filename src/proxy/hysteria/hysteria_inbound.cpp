@@ -35,12 +35,12 @@ namespace wire = ::transport::internet::hysteria;
 constexpr size_t kMaxRequestHeaderBytes = 8192;
 
 struct TcpRequest {
-    TargetAddress target;
+    common::TargetAddress target;
     // Request-stream bytes that followed the header in the same read.
     buf::MultiBuffer early_data;
 };
 
-[[nodiscard]] tl::expected<TargetAddress, wire::ProtocolError>
+[[nodiscard]] tl::expected<common::TargetAddress, wire::ProtocolError>
 ParseTcpRequest(wire::Version version, std::span<const uint8_t> header,
                 size_t& header_bytes) {
     if (version == wire::Version::V1) {
@@ -56,8 +56,8 @@ ParseTcpRequest(wire::Version version, std::span<const uint8_t> header,
     return std::move(request->target);
 }
 
-net::awaitable<tl::expected<TcpRequest, ErrorCode>>
-ReadTcpRequest(AsyncStream& stream, wire::Version version, session::Context& ctx) {
+net::awaitable<tl::expected<TcpRequest, common::ErrorCode>>
+ReadTcpRequest(transport::AsyncStream& stream, wire::Version version, session::Context& ctx) {
     buf::MultiBuffer received;
     for (;;) {
         buf::MultiBuffer chunk;
@@ -71,13 +71,13 @@ ReadTcpRequest(AsyncStream& stream, wire::Version version, session::Context& ctx
         }
         if (chunk.byte_size() == 0) {
             co_return tl::unexpected(ResolveHandshakeReadFailure(
-                stream, received.byte_size() == 0 ? ErrorCode::SOCKET_EOF
-                                                  : ErrorCode::PROTOCOL_DECODE_FAILED));
+                stream, received.byte_size() == 0 ? common::ErrorCode::SOCKET_EOF
+                                                  : common::ErrorCode::PROTOCOL_DECODE_FAILED));
         }
         buf::AppendCoalescedStreamInput(received, std::move(chunk));
 
         size_t header_bytes = 0;
-        tl::expected<TargetAddress, wire::ProtocolError> target =
+        tl::expected<common::TargetAddress, wire::ProtocolError> target =
             tl::unexpected(wire::ProtocolError::Incomplete);
         {
             const size_t inspect_bytes =
@@ -102,35 +102,35 @@ ReadTcpRequest(AsyncStream& stream, wire::Version version, session::Context& ctx
         const std::string_view reason = target.error() == wire::ProtocolError::Incomplete
             ? "request header too large" : "invalid request header";
         LogInboundRequestRejected(ctx, reason);
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 }
 
 // proxy/hysteria server: the transport has authenticated the connection and
 // bound its identity; each logical stream is either a UDP session or a TCP
 // request whose target this handler reads before dispatch.
-class HysteriaInbound final : public ::Inbound {
+class HysteriaInbound final : public ::proxy::Inbound {
 public:
-    HysteriaInbound(StatsShard& stats, wire::Version version) noexcept
+    HysteriaInbound(app::StatsShard& stats, wire::Version version) noexcept
         : stats_(stats), version_(version) {}
 
-    net::awaitable<RelayResult> Process(
-        std::unique_ptr<AsyncStream> stream,
+    net::awaitable<app::RelayResult> Process(
+        std::unique_ptr<transport::AsyncStream> stream,
         routing::Dispatcher& dispatcher,
         const proxyman::inbound::ReceiverSettings& receiver,
         net::io_context& io_context,
         session::Context& ctx,
-        const TimeoutsConfig& timeouts,
+        const infra::TimeoutsConfig& timeouts,
         uint32_t /*pressure_idle_timeout*/) override {
-        if (ctx.content.network == Network::UDP) {
+        if (ctx.content.network == common::Network::UDP) {
             const transport::Link client{stream.get(), stream.get()};
             co_return co_await dispatcher.Dispatch(
                 io_context, receiver.dispatch_policy, std::move(stream),
-                client, InitialPayload{},
+                client, common::InitialPayload{},
                 ctx, stats_, timeouts);
         }
 
-        InitialPayload initial_payload;
+        common::InitialPayload initial_payload;
         {
             auto request = co_await ReadTcpRequest(*stream, version_, ctx);
             if (!request) {
@@ -147,15 +147,15 @@ public:
                 co_return RejectInbound(
                     stats_, stream.get(),
                     (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout() ||
-                     stream->ConsumeWriteTimeout() ? ErrorCode::TIMEOUT : error.code()));
+                     stream->ConsumeWriteTimeout() ? common::ErrorCode::TIMEOUT : error.code()));
             } catch (const IoSystemError& error) {
                 co_return RejectInbound(
                     stats_, stream.get(),
                     ClassifyHandshakeWriteException(*stream, error));
             }
             BindInboundRequestTarget(
-                ctx, InboundRequestTarget{Network::TCP, std::move(request->target)});
-            initial_payload = InitialPayload(std::move(request->early_data));
+                ctx, InboundRequestTarget{common::Network::TCP, std::move(request->target)});
+            initial_payload = common::InitialPayload(std::move(request->early_data));
         }
         stream->ClearPhaseDeadline();
 
@@ -168,7 +168,7 @@ public:
     }
 
 private:
-    StatsShard& stats_;
+    app::StatsShard& stats_;
     wire::Version version_;
 };
 
@@ -179,7 +179,7 @@ constexpr uint64_t kBytesPerSecondPerMbps = 125000;
 }
 
 std::optional<std::shared_ptr<const proxyman::inbound::ProtocolSettings>>
-PrepareSettings(wire::Version version, const InboundProtocolSettings& config) {
+PrepareSettings(wire::Version version, const infra::InboundProtocolSettings& config) {
     auto settings = std::make_shared<wire::Settings>();
     settings->version = version;
     settings->upload_bytes_per_second =
@@ -189,7 +189,7 @@ PrepareSettings(wire::Version version, const InboundProtocolSettings& config) {
     return settings;
 }
 
-std::unique_ptr<::Inbound> CreateInbound(
+std::unique_ptr<::proxy::Inbound> CreateInbound(
     const proxyman::inbound::AdmissionEnvironment& environment,
     const proxyman::inbound::BuildRequest& request) {
     const auto* settings = wire::GetSettings(request);
@@ -199,7 +199,7 @@ std::unique_ptr<::Inbound> CreateInbound(
 
 std::optional<proxyman::inbound::UserSet> BuildUsers(
     const proxyman::inbound::BuildRequest& request,
-    std::span<const InboundUserSpec> specs) {
+    std::span<const infra::InboundUserSpec> specs) {
     return ::proxy::BuildHashedInboundUsers<
         proxyman::inbound::PreparedHysteriaUser>(
         "Hysteria", request, specs,
@@ -225,14 +225,14 @@ proxyman::inbound::ProxyRegistration Registration() {
 
 const bool kHysteriaRegistered = [] {
     auto v1 = Registration();
-    v1.prepare_settings = [](std::string_view, const InboundProtocolSettings& config)
+    v1.prepare_settings = [](std::string_view, const infra::InboundProtocolSettings& config)
         -> std::optional<std::shared_ptr<const proxyman::inbound::ProtocolSettings>> {
         return PrepareSettings(wire::Version::V1, config);
     };
     proxyman::inbound::RegisterProxy(constants::protocol::kHysteria, std::move(v1));
 
     auto v2 = Registration();
-    v2.prepare_settings = [](std::string_view, const InboundProtocolSettings& config)
+    v2.prepare_settings = [](std::string_view, const infra::InboundProtocolSettings& config)
         -> std::optional<std::shared_ptr<const proxyman::inbound::ProtocolSettings>> {
         return PrepareSettings(wire::Version::V2, config);
     };

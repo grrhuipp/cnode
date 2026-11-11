@@ -19,10 +19,22 @@
 #include <span>
 #include <string_view>
 
+namespace app {
+
 class ConnectionLimiter;
 struct ConnectionFamily;
+
+}  // namespace app
+namespace transport {
+
 class AsyncStream;
+
+}  // namespace transport
+namespace infra {
+
 struct TimeoutsConfig;
+
+}  // namespace infra
 
 namespace session {
 struct Context;
@@ -42,8 +54,10 @@ class ProtocolSettings;
 
 // Native datagram response view. Borrowed bytes and target are valid only
 // during encoding; a queued response must own its resulting payload.
+namespace proxy {
+
 struct UDPPacketView {
-    const TargetAddress& target;
+    const common::TargetAddress& target;
     std::span<const uint8_t> data;
 };
 
@@ -130,10 +144,10 @@ struct InboundDatagramAssociationKey {
 
 struct InboundDatagramAssociationKeyHash {
     [[nodiscard]] size_t operator()(const InboundDatagramAssociationKey& key) const noexcept {
-        uint64_t hash = Fnv1a64(std::span<const uint8_t>(key.owner.bytes.data(), key.owner.size));
-        hash = Fnv1a64Step(hash, key.owner.size);
-        hash = Mix64(hash ^ key.session_id);
-        hash = Mix64(hash ^ reinterpret_cast<uintptr_t>(key.configuration));
+        uint64_t hash = common::Fnv1a64(std::span<const uint8_t>(key.owner.bytes.data(), key.owner.size));
+        hash = common::Fnv1a64Step(hash, key.owner.size);
+        hash = common::Mix64(hash ^ key.session_id);
+        hash = common::Mix64(hash ^ reinterpret_cast<uintptr_t>(key.configuration));
         return static_cast<size_t>(hash);
     }
 };
@@ -154,9 +168,9 @@ struct InboundDatagramRequest {
 };
 
 struct InboundDatagramResult {
-    TargetAddress target;
+    common::TargetAddress target;
     buf::MultiBuffer payload;
-    std::optional<ForwardedMetadata> forwarded;
+    std::optional<common::ForwardedMetadata> forwarded;
     // Absent means that the normalized client endpoint identifies the session.
     std::optional<uint64_t> session_id;
     // Protocol session IDs are scoped by the authenticated credential.
@@ -168,7 +182,7 @@ struct InboundDatagramResult {
     InboundDatagramAssociation* committed_association = nullptr;
     // Synchronous-only view into the Worker's current user snapshot;
     // ingress copies the profile before any asynchronous handoff.
-    const UserProfile* user = nullptr;
+    const common::UserProfile* user = nullptr;
 };
 
 // ============================================================================
@@ -192,26 +206,28 @@ public:
     // @param pressure_idle_timeout Worker 当前压力模式的空闲超时秒数；0 表示未启用
     // @return        dispatcher/relay 结果；协议解析失败在进入 dispatcher 前返回错误
     // -----------------------------------------------------------------------
-    virtual net::awaitable<RelayResult> Process(
-        std::unique_ptr<AsyncStream> stream,
+    virtual net::awaitable<app::RelayResult> Process(
+        std::unique_ptr<transport::AsyncStream> stream,
         routing::Dispatcher& dispatcher,
         const proxyman::inbound::ReceiverSettings& receiver,
         net::io_context& io_context,
         session::Context& ctx,
-        const TimeoutsConfig& timeouts,
+        const infra::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) = 0;
 
     // Native datagrams enter through the same protocol handler abstraction.
     // The owning UDP runtime performs the dispatcher handoff after protocol
     // parsing and authentication.
-    [[nodiscard]] virtual tl::expected<InboundDatagramResult, ErrorCode>
+    [[nodiscard]] virtual tl::expected<InboundDatagramResult, common::ErrorCode>
     Process(const InboundDatagramRequest&) {
-        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+        return tl::unexpected(common::ErrorCode::NOT_SUPPORTED);
     }
     // Prepared only when the authenticated datagram starts an association.
-    [[nodiscard]] virtual tl::expected<std::shared_ptr<InboundDatagramResponse>, ErrorCode>
+    [[nodiscard]] virtual tl::expected<std::shared_ptr<InboundDatagramResponse>, common::ErrorCode>
     CreateDatagramResponse(const InboundDatagramResult&) {
-        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+        return tl::unexpected(common::ErrorCode::NOT_SUPPORTED);
     }
 };
+
+}  // namespace proxy
 

@@ -30,9 +30,21 @@
 #include <string_view>
 #include <utility>
 
+namespace common {
+
 struct TargetAddress;
+
+}  // namespace common
+namespace app {
+
 struct StatsShard;
+
+}  // namespace app
+namespace infra {
+
 struct TimeoutsConfig;
+
+}  // namespace infra
 
 namespace routing {
 class Dispatcher;
@@ -42,14 +54,14 @@ namespace proxyman::inbound {
 struct ReceiverSettings;
 }
 
-namespace worker_detail {
+namespace app::worker_detail {
 
 class UdpIngress;
 struct UdpSocketState;
 using UdpSocketStatePtr = std::shared_ptr<UdpSocketState>;
 
 struct ClientSessionKey final {
-    ClientSessionKey(InboundDatagramOwner authenticated_owner,
+    ClientSessionKey(proxy::InboundDatagramOwner authenticated_owner,
                      std::optional<uint64_t> protocol_session_id,
                      udp::endpoint client_endpoint = {},
                      const proxyman::inbound::ProtocolSettings* configuration_identity = nullptr) noexcept
@@ -63,7 +75,7 @@ struct ClientSessionKey final {
             session_id == other.session_id && (session_id.has_value() || endpoint == other.endpoint);
     }
 
-    InboundDatagramOwner owner;
+    proxy::InboundDatagramOwner owner;
     std::optional<uint64_t> session_id;
     udp::endpoint endpoint;
     const proxyman::inbound::ProtocolSettings* configuration = nullptr;
@@ -71,9 +83,9 @@ struct ClientSessionKey final {
 
 struct ClientSessionKeyHash final {
     [[nodiscard]] size_t operator()(const ClientSessionKey& key) const noexcept {
-        uint64_t hash = kFnv1aOffset64;
+        uint64_t hash = common::kFnv1aOffset64;
         const auto mix = [&hash](uint8_t byte) noexcept {
-            hash = Fnv1a64Step(hash, byte);
+            hash = common::Fnv1a64Step(hash, byte);
         };
         const auto configuration = reinterpret_cast<uintptr_t>(key.configuration);
         for (size_t shift = 0; shift < sizeof(configuration) * 8; shift += 8)
@@ -240,12 +252,12 @@ struct UdpAssociationHook final {
 // Worker-local min-heap over association rows embedded in UdpIngress maps.
 // One maintenance event sleeps until the nearest row deadline and reclaims at
 // most a bounded batch per wake; no timer runs while no row can expire.
-class UdpAssociationReclaimer final : private TimeoutEvent {
+class UdpAssociationReclaimer final : private transport::internet::TimeoutEvent {
 public:
     using FailureCallback = void (*)(void*, std::exception_ptr);
     using TimePoint = UdpAssociationHook::TimePoint;
 
-    UdpAssociationReclaimer(TimeoutScheduler& scheduler,
+    UdpAssociationReclaimer(transport::internet::TimeoutScheduler& scheduler,
                             void* failure_context,
                             FailureCallback on_failure) noexcept;
     ~UdpAssociationReclaimer() noexcept;
@@ -271,7 +283,7 @@ private:
     void SiftDown(std::size_t index) noexcept;
     void Repair(std::size_t index) noexcept;
 
-    TimeoutScheduler& scheduler_;
+    transport::internet::TimeoutScheduler& scheduler_;
     void* failure_context_ = nullptr;
     FailureCallback on_failure_ = nullptr;
     memory::Vector<UdpAssociationHook*> heap_;
@@ -317,7 +329,7 @@ public:
     [[nodiscard]] std::shared_ptr<UdpHandoffRecord> Claim(
         const UdpHandoffIdentity& key,
         std::shared_ptr<const proxyman::inbound::ProtocolSettings> configuration,
-        const InboundDatagramAssociationPolicy& policy);
+        const proxy::InboundDatagramAssociationPolicy& policy);
 private:
     memory::UnorderedMap<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
                          UdpHandoffIdentityHash> records_;
@@ -340,7 +352,7 @@ public:
         udp::endpoint endpoint;
         buf::MultiBuffer payload;
         UdpResourceBudget::PayloadReservation reservation;
-        ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> send_buffers;
+        common::ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> send_buffers;
 
         [[nodiscard]] std::span<const net::const_buffer> SendBuffers() const noexcept;
     };
@@ -350,12 +362,12 @@ public:
     // 回包只借用本入口，并持有地址稳定的 socket 状态直到会话结束。
     struct ReplyRoute {
         SocketStatePtr socket;
-        std::shared_ptr<InboundDatagramResponse> response;
+        std::shared_ptr<proxy::InboundDatagramResponse> response;
         UdpIngress* owner = nullptr;
         uint32_t worker_id = 0;
 
         [[nodiscard]] bool Valid() const noexcept { return response && owner && socket; }
-        [[nodiscard]] bool Send(UDPPacketView packet, const udp::endpoint& endpoint);
+        [[nodiscard]] bool Send(proxy::UDPPacketView packet, const udp::endpoint& endpoint);
     };
 
     enum class ReplyEnqueueResult : uint8_t {
@@ -376,7 +388,7 @@ public:
     };
 
 
-    UdpIngress(std::string_view tag, std::unique_ptr<::Inbound> proxy,
+    UdpIngress(std::string_view tag, std::unique_ptr<::proxy::Inbound> proxy,
                UdpAssociationReclaimer& reclaimer, UdpResourceBudget& budget,
                net::io_context& io_context);
     ~UdpIngress() noexcept;
@@ -388,7 +400,7 @@ public:
 
     // Keep Worker-local sockets stable while replacing cold-path protocol state.
     [[nodiscard]] bool ReplaceHandler(
-        std::unique_ptr<::Inbound> proxy) noexcept;
+        std::unique_ptr<::proxy::Inbound> proxy) noexcept;
     void RequestStop() noexcept;
     [[nodiscard]] net::awaitable<void> AsyncJoin();
 
@@ -415,7 +427,7 @@ public:
         net::io_context& io_context,
         ReplyRoute reply,
         udp::endpoint reply_endpoint,
-        ::InboundDatagramOwner session_owner,
+        ::proxy::InboundDatagramOwner session_owner,
         std::chrono::steady_clock::time_point last_active,
         std::chrono::seconds idle_timeout,
         std::shared_ptr<UdpHandoffRecord> record = {});
@@ -441,7 +453,7 @@ private:
     static net::awaitable<void> RunNativeDispatch(ClientSessionPtr session);
     void ProcessDecoded(const UdpDatagramContext& datagram,
         const net::ip::address& client_address,
-        InboundDatagramResult decoded,
+        proxy::InboundDatagramResult decoded,
         std::chrono::steady_clock::time_point now,
         std::shared_ptr<UdpHandoffRecord> record = {});
     void RegisterNativeJob(const ClientSessionPtr& session);
@@ -455,16 +467,16 @@ private:
     void Link(UdpClientSession& row, SocketState& socket,
               const ClientSessionKey& client_key, std::chrono::seconds idle_timeout) noexcept;
     void SetLocalAssociation(const UdpAssociationHook& hook,
-                             InboundDatagramAssociation* association) noexcept;
+                             proxy::InboundDatagramAssociation* association) noexcept;
     void Unlink(UdpClientSession& row) noexcept;
 
     memory::String tag_;
-    std::unique_ptr<::Inbound> proxy_;
+    std::unique_ptr<::proxy::Inbound> proxy_;
     UdpAssociationReclaimer& reclaimer_;
     UdpResourceBudget& budget_;
     memory::UnorderedMap<const SocketState*, SocketStatePtr> sockets_;
     net::io_context& io_context_;
-    SignalChannel completion_signal_;
+    common::SignalChannel completion_signal_;
     UdpHandoffDirectory handoff_directory_;
     ClientSession* jobs_ = nullptr;
     size_t outstanding_jobs_ = 0;
@@ -489,7 +501,7 @@ struct UdpSocketState final {
     UdpIngress* owner = nullptr;
     UdpIngress::SocketPtr socket;
     std::optional<tcp::endpoint> local_endpoint;
-    InboundDatagramAssociationIndex associations;
+    proxy::InboundDatagramAssociationIndex associations;
     memory::UnorderedMap<ClientSessionKey, UdpIngress::UdpClientSession,
                          ClientSessionKeyHash> sessions;
     memory::RingDeque<QueuedReply> pending;
@@ -508,7 +520,7 @@ public:
     ClientSession(net::io_context& io_context,
                   ReplyRoute reply,
                   udp::endpoint reply_endpoint,
-                  ::InboundDatagramOwner session_owner,
+                  ::proxy::InboundDatagramOwner session_owner,
                   UdpResourceBudget& budget,
                   UdpResourceBudget::AssociationLease association,
                   std::shared_ptr<UdpHandoffRecord> record = {});
@@ -519,11 +531,11 @@ public:
 
     [[nodiscard]] bool Closed() const noexcept;
     [[nodiscard]] bool Owns(
-        const ::InboundDatagramOwner& owner) const noexcept;
+        const ::proxy::InboundDatagramOwner& owner) const noexcept;
 
     void UpdateReplyEndpoint(udp::endpoint endpoint) noexcept;
     [[nodiscard]] bool Push(
-        const TargetAddress& target,
+        const common::TargetAddress& target,
         buf::MultiBuffer payload);
     void Close() noexcept;
 
@@ -546,9 +558,9 @@ private:
         net::io_context* io_context = nullptr;
         const proxyman::inbound::AdmissionEnvironment* admission = nullptr;
         app::RequestLoadState* request_load = nullptr;
-        TimeoutsConfig timeouts;
+        infra::TimeoutsConfig timeouts;
         // Owned copy of the authenticating credential's profile.
-        UserProfile profile;
+        common::UserProfile profile;
     };
 
     struct QueuedInput {
@@ -560,18 +572,18 @@ private:
     void WakeReader() {
         (void)reader_signal_.try_send(IoErrorCode{});
     }
-    void CloseWithError(ErrorCode error) noexcept;
+    void CloseWithError(common::ErrorCode error) noexcept;
 
     UdpResourceBudget::AssociationLease association_;
     UdpResourceBudget* budget_;
-    SignalChannel reader_signal_;
+    common::SignalChannel reader_signal_;
     ReplyRoute reply_;
     udp::endpoint reply_endpoint_;
     memory::RingDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
     bool closed_ = false;
-    ErrorCode terminal_error_ = ErrorCode::OK;
-    ::InboundDatagramOwner session_owner_;
+    common::ErrorCode terminal_error_ = common::ErrorCode::OK;
+    ::proxy::InboundDatagramOwner session_owner_;
     transport::CancellationSource cancellation_;
     std::optional<RequestData> request_;
     ClientSession* job_previous_ = nullptr;
@@ -588,7 +600,7 @@ private:
 
 
 struct UdpHandoffRecord {
-    std::unique_ptr<InboundDatagramAssociation> association;
+    std::unique_ptr<proxy::InboundDatagramAssociation> association;
     std::weak_ptr<UdpIngress::ClientSession> session;
     std::shared_ptr<const proxyman::inbound::ProtocolSettings> configuration;
     UdpSocketStatePtr socket_pin;
@@ -596,7 +608,7 @@ struct UdpHandoffRecord {
     const UdpHandoffIdentity* identity = nullptr;
     UdpHandoffRecord* previous = nullptr;
     UdpHandoffRecord* next = nullptr;
-    explicit UdpHandoffRecord(const InboundDatagramAssociationPolicy& policy)
+    explicit UdpHandoffRecord(const proxy::InboundDatagramAssociationPolicy& policy)
         : association(policy.create()) {}
 };
-}  // namespace worker_detail
+}  // namespace app::worker_detail

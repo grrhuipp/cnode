@@ -135,7 +135,7 @@ void DomainRuleSet::AddKeyword(std::string_view keyword) {
     }
     auto& lower = keywords_.emplace_back(keyword);
     std::ranges::transform(lower, lower.begin(), [](char ch) {
-        return ToLowerAscii(ch);
+        return common::ToLowerAscii(ch);
     });
 }
 
@@ -158,7 +158,7 @@ bool DomainRuleSet::Match(std::string_view domain) const {
             lower = heap_buf.emplace(domain.size(), '\0').data();
         }
         std::ranges::transform(domain, lower, [](char ch) {
-            return ToLowerAscii(ch);
+            return common::ToLowerAscii(ch);
         });
         lower_domain = std::string_view(lower, domain.size());
     }
@@ -282,7 +282,7 @@ private:
         }
     }
 
-    ByteReader reader_;
+    common::ByteReader reader_;
     const std::filesystem::path& path_;
 };
 
@@ -293,7 +293,7 @@ private:
 [[nodiscard]] std::string LowerTag(std::string_view tag) {
     std::string lower(tag);
     std::ranges::transform(lower, lower.begin(), [](char ch) {
-        return ToLowerAscii(ch);
+        return common::ToLowerAscii(ch);
     });
     return lower;
 }
@@ -466,7 +466,7 @@ void LoadCategories(
     const std::filesystem::path& path,
     std::span<const std::string> tags,
     std::string_view kind,
-    std::unordered_map<std::string, Set, TransparentStringHash, TransparentStringEq>& out,
+    std::unordered_map<std::string, Set, common::TransparentStringHash, common::TransparentStringEq>& out,
     void (*fill)(ProtoReader&, const std::filesystem::path&, Set&)) {
     std::vector<std::string> wanted;
     wanted.reserve(tags.size());
@@ -483,8 +483,8 @@ void LoadCategories(
     const auto less_ignore_case = [](std::string_view lhs, std::string_view rhs) noexcept {
         return std::ranges::lexicographical_compare(
             lhs, rhs, {},
-            [](char ch) { return ToLowerAscii(ch); },
-            [](char ch) { return ToLowerAscii(ch); });
+            [](char ch) { return common::ToLowerAscii(ch); },
+            [](char ch) { return common::ToLowerAscii(ch); });
     };
 
     const auto bytes = ReadWholeFile(path);
@@ -531,7 +531,7 @@ template <class Map>
     if (tag.size() <= 128) {
         std::array<char, 128> stack_buf{};
         std::ranges::transform(tag, stack_buf.begin(), [](char ch) {
-            return ToLowerAscii(ch);
+            return common::ToLowerAscii(ch);
         });
         const auto it = map.find(std::string_view(stack_buf.data(), tag.size()));
         return it == map.end() ? nullptr : &it->second;

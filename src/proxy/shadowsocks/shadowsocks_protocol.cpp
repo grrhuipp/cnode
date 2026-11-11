@@ -18,30 +18,30 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ss {
+namespace proxy::shadowsocks {
 
 // ============================================================================
 // ParseCipherMethod
 // ============================================================================
 std::optional<SsCipherInfo> ParseCipherMethod(std::string_view method) {
 
-    if (EqualsAsciiCI(method, constants::protocol::kAes128Gcm)) {
+    if (common::EqualsAsciiCI(method, constants::protocol::kAes128Gcm)) {
         return SsCipherInfo{SsCipherType::AES_128_GCM, 16, 16};
     }
-    if (EqualsAsciiCI(method, constants::protocol::kAes256Gcm)) {
+    if (common::EqualsAsciiCI(method, constants::protocol::kAes256Gcm)) {
         return SsCipherInfo{SsCipherType::AES_256_GCM, 32, 32};
     }
-    if (EqualsAsciiCI(method, constants::protocol::kChacha20IetfPoly1305) ||
-        EqualsAsciiCI(method, "chacha20-poly1305")) {
+    if (common::EqualsAsciiCI(method, constants::protocol::kChacha20IetfPoly1305) ||
+        common::EqualsAsciiCI(method, "chacha20-poly1305")) {
         return SsCipherInfo{SsCipherType::CHACHA20_POLY1305, 32, 32};
     }
-    if (EqualsAsciiCI(method, constants::protocol::kSs2022Blake3Aes128Gcm)) {
+    if (common::EqualsAsciiCI(method, constants::protocol::kSs2022Blake3Aes128Gcm)) {
         return SsCipherInfo{SsCipherType::AES_128_GCM_2022, 16, 16};
     }
-    if (EqualsAsciiCI(method, constants::protocol::kSs2022Blake3Aes256Gcm)) {
+    if (common::EqualsAsciiCI(method, constants::protocol::kSs2022Blake3Aes256Gcm)) {
         return SsCipherInfo{SsCipherType::AES_256_GCM_2022, 32, 32};
     }
-    if (EqualsAsciiCI(method, constants::protocol::kSs2022Blake3Chacha20Poly1305)) {
+    if (common::EqualsAsciiCI(method, constants::protocol::kSs2022Blake3Chacha20Poly1305)) {
         return SsCipherInfo{SsCipherType::CHACHA20_POLY1305_2022, 32, 32};
     }
     return std::nullopt;
@@ -86,7 +86,7 @@ KeyBytes DeriveKey(std::string_view password, size_t key_size) {
     }
 
     uint8_t prev[16]{};
-    ScopedCleanse cleanse_prev{prev};
+    common::ScopedCleanse cleanse_prev{prev};
     size_t prev_len = 0;
     size_t written = 0;
     const auto* pw = reinterpret_cast<const uint8_t*>(password.data());
@@ -123,7 +123,7 @@ KeyBytes Decode2022Psk(std::string_view password, size_t key_size) {
     }
 
     std::string encoded;
-    ScopedCleanse cleanse_encoded{encoded};
+    common::ScopedCleanse cleanse_encoded{encoded};
     encoded.reserve(44);
     for (const char ch : password) {
         if (ch == '\r' || ch == '\n' || ch == '\t' || ch == ' ') {
@@ -185,7 +185,7 @@ KeyBytes Decode2022Psk(std::string_view password, size_t key_size) {
     }
 
     std::array<uint8_t, 36> decoded{};
-    ScopedCleanse cleanse_decoded{decoded};
+    common::ScopedCleanse cleanse_decoded{decoded};
     const int decoded_len = EVP_DecodeBlock(
         decoded.data(),
         reinterpret_cast<const uint8_t*>(encoded.data()),
@@ -341,4 +341,4 @@ bool SsAeadCipher::Decrypt(const uint8_t* nonce, const uint8_t* ciphertext,
                       {output, ciphertext_len - kTagSize}).has_value();
 }
 
-}  // namespace ss
+}  // namespace proxy::shadowsocks

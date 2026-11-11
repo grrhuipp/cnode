@@ -32,9 +32,13 @@
 #include <utility>
 #include <variant>
 
+namespace app {
+
 class GroupCoordinator;
 
-namespace vmess {
+}  // namespace app
+
+namespace proxy::vmess {
 
 // 通过 AuthID 查找用户，限定 tag（优化：O(N_tag) 而非 O(N_total)）
 [[nodiscard]] std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>
@@ -46,7 +50,7 @@ FindByAuthIDForTag(std::string_view tag,
 // Returns false for replay or full tracking capacity; unexpired tuples are never
 // evicted to accept a new one.
 [[nodiscard]] net::awaitable<bool> RegisterSessionIfNew(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     const proxyman::inbound::UserStore::VmessCredential& user,
     const std::array<uint8_t, 16>& body_key,
     const std::array<uint8_t, 16>& body_iv);
@@ -54,16 +58,16 @@ FindByAuthIDForTag(std::string_view tag,
 // VMess UDP 会话的目标在请求头里固定；每份数据报封为一个认证 chunk，
 // 空 body 保留给 EOF，所以空数据报不可编码（NOT_SUPPORTED）。
 inline void ValidateFixedUdpDatagram(const buf::MultiBuffer& payload,
-                                     const TargetAddress& fixed_target) {
+                                     const common::TargetAddress& fixed_target) {
     const auto datagram = proxy::RequireUdpDatagram(payload, &fixed_target);
     if (datagram && datagram->payload_size == 0) {
-        throw transport::LinkError(ErrorCode::NOT_SUPPORTED);
+        throw transport::LinkError(common::ErrorCode::NOT_SUPPORTED);
     }
 }
 
-}  // namespace vmess
+}  // namespace proxy::vmess
 
-namespace vmess::encoding {
+namespace proxy::vmess::encoding {
 
 struct BodyKey {
     std::array<uint8_t, 16> key{};
@@ -91,7 +95,7 @@ inline constexpr size_t kRequestHeaderChecksumSize = 4;
 // padding 长度占 security 字节的高半字节。
 inline constexpr size_t kMaxRequestHeaderPaddingSize = 0x0F;
 inline constexpr size_t kMaxRequestHeaderPlainSize = kRequestHeaderFixedSize +
-    kMaxEncodedAddressSize + kMaxRequestHeaderPaddingSize + kRequestHeaderChecksumSize;
+    common::kMaxEncodedAddressSize + kMaxRequestHeaderPaddingSize + kRequestHeaderChecksumSize;
 inline constexpr size_t kMaxRequestHeaderWireSize =
     kRequestHeaderPrefixSize + kMaxRequestHeaderPlainSize + GCM_TAG_SIZE;
 
@@ -155,20 +159,20 @@ public:
     [[nodiscard]] bool PacketMode() const noexcept { return cipher_.PacketMode(); }
 
     net::awaitable<void> WriteMultiBuffer(
-        AsyncStream& stream,
+        transport::AsyncStream& stream,
         buf::MultiBuffer mb,
         const char* cancel_what,
         std::span<const uint8_t> first_header = std::span<const uint8_t>{},
         bool* header_sent = nullptr,
-        const TargetAddress* udp_target = nullptr);
+        const common::TargetAddress* udp_target = nullptr);
     net::awaitable<void> WriteBuffers(
-        AsyncStream& stream,
+        transport::AsyncStream& stream,
         std::span<const net::const_buffer> buffers,
         const char* cancel_what,
         std::span<const uint8_t> first_header = std::span<const uint8_t>{},
         bool* header_sent = nullptr);
     net::awaitable<void> WriteEOF(
-        AsyncStream& stream,
+        transport::AsyncStream& stream,
         const char* cancel_what,
         std::span<const uint8_t> first_header = std::span<const uint8_t>{},
         bool* header_sent = nullptr);
@@ -185,19 +189,19 @@ public:
 
 private:
     net::awaitable<void> WriteFirstEncodedChunks(
-        AsyncStream& stream,
+        transport::AsyncStream& stream,
         buf::MultiBuffer chunks,
         std::span<const uint8_t> first_header,
         bool& header_sent);
     // By value: an owned MultiBuffer stays in this frame until encoding consumes it.
     template <typename Payload>
     net::awaitable<void> WriteEncoded(
-        AsyncStream& stream,
+        transport::AsyncStream& stream,
         Payload payload,
         const char* cancel_what,
         std::span<const uint8_t> first_header,
         bool* header_sent,
-        const TargetAddress* udp_target);
+        const common::TargetAddress* udp_target);
     enum class State { Active, Finished, Failed };
 
     void EncodeStream(std::span<const uint8_t> bytes, buf::MultiBuffer& out);
@@ -263,7 +267,7 @@ private:
 };
 
 
-using VMessHandshakeResult = tl::expected<void, ErrorCode>;
+using VMessHandshakeResult = tl::expected<void, common::ErrorCode>;
 
 class ClientSession final {
 public:
@@ -276,24 +280,24 @@ public:
     // (including cancellation) retire request writes. Clean EOF/WriteClosed
     // ends only the request direction; responses remain readable.
     net::awaitable<VMessHandshakeResult> EncodeRequestHeader(
-        AsyncStream& stream,
+        transport::AsyncStream& stream,
         const MemoryAccount& user,
         const AES_KEY& auth_id_key,
-        const TargetAddress& target,
+        const common::TargetAddress& target,
         Command command,
-        ForwardedMetadataView forwarded = {});
+        common::ForwardedMetadataView forwarded = {});
     net::awaitable<void> EncodeRequestBody(
-        AsyncStream& stream,
+        transport::AsyncStream& stream,
         buf::MultiBuffer mb);
     net::awaitable<void> EncodeRequestBody(
-        AsyncStream& stream,
+        transport::AsyncStream& stream,
         std::span<const net::const_buffer> buffers);
-    net::awaitable<void> EncodeRequestBodyEOF(AsyncStream& stream);
+    net::awaitable<void> EncodeRequestBodyEOF(transport::AsyncStream& stream);
     // Authenticates the response header on first use, then returns body
     // chunks; empty at the end of the response body.
     // Authentication/truncation and real I/O errors are terminal; a cancelled
     // read instead preserves the current header/body progress for resumption.
-    net::awaitable<buf::MultiBuffer> DecodeResponse(AsyncStream& stream);
+    net::awaitable<buf::MultiBuffer> DecodeResponse(transport::AsyncStream& stream);
 
 private:
     struct SessionKeys {
@@ -303,8 +307,8 @@ private:
     };
 
     [[nodiscard]] static SessionKeys GenerateKeys();
-    net::awaitable<void> DecodeResponseHeader(AsyncStream& stream);
-    net::awaitable<buf::MultiBuffer> DecodeFirstResponse(AsyncStream& stream);
+    net::awaitable<void> DecodeResponseHeader(transport::AsyncStream& stream);
+    net::awaitable<buf::MultiBuffer> DecodeFirstResponse(transport::AsyncStream& stream);
 
     Security security_ = Security::AES_128_GCM;
     SessionKeys keys_;
@@ -326,7 +330,7 @@ inline constexpr size_t kResponseHeaderSize =
 
 class RequestBodyReader final : public transport::MultiBufferReader {
 public:
-    RequestBodyReader(const VMessRequest& request, AsyncStream& stream);
+    RequestBodyReader(const VMessRequest& request, transport::AsyncStream& stream);
 
     RequestBodyReader(const RequestBodyReader&) = delete;
     RequestBodyReader& operator=(const RequestBodyReader&) = delete;
@@ -351,9 +355,9 @@ private:
     net::awaitable<buf::MultiBuffer> ReadUdpMultiBuffer();
 
     BodyDecoder decoder_;
-    AsyncStream* stream_ = nullptr;
+    transport::AsyncStream* stream_ = nullptr;
     bool is_udp_ = false;
-    TargetAddress udp_target_;
+    common::TargetAddress udp_target_;
 };
 
 // The response header is coalesced into the first body write.
@@ -361,7 +365,7 @@ class ResponseBodyWriter final : public transport::MultiBufferWriter {
 public:
     ResponseBodyWriter(const VMessRequest& request,
                        const BodyKey& response,
-                       AsyncStream& stream,
+                       transport::AsyncStream& stream,
                        const std::array<uint8_t, kResponseHeaderSize>& response_header);
 
     ResponseBodyWriter(const ResponseBodyWriter&) = delete;
@@ -389,8 +393,8 @@ public:
 
 private:
     BodyEncoder encoder_;
-    AsyncStream* stream_ = nullptr;
-    TargetAddress udp_target_;
+    transport::AsyncStream* stream_ = nullptr;
+    common::TargetAddress udp_target_;
     std::array<uint8_t, kResponseHeaderSize> response_header_{};
     bool header_sent_ = false;
 };
@@ -407,7 +411,7 @@ public:
     struct Rejected {
         std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> user;
         Command command = Command::TCP;
-        TargetAddress target;
+        common::TargetAddress target;
     };
     // 认证与防重放都已通过，body 编解码只从这里取参数。
     struct Accepted {
@@ -434,11 +438,11 @@ public:
 
     // 只能在 SetRequest 之后调用（否则 INTERNAL）；分配失败 → RESOURCE_EXHAUSTED，
     // 其余构造异常属于系统故障，直接上抛。
-    tl::expected<RequestBodyReader, ErrorCode> DecodeRequestBody(
-        AsyncStream& stream);
+    tl::expected<RequestBodyReader, common::ErrorCode> DecodeRequestBody(
+        transport::AsyncStream& stream);
 
-    tl::expected<ResponseBodyWriter, ErrorCode> EncodeResponseBodyWithHeader(
-        AsyncStream& stream);
+    tl::expected<ResponseBodyWriter, common::ErrorCode> EncodeResponseBodyWithHeader(
+        transport::AsyncStream& stream);
 private:
     std::string_view tag_;
     std::variant<Pending, Rejected, Accepted> state_;
@@ -446,4 +450,4 @@ private:
     std::string_view header_failure_reason_;
 };
 
-}  // namespace vmess::encoding
+}  // namespace proxy::vmess::encoding

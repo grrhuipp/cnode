@@ -116,7 +116,7 @@ std::string MethodName(HttpMethod method) {
 
 // Adapts the existing Asio owner to byte I/O; HTTP parsing stays in transport.
 template <typename Stream>
-class PanelStream final : public AsyncStream {
+class PanelStream final : public transport::AsyncStream {
 public:
     template <typename... Args>
     explicit PanelStream(Args&&... args) : stream(std::forward<Args>(args)...) {}
@@ -182,7 +182,7 @@ private:
 };
 
 net::awaitable<HttpResponse> WriteRequestAndReadResponse(
-    std::unique_ptr<AsyncStream> stream, std::string_view request) {
+    std::unique_ptr<transport::AsyncStream> stream, std::string_view request) {
     using namespace transport::internet;
     constexpr size_t kMaxBodySize = 64 * 1024 * 1024;
     constexpr size_t kMaxLineSize = 64 * 1024;
@@ -312,8 +312,8 @@ private:
 
     net::io_context& io_context_;
     ::api::Config config_;
-    const PanelLogContext log_context_;
-    PanelApiUrlParts url_parts_;
+    const infra::PanelLogContext log_context_;
+    infra::PanelApiUrlParts url_parts_;
     std::optional<net::ip::address> literal_address_;
     std::string api_node_type_;
     std::string host_header_;
@@ -333,14 +333,14 @@ APIClient::APIClient(net::io_context& io_context,
         config_.RequestTimeout > std::chrono::seconds(defaults::kMaxPanelRequestTimeout)) {
         throw std::invalid_argument("API RequestTimeout is outside the supported range");
     }
-    if (!IsValidPanelName(config_.Name)) {
+    if (!infra::IsValidPanelName(config_.Name)) {
         throw std::invalid_argument("Invalid panel name");
     }
-    if (!IsValidPanelKey(config_.Key)) {
+    if (!infra::IsValidPanelKey(config_.Key)) {
         throw std::invalid_argument("Invalid panel API key");
     }
 
-    auto parts = ParsePanelApiUrl(config_.APIHost);
+    auto parts = infra::ParsePanelApiUrl(config_.APIHost);
     if (!parts) {
         throw std::invalid_argument("Invalid panel API host");
     }
@@ -500,7 +500,7 @@ APIClient::FetchConditionalResource(std::string_view endpoint,
     if (resp.not_modified) {
         if (committed_etag.empty()) {
             co_return tl::unexpected(FetchResult::Fail(
-                ErrorCode::PANEL_INVALID_RESPONSE,
+                common::ErrorCode::PANEL_INVALID_RESPONSE,
                 std::string(missing_etag_error)));
         }
         if (log_not_modified) {
@@ -512,7 +512,7 @@ APIClient::FetchConditionalResource(std::string_view endpoint,
         const auto error_message = FormatHttpFailure(resp);
         LOG_PANEL_DEBUG(log_context_, "{}: {}", pull_failure_label, error_message);
         co_return tl::unexpected(FetchResult::Fail(
-            ErrorCode::PANEL_API_FAILED,
+            common::ErrorCode::PANEL_API_FAILED,
             error_message));
     }
     co_return resp;
@@ -534,7 +534,7 @@ APIClient::GetNodeInfo(std::string committed_etag) {
         if (!jv.is_object()) {
             LOG_PANEL_ERROR(log_context_, "Invalid node configuration: root JSON value must be an object");
             co_return NodeInfoFetchResult::Fail(
-                ErrorCode::PANEL_INVALID_RESPONSE,
+                common::ErrorCode::PANEL_INVALID_RESPONSE,
                 "root JSON value must be an object");
         }
         auto& j = jv.as_object();
@@ -543,7 +543,7 @@ APIClient::GetNodeInfo(std::string committed_etag) {
         if (!parsed_config) {
             LOG_PANEL_ERROR(log_context_, "Invalid node configuration: {}", parsed_config.error());
             co_return NodeInfoFetchResult::Fail(
-                ErrorCode::PANEL_INVALID_RESPONSE,
+                common::ErrorCode::PANEL_INVALID_RESPONSE,
                 std::move(parsed_config.error()));
         }
         auto config = std::move(*parsed_config);
@@ -558,7 +558,7 @@ APIClient::GetNodeInfo(std::string committed_etag) {
 
     } catch (const std::exception& e) {
         LOG_PANEL_ERROR(log_context_, "Node configuration parsing failed: {}", e.what());
-        co_return NodeInfoFetchResult::Fail(ErrorCode::PANEL_INVALID_RESPONSE, e.what());
+        co_return NodeInfoFetchResult::Fail(common::ErrorCode::PANEL_INVALID_RESPONSE, e.what());
     }
 }
 
@@ -581,7 +581,7 @@ APIClient::GetUserList(std::string committed_etag) {
         if (!jv.is_object()) {
             LOG_PANEL_ERROR(log_context_, "User list parsing failed: root JSON value must be an object");
             co_return UserListFetchResult::Fail(
-                ErrorCode::PANEL_INVALID_RESPONSE,
+                common::ErrorCode::PANEL_INVALID_RESPONSE,
                 "root JSON value must be an object");
         }
         auto& j = jv.as_object();
@@ -590,7 +590,7 @@ APIClient::GetUserList(std::string committed_etag) {
         if (!users) {
             LOG_PANEL_ERROR(log_context_, "User list parsing failed: {}", users.error());
             co_return UserListFetchResult::Fail(
-                ErrorCode::PANEL_INVALID_RESPONSE,
+                common::ErrorCode::PANEL_INVALID_RESPONSE,
                 std::move(users.error()));
         }
 
@@ -599,7 +599,7 @@ APIClient::GetUserList(std::string committed_etag) {
 
     } catch (const std::exception& e) {
         LOG_PANEL_ERROR(log_context_, "User list parsing failed: {}", e.what());
-        co_return UserListFetchResult::Fail(ErrorCode::PANEL_INVALID_RESPONSE, e.what());
+        co_return UserListFetchResult::Fail(common::ErrorCode::PANEL_INVALID_RESPONSE, e.what());
     }
 }
 
@@ -763,7 +763,7 @@ tl::expected<std::vector<std::string>, std::string> ReadPanelStringList(
     const json::value& value, std::string_view field, bool allow_scalar) {
     std::vector<std::string> out;
     if (allow_scalar && value.is_string()) {
-        out.push_back(LowerAscii(std::string(value.as_string())));
+        out.push_back(common::LowerAscii(std::string(value.as_string())));
         return out;
     }
     if (!value.is_array()) {
@@ -776,7 +776,7 @@ tl::expected<std::vector<std::string>, std::string> ReadPanelStringList(
             return tl::unexpected(std::format(
                 "REALITY {} must contain only strings", field));
         }
-        out.push_back(LowerAscii(std::string(item.as_string())));
+        out.push_back(common::LowerAscii(std::string(item.as_string())));
     }
     return out;
 }
@@ -786,7 +786,7 @@ tl::expected<std::vector<std::string>, std::string> ReadPanelStringList(
 tl::expected<void, std::string> MapRealitySettings(
     const json::object& rs,
     std::string_view tls_server_name,
-    RealityConfig& out) {
+    transport::internet::RealityConfig& out) {
     infra::RealityServerInput input;
 
     REALITY_ALIAS_OR_RETURN(private_key, rs, "private_key", "privateKey");
@@ -811,7 +811,7 @@ tl::expected<void, std::string> MapRealitySettings(
             return tl::unexpected("REALITY server_name must be a string");
         }
         std::vector<std::string> single{
-            LowerAscii(std::string(server_name->as_string()))};
+            common::LowerAscii(std::string(server_name->as_string()))};
         if (server_names && input.server_names != single) {
             return tl::unexpected(
                 "REALITY server_names and server_name must match");
@@ -1012,7 +1012,7 @@ tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
     }
 
     ::api::NodeInfo config;
-    config.NodeType = LowerAscii(std::string(node_type));
+    config.NodeType = common::LowerAscii(std::string(node_type));
     config.Port = *port;
 
     if (const auto* network = source.if_contains("network");
@@ -1021,7 +1021,7 @@ tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
             return tl::unexpected("network must be a string");
         }
         config.TransportProtocol =
-            LowerAscii(std::string(network->as_string()));
+            common::LowerAscii(std::string(network->as_string()));
     }
 
     if (const auto* network_settings = source.if_contains("networkSettings");
@@ -1055,7 +1055,7 @@ tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
             }
             std::optional<std::string> host;
             for (const auto& [name, raw_value] : headers->as_object()) {
-                if (LowerAscii(name) != "host") {
+                if (common::LowerAscii(name) != "host") {
                     continue;
                 }
                 if (!raw_value.is_string()) {
@@ -1118,7 +1118,7 @@ tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
         if (!flow->is_string()) {
             return tl::unexpected("flow must be a string");
         }
-        config.Flow = LowerAscii(std::string(flow->as_string()));
+        config.Flow = common::LowerAscii(std::string(flow->as_string()));
     }
 
     if (const auto* server_name = source.if_contains("server_name");
@@ -1139,7 +1139,7 @@ tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
             return tl::unexpected("cipher must be a string");
         }
         config.CypherMethod =
-            LowerAscii(std::string(cipher->as_string()));
+            common::LowerAscii(std::string(cipher->as_string()));
     }
     if (const auto* server_key = source.if_contains("server_key");
         server_key && !server_key->is_null()) {
@@ -1160,7 +1160,7 @@ tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
                 return tl::unexpected("obfs must be a string or null");
             }
             const std::string mode =
-                LowerAscii(std::string(obfs->as_string()));
+                common::LowerAscii(std::string(obfs->as_string()));
             if (!mode.empty() && mode != constants::protocol::kNone) {
                 return tl::unexpected(
                     "Shadowsocks obfs is not supported by this runtime");
@@ -1180,7 +1180,7 @@ tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
                 return tl::unexpected("encryption must be a string or null");
             }
             const std::string mode =
-                LowerAscii(std::string(encryption->as_string()));
+                common::LowerAscii(std::string(encryption->as_string()));
             if (!mode.empty() && mode != constants::protocol::kNone) {
                 return tl::unexpected(
                     "panel VLESS encryption is not supported by this runtime");
@@ -1408,7 +1408,7 @@ ParseUserList(const json::object& source) {
 
         auto flow = ParseOptionalString(source_user, "flow", i);
         if (!flow) return tl::unexpected(std::move(flow.error()));
-        user.Flow = LowerAscii(std::move(*flow));
+        user.Flow = common::LowerAscii(std::move(*flow));
 
         auto speed_limit = ParseOptionalLimit(source_user, "speed_limit", i);
         if (!speed_limit) {

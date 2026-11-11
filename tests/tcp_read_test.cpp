@@ -19,7 +19,7 @@ struct ReadFixture {
     net::io_context io;
     tcp::acceptor acceptor{io, {net::ip::address_v4::loopback(), 0}};
     tcp::socket socket{io}, peer{io};
-    std::unique_ptr<TcpStream> stream;
+    std::unique_ptr<transport::internet::TcpStream> stream;
     const bool previous_reject = memory::reject_next_process_allocation;
     const std::size_t previous_peak = memory::detail::test_buffers_peak;
 
@@ -41,7 +41,7 @@ struct ReadFixture {
         memory::detail::test_buffers_peak = previous_peak;
     }
     void Start() {
-        stream = std::make_unique<TcpStream>(std::move(socket));
+        stream = std::make_unique<transport::internet::TcpStream>(std::move(socket));
         stream->SetReadTimeout(2s);
     }
     void Preload(const std::vector<uint8_t>& payload) {
@@ -79,7 +79,7 @@ std::vector<uint8_t> Payload(std::size_t bytes) {
     return result;
 }
 
-net::awaitable<std::vector<uint8_t>> ReadToEof(TcpStream& stream) {
+net::awaitable<std::vector<uint8_t>> ReadToEof(transport::internet::TcpStream& stream) {
     std::vector<uint8_t> result;
     for (;;) {
         auto batch = co_await stream.ReadMultiBuffer();

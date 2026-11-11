@@ -29,7 +29,7 @@
 #include <vector>
 namespace controller {
 [[nodiscard]] inline bool ShouldEnableInboundTls(
-    const PanelConfig& panel_config,
+    const infra::PanelConfig& panel_config,
     const api::NodeInfo& node_config) noexcept {
     if (!panel_config.TLSEnable) {
         return false;
@@ -44,12 +44,12 @@ namespace controller {
 // Panel configuration mapping: node and user records to the source-neutral
 // InboundSpec consumed by the shared inbound builder. Throws
 // std::invalid_argument when the node's stream settings are unsupported.
-[[nodiscard]] InboundSpec MapPanelInbound(
-    const PanelConfig& panel_config,
+[[nodiscard]] infra::InboundSpec MapPanelInbound(
+    const infra::PanelConfig& panel_config,
     const api::NodeInfo& node_config,
     std::span<const api::UserInfo> users);
 
-[[nodiscard]] std::vector<InboundUserSpec> MapPanelUsers(
+[[nodiscard]] std::vector<infra::InboundUserSpec> MapPanelUsers(
     const api::NodeInfo& node_config,
     std::span<const api::UserInfo> users);
 
@@ -63,7 +63,7 @@ struct NodeSnapshot {
     std::shared_ptr<const std::vector<rule::DetectRule>> rules;
     std::string tag;
     // Prepared by the shared inbound builder; carries the prepared users.
-    std::shared_ptr<const PreparedInbound> inbound;
+    std::shared_ptr<const app::PreparedInbound> inbound;
     std::shared_ptr<const proxyman::outbound::PreparedOutboundConfig> outbound;
 };
 
@@ -75,7 +75,7 @@ struct NodeState {
     // A failed transition can leave only its old and candidate tags behind.
     // No new transition starts until both have been cleaned successfully.
     std::array<std::shared_ptr<const NodeSnapshot>, 2> pending_cleanup;
-    std::optional<UserPublicationRollback> user_recovery;
+    std::optional<app::UserPublicationRollback> user_recovery;
 
     [[nodiscard]] bool HasPendingCleanup() const noexcept {
         return pending_cleanup[0] || pending_cleanup[1] || user_recovery.has_value();
@@ -184,8 +184,8 @@ struct OnlineSnapshot {
 };
 
 [[nodiscard]] inline OnlineSnapshot
-BuildOnlineSnapshot(std::vector<OnlineDevice> devices) {
-    std::erase_if(devices, [](const OnlineDevice& d) {
+BuildOnlineSnapshot(std::vector<common::OnlineDevice> devices) {
+    std::erase_if(devices, [](const common::OnlineDevice& d) {
         return d.user_id <= 0 || d.ip.empty();
     });
     std::sort(devices.begin(), devices.end());

@@ -22,7 +22,7 @@ TEST(SessionGroupExecutor, RoutesWorkerCallsAndReservedOperationsToControlExecut
     auto first_work = net::make_work_guard(first);
     auto second_work = net::make_work_guard(second);
 
-    auto coordinator = std::make_shared<GroupCoordinator>(control, 2);
+    auto coordinator = std::make_shared<app::GroupCoordinator>(control, 2);
     coordinator->RegisterWorker(first);
     coordinator->RegisterWorker(second);
 
@@ -42,7 +42,7 @@ TEST(SessionGroupExecutor, RoutesWorkerCallsAndReservedOperationsToControlExecut
 
         std::promise<void> reserved_done;
         auto reserved_fut = reserved_done.get_future();
-        struct Returned final : GroupCoordinator::ReservedOperation {
+        struct Returned final : app::GroupCoordinator::ReservedOperation {
             std::promise<void>& complete;
             explicit Returned(std::promise<void>& value) : complete(value) {}
             void Invoke() noexcept override { complete.set_value(); }

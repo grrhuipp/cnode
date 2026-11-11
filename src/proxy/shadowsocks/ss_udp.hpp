@@ -23,8 +23,12 @@
 #include <vector>
 #include <variant>
 
+namespace app {
+
 struct StatsShard;
-namespace ss {
+
+}  // namespace app
+namespace proxy::shadowsocks {
 
 class Ss2022UdpReplayWindow {
 public:
@@ -161,7 +165,7 @@ private:
         KeyBytes reply_key;
         SsCipherInfo cipher_info{};
     };
-    [[nodiscard]] size_t EncodePacketTo(const TargetAddress& target,
+    [[nodiscard]] size_t EncodePacketTo(const common::TargetAddress& target,
         std::span<const uint8_t> payload, uint8_t* out, size_t out_capacity);
     std::variant<ClassicState, Ss2022UdpTxState> state_;
 };
@@ -172,9 +176,9 @@ struct Ss2022UdpSessionState : Ss2022UdpTxState {
 
 // SS UDP 解码结果
 struct SsUdpDecodeResult {
-    TargetAddress        target;       // 解析出的 SOCKS5 目标地址
+    common::TargetAddress        target;       // 解析出的 SOCKS5 目标地址
     buf::MultiBuffer     payload;      // 解密后的 payload Buffer 所有权
-    std::optional<ForwardedMetadata> forwarded;
+    std::optional<common::ForwardedMetadata> forwarded;
     std::optional<uint64_t> session_id;
     // SS2022 authenticated metadata, available before replay acceptance.
     std::optional<uint64_t> packet_id;
@@ -216,7 +220,7 @@ struct SsUdpDecodeResult {
 //   - 编码失败：返回 0
 // ============================================================================
 [[nodiscard]] size_t EncodeUdpPacketTo(
-    const TargetAddress&        target,
+    const common::TargetAddress&        target,
     const uint8_t*              payload,
     size_t                      payload_len,
     std::span<const uint8_t>    master_key,
@@ -225,7 +229,7 @@ struct SsUdpDecodeResult {
     size_t                      salt_size,
     uint8_t*                    output,
     size_t                      output_size,
-    ForwardedMetadataView       forwarded = {});
+    common::ForwardedMetadataView       forwarded = {});
 
 [[nodiscard]] std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
     const uint8_t* datagram,
@@ -241,17 +245,17 @@ struct SsUdpDecodeResult {
     const KeyBytes& key);
 
 [[nodiscard]] size_t Encode2022UdpRequestPacketTo(
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     const uint8_t* payload,
     size_t payload_len,
     Ss2022UdpTxState& state,
     std::span<const KeyBytes> psk_chain,
     uint8_t* output,
     size_t output_size,
-    ForwardedMetadataView forwarded = {});
+    common::ForwardedMetadataView forwarded = {});
 
 [[nodiscard]] size_t Encode2022UdpResponsePacketTo(
-    const TargetAddress& target,
+    const common::TargetAddress& target,
     const uint8_t* payload,
     size_t payload_len,
     Ss2022UdpTxState& state,
@@ -264,5 +268,5 @@ struct SsUdpDecodeResult {
     Ss2022UdpSessionState& state);
 
 
-}  // namespace ss
+}  // namespace proxy::shadowsocks
 

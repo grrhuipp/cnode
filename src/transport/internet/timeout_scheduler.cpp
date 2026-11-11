@@ -14,7 +14,7 @@
 #include <vector>
 
 
-struct TimeoutScheduler::Impl {
+struct transport::internet::TimeoutScheduler::Impl {
     explicit Impl(net::io_context& context) : context(context), timer(context) {
         heap.reserve(1024);
     }
@@ -22,21 +22,21 @@ struct TimeoutScheduler::Impl {
     net::io_context& context;
     net::steady_timer timer;
     // Shared Worker bookkeeping uses the process allocator.
-    std::vector<TimeoutEvent*, memory::ProcessAllocator<TimeoutEvent*>> heap;
+    std::vector<transport::internet::TimeoutEvent*, memory::ProcessAllocator<transport::internet::TimeoutEvent*>> heap;
     uint64_t next_sequence = 0;
-    std::optional<SignalChannel> join;
+    std::optional<common::SignalChannel> join;
     bool wait_pending = false;
     bool wakeup_requested = false;
     bool released = false;
     bool dispatching = false;
     std::chrono::steady_clock::time_point armed_deadline{};
 
-    static bool Before(const TimeoutEvent* lhs, const TimeoutEvent* rhs) noexcept {
+    static bool Before(const transport::internet::TimeoutEvent* lhs, const transport::internet::TimeoutEvent* rhs) noexcept {
         if (lhs->deadline_ != rhs->deadline_) return lhs->deadline_ < rhs->deadline_;
         if (lhs->sequence_ != rhs->sequence_) return lhs->sequence_ < rhs->sequence_;
-        return std::less<const TimeoutEvent*>{}(lhs, rhs);
+        return std::less<const transport::internet::TimeoutEvent*>{}(lhs, rhs);
     }
-    void Place(std::size_t index, TimeoutEvent* event) noexcept {
+    void Place(std::size_t index, transport::internet::TimeoutEvent* event) noexcept {
         heap[index] = event;
         event->index_ = index;
     }
@@ -65,7 +65,7 @@ struct TimeoutScheduler::Impl {
         if (index != 0 && Before(heap[index], heap[(index - 1) / 2])) SiftUp(index);
         else SiftDown(index);
     }
-    void Remove(TimeoutEvent& event) noexcept {
+    void Remove(transport::internet::TimeoutEvent& event) noexcept {
         const auto index = event.index_;
         auto* last = heap.back();
         heap.pop_back();
@@ -79,7 +79,7 @@ struct TimeoutScheduler::Impl {
         const auto needed = heap.size() + count;
         if (needed > heap.capacity()) heap.reserve(std::max(needed, heap.capacity() * 2));
     }
-    void Insert(TimeoutScheduler& scheduler, TimeoutEvent& event) noexcept {
+    void Insert(transport::internet::TimeoutScheduler& scheduler, transport::internet::TimeoutEvent& event) noexcept {
         heap.push_back(&event);
         event.owner_ = &scheduler;
         event.index_ = heap.size() - 1;
@@ -111,6 +111,8 @@ struct TimeoutScheduler::Impl {
     void OnTimer(const IoErrorCode& ec);
     void Release() noexcept;
 };
+
+namespace transport::internet {
 
 void TimeoutScheduler::Impl::OnTimer(const IoErrorCode& ec) {
     wait_pending = false;
@@ -181,13 +183,17 @@ bool TimeoutEvent::ScheduleAfter(std::chrono::milliseconds delay) {
     return TimeoutScheduler::ForIoContext(*context_).ScheduleAfter(delay, *this);
 }
 
-TimeoutScheduler& TimeoutScheduler::ForIoContext(net::io_context& context) {
+}  // namespace transport::internet
+
+transport::internet::TimeoutScheduler& transport::internet::TimeoutScheduler::ForIoContext(net::io_context& context) {
     if (tl_cached_context == &context && tl_cached_scheduler) return *tl_cached_scheduler;
-    auto& service = asio::use_service<TimeoutSchedulerService>(context);
+    auto& service = asio::use_service<transport::internet::TimeoutSchedulerService>(context);
     tl_cached_context = &context;
     tl_cached_scheduler = &service.Scheduler();
     return *tl_cached_scheduler;
 }
+namespace transport::internet {
+
 void TimeoutScheduler::ReleaseForIoContext(net::io_context& context) {
     if (asio::has_service<TimeoutSchedulerService>(context))
         asio::use_service<TimeoutSchedulerService>(context).ShutdownNow();
@@ -202,7 +208,7 @@ net::awaitable<void> TimeoutScheduler::AsyncReleaseForIoContext(net::io_context&
     if (impl.join) throw std::logic_error("concurrent timeout scheduler join");
     impl.join.emplace(co_await net::this_coro::executor, 1);
     struct JoinReset {
-        std::optional<SignalChannel>& channel;
+        std::optional<common::SignalChannel>& channel;
         ~JoinReset() { channel.reset(); }
     } reset{impl.join};
     auto [ec] = co_await impl.join->async_receive(
@@ -244,3 +250,5 @@ TimeoutScheduler::ResourceStats TimeoutScheduler::GetResourceStats() const noexc
     return {.active_events = impl_->heap.size(), .heap_capacity = impl_->heap.capacity(),
         .wait_pending = impl_->wait_pending};
 }
+
+}  // namespace transport::internet

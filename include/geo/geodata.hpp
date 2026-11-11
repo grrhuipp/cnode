@@ -81,7 +81,7 @@ private:
 
     [[nodiscard]] bool MatchSuffix(std::string_view lower_domain) const noexcept;
 
-    std::pmr::unordered_set<std::pmr::string, TransparentStringHash, TransparentStringEq> full_;
+    std::pmr::unordered_set<std::pmr::string, common::TransparentStringHash, common::TransparentStringEq> full_;
     std::pmr::vector<SuffixNode> suffix_nodes_;
     std::pmr::vector<std::pmr::string> keywords_;
     std::pmr::vector<std::regex> regexes_;
@@ -116,8 +116,8 @@ public:
     [[nodiscard]] Stats GetStats() const noexcept;
 
 private:
-    std::unordered_map<std::string, CidrSet, TransparentStringHash, TransparentStringEq> geoip_;
-    std::unordered_map<std::string, DomainRuleSet, TransparentStringHash, TransparentStringEq>
+    std::unordered_map<std::string, CidrSet, common::TransparentStringHash, common::TransparentStringEq> geoip_;
+    std::unordered_map<std::string, DomainRuleSet, common::TransparentStringHash, common::TransparentStringEq>
         geosite_;
 };
 

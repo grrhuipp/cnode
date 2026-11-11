@@ -24,6 +24,8 @@
 // ============================================================================
 // 资源限制配置
 // ============================================================================
+namespace infra {
+
 struct AuthFailureLimitConfig {
     bool enabled = false;
     uint32_t failure_limit = 10;
@@ -209,14 +211,14 @@ struct InboundSpec {
     // Opaque reporting identity; empty disables per-user reporting.
     std::string accounting_key;
     std::string protocol;
-    InboundListen listen;
+    transport::internet::InboundListen listen;
     uint16_t port = 0;
-    ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto;
+    transport::internet::ProxyProtocolMode proxy_protocol = transport::internet::ProxyProtocolMode::Auto;
     InboundProtocolSettings settings;
     std::vector<InboundUserSpec> users;
     // Normalized and validated by the source's shared field parsers.
-    StreamSettings stream_settings;
-    SniffConfig sniffing;
+    transport::internet::StreamSettings stream_settings;
+    routing::SniffConfig sniffing;
     routing::OutboundSelectionPolicy outbound_policy{
         routing::ForceOutbound(std::string(constants::protocol::kDirect))};
 };
@@ -226,17 +228,19 @@ struct InboundSpec {
 struct StaticInboundConfig {
     std::vector<std::string> tags;
     std::string protocol;
-    InboundListen listen;
+    transport::internet::InboundListen listen;
     uint16_t port = 0;
     InboundProtocolSettings settings;
     std::vector<InboundUserSpec> users;
-    StreamSettings stream_settings;
-    SniffConfig sniffing;
-    ProxyProtocolMode proxy_protocol = ProxyProtocolMode::Auto;
+    transport::internet::StreamSettings stream_settings;
+    routing::SniffConfig sniffing;
+    transport::internet::ProxyProtocolMode proxy_protocol = transport::internet::ProxyProtocolMode::Auto;
     bool routing_enabled = false;
     std::optional<std::string> outbound_tag;
     static StaticInboundConfig FromJson(const json::object& j);
 };
+
+}  // namespace infra
 
 namespace infra {
 
@@ -244,8 +248,8 @@ struct OutboundSourceConfig {
     std::string tag;
     std::string protocol;
     OutboundSettings settings;
-    StreamSettings stream_settings;
-    std::optional<OutboundBind> send_through;
+    transport::internet::StreamSettings stream_settings;
+    std::optional<transport::internet::OutboundBind> send_through;
     bool passthrough = false;
     static OutboundSourceConfig FromJson(const json::object& j);
 };

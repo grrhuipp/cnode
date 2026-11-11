@@ -28,6 +28,8 @@ namespace app::dns {
 class DNS;
 }  // namespace app::dns
 
+namespace transport::internet {
+
 class SslContext;
 
 // Xray proxyman SenderSettings: how one outbound tag leaves this node. Owned by
@@ -113,7 +115,7 @@ std::string_view ResolveOutboundTlsServerName(
     std::string_view fallback_server_name) = delete;
 
 [[nodiscard]]
-net::awaitable<tl::expected<OutboundTransportTarget, ErrorCode>>
+net::awaitable<tl::expected<OutboundTransportTarget, common::ErrorCode>>
 BuildOutboundTransportTarget(OutboundTargetOptions options);
 
 // 统一出站传输连接：
@@ -169,9 +171,9 @@ public:
     [[nodiscard]] net::io_context& IoContext() const noexcept { return io_context_; }
 
     [[nodiscard]] bool Passthrough() const noexcept { return sender_.passthrough; }
-    [[nodiscard]] ForwardedMetadataView ForwardedMetadata(
+    [[nodiscard]] common::ForwardedMetadataView ForwardedMetadata(
         const session::Context& ctx) const noexcept;
-    ForwardedMetadataView ForwardedMetadata(
+    common::ForwardedMetadataView ForwardedMetadata(
         const session::Context&& ctx) const = delete;
     // Empty unless sendThrough is Ordered.
     [[nodiscard]] std::optional<OrderedBind> SelectOrderedBind(
@@ -180,18 +182,18 @@ public:
         const session::Context&& ctx) const = delete;
 
     // Proxy next hop through the Handler's stream settings.
-    [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+    [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, common::ErrorCode>>
     Dial(session::Context& ctx, const OutboundServer& server,
          const OrderedBind* ordered = nullptr);
 
     // 直连目标的解析、地址族筛选与尝试顺序由拨号器统一执行。
-    [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
-    Dial(session::Context& ctx, const TargetAddress& target, AddressFamilyPolicy policy);
+    [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, common::ErrorCode>>
+    Dial(session::Context& ctx, const common::TargetAddress& target, AddressFamilyPolicy policy);
 
     // Native UDP association: selects the sendThrough bind address, constructs
     // Endpoint(io_context, dns, bind_address, args...) and records the egress.
     template <typename Endpoint, typename... Args>
-    [[nodiscard]] tl::expected<void, ErrorCode> OpenDatagram(
+    [[nodiscard]] tl::expected<void, common::ErrorCode> OpenDatagram(
         session::Context& ctx, const DatagramRemote& remote,
         std::optional<Endpoint>& endpoint, Args&&... args) {
         auto bind = SelectDatagramBind(ctx, remote);
@@ -203,7 +205,7 @@ public:
             return tl::unexpected(error.code());
         } catch (const IoSystemError& error) {
             ReportDatagramFailure(ctx, *bind, error.what());
-            return tl::unexpected(MapAsioError(error.code()));
+            return tl::unexpected(common::MapAsioError(error.code()));
         }
         RecordEgress(ctx, *bind);
         return {};
@@ -214,12 +216,12 @@ public:
     void RecordConnected(session::Context& ctx, const AsyncStream& stream) const;
 
 private:
-    [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+    [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, common::ErrorCode>>
     DialAddresses(session::Context& ctx, std::span<const net::ip::address> addresses,
                   uint16_t port, AddressFamilyPolicy policy);
-    [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+    [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, common::ErrorCode>>
     DialTarget(session::Context& ctx, const OutboundTransportTarget& target);
-    [[nodiscard]] tl::expected<net::ip::address, ErrorCode> SelectDatagramBind(
+    [[nodiscard]] tl::expected<net::ip::address, common::ErrorCode> SelectDatagramBind(
         const session::Context& ctx, const DatagramRemote& remote) const;
     void ReportDatagramFailure(const session::Context& ctx,
                                const net::ip::address& bind,
@@ -233,4 +235,6 @@ private:
     TransportSecurity security_;  // Contexts for sender_.stream_settings.
     std::chrono::seconds timeout_;
 };
+
+}  // namespace transport::internet
 

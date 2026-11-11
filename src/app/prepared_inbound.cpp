@@ -13,9 +13,11 @@
 #include <variant>
 
 
+namespace app {
+
 std::shared_ptr<const proxyman::inbound::UserSet> PrepareInboundUsers(
     const proxyman::inbound::BuildRequest& request,
-    std::span<const InboundUserSpec> users) {
+    std::span<const infra::InboundUserSpec> users) {
     auto prepared = proxyman::inbound::BuildUsers(request, users);
     if (!prepared) {
         throw std::invalid_argument(
@@ -30,7 +32,7 @@ std::shared_ptr<const proxyman::inbound::UserSet> PrepareInboundUsers(
     return std::make_shared<const proxyman::inbound::UserSet>(std::move(*prepared));
 }
 
-PreparedInbound PrepareInbound(const InboundSpec& spec) {
+PreparedInbound PrepareInbound(const infra::InboundSpec& spec) {
     if (!proxyman::inbound::HasProxy(spec.protocol)) {
         throw std::invalid_argument(
             "inbound '" + spec.tag + "' has unsupported protocol '" +
@@ -44,8 +46,8 @@ PreparedInbound PrepareInbound(const InboundSpec& spec) {
     }
     auto users = PrepareInboundUsers(*build_request, spec.users);
 
-    StreamSettings stream_settings = spec.stream_settings;
-    TransportSecurity::Prepare(stream_settings, StreamEndpointRole::Inbound);
+    transport::internet::StreamSettings stream_settings = spec.stream_settings;
+    transport::internet::TransportSecurity::Prepare(stream_settings, transport::internet::StreamEndpointRole::Inbound);
     // XHTTP 会话命名空间按入站 tag 隔离，配置准备期一次推导，Worker 只读。
     if (stream_settings.IsXHttp()) {
         stream_settings.xhttp.session_namespace.insert(0, spec.tag + std::string(1, '\0'));
@@ -74,13 +76,13 @@ PreparedInbound PrepareInbound(const InboundSpec& spec) {
 
 namespace {
 
-StaticInboundConfig MakeTestInboundConfig() {
-    StaticInboundConfig source;
+infra::StaticInboundConfig MakeTestInboundConfig() {
+    infra::StaticInboundConfig source;
     source.protocol = constants::protocol::kDefaultNodeProtocol;
     source.tags.emplace_back(constants::test::kTestInboundTag);
     source.port = constants::test::kTestPort;
     // The ordinary StreamSettings and SniffConfig defaults are already normalized.
-    source.users.push_back(InboundUserSpec{
+    source.users.push_back(infra::InboundUserSpec{
         .user_id = 0,
         .email = "test@example.com",
         .credential = std::string(constants::test::kTestVmessUuid),
@@ -93,7 +95,7 @@ StaticInboundConfig MakeTestInboundConfig() {
 
 // Static-only mapping: tag fallback, outbound selection and the per-user
 // email default. Everything else passes through unchanged.
-InboundSpec StaticInboundSpec(StaticInboundConfig source) {
+infra::InboundSpec StaticInboundSpec(infra::StaticInboundConfig source) {
     std::string tag = source.tags.empty()
         ? naming::BuildProtocolPortTag(source.protocol, source.port)
         : source.tags.front();
@@ -112,7 +114,7 @@ InboundSpec StaticInboundSpec(StaticInboundConfig source) {
             if (user.email.empty()) user.email = tag;
         }
     }
-    return InboundSpec{
+    return infra::InboundSpec{
         .tag = std::move(tag),
         .all_tags = std::move(all_tags),
         .accounting_key = {},
@@ -131,9 +133,9 @@ InboundSpec StaticInboundSpec(StaticInboundConfig source) {
 }  // namespace
 
 std::vector<PreparedInbound> PrepareStartupInbounds(
-    std::vector<StaticInboundConfig> sources, bool enable_test_mode) {
+    std::vector<infra::StaticInboundConfig> sources, bool enable_test_mode) {
     if (enable_test_mode) sources.push_back(MakeTestInboundConfig());
-    const auto validation = ValidateStaticInboundSemantics(sources);
+    const auto validation = infra::ValidateStaticInboundSemantics(sources);
     if (!validation.Ok()) {
         throw std::invalid_argument("startup inbound " + validation.Message());
     }
@@ -249,4 +251,6 @@ net::awaitable<void> RollbackUsers(
     Store::CommitSnapshot(rollback->previous);
     rollback.reset();
 }
+
+}  // namespace app
 

@@ -46,13 +46,13 @@ using namespace std::chrono_literals;
 using timeout_allocation_test::reject_allocations;
 
 template<class F>
-struct Event final : TimeoutEvent {
+struct Event final : transport::internet::TimeoutEvent {
     explicit Event(F callback) : callback(std::move(callback)) {}
     void OnTimeout() override { callback(); }
     F callback;
 };
 
-struct CounterEvent final : TimeoutEvent {
+struct CounterEvent final : transport::internet::TimeoutEvent {
     std::size_t* counter = nullptr;
     void OnTimeout() override { if (counter) ++*counter; }
 };
@@ -68,7 +68,7 @@ protected:
 
 TEST_F(TimeoutSchedulerCases, CancellationAndRearmPreserveLiveEvent) {
     net::io_context io;
-    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    auto& scheduler = transport::internet::TimeoutScheduler::ForIoContext(io);
     std::size_t calls = 0;
     CounterEvent event;
     event.counter = &calls;
@@ -90,7 +90,7 @@ TEST_F(TimeoutSchedulerCases, CancellationAndRearmPreserveLiveEvent) {
 
 TEST_F(TimeoutSchedulerCases, DestroyingQueuedEventCancelsItsCallback) {
     net::io_context io;
-    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    auto& scheduler = transport::internet::TimeoutScheduler::ForIoContext(io);
     std::size_t calls = 0;
     {
         CounterEvent abandoned;
@@ -104,7 +104,7 @@ TEST_F(TimeoutSchedulerCases, DestroyingQueuedEventCancelsItsCallback) {
 
 TEST_F(TimeoutSchedulerCases, ReentrantDestructionDoesNotHideOtherCallbackFailures) {
     net::io_context io;
-    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    auto& scheduler = transport::internet::TimeoutScheduler::ForIoContext(io);
     std::size_t cancelled_calls = 0, survivor_calls = 0;
     auto owner = std::make_unique<CounterEvent>();
     owner->counter = &cancelled_calls;
@@ -128,17 +128,17 @@ TEST_F(TimeoutSchedulerCases, ReentrantDestructionDoesNotHideOtherCallbackFailur
 
 TEST_F(TimeoutSchedulerCases, ExpiringEventCanDestroyItself) {
     net::io_context io;
-    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    auto& scheduler = transport::internet::TimeoutScheduler::ForIoContext(io);
 
-    struct Self final : TimeoutEvent {
-        Self(TimeoutScheduler& scheduler, std::unique_ptr<Self>& owner, bool& fired)
+    struct Self final : transport::internet::TimeoutEvent {
+        Self(transport::internet::TimeoutScheduler& scheduler, std::unique_ptr<Self>& owner, bool& fired)
             : scheduler(scheduler), owner(owner), fired(fired) {}
         void OnTimeout() override {
             scheduler.Cancel(*this); // Already detached, safe even inside expiry.
             fired = true;
             owner.reset(); // No access to this event after destruction.
         }
-        TimeoutScheduler& scheduler;
+        transport::internet::TimeoutScheduler& scheduler;
         std::unique_ptr<Self>& owner;
         bool& fired;
     };
@@ -155,13 +155,13 @@ TEST_F(TimeoutSchedulerCases, ExpiringEventCanDestroyItself) {
 
 TEST_F(TimeoutSchedulerCases, ExpiringEventCanRearmItself) {
     net::io_context io;
-    auto& scheduler = TimeoutScheduler::ForIoContext(io);
-    struct Repeating final : TimeoutEvent {
-        explicit Repeating(TimeoutScheduler& scheduler) : scheduler(scheduler) {}
+    auto& scheduler = transport::internet::TimeoutScheduler::ForIoContext(io);
+    struct Repeating final : transport::internet::TimeoutEvent {
+        explicit Repeating(transport::internet::TimeoutScheduler& scheduler) : scheduler(scheduler) {}
         void OnTimeout() override {
             if (++calls < 5) (void)scheduler.ScheduleAfter(0ms, *this);
         }
-        TimeoutScheduler& scheduler;
+        transport::internet::TimeoutScheduler& scheduler;
         int calls = 0;
     } repeating(scheduler);
     (void)scheduler.ScheduleAfter(0ms, repeating);
@@ -172,7 +172,7 @@ TEST_F(TimeoutSchedulerCases, ExpiringEventCanRearmItself) {
 
 TEST_F(TimeoutSchedulerCases, ExpiryStormYieldsToQueuedIo) {
     net::io_context io;
-    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    auto& scheduler = transport::internet::TimeoutScheduler::ForIoContext(io);
     std::size_t calls = 0, observed = 0;
     const auto callback = [&] {
         if (++calls == 1) net::post(io, [&] { observed = calls; });
@@ -191,7 +191,7 @@ TEST_F(TimeoutSchedulerCases, ExpiryStormYieldsToQueuedIo) {
 
 TEST_F(TimeoutSchedulerCases, WaitInitiationFailureRollsBackAndAllowsRecovery) {
     net::io_context io;
-    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    auto& scheduler = transport::internet::TimeoutScheduler::ForIoContext(io);
     std::size_t failed_calls = 0, recovered_calls = 0;
     CounterEvent failed, recovered;
     failed.counter = &failed_calls;
@@ -211,7 +211,7 @@ TEST_F(TimeoutSchedulerCases, WaitInitiationFailureRollsBackAndAllowsRecovery) {
 
 TEST_F(TimeoutSchedulerCases, HeapGrowthAndInterleavedCancellationPreserveSurvivingEvents) {
         net::io_context io;
-        auto& scheduler = TimeoutScheduler::ForIoContext(io);
+        auto& scheduler = transport::internet::TimeoutScheduler::ForIoContext(io);
         std::size_t fired = 0;
         std::deque<CounterEvent> events(12000);
         for (std::size_t i = 0; i != events.size(); ++i) {
@@ -231,10 +231,10 @@ TEST_F(TimeoutSchedulerCases, HeapGrowthAndInterleavedCancellationPreserveSurviv
 
 TEST_F(TimeoutSchedulerCases, ReleaseInvalidatesBorrowedEventsAndRejectsNewScheduling) {
     net::io_context io;
-    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    auto& scheduler = transport::internet::TimeoutScheduler::ForIoContext(io);
     std::deque<CounterEvent> events(12000);
     for (auto& event : events) (void)scheduler.ScheduleAfter(1h, event);
-    TimeoutScheduler::ReleaseForIoContext(io);
+    transport::internet::TimeoutScheduler::ReleaseForIoContext(io);
     for (auto& event : events) EXPECT_FALSE(event.Valid());
     EXPECT_FALSE(scheduler.ScheduleAfter(0ms, events.front()));
     io.run();
@@ -242,8 +242,8 @@ TEST_F(TimeoutSchedulerCases, ReleaseInvalidatesBorrowedEventsAndRejectsNewSched
 
 TEST_F(TimeoutSchedulerCases, EventCannotBeCancelledOrRearmedByAnotherContext) {
     net::io_context left, right;
-    auto& lhs = TimeoutScheduler::ForIoContext(left);
-    auto& rhs = TimeoutScheduler::ForIoContext(right);
+    auto& lhs = transport::internet::TimeoutScheduler::ForIoContext(left);
+    auto& rhs = transport::internet::TimeoutScheduler::ForIoContext(right);
     std::size_t calls = 0;
     CounterEvent event;
     event.counter = &calls;
@@ -264,7 +264,7 @@ TEST_F(TimeoutSchedulerCases, RecycledContextAddressDoesNotRetainSchedulerOwners
         recycled.emplace();
         CounterEvent next;
         next.counter = &calls;
-        auto& scheduler = TimeoutScheduler::ForIoContext(*recycled);
+        auto& scheduler = transport::internet::TimeoutScheduler::ForIoContext(*recycled);
         (void)scheduler.ScheduleAfter(0ms, next);
         recycled->run();
         recycled.reset();
@@ -274,7 +274,7 @@ TEST_F(TimeoutSchedulerCases, RecycledContextAddressDoesNotRetainSchedulerOwners
 
 TEST_F(TimeoutSchedulerCases, MaximumDelayCanBeExpeditedAndNegativeDelayExpiresImmediately) {
     net::io_context io;
-    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    auto& scheduler = transport::internet::TimeoutScheduler::ForIoContext(io);
     std::size_t far_calls = 0, immediate_calls = 0;
     CounterEvent maximum, immediate;
     maximum.counter = &far_calls;
@@ -301,12 +301,12 @@ TEST_F(TimeoutSchedulerCases, OwnerThreadDestructionDrainsSchedulerWait) {
     std::thread owner([&] {
         try {
             auto io = std::make_unique<net::io_context>();
-            auto& scheduler = TimeoutScheduler::ForIoContext(*io);
+            auto& scheduler = transport::internet::TimeoutScheduler::ForIoContext(*io);
             {
                 std::deque<CounterEvent> events(4096);
                 for (auto& event : events) (void)scheduler.ScheduleAfter(1h, event);
             }
-            TimeoutScheduler::ReleaseForIoContext(*io);
+            transport::internet::TimeoutScheduler::ReleaseForIoContext(*io);
             io->run();
             const bool drained = !scheduler.GetResourceStats().wait_pending;
             io.reset();
@@ -319,7 +319,7 @@ TEST_F(TimeoutSchedulerCases, OwnerThreadDestructionDrainsSchedulerWait) {
 
 TEST_F(TimeoutSchedulerCases, DelayCancelIsIdempotentAndDoesNotCancelNextWait) {
     net::io_context io;
-    AsyncDelay delay(io);
+    transport::internet::AsyncDelay delay(io);
     bool second_started = false, second_finished = false, early_completion = false;
     auto future = net::co_spawn(io, [&]() -> net::awaitable<void> {
         co_await delay.WaitFor(1h);
@@ -328,7 +328,7 @@ TEST_F(TimeoutSchedulerCases, DelayCancelIsIdempotentAndDoesNotCancelNextWait) {
         second_finished = true;
     }, net::use_future);
     net::post(io, [&] { delay.Cancel(); delay.Cancel(); });
-    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    auto& scheduler = transport::internet::TimeoutScheduler::ForIoContext(io);
     Event probe([&] { early_completion = second_finished; delay.Cancel(); });
     (void)scheduler.ScheduleAfter(10ms, probe);
     io.run();
@@ -340,7 +340,7 @@ TEST_F(TimeoutSchedulerCases, DelayCancelIsIdempotentAndDoesNotCancelNextWait) {
 
 TEST_F(TimeoutSchedulerCases, DelayParentCancellationAllowsReuse) {
     net::io_context io;
-    AsyncDelay delay(io);
+    transport::internet::AsyncDelay delay(io);
     net::cancellation_signal cancellation;
     bool parent_observed = false;
     auto cancelled = net::co_spawn(io, [&]() -> net::awaitable<void> {
@@ -363,7 +363,7 @@ TEST_F(TimeoutSchedulerCases, DelayParentCancellationAllowsReuse) {
 
 TEST_F(TimeoutSchedulerCases, DelayRejectsConcurrentWaitAndCancelsMaximumDuration) {
     net::io_context io;
-    AsyncDelay delay(io);
+    transport::internet::AsyncDelay delay(io);
     auto first = net::co_spawn(io, delay.WaitFor(std::chrono::milliseconds::max()), net::use_future);
     auto second = net::co_spawn(io, delay.WaitFor(1h), net::use_future);
     io.poll();
@@ -379,10 +379,10 @@ TEST_F(TimeoutSchedulerCases, DelayRejectsConcurrentWaitAndCancelsMaximumDuratio
 
 TEST_F(TimeoutSchedulerCases, DelayCancellationAfterSchedulerReleaseCompletesWaiter) {
     net::io_context io;
-    AsyncDelay delay(io);
+    transport::internet::AsyncDelay delay(io);
     auto waiting = net::co_spawn(io, delay.WaitFor(1h), net::use_future);
     io.poll();
-    TimeoutScheduler::ReleaseForIoContext(io);
+    transport::internet::TimeoutScheduler::ReleaseForIoContext(io);
     delay.Cancel();
     io.restart();
     io.run_for(100ms);

@@ -23,7 +23,7 @@ namespace {
 using namespace std::chrono_literals;
 
 template<class F>
-struct TestEvent final : TimeoutEvent {
+struct TestEvent final : transport::internet::TimeoutEvent {
     explicit TestEvent(F callback) : callback(std::move(callback)) {}
     void OnTimeout() override { callback(); }
     F callback;
@@ -40,14 +40,14 @@ buf::MultiBuffer Payload(size_t size) {
     return Payload(size, 0x42);
 }
 
-struct Endpoint : TimeoutEvent {
+struct Endpoint : transport::internet::TimeoutEvent {
     buf::MultiBuffer input;
     net::io_context* io = nullptr;
     bool phase_expired = false;
     uint8_t phase_flags = 0;
     uint32_t phase_generation = 0;
-    ErrorCode read_error = ErrorCode::OK;
-    ErrorCode write_error = ErrorCode::OK;
+    common::ErrorCode read_error = common::ErrorCode::OK;
+    common::ErrorCode write_error = common::ErrorCode::OK;
     bool allocation_failure = false;
     bool unknown_read_failure = false;
     bool unknown_write_failure = false;
@@ -64,7 +64,7 @@ struct Endpoint : TimeoutEvent {
     std::vector<uint16_t> packet_ports;
     size_t read_calls = 0;
     size_t fail_after_writes = 0;
-    ErrorCode later_write_error = ErrorCode::OK;
+    common::ErrorCode later_write_error = common::ErrorCode::OK;
     bool cancelled = false;
     std::optional<net::steady_timer> pending_read;
     int active_reads = 0;
@@ -77,7 +77,7 @@ struct Endpoint : TimeoutEvent {
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() {
         ++read_calls;
         if (unknown_read_failure) throw std::runtime_error("read failed");
-        if (read_error != ErrorCode::OK) throw transport::LinkError(read_error);
+        if (read_error != common::ErrorCode::OK) throw transport::LinkError(read_error);
         if (cancelled) co_return buf::MultiBuffer{};
         if (pending_read) {
             struct ReadScope {
@@ -90,12 +90,12 @@ struct Endpoint : TimeoutEvent {
         co_return std::move(input);
     }
     void RecordWrite(size_t size) {
-        if (cancelled) throw transport::LinkError(ErrorCode::CANCELLED);
+        if (cancelled) throw transport::LinkError(common::ErrorCode::CANCELLED);
         if (write_closed) throw transport::WriteClosed();
         if (allocation_failure) throw std::bad_alloc();
         if (unknown_write_failure) throw std::runtime_error("write failed");
-        if (write_error == ErrorCode::CANCELLED) write_timed_out = true;
-        if (write_error != ErrorCode::OK) throw transport::LinkError(write_error);
+        if (write_error == common::ErrorCode::CANCELLED) write_timed_out = true;
+        if (write_error != common::ErrorCode::OK) throw transport::LinkError(write_error);
         if (written == 0) first_write = std::chrono::steady_clock::now();
         last_write = std::chrono::steady_clock::now();
         written += size;
@@ -127,11 +127,11 @@ struct Endpoint : TimeoutEvent {
     net::awaitable<void> AsyncShutdownWrite() {
         ++shutdowns;
         if (shutdown_failure == 1) throw std::bad_alloc();
-        if (shutdown_failure == 2) throw transport::LinkError(ErrorCode::BLOCKED);
+        if (shutdown_failure == 2) throw transport::LinkError(common::ErrorCode::BLOCKED);
         if (shutdown_failure == 3) throw std::runtime_error("shutdown failed");
         co_return;
     }
-    void Cancel(ErrorCode reason = ErrorCode::CANCELLED) noexcept {
+    void Cancel(common::ErrorCode reason = common::ErrorCode::CANCELLED) noexcept {
         cancelled = true;
         cancellation.Stop(reason);
         if (pending_read) {
@@ -145,7 +145,7 @@ struct Endpoint : TimeoutEvent {
     void SetIdleTimeout(std::chrono::seconds) noexcept {}
     void SetReadTimeout(std::chrono::seconds) noexcept {}
     void SetWriteTimeout(std::chrono::seconds) noexcept {}
-    PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
+    transport::PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
         if (!io) return {};
         ++phase_generation;
         phase_expired = false;
@@ -153,7 +153,7 @@ struct Endpoint : TimeoutEvent {
         const auto maximum = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::milliseconds::max());
         const auto delay = timeout >= maximum ? std::chrono::milliseconds::max()
             : std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
-        if (!TimeoutScheduler::ForIoContext(*io).ScheduleAfter(delay, *this)) return {};
+        if (!transport::internet::TimeoutScheduler::ForIoContext(*io).ScheduleAfter(delay, *this)) return {};
         return {&phase_flags, 1, &phase_generation, phase_generation};
     }
     void OnTimeout() override {
@@ -162,7 +162,7 @@ struct Endpoint : TimeoutEvent {
         Cancel();
     }
     void ClearPhaseDeadline() noexcept {
-        TimeoutEvent::Cancel();
+        transport::internet::TimeoutEvent::Cancel();
         ++phase_generation;
         phase_flags = 0;
         phase_expired = false;
@@ -178,7 +178,7 @@ struct Endpoint : TimeoutEvent {
 
 // relay 的客户端侧只接受 transport 读写接口与 AsyncStream 控制面。该适配器把桩端点
 // 接到这些具体接口上；客户端阶段截止期由内嵌的 StreamPhaseDeadline 承载，到期时取消桩端点。
-class ClientStream final : public AsyncStream {
+class ClientStream final : public transport::AsyncStream {
 public:
     ClientStream(net::io_context& io, Endpoint& endpoint) : endpoint_(endpoint), phase_(io, *this) {}
 
@@ -207,11 +207,11 @@ public:
     bool IsOpen() const override { return true; }
 
 protected:
-    StreamPhaseDeadline* LogicalPhaseDeadline() noexcept override { return &phase_; }
+    transport::StreamPhaseDeadline* LogicalPhaseDeadline() noexcept override { return &phase_; }
 
 private:
     Endpoint& endpoint_;
-    StreamPhaseDeadline phase_;
+    transport::StreamPhaseDeadline phase_;
 };
 
 net::awaitable<bool> TestRateCancellation(net::io_context& io, int mode) {
@@ -222,37 +222,37 @@ net::awaitable<bool> TestRateCancellation(net::io_context& io, int mode) {
     if (mode == 1 || mode == 3) target.input = Payload(4000);
     else client.input = Payload(4000);
     if (mode >= 6) target.input = Payload(4000);
-    if (mode == 2) target.read_error = ErrorCode::SOCKET_READ_FAILED;
-    if (mode >= 14) client.Cancel(mode == 15 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED);
+    if (mode == 2) target.read_error = common::ErrorCode::SOCKET_READ_FAILED;
+    if (mode >= 14) client.Cancel(mode == 15 ? common::ErrorCode::RESOURCE_EXHAUSTED : common::ErrorCode::CANCELLED);
     TestEvent external_cancel([&client, &target, mode] {
         if (mode >= 12) {
-            client.Cancel(mode == 13 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED);
+            client.Cancel(mode == 13 ? common::ErrorCode::RESOURCE_EXHAUSTED : common::ErrorCode::CANCELLED);
             return;
         }
         target.phase_expired = mode == 8 || mode == 9;
-        target.Cancel(mode >= 10 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED);
+        target.Cancel(mode >= 10 ? common::ErrorCode::RESOURCE_EXHAUSTED : common::ErrorCode::CANCELLED);
     });
     if (mode >= 6 && mode < 14)
-        (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external_cancel);
-    StatsShard stats;
+        (void)transport::internet::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external_cancel);
+    app::StatsShard stats;
     session::Context context;
-    const RelayConfig config{.uplink_only = mode == 4 ? 0s : 1s,
+    const app::RelayConfig config{.uplink_only = mode == 4 ? 0s : 1s,
                              .downlink_only = mode == 4 ? 0s : 1s, .speed_limit = 1000};
     const auto start = std::chrono::steady_clock::now();
     const bool controlled = !(mode == 1 || mode == 5 || mode == 7 || mode == 9 || mode == 11 || mode >= 12);
-    const auto result = co_await DoRelayLink(io, link, link, controlled ? &link : nullptr,
+    const auto result = co_await app::DoRelayLink(io, link, link, controlled ? &link : nullptr,
         target, context, stats, config,
         buf::MultiBufferBatch(mode >= 14 ? Payload(4000) : buf::MultiBuffer{}));
     const auto elapsed = std::chrono::steady_clock::now() - start;
-    const auto expected = mode == 12 || mode == 14 ? ErrorCode::CANCELLED :
-        mode >= 10 ? ErrorCode::RESOURCE_EXHAUSTED : mode == 2 ? ErrorCode::SOCKET_READ_FAILED :
-        (mode == 6 || mode == 7 ? ErrorCode::CANCELLED : ErrorCode::RELAY_TIMEOUT);
+    const auto expected = mode == 12 || mode == 14 ? common::ErrorCode::CANCELLED :
+        mode >= 10 ? common::ErrorCode::RESOURCE_EXHAUSTED : mode == 2 ? common::ErrorCode::SOCKET_READ_FAILED :
+        (mode == 6 || mode == 7 ? common::ErrorCode::CANCELLED : common::ErrorCode::RELAY_TIMEOUT);
     const bool passed = elapsed < (mode >= 6 ? 500ms : 1800ms) && result.bytes_up == 0 && result.bytes_down == 0 &&
         result.error == expected;
     std::printf("rate cancellation mode=%d elapsed=%lldms up=%llu down=%llu code=%s: %s\n",
                 mode, static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()),
                 static_cast<unsigned long long>(result.bytes_up), static_cast<unsigned long long>(result.bytes_down),
-                ErrorCodeToString(result.error).data(), passed ? "PASS" : "FAIL");
+                common::ErrorCodeToString(result.error).data(), passed ? "PASS" : "FAIL");
     co_return passed;
 }
 
@@ -267,29 +267,29 @@ net::awaitable<bool> TestPendingRead(net::io_context& io, bool controlled, int m
     };
     if (mode != 1) block(client);
     if (mode != 0 && mode != 4) block(target);
-    StatsShard stats;
+    app::StatsShard stats;
     session::Context context;
     net::cancellation_signal parent;
     TestEvent external([&] {
         if (mode == 3) parent.emit(net::cancellation_type::terminal);
         else target.Cancel();
     });
-    if (mode >= 2) (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
+    if (mode >= 2) (void)transport::internet::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
     const auto budget = mode == 4 ? std::chrono::seconds::max() : 1s;
-    const RelayConfig config{.uplink_only = budget, .downlink_only = budget};
+    const app::RelayConfig config{.uplink_only = budget, .downlink_only = budget};
     const auto start = std::chrono::steady_clock::now();
-    auto relay = DoRelayLink(io, link, link, controlled ? &link : nullptr,
+    auto relay = app::DoRelayLink(io, link, link, controlled ? &link : nullptr,
                             target, context, stats, config);
     const auto result = co_await net::co_spawn(io, std::move(relay),
         net::bind_cancellation_slot(parent.slot(), net::use_awaitable));
     const auto elapsed = std::chrono::steady_clock::now() - start;
-    const auto expected = mode >= 2 ? ErrorCode::CANCELLED : ErrorCode::RELAY_TIMEOUT;
+    const auto expected = mode >= 2 ? common::ErrorCode::CANCELLED : common::ErrorCode::RELAY_TIMEOUT;
     const bool passed = result.error == expected && client.active_reads == 0 && target.active_reads == 0 &&
         result.bytes_up == 0 && result.bytes_down == 0 &&
         elapsed < (mode >= 2 ? 500ms : 1800ms) && (mode != 4 || elapsed >= 30ms);
     std::printf("pending read controlled=%d mode=%d elapsed=%lldms code=%s joined=%d: %s\n",
         controlled, mode, static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()),
-        ErrorCodeToString(result.error).data(), client.active_reads + target.active_reads == 0,
+        common::ErrorCodeToString(result.error).data(), client.active_reads + target.active_reads == 0,
         passed ? "PASS" : "FAIL");
     co_return passed;
 }
@@ -298,7 +298,7 @@ net::awaitable<bool> TestTcpCancellation(net::io_context& io, bool controlled, i
     tcp::acceptor listener(io, tcp::endpoint(net::ip::address_v4::loopback(), 0));
     tcp::socket peer(io);
     peer.connect(listener.local_endpoint());
-    TcpStream target(listener.accept());
+    transport::internet::TcpStream target(listener.accept());
     Endpoint client;
     client.io = &io;
     ClientStream link(io, client);
@@ -311,21 +311,21 @@ net::awaitable<bool> TestTcpCancellation(net::io_context& io, bool controlled, i
     if (mode == 4) target.SetReadTimeout(1s);
     TestEvent external([&] { target.Cancel(); });
     if (mode == 2 || mode == 3)
-        (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
-    StatsShard stats;
+        (void)transport::internet::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
+    app::StatsShard stats;
     session::Context context;
-    const RelayConfig config{.speed_limit = 1000};
+    const app::RelayConfig config{.speed_limit = 1000};
     const auto start = std::chrono::steady_clock::now();
-    const auto result = co_await DoRelayLink(io, link, link, controlled ? &link : nullptr,
+    const auto result = co_await app::DoRelayLink(io, link, link, controlled ? &link : nullptr,
                                            target, context, stats, config);
     const auto elapsed = std::chrono::steady_clock::now() - start;
-    const auto expected = mode == 2 || mode == 3 ? ErrorCode::CANCELLED : ErrorCode::RELAY_TIMEOUT;
+    const auto expected = mode == 2 || mode == 3 ? common::ErrorCode::CANCELLED : common::ErrorCode::RELAY_TIMEOUT;
     const bool passed = result.error == expected && result.bytes_up == 0 && result.bytes_down == 0 &&
         stats.Snapshot().bytes_out == 0 && peer.available() == 0 &&
-        elapsed < (expected == ErrorCode::CANCELLED ? 500ms : mode == 0 ? 2800ms : 1800ms) && elapsed >= 30ms;
+        elapsed < (expected == common::ErrorCode::CANCELLED ? 500ms : mode == 0 ? 2800ms : 1800ms) && elapsed >= 30ms;
     std::printf("TCP cancellation controlled=%d mode=%d elapsed=%lldms code=%s: %s\n",
         controlled, mode, static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()),
-        ErrorCodeToString(result.error).data(), passed ? "PASS" : "FAIL");
+        common::ErrorCodeToString(result.error).data(), passed ? "PASS" : "FAIL");
     co_return passed;
 }
 
@@ -333,31 +333,31 @@ net::awaitable<bool> TestTcpPending(net::io_context& io, bool controlled, bool p
     tcp::acceptor listener(io, tcp::endpoint(net::ip::address_v4::loopback(), 0));
     tcp::socket client_peer(io), target_peer(io);
     client_peer.connect(listener.local_endpoint());
-    TcpStream client(listener.accept());
+    transport::internet::TcpStream client(listener.accept());
     target_peer.connect(listener.local_endpoint());
-    TcpStream target(listener.accept());
+    transport::internet::TcpStream target(listener.accept());
     net::cancellation_signal parent;
     TestEvent external([&] {
         if (parent_cancel) parent.emit(net::cancellation_type::terminal);
         else target.Cancel();
     });
-    (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
+    (void)transport::internet::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
     session::Context context;
-    StatsShard stats;
-    const RelayConfig config{.uplink_only = 1s, .downlink_only = 1s,
+    app::StatsShard stats;
+    const app::RelayConfig config{.uplink_only = 1s, .downlink_only = 1s,
         .speed_limit = limited ? 1000u : 0u};
-    auto relay = DoRelayLink(io, client, client, controlled ? &client : nullptr,
+    auto relay = app::DoRelayLink(io, client, client, controlled ? &client : nullptr,
                             target, context, stats, config);
     const auto start = std::chrono::steady_clock::now();
     const auto result = co_await net::co_spawn(io, std::move(relay),
         net::bind_cancellation_slot(parent.slot(), net::use_awaitable));
     const auto elapsed = std::chrono::steady_clock::now() - start;
-    const bool passed = result.error == ErrorCode::CANCELLED && elapsed < 500ms &&
+    const bool passed = result.error == common::ErrorCode::CANCELLED && elapsed < 500ms &&
         result.bytes_up == 0 && result.bytes_down == 0;
     std::printf("TCP pending controlled=%d parent=%d limited=%d elapsed=%lldms code=%s: %s\n",
         controlled, parent_cancel, limited,
         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()),
-        ErrorCodeToString(result.error).data(), passed ? "PASS" : "FAIL");
+        common::ErrorCodeToString(result.error).data(), passed ? "PASS" : "FAIL");
     co_return passed;
 }
 
@@ -367,17 +367,17 @@ net::awaitable<bool> TestInitialPayload(net::io_context& io, bool controlled, in
     client.io = target.io = &io;
     ClientStream link(io, client);
     client.input = Payload(later_size, 0x73);
-    if (failure == 1) target.write_error = ErrorCode::RESOURCE_EXHAUSTED;
+    if (failure == 1) target.write_error = common::ErrorCode::RESOURCE_EXHAUSTED;
     if (failure == 2) target.allocation_failure = true;
-    if (failure == 3) target.write_error = ErrorCode::CANCELLED;
+    if (failure == 3) target.write_error = common::ErrorCode::CANCELLED;
     auto prefix = Payload(prefix_size);
-    StatsShard stats;
+    app::StatsShard stats;
     session::Context context;
-    const RelayConfig config{.uplink_only = 5s, .downlink_only = 5s,
+    const app::RelayConfig config{.uplink_only = 5s, .downlink_only = 5s,
                              .speed_limit = limited ? 1000u : 0u};
-    RelayResult result;
+    app::RelayResult result;
     const auto start = std::chrono::steady_clock::now();
-    result = co_await DoRelayLink(io, link, link, controlled ? &link : nullptr,
+    result = co_await app::DoRelayLink(io, link, link, controlled ? &link : nullptr,
                                  target, context, stats, config, buf::MultiBufferBatch(std::move(prefix)));
     const auto stats_bytes = stats.Snapshot().bytes_out;
     const auto first_write_ms = target.written == 0 ? -1 :
@@ -386,20 +386,20 @@ net::awaitable<bool> TestInitialPayload(net::io_context& io, bool controlled, in
         std::chrono::duration_cast<std::chrono::milliseconds>(target.last_write - start).count();
     bool passed = false;
     if (failure) {
-        const ErrorCode expected = failure == 3 ? ErrorCode::RELAY_TIMEOUT : ErrorCode::RESOURCE_EXHAUSTED;
+        const common::ErrorCode expected = failure == 3 ? common::ErrorCode::RELAY_TIMEOUT : common::ErrorCode::RESOURCE_EXHAUSTED;
         passed = result.error == expected && result.bytes_up == 0 && stats_bytes == 0 &&
             context.traffic.bytes_up == 0 && prefix.empty() &&
             (failure != 2 || !result.close_side_known);
     } else {
         std::vector<uint8_t> expected(prefix_size, 0x42);
         expected.insert(expected.end(), later_size, 0x73);
-        passed = result.error == ErrorCode::OK && result.bytes_up == expected.size() &&
+        passed = result.error == common::ErrorCode::OK && result.bytes_up == expected.size() &&
             stats_bytes == expected.size() && context.traffic.bytes_up == expected.size() &&
             target.output == expected && prefix.empty() &&
             (!limited || (prefix_size > 1000 ? first_write_ms >= 900 : last_write_ms >= 450));
     }
     std::printf("controlled=%d failure=%d prefix=%zu later=%zu limited=%d error=%s result=%llu context=%llu stats=%llu first_ms=%lld last_ms=%lld passed=%d\n",
-        controlled, failure, prefix_size, later_size, limited, ErrorCodeToString(result.error).data(),
+        controlled, failure, prefix_size, later_size, limited, common::ErrorCodeToString(result.error).data(),
         static_cast<unsigned long long>(result.bytes_up), static_cast<unsigned long long>(context.traffic.bytes_up),
         static_cast<unsigned long long>(stats_bytes), static_cast<long long>(first_write_ms),
         static_cast<long long>(last_write_ms), passed);
@@ -449,7 +449,7 @@ net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int
     ClientStream link(io, client);
     auto packet = [](size_t size, uint8_t byte, uint16_t port) {
         auto result = Payload(size, byte);
-        if (!buf::SetUdpTarget(result, TargetAddress("127.0.0.1", port))) throw std::bad_alloc();
+        if (!buf::SetUdpTarget(result, common::TargetAddress("127.0.0.1", port))) throw std::bad_alloc();
         return result;
     };
     buf::MultiBufferBatch batch;
@@ -461,16 +461,16 @@ net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int
     const size_t queued_bytes = 3 + buf::Buffer::kSize + 7 + 5;
     const bool queued_ok = batch.byte_size() == queued_bytes;
     client.input = packet(9, 0x44, 1004);
-    if (mode == 1) client.read_error = ErrorCode::SOCKET_READ_FAILED;
+    if (mode == 1) client.read_error = common::ErrorCode::SOCKET_READ_FAILED;
     if (mode >= 2) {
         target.fail_after_writes = 1;
-        target.later_write_error = mode == 2 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED;
+        target.later_write_error = mode == 2 ? common::ErrorCode::RESOURCE_EXHAUSTED : common::ErrorCode::CANCELLED;
     }
-    StatsShard stats;
+    app::StatsShard stats;
     session::Context context;
-    context.content.network = Network::UDP;
-    const RelayConfig config{.uplink_only = 5s, .downlink_only = 5s};
-    const auto result = co_await DoRelayLink(io, link, link, controlled ? &link : nullptr,
+    context.content.network = common::Network::UDP;
+    const app::RelayConfig config{.uplink_only = 5s, .downlink_only = 5s};
+    const auto result = co_await app::DoRelayLink(io, link, link, controlled ? &link : nullptr,
                                            target, context, stats, config, std::move(batch));
     std::vector<size_t> sizes{3};
     std::vector<size_t> fragments{1};
@@ -489,8 +489,8 @@ net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int
             bytes.insert(bytes.end(), 9, 0x44);
         }
     }
-    const auto expected = mode == 0 ? ErrorCode::OK : mode == 1 ? ErrorCode::SOCKET_READ_FAILED :
-        mode == 2 ? ErrorCode::RESOURCE_EXHAUSTED : ErrorCode::CANCELLED;
+    const auto expected = mode == 0 ? common::ErrorCode::OK : mode == 1 ? common::ErrorCode::SOCKET_READ_FAILED :
+        mode == 2 ? common::ErrorCode::RESOURCE_EXHAUSTED : common::ErrorCode::CANCELLED;
     const bool passed = queued_ok && batch.empty() && batch.byte_size() == 0 &&
         target.packet_sizes == sizes && target.packet_fragments == fragments &&
         target.packet_ports == ports && target.output == bytes &&
@@ -511,7 +511,7 @@ net::awaitable<bool> TestFullClose(net::io_context& io, bool controlled, int mod
         endpoint.pending_read->expires_after(timeout);
     };
     uint64_t expected_down = 0;
-    ErrorCode expected_error = ErrorCode::OK;
+    common::ErrorCode expected_error = common::ErrorCode::OK;
     if (mode == 0) {
         client.input = Payload(4000);
         target.eof_action = transport::EofAction::CloseLink;
@@ -530,14 +530,14 @@ net::awaitable<bool> TestFullClose(net::io_context& io, bool controlled, int mod
         target.shutdown_closes_link = true;
         target.shutdown_failure = mode - 2;
         block(target, 1h);
-        expected_error = mode == 3 ? ErrorCode::RESOURCE_EXHAUSTED :
-            mode == 4 ? ErrorCode::BLOCKED : ErrorCode::RELAY_WRITE_FAILED;
+        expected_error = mode == 3 ? common::ErrorCode::RESOURCE_EXHAUSTED :
+            mode == 4 ? common::ErrorCode::BLOCKED : common::ErrorCode::RELAY_WRITE_FAILED;
     }
-    StatsShard stats;
+    app::StatsShard stats;
     session::Context context;
-    const RelayConfig config{.uplink_only = 10s, .downlink_only = 10s, .speed_limit = 1000};
+    const app::RelayConfig config{.uplink_only = 10s, .downlink_only = 10s, .speed_limit = 1000};
     const auto start = std::chrono::steady_clock::now();
-    const auto result = co_await DoRelayLink(io, link, link, controlled ? &link : nullptr,
+    const auto result = co_await app::DoRelayLink(io, link, link, controlled ? &link : nullptr,
                                            target, context, stats, config);
     const auto elapsed = std::chrono::steady_clock::now() - start;
     const auto snapshot = stats.Snapshot();
@@ -548,7 +548,7 @@ net::awaitable<bool> TestFullClose(net::io_context& io, bool controlled, int mod
         (mode == 2 ? elapsed >= 2900ms && elapsed < 4s : elapsed < 500ms);
     std::printf("full close controlled=%d mode=%d up=%llu down=%llu code=%s elapsed=%lldms joined=%d shutdowns=%d: %s\n",
         controlled, mode, static_cast<unsigned long long>(result.bytes_up),
-        static_cast<unsigned long long>(result.bytes_down), ErrorCodeToString(result.error).data(),
+        static_cast<unsigned long long>(result.bytes_down), common::ErrorCodeToString(result.error).data(),
         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()),
         client.active_reads == 0 && target.active_reads == 0, target.shutdowns, passed ? "PASS" : "FAIL");
     co_return passed;
@@ -567,19 +567,19 @@ net::awaitable<bool> TestExceptionClassification(net::io_context& io, bool contr
         client.shutdown_failure = target.shutdown_failure = mode - 1;
         target.shutdown_closes_link = true;
     }
-    const auto expected = mode == 0 ? ErrorCode::INTERNAL :
-        mode == 2 ? ErrorCode::RESOURCE_EXHAUSTED :
-        mode == 3 ? ErrorCode::BLOCKED : ErrorCode::RELAY_WRITE_FAILED;
-    StatsShard stats;
+    const auto expected = mode == 0 ? common::ErrorCode::INTERNAL :
+        mode == 2 ? common::ErrorCode::RESOURCE_EXHAUSTED :
+        mode == 3 ? common::ErrorCode::BLOCKED : common::ErrorCode::RELAY_WRITE_FAILED;
+    app::StatsShard stats;
     session::Context context;
-    const auto result = co_await DoRelayLink(io, link, link, controlled ? &link : nullptr,
+    const auto result = co_await app::DoRelayLink(io, link, link, controlled ? &link : nullptr,
                                            target, context, stats);
     const bool passed = result.error == expected &&
         client.active_reads == 0 && target.active_reads == 0 &&
         client.active_writes == 0 && target.active_writes == 0 &&
         (mode < 2 || (client.shutdowns == 1 && target.shutdowns == 1));
     std::printf("exception classification controlled=%d mode=%d code=%s: %s\n",
-        controlled, mode, ErrorCodeToString(result.error).data(), passed ? "PASS" : "FAIL");
+        controlled, mode, common::ErrorCodeToString(result.error).data(), passed ? "PASS" : "FAIL");
     co_return passed;
 }
 
@@ -589,11 +589,11 @@ net::awaitable<bool> TestTcpHalfClose(net::io_context& io, bool controlled, bool
     tcp::acceptor listener(io, tcp::endpoint(net::ip::address_v4::loopback(), 0));
     tcp::socket client_peer(io), target_peer(io);
     client_peer.connect(listener.local_endpoint());
-    TcpStream client(listener.accept());
+    transport::internet::TcpStream client(listener.accept());
     target_peer.connect(listener.local_endpoint());
-    TcpStream target(listener.accept());
+    transport::internet::TcpStream target(listener.accept());
     session::Context context;
-    StatsShard stats;
+    app::StatsShard stats;
     auto peers = [&]() -> net::awaitable<bool> {
         auto& first = upload_first ? client_peer : target_peer;
         auto& reverse = upload_first ? target_peer : client_peer;
@@ -627,10 +627,10 @@ net::awaitable<bool> TestTcpHalfClose(net::io_context& io, bool controlled, bool
         co_return count == response.size() && std::equal(response.begin(), response.end(), received.begin());
     };
     auto [result, received] = co_await (
-        DoRelayLink(io, client, client, controlled ? &client : nullptr, target, context, stats,
-                    RelayConfig{.uplink_only = 2s, .downlink_only = 2s}) && peers());
+        app::DoRelayLink(io, client, client, controlled ? &client : nullptr, target, context, stats,
+                    app::RelayConfig{.uplink_only = 2s, .downlink_only = 2s}) && peers());
     const auto snapshot = stats.Snapshot();
-    const bool passed = received && result.error == ErrorCode::OK &&
+    const bool passed = received && result.error == common::ErrorCode::OK &&
         result.bytes_up == (upload_first ? 3u : 5u) && result.bytes_down == (upload_first ? 5u : 3u) &&
         snapshot.bytes_out == result.bytes_up && snapshot.bytes_in == result.bytes_down &&
         result.close_side_known && result.client_closed_first == upload_first;
@@ -652,18 +652,18 @@ net::awaitable<bool> TestBackpressuredWrite(net::io_context& io, bool controlled
     net::cancellation_signal parent;
     TestEvent stop([&] {
         if (mode == 1) parent.emit(net::cancellation_type::terminal);
-        else target.Cancel(ErrorCode::RESOURCE_EXHAUSTED);
+        else target.Cancel(common::ErrorCode::RESOURCE_EXHAUSTED);
     });
     if (mode == 2) (void)target.StartPhaseDeadline(1s);
-    else (void)TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, stop);
+    else (void)transport::internet::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, stop);
     session::Context context;
-    StatsShard stats;
+    app::StatsShard stats;
     const auto start = std::chrono::steady_clock::now();
     const auto result = co_await net::co_spawn(io,
-        DoRelayLink(io, link, link, controlled ? &link : nullptr, target, context, stats),
+        app::DoRelayLink(io, link, link, controlled ? &link : nullptr, target, context, stats),
         net::bind_cancellation_slot(parent.slot(), net::use_awaitable));
-    const auto expected = mode == 2 ? ErrorCode::RELAY_TIMEOUT :
-        mode == 1 ? ErrorCode::CANCELLED : ErrorCode::RESOURCE_EXHAUSTED;
+    const auto expected = mode == 2 ? common::ErrorCode::RELAY_TIMEOUT :
+        mode == 1 ? common::ErrorCode::CANCELLED : common::ErrorCode::RESOURCE_EXHAUSTED;
     const bool passed = result.error == expected && result.bytes_up == 0 && result.bytes_down == 0 &&
         client.active_reads == 0 && target.active_reads == 0 &&
         client.active_writes == 0 && target.active_writes == 0 &&

@@ -14,6 +14,8 @@
 // ============================================================================
 // 网络类型
 // ============================================================================
+namespace common {
+
 enum class Network : uint8_t {
     TCP = 0,
     UDP = 1,
@@ -266,14 +268,16 @@ struct ForwardedMetadata {
     ForwardedMetadataView View() const&& = delete;
 };
 
+}  // namespace common
+
 template <>
-struct std::formatter<::TargetAddress> {
+struct std::formatter<::common::TargetAddress> {
     constexpr auto parse(std::format_parse_context& ctx) {
         return ctx.begin();
     }
 
     template <class FormatContext>
-    auto format(const ::TargetAddress& target, FormatContext& ctx) const {
+    auto format(const ::common::TargetAddress& target, FormatContext& ctx) const {
         std::optional<::iputil::AddressText> ip_storage;
         std::string_view host(target.host.data(), target.host.size());
         const bool use_resolved = host.empty() && target.resolved_addr.has_value();

@@ -23,7 +23,7 @@ inline constexpr size_t kMaxFramedDatagramPayload = std::numeric_limits<uint16_t
 // 一份已校验、待写出的数据报。target 借用 MultiBuffer 的元数据，
 // 只在该 MultiBuffer 未修改期间有效。
 struct RequiredUdpDatagram {
-    const TargetAddress* target = nullptr;
+    const common::TargetAddress* target = nullptr;
     size_t payload_size = 0;
 };
 
@@ -32,7 +32,7 @@ struct RequiredUdpDatagram {
 // 负载超过 max_payload → PROTOCOL_ENCODE_FAILED。
 [[nodiscard]] inline std::optional<RequiredUdpDatagram> RequireUdpDatagram(
     const buf::MultiBuffer& mb,
-    const TargetAddress* fixed_target,
+    const common::TargetAddress* fixed_target,
     size_t max_payload = kMaxFramedDatagramPayload) {
     const auto datagram = buf::InspectUdpDatagram(mb);
     if (datagram.status == buf::UdpDatagramStatus::Empty) {
@@ -40,10 +40,10 @@ struct RequiredUdpDatagram {
     }
     if (!datagram.Valid() || !datagram.target || !datagram.target->IsValid() ||
         (fixed_target && !datagram.target->SameEndpoint(*fixed_target))) {
-        throw transport::LinkError(ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
     if (datagram.payload_size > max_payload) {
-        throw transport::LinkError(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     return RequiredUdpDatagram{.target = datagram.target,
                                .payload_size = datagram.payload_size};
@@ -55,7 +55,7 @@ struct RequiredUdpDatagram {
     size_t max_payload = kMaxFramedDatagramPayload) {
     const auto size = buf::TrySumBufferSizes(payload, max_payload);
     if (!size) {
-        throw transport::LinkError(ErrorCode::PROTOCOL_ENCODE_FAILED);
+        throw transport::LinkError(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     return *size;
 }
@@ -65,7 +65,7 @@ inline net::awaitable<void> WriteFramedDatagram(
     transport::MultiBufferWriter& writer,
     std::span<const uint8_t> header,
     const buf::MultiBuffer& payload) {
-    ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+    common::ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
     framed.Append(net::buffer(header.data(), header.size()));
     framed.AppendMultiBuffer(payload);
     co_await writer.WriteBuffers(framed.Span());
@@ -75,7 +75,7 @@ inline net::awaitable<void> WriteFramedDatagram(
     transport::MultiBufferWriter& writer,
     std::span<const uint8_t> header,
     std::span<const net::const_buffer> payload) {
-    ConstBufferSpanBuilder<8> framed;
+    common::ConstBufferSpanBuilder<8> framed;
     framed.Append(net::buffer(header.data(), header.size()));
     framed.AppendBuffers(payload);
     co_await writer.WriteBuffers(framed.Span());

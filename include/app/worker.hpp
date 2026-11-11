@@ -18,7 +18,11 @@
 #include <utility>
 #include <vector>
 
+namespace app {
+
 class GroupCoordinator;
+
+}  // namespace app
 
 namespace proxyman::inbound {
 struct BuildRequest;
@@ -34,19 +38,27 @@ namespace app::dns {
 class DNSWorker;
 }
 #include "app/stats.hpp"
+namespace common {
+
 struct OnlineDevice;
+
+}  // namespace common
+namespace app {
+
 struct PortBinding;
 struct StatsShard;
 struct WorkerRuntimeConfig {
-    TimeoutsConfig timeouts;
-    LimitsConfig limits;
-    RoutingConfig routing;
+    infra::TimeoutsConfig timeouts;
+    infra::LimitsConfig limits;
+    infra::RoutingConfig routing;
     std::vector<proxyman::outbound::PreparedOutboundConfig> outbounds;
     uint32_t workers = 0;
     uint32_t pressure_threshold = 1;
     uint32_t pressure_idle_timeout = 0;
 };
 struct WorkerRuntimeStatsSnapshot;
+
+}  // namespace app
 namespace rule {
 struct DetectRule;
 }
@@ -57,6 +69,8 @@ struct DetectRule;
 // 每个 Worker 持有同一套 live 能力，由 RuntimeState 统一构造和启动。
 // 热路径只在所属 io_context 上运行。跨线程控制面只能经有界 mailbox 投递。
 // ============================================================================
+namespace app {
+
 class Worker {
 public:
     // coordinator 是整个 Worker 池共享的有界全局准入协调器，必须由调用方提供
@@ -146,7 +160,7 @@ public:
     void RollbackTraffic(std::string_view tag, const app::UserTrafficCounters& snapshot);
 
     // 协议类型由 inbound handler 的 ReceiverSettings 自动判断，无需外部传入。
-    [[nodiscard]] std::vector<OnlineDevice> GetOnlineDevices(std::string_view tag) const;
+    [[nodiscard]] std::vector<common::OnlineDevice> GetOnlineDevices(std::string_view tag) const;
 
     // Resource traversal is requested only by the low-frequency diagnostics loop.
     [[nodiscard]] WorkerRuntimeStatsSnapshot CollectRuntimeStats(bool include_resources) const;
@@ -178,4 +192,6 @@ private:
     std::unique_ptr<WorkerMailbox> mailbox_;
     std::shared_ptr<GroupCoordinator> group_coordinator_;
 };
+
+}  // namespace app
 

@@ -17,41 +17,41 @@
 namespace proxy {
 
 [[nodiscard]] inline bool ConsumeStreamReadTimeout(
-    AsyncStream& stream) noexcept {
+    transport::AsyncStream& stream) noexcept {
     return stream.ConsumePhaseDeadline() || stream.ConsumeIdleTimeout() ||
            stream.ConsumeReadTimeout();
 }
 
-[[nodiscard]] inline ErrorCode ResolveHandshakeReadFailure(
-    AsyncStream& stream,
-    ErrorCode fallback = ErrorCode::SOCKET_READ_FAILED) noexcept {
-    return ConsumeStreamReadTimeout(stream) ? ErrorCode::TIMEOUT : fallback;
+[[nodiscard]] inline common::ErrorCode ResolveHandshakeReadFailure(
+    transport::AsyncStream& stream,
+    common::ErrorCode fallback = common::ErrorCode::SOCKET_READ_FAILED) noexcept {
+    return ConsumeStreamReadTimeout(stream) ? common::ErrorCode::TIMEOUT : fallback;
 }
 
-[[nodiscard]] inline ErrorCode ClassifyHandshakeReadException(
-    AsyncStream& stream,
+[[nodiscard]] inline common::ErrorCode ClassifyHandshakeReadException(
+    transport::AsyncStream& stream,
     const IoSystemError& error) noexcept {
     if (ConsumeStreamReadTimeout(stream) || error.code() == io_error::timed_out) {
-        return ErrorCode::TIMEOUT;
+        return common::ErrorCode::TIMEOUT;
     }
     if (error.code() == io_error::operation_aborted) {
-        return ErrorCode::CANCELLED;
+        return common::ErrorCode::CANCELLED;
     }
-    return ErrorCode::SOCKET_READ_FAILED;
+    return common::ErrorCode::SOCKET_READ_FAILED;
 }
 
 // 入站握手响应写失败的分类：写超时与阶段截止期归为 TIMEOUT，不计作读失败。
-[[nodiscard]] inline ErrorCode ClassifyHandshakeWriteException(
-    AsyncStream& stream,
+[[nodiscard]] inline common::ErrorCode ClassifyHandshakeWriteException(
+    transport::AsyncStream& stream,
     const IoSystemError& error) noexcept {
     if (stream.ConsumePhaseDeadline() || stream.ConsumeIdleTimeout() ||
         stream.ConsumeWriteTimeout() || error.code() == io_error::timed_out) {
-        return ErrorCode::TIMEOUT;
+        return common::ErrorCode::TIMEOUT;
     }
     if (error.code() == io_error::operation_aborted) {
-        return ErrorCode::CANCELLED;
+        return common::ErrorCode::CANCELLED;
     }
-    return ErrorCode::SOCKET_WRITE_FAILED;
+    return common::ErrorCode::SOCKET_WRITE_FAILED;
 }
 
 // 本次握手在这次读之前是否已经收到过字节，决定 EOF 的含义。
@@ -63,8 +63,8 @@ enum class HandshakeProgress : uint8_t {
 // 唯一的握手精确读：填满 `out` 才返回成功。
 // 握手首字节前 EOF 是对端正常关闭 → SOCKET_EOF；收到任何握手字节后 EOF 是
 // 异常截断 → PROTOCOL_DECODE_FAILED；已触发的读、空闲或阶段超时优先归为 TIMEOUT。
-[[nodiscard]] inline net::awaitable<tl::expected<void, ErrorCode>> ReadHandshakeExact(
-    AsyncStream& stream,
+[[nodiscard]] inline net::awaitable<tl::expected<void, common::ErrorCode>> ReadHandshakeExact(
+    transport::AsyncStream& stream,
     std::span<uint8_t> out,
     HandshakeProgress progress) {
     bool started = progress == HandshakeProgress::Started;
@@ -75,40 +75,40 @@ enum class HandshakeProgress : uint8_t {
         } catch (const IoSystemError& error) {
             if (error.code() == io_error::eof) {
                 co_return tl::unexpected(ResolveHandshakeReadFailure(stream, started
-                    ? ErrorCode::PROTOCOL_DECODE_FAILED : ErrorCode::SOCKET_EOF));
+                    ? common::ErrorCode::PROTOCOL_DECODE_FAILED : common::ErrorCode::SOCKET_EOF));
             }
             co_return tl::unexpected(ClassifyHandshakeReadException(stream, error));
         } catch (const std::bad_alloc&) {
-            co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
+            co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
         }
         if (n == 0) {
             co_return tl::unexpected(ResolveHandshakeReadFailure(
                 stream,
-                started ? ErrorCode::PROTOCOL_DECODE_FAILED : ErrorCode::SOCKET_EOF));
+                started ? common::ErrorCode::PROTOCOL_DECODE_FAILED : common::ErrorCode::SOCKET_EOF));
         }
         started = true;
         out = out.subspan(n);
     }
-    co_return tl::expected<void, ErrorCode>{};
+    co_return tl::expected<void, common::ErrorCode>{};
 }
 
 [[nodiscard]] inline bool ConsumeOutboundHandshakeTimeout(
-    AsyncStream& stream,
-    const PhaseDeadlineHandle& deadline) noexcept {
+    transport::AsyncStream& stream,
+    const transport::PhaseDeadlineHandle& deadline) noexcept {
     return deadline.Expired() || ConsumeStreamReadTimeout(stream) ||
            stream.ConsumeWriteTimeout();
 }
 
 // 出站握手异常分类：只能在 catch 块内调用。类型分类交给
 // transport::ClassifyFailure，本函数只叠加握手截止期语义。
-[[nodiscard]] inline ErrorCode ClassifyOutboundHandshakeException(
-    AsyncStream& stream,
-    const PhaseDeadlineHandle& deadline,
-    ErrorCode fallback = ErrorCode::SOCKET_WRITE_FAILED) noexcept {
-    const ErrorCode code = transport::ClassifyFailure(std::current_exception(), fallback);
-    if (code == ErrorCode::RESOURCE_EXHAUSTED) return code;
-    return ConsumeOutboundHandshakeTimeout(stream, deadline) || code == ErrorCode::TIMEOUT
-        ? ErrorCode::TIMEOUT
+[[nodiscard]] inline common::ErrorCode ClassifyOutboundHandshakeException(
+    transport::AsyncStream& stream,
+    const transport::PhaseDeadlineHandle& deadline,
+    common::ErrorCode fallback = common::ErrorCode::SOCKET_WRITE_FAILED) noexcept {
+    const common::ErrorCode code = transport::ClassifyFailure(std::current_exception(), fallback);
+    if (code == common::ErrorCode::RESOURCE_EXHAUSTED) return code;
+    return ConsumeOutboundHandshakeTimeout(stream, deadline) || code == common::ErrorCode::TIMEOUT
+        ? common::ErrorCode::TIMEOUT
         : code;
 }
 

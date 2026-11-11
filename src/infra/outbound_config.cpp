@@ -12,17 +12,17 @@
 
 namespace proxy::freedom::outbound {
 std::optional<DomainStrategy> ParseDomainStrategy(std::string_view value) {
-    if (EqualsAsciiCI(value, "asis")) return DomainStrategy::AsIs;
-    if (EqualsAsciiCI(value, "useip")) return DomainStrategy::UseIP;
-    if (EqualsAsciiCI(value, "useipv6v4")) return DomainStrategy::UseIPv6v4;
-    if (EqualsAsciiCI(value, "useipv4")) return DomainStrategy::UseIPv4;
-    if (EqualsAsciiCI(value, "useipv4v6")) return DomainStrategy::UseIPv4v6;
-    if (EqualsAsciiCI(value, "useipv6")) return DomainStrategy::UseIPv6;
-    if (EqualsAsciiCI(value, "forceip")) return DomainStrategy::ForceIP;
-    if (EqualsAsciiCI(value, "forceipv6v4")) return DomainStrategy::ForceIPv6v4;
-    if (EqualsAsciiCI(value, "forceipv6")) return DomainStrategy::ForceIPv6;
-    if (EqualsAsciiCI(value, "forceipv4v6")) return DomainStrategy::ForceIPv4v6;
-    if (EqualsAsciiCI(value, "forceipv4")) return DomainStrategy::ForceIPv4;
+    if (common::EqualsAsciiCI(value, "asis")) return DomainStrategy::AsIs;
+    if (common::EqualsAsciiCI(value, "useip")) return DomainStrategy::UseIP;
+    if (common::EqualsAsciiCI(value, "useipv6v4")) return DomainStrategy::UseIPv6v4;
+    if (common::EqualsAsciiCI(value, "useipv4")) return DomainStrategy::UseIPv4;
+    if (common::EqualsAsciiCI(value, "useipv4v6")) return DomainStrategy::UseIPv4v6;
+    if (common::EqualsAsciiCI(value, "useipv6")) return DomainStrategy::UseIPv6;
+    if (common::EqualsAsciiCI(value, "forceip")) return DomainStrategy::ForceIP;
+    if (common::EqualsAsciiCI(value, "forceipv6v4")) return DomainStrategy::ForceIPv6v4;
+    if (common::EqualsAsciiCI(value, "forceipv6")) return DomainStrategy::ForceIPv6;
+    if (common::EqualsAsciiCI(value, "forceipv4v6")) return DomainStrategy::ForceIPv4v6;
+    if (common::EqualsAsciiCI(value, "forceipv4")) return DomainStrategy::ForceIPv4;
     return std::nullopt;
 }
 }  // namespace proxy::freedom::outbound
@@ -39,12 +39,12 @@ const json::object& SingleObject(const json::object& source, std::string_view ke
     return value->as_array()[0].as_object();
 }
 
-OutboundServer Server(const json::object& source, uint16_t default_port) {
+transport::internet::OutboundServer Server(const json::object& source, uint16_t default_port) {
     const auto port = ReadJsonPort(source, "port");
     if (port.error != JsonPortError::None && port.error != JsonPortError::Missing) {
         throw std::invalid_argument("outbound server port must be an integer between 1 and 65535");
     }
-    auto server = MakeOutboundServer(JsonStringOr(source, "address", ""),
+    auto server = transport::internet::MakeOutboundServer(JsonStringOr(source, "address", ""),
                                     port.Valid() ? port.value : default_port);
     if (!server) throw std::invalid_argument(std::string(server.error()));
     return std::move(*server);
@@ -124,7 +124,7 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const json::ob
         result.domain_strategy = *strategy;
         const auto redirect = JsonStringOr(source, "redirect", "");
         if (!redirect.empty()) {
-            result.redirect = TargetAddress::Parse(redirect);
+            result.redirect = common::TargetAddress::Parse(redirect);
             if (!result.redirect || !result.redirect->IsValid()) {
                 throw std::invalid_argument("freedom redirect must be a valid host:port");
             }
@@ -136,7 +136,7 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const json::ob
         BlackholeSettings result;
         if (const auto* response = RequireJson(ParseJsonObject(source, "response"))) {
             RequireJsonKeys(*response, {"type"}, "outbound.settings.response");
-            const auto type = LowerAscii(JsonStringOr(*response, "type", "none"));
+            const auto type = common::LowerAscii(JsonStringOr(*response, "type", "none"));
             if (type != "none" && type != "http") {
                 throw std::invalid_argument("blackhole response.type must be none or http");
             }
@@ -150,8 +150,8 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const json::ob
         AnyTlsSettings result;
         result.server = Server(source, 0);
         auto password = Password(source);
-        ScopedCleanse cleanse{password};
-        result.password_hash = anytls::PasswordHash(password);
+        common::ScopedCleanse cleanse{password};
+        result.password_hash = proxy::anytls::PasswordHash(password);
         result.idle_session_check_interval = PositiveSeconds(
             source, "idleSessionCheckInterval", result.idle_session_check_interval);
         result.idle_session_timeout = PositiveSeconds(source, "idleSessionTimeout", result.idle_session_timeout);
@@ -170,7 +170,7 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const json::ob
         if (shadowsocks) {
             ShadowsocksSettings result;
             result.server = Server(*server, 8388);
-            const auto cipher = ss::ParseCipherMethod(JsonStringOr(*server, "method", "aes-256-gcm"));
+            const auto cipher = proxy::shadowsocks::ParseCipherMethod(JsonStringOr(*server, "method", "aes-256-gcm"));
             if (!cipher) throw std::invalid_argument("unsupported Shadowsocks method");
             result.cipher = *cipher;
             result.password = Password(*server);
@@ -204,34 +204,34 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const json::ob
         if (vless_protocol) {
             VlessSettings result;
             result.server = std::move(endpoint);
-            const auto uuid = vless::ParseUuidBytes(id);
+            const auto uuid = proxy::vless::ParseUuidBytes(id);
             if (!uuid) throw std::invalid_argument("VLESS id must be a UUID or a 1-30 byte custom id");
             result.id = *uuid;
-            result.flow = vless::NormalizeFlow(JsonStringOr(*user, "flow", ""));
+            result.flow = proxy::vless::NormalizeFlow(JsonStringOr(*user, "flow", ""));
             if (!result.flow.empty() && result.flow != "xtls-rprx-vision" &&
                 result.flow != "xtls-rprx-vision-udp443") {
                 throw std::invalid_argument("unsupported VLESS flow");
             }
-            auto encryption = vless::ParseVlessClientEncryption(JsonStringOr(*user, "encryption", ""));
-            if (!encryption) throw std::invalid_argument(std::string(vless::VlessEncryptionParseErrorMessage(encryption.error())));
-            if (*encryption) result.encryption = std::make_shared<const vless::VlessEncryptionConfig>(std::move(**encryption));
-            const auto packet = LowerAscii(JsonStringOr(*user, "packetEncoding", "xudp"));
+            auto encryption = proxy::vless::ParseVlessClientEncryption(JsonStringOr(*user, "encryption", ""));
+            if (!encryption) throw std::invalid_argument(std::string(proxy::vless::VlessEncryptionParseErrorMessage(encryption.error())));
+            if (*encryption) result.encryption = std::make_shared<const proxy::vless::VlessEncryptionConfig>(std::move(**encryption));
+            const auto packet = common::LowerAscii(JsonStringOr(*user, "packetEncoding", "xudp"));
             if (packet == "none") result.packet_encoding = PacketEncoding::None;
             else if (packet == "packetaddr") result.packet_encoding = PacketEncoding::PacketAddr;
             else if (packet == "xudp" || packet.empty()) result.packet_encoding = PacketEncoding::Xudp;
             else throw std::invalid_argument("packetEncoding must be none, packetaddr, or xudp");
             return result;
         }
-        const auto uuid = ParseUuid(id);
+        const auto uuid = common::ParseUuid(id);
         if (!uuid) throw std::invalid_argument("VMess id must be a UUID");
         const auto alter_id = RequireJson(ParseJsonUint64(*user, "alterId"));
         if (alter_id && *alter_id != 0) throw std::invalid_argument("VMess alterId must be zero");
-        const auto security = LowerAscii(JsonStringOr(*user, "security", "auto"));
-        vmess::Security cipher;
-        if (security.empty() || security == "auto" || security == "aes-128-gcm") cipher = vmess::Security::AES_128_GCM;
-        else if (security == "chacha20-poly1305") cipher = vmess::Security::CHACHA20_POLY1305;
-        else if (security == "none") cipher = vmess::Security::NONE;
-        else if (security == "zero") cipher = vmess::Security::ZERO;
+        const auto security = common::LowerAscii(JsonStringOr(*user, "security", "auto"));
+        proxy::vmess::Security cipher;
+        if (security.empty() || security == "auto" || security == "aes-128-gcm") cipher = proxy::vmess::Security::AES_128_GCM;
+        else if (security == "chacha20-poly1305") cipher = proxy::vmess::Security::CHACHA20_POLY1305;
+        else if (security == "none") cipher = proxy::vmess::Security::NONE;
+        else if (security == "zero") cipher = proxy::vmess::Security::ZERO;
         else throw std::invalid_argument("unsupported VMess security");
         return VmessSettings{.server = std::move(endpoint), .id = *uuid, .security = cipher};
     }

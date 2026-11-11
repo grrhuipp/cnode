@@ -139,7 +139,7 @@ TEST(DatagramSocket, ZeroLengthAndCancellationIsolation) {
     bool cancelled = false;
     try { (void)cancelled_future.get(); }
     catch (const ::transport::LinkError& error) {
-        cancelled = error.code() == ::ErrorCode::CANCELLED;
+        cancelled = error.code() == ::common::ErrorCode::CANCELLED;
     }
     const auto packet = live_future.get();
     EXPECT_TRUE(cancelled);
@@ -206,7 +206,7 @@ TEST(DatagramSocket, IPv6MaximumAndFamilyValidation) {
         io.run();
         try { family_future.get(); }
         catch (const ::transport::LinkError& error) {
-            family_rejected = error.code() == ::ErrorCode::INVALID_ARGUMENT;
+            family_rejected = error.code() == ::common::ErrorCode::INVALID_ARGUMENT;
         }
     }
 
@@ -220,7 +220,7 @@ TEST(DatagramSocket, IPv6MaximumAndFamilyValidation) {
     bool size_rejected = false;
     try { size_future.get(); }
     catch (const ::transport::LinkError& error) {
-        size_rejected = error.code() == ::ErrorCode::INVALID_ARGUMENT;
+        size_rejected = error.code() == ::common::ErrorCode::INVALID_ARGUMENT;
     }
     EXPECT_TRUE(family_rejected);
     EXPECT_TRUE(size_rejected);
@@ -290,7 +290,7 @@ TEST(DatagramSocket, SocketLimitAndReclamation) {
     bool rejected = false;
     try { DatagramSocket extra(io, ::net::ip::address_v4::loopback()); }
     catch (const ::transport::LinkError& error) {
-        rejected = error.code() == ::ErrorCode::RESOURCE_EXHAUSTED;
+        rejected = error.code() == ::common::ErrorCode::RESOURCE_EXHAUSTED;
     }
     EXPECT_TRUE(rejected);
     EXPECT_EQ(DatagramSocket::ActiveCount(), limit);

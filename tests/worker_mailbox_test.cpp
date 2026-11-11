@@ -69,7 +69,7 @@ protected:
 
     ::net::io_context worker_io_;
     ::net::executor_work_guard<::net::io_context::executor_type> work_;
-    ::WorkerMailbox mailbox_;
+    ::app::WorkerMailbox mailbox_;
     ::net::io_context caller_io_;
     std::thread worker_thread_;
 };
@@ -106,8 +106,8 @@ TEST_F(WorkerMailboxTest, FullMailboxRejectsBothAdmissionKindsAndReusesReleasedS
     caller_io_.run();
     caller_io_.restart();
     held.get();
-    EXPECT_THROW(post.get(), ::WorkerMailboxFull);
-    EXPECT_THROW(call.get(), ::WorkerMailboxFull);
+    EXPECT_THROW(post.get(), ::app::WorkerMailboxFull);
+    EXPECT_THROW(call.get(), ::app::WorkerMailboxFull);
     EXPECT_EQ(mailbox_.Outstanding(), 0u);
     EXPECT_EQ(Await(mailbox_.Post(PostedThread())), worker_thread_.get_id());
 }

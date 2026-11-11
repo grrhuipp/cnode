@@ -24,6 +24,8 @@
 // destOverride 是封闭的协议集合（routing::SniffedProtocolBit），配置边界一次
 // 解析为位集；字段之间没有派生状态，任意构造结果即可直接进入热路径。
 // ============================================================================
+namespace routing {
+
 struct SniffConfig {
     bool enabled = true;
     bool metadata_only = false;
@@ -48,14 +50,28 @@ struct SniffConfig {
     [[nodiscard]] bool operator==(const SniffConfig&) const = default;
 };
 
+}  // namespace routing
+
+namespace transport {
+
 class AsyncStream;
+
+}  // namespace transport
 
 namespace session {
 struct Context;
 }
 
+namespace app {
+
 struct StatsShard;
+
+}  // namespace app
+namespace infra {
+
 struct TimeoutsConfig;
+
+}  // namespace infra
 
 namespace routing {
 
@@ -104,15 +120,15 @@ class Dispatcher {
 public:
     virtual ~Dispatcher() noexcept = default;
 
-    virtual net::awaitable<RelayResult> Dispatch(
+    virtual net::awaitable<app::RelayResult> Dispatch(
         net::io_context& io_context,
         const DispatchPolicy& policy,
-        std::unique_ptr<AsyncStream> inbound,
+        std::unique_ptr<transport::AsyncStream> inbound,
         transport::Link inbound_link,
-        InitialPayload first_packet,
+        common::InitialPayload first_packet,
         session::Context& ctx,
-        StatsShard& stats,
-        const TimeoutsConfig& timeouts) = 0;
+        app::StatsShard& stats,
+        const infra::TimeoutsConfig& timeouts) = 0;
 };
 
 }  // namespace routing

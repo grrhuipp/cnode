@@ -78,7 +78,7 @@ TEST_F(HysteriaProtocol, V1UdpRoundTrip) {
     UdpMessage message;
     message.session_id = 0x01020304;
     message.packet_id = 42;
-    message.target = ::TargetAddress("1.2.3.4", 53);
+    message.target = ::common::TargetAddress("1.2.3.4", 53);
     message.payload = payload;
     const auto encoded = EncodeUdpMessage(Version::V1, message);
     ASSERT_TRUE(encoded);
@@ -97,7 +97,7 @@ TEST_F(HysteriaProtocol, V2UdpRoundTripAndContinuationFragment) {
     message.packet_id = 99;
     message.fragment_id = 0;
     message.fragment_count = 2;
-    message.target = ::TargetAddress("example.com", 53);
+    message.target = ::common::TargetAddress("example.com", 53);
     message.payload = payload;
     const auto encoded = EncodeUdpMessage(Version::V2, message);
     ASSERT_TRUE(encoded);
@@ -127,7 +127,7 @@ TEST_F(HysteriaProtocol, V2SinglePacketAcceptsIgnoredFragmentId) {
     EXPECT_EQ(parsed->packet_id, 0x1234);
     EXPECT_EQ(parsed->fragment_id, 255);
     EXPECT_EQ(parsed->fragment_count, 1);
-    EXPECT_TRUE(parsed->target.SameEndpoint(::TargetAddress("example.com", 53)));
+    EXPECT_TRUE(parsed->target.SameEndpoint(::common::TargetAddress("example.com", 53)));
     EXPECT_EQ(std::vector<uint8_t>(parsed->payload.begin(), parsed->payload.end()),
               (std::vector<uint8_t>{'d', 'n', 's'}));
 }
@@ -136,7 +136,7 @@ TEST_F(HysteriaProtocol, V2SinglePacketEncodesIgnoredFragmentId) {
     const std::vector<uint8_t> payload{'d', 'n', 's'};
     const UdpMessage message{.session_id = 7, .packet_id = 0x1234,
         .fragment_id = 255, .fragment_count = 1,
-        .target = ::TargetAddress("example.com", 53), .payload = payload};
+        .target = ::common::TargetAddress("example.com", 53), .payload = payload};
     const auto encoded = EncodeUdpMessage(Version::V2, message);
     ASSERT_TRUE(encoded);
     EXPECT_TRUE(std::ranges::equal(*encoded, kV2SinglePacket));
@@ -154,7 +154,7 @@ TEST_F(HysteriaProtocol, V2FragmentCountAndIndexRemainValidated) {
         EXPECT_EQ(parsed.error(), ::transport::internet::hysteria::ProtocolError::Invalid);
         const UdpMessage message{.session_id = 7, .packet_id = 0x1234,
             .fragment_id = 255, .fragment_count = count,
-            .target = ::TargetAddress("example.com", 53), .payload = payload};
+            .target = ::common::TargetAddress("example.com", 53), .payload = payload};
         EXPECT_FALSE(EncodeUdpMessage(Version::V2, message));
     }
 }
@@ -176,9 +176,9 @@ TEST_F(HysteriaProtocol, UdpPreservesEmptyAndMaximumPayloadsAcrossAddressForms) 
     const auto domain = std::string(63, 'a') + "." + std::string(63, 'b') +
         "." + std::string(63, 'c') + "." + std::string(61, 'd');
     const std::array targets{
-        ::TargetAddress("192.0.2.123", 65535),
-        ::TargetAddress("2001:db8::1234", 65535),
-        ::TargetAddress(domain, 65535)};
+        ::common::TargetAddress("192.0.2.123", 65535),
+        ::common::TargetAddress("2001:db8::1234", 65535),
+        ::common::TargetAddress(domain, 65535)};
     std::array<uint8_t, kMaxUdpPayloadLength + 1> payload{};
     for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<uint8_t>(i);
     for (const auto version : {Version::V1, Version::V2}) {

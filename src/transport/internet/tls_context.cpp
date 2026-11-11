@@ -46,6 +46,8 @@
 // SslContext 工厂
 // ============================================================================
 
+namespace transport::internet {
+
 namespace {
 
 [[nodiscard]] bool AlpnWireContains(
@@ -285,6 +287,8 @@ void TransportSecurity::Prepare(StreamSettings& settings, StreamEndpointRole rol
     settings.prepared_security = std::make_shared<TransportSecurity>(source, role);
 }
 
+}  // namespace transport::internet
+
 // ============================================================================
 // AutoSignCertificate & AutoSignContextRenewal
 // ============================================================================
@@ -403,6 +407,8 @@ std::unique_ptr<AutoSignCertificate> AutoSignCertificate::Create(std::string_vie
 }
 
 }  // namespace transport::internet
+
+namespace transport::internet {
 
 class AutoSignRenewalScheduler {
 public:
@@ -935,3 +941,5 @@ std::unique_ptr<SslContext> SslContext::CreateClient(const TlsConfig& config) {
 }
 
 SslContext::~SslContext() = default;
+
+}  // namespace transport::internet

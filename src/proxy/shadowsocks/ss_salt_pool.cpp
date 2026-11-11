@@ -6,7 +6,7 @@
 #include <array>
 #include <new>
 
-namespace ss {
+namespace proxy::shadowsocks {
 
 static_assert(Ss2022SaltPool::kRetention > std::chrono::seconds(2 * kSs2022MaxTimestampSkew));
 
@@ -37,18 +37,18 @@ struct SaltPoolService final : net::execution_context::service {
 }  // namespace
 
 net::awaitable<Ss2022SaltAdmission> AdmitSs2022RequestSalt(
-    GroupCoordinator& coordinator, const KeyBytes& salt) {
+    app::GroupCoordinator& coordinator, const KeyBytes& salt) {
     // Copy the small key, not a borrowed worker-side buffer, into owner work.
     try {
         co_return co_await coordinator.PostCall([&coordinator, salt] {
             return net::use_service<SaltPoolService>(coordinator.Services()).pool.Admit(
                 salt.span(), Ss2022SaltPool::Clock::now());
         });
-    } catch (const WorkerMailboxFull&) {
+    } catch (const app::WorkerMailboxFull&) {
         co_return Ss2022SaltAdmission::Limited;
     } catch (const std::bad_alloc&) {
         co_return Ss2022SaltAdmission::Limited;
     }
 }
 
-}  // namespace ss
+}  // namespace proxy::shadowsocks

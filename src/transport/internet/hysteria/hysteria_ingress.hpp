@@ -32,9 +32,21 @@
 #include <vector>
 #include <tl/expected.hpp>
 
+namespace transport::internet {
+
 class InboundTransportStreamHandler;
+
+}  // namespace transport::internet
+namespace common {
+
 class AwaitableTaskGroup;
+
+}  // namespace common
+namespace transport::internet {
+
 class SslContext;
+
+}  // namespace transport::internet
 struct ngtcp2_cid;
 namespace proxyman::inbound { struct ReceiverSettings; }
 
@@ -69,7 +81,7 @@ struct ConnectionId {
 
 struct ConnectionIdHash {
     size_t operator()(const ConnectionId& id) const noexcept {
-        return Fnv1a64(std::span<const uint8_t>(id.bytes.data(), id.size)) ^ id.size;
+        return common::Fnv1a64(std::span<const uint8_t>(id.bytes.data(), id.size)) ^ id.size;
     }
 };
 
@@ -121,7 +133,7 @@ private:
         OutputWait(OutputWait&&) = delete;
         OutputWait& operator=(OutputWait&&) = delete;
 
-        SignalChannel ready;
+        common::SignalChannel ready;
         size_t waiters = 0;
     };
 
@@ -132,7 +144,7 @@ private:
     net::io_context& io_context_;
     int64_t stream_id_;
     std::weak_ptr<Connection> owner_;
-    SignalChannel input_signal_;
+    common::SignalChannel input_signal_;
     // Borrowed only while writers actually wait; idle streams retain no node.
     std::unique_ptr<OutputWait> output_wait_;
     buf::MultiBuffer input_;
@@ -186,7 +198,7 @@ public:
                      std::weak_ptr<Connection> owner);
     ~UdpSessionStream() noexcept override;
 
-    [[nodiscard]] bool Push(const TargetAddress& target, std::span<const uint8_t> payload);
+    [[nodiscard]] bool Push(const common::TargetAddress& target, std::span<const uint8_t> payload);
     // The owning connection closed; pending reads end and writes fail.
     void Detach() noexcept;
 
@@ -211,7 +223,7 @@ private:
 
     uint32_t session_id_;
     std::weak_ptr<Connection> owner_;
-    SignalChannel signal_;
+    common::SignalChannel signal_;
     memory::RingDeque<buf::MultiBuffer> input_;
     size_t queued_buffer_count_ = 0;
     bool cancelled_ = false;
@@ -269,7 +281,7 @@ private:
     uint64_t download_bytes_per_second = 0;
     std::unique_ptr<SslContext> ssl_context;
     memory::UnorderedMap<memory::String,
-        std::shared_ptr<SocketState>, TransparentStringHash, TransparentStringEq> sockets;
+        std::shared_ptr<SocketState>, common::TransparentStringHash, common::TransparentStringEq> sockets;
     memory::UnorderedMap<
         ConnectionId, std::shared_ptr<Connection>, ConnectionIdHash> connections;
     // AsyncJoin 的唤醒信号：每个已启动任务结束时取消一次等待。

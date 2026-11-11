@@ -38,55 +38,55 @@
 
 namespace {
 using namespace std::chrono_literals;
-using Ingress = ::worker_detail::UdpIngress;
-using Reclaimer = ::worker_detail::UdpAssociationReclaimer;
+using Ingress = ::app::worker_detail::UdpIngress;
+using Reclaimer = ::app::worker_detail::UdpAssociationReclaimer;
 
 
 
 
-class NativeResponse final : public ::InboundDatagramResponse {
+class NativeResponse final : public ::proxy::InboundDatagramResponse {
 public:
-    ::buf::MultiBuffer Encode(::UDPPacketView packet) override {
+    ::buf::MultiBuffer Encode(::proxy::UDPPacketView packet) override {
         ::buf::MultiBuffer payload;
         if (!::buf::AppendSpanToMultiBuffer(packet.data, payload)) return {};
         return payload;
     }
 };
 
-class NativeInbound final : public ::Inbound {
+class NativeInbound final : public ::proxy::Inbound {
 public:
 
-    ::net::awaitable<::RelayResult> Process(
-        std::unique_ptr<::AsyncStream>, ::routing::Dispatcher&,
+    ::net::awaitable<::app::RelayResult> Process(
+        std::unique_ptr<::transport::AsyncStream>, ::routing::Dispatcher&,
         const ::proxyman::inbound::ReceiverSettings&, ::net::io_context&,
-        ::session::Context&, const ::TimeoutsConfig&, uint32_t) override {
-        co_return ::RelayResult{};
+        ::session::Context&, const ::infra::TimeoutsConfig&, uint32_t) override {
+        co_return ::app::RelayResult{};
     }
 
-    tl::expected<::InboundDatagramResult, ::ErrorCode> Process(
-        const ::InboundDatagramRequest& request) override {
-        ::InboundDatagramResult result;
+    tl::expected<::proxy::InboundDatagramResult, ::common::ErrorCode> Process(
+        const ::proxy::InboundDatagramRequest& request) override {
+        ::proxy::InboundDatagramResult result;
         result.user = &profile_;
         constexpr std::array<uint8_t, 1> owner{0x47};
         if (!result.session_owner.Assign(owner))
-            return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
+            return tl::unexpected(::common::ErrorCode::RESOURCE_EXHAUSTED);
         result.session_id = request.payload.front() == 0x63 ? 2 : 1;
-        result.target = ::TargetAddress(
+        result.target = ::common::TargetAddress(
             ::net::ip::address_v4::loopback(), 53);
         auto buffer = ::buf::BufferGuard{::buf::Buffer::New()};
-        if (!buffer) return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
+        if (!buffer) return tl::unexpected(::common::ErrorCode::RESOURCE_EXHAUSTED);
         buffer->Tail()[0] = request.payload.front();
         buffer->Produce(1);
         result.payload.push_back(std::move(buffer));
         return result;
     }
-    tl::expected<std::shared_ptr<::InboundDatagramResponse>, ::ErrorCode>
-    CreateDatagramResponse(const ::InboundDatagramResult&) override {
+    tl::expected<std::shared_ptr<::proxy::InboundDatagramResponse>, ::common::ErrorCode>
+    CreateDatagramResponse(const ::proxy::InboundDatagramResult&) override {
         return std::make_shared<NativeResponse>();
     }
 
 private:
-    ::UserProfile profile_;
+    ::common::UserProfile profile_;
 };
 
 class GateDispatcher final : public ::routing::Dispatcher {
@@ -108,11 +108,11 @@ public:
         gate.expires_after(10s);
     }
 
-    ::net::awaitable<::RelayResult> Dispatch(
+    ::net::awaitable<::app::RelayResult> Dispatch(
         ::net::io_context&, const ::routing::DispatchPolicy& policy,
-        std::unique_ptr<::AsyncStream>, ::transport::Link link,
-        ::InitialPayload, ::session::Context& context, ::StatsShard&,
-        const ::TimeoutsConfig&) override {
+        std::unique_ptr<::transport::AsyncStream>, ::transport::Link link,
+        ::common::InitialPayload, ::session::Context& context, ::app::StatsShard&,
+        const ::infra::TimeoutsConfig&) override {
         const auto* forced = std::get_if<::routing::ForceOutbound>(&policy.outbound);
         EXPECT_NE(forced, nullptr);
         if (forced) EXPECT_EQ(forced->outbound_tag, "loopback");
@@ -121,7 +121,7 @@ public:
         if (!context.inbound.tags.empty()) EXPECT_EQ(context.inbound.tags.front(), "route-tag");
         EXPECT_LT(dispatches, sessions.size());
         EXPECT_NE(link.reader, nullptr);
-        if (dispatches >= sessions.size() || !link.reader) co_return ::RelayResult{};
+        if (dispatches >= sessions.size() || !link.reader) co_return ::app::RelayResult{};
         sessions[dispatches++] = static_cast<Ingress::ClientSession*>(link.reader);
         auto payload = co_await link.reader->ReadMultiBuffer();
         EXPECT_EQ(payload.byte_size(), 1u);
@@ -138,7 +138,7 @@ public:
         auto [ec] = co_await gate.async_wait(
             ::net::as_tuple(::net::use_awaitable));
         (void)ec;
-        co_return ::RelayResult{};
+        co_return ::app::RelayResult{};
     }
 
 
@@ -185,7 +185,7 @@ public:
         .dispatch_policy = {
             .sniffing = {},
             .outbound = ::routing::ForceOutbound{"loopback"}}};
-    receiver.stream_settings.security_mode = ::SecurityMode::Tls;
+    receiver.stream_settings.security_mode = ::transport::internet::SecurityMode::Tls;
     return receiver;
 }
 
@@ -210,22 +210,22 @@ class UdpNativeLifecycleTest : public ::testing::Test {
 protected:
     ::net::io_context io;
     WorkerCoordinatorFixture coordinator{io};
-    std::shared_ptr<::ConnectionLimiter> limiter =
-        ::ConnectionLimiter::Acquire({}, coordinator.Get());
-    ::UserOnlineTracker tracker{*coordinator.Get()};
-    ::StatsShard stats;
+    std::shared_ptr<::app::ConnectionLimiter> limiter =
+        ::app::ConnectionLimiter::Acquire({}, coordinator.Get());
+    ::common::UserOnlineTracker tracker{*coordinator.Get()};
+    ::app::StatsShard stats;
     const ::proxyman::inbound::AdmissionEnvironment admission{
         *coordinator.Get(), *limiter, tracker, stats};
     ::app::RequestLoadState request_load{1024, 0};
     UdpNativeLifecycleTest() { coordinator.Get()->RegisterWorker(io); }
-    ::TimeoutScheduler& scheduler = ::TimeoutScheduler::ForIoContext(io);
+    ::transport::internet::TimeoutScheduler& scheduler = ::transport::internet::TimeoutScheduler::ForIoContext(io);
     Reclaimer reclaimer{scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); }};
 };
 
 TEST_F(UdpNativeLifecycleTest, RetiredSocketJobsCannotAffectReplacementIdentity) {
     io.restart();
     UdpSocketFixtures sockets(io);
-    ::worker_detail::UdpResourceBudget budget({
+    ::app::worker_detail::UdpResourceBudget budget({
         .associations = 2, .datagrams = 8, .payload_capacity = 64 * 1024});
     Ingress ingress("native-reuse", std::make_unique<NativeInbound>(), reclaimer, budget, io);
     Ingress other("native-other", std::make_unique<NativeInbound>(), reclaimer, budget, io);
@@ -238,14 +238,14 @@ TEST_F(UdpNativeLifecycleTest, RetiredSocketJobsCannotAffectReplacementIdentity)
     ASSERT_TRUE(sockets.Attach(ingress, "identity-socket", old_socket)) << "failed to attach old socket identity";
     GateDispatcher dispatcher(io);
     DrainNativeJobs drain{io, ingress, dispatcher};
-    ::TimeoutsConfig timeouts;
+    ::infra::TimeoutsConfig timeouts;
     auto receiver = MakeReceiver();
     const ::app::DatagramSessionEnvironment environment{
         .timeouts = timeouts, .dispatcher = &dispatcher,
         .admission = &admission, .request_load = &request_load};
     constexpr std::array<uint8_t, 1> packet{0x62};
     auto process = [&](const Ingress::SocketPtr& current) {
-        ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
+        ingress.ProcessDatagram(::app::worker_detail::UdpDatagramContext{
             .socket = sockets.Find(ingress, current.get()).get(),
             .client_endpoint = {::net::ip::address_v4::loopback(), 47123},
             .payload = packet,
@@ -260,10 +260,10 @@ TEST_F(UdpNativeLifecycleTest, RetiredSocketJobsCannotAffectReplacementIdentity)
     io.restart();
     EXPECT_EQ(dispatcher.dispatches, 1) << "old socket identity did not start its native dispatch";
     EXPECT_EQ(dispatcher.packets_read, 1) << "old socket identity did not start its native dispatch";
-    ::InboundDatagramOwner owner;
+    ::proxy::InboundDatagramOwner owner;
     constexpr std::array<uint8_t, 1> owner_bytes{0x47};
     EXPECT_TRUE(owner.Assign(owner_bytes)) << "failed to create socket identity owner";
-    const ::worker_detail::ClientSessionKey client_key{owner, 1};
+    const ::app::worker_detail::ClientSessionKey client_key{owner, 1};
     auto* const old_session = dispatcher.sessions[0];
     ASSERT_TRUE(old_session) << "old socket session was not created";
     EXPECT_EQ(ingress.GetResourceStats().associations, 1) << "old socket session was not created";
@@ -319,7 +319,7 @@ TEST_F(UdpNativeLifecycleTest, RetiredSocketJobsCannotAffectReplacementIdentity)
 TEST_F(UdpNativeLifecycleTest, UplinkRefreshDelaysNaturalExpiryUntilIdle) {
     io.restart();
     UdpSocketFixtures sockets(io);
-    ::worker_detail::UdpResourceBudget budget;
+    ::app::worker_detail::UdpResourceBudget budget;
     Ingress ingress("native-refresh", std::make_unique<NativeInbound>(), reclaimer, budget, io);
     auto socket = Ingress::MakeSocket(io);
     ::IoErrorCode ec;
@@ -331,7 +331,7 @@ TEST_F(UdpNativeLifecycleTest, UplinkRefreshDelaysNaturalExpiryUntilIdle) {
 
     GateDispatcher dispatcher(io);
     DrainNativeJobs drain{io, ingress, dispatcher};
-    ::TimeoutsConfig timeouts;
+    ::infra::TimeoutsConfig timeouts;
     timeouts.idle = 1;
     auto receiver = MakeReceiver();
     const ::app::DatagramSessionEnvironment environment{
@@ -339,7 +339,7 @@ TEST_F(UdpNativeLifecycleTest, UplinkRefreshDelaysNaturalExpiryUntilIdle) {
         .admission = &admission, .request_load = &request_load};
     constexpr std::array<uint8_t, 1> packet{0x62};
     auto process_packet = [&]() {
-        ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
+        ingress.ProcessDatagram(::app::worker_detail::UdpDatagramContext{
             .socket = sockets.Find(ingress, socket.get()).get(),
             .client_endpoint = {::net::ip::address_v4::loopback(), 45123},
             .payload = packet,
@@ -382,13 +382,13 @@ TEST_F(UdpNativeLifecycleTest, UplinkRefreshDelaysNaturalExpiryUntilIdle) {
 }
 
 TEST_F(UdpNativeLifecycleTest, ClosedSessionReleasesAllocationButRetainsReplayAuthority) {
-    using namespace ::worker_detail;
+    using namespace ::app::worker_detail;
     UdpSocketFixtures sockets(io);
     UdpHandoffDirectory directory;
-    const auto& policy = ::ss::Ss2022UdpAssociation::Policy();
+    const auto& policy = ::proxy::shadowsocks::Ss2022UdpAssociation::Policy();
     auto configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
     std::weak_ptr<const ::proxyman::inbound::ProtocolSettings> configuration_lifetime = configuration;
-    ::InboundDatagramOwner owner;
+    ::proxy::InboundDatagramOwner owner;
     constexpr std::array<uint8_t, 32> credential{0x71};
     EXPECT_TRUE(owner.Assign(credential)) << "failed to prepare tombstone credential";
     UdpHandoffIdentity key{
@@ -406,7 +406,7 @@ TEST_F(UdpNativeLifecycleTest, ClosedSessionReleasesAllocationButRetainsReplayAu
     owner, std::chrono::steady_clock::now(), 0s, record);
     ASSERT_TRUE(session) << "failed to prepare live directory association";
     ASSERT_TRUE(record) << "failed to prepare live directory association";
-    EXPECT_TRUE(record->association->Check(31, 0, endpoint, ::InboundDatagramCheck::Commit)) << "failed to prepare live directory association";
+    EXPECT_TRUE(record->association->Check(31, 0, endpoint, ::proxy::InboundDatagramCheck::Commit)) << "failed to prepare live directory association";
     record->association->claimed = false;
     ingress.CleanupClientSessions(*socket);
     EXPECT_TRUE(session->Closed()) << "closed association did not retain its outstanding session owner";
@@ -438,21 +438,21 @@ TEST_F(UdpNativeLifecycleTest, ClosedSessionReleasesAllocationButRetainsReplayAu
     auto resumed = directory.Claim(key, configuration_lifetime.lock(), policy);
     ASSERT_TRUE(resumed) << "association closure reopened a protected replay window";
     EXPECT_EQ(resumed, tombstone.lock()) << "association closure reopened a protected replay window";
-    EXPECT_FALSE(resumed->association->Check(31, 0, endpoint, ::InboundDatagramCheck::Commit)) << "association closure reopened a protected replay window";
-    EXPECT_FALSE(resumed->association->Check(30, 1, endpoint, ::InboundDatagramCheck::Commit)) << "association closure reopened a protected replay window";
-    EXPECT_TRUE(resumed->association->Check(32, 1, endpoint, ::InboundDatagramCheck::Commit)) << "association closure reopened a protected replay window";
-    EXPECT_FALSE(resumed->association->Check(30, 0, endpoint, ::InboundDatagramCheck::Commit)) << "association closure reopened a protected replay window";
-    EXPECT_TRUE(resumed->association->Check(30, 1, endpoint, ::InboundDatagramCheck::Commit)) << "association closure reopened a protected replay window";
+    EXPECT_FALSE(resumed->association->Check(31, 0, endpoint, ::proxy::InboundDatagramCheck::Commit)) << "association closure reopened a protected replay window";
+    EXPECT_FALSE(resumed->association->Check(30, 1, endpoint, ::proxy::InboundDatagramCheck::Commit)) << "association closure reopened a protected replay window";
+    EXPECT_TRUE(resumed->association->Check(32, 1, endpoint, ::proxy::InboundDatagramCheck::Commit)) << "association closure reopened a protected replay window";
+    EXPECT_FALSE(resumed->association->Check(30, 0, endpoint, ::proxy::InboundDatagramCheck::Commit)) << "association closure reopened a protected replay window";
+    EXPECT_TRUE(resumed->association->Check(30, 1, endpoint, ::proxy::InboundDatagramCheck::Commit)) << "association closure reopened a protected replay window";
     resumed->association->claimed = false;
     ingress.RequestStop();
 }
 
 TEST_F(UdpNativeLifecycleTest, DirectoryCapacityProtectsUnexpiredAndClaimedTombstones) {
-    using namespace ::worker_detail;
+    using namespace ::app::worker_detail;
     UdpHandoffDirectory directory;
-    const auto& policy = ::ss::Ss2022UdpAssociation::Policy();
+    const auto& policy = ::proxy::shadowsocks::Ss2022UdpAssociation::Policy();
     auto configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
-    ::InboundDatagramOwner owner;
+    ::proxy::InboundDatagramOwner owner;
     constexpr std::array<uint8_t, 32> credential{0x63};
     EXPECT_TRUE(owner.Assign(credential)) << "failed to prepare capacity credential";
     UdpHandoffIdentity key{
@@ -463,7 +463,7 @@ TEST_F(UdpNativeLifecycleTest, DirectoryCapacityProtectsUnexpiredAndClaimedTombs
         key.client.session_id = i;
         auto record = directory.Claim(key, configuration, policy);
         ASSERT_TRUE(record) << "directory rejected a session before reaching capacity";
-        EXPECT_TRUE(record->association->Check(11, 0, endpoint, ::InboundDatagramCheck::Commit)) << "directory rejected a session before reaching capacity";
+        EXPECT_TRUE(record->association->Check(11, 0, endpoint, ::proxy::InboundDatagramCheck::Commit)) << "directory rejected a session before reaching capacity";
         record->association->claimed = false;
         if (i == 0) first = std::move(record);
     }
@@ -473,10 +473,10 @@ TEST_F(UdpNativeLifecycleTest, DirectoryCapacityProtectsUnexpiredAndClaimedTombs
     protected_key.client.session_id = 0;
     auto protected_record = directory.Claim(protected_key, configuration, policy);
     ASSERT_EQ(protected_record, first) << "capacity rejection lost an existing session or its replay history";
-    EXPECT_FALSE(protected_record->association->Check(11, 0, endpoint, ::InboundDatagramCheck::Commit)) << "capacity rejection lost an existing session or its replay history";
+    EXPECT_FALSE(protected_record->association->Check(11, 0, endpoint, ::proxy::InboundDatagramCheck::Commit)) << "capacity rejection lost an existing session or its replay history";
     const auto expired = std::chrono::steady_clock::now() -
         policy.retention - 1s;
-    EXPECT_TRUE(first->association->Check(12, 0, endpoint, ::InboundDatagramCheck::Commit, expired)) << "failed to commit an expired protocol retention deadline";
+    EXPECT_TRUE(first->association->Check(12, 0, endpoint, ::proxy::InboundDatagramCheck::Commit, expired)) << "failed to commit an expired protocol retention deadline";
     EXPECT_FALSE(directory.Claim(key, configuration, policy)) << "directory reclaimed a still-claimed expired tombstone";
     first->association->claimed = false;
     std::shared_ptr<UdpHandoffRecord> replacement;
@@ -484,19 +484,19 @@ TEST_F(UdpNativeLifecycleTest, DirectoryCapacityProtectsUnexpiredAndClaimedTombs
         replacement = directory.Claim(key, configuration, policy);
     ASSERT_TRUE(replacement) << "directory did not reclaim an expired unclaimed tombstone";
     EXPECT_NE(replacement, first) << "directory did not reclaim an expired unclaimed tombstone";
-    EXPECT_TRUE(replacement->association->Check(11, 0, endpoint, ::InboundDatagramCheck::Commit)) << "directory did not reclaim an expired unclaimed tombstone";
+    EXPECT_TRUE(replacement->association->Check(11, 0, endpoint, ::proxy::InboundDatagramCheck::Commit)) << "directory did not reclaim an expired unclaimed tombstone";
     replacement->association->claimed = false;
     EXPECT_FALSE(directory.Claim(protected_key, configuration, policy)) << "directory exceeded capacity after reclaiming one expired tombstone";
 }
 
 TEST(UdpHandoffDirectory, ClaimsAreExclusiveAndRetainCommittedReplay) {
-    using namespace ::worker_detail;
+    using namespace ::app::worker_detail;
     UdpHandoffDirectory directory;
-    const auto& policy = ::ss::Ss2022UdpAssociation::Policy();
+    const auto& policy = ::proxy::shadowsocks::Ss2022UdpAssociation::Policy();
     auto configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
     auto other_configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
     UdpSocketState listener_state, other_listener_state;
-    ::InboundDatagramOwner owner;
+    ::proxy::InboundDatagramOwner owner;
     std::array<uint8_t, 32> credential{};
     for (size_t i = 0; i < credential.size(); ++i)
         credential[i] = static_cast<uint8_t>(i + 1);
@@ -509,11 +509,11 @@ TEST(UdpHandoffDirectory, ClaimsAreExclusiveAndRetainCommittedReplay) {
     ASSERT_TRUE(record) << "directory allowed duplicate ownership claims";
     EXPECT_TRUE(record->association->claimed) << "directory allowed duplicate ownership claims";
     EXPECT_FALSE(directory.Claim(key, configuration, policy)) << "directory allowed duplicate ownership claims";
-    EXPECT_TRUE(record->association->Check(7, 0, endpoint, ::InboundDatagramCheck::Commit)) << "directory allowed duplicate ownership claims";
+    EXPECT_TRUE(record->association->Check(7, 0, endpoint, ::proxy::InboundDatagramCheck::Commit)) << "directory allowed duplicate ownership claims";
     record->association->claimed = false;
     auto reclaimed = directory.Claim(key, configuration, policy);
     ASSERT_EQ(reclaimed, record) << "directory claim lost unique ownership or committed replay";
-    EXPECT_FALSE(reclaimed->association->Check(7, 0, endpoint, ::InboundDatagramCheck::Commit)) << "directory claim lost unique ownership or committed replay";
+    EXPECT_FALSE(reclaimed->association->Check(7, 0, endpoint, ::proxy::InboundDatagramCheck::Commit)) << "directory claim lost unique ownership or committed replay";
     EXPECT_FALSE(directory.Claim(key, configuration, policy)) << "directory claim lost unique ownership or committed replay";
     record->association->claimed = false;
 }
@@ -521,13 +521,13 @@ TEST(UdpHandoffDirectory, ClaimsAreExclusiveAndRetainCommittedReplay) {
 class UdpHandoffNamespaceTest : public ::testing::TestWithParam<int> {};
 
 TEST_P(UdpHandoffNamespaceTest, DistinctAuthenticatedNamespacesKeepIndependentReplay) {
-    using namespace ::worker_detail;
+    using namespace ::app::worker_detail;
     UdpHandoffDirectory directory;
-    const auto& policy = ::ss::Ss2022UdpAssociation::Policy();
+    const auto& policy = ::proxy::shadowsocks::Ss2022UdpAssociation::Policy();
     auto configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
     auto other_configuration = std::make_shared<const ::proxyman::inbound::ProtocolSettings>();
     UdpSocketState listener_state, other_listener_state;
-    ::InboundDatagramOwner owner;
+    ::proxy::InboundDatagramOwner owner;
     std::array<uint8_t, 32> credential{};
     for (size_t i = 0; i < credential.size(); ++i)
         credential[i] = static_cast<uint8_t>(i + 1);
@@ -540,11 +540,11 @@ TEST_P(UdpHandoffNamespaceTest, DistinctAuthenticatedNamespacesKeepIndependentRe
     ASSERT_TRUE(record) << "directory allowed duplicate ownership claims";
     EXPECT_TRUE(record->association->claimed) << "directory allowed duplicate ownership claims";
     EXPECT_FALSE(directory.Claim(key, configuration, policy)) << "directory allowed duplicate ownership claims";
-    EXPECT_TRUE(record->association->Check(7, 0, endpoint, ::InboundDatagramCheck::Commit)) << "directory allowed duplicate ownership claims";
+    EXPECT_TRUE(record->association->Check(7, 0, endpoint, ::proxy::InboundDatagramCheck::Commit)) << "directory allowed duplicate ownership claims";
     record->association->claimed = false;
     auto reclaimed = directory.Claim(key, configuration, policy);
     ASSERT_EQ(reclaimed, record) << "directory claim lost unique ownership or committed replay";
-    EXPECT_FALSE(reclaimed->association->Check(7, 0, endpoint, ::InboundDatagramCheck::Commit)) << "directory claim lost unique ownership or committed replay";
+    EXPECT_FALSE(reclaimed->association->Check(7, 0, endpoint, ::proxy::InboundDatagramCheck::Commit)) << "directory claim lost unique ownership or committed replay";
     EXPECT_FALSE(directory.Claim(key, configuration, policy)) << "directory claim lost unique ownership or committed replay";
     record->association->claimed = false;
 
@@ -562,14 +562,14 @@ TEST_P(UdpHandoffNamespaceTest, DistinctAuthenticatedNamespacesKeepIndependentRe
     auto isolated = directory.Claim(distinct, snapshot, policy);
     ASSERT_NE(isolated, nullptr);
     EXPECT_NE(isolated, record);
-    EXPECT_TRUE(isolated->association->Check(7, 1, endpoint, ::InboundDatagramCheck::Commit));
+    EXPECT_TRUE(isolated->association->Check(7, 1, endpoint, ::proxy::InboundDatagramCheck::Commit));
     EXPECT_FALSE(directory.Claim(distinct, snapshot, policy));
     isolated->association->claimed = false;
     auto repeated = directory.Claim(distinct, snapshot, policy);
     ASSERT_EQ(repeated, isolated);
-    EXPECT_FALSE(repeated->association->Check(7, 1, endpoint, ::InboundDatagramCheck::Commit));
-    EXPECT_TRUE(repeated->association->Check(6, 1, endpoint, ::InboundDatagramCheck::Commit));
-    EXPECT_FALSE(repeated->association->Check(5, 0, endpoint, ::InboundDatagramCheck::Commit));
+    EXPECT_FALSE(repeated->association->Check(7, 1, endpoint, ::proxy::InboundDatagramCheck::Commit));
+    EXPECT_TRUE(repeated->association->Check(6, 1, endpoint, ::proxy::InboundDatagramCheck::Commit));
+    EXPECT_FALSE(repeated->association->Check(5, 0, endpoint, ::proxy::InboundDatagramCheck::Commit));
     repeated->association->claimed = false;
 }
 
@@ -579,30 +579,30 @@ class UdpLocalProtocolTest : public ::testing::TestWithParam<const char*> {
 protected:
     ::net::io_context io;
     WorkerCoordinatorFixture coordinator{io};
-    std::shared_ptr<::ConnectionLimiter> limiter =
-        ::ConnectionLimiter::Acquire({}, coordinator.Get());
-    ::UserOnlineTracker tracker{*coordinator.Get()};
-    ::StatsShard stats{};
+    std::shared_ptr<::app::ConnectionLimiter> limiter =
+        ::app::ConnectionLimiter::Acquire({}, coordinator.Get());
+    ::common::UserOnlineTracker tracker{*coordinator.Get()};
+    ::app::StatsShard stats{};
     const ::proxyman::inbound::AdmissionEnvironment environment{
         *coordinator.Get(), *limiter, tracker, stats};
     ::proxyman::inbound::ProtocolSettings configuration{}, other_configuration{};
     const ::udp::endpoint first{::net::ip::address_v4::loopback(), 48234};
     const ::udp::endpoint second{::net::ip::address_v4::loopback(), 48235};
-    const ::TargetAddress target{"127.0.0.1", 53};
+    const ::common::TargetAddress target{"127.0.0.1", 53};
     const std::array<uint8_t, 3> payload{1, 2, 3};
-    ::ss::SsCipherInfo cipher{};
-    ::ss::KeyBytes key;
-    ::ss::Ss2022UdpSessionState encoder;
+    ::proxy::shadowsocks::SsCipherInfo cipher{};
+    ::proxy::shadowsocks::KeyBytes key;
+    ::proxy::shadowsocks::Ss2022UdpSessionState encoder;
     std::unique_ptr<::proxy::shadowsocks::inbound::Handler> handler;
-    ::InboundDatagramAssociationIndex index;
-    ::InboundDatagramRequest request{
+    ::proxy::InboundDatagramAssociationIndex index;
+    ::proxy::InboundDatagramRequest request{
         .tag = "protocol-association", .payload = {}, .associations = &index,
         .configuration = &configuration, .worker_id = 0, .client_endpoint = first};
     std::vector<uint8_t> packet;
 
     void SetUp() override {
         coordinator.Get()->RegisterWorker(io);
-        const auto parsed = ::ss::ParseCipherMethod(GetParam());
+        const auto parsed = ::proxy::shadowsocks::ParseCipherMethod(GetParam());
         ASSERT_TRUE(parsed);
         cipher = *parsed;
         const std::array<uint8_t, 32> credential{0x61, 0x72};
@@ -614,7 +614,7 @@ protected:
         ::proxyman::inbound::UserStore::InstallWorkerView(::proxyman::inbound::UserStore::PrepareWorkerView(
             ::proxyman::inbound::UserStore::PrepareUsers("protocol-association", users)));
         handler = std::make_unique<::proxy::shadowsocks::inbound::Handler>(environment, cipher);
-        ASSERT_TRUE(::ss::Init2022UdpSessionState(encoder, cipher, key));
+        ASSERT_TRUE(::proxy::shadowsocks::Init2022UdpSessionState(encoder, cipher, key));
     }
     void TearDown() override {
         handler.reset();
@@ -622,11 +622,11 @@ protected:
     }
     void Encode(uint64_t id) {
         encoder.next_packet_id = id;
-        const auto size = ::ss::Encode2022UdpRequestPacketTo(
+        const auto size = ::proxy::shadowsocks::Encode2022UdpRequestPacketTo(
             target, payload.data(), payload.size(), encoder, {}, nullptr, 0);
         if (size == 0) throw std::runtime_error("failed to size protocol packet");
         packet.resize(size);
-        if (::ss::Encode2022UdpRequestPacketTo(target, payload.data(), payload.size(), encoder, {},
+        if (::proxy::shadowsocks::Encode2022UdpRequestPacketTo(target, payload.data(), payload.size(), encoder, {},
                 packet.data(), packet.size()) != size)
             throw std::runtime_error("failed to encode protocol packet");
         request.payload = packet;
@@ -637,13 +637,13 @@ TEST_P(UdpLocalProtocolTest, ColdAndWarmPacketsShareReplayAuthority) {
     Encode(0);
     auto decoded = handler->Process(request);
     ASSERT_TRUE(decoded);
-    ASSERT_EQ(decoded->association_policy, &::ss::Ss2022UdpAssociation::Policy());
+    ASSERT_EQ(decoded->association_policy, &::proxy::shadowsocks::Ss2022UdpAssociation::Policy());
     ASSERT_TRUE(decoded->session_id);
     ASSERT_TRUE(decoded->packet_id);
     auto association = decoded->association_policy->create();
     ASSERT_NE(association, nullptr);
-    ASSERT_TRUE(association->Check(*decoded->packet_id, 0, first, ::InboundDatagramCheck::Commit));
-    index.emplace(::InboundDatagramAssociationKey{
+    ASSERT_TRUE(association->Check(*decoded->packet_id, 0, first, ::proxy::InboundDatagramCheck::Commit));
+    index.emplace(::proxy::InboundDatagramAssociationKey{
         decoded->session_owner, *decoded->session_id, &configuration}, association.get());
     association->claimed = false;
     EXPECT_FALSE(handler->Process(request));
@@ -660,13 +660,13 @@ TEST_P(UdpLocalProtocolTest, ReorderedPacketsCannotStealResponsePath) {
     Encode(0);
     auto decoded = handler->Process(request);
     ASSERT_TRUE(decoded);
-    ASSERT_EQ(decoded->association_policy, &::ss::Ss2022UdpAssociation::Policy());
+    ASSERT_EQ(decoded->association_policy, &::proxy::shadowsocks::Ss2022UdpAssociation::Policy());
     ASSERT_TRUE(decoded->session_id);
     ASSERT_TRUE(decoded->packet_id);
     auto association = decoded->association_policy->create();
     ASSERT_NE(association, nullptr);
-    ASSERT_TRUE(association->Check(*decoded->packet_id, 0, first, ::InboundDatagramCheck::Commit));
-    index.emplace(::InboundDatagramAssociationKey{
+    ASSERT_TRUE(association->Check(*decoded->packet_id, 0, first, ::proxy::InboundDatagramCheck::Commit));
+    index.emplace(::proxy::InboundDatagramAssociationKey{
         decoded->session_owner, *decoded->session_id, &configuration}, association.get());
     association->claimed = false;
     Encode(2);
@@ -682,13 +682,13 @@ TEST_P(UdpLocalProtocolTest, ClaimedStateWaitsForExclusiveControlCommit) {
     Encode(0);
     auto decoded = handler->Process(request);
     ASSERT_TRUE(decoded);
-    ASSERT_EQ(decoded->association_policy, &::ss::Ss2022UdpAssociation::Policy());
+    ASSERT_EQ(decoded->association_policy, &::proxy::shadowsocks::Ss2022UdpAssociation::Policy());
     ASSERT_TRUE(decoded->session_id);
     ASSERT_TRUE(decoded->packet_id);
     auto association = decoded->association_policy->create();
     ASSERT_NE(association, nullptr);
-    ASSERT_TRUE(association->Check(*decoded->packet_id, 0, first, ::InboundDatagramCheck::Commit));
-    index.emplace(::InboundDatagramAssociationKey{
+    ASSERT_TRUE(association->Check(*decoded->packet_id, 0, first, ::proxy::InboundDatagramCheck::Commit));
+    index.emplace(::proxy::InboundDatagramAssociationKey{
         decoded->session_owner, *decoded->session_id, &configuration}, association.get());
     association->claimed = false;
     Encode(3);
@@ -696,7 +696,7 @@ TEST_P(UdpLocalProtocolTest, ClaimedStateWaitsForExclusiveControlCommit) {
     auto pending = handler->Process(request);
     ASSERT_TRUE(pending);
     EXPECT_EQ(pending->committed_association, nullptr);
-    EXPECT_TRUE(association->Check(3, 0, first, ::InboundDatagramCheck::Commit));
+    EXPECT_TRUE(association->Check(3, 0, first, ::proxy::InboundDatagramCheck::Commit));
     association->claimed = false;
     EXPECT_FALSE(handler->Process(request));
 }
@@ -705,13 +705,13 @@ TEST_P(UdpLocalProtocolTest, ConfigurationNamespacesDoNotShareLocalState) {
     Encode(0);
     auto decoded = handler->Process(request);
     ASSERT_TRUE(decoded);
-    ASSERT_EQ(decoded->association_policy, &::ss::Ss2022UdpAssociation::Policy());
+    ASSERT_EQ(decoded->association_policy, &::proxy::shadowsocks::Ss2022UdpAssociation::Policy());
     ASSERT_TRUE(decoded->session_id);
     ASSERT_TRUE(decoded->packet_id);
     auto association = decoded->association_policy->create();
     ASSERT_NE(association, nullptr);
-    ASSERT_TRUE(association->Check(*decoded->packet_id, 0, first, ::InboundDatagramCheck::Commit));
-    index.emplace(::InboundDatagramAssociationKey{
+    ASSERT_TRUE(association->Check(*decoded->packet_id, 0, first, ::proxy::InboundDatagramCheck::Commit));
+    index.emplace(::proxy::InboundDatagramAssociationKey{
         decoded->session_owner, *decoded->session_id, &configuration}, association.get());
     association->claimed = false;
     Encode(4);
@@ -725,13 +725,13 @@ TEST_P(UdpLocalProtocolTest, InvalidCiphertextCannotPoisonReplayState) {
     Encode(0);
     auto decoded = handler->Process(request);
     ASSERT_TRUE(decoded);
-    ASSERT_EQ(decoded->association_policy, &::ss::Ss2022UdpAssociation::Policy());
+    ASSERT_EQ(decoded->association_policy, &::proxy::shadowsocks::Ss2022UdpAssociation::Policy());
     ASSERT_TRUE(decoded->session_id);
     ASSERT_TRUE(decoded->packet_id);
     auto association = decoded->association_policy->create();
     ASSERT_NE(association, nullptr);
-    ASSERT_TRUE(association->Check(*decoded->packet_id, 0, first, ::InboundDatagramCheck::Commit));
-    index.emplace(::InboundDatagramAssociationKey{
+    ASSERT_TRUE(association->Check(*decoded->packet_id, 0, first, ::proxy::InboundDatagramCheck::Commit));
+    index.emplace(::proxy::InboundDatagramAssociationKey{
         decoded->session_owner, *decoded->session_id, &configuration}, association.get());
     association->claimed = false;
     Encode(4);
@@ -747,11 +747,11 @@ INSTANTIATE_TEST_SUITE_P(Ciphers, UdpLocalProtocolTest, ::testing::Values(
 class NativeJobsTest : public UdpNativeLifecycleTest {
 protected:
     UdpSocketFixtures sockets{io};
-    ::worker_detail::UdpResourceBudget budget;
+    ::app::worker_detail::UdpResourceBudget budget;
     Ingress ingress{"native-test", std::make_unique<NativeInbound>(), reclaimer, budget, io};
     GateDispatcher dispatcher{io};
     Ingress::SocketPtr socket;
-    ::TimeoutsConfig timeouts;
+    ::infra::TimeoutsConfig timeouts;
     ::proxyman::inbound::ReceiverSettings receiver = MakeReceiver();
     const ::app::DatagramSessionEnvironment environment{
         .timeouts = timeouts, .dispatcher = &dispatcher,
@@ -768,7 +768,7 @@ protected:
         ASSERT_TRUE(sockets.Attach(ingress, "native-socket", socket));
         dispatcher.ingress = &ingress;
         dispatcher.reenter_stop = true;
-    ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
+    ingress.ProcessDatagram(::app::worker_detail::UdpDatagramContext{
         .socket = sockets.Find(ingress, socket.get()).get(),
         .client_endpoint = {::net::ip::address_v4::loopback(), 43123},
         .payload = datagram,
@@ -778,7 +778,7 @@ protected:
         .environment = environment,
     });
     constexpr std::array<uint8_t, 1> second_datagram{0x63};
-    ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
+    ingress.ProcessDatagram(::app::worker_detail::UdpDatagramContext{
         .socket = sockets.Find(ingress, socket.get()).get(),
         .client_endpoint = {::net::ip::address_v4::loopback(), 43124},
         .payload = second_datagram,
@@ -826,7 +826,7 @@ TEST_F(NativeJobsTest, HandlerReplacementPreservesActiveNativeJobs) {
     auto* const session_b = dispatcher.sessions[1];
     // A datagram decoded by the replacement handler must reach the existing
     // row's queue instead of starting a new job.
-    ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
+    ingress.ProcessDatagram(::app::worker_detail::UdpDatagramContext{
         .socket = sockets.Find(ingress, socket.get()).get(),
         .client_endpoint = {::net::ip::address_v4::loopback(), 43123},
         .payload = datagram,
@@ -929,16 +929,16 @@ TEST_P(ReplayTombstoneAllocationTest, RetainedRecordsDoNotRetainBoundSessionAllo
     constexpr size_t count = 4096;
     const bool bound_record = GetParam();
         ::net::io_context io;
-        ::worker_detail::UdpResourceBudget budget;
+        ::app::worker_detail::UdpResourceBudget budget;
         SessionAllocationCounts counts;
-        std::vector<std::shared_ptr<::worker_detail::UdpHandoffRecord>> records;
+        std::vector<std::shared_ptr<::app::worker_detail::UdpHandoffRecord>> records;
         records.reserve(count);
         for (size_t index = 0; index != count; ++index) {
-            auto record = std::make_shared<::worker_detail::UdpHandoffRecord>(
-                ::ss::Ss2022UdpAssociation::Policy());
+            auto record = std::make_shared<::app::worker_detail::UdpHandoffRecord>(
+                ::proxy::shadowsocks::Ss2022UdpAssociation::Policy());
             auto session = std::allocate_shared<Ingress::ClientSession>(
                 SessionAllocationCounter<Ingress::ClientSession>{counts}, io,
-                Ingress::ReplyRoute{}, ::udp::endpoint{}, ::InboundDatagramOwner{},
+                Ingress::ReplyRoute{}, ::udp::endpoint{}, ::proxy::InboundDatagramOwner{},
                 budget, budget.AcquireAssociation(), bound_record ? record : nullptr);
             record->session = session;
             session.reset();

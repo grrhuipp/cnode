@@ -7,6 +7,8 @@
 // 非加密散列原语：FNV-1a（32/64 位）与 SplitMix64 终混函数。
 // 仅用于进程内分桶与协议校验和，不可用于任何安全目的。
 
+namespace common {
+
 inline constexpr uint64_t kFnv1aOffset64 = 0xcbf29ce484222325ULL;
 inline constexpr uint64_t kFnv1aPrime64 = 0x100000001b3ULL;
 inline constexpr uint32_t kFnv1aOffset32 = 0x811c9dc5U;
@@ -43,3 +45,5 @@ inline constexpr uint32_t kFnv1aPrime32 = 0x01000193U;
     value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
     return value ^ (value >> 31);
 }
+
+}  // namespace common

@@ -37,7 +37,7 @@ using namespace std::chrono_literals;
 
 class TransportBehavior : public testing::Test {
 protected:
-    void SetUp() override { ::TlsStream::InitializeIo(); }
+    void SetUp() override { ::transport::internet::TlsStream::InitializeIo(); }
     void TearDown() override {
         ::memory::reject_next_process_allocation = false;
         EXPECT_EQ(::memory::detail::test_buffers_live, 0);
@@ -51,17 +51,17 @@ protected:
         auto name = (std::filesystem::temp_directory_path() / "cnode-http-logs-XXXXXX").string();
         ASSERT_NE(::mkdtemp(name.data()), nullptr);
         directory = name;
-        ASSERT_TRUE(::Log::Init({.level = LogLevel::TRACE, .log_dir = directory,
+        ASSERT_TRUE(::infra::Log::Init({.level = infra::LogLevel::TRACE, .log_dir = directory,
                                 .access_path = {}, .error_path = "error.log", .max_days = 1,
                                 .rotate_daily = false, .gzip = false}));
     }
     void TearDown() override {
-        ::Log::Shutdown();
+        ::infra::Log::Shutdown();
         if (!directory.empty()) std::filesystem::remove_all(directory);
         TransportBehavior::TearDown();
     }
     void ExpectRedactedDiagnostics() {
-        ::Log::Shutdown();
+        ::infra::Log::Shutdown();
         std::ifstream input(directory / "error.log");
         ASSERT_TRUE(input.is_open());
         std::string diagnostics;
@@ -82,7 +82,7 @@ protected:
 std::span<const uint8_t> Bytes(std::string_view value) {
     return {reinterpret_cast<const uint8_t*>(value.data()), value.size()};
 }
-void Prepend(::AsyncStream& stream, std::string_view value) {
+void Prepend(::transport::AsyncStream& stream, std::string_view value) {
     stream.PrependReadData(Bytes(value));
 }
 std::string Flatten(const ::buf::MultiBuffer& data) {
@@ -105,7 +105,7 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
     ::tcp::socket socket(io), peer_socket(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer_socket);
-    auto raw = std::make_unique<::TcpStream>(std::move(socket));
+    auto raw = std::make_unique<::transport::internet::TcpStream>(std::move(socket));
     const int native = raw->NativeHandle();
     raw->SetIdleTimeout(3s);
     raw->SetReadTimeout(2s);
@@ -113,12 +113,12 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
     (void)raw->StartPhaseDeadline(3s);
 
     const auto fixtures = std::filesystem::path(CNODE_TEST_SOURCE_DIR) / "tests/fixtures/anytls-pool";
-    ::StreamSettings settings;
-    settings.network_mode = upgrade ? ::NetworkMode::HttpUpgrade : ::NetworkMode::Http;
+    ::transport::internet::StreamSettings settings;
+    settings.network_mode = upgrade ? ::transport::internet::NetworkMode::HttpUpgrade : ::transport::internet::NetworkMode::Http;
     settings.http.path = settings.http_upgrade.path = "/up";
     settings.http.host = settings.http_upgrade.host = "localhost";
     settings.http.method = "GET";
-    settings.security_mode = tls ? ::SecurityMode::Tls : ::SecurityMode::None;
+    settings.security_mode = tls ? ::transport::internet::SecurityMode::Tls : ::transport::internet::SecurityMode::None;
     settings.tls.alpn = {"http/1.1"};
     settings.tls.allow_insecure = true;
     settings.tls.server_name = "localhost";
@@ -126,10 +126,10 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
         settings.tls.cert_file = (fixtures / "cert.pem").string();
         settings.tls.key_file = (fixtures / "key.pem").string();
     }
-    ::LoadTlsPemMaterial(settings.tls);
-    settings = ::NormalizeStreamSettings(settings);
-    const ::TransportSecurity security(
-        settings, outbound ? ::StreamEndpointRole::Outbound : ::StreamEndpointRole::Inbound);
+    ::transport::internet::LoadTlsPemMaterial(settings.tls);
+    settings = ::transport::internet::NormalizeStreamSettings(settings);
+    const ::transport::internet::TransportSecurity security(
+        settings, outbound ? ::transport::internet::StreamEndpointRole::Outbound : ::transport::internet::StreamEndpointRole::Inbound);
     net::ssl::context context(net::ssl::context::tls);
     context.set_verify_mode(net::ssl::verify_none);
     if (tls && outbound) {
@@ -147,7 +147,7 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
     bool peer_eof = false, cancelled = false;
     size_t completed = 0;
     std::exception_ptr error;
-    std::unique_ptr<::AsyncStream> stream;
+    std::unique_ptr<::transport::AsyncStream> stream;
 
     auto peer = [&]<typename Peer>(Peer& wire) -> net::awaitable<void> {
         if (outbound) {
@@ -226,11 +226,11 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
             }
             raw->PrependReadData(Bytes(retained));
         }
-        ::TransportBuildResult built;
+        ::transport::internet::TransportBuildResult built;
         if (outbound) {
-            built = co_await ::BuildOutboundTransport(std::move(raw), settings, security.Context());
+            built = co_await ::transport::internet::BuildOutboundTransport(std::move(raw), settings, security.Context());
         } else {
-            built = co_await ::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, security.Context());
+            built = co_await ::transport::internet::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, security.Context());
         }
         EXPECT_TRUE(built.has_value()) << "HTTP transport handshake failed";
         if (!built || !*built) throw std::runtime_error("cannot read from failed HTTP handshake");
@@ -347,7 +347,7 @@ void WriteTimeoutResetsQueuedPayload() {
     acceptor.accept(peer);
     socket.set_option(net::socket_base::send_buffer_size(4096));
     peer.set_option(net::socket_base::receive_buffer_size(4096));
-    ::TcpStream stream(std::move(socket));
+    ::transport::internet::TcpStream stream(std::move(socket));
     stream.SetWriteTimeout(1s);
     bool completed = false;
     std::exception_ptr error;
@@ -398,7 +398,7 @@ void ExistingTcpResidual() {
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    ::TcpStream stream(std::move(socket));
+    ::transport::internet::TcpStream stream(std::move(socket));
     // More than eight blocks exercises spill metadata while the old residual
     // is transferred behind the new prefix without copying its payload.
     const std::string tail(10 * ::buf::Buffer::kSize, 't');
@@ -438,12 +438,12 @@ void TlsReadTermination(bool multi_buffer, bool clean) {
     net::ssl::context server_context(net::ssl::context::tls_server);
     server_context.use_certificate_chain_file((fixtures / "cert.pem").string());
     server_context.use_private_key_file((fixtures / "key.pem").string(), net::ssl::context::pem);
-    ::TlsConfig client_config;
+    ::transport::internet::TlsConfig client_config;
     client_config.allow_insecure = true;
-    auto client_context = ::SslContext::CreateClient(client_config);
+    auto client_context = ::transport::internet::SslContext::CreateClient(client_config);
     ASSERT_NE(client_context, nullptr);
     net::ssl::stream<::tcp::socket> peer(std::move(peer_socket), server_context);
-    ::TlsStream stream(std::make_unique<::TcpStream>(std::move(socket)),
+    ::transport::internet::TlsStream stream(std::make_unique<::transport::internet::TcpStream>(std::move(socket)),
                            *client_context, false);
     std::exception_ptr failure;
     unsigned completed = 0;
@@ -600,7 +600,7 @@ void WsResume(bool client, bool multi_buffer, size_t size, size_t cut, uint8_t o
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    ::BaseWsStream stream(std::make_unique<::TcpStream>(std::move(socket)), client);
+    ::transport::internet::BaseWsStream stream(std::make_unique<::transport::internet::TcpStream>(std::move(socket)), client);
     std::string payload(size, '\0');
     for (size_t i = 0; i < size; ++i) payload[i] = static_cast<char>(i % 251);
     if (opcode == 8) payload = size == 0 ? "" : std::string("\x03\xe8", 2) + "bye";
@@ -711,7 +711,7 @@ void WsWriteBoundary(WsConcurrent action, bool owned) {
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
     socket.set_option(net::socket_base::send_buffer_size(4096));
-    ::BaseWsStream stream(std::make_unique<::TcpStream>(std::move(socket)), true);
+    ::transport::internet::BaseWsStream stream(std::make_unique<::transport::internet::TcpStream>(std::move(socket)), true);
     std::string payload(1024 * 1024 + 19, '\0');
     for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>(i % 251);
     bool data_done = false, control_done = false;
@@ -827,7 +827,7 @@ void WsReject(std::string_view frame, bool client, bool multi_buffer) {
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    ::BaseWsStream stream(std::make_unique<::TcpStream>(std::move(socket)), client);
+    ::transport::internet::BaseWsStream stream(std::make_unique<::transport::internet::TcpStream>(std::move(socket)), client);
     ::buf::MultiBuffer residual;
     ASSERT_TRUE(::buf::AppendSpanToMultiBuffer(
         {reinterpret_cast<const uint8_t*>(frame.data()), frame.size()}, residual));
@@ -870,13 +870,13 @@ void UpgradeHeaderTokens(bool outbound, bool websocket,
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    auto raw = std::make_unique<::TcpStream>(std::move(socket));
+    auto raw = std::make_unique<::transport::internet::TcpStream>(std::move(socket));
     raw->SetIdleTimeout(2s);
-    ::StreamSettings settings;
-    settings.network_mode = websocket ? ::NetworkMode::Ws : ::NetworkMode::HttpUpgrade;
+    ::transport::internet::StreamSettings settings;
+    settings.network_mode = websocket ? ::transport::internet::NetworkMode::Ws : ::transport::internet::NetworkMode::HttpUpgrade;
     settings.ws.path = settings.http_upgrade.path = "/up";
-    settings.security_mode = ::SecurityMode::None;
-    settings = ::NormalizeStreamSettings(settings);
+    settings.security_mode = ::transport::internet::SecurityMode::None;
+    settings = ::transport::internet::NormalizeStreamSettings(settings);
     std::exception_ptr error;
     size_t completed = 0;
     auto finish = [&](std::exception_ptr failure) {
@@ -899,7 +899,7 @@ void UpgradeHeaderTokens(bool outbound, bool websocket,
             } while (!request.ends_with("\r\n\r\n"));
             message = "HTTP/1.1 101 Switching Protocols\r\n";
             if (websocket) {
-                const auto key = TrimAscii(
+                const auto key = common::TrimAscii(
                     ::transport::internet::ExtractHeaderValueCI(request, "Sec-WebSocket-Key"));
                 const auto accept = ::ws::EncodeWsAccept(key);
                 message += "Sec-WebSocket-Accept: ";
@@ -917,11 +917,11 @@ void UpgradeHeaderTokens(bool outbound, bool websocket,
         co_await net::async_write(peer, net::buffer(message), net::use_awaitable);
     };
     auto product = [&]() -> net::awaitable<void> {
-        ::TransportBuildResult built;
+        ::transport::internet::TransportBuildResult built;
         if (outbound) {
-            built = co_await ::BuildOutboundTransport(std::move(raw), settings, nullptr);
+            built = co_await ::transport::internet::BuildOutboundTransport(std::move(raw), settings, nullptr);
         } else {
-            built = co_await ::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr);
+            built = co_await ::transport::internet::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr);
         }
         EXPECT_EQ(built.has_value(), accepted) << "Connection header token handshake mismatch";
         if (built && *built) (*built)->Close();
@@ -946,7 +946,7 @@ void ChunkExtensionBody(std::string_view wire, bool accepted, bool multi_buffer)
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    auto raw = std::make_unique<::TcpStream>(std::move(socket));
+    auto raw = std::make_unique<::transport::internet::TcpStream>(std::move(socket));
     raw->SetIdleTimeout(2s);
     auto stream = ::transport::internet::MakeHttp1BodyStream(
         std::move(raw), ::transport::internet::Http1BodyChunked{}, false);
@@ -1009,10 +1009,10 @@ void ChunkExtensionBody(std::string_view wire, bool accepted, bool multi_buffer)
 }
 
 
-class CloseHttpLogStream final : public ::InboundTransportStreamHandler {
+class CloseHttpLogStream final : public ::transport::internet::InboundTransportStreamHandler {
 public:
     net::awaitable<void> OnInboundTransportStream(
-        std::unique_ptr<::AsyncStream> stream, ::InboundTransportMetadata) override {
+        std::unique_ptr<::transport::AsyncStream> stream, ::transport::internet::InboundTransportMetadata) override {
         stream->Close();
         co_return;
     }
@@ -1030,20 +1030,20 @@ void HttpLogHandshake(std::string_view network, bool outbound,
     ::tcp::socket socket(io), peer(io);
     socket.connect(acceptor.local_endpoint());
     acceptor.accept(peer);
-    auto raw = std::make_unique<::TcpStream>(std::move(socket));
+    auto raw = std::make_unique<::transport::internet::TcpStream>(std::move(socket));
     raw->SetIdleTimeout(2s);
-    ::StreamSettings settings;
-    settings.network_mode = ParseNetworkMode(network);
-    settings.http.force_http2 = EqualsAsciiCI(network, "h2");
+    ::transport::internet::StreamSettings settings;
+    settings.network_mode = transport::internet::ParseNetworkMode(network);
+    settings.http.force_http2 = common::EqualsAsciiCI(network, "h2");
     settings.http.path = settings.http_upgrade.path = settings.ws.path =
         settings.xhttp.path = path;
     settings.http.method = "GET";
-    settings.xhttp.mode = ::XHttpMode::Auto;
+    settings.xhttp.mode = ::transport::internet::XHttpMode::Auto;
     if (outbound) {
         settings.http.host = settings.http_upgrade.host = host;
         settings.ws.headers.emplace("Host", host);
     }
-    settings = ::NormalizeStreamSettings(settings);
+    settings = ::transport::internet::NormalizeStreamSettings(settings);
     std::exception_ptr error;
     size_t completed = 0;
     auto finish = [&](std::exception_ptr failure) {
@@ -1074,7 +1074,7 @@ void HttpLogHandshake(std::string_view network, bool outbound,
                    "User-Agent: http://user:review_password@example.com/?token=review_token#review_fragment\r\n"
                    "Content-Length: 0\r\n";
         if (outbound && network == "ws") {
-            const auto key = TrimAscii(
+            const auto key = common::TrimAscii(
                 ::transport::internet::ExtractHeaderValueCI(request, "Sec-WebSocket-Key"));
             const auto accept = ::ws::EncodeWsAccept(key);
             message += "Sec-WebSocket-Accept: ";
@@ -1096,13 +1096,13 @@ void HttpLogHandshake(std::string_view network, bool outbound,
         }
     };
     auto product = [&]() -> net::awaitable<void> {
-        ::TransportBuildResult built;
+        ::transport::internet::TransportBuildResult built;
         if (outbound) {
-            built = co_await ::BuildOutboundTransport(std::move(raw), settings, nullptr);
+            built = co_await ::transport::internet::BuildOutboundTransport(std::move(raw), settings, nullptr);
         } else {
-            const std::shared_ptr<::InboundTransportStreamHandler> sink =
+            const std::shared_ptr<::transport::internet::InboundTransportStreamHandler> sink =
                 network == "xhttp" ? std::make_shared<CloseHttpLogStream>() : nullptr;
-            built = co_await ::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr, 0, sink);
+            built = co_await ::transport::internet::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr, 0, sink);
         }
         EXPECT_EQ(built.has_value(), accepted) << "HTTP log redaction changed request acceptance";
         if (built && *built) (*built)->Close();

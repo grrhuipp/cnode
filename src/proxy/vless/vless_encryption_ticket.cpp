@@ -9,7 +9,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
-namespace vless {
+namespace proxy::vless {
 namespace {
 [[nodiscard]] std::array<uint8_t, 32> DigestNfsKey(
     const VlessEncryptionNfsKey& nfs_key) noexcept {
@@ -188,7 +188,7 @@ private:
 } // namespace
 
 net::awaitable<bool> AuthenticateVlessTicket(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     std::shared_ptr<const VlessEncryptionConfig> config, std::string_view tag,
     VlessEncryptionIssuedTicket ticket, std::array<uint8_t, 16> identity) {
     if (!config) co_return false;
@@ -207,7 +207,7 @@ net::awaitable<bool> AuthenticateVlessTicket(
 }
 
 net::awaitable<std::optional<Resumed>> LookupVlessTicket(
-    GroupCoordinator& coordinator,
+    app::GroupCoordinator& coordinator,
     std::shared_ptr<const VlessEncryptionConfig> config, std::string_view tag,
     Ticket ticket, VlessEncryptionNfsKey nfs) {
     if (!config) co_return std::nullopt;
@@ -223,4 +223,4 @@ net::awaitable<std::optional<Resumed>> LookupVlessTicket(
             return result;
         });
 }
-}  // namespace vless
+}  // namespace proxy::vless

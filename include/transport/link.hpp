@@ -12,12 +12,16 @@
 #include <span>
 #include <utility>
 
+namespace transport {
+
 class AsyncStream;
+
+}  // namespace transport
 
 namespace transport {
 
 struct Cancellation {
-    ErrorCode reason;
+    common::ErrorCode reason;
     bool terminal;
 };
 
@@ -33,15 +37,15 @@ public:
     CancellationSource(const CancellationSource&) = delete;
     CancellationSource& operator=(const CancellationSource&) = delete;
 
-    void CancelPending(ErrorCode reason = ErrorCode::CANCELLED) noexcept;
-    void Stop(ErrorCode reason = ErrorCode::CANCELLED) noexcept;
-    [[nodiscard]] bool Stopped() const noexcept { return terminal_reason_ != ErrorCode::OK; }
+    void CancelPending(common::ErrorCode reason = common::ErrorCode::CANCELLED) noexcept;
+    void Stop(common::ErrorCode reason = common::ErrorCode::CANCELLED) noexcept;
+    [[nodiscard]] bool Stopped() const noexcept { return terminal_reason_ != common::ErrorCode::OK; }
 
 private:
     friend class CancellationSubscription;
     void Notify(Cancellation cancellation) noexcept;
     CancellationSubscription* head_ = nullptr;
-    ErrorCode terminal_reason_ = ErrorCode::OK;
+    common::ErrorCode terminal_reason_ = common::ErrorCode::OK;
 };
 
 // One-shot listener embedded at a stable address. Derived state must be fully
@@ -58,7 +62,7 @@ public:
     // from inside its callback. The source's current batch remains detached.
     void Resubscribe(CancellationSource& source) noexcept {
         Unsubscribe();
-        if (source.terminal_reason_ != ErrorCode::OK) {
+        if (source.terminal_reason_ != common::ErrorCode::OK) {
             OnCancellation({source.terminal_reason_, true});
             return;
         }
@@ -91,13 +95,13 @@ inline CancellationSource::~CancellationSource() noexcept {
     while (head_) head_->Unsubscribe();
 }
 
-inline void CancellationSource::CancelPending(ErrorCode reason) noexcept {
-    Notify({terminal_reason_ == ErrorCode::OK ? reason : terminal_reason_, terminal_reason_ != ErrorCode::OK});
+inline void CancellationSource::CancelPending(common::ErrorCode reason) noexcept {
+    Notify({terminal_reason_ == common::ErrorCode::OK ? reason : terminal_reason_, terminal_reason_ != common::ErrorCode::OK});
 }
 
-inline void CancellationSource::Stop(ErrorCode reason) noexcept {
-    if (terminal_reason_ != ErrorCode::OK) return;
-    terminal_reason_ = reason == ErrorCode::OK ? ErrorCode::CANCELLED : reason;
+inline void CancellationSource::Stop(common::ErrorCode reason) noexcept {
+    if (terminal_reason_ != common::ErrorCode::OK) return;
+    terminal_reason_ = reason == common::ErrorCode::OK ? common::ErrorCode::CANCELLED : reason;
     Notify({terminal_reason_, true});
 }
 
@@ -154,12 +158,12 @@ private:
 // boundaries. They are not fabricated operating-system socket errors.
 class LinkError final : public std::exception {
 public:
-    explicit LinkError(ErrorCode code) noexcept : code_(code) {}
-    [[nodiscard]] ErrorCode code() const noexcept { return code_; }
-    const char* what() const noexcept override { return ErrorCodeToString(code_).data(); }
+    explicit LinkError(common::ErrorCode code) noexcept : code_(code) {}
+    [[nodiscard]] common::ErrorCode code() const noexcept { return code_; }
+    const char* what() const noexcept override { return common::ErrorCodeToString(code_).data(); }
 
 private:
-    ErrorCode code_;
+    common::ErrorCode code_;
 };
 
 enum class EofAction : uint8_t {

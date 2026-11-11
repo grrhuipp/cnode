@@ -4,13 +4,13 @@
 #include "common/initial_payload.hpp"
 #include "common/target_address.hpp"
 
-namespace ss {
+namespace proxy::shadowsocks {
 class SsStreamWriter final : public transport::MultiBufferWriter {
 public:
     SsStreamWriter(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
                        const SsCipherInfo& cipher_info,
                        const KeyBytes& request_salt,
-                       AsyncStream& stream)
+                       transport::AsyncStream& stream)
         : cipher_type_(cipher_info.type)
         , key_size_(cipher_info.key_size == cipher_info.salt_size &&
                     cipher_info.key_size <= KeyBytes::kMaxSize &&
@@ -31,7 +31,7 @@ public:
         ClearHandshakeKeys();
     }
 
-    SsStreamWriter(SsAeadCipher cipher, uint64_t nonce, AsyncStream& stream)
+    SsStreamWriter(SsAeadCipher cipher, uint64_t nonce, transport::AsyncStream& stream)
         : cipher_type_(SsCipherType::AES_128_GCM), write_cipher_(std::move(cipher)),
           write_nonce_(nonce), write_init_(true), stream_(&stream) {}
 
@@ -110,7 +110,7 @@ private:
     template <typename BufferRange>
     net::awaitable<void> WriteEncrypted(BufferRange buffers);
 
-    net::awaitable<void> FlushPendingAndWrite(AsyncStream& stream, buf::MultiBuffer out_mb);
+    net::awaitable<void> FlushPendingAndWrite(transport::AsyncStream& stream, buf::MultiBuffer out_mb);
 
     bool InitResponseCipher();
 
@@ -129,43 +129,43 @@ private:
     bool write_init_ = false;
     bool write_finished_ = false;
     size_t skip_first_bytes_ = 0;
-    AsyncStream* stream_ = nullptr;
+    transport::AsyncStream* stream_ = nullptr;
 };
 
 struct ReadTCPSessionResult {
     std::shared_ptr<const proxyman::inbound::UserStore::ShadowsocksCredential> user;
-    TargetAddress target;
-    std::optional<ForwardedMetadata> forwarded;
-    InitialPayload initial_payload;
+    common::TargetAddress target;
+    std::optional<common::ForwardedMetadata> forwarded;
+    common::InitialPayload initial_payload;
     std::optional<detail::BodyReader> body_reader;
     KeyBytes request_salt;
 };
 
 // xray-core proxy/shadowsocks/server.go 对应的服务器端握手与 body reader/writer 入口。
-[[nodiscard]] net::awaitable<tl::expected<ReadTCPSessionResult, ErrorCode>>
-ReadTCPSession(AsyncStream& stream,
+[[nodiscard]] net::awaitable<tl::expected<ReadTCPSessionResult, common::ErrorCode>>
+ReadTCPSession(transport::AsyncStream& stream,
                const SsCipherInfo& cipher_info,
                std::string_view tag,
                size_t& last_matched_index);
 
-[[nodiscard]] tl::expected<SsStreamWriter, ErrorCode>
+[[nodiscard]] tl::expected<SsStreamWriter, common::ErrorCode>
 WriteTCPResponse(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
                  const SsCipherInfo& cipher_info,
                  const KeyBytes& request_salt,
-                 AsyncStream& stream);
+                 transport::AsyncStream& stream);
 struct WriteTCPRequestResult {
     SsStreamWriter request_writer;
     KeyBytes request_salt;
 };
 
 // xray-core proxy/shadowsocks/client.go 对应的客户端握手与 reader/writer 入口。
-[[nodiscard]] net::awaitable<tl::expected<WriteTCPRequestResult, ErrorCode>>
-WriteTCPRequest(const TargetAddress& target,
+[[nodiscard]] net::awaitable<tl::expected<WriteTCPRequestResult, common::ErrorCode>>
+WriteTCPRequest(const common::TargetAddress& target,
                 const SsCipherInfo& cipher_info,
                 const KeyBytes& master_key,
                 std::span<const KeyBytes> psk_chain,
-                AsyncStream& stream,
-                ForwardedMetadataView forwarded = {});
+                transport::AsyncStream& stream,
+                common::ForwardedMetadataView forwarded = {});
 
 // 2022 固定响应头可携带首段载荷；它在 reader 之前交付，reader 只负责后续记录。
 struct ReadTCPResponseResult {
@@ -173,9 +173,9 @@ struct ReadTCPResponseResult {
     buf::MultiBuffer initial_payload;
 };
 
-[[nodiscard]] net::awaitable<tl::expected<ReadTCPResponseResult, ErrorCode>>
+[[nodiscard]] net::awaitable<tl::expected<ReadTCPResponseResult, common::ErrorCode>>
 ReadTCPResponse(const SsCipherInfo& cipher_info,
                 const KeyBytes& master_key,
                 const KeyBytes& request_salt,
-                AsyncStream& stream);
-}  // namespace ss
+                transport::AsyncStream& stream);
+}  // namespace proxy::shadowsocks

@@ -12,7 +12,7 @@
 class WorkerCoordinatorFixture final {
 public:
     explicit WorkerCoordinatorFixture(net::io_context& control)
-        : control_(control), coordinator_(std::make_shared<GroupCoordinator>(control)) {}
+        : control_(control), coordinator_(std::make_shared<app::GroupCoordinator>(control)) {}
     ~WorkerCoordinatorFixture() {
         auto result = net::co_spawn(control_, Finish(), net::use_future);
         while (result.wait_for(std::chrono::seconds::zero()) != std::future_status::ready) {
@@ -27,10 +27,10 @@ public:
         coordinator_->ReleaseServices();
         co_await coordinator_->Finalize();
     }
-    [[nodiscard]] const std::shared_ptr<GroupCoordinator>& Get() const noexcept {
+    [[nodiscard]] const std::shared_ptr<app::GroupCoordinator>& Get() const noexcept {
         return coordinator_;
     }
 private:
     net::io_context& control_;
-    std::shared_ptr<GroupCoordinator> coordinator_;
+    std::shared_ptr<app::GroupCoordinator> coordinator_;
 };

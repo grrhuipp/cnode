@@ -25,21 +25,21 @@ public:
     net::awaitable<OutboundProcessResult> Process(
         session::Context& ctx,
         transport::Link inbound,
-        OutboundDialer& dialer,
-        const TimeoutsConfig& timeouts,
-        StatsShard& stats,
-        const RelayConfig& relay_config,
+        transport::internet::OutboundDialer& dialer,
+        const infra::TimeoutsConfig& timeouts,
+        app::StatsShard& stats,
+        const app::RelayConfig& relay_config,
         buf::MultiBufferBatch first_payload) override;
 
 private:
     DomainStrategy domain_strategy_;
-    std::optional<TargetAddress> redirect_target_;
+    std::optional<common::TargetAddress> redirect_target_;
 };
 
 namespace {
 
-OutboundDialer::AddressFamilyPolicy FamilyPolicy(DomainStrategy strategy) {
-    using Policy = OutboundDialer::AddressFamilyPolicy;
+transport::internet::OutboundDialer::AddressFamilyPolicy FamilyPolicy(DomainStrategy strategy) {
+    using Policy = transport::internet::OutboundDialer::AddressFamilyPolicy;
     switch (strategy) {
         case DomainStrategy::UseIPv4:
             return Policy{.accepts_v6 = false};
@@ -69,21 +69,21 @@ Handler::Handler(const infra::FreedomSettings& settings)
 net::awaitable<OutboundProcessResult> Handler::Process(
     session::Context& ctx,
     transport::Link inbound,
-    OutboundDialer& dialer,
-    const TimeoutsConfig& /*timeouts*/,
-    StatsShard& stats,
-    const RelayConfig& relay_config,
+    transport::internet::OutboundDialer& dialer,
+    const infra::TimeoutsConfig& /*timeouts*/,
+    app::StatsShard& stats,
+    const app::RelayConfig& relay_config,
     buf::MultiBufferBatch first_payload) {
     if (!inbound.Valid()) {
-        co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 
     // UDP 数据面：dispatcher.Dispatch -> outbound.Process -> DoRelayLink。
     // 不做 redirect（保持 UDP 逐包目标语义）；嗅探首包作为普通上行交给转发。
-    if (ctx.content.network == Network::UDP) {
+    if (ctx.content.network == common::Network::UDP) {
         const auto& target = ctx.outbound.target;
         std::optional<UdpRequest> endpoint;
-        if (auto opened = dialer.OpenDatagram(ctx, OutboundDialer::DatagramRemote{
+        if (auto opened = dialer.OpenDatagram(ctx, transport::internet::OutboundDialer::DatagramRemote{
                 .address = target.IsDomain() ? std::nullopt : target.resolved_addr,
                 .family_hint = target.IsDomain() ? target.resolved_addr : std::nullopt,
                 .family_policy = FamilyPolicy(domain_strategy_),
@@ -92,7 +92,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         }
         endpoint->SetIdleTimeout(relay_config.idle_timeout);
         endpoint->SetWriteTimeout(relay_config.write_timeout);
-        co_return co_await DoRelayLink(dialer.IoContext(), *inbound.reader, *inbound.writer,
+        co_return co_await app::DoRelayLink(dialer.IoContext(), *inbound.reader, *inbound.writer,
             inbound.control, *endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
 
@@ -111,7 +111,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     stream->SetIdleTimeout(relay_config.idle_timeout);
     stream->SetReadTimeout(std::chrono::seconds(0));
     stream->SetWriteTimeout(relay_config.write_timeout);
-    co_return co_await DoRelayLink(
+    co_return co_await app::DoRelayLink(
         dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
         *stream, ctx, stats, relay_config, std::move(first_payload));
 }
@@ -122,7 +122,7 @@ PrepareOutbound(infra::FreedomSettings settings) {
     return proxyman::outbound::MakePreparedOutboundCreator<
         infra::FreedomSettings,
         +[](std::string_view, std::shared_ptr<const infra::FreedomSettings> config,
-            net::io_context&, AwaitableTaskGroup&) -> std::unique_ptr<Outbound> {
+            net::io_context&, common::AwaitableTaskGroup&) -> std::unique_ptr<Outbound> {
             return std::make_unique<Handler>(*config);
         }>(std::move(settings));
 }
@@ -138,9 +138,9 @@ const bool kFreedomRegistered = (::proxyman::outbound::RegisterProxy(
         -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
         const auto* settings = std::get_if<::infra::FreedomSettings>(&cfg.settings);
         if (!settings) return std::nullopt;
-        ::OutboundSenderSettings sender{
+        ::transport::internet::OutboundSenderSettings sender{
             .stream_settings = {},
-            .send_through = ::OutboundBind::Auto(),
+            .send_through = ::transport::internet::OutboundBind::Auto(),
         };
         return ::proxyman::outbound::PreparedOutboundProxy{
             .create = ::proxy::freedom::outbound::PrepareOutbound(*settings),

@@ -30,7 +30,7 @@ extern "C" int __wrap_EVP_DigestSqueeze(EVP_MD_CTX* ctx, uint8_t* out, size_t si
 #endif
 
 namespace {
-using namespace ::vmess;
+using namespace ::proxy::vmess;
 constexpr std::array<uint8_t, 16> key{}, iv{};
 
 #ifdef CNODE_TEST_CRYPTO_FAULT

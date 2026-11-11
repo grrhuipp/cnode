@@ -32,10 +32,10 @@ public:
     net::awaitable<OutboundProcessResult> Process(
         session::Context& ctx,
         transport::Link inbound,
-        OutboundDialer& dialer,
-        const TimeoutsConfig& timeouts,
-        StatsShard& stats,
-        const RelayConfig& relay_config,
+        transport::internet::OutboundDialer& dialer,
+        const infra::TimeoutsConfig& timeouts,
+        app::StatsShard& stats,
+        const app::RelayConfig& relay_config,
         buf::MultiBufferBatch first_payload) override;
 
 private:
@@ -53,14 +53,14 @@ Handler::Handler(const infra::BlackholeSettings& settings)
 net::awaitable<OutboundProcessResult> Handler::Process(
     session::Context& ctx,
     transport::Link inbound,
-    OutboundDialer& /*dialer*/,
-    const TimeoutsConfig& /*timeouts*/,
-    StatsShard& /*stats*/,
-    const RelayConfig& /*relay_config*/,
+    transport::internet::OutboundDialer& /*dialer*/,
+    const infra::TimeoutsConfig& /*timeouts*/,
+    app::StatsShard& /*stats*/,
+    const app::RelayConfig& /*relay_config*/,
     buf::MultiBufferBatch first_payload) {
     first_payload.clear();
     const bool send_http =
-        http_response_ && ctx.content.network == Network::TCP && inbound.writer;
+        http_response_ && ctx.content.network == common::Network::TCP && inbound.writer;
     if (send_http) {
         net::const_buffer response{kHttp403Response.data(), kHttp403Response.size()};
         try {
@@ -72,7 +72,7 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         }
     }
     LOG_CONN_DEBUG(ctx, "blocked before relay response={}", send_http ? "http" : "none");
-    co_return tl::unexpected(ErrorCode::BLOCKED);
+    co_return tl::unexpected(common::ErrorCode::BLOCKED);
 }
 
 }  // namespace proxy::blackhole::outbound
@@ -93,7 +93,7 @@ const bool kBlackholeRegistered = (::proxyman::outbound::RegisterProxy(
                 +[](std::string_view /*tag*/,
                     std::shared_ptr<const ::infra::BlackholeSettings> s,
                     ::net::io_context& /*io_context*/,
-                    ::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::Outbound> {
+                    ::common::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::proxy::Outbound> {
                     return std::make_unique<::proxy::blackhole::outbound::Handler>(*s);
                 }>(*settings),
             .sender = {},

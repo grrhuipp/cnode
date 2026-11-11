@@ -105,7 +105,7 @@ inline constexpr std::string_view kPanelNodeTagPrefix = "panel/";
 }
 
 [[nodiscard]] inline std::string NormalizeV2BoardApiNodeType(std::string_view node_type) {
-    const auto lowered = LowerAscii(std::string(node_type));
+    const auto lowered = common::LowerAscii(std::string(node_type));
     if (lowered.empty() || lowered == "vmess") {
         return "v2ray";
     }

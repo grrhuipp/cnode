@@ -44,7 +44,7 @@ struct ConsoleRestore {
     }
     ~ConsoleRestore() { Restore(); }
     void Restore() noexcept {
-        ::Log::Shutdown();
+        ::infra::Log::Shutdown();
         if (output.value >= 0) ::dup2(output.value, STDOUT_FILENO);
         if (error.value >= 0) ::dup2(error.value, STDERR_FILENO);
         output.Close();
@@ -62,7 +62,7 @@ struct StreamCapture {
             throw std::runtime_error("cannot capture console descriptor");
     }
     ~StreamCapture() {
-        ::Log::Shutdown();
+        ::infra::Log::Shutdown();
         ::dup2(previous.value, target);
     }
     std::string Text() const {
@@ -123,12 +123,12 @@ protected:
     const std::filesystem::path directory = std::filesystem::temp_directory_path() /
         ("cnode-log-format-" + std::to_string(::getpid()) + "-" +
          std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    LogConfig config{
-        .level = LogLevel::TRACE, .log_dir = directory,
+    infra::LogConfig config{
+        .level = infra::LogLevel::TRACE, .log_dir = directory,
         .access_path = "access.log", .error_path = "error.log", .max_days = 1,
         .rotate_daily = false, .gzip = false};
     void TearDown() override {
-        ::Log::Shutdown();
+        ::infra::Log::Shutdown();
         std::filesystem::remove_all(directory);
     }
 };
@@ -137,13 +137,13 @@ TEST_F(LogFormat, EscapesControlCharactersWithoutForgingRecords) {
     std::string console_text;
     {
         StreamCapture console(STDOUT_FILENO);
-        if (!::Log::Init(config)) throw std::runtime_error("logger initialization failed");
+        if (!::infra::Log::Init(config)) throw std::runtime_error("logger initialization failed");
         std::string injection = "diagnostic injection\nforged\r\t\x1b";
         injection.push_back('\0');
-        ::Log::WriteSystem(LogLevel::WARN, injection);
-        ::Log::WriteAccess("rejected invalid input\nforged-access\x1b");
-        ::Log::WriteConsole(LogLevel::INFO, "quoted \"value\"\\path\nnext");
-        ::Log::Shutdown();
+        ::infra::Log::WriteSystem(infra::LogLevel::WARN, injection);
+        ::infra::Log::WriteAccess("rejected invalid input\nforged-access\x1b");
+        ::infra::Log::WriteConsole(infra::LogLevel::INFO, "quoted \"value\"\\path\nnext");
+        ::infra::Log::Shutdown();
         console_text = console.Text();
     }
     const auto diagnostics = ReadLines(directory / "error.log");
@@ -156,17 +156,17 @@ TEST_F(LogFormat, EscapesControlCharactersWithoutForgingRecords) {
 }
 
 TEST_F(LogFormat, ConnectionIdentityPreservesWorkerBitsAndAuthenticationPhase) {
-    ASSERT_TRUE(::Log::Init(config));
-    ::Log::WriteConnection(LogLevel::WARN,
+    ASSERT_TRUE(::infra::Log::Init(config));
+    ::infra::Log::WriteConnection(infra::LogLevel::WARN,
         SessionLogContext{.inbound = {.tag = "vless-in", .user_id = 123},
                           .outbound = {.tag = "direct"}, .conn_id = (1ull << 32) | 7},
         "authenticated outbound failure");
-    ::Log::WriteConnection(LogLevel::WARN,
+    ::infra::Log::WriteConnection(infra::LogLevel::WARN,
         SessionLogContext{.inbound = {.tag = "vless-in", .user_id = 0},
                           .outbound = {}, .conn_id = (2ull << 32) | 7},
         "authentication failed from 192.0.2.10:52000 > invalid credential");
-    ::Log::WriteConnection(LogLevel::DEBUG, uint64_t{0}, "diagnostic without connection identity");
-    ::Log::Shutdown();
+    ::infra::Log::WriteConnection(infra::LogLevel::DEBUG, uint64_t{0}, "diagnostic without connection identity");
+    ::infra::Log::Shutdown();
     const auto diagnostics = ReadLines(directory / "error.log");
     const auto& authenticated = FindLine(diagnostics, "authenticated outbound failure");
     EXPECT_NE(authenticated.find("[4294967303]"), std::string::npos);
@@ -182,14 +182,14 @@ TEST_F(LogFormat, RedactsPanelUrlSecretsAcrossConsoleAndDiagnosticSinks) {
     std::string console_text, error_text;
     {
         StreamCapture console(STDOUT_FILENO), errors(STDERR_FILENO);
-        if (!::Log::Init(config)) throw std::runtime_error("logger initialization failed");
-        const PanelLogContext panel{
+        if (!::infra::Log::Init(config)) throw std::runtime_error("logger initialization failed");
+        const infra::PanelLogContext panel{
             .name = "main panel",
             .host = "https://login:password@panel.example.com:8443/api?key=secret#private",
             .node_id = 1041, .type = "Vless"};
-        ::Log::WritePanel(LogLevel::INFO, panel, "node ready");
-        ::Log::WritePanel(LogLevel::WARN, panel, "panel request failed");
-        ::Log::Shutdown();
+        ::infra::Log::WritePanel(infra::LogLevel::INFO, panel, "node ready");
+        ::infra::Log::WritePanel(infra::LogLevel::WARN, panel, "panel request failed");
+        ::infra::Log::Shutdown();
         console_text = console.Text();
         error_text = errors.Text();
     }
@@ -209,12 +209,12 @@ TEST_F(LogFormat, RoutesAccessDiagnosticsAndLifecycleEventsToSeparateSinks) {
     std::string console_text, error_text;
     {
         StreamCapture console(STDOUT_FILENO), errors(STDERR_FILENO);
-        if (!::Log::Init(config)) throw std::runtime_error("logger initialization failed");
-        ::Log::WriteSystem(LogLevel::WARN, "diagnostic-only event");
-        ::Log::WriteConsole(LogLevel::INFO, "ordinary lifecycle event");
-        ::Log::WriteConsole(LogLevel::ERROR, "fatal startup failure");
-        ::Log::WriteAccess("accepted tcp:example.com:443");
-        ::Log::Shutdown();
+        if (!::infra::Log::Init(config)) throw std::runtime_error("logger initialization failed");
+        ::infra::Log::WriteSystem(infra::LogLevel::WARN, "diagnostic-only event");
+        ::infra::Log::WriteConsole(infra::LogLevel::INFO, "ordinary lifecycle event");
+        ::infra::Log::WriteConsole(infra::LogLevel::ERROR, "fatal startup failure");
+        ::infra::Log::WriteAccess("accepted tcp:example.com:443");
+        ::infra::Log::Shutdown();
         console_text = console.Text();
         error_text = errors.Text();
     }
@@ -235,13 +235,13 @@ TEST_F(LogFormat, SeverityFilteringDoesNotDiscardAccessFacts) {
     std::string console_text;
     {
         StreamCapture console(STDOUT_FILENO);
-        config.level = LogLevel::WARN;
-        if (!::Log::Init(config)) throw std::runtime_error("logger initialization failed");
-        ::Log::WriteConsole(LogLevel::INFO, "hidden console event");
-        ::Log::WriteSystem(LogLevel::DEBUG, "hidden diagnostic event");
-        ::Log::WriteSystem(LogLevel::WARN, "visible warning");
-        ::Log::WriteAccess("accepted despite diagnostic severity");
-        ::Log::Shutdown();
+        config.level = infra::LogLevel::WARN;
+        if (!::infra::Log::Init(config)) throw std::runtime_error("logger initialization failed");
+        ::infra::Log::WriteConsole(infra::LogLevel::INFO, "hidden console event");
+        ::infra::Log::WriteSystem(infra::LogLevel::DEBUG, "hidden diagnostic event");
+        ::infra::Log::WriteSystem(infra::LogLevel::WARN, "visible warning");
+        ::infra::Log::WriteAccess("accepted despite diagnostic severity");
+        ::infra::Log::Shutdown();
         console_text = console.Text();
     }
     const auto diagnostics = ReadLines(directory / "error.log");
@@ -255,12 +255,12 @@ TEST_F(LogFormat, DisabledDiagnosticsPreserveAccessFactsAndUnconditionalFatalErr
     std::string error_text;
     {
         StreamCapture errors(STDERR_FILENO);
-        config.level = LogLevel::NONE;
-        if (!::Log::Init(config)) throw std::runtime_error("logger initialization failed");
+        config.level = infra::LogLevel::NONE;
+        if (!::infra::Log::Init(config)) throw std::runtime_error("logger initialization failed");
         LOG_CONSOLE_ERROR("hidden ordinary error");
-        ::Log::WriteConsole(LogLevel::ERROR, "unconditional fatal startup failure");
-        ::Log::WriteAccess("rejected despite disabled diagnostics");
-        ::Log::Shutdown();
+        ::infra::Log::WriteConsole(infra::LogLevel::ERROR, "unconditional fatal startup failure");
+        ::infra::Log::WriteAccess("rejected despite disabled diagnostics");
+        ::infra::Log::Shutdown();
         error_text = errors.Text();
     }
     EXPECT_TRUE(ReadLines(directory / "error.log").empty());
@@ -274,10 +274,10 @@ TEST_F(LogFormat, ErrorSinkFailureIsReportedWithoutLosingAccessRecords) {
     {
         StreamCapture errors(STDERR_FILENO);
         config.error_path = "/dev/full";
-        if (!::Log::Init(config)) throw std::runtime_error("logger initialization failed");
-        for (int i = 0; i < 100; ++i) ::Log::WriteSystem(LogLevel::WARN, "unwritable error record");
-        ::Log::WriteAccess("healthy access channel");
-        ::Log::Shutdown();
+        if (!::infra::Log::Init(config)) throw std::runtime_error("logger initialization failed");
+        for (int i = 0; i < 100; ++i) ::infra::Log::WriteSystem(infra::LogLevel::WARN, "unwritable error record");
+        ::infra::Log::WriteAccess("healthy access channel");
+        ::infra::Log::Shutdown();
         error_text = errors.Text();
     }
     EXPECT_NE(error_text.find("channel=error"), std::string::npos);
@@ -289,10 +289,10 @@ TEST_F(LogFormat, AccessSinkFailureIsReportedWithoutLosingDiagnosticRecords) {
     {
         StreamCapture errors(STDERR_FILENO);
         config.access_path = "/dev/full";
-        if (!::Log::Init(config)) throw std::runtime_error("logger initialization failed");
-        ::Log::WriteAccess("unwritable access record");
-        ::Log::WriteSystem(LogLevel::WARN, "healthy error channel");
-        ::Log::Shutdown();
+        if (!::infra::Log::Init(config)) throw std::runtime_error("logger initialization failed");
+        ::infra::Log::WriteAccess("unwritable access record");
+        ::infra::Log::WriteSystem(infra::LogLevel::WARN, "healthy error channel");
+        ::infra::Log::Shutdown();
         error_text = errors.Text();
     }
     EXPECT_NE(error_text.find("channel=access"), std::string::npos);
@@ -304,14 +304,14 @@ TEST_F(LogFormat, RedirectedConsoleAndDirectWritesShareTheFileOffsetAfterShutdow
     constexpr std::string_view marker = "direct emergency output\n";
     {
         StreamCapture capture(STDOUT_FILENO);
-        config.level = LogLevel::INFO;
-        if (!::Log::Init(config)) throw std::runtime_error("logger initialization failed");
-        ::Log::WriteConsole(LogLevel::INFO, "async console offset");
-        ::Log::Shutdown();
+        config.level = infra::LogLevel::INFO;
+        if (!::infra::Log::Init(config)) throw std::runtime_error("logger initialization failed");
+        ::infra::Log::WriteConsole(infra::LogLevel::INFO, "async console offset");
+        ::infra::Log::Shutdown();
         before_direct = capture.Text();
         if (::write(STDOUT_FILENO, marker.data(), marker.size()) != static_cast<ssize_t>(marker.size()))
             throw std::runtime_error("direct console write failed");
-        ::Log::WriteConsole(LogLevel::INFO, "after-shutdown console offset");
+        ::infra::Log::WriteConsole(infra::LogLevel::INFO, "after-shutdown console offset");
         before_second_direct = capture.Text();
         if (::write(STDOUT_FILENO, marker.data(), marker.size()) != static_cast<ssize_t>(marker.size()))
             throw std::runtime_error("second direct console write failed");
@@ -335,12 +335,12 @@ TEST_F(LogFormat, BlockedConsoleDoesNotStallProducersShutdownOrAccessWriter) {
         if (::dup2(output.value, STDOUT_FILENO) < 0) ::_exit(2);
         output.Close();
         // Retain the read descriptor without consuming bytes: EAGAIN, not EPIPE.
-        config.level = LogLevel::INFO;
-        if (!::Log::Init(config)) ::_exit(2);
+        config.level = infra::LogLevel::INFO;
+        if (!::infra::Log::Init(config)) ::_exit(2);
         const std::string message(512, 'x');
-        for (int i = 0; i < 20000; ++i) ::Log::WriteConsole(LogLevel::INFO, message);
-        ::Log::WriteAccess("access survives blocked stdout");
-        ::Log::Shutdown();
+        for (int i = 0; i < 20000; ++i) ::infra::Log::WriteConsole(infra::LogLevel::INFO, message);
+        ::infra::Log::WriteAccess("access survives blocked stdout");
+        ::infra::Log::Shutdown();
         ::_exit(0);
     }
     output.Close();
@@ -360,10 +360,10 @@ TEST_F(LogFormat, SocketConsolePreservesCallerDescriptorFlagsAndDeliversRecords)
     ConsoleRestore restore;
     ASSERT_GE(::dup2(output.value, STDOUT_FILENO), 0);
     const int flags = ::fcntl(output.value, F_GETFL);
-    config.level = LogLevel::INFO;
-    const bool initialized = ::Log::Init(config);
-    ::Log::WriteConsole(LogLevel::INFO, "journald console record");
-    ::Log::Shutdown();
+    config.level = infra::LogLevel::INFO;
+    const bool initialized = ::infra::Log::Init(config);
+    ::infra::Log::WriteConsole(infra::LogLevel::INFO, "journald console record");
+    ::infra::Log::Shutdown();
     const int final_flags = ::fcntl(output.value, F_GETFL);
     restore.Restore();
     output.Close();
@@ -390,9 +390,9 @@ TEST_F(LogFormat, PartialConsoleRecordRetiresBothAliasesWithoutAffectingErrorFil
     ASSERT_GE(::dup2(output.value, STDOUT_FILENO), 0);
     ASSERT_GE(::dup2(output.value, STDERR_FILENO), 0);
     // Suppress startup info so only the controlled record occupies the socket.
-    config.level = LogLevel::WARN;
-    const bool initialized = ::Log::Init(config);
-    ::Log::WriteConsole(LogLevel::WARN, std::string(4000, 'x'));
+    config.level = infra::LogLevel::WARN;
+    const bool initialized = ::infra::Log::Init(config);
+    ::infra::Log::WriteConsole(infra::LogLevel::WARN, std::string(4000, 'x'));
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     int available = 0;
     while (std::chrono::steady_clock::now() < deadline) {
@@ -403,8 +403,8 @@ TEST_F(LogFormat, PartialConsoleRecordRetiresBothAliasesWithoutAffectingErrorFil
     const auto first_count = ::recv(input.value, bytes.data(), bytes.size(), MSG_DONTWAIT);
     const bool partial = first_count > 128 && bytes[static_cast<size_t>(first_count - 1)] != '\n';
     // Draining restores writability, but neither alias may append to the prefix.
-    ::Log::WriteConsole(LogLevel::ERROR, "must-not-follow-partial-record");
-    ::Log::Shutdown();
+    ::infra::Log::WriteConsole(infra::LogLevel::ERROR, "must-not-follow-partial-record");
+    ::infra::Log::Shutdown();
     restore.Restore();
     output.Close();
     std::string after_partial;
