@@ -41,22 +41,22 @@ TEST_P(QuicUdpFrameBudget, DownlinkPreservesSourcesWithinPeerFrameBudget) {
         uint16_t packet_id = 0;
         for (size_t index = 0; count == 0 || index < count; ++index) {
             const auto wire = peer.ReadDatagram();
-            udp::Require(wire.size() >= 9 && wire.size() < frame_limit, "HY2 frame exceeds peer budget");
+            Require(wire.size() >= 9 && wire.size() < frame_limit, "HY2 frame exceeds peer budget");
             const auto view = std::string_view(wire);
-            udp::Require(ReadBigEndian(view.substr(0, 4)) == expected_session, "HY2 reply changed session");
+            Require(ReadBigEndian(view.substr(0, 4)) == expected_session, "HY2 reply changed session");
             const auto current_packet = static_cast<uint16_t>(ReadBigEndian(view.substr(4, 2)));
             const auto current_count = static_cast<uint8_t>(wire[7]);
             const auto fragment = current_count == 1 ? uint8_t{0} : static_cast<uint8_t>(wire[6]);
             if (count == 0) { count = current_count; packet_id = current_packet; }
-            udp::Require(count != 0 && current_count == count && current_packet == packet_id &&
+            Require(count != 0 && current_count == count && current_packet == packet_id &&
                 fragment < count && !received.test(fragment), "HY2 fragment identity changed");
             const size_t width = size_t{1} << (static_cast<uint8_t>(wire[8]) >> 6);
-            udp::Require(width <= wire.size() - 8, "truncated HY2 address length");
+            Require(width <= wire.size() - 8, "truncated HY2 address length");
             size_t length = static_cast<uint8_t>(wire[8]) & 0x3f;
             for (size_t byte = 1; byte < width; ++byte)
                 length = (length << 8) | static_cast<uint8_t>(wire[8 + byte]);
-            udp::Require(length <= wire.size() - 8 - width, "truncated HY2 reply address");
-            udp::Require(view.substr(8 + width, length) == expected_source,
+            Require(length <= wire.size() - 8 - width, "truncated HY2 reply address");
+            Require(view.substr(8 + width, length) == expected_source,
                 "HY2 fragment lost its source address");
             parts[fragment] = view.substr(8 + width + length);
             received.set(fragment);
@@ -68,9 +68,9 @@ TEST_P(QuicUdpFrameBudget, DownlinkPreservesSourcesWithinPeerFrameBudget) {
     auto exchange = [&](std::string_view request, std::string_view response, std::string_view response_host) {
         peer.SendDatagram(UdpWire(session, 7, 0, 1, "127.0.0.1:53", request));
         auto packet = udp::Receive(next_hop);
-        udp::Require(udp::LegacyDecrypt(packet.payload) == request_header + std::string(request),
+        Require(udp::LegacyDecrypt(packet.payload) == request_header + std::string(request),
             "HY2 to SS changed target or payload");
-        if (origin) udp::Require(origin->SameEndpoint(packet), "HY2 session replaced its SS socket");
+        if (origin) Require(origin->SameEndpoint(packet), "HY2 session replaced its SS socket");
         else {
             origin.emplace();
             origin->address = packet.address;
@@ -98,14 +98,14 @@ TEST_P(QuicUdpFrameBudget, DownlinkPreservesSourcesWithinPeerFrameBudget) {
     if (frame_limit <= 273) {
         peer.SendDatagram(UdpWire(session, 7, 0, 1, "127.0.0.1:53", "unrepresentable-response"));
         auto rejected = udp::Receive(next_hop);
-        udp::Require(udp::LegacyDecrypt(rejected.payload) == request_header + "unrepresentable-response",
+        Require(udp::LegacyDecrypt(rejected.payload) == request_header + "unrepresentable-response",
             "unrepresentable reply lost its request context");
         udp::Reply(next_hop, rejected, udp::LegacyEncrypt(SocksAddress(54321, reply_host) +
             udp::Sequence(frame_limit == 273 ? 257 : 1)));
         constexpr auto sibling = session + 1;
         peer.SendDatagram(UdpWire(sibling, 7, 0, 1, "127.0.0.1:53", "sibling-request"));
         auto sibling_packet = udp::Receive(next_hop);
-        udp::Require(udp::LegacyDecrypt(sibling_packet.payload) == request_header + "sibling-request",
+        Require(udp::LegacyDecrypt(sibling_packet.payload) == request_header + "sibling-request",
             "sibling request did not survive the oversized reply");
         const std::string_view sibling_host = frame_limit == 18 ? "c" : "127.0.0.1";
         const std::string_view sibling_reply = frame_limit == 18 ? "" : "sibling-usable";
@@ -638,15 +638,15 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
 
     auto decode_udp_reply = [](std::string_view wire, uint32_t expected_session,
                                std::string_view expected_address) {
-        udp::Require(wire.size() >= 9 &&
+        Require(wire.size() >= 9 &&
             ReadBigEndian(wire.substr(0, 4)) == expected_session &&
             static_cast<uint8_t>(wire[7]) == 1, "concurrent HY2 UDP header mismatch");
         const size_t width = size_t{1} << (static_cast<uint8_t>(wire[8]) >> 6);
-        udp::Require(width <= wire.size() - 8, "truncated concurrent HY2 UDP address width");
+        Require(width <= wire.size() - 8, "truncated concurrent HY2 UDP address width");
         size_t length = static_cast<uint8_t>(wire[8]) & 0x3f;
         for (size_t i = 1; i < width; ++i)
             length = (length << 8) | static_cast<uint8_t>(wire[8 + i]);
-        udp::Require(length <= wire.size() - 8 - width &&
+        Require(length <= wire.size() - 8 - width &&
             wire.substr(8 + width, length) == expected_address,
             "concurrent HY2 UDP source address mismatch");
         return std::string(wire.substr(8 + width + length));
@@ -1206,15 +1206,15 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
 
     auto decode_udp = [](std::string_view wire, uint32_t expected_session,
                          std::string_view expected_address) {
-        udp::Require(wire.size() >= 9 &&
+        Require(wire.size() >= 9 &&
             ReadBigEndian(wire.substr(0, 4)) == expected_session &&
             static_cast<uint8_t>(wire[7]) == 1, "matrix HY2 UDP header mismatch");
         const size_t width = size_t{1} << (static_cast<uint8_t>(wire[8]) >> 6);
-        udp::Require(width <= wire.size() - 8, "matrix HY2 UDP address width");
+        Require(width <= wire.size() - 8, "matrix HY2 UDP address width");
         size_t length = static_cast<uint8_t>(wire[8]) & 0x3f;
         for (size_t i = 1; i < width; ++i)
             length = (length << 8) | static_cast<uint8_t>(wire[8 + i]);
-        udp::Require(length <= wire.size() - 8 - width &&
+        Require(length <= wire.size() - 8 - width &&
             wire.substr(8 + width, length) == expected_address,
             "matrix HY2 UDP source address mismatch");
         return std::string(wire.substr(8 + width + length));
