@@ -31,6 +31,7 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 
@@ -199,14 +200,6 @@ std::string ComponentName(std::string_view file) {
     if (relative.empty()) {
         relative = file;
     }
-    if (relative.starts_with("acppnode") &&
-        (relative.size() == 8 || relative[8] == '/' || relative[8] == '\\')) {
-        relative.remove_prefix(8);
-        while (!relative.empty() &&
-               (relative.front() == '/' || relative.front() == '\\')) {
-            relative.remove_prefix(1);
-        }
-    }
 
     const auto extension = relative.rfind('.');
     if (extension != std::string_view::npos) {
@@ -331,7 +324,7 @@ public:
         if (record.connection && record.connection->conn_id != 0) {
             std::format_to(std::back_inserter(line_), "[{}] ", record.connection->conn_id);
         }
-        line_.append(ComponentName(record.source_file)).append(": ");
+        line_.append(CachedComponentName(record.source_file)).append(": ");
         if (record.connection) {
             const auto& context = *record.connection;
             if (!context.inbound_tag.empty()) {
@@ -371,7 +364,15 @@ private:
         std::format_to(std::back_inserter(line_), ".{:06}", timestamp_us % 1'000'000);
     }
 
+    // source_location::file_name() 指向静态存储，按指针缓存，每个源文件只解析一次。
+    std::string_view CachedComponentName(std::string_view file) {
+        auto [entry, inserted] = component_names_.try_emplace(file.data());
+        if (inserted) entry->second = ComponentName(file);
+        return entry->second;
+    }
+
     std::string line_;
+    std::unordered_map<const char*, std::string> component_names_;
     std::array<char, 32> second_prefix_{};
     size_t second_prefix_size_ = 0;
     int64_t cached_second_ = 0;

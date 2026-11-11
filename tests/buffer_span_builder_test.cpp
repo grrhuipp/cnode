@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
 #include "common/initial_payload.hpp"
 
 #include <array>

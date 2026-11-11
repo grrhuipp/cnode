@@ -1,6 +1,7 @@
 #pragma once
 
 #include "features/routing/dispatcher.hpp"
+#include "app/relay.hpp"
 #include "features/routing/router.hpp"
 #include "common/allocator.hpp"
 

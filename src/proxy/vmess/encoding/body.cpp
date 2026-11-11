@@ -1,12 +1,14 @@
-#include "body.hpp"
+#include "proxy/vmess/encoding/body.hpp"
+#include "common/scoped_cleanse.hpp"
 
 #include "app/proxyman/inbound/user_store.hpp"
 #include "app/session_group_executor.hpp"
 #include "common/address_codec.hpp"
 #include "common/allocator.hpp"
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
+#include "common/eof_cancellation.hpp"
 #include "common/byte_reader.hpp"
-#include "common/container_util.hpp"
+#include "common/hash_container_shrink.hpp"
 #include "common/error.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "common/string_hash.hpp"
@@ -114,9 +116,9 @@ std::optional<size_t> BodyChunkCipher::DecodeLength(const uint8_t* in) {
         if (length_->Decrypt(in, LengthSize(), plain) != static_cast<ssize_t>(sizeof(plain))) {
             return std::nullopt;
         }
-        return ((static_cast<size_t>(plain[0]) << 8) | plain[1]) + length_->Overhead();
+        return static_cast<size_t>(LoadU16BE(&plain[0])) + length_->Overhead();
     }
-    uint16_t wire = static_cast<uint16_t>((static_cast<uint16_t>(in[0]) << 8) | in[1]);
+    uint16_t wire = LoadU16BE(&in[0]);
     if (mask_) {
         wire ^= mask_->NextMask();
     }
@@ -589,10 +591,7 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
     ForwardedMetadataView forwarded,
     std::array<uint8_t, kRequestPacketMax>& packet) {
     std::array<uint8_t, kRequestHeaderMax> header{};
-    struct HeaderCleanseGuard {
-        std::array<uint8_t, kRequestHeaderMax>& buf;
-        ~HeaderCleanseGuard() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
-    } cleanse_header{header};
+    ScopedCleanse cleanse_header{header};
     ByteWriter writer(header.data(), header.size());
     writer.WriteU8(VERSION);
     writer.WriteBytes(request_body.iv.data(), request_body.iv.size());
@@ -621,7 +620,7 @@ tl::expected<size_t, ErrorCode> BuildRequestHeaderPacket(
     } else if (command != Command::Mux) {
         return tl::unexpected(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
-    const uint32_t checksum = FNV1a32(header.data(), header_len);
+    const uint32_t checksum = Fnv1a32(std::span<const uint8_t>(header.data(), header_len));
     header[header_len++] = static_cast<uint8_t>(checksum >> 24);
     header[header_len++] = static_cast<uint8_t>(checksum >> 16);
     header[header_len++] = static_cast<uint8_t>(checksum >> 8);
@@ -713,10 +712,7 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(
         co_return tl::unexpected(ErrorCode::CANCELLED);
     }
     std::array<uint8_t, kRequestPacketMax> packet{};
-    struct PacketCleanseGuard {
-        std::array<uint8_t, kRequestPacketMax>& buf;
-        ~PacketCleanseGuard() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
-    } cleanse_packet{packet};
+    ScopedCleanse cleanse_packet{packet};
     auto built = BuildRequestHeaderPacket(
         user, auth_id_key, target, security_, command, keys_.request,
         keys_.response_header, forwarded, packet);
@@ -800,7 +796,7 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
                 length_size != length.size()) {
                 ThrowResponseHeaderError();
             }
-            const size_t header_len = (static_cast<size_t>(length[0]) << 8) | length[1];
+            const size_t header_len = LoadU16BE(&length[0]);
             if (header_len < 4 || header_len > kResponseHeaderMax) {
                 ThrowResponseHeaderError();
             }
@@ -940,7 +936,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
     size_t pos = reader.Position();
     if (pos + 4 != len) return false;
 
-    uint32_t expected_fnv = FNV1a32(data, pos);
+    uint32_t expected_fnv = Fnv1a32(std::span<const uint8_t>(data, pos));
     uint32_t actual_fnv = reader.ReadU32BE();
 
     if (!reader.Ok() || expected_fnv != actual_fnv) {
@@ -974,13 +970,7 @@ bool OpenRequestHeader(const uint8_t* packet,
         user->cmd_key,
         std::span<const uint8_t, 16>(packet, 16),
         std::span<const uint8_t, 8>(packet + 34, 8));
-    struct PlainCleanseGuard {
-        uint8_t* data;
-        size_t len;
-        ~PlainCleanseGuard() noexcept {
-            if (len != 0) OPENSSL_cleanse(data, len);
-        }
-    } cleanse_plain{plain.data(), header_len};
+    ScopedCleanse cleanse_plain{plain};
     size_t written = 0;
     if (!AES128GCMDecryptTo(key.key.data(), key.nonce.data(), key.nonce.size(),
             packet + kRequestHeaderPrefixSize, header_len + 16, packet, 16,
@@ -1080,7 +1070,7 @@ std::pair<std::optional<VMessRequest>, size_t> ServerSession::DecodeRequestHeade
             required_header_bytes_ = 0;
             return {std::nullopt, 0};
         }
-        header_length_ = (static_cast<uint16_t>(plain[0]) << 8) | plain[1];
+        header_length_ = LoadU16BE(&plain[0]);
         constexpr size_t kMinRequestHeaderLength = 38 + 4;
         if (header_length_ < kMinRequestHeaderLength ||
             header_length_ > kRequestHeaderMax) {

@@ -2,7 +2,7 @@
 
 #include "common/allocator.hpp"
 #include "common/string_hash.hpp"
-#include "common/container_util.hpp"
+#include "common/hash_container_shrink.hpp"
 #include "app/session_group_executor.hpp"
 
 #include <string>

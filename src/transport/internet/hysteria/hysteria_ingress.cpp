@@ -1,4 +1,5 @@
-#include "hysteria_ingress.hpp"
+#include "transport/internet/hysteria/hysteria_ingress.hpp"
+#include "common/scoped_cleanse.hpp"
 
 #include "app/proxyman/inbound/user_store.hpp"
 #include "app/rate_limiter.hpp"
@@ -7,7 +8,7 @@
 #include "common/buf/multi_buffer.hpp"
 #include "common/byte_reader.hpp"
 #include "common/ip_utils.hpp"
-#include "common/container_util.hpp"
+#include "common/hash_container_shrink.hpp"
 #include "common/session.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "common/string_hash.hpp"
@@ -15,10 +16,10 @@
 #include "infra/log.hpp"
 #include "transport/internet/transport_stack.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
-#include "../reality_tls.hpp"
-#include "../../../proxy/inbound_admission.hpp"
-#include "../../../common/awaitable_task_group.hpp"
-#include "../../../app/worker/udp_receive_loop.hpp"
+#include "transport/internet/reality_tls.hpp"
+#include "proxy/inbound_admission.hpp"
+#include "common/awaitable_task_group.hpp"
+#include "app/worker/udp_receive_loop.hpp"
 #include "transport/internet/datagram_socket.hpp"
 
 #include <nghttp3/nghttp3.h>
@@ -1172,10 +1173,7 @@ void Connection::Refuse() noexcept {
 net::awaitable<Connection::AdmitResult> Connection::AdmitConnection(
     std::string_view credential) {
     auto auth_hash = HashCredential(credential);
-    struct CleanseAuthHash {
-        std::array<uint8_t, 32>& hash;
-        ~CleanseAuthHash() noexcept { OPENSSL_cleanse(hash.data(), hash.size()); }
-    } cleanse_auth_hash{auth_hash};
+    ScopedCleanse cleanse_auth_hash{auth_hash};
     auto* limiter = listener_->environment.limiter;
     while (physical_ == PhysicalAdmission::Pending && !closed_) {
         auto [error] = co_await physical_ready_.async_receive(

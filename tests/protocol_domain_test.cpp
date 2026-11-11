@@ -210,7 +210,7 @@ TEST_P(ProtocolDomainTest, VmessAuthenticatedRequestHeader) {
     plain[37] = static_cast<uint8_t>(vmess::Command::UDP);
     plain.insert(plain.end(), address.begin(), address.end());
     ASSERT_EQ(plain[41], domain.wire_size); // 加密前的实际PortFirst域名长度。
-    const uint32_t checksum = vmess::FNV1a32(plain.data(), plain.size());
+    const uint32_t checksum = Fnv1a32(std::span<const uint8_t>(plain.data(), plain.size()));
     for (size_t i = 0; i != 4; ++i) {
         plain.push_back(static_cast<uint8_t>(checksum >> (24 - i * 8)));
     }

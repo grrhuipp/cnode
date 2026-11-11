@@ -8,7 +8,7 @@
 #include "common/buf/multi_buffer.hpp"
 #include "common/error.hpp"
 #include "common/target_address.hpp"
-#include "common/unsafe.hpp"
+#include <openssl/mem.h>
 #include "core/constants.hpp"
 #include "transport/link.hpp"
 
@@ -50,7 +50,7 @@ ParseUuidBytes(std::string_view uuid) noexcept {
 }
 
 [[nodiscard]] inline std::string NormalizeFlow(std::string_view flow) {
-    return naming::LowerAscii(std::string(flow));
+    return LowerAscii(std::string(flow));
 }
 
 inline constexpr uint8_t kVersion = 0x00;
@@ -245,8 +245,8 @@ public:
                  std::array<uint8_t, 16> user_uuid,
                  VisionTrafficState& traffic);
     ~VisionReader() noexcept override {
-        ::SecureZeroMemory(user_uuid_.data(), user_uuid_.size());
-        ::SecureZeroMemory(header_.data(), header_.size());
+        OPENSSL_cleanse(user_uuid_.data(), user_uuid_.size());
+        OPENSSL_cleanse(header_.data(), header_.size());
     }
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
@@ -277,7 +277,7 @@ public:
                  std::array<uint8_t, 16> user_uuid,
                  VisionTrafficState& traffic);
     ~VisionWriter() noexcept override {
-        ::SecureZeroMemory(user_uuid_.data(), user_uuid_.size());
+        OPENSSL_cleanse(user_uuid_.data(), user_uuid_.size());
     }
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;

@@ -1,12 +1,12 @@
 #include <gtest/gtest.h>
 
 #include "../anytls_codec.hpp"
+#include "app/relay.hpp"
 #include "app/proxyman/inbound/handler.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "app/stats.hpp"
 #include "app/session_group_executor.hpp"
 #include "common/allocator.hpp"
-#include "common/buffer_util.hpp"
 #include "common/mux/mux_codec.hpp"
 #include "common/session.hpp"
 #include "features/routing/dispatcher.hpp"

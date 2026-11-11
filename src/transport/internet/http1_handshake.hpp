@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common/buf/multi_buffer.hpp"
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
 #include "common/unsafe.hpp"
 #include "transport/internet/transport_stack.hpp"
 

@@ -1,8 +1,10 @@
-#include "../../inbound_admission.hpp"
+#include "proxy/inbound_admission.hpp"
+#include "app/relay.hpp"
+#include "common/scoped_cleanse.hpp"
 #include "proxy/inbound.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "transport/async_stream.hpp"
-#include "../trojan_codec.hpp"
+#include "proxy/trojan/trojan_codec.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "features/routing/dispatcher.hpp"
@@ -45,14 +47,7 @@ ParseTrojanRequest(AsyncStream& stream,
     size_t total_read = 0;
     size_t required = ::trojan::kRequestPrefixSize;
     ::trojan::RequestDecodeResult decoded;
-    struct CleanseHandshake {
-        std::array<uint8_t, kMaxTrojanHandshakeBytes>& buf;
-        ::trojan::PasswordHash& hash;
-        ~CleanseHandshake() noexcept {
-            OPENSSL_cleanse(buf.data(), buf.size());
-            OPENSSL_cleanse(hash.data(), hash.size());
-        }
-    } cleanse_handshake{handshake_buf, decoded.request.password_hash};
+    ScopedCleanse cleanse_handshake{handshake_buf, decoded.request.password_hash};
     while (true) {
         if (required > kMaxTrojanHandshakeBytes) {
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);

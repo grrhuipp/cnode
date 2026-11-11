@@ -2,7 +2,7 @@
 
 #include "common/string_hash.hpp"
 #include "common/target_address.hpp"
-#include "common/unsafe.hpp"
+#include <openssl/mem.h>
 
 #include <openssl/aes.h>
 
@@ -49,7 +49,7 @@ struct PreparedKeyBytes {
     PreparedKeyBytes(PreparedKeyBytes&&) noexcept = default;
     PreparedKeyBytes& operator=(PreparedKeyBytes&&) noexcept = default;
     ~PreparedKeyBytes() noexcept {
-        ::SecureZeroMemory(bytes.data(), bytes.size());
+        OPENSSL_cleanse(bytes.data(), bytes.size());
     }
 
     [[nodiscard]] const uint8_t* data() const noexcept { return bytes.data(); }
@@ -77,9 +77,9 @@ struct PreparedVmessUser {
     ::UserProfile profile;
 
     ~PreparedVmessUser() noexcept {
-        ::SecureZeroMemory(uuid_bytes.data(), uuid_bytes.size());
-        ::SecureZeroMemory(cmd_key.data(), cmd_key.size());
-        ::SecureZeroMemory(auth_key.data(), auth_key.size());
+        OPENSSL_cleanse(uuid_bytes.data(), uuid_bytes.size());
+        OPENSSL_cleanse(cmd_key.data(), cmd_key.size());
+        OPENSSL_cleanse(auth_key.data(), auth_key.size());
     }
 };
 
@@ -186,9 +186,9 @@ public:
         Profile profile;
 
         ~VmessCredential() noexcept {
-            ::SecureZeroMemory(uuid_bytes.data(), uuid_bytes.size());
-            ::SecureZeroMemory(cmd_key.data(), cmd_key.size());
-            ::SecureZeroMemory(&auth_id_key, sizeof(auth_id_key));
+            OPENSSL_cleanse(uuid_bytes.data(), uuid_bytes.size());
+            OPENSSL_cleanse(cmd_key.data(), cmd_key.size());
+            OPENSSL_cleanse(&auth_id_key, sizeof(auth_id_key));
         }
     };
 

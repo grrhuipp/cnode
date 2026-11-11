@@ -1,18 +1,19 @@
 #pragma once
 
-#include "../outbound_stream_endpoint.hpp"
-#include "../uot/uot.hpp"
+#include "proxy/outbound_stream_endpoint.hpp"
+#include "app/relay.hpp"
+#include "proxy/uot/uot.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/initial_payload.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "common/target_address.hpp"
-#include "common/unsafe.hpp"
+#include <openssl/mem.h>
 #include "infra/json.hpp"
 #include "proxy/inbound.hpp"
 #include "proxy/outbound.hpp"
-#include "shadowsocks_protocol.hpp"
+#include "proxy/shadowsocks/shadowsocks_protocol.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
 #include "transport/link.hpp"
@@ -81,9 +82,9 @@ private:
         [[nodiscard]] bool operator==(const SessionKey& other) const noexcept {
             return session_id == other.session_id &&
                 credential.size == other.credential.size &&
-                ::ConstantTimeEqual(credential.bytes.data(),
+                CRYPTO_memcmp(credential.bytes.data(),
                                           other.credential.bytes.data(),
-                                          credential.size);
+                                          credential.size) == 0;
         }
     };
     struct SessionKeyHash {
@@ -146,10 +147,10 @@ struct Ss2022UdpTxState {
     Ss2022UdpTxState& operator=(Ss2022UdpTxState&&) noexcept = default;
 
     void Clear() noexcept {
-        ::SecureZeroMemory(key.bytes.data(), key.bytes.size());
+        OPENSSL_cleanse(key.bytes.data(), key.bytes.size());
         key.size = 0;
-        ::SecureZeroMemory(client_session_id.data(), client_session_id.size());
-        ::SecureZeroMemory(server_session_id.data(), server_session_id.size());
+        OPENSSL_cleanse(client_session_id.data(), client_session_id.size());
+        OPENSSL_cleanse(server_session_id.data(), server_session_id.size());
         next_packet_id = 0;
     }
 
@@ -335,15 +336,15 @@ private:
         PendingHandshake(PendingHandshake&&) noexcept = default;
         PendingHandshake& operator=(PendingHandshake&&) noexcept = default;
         ~PendingHandshake() noexcept {
-            ::SecureZeroMemory(master_key.data(), master_key.size());
+            OPENSSL_cleanse(master_key.data(), master_key.size());
         }
     };
 
     void ClearHandshakeKeys() noexcept {
         if (pending_handshake_) {
-            ::SecureZeroMemory(pending_handshake_->master_key.data(),
+            OPENSSL_cleanse(pending_handshake_->master_key.data(),
                                pending_handshake_->master_key.size());
-            ::SecureZeroMemory(pending_handshake_->request_salt.bytes.data(),
+            OPENSSL_cleanse(pending_handshake_->request_salt.bytes.data(),
                                pending_handshake_->request_salt.bytes.size());
             pending_handshake_.reset();
         }

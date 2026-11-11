@@ -4,6 +4,7 @@
 #include "app/rate_limiter.hpp"
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
+#include "common/hash.hpp"
 #include "common/session.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "common/asio_types.hpp"
@@ -200,22 +201,14 @@ struct ConnectionId {
 
 struct ConnectionIdHash {
     size_t operator()(const ConnectionId& id) const noexcept {
-        size_t hash = 1469598103934665603ULL;
-        for (size_t i = 0; i < id.size; ++i) {
-            hash ^= id.bytes[i];
-            hash *= 1099511628211ULL;
-        }
-        return hash ^ id.size;
+        return Fnv1a64(std::span<const uint8_t>(id.bytes.data(), id.size)) ^ id.size;
     }
 };
 
 class Connection;
 struct SocketState;
 
-struct SslContextDeleter {
-    void operator()(SSL_CTX* context) const noexcept { SSL_CTX_free(context); }
-};
-using SslContextPtr = std::unique_ptr<SSL_CTX, SslContextDeleter>;
+using SslContextPtr = bssl::UniquePtr<SSL_CTX>;
 
 
 class QuicStreamState final {

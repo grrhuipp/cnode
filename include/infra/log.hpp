@@ -135,97 +135,36 @@ private:
     static std::atomic_bool initialized_;
 };
 
-#define LOG_CONSOLE(fmt_str, ...) \
+// 内部宏：只有级别启用时才格式化消息；位置信息由 Write* 的默认实参在调用处取得。
+#define CNODE_LOG_IF(level, write, ...) \
     do { \
-        if (::Log::ShouldLog(::LogLevel::INFO)) \
-            ::Log::WriteConsole(::LogLevel::INFO, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
-#define LOG_CONSOLE_WARN(fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::WARN)) \
-            ::Log::WriteConsole(::LogLevel::WARN, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
-#define LOG_CONSOLE_ERROR(fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::ERROR)) \
-            ::Log::WriteConsole(::LogLevel::ERROR, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
+        if (::Log::ShouldLog(::LogLevel::level)) \
+            ::Log::write(::LogLevel::level, __VA_ARGS__); \
     } while (0)
 
-#define LOG_PANEL_INFO(ctx, fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::INFO)) \
-            ::Log::WritePanel(::LogLevel::INFO, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
-#define LOG_PANEL_WARN(ctx, fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::WARN)) \
-            ::Log::WritePanel(::LogLevel::WARN, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
-#define LOG_PANEL_ERROR(ctx, fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::ERROR)) \
-            ::Log::WritePanel(::LogLevel::ERROR, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
-#define LOG_PANEL_DEBUG(ctx, fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::DEBUG)) \
-            ::Log::WritePanel(::LogLevel::DEBUG, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
+#define LOG_CONSOLE(fmt_str, ...) CNODE_LOG_IF(INFO, WriteConsole, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
+#define LOG_CONSOLE_WARN(fmt_str, ...) CNODE_LOG_IF(WARN, WriteConsole, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
+#define LOG_CONSOLE_ERROR(fmt_str, ...) CNODE_LOG_IF(ERROR, WriteConsole, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
 
-#define LOG_DEBUG(fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::DEBUG)) \
-            ::Log::WriteSystem(::LogLevel::DEBUG, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
-#define LOG_INFO(fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::INFO)) \
-            ::Log::WriteSystem(::LogLevel::INFO, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
-#define LOG_WARN(fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::WARN)) \
-            ::Log::WriteSystem(::LogLevel::WARN, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
-#define LOG_ERROR(fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::ERROR)) \
-            ::Log::WriteSystem(::LogLevel::ERROR, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
+#define LOG_PANEL_INFO(ctx, fmt_str, ...) CNODE_LOG_IF(INFO, WritePanel, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
+#define LOG_PANEL_WARN(ctx, fmt_str, ...) CNODE_LOG_IF(WARN, WritePanel, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
+#define LOG_PANEL_ERROR(ctx, fmt_str, ...) CNODE_LOG_IF(ERROR, WritePanel, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
+#define LOG_PANEL_DEBUG(ctx, fmt_str, ...) CNODE_LOG_IF(DEBUG, WritePanel, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
 
-#define LOG_CONN_TRACE(ctx, fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::TRACE)) \
-            ::Log::WriteConnection(::LogLevel::TRACE, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
-#define LOG_CONN_DEBUG(ctx, fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::DEBUG)) \
-            ::Log::WriteConnection(::LogLevel::DEBUG, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
-#define LOG_CONN_WARN(ctx, fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::WARN)) \
-            ::Log::WriteConnection(::LogLevel::WARN, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
-#define LOG_CONN_ERROR(ctx, fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::ERROR)) \
-            ::Log::WriteConnection(::LogLevel::ERROR, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
+#define LOG_DEBUG(fmt_str, ...) CNODE_LOG_IF(DEBUG, WriteSystem, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
+#define LOG_INFO(fmt_str, ...) CNODE_LOG_IF(INFO, WriteSystem, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
+#define LOG_WARN(fmt_str, ...) CNODE_LOG_IF(WARN, WriteSystem, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
+#define LOG_ERROR(fmt_str, ...) CNODE_LOG_IF(ERROR, WriteSystem, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
+
+#define LOG_CONN_TRACE(ctx, fmt_str, ...) CNODE_LOG_IF(TRACE, WriteConnection, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
+#define LOG_CONN_DEBUG(ctx, fmt_str, ...) CNODE_LOG_IF(DEBUG, WriteConnection, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
+#define LOG_CONN_WARN(ctx, fmt_str, ...) CNODE_LOG_IF(WARN, WriteConnection, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
+#define LOG_CONN_ERROR(ctx, fmt_str, ...) CNODE_LOG_IF(ERROR, WriteConnection, ctx, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
 
 // Connection diagnostics without a session Context (transport parsing,
 // listener admission, and other pre-session paths).
-#define LOG_NET_DEBUG(fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::DEBUG)) \
-            ::Log::WriteConnection(::LogLevel::DEBUG, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
-#define LOG_NET_WARN(fmt_str, ...) \
-    do { \
-        if (::Log::ShouldLog(::LogLevel::WARN)) \
-            ::Log::WriteConnection(::LogLevel::WARN, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__)); \
-    } while (0)
+#define LOG_NET_DEBUG(fmt_str, ...) CNODE_LOG_IF(DEBUG, WriteConnection, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
+#define LOG_NET_WARN(fmt_str, ...) CNODE_LOG_IF(WARN, WriteConnection, std::format(fmt_str __VA_OPT__(,) __VA_ARGS__))
 
 #define LOG_ACCESS(message) \
     do { \

@@ -117,10 +117,6 @@ struct UserListFetchResult : ResultStatus {
     std::string etag;
     bool not_modified = false;
 
-    [[nodiscard]] bool Ok() const noexcept {
-        return ResultStatus::Ok();
-    }
-
     [[nodiscard]] static UserListFetchResult Success(
         std::vector<api::UserInfo> value, std::string etag) {
         UserListFetchResult result;

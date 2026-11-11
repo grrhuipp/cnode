@@ -1,13 +1,14 @@
 #include <gtest/gtest.h>
 
 #include "app/proxyman/inbound/handler.hpp"
+#include "app/relay.hpp"
 #include "app/stats.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "app/proxyman/outbound/handler.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"
-#include "../src/common/awaitable_task_group.hpp"
+#include "common/awaitable_task_group.hpp"
 
 #include <iostream>
 #include <stdexcept>

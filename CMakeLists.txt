@@ -31,7 +31,8 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ${CNODE_ENABLE_LTO})
 
 add_library(cnode_build_options INTERFACE)
 target_compile_features(cnode_build_options INTERFACE cxx_std_20)
-target_include_directories(cnode_build_options INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(cnode_build_options INTERFACE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_options(cnode_build_options INTERFACE
     -Wall -Wextra -Wpedantic -Wno-unused-parameter -Wno-mismatched-new-delete
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-stringop-overread;-Wno-free-nonheap-object>"

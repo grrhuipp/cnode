@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/ascii.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <format>
@@ -15,7 +17,7 @@ inline constexpr std::string_view kOutboundFile = "outbounds.json";
 inline constexpr std::string_view kRouteFile = "routing.json";
 inline constexpr std::string_view kGeoIpFile = "geoip.dat";
 inline constexpr std::string_view kGeoSiteFile = "geosite.dat";
-inline constexpr std::string_view kDefaultLogDir = "/var/log/acppnode";
+inline constexpr std::string_view kDefaultLogDir = "/var/log/cnode";
 }  // namespace paths
 
 namespace logging {
@@ -100,13 +102,6 @@ inline constexpr std::string_view kPanelNodeTagPrefix = "panel/";
 [[nodiscard]] inline std::string BuildPanelNodeAccountingKey(std::string_view panel_name,
                                                              int node_id) {
     return std::format("{}{}/{}/", kPanelNodeTagPrefix, panel_name, node_id);
-}
-
-[[nodiscard]] inline std::string LowerAscii(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](char ch) {
-        return ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch - 'A' + 'a') : ch;
-    });
-    return value;
 }
 
 [[nodiscard]] inline std::string NormalizeV2BoardApiNodeType(std::string_view node_type) {

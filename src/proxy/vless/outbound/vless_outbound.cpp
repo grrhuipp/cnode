@@ -1,16 +1,17 @@
 #include "common/domain_name.hpp"
 #include "common/ip_utils.hpp"
-#include "common/unsafe.hpp"
+#include <openssl/mem.h>
 #include "proxy/outbound.hpp"
-#include "../vless_codec.hpp"
-#include "../vless_encryption.hpp"
-#include "../../inbound_admission.hpp"
-#include "../../outbound_stream_endpoint.hpp"
+#include "proxy/vless/vless_codec.hpp"
+#include "proxy/vless/vless_encryption.hpp"
+#include "proxy/inbound_admission.hpp"
+#include "proxy/outbound_stream_endpoint.hpp"
 #include "app/dns/dns.hpp"
 #include "app/proxyman/outbound/handler.hpp"
 #include "infra/json.hpp"
 #include "app/relay.hpp"
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
+#include "common/eof_cancellation.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
 #include "common/error.hpp"
@@ -52,7 +53,7 @@ struct VlessOutboundConfig {
     VlessOutboundConfig(VlessOutboundConfig&&) noexcept = default;
     VlessOutboundConfig& operator=(VlessOutboundConfig&&) noexcept = default;
     ~VlessOutboundConfig() noexcept {
-        ::SecureZeroMemory(uuid_bytes.data(), uuid_bytes.size());
+        OPENSSL_cleanse(uuid_bytes.data(), uuid_bytes.size());
     }
 };
 
@@ -600,7 +601,7 @@ proxy::vless::outbound::Handler::Process(
         auto res = co_await DoRelayLink(
             dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
             target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-        if (encrypted_io && !res) {
+        if (encrypted_io && !res.Ok()) {
             encrypted_io->reader.RejectDeferredTicket();
         }
         co_return res;
@@ -618,7 +619,7 @@ proxy::vless::outbound::Handler::Process(
     auto res = co_await DoRelayLink(
         dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
         target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-    if (encrypted_io && !res) {
+    if (encrypted_io && !res.Ok()) {
         encrypted_io->reader.RejectDeferredTicket();
     }
     co_return res;
@@ -710,7 +711,7 @@ const bool kVlessRegistered = (::proxyman::outbound::RegisterProxy(
                 std::move(*parsed.config));
         }
 
-        packet_encoding = ::naming::LowerAscii(std::move(packet_encoding));
+        packet_encoding = LowerAscii(std::move(packet_encoding));
         if (packet_encoding.empty() || packet_encoding == "xudp") {
             vless_config.packet_xudp = true;
             vless_config.packet_addr = false;

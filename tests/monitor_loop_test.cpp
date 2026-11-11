@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "common/awaitable_batch.hpp"
+#include "common/monitor_loop.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/post.hpp>
@@ -13,7 +14,7 @@
 namespace {
 
 namespace net = ::net;
-using ::monitor_detail::MonitorLoop;
+using ::MonitorLoop;
 
 void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);

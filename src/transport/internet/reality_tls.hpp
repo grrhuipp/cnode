@@ -86,15 +86,14 @@ ParseRealityClientKeyShareExtension(
 class AutoSignCertificate {
 public:
     [[nodiscard]] static std::unique_ptr<AutoSignCertificate> Create(std::string_view identity);
-    ~AutoSignCertificate();
     AutoSignCertificate(const AutoSignCertificate&) = delete;
     AutoSignCertificate& operator=(const AutoSignCertificate&) = delete;
-    [[nodiscard]] X509* Certificate() const noexcept { return certificate_; }
-    [[nodiscard]] EVP_PKEY* Key() const noexcept { return key_; }
+    [[nodiscard]] X509* Certificate() const noexcept { return certificate_.get(); }
+    [[nodiscard]] EVP_PKEY* Key() const noexcept { return key_.get(); }
 private:
     AutoSignCertificate() = default;
-    X509* certificate_ = nullptr;
-    EVP_PKEY* key_ = nullptr;
+    bssl::UniquePtr<X509> certificate_;
+    bssl::UniquePtr<EVP_PKEY> key_;
 };
 }  // namespace transport::internet
 

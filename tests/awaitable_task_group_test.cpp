@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "allocation_hook.hpp"
-#include "awaitable_task_group.hpp"
+#include "common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/async_result.hpp>

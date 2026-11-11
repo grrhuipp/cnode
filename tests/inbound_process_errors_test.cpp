@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "app/proxyman/inbound/handler.hpp"
+#include "app/relay.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/session_group_executor.hpp"
 #include "common/allocator.hpp"
@@ -8,7 +9,7 @@
 #include "transport/internet/tls_stream.hpp"
 #include "transport/internet/transport_stack.hpp"
 #include "anytls_codec.hpp"
-#include "../src/common/awaitable_task_group.hpp"
+#include "common/awaitable_task_group.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/ascii.hpp"
+
 #include <cstddef>
 #include <string>
 #include <string_view>
@@ -10,12 +12,6 @@ enum class TrailingDotPolicy {
     Forbid,
     Allow,
 };
-
-[[nodiscard]] constexpr char ToLowerAscii(unsigned char ch) noexcept {
-    return ch >= 'A' && ch <= 'Z'
-        ? static_cast<char>(ch + ('a' - 'A'))
-        : static_cast<char>(ch);
-}
 
 [[nodiscard]] inline std::string_view WithoutTrailingRootDot(
     std::string_view hostname) noexcept {

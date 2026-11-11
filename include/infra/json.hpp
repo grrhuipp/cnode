@@ -93,6 +93,20 @@ public:
         return !(*this == other);
     }
 
+    // 以实际类型访问取值；object/array 以引用传入，不暴露内部指针。
+    template <typename Visitor>
+    decltype(auto) visit(Visitor&& visitor) const {
+        return std::visit([&](const auto& alternative) -> decltype(auto) {
+            using Alternative = std::decay_t<decltype(alternative)>;
+            if constexpr (std::is_same_v<Alternative, object_ptr> ||
+                          std::is_same_v<Alternative, array_ptr>) {
+                return visitor(*alternative);
+            } else {
+                return visitor(alternative);
+            }
+        }, data_);
+    }
+
 private:
     using data_type = std::variant<std::nullptr_t, bool, int64_t, uint64_t, double,
                                    std::string, object_ptr, array_ptr>;

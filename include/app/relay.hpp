@@ -1,10 +1,12 @@
 #pragma once
 
 #include "common/allocator.hpp"
+#include "common/defaults.hpp"
 #include "common/error.hpp"
 #include "common/session.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "transport/async_stream.hpp"
+#include "transport/failure.hpp"
 #include "app/stats.hpp"
 #include "infra/log.hpp"
 #include "transport/internet/async_delay.hpp"
@@ -21,6 +23,25 @@
 #include <cstddef>
 #include <limits>
 #include <utility>
+
+// ============================================================================
+// Relay 配置
+// ============================================================================
+struct RelayConfig {
+    std::chrono::seconds uplink_only{defaults::kUplinkOnlyTimeout};     // 下行 EOF 后上行最多保留多久
+    std::chrono::seconds downlink_only{defaults::kDownlinkOnlyTimeout}; // 上行 EOF 后下行最多保留多久
+    uint64_t speed_limit = 0;              // bytes/s，0 = 不限速
+};
+
+// ============================================================================
+// Relay 结果
+// ============================================================================
+struct RelayResult : ResultStatus {
+    uint64_t bytes_up = 0;
+    uint64_t bytes_down = 0;
+    bool client_closed_first = false;
+    bool close_side_known = false;
+};
 
 // Worker-local byte reservations. Initial credit is one second of traffic;
 // idle credit is capped at two seconds. Waiting cannot earn reserved bytes again.
@@ -197,20 +218,6 @@ net::awaitable<void> ShutdownWriteForClose(
     }
     if (!preserve_phase_deadline) {
         if constexpr (requires { control.ClearPhaseDeadline(); }) control.ClearPhaseDeadline();
-    }
-}
-
-inline ErrorCode CaptureFailure(ErrorCode unknown = ErrorCode::INTERNAL) noexcept {
-    try {
-        throw;
-    } catch (const transport::LinkError& error) {
-        return error.code();
-    } catch (const IoSystemError& error) {
-        return MapAsioError(error.code());
-    } catch (const std::bad_alloc&) {
-        return ErrorCode::RESOURCE_EXHAUSTED;
-    } catch (...) {
-        return unknown;
     }
 }
 
@@ -440,7 +447,7 @@ net::awaitable<RelayResult> DoRelayLink(
             state.Mark(operation_side_is_client);
             if (!peer.eof) arm_half_close(upload ? config.downlink_only : config.uplink_only);
         } catch (...) {
-            auto error = relay_detail::CaptureFailure(
+            auto error = transport::ClassifyFailure(std::current_exception(),
                 writing ? ErrorCode::RELAY_WRITE_FAILED : ErrorCode::INTERNAL);
             const bool timed_out = cancellation.ConsumeTimeout();
             if (timed_out) error = ErrorCode::RELAY_TIMEOUT;
@@ -468,7 +475,7 @@ net::awaitable<RelayResult> DoRelayLink(
                          direction(target, client_writer, client_control, false)) ||
                         watch_stop());
     } catch (...) {
-        cancellation.Stop(relay_detail::CaptureFailure());
+        cancellation.Stop(transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL));
     }
     if (parent_cancellation.cancelled() != net::cancellation_type::none && state.reason == ErrorCode::OK)
         state.Stop(ErrorCode::CANCELLED);
@@ -487,7 +494,8 @@ net::awaitable<RelayResult> DoRelayLink(
             } catch (...) {
                 // Capture each child's original cause before the join can wrap
                 // simultaneous failures in asio::multiple_exceptions.
-                const auto error = relay_detail::CaptureFailure(ErrorCode::RELAY_WRITE_FAILED);
+                const auto error = transport::ClassifyFailure(
+                    std::current_exception(), ErrorCode::RELAY_WRITE_FAILED);
                 state.Stop((client_shutdown_timed_out || cancellation.ConsumeTimeout())
                                ? ErrorCode::RELAY_TIMEOUT
                                : error);
@@ -517,7 +525,7 @@ net::awaitable<RelayResult> DoRelayLink(
             co_await (shutdown_client() &&
                       shutdown(target, &target, state.up.write_shutdown));
         } catch (...) {
-            const auto error = relay_detail::CaptureFailure();
+            const auto error = transport::ClassifyFailure(std::current_exception(), ErrorCode::INTERNAL);
             state.Stop((client_shutdown_timed_out || cancellation.ConsumeTimeout())
                            ? ErrorCode::RELAY_TIMEOUT
                            : error);

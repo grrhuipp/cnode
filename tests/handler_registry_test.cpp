@@ -1,13 +1,14 @@
 #include <gtest/gtest.h>
 
 #include "app/proxyman/inbound/handler.hpp"
+#include "app/relay.hpp"
 #include "app/proxyman/outbound/handler.hpp"
 #include "app/dns/dns.hpp"
 #include "common/session.hpp"
 #include "app/stats.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/outbound.hpp"
-#include "../src/common/awaitable_task_group.hpp"
+#include "common/awaitable_task_group.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <cstdio>

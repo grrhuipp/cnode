@@ -1,10 +1,10 @@
 #pragma once
 
 #include "common/defaults.hpp"
+#include "common/ascii.hpp"
 #include "core/constants.hpp"
 #include "infra/config_types.hpp"
 #include "infra/json.hpp"
-#include "transport/internet/http_headers.hpp"
 #include "transport/internet/inbound_listen.hpp"
 #include "transport/internet/proxy_protocol.hpp"
 #include "transport/internet/stream_settings.hpp"
@@ -42,7 +42,6 @@ enum class DomainStrategy : uint8_t {
 };
 
 [[nodiscard]] inline std::optional<DomainStrategy> ParseDomainStrategy(std::string_view value) {
-    using transport::internet::EqualsAsciiCI;
     if (EqualsAsciiCI(value, "asis")) return DomainStrategy::AsIs;
     if (EqualsAsciiCI(value, "useip")) return DomainStrategy::UseIP;
     if (EqualsAsciiCI(value, "useipv6v4")) return DomainStrategy::UseIPv6v4;
@@ -220,11 +219,11 @@ namespace infra {
             throw std::invalid_argument(
                 "sendThroughStrategy must be random, ip_hash, or user_hash");
         }
-        if (transport::internet::EqualsAsciiCI(strategy->as_string(), "random")) {
+        if (EqualsAsciiCI(strategy->as_string(), "random")) {
             policy = OutboundBind::ChoicePolicy::Random;
-        } else if (transport::internet::EqualsAsciiCI(strategy->as_string(), "ip_hash")) {
+        } else if (EqualsAsciiCI(strategy->as_string(), "ip_hash")) {
             policy = OutboundBind::ChoicePolicy::IpHash;
-        } else if (transport::internet::EqualsAsciiCI(strategy->as_string(), "user_hash")) {
+        } else if (EqualsAsciiCI(strategy->as_string(), "user_hash")) {
             policy = OutboundBind::ChoicePolicy::UserHash;
         } else {
             throw std::invalid_argument(
@@ -357,7 +356,7 @@ struct RealityServerInput {
     const auto* value = object.if_contains(key);
     if (!value) return fallback;
     if (value->is_string()) {
-        const auto mode = naming::LowerAscii(value->as_string());
+        const auto mode = LowerAscii(value->as_string());
         if (mode == "off") return ProxyProtocolMode::Off;
         if (mode == "auto") return ProxyProtocolMode::Auto;
         if (mode == "on") return ProxyProtocolMode::On;

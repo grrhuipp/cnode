@@ -1,13 +1,15 @@
 #include "common/mux/mux_codec.hpp"
-#include "../../inbound_admission.hpp"
+#include "app/relay.hpp"
+#include "common/scoped_cleanse.hpp"
+#include "proxy/inbound_admission.hpp"
 #include "proxy/inbound.hpp"
 #include "common/sharded_user_stats.hpp"
-#include "../vless_codec.hpp"
-#include "../vless_encryption.hpp"
+#include "proxy/vless/vless_codec.hpp"
+#include "proxy/vless/vless_encryption.hpp"
 #include "app/worker_mailbox.hpp"
 #include "app/proxyman/inbound/handler.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "common/buf/multi_buffer.hpp"
@@ -109,13 +111,7 @@ ReadVlessRequestHeader(VlessBufferedReader& active_reader,
     using ::vless::RequestHeaderDecodeStatus;
     std::array<uint8_t, ::vless::kMaxRequestHeaderSize> handshake{};
     size_t total_read = 0;
-    struct HandshakeCleanseGuard {
-        std::array<uint8_t, ::vless::kMaxRequestHeaderSize>& buf;
-        size_t& read_bytes;
-        ~HandshakeCleanseGuard() noexcept {
-            if (read_bytes > 0) OPENSSL_cleanse(buf.data(), read_bytes);
-        }
-    } cleanse_handshake{handshake, total_read};
+    ScopedCleanse cleanse_handshake{handshake};
     size_t required = 1;
     for (;;) {
         bool read_ok = false;

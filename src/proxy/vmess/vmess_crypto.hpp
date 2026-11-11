@@ -8,11 +8,12 @@
 // ============================================================================
 
 #include "app/proxyman/inbound/user_store.hpp"
-#include "../aead.hpp"
+#include "proxy/aead.hpp"
 #include "common/allocator.hpp"
+#include "common/hash.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/target_address.hpp"
-#include "common/unsafe.hpp"
+#include <openssl/mem.h>
 #include <openssl/aes.h>
 #include <openssl/ossl_typ.h>
 #include <array>
@@ -78,8 +79,8 @@ struct VMessRequest {
 
     std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> user;
     ~VMessRequest() noexcept {
-        ::SecureZeroMemory(body_iv.data(), body_iv.size());
-        ::SecureZeroMemory(body_key.data(), body_key.size());
+        OPENSSL_cleanse(body_iv.data(), body_iv.size());
+        OPENSSL_cleanse(body_key.data(), body_key.size());
     }
 };
 
@@ -89,9 +90,9 @@ struct MemoryAccount {
     std::array<uint8_t, 16> auth_key{};
 
     ~MemoryAccount() noexcept {
-        ::SecureZeroMemory(uuid_bytes.data(), uuid_bytes.size());
-        ::SecureZeroMemory(cmd_key.data(), cmd_key.size());
-        ::SecureZeroMemory(auth_key.data(), auth_key.size());
+        OPENSSL_cleanse(uuid_bytes.data(), uuid_bytes.size());
+        OPENSSL_cleanse(cmd_key.data(), cmd_key.size());
+        OPENSSL_cleanse(auth_key.data(), auth_key.size());
     }
     static std::optional<MemoryAccount> FromUUID(std::string_view uuid_str);
 };
@@ -120,8 +121,8 @@ struct HeaderAeadKey {
     std::array<uint8_t, 16> key{};
     std::array<uint8_t, 12> nonce{};
     ~HeaderAeadKey() noexcept {
-        ::SecureZeroMemory(key.data(), key.size());
-        ::SecureZeroMemory(nonce.data(), nonce.size());
+        OPENSSL_cleanse(key.data(), key.size());
+        OPENSSL_cleanse(nonce.data(), nonce.size());
     }
 };
 
@@ -161,7 +162,6 @@ bool AES128GCMEncrypt(
 // ============================================================================
 
 uint32_t CRC32(const uint8_t* data, size_t len);
-uint32_t FNV1a32(const uint8_t* data, size_t len);
 
 // ============================================================================
 // AuthID 生成（客户端使用）
@@ -184,7 +184,7 @@ public:
     VMessCipher(Security security, const uint8_t* key, const uint8_t* iv,
                 proxy::AeadDirection direction);
     ~VMessCipher() noexcept {
-        ::SecureZeroMemory(iv_.data(), iv_.size());
+        OPENSSL_cleanse(iv_.data(), iv_.size());
     }
 
     VMessCipher(const VMessCipher&)            = delete;

@@ -1,7 +1,8 @@
 #include "service/controller/controller.hpp"
 
-#include "../../common/awaitable_batch.hpp"
-#include "node_transaction.hpp"
+#include "common/awaitable_batch.hpp"
+#include "common/monitor_loop.hpp"
+#include "service/controller/node_transaction.hpp"
 
 #include "api/api.hpp"
 #include "app/prepared_inbound.hpp"
@@ -131,7 +132,7 @@ namespace {
         stream.ws.path = node_config.Path;
         if (!node_config.Host.empty()) {
             stream.ws.headers.emplace(
-                transport::internet::NormalizeHttpHeaderName("Host"),
+                LowerAscii("Host"),
                 node_config.Host);
         }
         break;
@@ -518,8 +519,8 @@ struct Controller::Impl : std::enable_shared_from_this<Controller::Impl> {
         NodeStats stats;
         std::unique_ptr<controller::TrafficJournal> traffic_journal;
         // Active loops retain Impl, which owns these address-stable entities.
-        std::weak_ptr<monitor_detail::MonitorLoop> sync_loop;
-        std::weak_ptr<monitor_detail::MonitorLoop> status_loop;
+        std::weak_ptr<MonitorLoop> sync_loop;
+        std::weak_ptr<MonitorLoop> status_loop;
     };
     std::vector<std::unique_ptr<PanelRuntime>> panels_;
 };
@@ -822,7 +823,7 @@ void Controller::Impl::Start() {
                 panel->config.Name, panel->node_id,
                 kind == LoopKind::Sync ? "sync" : "status");
             auto self = shared_from_this();
-            auto loop = std::make_shared<monitor_detail::MonitorLoop>(
+            auto loop = std::make_shared<MonitorLoop>(
                 io_context_.get_executor(), name,
                 [self, panel, kind] {
                     return kind == LoopKind::Sync

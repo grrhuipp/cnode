@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "allocation_hook.hpp"
-#include "awaitable_batch.hpp"
+#include "common/awaitable_batch.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/async_result.hpp>

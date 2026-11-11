@@ -1,8 +1,9 @@
-#include "trojan_codec.hpp"
+#include "proxy/trojan/trojan_codec.hpp"
 #include "common/address_codec.hpp"
 #include "common/binary_text_codec.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
+#include "common/eof_cancellation.hpp"
 #include "common/byte_reader.hpp"
 
 #include <algorithm>
@@ -190,7 +191,7 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
             Fail();
             throw IoSystemError(io_error::invalid_argument, "invalid Trojan UDP delimiter");
         }
-        payload_size_ = (static_cast<size_t>(header[pos]) << 8) | header[pos + 1];
+        payload_size_ = LoadU16BE(&header[pos]);
         target_.emplace(std::move(address.target));
         (void)pending_.DropPrefixBytes(pos + 4);
     }

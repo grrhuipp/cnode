@@ -1,10 +1,13 @@
-#include "vless_encryption.hpp"
+#include "proxy/vless/vless_encryption.hpp"
+#include "common/byte_reader.hpp"
+#include "common/scoped_cleanse.hpp"
 
 #include "common/allocator.hpp"
 #include "common/binary_text_codec.hpp"
 #include "app/session_group_executor.hpp"
-#include "common/buffer_util.hpp"
-#include "common/container_util.hpp"
+#include "common/const_buffer_span.hpp"
+#include "common/eof_cancellation.hpp"
+#include "common/hash_container_shrink.hpp"
 #include "common/error.hpp"
 #include "infra/log.hpp"
 #include "transport/internet/http_headers.hpp"
@@ -71,15 +74,15 @@ constexpr int kMaxPaddingLength = 18 + 65535;
 [[nodiscard]] VlessEncryptionParseError ParseMode(
     std::string_view value,
     VlessEncryptionMode& out) noexcept {
-    if (transport::internet::EqualsAsciiCI(value, "native")) {
+    if (EqualsAsciiCI(value, "native")) {
         out = VlessEncryptionMode::Native;
         return VlessEncryptionParseError::None;
     }
-    if (transport::internet::EqualsAsciiCI(value, "xorpub")) {
+    if (EqualsAsciiCI(value, "xorpub")) {
         out = VlessEncryptionMode::XorPub;
         return VlessEncryptionParseError::None;
     }
-    if (transport::internet::EqualsAsciiCI(value, "random")) {
+    if (EqualsAsciiCI(value, "random")) {
         out = VlessEncryptionMode::Random;
         return VlessEncryptionParseError::None;
     }
@@ -155,7 +158,7 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
     if (parts.size() < 4) {
         return ParseErrorResult(VlessEncryptionParseError::TooFewParts);
     }
-    if (!transport::internet::EqualsAsciiCI(parts[0], kEncryptionName)) {
+    if (!EqualsAsciiCI(parts[0], kEncryptionName)) {
         return ParseErrorResult(VlessEncryptionParseError::UnsupportedName);
     }
 
@@ -167,9 +170,9 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
     }
 
     if (role == VlessEncryptionRole::Client) {
-        if (transport::internet::EqualsAsciiCI(parts[2], "1rtt")) {
+        if (EqualsAsciiCI(parts[2], "1rtt")) {
             config.zero_rtt = false;
-        } else if (transport::internet::EqualsAsciiCI(parts[2], "0rtt")) {
+        } else if (EqualsAsciiCI(parts[2], "0rtt")) {
             config.zero_rtt = true;
         } else {
             return ParseErrorResult(VlessEncryptionParseError::InvalidRtt);
@@ -204,12 +207,7 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
         }
 
         std::vector<uint8_t> key(Base64UrlDecodedSize(part.size()));
-        struct KeyCleanseGuard {
-            std::vector<uint8_t>& buf;
-            ~KeyCleanseGuard() noexcept {
-                if (!buf.empty()) OPENSSL_cleanse(buf.data(), buf.size());
-            }
-        } cleanse_key{key};
+        ScopedCleanse cleanse_key{key};
         if (!DecodeBase64Url(part, key)) {
             return ParseErrorResult(VlessEncryptionParseError::InvalidBase64);
         }
@@ -284,7 +282,7 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
 }  // namespace
 
 bool IsNoVlessEncryption(std::string_view value) noexcept {
-    return value.empty() || transport::internet::EqualsAsciiCI(value, "none");
+    return value.empty() || EqualsAsciiCI(value, "none");
 }
 
 VlessEncryptionParseResult ParseVlessClientEncryption(
@@ -547,9 +545,7 @@ EncodeVlessEncryptionLength(size_t length) noexcept {
 
 uint16_t DecodeVlessEncryptionLength(
     std::span<const uint8_t, kVlessEncryptionLengthSize> encoded) noexcept {
-    return static_cast<uint16_t>(
-        (static_cast<uint16_t>(encoded[0]) << 8) |
-        static_cast<uint16_t>(encoded[1]));
+    return LoadU16BE(encoded.data());
 }
 
 bool EncodeVlessEncryptionRecordHeader(
@@ -569,9 +565,7 @@ bool EncodeVlessEncryptionRecordHeader(
 
 std::optional<uint16_t> DecodeVlessEncryptionRecordHeader(
     std::span<const uint8_t, kVlessEncryptionRecordHeaderSize> header) noexcept {
-    const auto length = static_cast<uint16_t>(
-        (static_cast<uint16_t>(header[3]) << 8) |
-        static_cast<uint16_t>(header[4]));
+    const uint16_t length = LoadU16BE(&header[3]);
     if (header[0] != 23 || header[1] != 3 || header[2] != 3 ||
         length < kVlessEncryptionMinRecordCiphertextSize ||
         length > kVlessEncryptionMaxRecordCiphertextSize) {

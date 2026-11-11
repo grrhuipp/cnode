@@ -3,10 +3,10 @@
 #include "app/proxyman/inbound/user_store.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
 #include "common/buf/multi_buffer.hpp"
-#include "common/buffer_util.hpp"
+#include "common/eof_cancellation.hpp"
 #include "common/byte_reader.hpp"
 #include "common/unsafe.hpp"
-#include "../aead.hpp"
+#include "proxy/aead.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/link.hpp"
 
@@ -376,7 +376,7 @@ private:
                 const auto nonce = MakeNonce(nonce_);
                 if (!cipher_.Decrypt(nonce.data(), header.data(), header.size(), plain.data()))
                     throw transport::LinkError(ErrorCode::PROTOCOL_AUTH_FAILED);
-                const size_t length = (size_t(plain[0]) << 8) | plain[1];
+                const size_t length = LoadU16BE(&plain[0]);
                 if (length > max_payload_)
                     throw transport::LinkError(ErrorCode::PROTOCOL_DECODE_FAILED);
                 length_ = length;

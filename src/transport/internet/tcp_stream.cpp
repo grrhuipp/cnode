@@ -1,8 +1,8 @@
 #include "transport/internet/tcp_stream.hpp"
 #include "common/allocator.hpp"
-#include "common/buffer_util.hpp"
+#include "common/const_buffer_span.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
-#include "connection_timeouts.hpp"
+#include "transport/internet/connection_timeouts.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/bind_allocator.hpp>

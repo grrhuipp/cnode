@@ -8,7 +8,7 @@
 // 方向，因此编码器与解码器各只保留一份实现。
 // ============================================================================
 
-#include "../vmess_crypto.hpp"
+#include "proxy/vmess/vmess_crypto.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
 #include "common/asio_types.hpp"
 #include "common/address_codec.hpp"
@@ -19,6 +19,7 @@
 #include "transport/async_stream.hpp"
 #include "transport/link.hpp"
 #include <openssl/aes.h>
+#include <openssl/mem.h>
 #include <tl/expected.hpp>
 #include <array>
 #include <cstddef>
@@ -75,8 +76,8 @@ struct BodyKey {
     std::array<uint8_t, 16> key{};
     std::array<uint8_t, 16> iv{};
     ~BodyKey() noexcept {
-        ::SecureZeroMemory(key.data(), key.size());
-        ::SecureZeroMemory(iv.data(), iv.size());
+        OPENSSL_cleanse(key.data(), key.size());
+        OPENSSL_cleanse(iv.data(), iv.size());
     }
 };
 

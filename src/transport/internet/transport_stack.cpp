@@ -1,9 +1,9 @@
 #include "transport/internet/transport_stack.hpp"
 
-#include "http1_handshake.hpp"
-#include "http2_session.hpp"
-#include "reality_tls.hpp"
-#include "xhttp_session.hpp"
+#include "transport/internet/http1_handshake.hpp"
+#include "transport/internet/http2_session.hpp"
+#include "transport/internet/reality_tls.hpp"
+#include "transport/internet/xhttp_session.hpp"
 #include "app/relay.hpp"
 #include "common/allocator.hpp"
 #include "common/session.hpp"
@@ -37,9 +37,6 @@ net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
 }
 
 namespace {
-
-using transport::internet::EqualsAsciiCI;
-using transport::internet::TrimAscii;
 
 
 [[nodiscard]] bool ReceivesSupportedReality(const StreamSettings& s) {

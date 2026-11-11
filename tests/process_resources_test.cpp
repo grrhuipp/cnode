@@ -1,11 +1,12 @@
 #include <gtest/gtest.h>
 
-#include "common/awaitable_batch.hpp"
+#include "app/process_descriptors.hpp"
 
 #include <cstdio>
 #include <type_traits>
 
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 

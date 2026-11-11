@@ -1,12 +1,11 @@
-#include "http2_session.hpp"
+#include "transport/internet/http2_session.hpp"
 #include "common/byte_reader.hpp"
 
-#include "http1_handshake.hpp"
-#include "xhttp_session.hpp"
-#include "../../common/awaitable_task_group.hpp"
+#include "transport/internet/http1_handshake.hpp"
+#include "transport/internet/xhttp_session.hpp"
+#include "common/awaitable_task_group.hpp"
 #include "common/allocator.hpp"
-#include "common/buffer_util.hpp"
-#include "common/container_util.hpp"
+#include "common/hash_container_shrink.hpp"
 #include "common/unsafe.hpp"
 #include "infra/log.hpp"
 #include "transport/internet/async_write_gate.hpp"
@@ -269,12 +268,7 @@ void AppendHpackLiteralNewName(memory::ByteVector& out,
                                std::string_view value) {
     out.push_back(0);
     AppendHpackInt(out, 7, 0, static_cast<uint32_t>(name.size()));
-    for (unsigned char ch : name) {
-        if (ch >= 'A' && ch <= 'Z') {
-            ch = static_cast<unsigned char>(ch - 'A' + 'a');
-        }
-        out.push_back(ch);
-    }
+    for (const unsigned char ch : name) out.push_back(ToLowerAscii(ch));
     AppendHpackString(out, value);
 }
 

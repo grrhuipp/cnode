@@ -1,4 +1,5 @@
 #include "app/proxyman/outbound/handler.hpp"
+#include "app/relay.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/session.hpp"
 #include "core/constants.hpp"
@@ -105,7 +106,7 @@ const bool kBlackholeRegistered = (::proxyman::outbound::RegisterProxy(
                 return std::nullopt;
             }
             if (*type) {
-                const std::string value = ::naming::LowerAscii(**type);
+                const std::string value = LowerAscii(**type);
                 if (value == ::constants::protocol::kHttp) {
                     settings.http_response = true;
                 } else if (value != ::constants::protocol::kNone) {

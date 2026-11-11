@@ -1,22 +1,16 @@
 #pragma once
 
 #include <algorithm>
-#include <array>
-#include <chrono>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <exception>
 #include <limits>
 #include <list>
 #include <map>
 #include <memory>
 #include <memory_resource>
 #include <new>
-#include <span>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -200,18 +194,7 @@ public:
         : RingDeque(alloc.resource()) {}
     RingDeque(const RingDeque& other)
         : RingDeque(other.resource_) {
-        if (!other.empty()) {
-            Reserve(other.size_);
-            try {
-                for (std::size_t i = 0; i < other.size_; ++i) {
-                    ConstructAt(data_ + size_, other[i]);
-                    ++size_;
-                }
-            } catch (...) {
-                clear();
-                throw;
-            }
-        }
+        CopyElementsFrom(other);
     }
 
     RingDeque(RingDeque&& other) noexcept
@@ -223,19 +206,13 @@ public:
 
     RingDeque& operator=(const RingDeque& other) {
         if (this != &other) {
-            RingDeque tmp(resource_);
-            if (!other.empty()) {
-                tmp.Reserve(other.size_);
-                for (std::size_t i = 0; i < other.size_; ++i) {
-                    tmp.ConstructAt(tmp.data_ + tmp.size_, other[i]);
-                    ++tmp.size_;
-                }
-            }
+            RingDeque copy(resource_);
+            copy.CopyElementsFrom(other);
             clear();
-            data_ = std::exchange(tmp.data_, nullptr);
-            head_ = std::exchange(tmp.head_, 0);
-            size_ = std::exchange(tmp.size_, 0);
-            capacity_ = std::exchange(tmp.capacity_, 0);
+            data_ = std::exchange(copy.data_, nullptr);
+            head_ = std::exchange(copy.head_, 0);
+            size_ = std::exchange(copy.size_, 0);
+            capacity_ = std::exchange(copy.capacity_, 0);
         }
         return *this;
     }
@@ -380,6 +357,51 @@ public:
     }
 
 private:
+    // 空队列按 other 的顺序拷贝元素；失败时清空并释放已取得的存储。
+    void CopyElementsFrom(const RingDeque& other) {
+        if (other.empty()) return;
+        Reserve(other.size_);
+        try {
+            for (std::size_t i = 0; i < other.size_; ++i) {
+                ConstructAt(data_ + size_, other[i]);
+                ++size_;
+            }
+        } catch (...) {
+            clear();
+            throw;
+        }
+    }
+
+    // 把现有元素按逻辑顺序搬到 next_data[offset...]；抛异常时析构已搬入的元素并
+    // 继续抛出，旧存储保持不变，next_data 由调用方释放。
+    void RelocateInto(T* next_data, std::size_t offset) {
+        std::size_t constructed = 0;
+        try {
+            for (; constructed < size_; ++constructed) {
+                ConstructRelocatedAt(next_data + offset + constructed,
+                    data_[(head_ + constructed) & (capacity_ - 1)]);
+            }
+        } catch (...) {
+            for (std::size_t i = 0; i < constructed; ++i) {
+                std::destroy_at(next_data + offset + i);
+            }
+            throw;
+        }
+    }
+
+    // 析构旧元素、释放旧存储，并接管已完成搬移的新存储。
+    void AdoptRelocated(T* next_data, std::size_t next_cap) noexcept {
+        for (std::size_t i = 0; i < size_; ++i) {
+            std::destroy_at(data_ + ((head_ + i) & (capacity_ - 1)));
+        }
+        if (data_) {
+            resource_->deallocate(data_, capacity_ * sizeof(T), alignof(T));
+        }
+        data_ = next_data;
+        head_ = 0;
+        capacity_ = next_cap;
+    }
+
     template <class... Args>
     void ConstructAt(T* ptr, Args&&... args) {
         // The live backing allocation already retains its domain resource.
@@ -422,28 +444,13 @@ private:
         if (next_cap <= capacity_) return;
         T* next_data = static_cast<T*>(
             resource_->allocate(next_cap * sizeof(T), alignof(T)));
-        std::size_t constructed = 0;
         try {
-            for (; constructed < size_; ++constructed) {
-                ConstructRelocatedAt(
-                    next_data + constructed, data_[(head_ + constructed) & (capacity_ - 1)]);
-            }
+            RelocateInto(next_data, 0);
         } catch (...) {
-            for (std::size_t i = 0; i < constructed; ++i) {
-                std::destroy_at(next_data + i);
-            }
             resource_->deallocate(next_data, next_cap * sizeof(T), alignof(T));
             throw;
         }
-        for (std::size_t i = 0; i < size_; ++i) {
-            std::destroy_at(data_ + ((head_ + i) & (capacity_ - 1)));
-        }
-        if (data_) {
-            resource_->deallocate(data_, capacity_ * sizeof(T), alignof(T));
-        }
-        data_ = next_data;
-        head_ = 0;
-        capacity_ = next_cap;
+        AdoptRelocated(next_data, next_cap);
     }
 
     // Keep allocation and relocation out of the common insertion path.
@@ -459,35 +466,20 @@ private:
         T* next_data = static_cast<T*>(
             resource_->allocate(next_cap * sizeof(T), alignof(T)));
         T* new_elem = next_data + (at_back ? size_ : 0);
-        const std::size_t old_offset = at_back ? 0 : 1;
-        bool new_constructed = false;
-        std::size_t constructed = 0;
         try {
             ConstructAt(new_elem, std::forward<Args>(args)...);
-            new_constructed = true;
-            for (; constructed < size_; ++constructed) {
-                ConstructRelocatedAt(
-                    next_data + old_offset + constructed, data_[(head_ + constructed) & (capacity_ - 1)]);
-            }
         } catch (...) {
-            for (std::size_t i = 0; i < constructed; ++i) {
-                std::destroy_at(next_data + old_offset + i);
-            }
-            if (new_constructed) {
-                std::destroy_at(new_elem);
-            }
             resource_->deallocate(next_data, next_cap * sizeof(T), alignof(T));
             throw;
         }
-        for (std::size_t i = 0; i < size_; ++i) {
-            std::destroy_at(data_ + ((head_ + i) & (capacity_ - 1)));
+        try {
+            RelocateInto(next_data, at_back ? 0 : 1);
+        } catch (...) {
+            std::destroy_at(new_elem);
+            resource_->deallocate(next_data, next_cap * sizeof(T), alignof(T));
+            throw;
         }
-        if (data_) {
-            resource_->deallocate(data_, capacity_ * sizeof(T), alignof(T));
-        }
-        data_ = next_data;
-        capacity_ = next_cap;
-        head_ = 0;
+        AdoptRelocated(next_data, next_cap);
         ++size_;
         return *new_elem;
     }

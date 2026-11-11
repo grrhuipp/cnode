@@ -13,26 +13,10 @@
 // Asio（最重，PCH 收益最大）
 // ============================================================================
 #include <asio.hpp>
-#include <asio/as_tuple.hpp>
-#include <asio/awaitable.hpp>
-#include <asio/buffer.hpp>
-#include <asio/co_spawn.hpp>
-#include <asio/connect.hpp>
-#include <asio/detached.hpp>
-#include <asio/executor_work_guard.hpp>
+// asio.hpp 总头不含实验特性与 SSL，单独列出。
 #include <asio/experimental/awaitable_operators.hpp>
 #include <asio/experimental/channel.hpp>
-#include <asio/io_context.hpp>
-#include <asio/ip/address.hpp>
-#include <asio/ip/tcp.hpp>
-#include <asio/ip/udp.hpp>
-#include <asio/read.hpp>
-#include <asio/read_until.hpp>
-#include <asio/signal_set.hpp>
 #include <asio/ssl.hpp>
-#include <asio/steady_timer.hpp>
-#include <asio/system_error.hpp>
-#include <asio/write.hpp>
 
 // liburing headers expose BLOCK_SIZE as a macro; keep it from breaking
 // third-party C++ headers that use BLOCK_SIZE as an identifier.
@@ -56,13 +40,10 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <deque>
-#include <tl/expected.hpp>
 #include <filesystem>
 #include <format>
 #include <functional>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <list>
@@ -70,11 +51,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <queue>
 #include <random>
 #include <ranges>
 #include <span>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -88,16 +67,19 @@
 // BoringSSL（OpenSSL-compatible headers）
 // ============================================================================
 #include <openssl/aes.h>
-#include <openssl/bn.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/md5.h>
 #include <openssl/rand.h>
-#include <openssl/rsa.h>
 #include <openssl/sha.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+
+// ============================================================================
+// tl::expected
+// ============================================================================
+#include <tl/expected.hpp>
 
 // ============================================================================
 // zlib

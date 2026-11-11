@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/ascii.hpp"
 #include "common/binary_text_codec.hpp"
 
 #include <limits>
@@ -12,18 +13,6 @@ namespace transport::internet {
 
 using HttpHeaders = std::unordered_map<std::string, std::string>;
 
-[[nodiscard]] constexpr bool EqualsAsciiCI(
-    std::string_view lhs, std::string_view rhs) noexcept {
-    constexpr auto lower = [](char ch) noexcept {
-        return ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch - 'A' + 'a') : ch;
-    };
-    if (lhs.size() != rhs.size()) return false;
-    for (size_t i = 0; i < lhs.size(); ++i) {
-        if (lower(lhs[i]) != lower(rhs[i])) return false;
-    }
-    return true;
-}
-
 [[nodiscard]] constexpr std::string_view TrimHttpOws(
     std::string_view value) noexcept {
     while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
@@ -32,16 +21,6 @@ using HttpHeaders = std::unordered_map<std::string, std::string>;
     while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
         value.remove_suffix(1);
     }
-    return value;
-}
-
-// Strips SP/HTAB and stray CR/LF around a header value or token.
-[[nodiscard]] constexpr std::string_view TrimAscii(std::string_view value) noexcept {
-    constexpr auto is_space = [](char ch) noexcept {
-        return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
-    };
-    while (!value.empty() && is_space(value.front())) value.remove_prefix(1);
-    while (!value.empty() && is_space(value.back())) value.remove_suffix(1);
     return value;
 }
 
@@ -199,17 +178,6 @@ using HttpHeaders = std::unordered_map<std::string, std::string>;
         }
     }
     return true;
-}
-
-[[nodiscard]] inline std::string NormalizeHttpHeaderName(
-    std::string_view name) {
-    std::string normalized(name);
-    for (char& ch : normalized) {
-        if (ch >= 'A' && ch <= 'Z') {
-            ch = static_cast<char>(ch - 'A' + 'a');
-        }
-    }
-    return normalized;
 }
 
 namespace detail {

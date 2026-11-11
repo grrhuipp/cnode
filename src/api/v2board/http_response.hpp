@@ -43,10 +43,6 @@ struct Response {
     bool not_modified = false;
 };
 
-inline std::string HeaderNameLower(std::string_view name) {
-    return naming::LowerAscii(std::string(name));
-}
-
 inline std::string TrimHeaderValue(std::string_view value) {
     return std::string(transport::internet::TrimHttpOws(value));
 }
@@ -230,7 +226,7 @@ inline void AppendTransferCodings(std::string_view value, TransferCodings& codin
             continue;
         }
         ++codings.count;
-        if (naming::LowerAscii(coding) != "chunked") {
+        if (LowerAscii(coding) != "chunked") {
             codings.only_chunked = false;
         }
     }
@@ -321,7 +317,7 @@ net::awaitable<Response> ReadResponse(Stream& stream) {
                 co_return result;
             }
 
-            const auto name = HeaderNameLower(std::string_view(line).substr(0, colon));
+            const auto name = LowerAscii(std::string_view(line).substr(0, colon));
             if (!transport::internet::IsValidHttpHeaderName(name)) {
                 result.status = -1;
                 result.body = "invalid HTTP header name";
@@ -587,10 +583,10 @@ namespace api::v2board {
     }
     if (value.is_string()) {
         const std::string_view text = value.as_string();
-        if (transport::internet::EqualsAsciiCI(text, "true")) {
+        if (EqualsAsciiCI(text, "true")) {
             return true;
         }
-        if (transport::internet::EqualsAsciiCI(text, "false")) {
+        if (EqualsAsciiCI(text, "false")) {
             return false;
         }
     }

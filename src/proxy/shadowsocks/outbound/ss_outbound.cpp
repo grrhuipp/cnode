@@ -1,13 +1,14 @@
-#include "../ss_udp.hpp"
+#include "proxy/shadowsocks/ss_udp.hpp"
+#include "common/scoped_cleanse.hpp"
 #include "common/domain_name.hpp"
 #include "common/ip_utils.hpp"
 #include "core/constants.hpp"
 #include "common/address_codec.hpp"
-#include "common/buffer_util.hpp"
+#include "common/buf/multi_buffer.hpp"
 #include "common/byte_reader.hpp"
-#include "../../uot/uot.hpp"
-#include "../../inbound_admission.hpp"
-#include "../../outbound_stream_endpoint.hpp"
+#include "proxy/uot/uot.hpp"
+#include "proxy/inbound_admission.hpp"
+#include "proxy/outbound_stream_endpoint.hpp"
 #include "app/relay.hpp"
 #include "app/proxyman/outbound/handler.hpp"
 #include "infra/json.hpp"
@@ -222,10 +223,7 @@ PrepareTCPRequest2022(const TargetAddress& target,
     }
 
     std::array<uint8_t, 32> write_subkey{};
-    struct CleanseWriteSubkey {
-        std::array<uint8_t, 32>& buf;
-        ~CleanseWriteSubkey() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
-    } cleanse_write_subkey{write_subkey};
+    ScopedCleanse cleanse_write_subkey{write_subkey};
     if (!Derive2022Subkey(master_key.data(), cipher_info.key_size,
                           prepared.request_salt.data(), prepared.request_salt.size,
                           write_subkey.data())) {
@@ -332,14 +330,7 @@ PrepareTCPRequestLegacy(const TargetAddress& target,
     }
 
     std::array<uint8_t, 64> write_subkey{};
-    struct CleanseLegacySecrets {
-        std::array<uint8_t, 64>& salt;
-        std::array<uint8_t, 64>& subkey;
-        ~CleanseLegacySecrets() noexcept {
-            OPENSSL_cleanse(salt.data(), salt.size());
-            OPENSSL_cleanse(subkey.data(), subkey.size());
-        }
-    } cleanse_legacy{client_salt, write_subkey};
+    ScopedCleanse cleanse_legacy{client_salt, write_subkey};
     if (!DeriveSubkey(master_key.data(), cipher_info.key_size,
                       client_salt.data(), cipher_info.salt_size,
                       write_subkey.data())) {
@@ -487,14 +478,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
             }
 
             std::array<uint8_t, 32> read_subkey{};
-            struct Cleanse2022ReadSecrets {
-                std::array<uint8_t, 64>& salt;
-                std::array<uint8_t, 32>& subkey;
-                ~Cleanse2022ReadSecrets() noexcept {
-                    OPENSSL_cleanse(salt.data(), salt.size());
-                    OPENSSL_cleanse(subkey.data(), subkey.size());
-                }
-            } cleanse_2022_read{server_salt, read_subkey};
+            ScopedCleanse cleanse_2022_read{server_salt, read_subkey};
             if (!Derive2022Subkey(master_key.data(), cipher_info.key_size,
                                   server_salt.data(), cipher_info.salt_size,
                                   read_subkey.data())) {
@@ -519,10 +503,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
             }
 
             std::array<uint8_t, kFixedPlainMaxSize> fixed_plain{};
-            struct CleanseFixedPlain {
-                std::array<uint8_t, kFixedPlainMaxSize>& buf;
-                ~CleanseFixedPlain() noexcept { OPENSSL_cleanse(buf.data(), buf.size()); }
-            } cleanse_fixed_plain{fixed_plain};
+            ScopedCleanse cleanse_fixed_plain{fixed_plain};
             auto nonce0 = MakeNonce(0);
             if (!read_cipher.Decrypt(nonce0.data(), fixed_cipher.data(), fixed_cipher_size,
                                      fixed_plain.data())) {
@@ -561,14 +542,7 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
         }
 
         std::array<uint8_t, 64> read_subkey{};
-        struct CleanseLegacyReadSecrets {
-            std::array<uint8_t, 64>& salt;
-            std::array<uint8_t, 64>& subkey;
-            ~CleanseLegacyReadSecrets() noexcept {
-                OPENSSL_cleanse(salt.data(), salt.size());
-                OPENSSL_cleanse(subkey.data(), subkey.size());
-            }
-        } cleanse_legacy_read{server_salt, read_subkey};
+        ScopedCleanse cleanse_legacy_read{server_salt, read_subkey};
         if (!DeriveSubkey(master_key.data(), cipher_info.key_size,
                           server_salt.data(), cipher_info.salt_size,
                           read_subkey.data())) {
@@ -1035,7 +1009,7 @@ const bool kSsOutboundRegistered = (::proxyman::outbound::RegisterProxy(
                 password = std::move(*source_key).value_or(std::string{});
             }
             if (*source_method) {
-                method = ::naming::LowerAscii(std::move(**source_method));
+                method = LowerAscii(std::move(**source_method));
             }
             auto parsed_uot = ::proxy::shadowsocks::outbound::ParseUotVersion(obj);
             if (!parsed_uot) {

@@ -6,7 +6,7 @@
 #include "app/dns/dns.hpp"
 #include "infra/json.hpp"
 #include "infra/log.hpp"
-#include "http_response.hpp"
+#include "api/v2board/http_response.hpp"
 
 #include <asio/ip/tcp.hpp>
 #include <asio/ssl.hpp>
@@ -676,7 +676,7 @@ tl::expected<uint32_t, std::string> ParseRequiredPanelUint32(
 }
 
 // Reads one alias pair; null and absent are both "not declared".
-#define ACPP_RESOLVE_OR_RETURN(var, obj, primary, secondary)                   \
+#define REALITY_ALIAS_OR_RETURN(var, obj, primary, secondary)                   \
     const auto var##_res =                                                     \
         ResolveAlias(obj, primary, secondary, "REALITY tls_settings");         \
     if (!var##_res) {                                                          \
@@ -688,7 +688,7 @@ tl::expected<std::vector<std::string>, std::string> ReadPanelStringList(
     const json::value& value, std::string_view field, bool allow_scalar) {
     std::vector<std::string> out;
     if (allow_scalar && value.is_string()) {
-        out.push_back(naming::LowerAscii(std::string(value.as_string())));
+        out.push_back(LowerAscii(std::string(value.as_string())));
         return out;
     }
     if (!value.is_array()) {
@@ -701,7 +701,7 @@ tl::expected<std::vector<std::string>, std::string> ReadPanelStringList(
             return tl::unexpected(std::format(
                 "REALITY {} must contain only strings", field));
         }
-        out.push_back(naming::LowerAscii(std::string(item.as_string())));
+        out.push_back(LowerAscii(std::string(item.as_string())));
     }
     return out;
 }
@@ -714,7 +714,7 @@ tl::expected<void, std::string> MapRealitySettings(
     RealityConfig& out) {
     infra::RealityServerInput input;
 
-    ACPP_RESOLVE_OR_RETURN(private_key, rs, "private_key", "privateKey");
+    REALITY_ALIAS_OR_RETURN(private_key, rs, "private_key", "privateKey");
     if (private_key) {
         if (!private_key->is_string()) {
             return tl::unexpected("REALITY private_key must be a string");
@@ -722,8 +722,8 @@ tl::expected<void, std::string> MapRealitySettings(
         input.private_key = std::string(private_key->as_string());
     }
 
-    ACPP_RESOLVE_OR_RETURN(server_names, rs, "server_names", "serverNames");
-    ACPP_RESOLVE_OR_RETURN(server_name, rs, "server_name", "serverName");
+    REALITY_ALIAS_OR_RETURN(server_names, rs, "server_names", "serverNames");
+    REALITY_ALIAS_OR_RETURN(server_name, rs, "server_name", "serverName");
     if (server_names) {
         auto names = ReadPanelStringList(*server_names, "server_names", false);
         if (!names) {
@@ -736,7 +736,7 @@ tl::expected<void, std::string> MapRealitySettings(
             return tl::unexpected("REALITY server_name must be a string");
         }
         std::vector<std::string> single{
-            naming::LowerAscii(std::string(server_name->as_string()))};
+            LowerAscii(std::string(server_name->as_string()))};
         if (server_names && input.server_names != single) {
             return tl::unexpected(
                 "REALITY server_names and server_name must match");
@@ -746,8 +746,8 @@ tl::expected<void, std::string> MapRealitySettings(
         input.server_names.emplace_back(tls_server_name);
     }
 
-    ACPP_RESOLVE_OR_RETURN(short_ids, rs, "short_ids", "shortIds");
-    ACPP_RESOLVE_OR_RETURN(short_id, rs, "short_id", "shortId");
+    REALITY_ALIAS_OR_RETURN(short_ids, rs, "short_ids", "shortIds");
+    REALITY_ALIAS_OR_RETURN(short_id, rs, "short_id", "shortId");
     if (short_ids) {
         auto ids = ReadPanelStringList(*short_ids, "short_ids", false);
         if (!ids) {
@@ -769,7 +769,7 @@ tl::expected<void, std::string> MapRealitySettings(
         input.short_ids.emplace_back();
     }
 
-    ACPP_RESOLVE_OR_RETURN(server_port, rs, "server_port", "serverPort");
+    REALITY_ALIAS_OR_RETURN(server_port, rs, "server_port", "serverPort");
     std::optional<uint16_t> sp_port;
     if (server_port) {
         const auto port = PanelUnsignedInteger(*server_port);
@@ -799,7 +799,7 @@ tl::expected<void, std::string> MapRealitySettings(
         input.xver = *value;
     }
 
-    ACPP_RESOLVE_OR_RETURN(mldsa65_seed, rs, "mldsa65_seed", "mldsa65Seed");
+    REALITY_ALIAS_OR_RETURN(mldsa65_seed, rs, "mldsa65_seed", "mldsa65Seed");
     if (mldsa65_seed) {
         if (!mldsa65_seed->is_string()) {
             return tl::unexpected("REALITY mldsa65_seed must be a string");
@@ -807,14 +807,14 @@ tl::expected<void, std::string> MapRealitySettings(
         input.mldsa65_seed = std::string(mldsa65_seed->as_string());
     }
 
-    ACPP_RESOLVE_OR_RETURN(min_ver, rs, "min_client_ver", "minClientVer");
+    REALITY_ALIAS_OR_RETURN(min_ver, rs, "min_client_ver", "minClientVer");
     if (min_ver) {
         if (!min_ver->is_string()) {
             return tl::unexpected("REALITY min_client_ver must be a string");
         }
         input.min_client_ver = std::string(min_ver->as_string());
     }
-    ACPP_RESOLVE_OR_RETURN(max_ver, rs, "max_client_ver", "maxClientVer");
+    REALITY_ALIAS_OR_RETURN(max_ver, rs, "max_client_ver", "maxClientVer");
     if (max_ver) {
         if (!max_ver->is_string()) {
             return tl::unexpected("REALITY max_client_ver must be a string");
@@ -822,7 +822,7 @@ tl::expected<void, std::string> MapRealitySettings(
         input.max_client_ver = std::string(max_ver->as_string());
     }
 
-    ACPP_RESOLVE_OR_RETURN(max_time, rs, "max_time_diff", "maxTimeDiff");
+    REALITY_ALIAS_OR_RETURN(max_time, rs, "max_time_diff", "maxTimeDiff");
     if (max_time) {
         const auto value = PanelUnsignedInteger(*max_time);
         if (!value) {
@@ -842,7 +842,7 @@ tl::expected<void, std::string> MapRealitySettings(
     return infra::ValidateInboundReality(out);
 }
 
-#undef ACPP_RESOLVE_OR_RETURN
+#undef REALITY_ALIAS_OR_RETURN
 
 constexpr uint64_t kBytesPerSecondPerMbps = 1024ULL * 1024ULL / 8ULL;
 constexpr uint64_t kMaxSpeedLimitMbps =
@@ -937,7 +937,7 @@ tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
     }
 
     ::api::NodeInfo config;
-    config.NodeType = naming::LowerAscii(std::string(node_type));
+    config.NodeType = LowerAscii(std::string(node_type));
     config.Port = *port;
 
     if (const auto* network = source.if_contains("network");
@@ -946,7 +946,7 @@ tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
             return tl::unexpected("network must be a string");
         }
         config.TransportProtocol =
-            naming::LowerAscii(std::string(network->as_string()));
+            LowerAscii(std::string(network->as_string()));
     }
 
     if (const auto* network_settings = source.if_contains("networkSettings");
@@ -980,7 +980,7 @@ tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
             }
             std::optional<std::string> host;
             for (const auto& [name, raw_value] : headers->as_object()) {
-                if (transport::internet::NormalizeHttpHeaderName(name) != "host") {
+                if (LowerAscii(name) != "host") {
                     continue;
                 }
                 if (!raw_value.is_string()) {
@@ -1043,7 +1043,7 @@ tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
         if (!flow->is_string()) {
             return tl::unexpected("flow must be a string");
         }
-        config.Flow = naming::LowerAscii(std::string(flow->as_string()));
+        config.Flow = LowerAscii(std::string(flow->as_string()));
     }
 
     if (const auto* server_name = source.if_contains("server_name");
@@ -1064,7 +1064,7 @@ tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
             return tl::unexpected("cipher must be a string");
         }
         config.CypherMethod =
-            naming::LowerAscii(std::string(cipher->as_string()));
+            LowerAscii(std::string(cipher->as_string()));
     }
     if (const auto* server_key = source.if_contains("server_key");
         server_key && !server_key->is_null()) {
@@ -1085,7 +1085,7 @@ tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
                 return tl::unexpected("obfs must be a string or null");
             }
             const std::string mode =
-                naming::LowerAscii(std::string(obfs->as_string()));
+                LowerAscii(std::string(obfs->as_string()));
             if (!mode.empty() && mode != constants::protocol::kNone) {
                 return tl::unexpected(
                     "Shadowsocks obfs is not supported by this runtime");
@@ -1105,7 +1105,7 @@ tl::expected<::api::NodeInfo, std::string> ParseNodeInfo(
                 return tl::unexpected("encryption must be a string or null");
             }
             const std::string mode =
-                naming::LowerAscii(std::string(encryption->as_string()));
+                LowerAscii(std::string(encryption->as_string()));
             if (!mode.empty() && mode != constants::protocol::kNone) {
                 return tl::unexpected(
                     "panel VLESS encryption is not supported by this runtime");
@@ -1333,7 +1333,7 @@ ParseUserList(const json::object& source) {
 
         auto flow = ParseOptionalString(source_user, "flow", i);
         if (!flow) return tl::unexpected(std::move(flow.error()));
-        user.Flow = naming::LowerAscii(std::move(*flow));
+        user.Flow = LowerAscii(std::move(*flow));
 
         auto speed_limit = ParseOptionalLimit(source_user, "speed_limit", i);
         if (!speed_limit) {

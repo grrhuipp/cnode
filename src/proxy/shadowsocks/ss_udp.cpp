@@ -1,9 +1,10 @@
-#include "ss_udp.hpp"
+#include "proxy/shadowsocks/ss_udp.hpp"
+#include "common/scoped_cleanse.hpp"
 #include "common/byte_reader.hpp"
-#include "shadowsocks_protocol.hpp"
+#include "proxy/shadowsocks/shadowsocks_protocol.hpp"
 #include "common/address_codec.hpp"
 #include "common/allocator.hpp"
-#include "common/container_util.hpp"
+#include "common/hash_container_shrink.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/aead.h>
@@ -418,12 +419,7 @@ struct PlaintextScratch {
     static_assert(sizeof(headers) == kSs2022UdpSeparateHeaderSize * 2);
     auto& separate = headers[0];
     auto& identity_hash = headers[1];
-    struct CleanseIdentityHeaders {
-        std::array<std::array<uint8_t, 16>, 2>& bytes;
-        ~CleanseIdentityHeaders() noexcept {
-            OPENSSL_cleanse(&bytes, sizeof(bytes));
-        }
-    } cleanse_headers{headers};
+    ScopedCleanse cleanse_headers{headers};
     PlaintextScratch scratch;
     for (size_t group = 0; group < users.size();) {
         const auto& first = users[group];
