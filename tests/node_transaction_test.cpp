@@ -62,12 +62,6 @@ void ReplaceUsers(NodeSnapshot& snapshot, size_t count) {
     snapshot.inbound = std::move(inbound);
 }
 
-PreparedNodeChange Change(std::shared_ptr<const NodeSnapshot> next, const NodeState&) {
-    PreparedNodeChange change;
-    change.next = std::move(next);
-    return change;
-}
-
 struct Resources {
     bool inbound = false;
     bool outbound = false;
@@ -222,7 +216,7 @@ TEST(NodeTransaction, CreatesCompleteRuntime) {
     Runtime runtime;
     NodeState state;
     const auto first = Snapshot(1000);
-    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(first, state))));
+    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, first)));
     EXPECT_EQ(state.committed, first);
     EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
     EXPECT_FALSE(state.HasPendingCleanup());
@@ -239,7 +233,7 @@ TEST(NodeTransaction, RefreshPublishesUsersAndRulesWithoutReplacingListener) {
     ReplaceUsers(*refresh, 2);
     refresh->users_etag = "users-2";
     refresh->rules = std::make_shared<const std::vector<::rule::DetectRule>>(2);
-    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(refresh, state))));
+    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, refresh)));
     EXPECT_EQ(state.committed, refresh);
     EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
     EXPECT_FALSE(state.HasPendingCleanup());
@@ -250,6 +244,69 @@ TEST(NodeTransaction, RefreshPublishesUsersAndRulesWithoutReplacingListener) {
     EXPECT_EQ(state.committed->users_etag, "users-2");
     EXPECT_EQ(first->users_etag, "users-1");
 }
+
+enum class RefreshPayload { Users, Rules, Validators };
+
+struct RefreshCase {
+    const char* name;
+    RefreshPayload payload;
+    size_t count;
+    bool fail_after_mutation;
+};
+
+class SelectiveNodeRefresh : public testing::TestWithParam<RefreshCase> {};
+
+TEST_P(SelectiveNodeRefresh, RetainsUnchangedResourcesAndCommitsOnlyOnSuccess) {
+    const auto& test = GetParam();
+    Runtime runtime;
+    NodeState state;
+    const auto old = Snapshot(1000);
+    Seed(runtime, state, old);
+    auto next = std::make_shared<NodeSnapshot>(*old);
+    if (test.payload == RefreshPayload::Users) {
+        next->users = std::make_shared<const std::vector<::api::UserInfo>>(test.count);
+        ReplaceUsers(*next, test.count);
+        next->users_etag = "users-2";
+    } else {
+        next->config_etag = "config-2";
+    }
+    if (test.payload == RefreshPayload::Rules) {
+        next->rules = std::make_shared<const std::vector<::rule::DetectRule>>(test.count);
+    }
+    // Unchanged resources must remain usable even when their update path fails.
+    if (test.payload != RefreshPayload::Users) {
+        runtime.faults.push_back({"users:" + old->tag});
+    }
+    if (test.payload != RefreshPayload::Rules) {
+        runtime.faults.push_back({"rules:" + old->tag});
+    }
+    if (test.fail_after_mutation) {
+        const auto operation = test.payload == RefreshPayload::Users ? "users:" : "rules:";
+        runtime.faults.push_back({operation + old->tag, 1, true});
+    }
+
+    const auto failure = RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, next));
+    EXPECT_EQ(static_cast<bool>(failure), test.fail_after_mutation);
+    EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
+    EXPECT_FALSE(state.HasPendingCleanup());
+    if (test.fail_after_mutation) {
+        EXPECT_EQ(state.committed, old);
+        ExpectMatches(runtime, *old);
+    } else {
+        EXPECT_EQ(state.committed, next);
+        ExpectMatches(runtime, *next);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(PayloadBoundaries, SelectiveNodeRefresh, testing::Values(
+    RefreshCase{"UsersChanged", RefreshPayload::Users, 2, false},
+    RefreshCase{"UsersCleared", RefreshPayload::Users, 0, false},
+    RefreshCase{"RulesChanged", RefreshPayload::Rules, 2, false},
+    RefreshCase{"RulesCleared", RefreshPayload::Rules, 0, false},
+    RefreshCase{"ValidatorsOnly", RefreshPayload::Validators, 1, false},
+    RefreshCase{"UsersMutationFailure", RefreshPayload::Users, 2, true},
+    RefreshCase{"RulesMutationFailure", RefreshPayload::Rules, 2, true}),
+    [](const testing::TestParamInfo<RefreshCase>& info) { return info.param.name; });
 
 struct TransitionFault {
     const char* name;
@@ -270,7 +327,7 @@ TEST_P(NodeTransitionFailure, RestoresCommittedRuntimeAndValidators) {
     const auto& fault = GetParam();
     const auto operation = std::string(fault.operation) + (fault.candidate ? next->tag : old->tag);
     runtime.faults.push_back({operation, 1, fault.after_mutation, fault.return_false});
-    const auto failure = RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(next, state)));
+    const auto failure = RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, next));
     EXPECT_TRUE(failure);
     if (failure && !fault.return_false) {
         try {
@@ -322,12 +379,12 @@ TEST(NodeTransaction, FailedRefreshCompensationForcesRebuild) {
     next->rules = std::make_shared<const std::vector<::rule::DetectRule>>(2);
     Seed(runtime, state, old);
     runtime.faults = {{"users:" + old->tag, 1, true}, {"rules:" + old->tag, 2, false}};
-    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(next, state))));
+    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, next)));
     EXPECT_EQ(state.committed, old);
     EXPECT_EQ(state.phase, NodeRuntimePhase::RecoveryRequired);
     EXPECT_EQ(runtime.resources.at(old->tag).rules, 2u);
     runtime.faults.clear();
-    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(old, state))));
+    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, old)));
     ExpectMatches(runtime, *old);
     EXPECT_EQ(runtime.counts["add-in:" + old->tag], 1);
 }
@@ -339,14 +396,14 @@ TEST(NodeTransaction, FailedRollbackRebuildsEvenIdenticalConfig) {
     const auto next = Snapshot(1000, 2);
     Seed(runtime, state, old);
     runtime.faults = {{"rules:" + old->tag, 1, true}, {"add-in:" + old->tag, 2, false}};
-    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(next, state))));
+    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, next)));
     EXPECT_EQ(state.committed, old);
     EXPECT_EQ(state.phase, NodeRuntimePhase::RecoveryRequired);
     EXPECT_TRUE(state.HasPendingCleanup());
     EXPECT_FALSE(runtime.resources.at(old->tag).inbound);
     const auto installs = runtime.counts["add-in:" + old->tag];
     runtime.faults.clear();
-    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(old, state))));
+    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, old)));
     EXPECT_GT(runtime.counts["add-in:" + old->tag], installs);
     ExpectMatches(runtime, *old);
     EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
@@ -361,16 +418,16 @@ TEST(NodeTransaction, OrphanCleanupBlocksCandidatesUntilRecovery) {
     const auto later = Snapshot(3000, 3);
     Seed(runtime, state, old);
     runtime.faults = {{"add-in:" + next->tag, 1, true}, {"remove-in:" + next->tag, 1, false}};
-    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(next, state))));
+    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, next)));
     EXPECT_TRUE(runtime.resources.at(next->tag).inbound);
     EXPECT_TRUE(state.HasPendingCleanup());
     runtime.faults = {{"remove-out:" + old->tag, runtime.counts["remove-out:" + old->tag] + 1, true}};
-    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(later, state))));
+    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, later)));
     ExpectEmpty(runtime, later->tag);
     EXPECT_EQ(state.committed, old);
     EXPECT_TRUE(state.HasPendingCleanup());
     runtime.faults.clear();
-    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(later, state))));
+    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, later)));
     ExpectEmpty(runtime, old->tag);
     ExpectEmpty(runtime, next->tag);
     ExpectMatches(runtime, *later);
@@ -391,7 +448,7 @@ TEST(NodeTransaction, PartialCleanupRetainsSnapshotForRecovery) {
     EXPECT_TRUE(state.HasPendingCleanup());
     EXPECT_FALSE(runtime.resources.at(old->tag).inbound);
     runtime.faults.clear();
-    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(old, state))));
+    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, old)));
     ExpectMatches(runtime, *old);
     ASSERT_TRUE(state.committed);
     EXPECT_EQ(state.committed->users_etag, "users-1");
@@ -402,7 +459,7 @@ TEST(NodeTransaction, CleansUncommittedOrphanCandidate) {
     NodeState state;
     const auto next = Snapshot(2000);
     runtime.faults = {{"add-in:" + next->tag, 1, true}, {"remove-in:" + next->tag, 1, false}};
-    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(next, state))));
+    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, next)));
     EXPECT_FALSE(state.committed);
     EXPECT_TRUE(state.HasPendingCleanup());
     runtime.faults.clear();
@@ -418,7 +475,7 @@ TEST(NodeTransaction, ReservesEndpointsBeforeFirstSuspend) {
     const auto next = Snapshot(2000);
     Seed(runtime, state, old);
     net::io_context io;
-    auto completed = net::co_spawn(io, ApplyNodeChange(runtime, state, Change(next, state)), net::use_future);
+    auto completed = net::co_spawn(io, ApplyNodeChange(runtime, state, next), net::use_future);
     EXPECT_EQ(io.poll_one(), 1u);
     EXPECT_EQ(state.phase, NodeRuntimePhase::Updating);
     EXPECT_TRUE(state.ReservesPort(1000));
@@ -447,7 +504,7 @@ TEST_P(NodeCancellation, JoinsMutationAndRecoversCommittedRuntime) {
     net::cancellation_signal cancellation;
     bool completed = false;
     std::exception_ptr failure;
-    net::co_spawn(io, ApplyNodeChange(runtime, state, Change(next, state)),
+    net::co_spawn(io, ApplyNodeChange(runtime, state, next),
         net::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr error) {
             completed = true;
             failure = error;
@@ -493,7 +550,7 @@ TEST_P(NodeCancellation, JoinsMutationAndRecoversCommittedRuntime) {
     }
     runtime.inbound_gate = nullptr;
     runtime.closed = false;
-    EXPECT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(old, state))));
+    EXPECT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, old)));
     ExpectMatches(runtime, *old);
     ExpectEmpty(runtime, next->tag);
     EXPECT_TRUE(state.ReservesPort(1000));
@@ -509,11 +566,11 @@ INSTANTIATE_TEST_SUITE_P(RuntimeAdmission, NodeCancellation, ::testing::Bool(),
     });
 
 net::awaitable<void> RecoverThenWait(Runtime& runtime, NodeState& state,
-                                   PreparedNodeChange change, net::steady_timer& wait,
+                                   std::shared_ptr<const NodeSnapshot> next, net::steady_timer& wait,
                                    bool& recovered) {
     bool failed = false;
     try {
-        co_await ApplyNodeChange(runtime, state, std::move(change));
+        co_await ApplyNodeChange(runtime, state, std::move(next));
     } catch (const MutationFailure&) {
         failed = true;
     }
@@ -536,7 +593,7 @@ TEST(NodeTransaction, RollbackDoesNotDisableFutureStop) {
     bool recovered = false;
     bool completed = false;
     std::exception_ptr failure;
-    net::co_spawn(io, RecoverThenWait(runtime, state, Change(next, state), wait, recovered),
+    net::co_spawn(io, RecoverThenWait(runtime, state, next, wait, recovered),
         net::bind_cancellation_slot(stop.slot(), [&](std::exception_ptr error) {
             completed = true;
             failure = error;
@@ -567,7 +624,7 @@ TEST(NodeTransaction, IncompleteCandidatePreservesLiveService) {
     Seed(runtime, state, old);
     auto next = std::make_shared<NodeSnapshot>(*Snapshot(1000, 2));
     next->inbound.reset();
-    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, Change(next, state))));
+    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, next)));
     EXPECT_TRUE(runtime.calls.empty());
     EXPECT_EQ(state.committed, old);
     EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
@@ -582,7 +639,7 @@ net::awaitable<void> GatedChange(
     if (hold) {
         (void)co_await hold->async_wait(net::as_tuple(net::use_awaitable));
     }
-    co_await ApplyNodeChange(runtime, state, Change(std::move(next), state));
+    co_await ApplyNodeChange(runtime, state, std::move(next));
     committed.push_back(panel);
 }
 

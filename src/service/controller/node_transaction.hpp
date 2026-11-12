@@ -55,6 +55,7 @@ namespace controller {
 
 
 // Constructed before runtime mutations and immutable after publication.
+// Refresh candidates retain the shared identity of unchanged payloads.
 struct NodeSnapshot {
     api::NodeInfo config;
     std::shared_ptr<const std::vector<api::UserInfo>> users;
@@ -93,12 +94,6 @@ struct NodeState {
         }
         return false;
     }
-};
-
-struct PreparedNodeChange {
-    std::shared_ptr<const NodeSnapshot> next;
-    bool replace_users = true;
-    bool replace_rules = true;
 };
 
 enum class NodeTransitionMode {
@@ -374,15 +369,13 @@ net::awaitable<void> CleanPendingNodeRuntime(Runtime& runtime, NodeState& state)
 
 template <typename Runtime>
 net::awaitable<void> ApplyNodeChange(
-    Runtime& runtime, NodeState& state, PreparedNodeChange change) {
+    Runtime& runtime, NodeState& state, std::shared_ptr<const NodeSnapshot> next) {
     const auto old = state.committed;
-    const auto& next = change.next;
     if (!next) throw std::logic_error("node change requires a prepared snapshot");
     const auto plan = PlanNodeTransition(old ? &old->config : nullptr,
         state.phase == NodeRuntimePhase::Ready, next->config);
     if (!next->inbound || !next->outbound || !next->inbound->users ||
-        (old && (!old->inbound || !old->outbound || !old->inbound->users)) ||
-        (plan.Transitioning() && (!change.replace_users || !change.replace_rules))) {
+        (old && (!old->inbound || !old->outbound || !old->inbound->users))) {
         throw std::logic_error("node change requires complete prepared runtime snapshots");
     }
 
@@ -418,11 +411,11 @@ net::awaitable<void> ApplyNodeChange(
     std::exception_ptr failure;
     try {
         if (!plan.Transitioning()) {
-            if (change.replace_rules) {
+            if (next->rules != old->rules) {
                 rules_attempted = true;
                 co_await runtime.UpdateRules(tag, next->rules);
             }
-            if (change.replace_users) {
+            if (next->inbound->users != old->inbound->users) {
                 users_attempted = true;
                 co_await runtime.ApplyUsers(tag, *next->inbound->users);
             }

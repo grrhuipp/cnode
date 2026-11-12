@@ -696,12 +696,9 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
         LOG_PANEL_INFO(log_context, "Panel configuration changed; recreating inbound");
     }
 
-    const bool replace_rules = !config_result.not_modified || transitioning;
-
     auto users_result = co_await panel.client->GetUserList(
         old_state ? old_state->users_etag : std::string{});
     app::ThrowIfStopping(stopping_);
-    std::optional<std::vector<api::UserInfo>> next_users;
     if (!users_result.Ok()) {
         if (transitioning) {
             throw std::runtime_error(common::ErrorMessage(
@@ -716,11 +713,10 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
             throw std::runtime_error(
                 "panel returned users not modified without a committed user snapshot");
         }
-    } else {
-        next_users = std::move(users_result.users);
     }
 
-    if (!transitioning && config_result.not_modified && !next_users) {
+    const bool users_changed = users_result.Ok() && !users_result.not_modified;
+    if (!transitioning && config_result.not_modified && !users_changed) {
         panel.state = users_result.Ok() ? PanelState::Ready : PanelState::Degraded;
         co_return;
     }
@@ -730,10 +726,10 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
     candidate->config_etag = config_result.not_modified
         ? old_state->config_etag : std::move(config_result.etag);
     candidate->tag = tag;
-    candidate->users = next_users
-        ? std::make_shared<const std::vector<api::UserInfo>>(std::move(*next_users))
+    candidate->users = users_changed
+        ? std::make_shared<const std::vector<api::UserInfo>>(std::move(users_result.users))
         : old_state->users;
-    candidate->users_etag = next_users
+    candidate->users_etag = users_changed
         ? std::move(users_result.etag) : old_state->users_etag;
     candidate->rules = config_result.not_modified
         ? old_state->rules
@@ -747,7 +743,7 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
         candidate->outbound =
             std::make_shared<const proxyman::outbound::PreparedOutboundConfig>(
                 BuildPanelAutoOutbound(tag, panel.config));
-    } else if (next_users) {
+    } else if (users_changed) {
         // Only the users changed: keep every prepared setting and rebuild the
         // authentication payload through the same per-protocol builder.
         auto inbound = std::make_shared<app::PreparedInbound>(*old_state->inbound);
@@ -760,10 +756,7 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
         candidate->inbound = old_state->inbound;
         candidate->outbound = old_state->outbound;
     }
-    controller::PreparedNodeChange change;
-    change.replace_users = next_users.has_value() || transitioning;
-    change.replace_rules = replace_rules;
-    change.next = std::move(candidate);
+    std::shared_ptr<const controller::NodeSnapshot> next = std::move(candidate);
     // Candidate data and authentication payloads are complete before
     // entering the transaction's first runtime mutation.
     // Hold fair admission before checking endpoints: another panel may
@@ -774,14 +767,14 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
         throw std::logic_error("node admission requires completed local cleanup");
     }
     for (const auto& other : panels_) {
-        if (other.get() != &panel && other->node.ReservesPort(change.next->config.Port) &&
+        if (other.get() != &panel && other->node.ReservesPort(next->config.Port) &&
             other->config.ListenIP.Overlaps(panel.config.ListenIP)) {
             throw std::runtime_error(std::format(
                 "panel listener endpoint conflict owner={}/{} port={}",
-                other->config.Name, other->node_id, change.next->config.Port));
+                other->config.Name, other->node_id, next->config.Port));
         }
     }
-    co_await controller::ApplyNodeChange(runtime, panel.node, std::move(change));
+    co_await controller::ApplyNodeChange(runtime, panel.node, std::move(next));
     app::ThrowIfStopping(stopping_);
     if (transitioning) {
         LOG_PANEL_INFO(log_context, "Panel configuration ready: tag={} replaced={}",
