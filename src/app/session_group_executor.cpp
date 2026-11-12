@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <system_error>
+#include <vector>
 
 
 struct app::GroupCoordinator::ReservedState {
@@ -30,7 +31,7 @@ struct app::GroupCoordinator::ReservedState {
     bool stopping = false;
     bool joined = false;
     std::atomic<uint32_t> worker_count{0};
-    memory::Vector<net::io_context*> workers;
+    std::vector<net::io_context*> workers;
 };
 
 namespace app {

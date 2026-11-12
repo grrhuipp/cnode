@@ -3,7 +3,6 @@
 #include "common/byte_reader.hpp"
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
 #include "common/address_codec.hpp"
-#include "common/allocator.hpp"
 #include "common/hash_container_shrink.hpp"
 
 #include <openssl/evp.h>
@@ -16,6 +15,7 @@
 #include <cstring>
 #include <limits>
 #include <span>
+#include <vector>
 
 namespace proxy::shadowsocks {
 
@@ -208,7 +208,7 @@ struct Parsed2022Body {
 
 struct PlaintextScratch {
     buf::BufferGuard pooled;
-    memory::ByteVector large;
+    std::vector<uint8_t> large;
     size_t len = 0;
 
     ~PlaintextScratch() noexcept {

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/byte_reader.hpp"
 #include "transport/internet/stream_settings.hpp"
 #include <algorithm>
@@ -14,6 +13,8 @@
 #include <openssl/ssl.h>
 #include <openssl/mem.h>
 #include <openssl/mldsa.h>
+#include <string>
+#include <vector>
 
 
 namespace transport::internet {
@@ -84,10 +85,10 @@ struct RealityClientState {
     }
     transport::internet::RealityShortId short_id{};
     std::array<uint8_t, 32> auth_key{};
-    memory::String spider_x;
+    std::string spider_x;
     const MLDSA65_public_key* mldsa65_verify_key = nullptr;
-    memory::ByteVector client_hello_raw;
-    memory::ByteVector server_hello_raw;
+    std::vector<uint8_t> client_hello_raw;
+    std::vector<uint8_t> server_hello_raw;
     bool auth_key_ready = false;
 };
 
@@ -96,7 +97,7 @@ struct RealityServerConnState {
         OPENSSL_cleanse(auth_key.data(), auth_key.size());
     }
     std::array<uint8_t, 32> auth_key{};
-    memory::ByteVector client_hello_raw;
+    std::vector<uint8_t> client_hello_raw;
 };
 
 [[nodiscard]] bool VerifyRealityClientHandshake(
@@ -111,7 +112,7 @@ void ClearRealityServerConnState(SSL* ssl) noexcept;
 
 [[nodiscard]] std::unique_ptr<RealityServerConnState>
 VerifyRealityClientHello(
-    memory::ByteVector handshake,
+    std::vector<uint8_t> handshake,
     const SslContext& ctx);
 
 // RFC 8446 sections 4.1.2 and 5.1: handshake messages may span records.
@@ -133,15 +134,15 @@ public:
     }
     void Append(std::span<const uint8_t> bytes);
     [[nodiscard]] std::span<const uint8_t> Hello() const noexcept { return hello_; }
-    [[nodiscard]] memory::ByteVector TakeHello() noexcept { return std::move(hello_); }
-    [[nodiscard]] memory::ByteVector TakeWire() noexcept { return std::move(wire_); }
+    [[nodiscard]] std::vector<uint8_t> TakeHello() noexcept { return std::move(hello_); }
+    [[nodiscard]] std::vector<uint8_t> TakeWire() noexcept { return std::move(wire_); }
 private:
     std::array<uint8_t, 5> header_{};
     size_t header_size_ = 0;
     size_t remaining_ = 0;
     size_t hello_size_ = 0;
     Status status_ = Status::Reading;
-    memory::ByteVector wire_;
-    memory::ByteVector hello_;
+    std::vector<uint8_t> wire_;
+    std::vector<uint8_t> hello_;
 };
 }  // namespace transport::internet

@@ -26,6 +26,8 @@
 #include <memory>
 #include <span>
 #include <utility>
+#include <cstdint>
+#include <vector>
 
 namespace proxy::hysteria {
 namespace {
@@ -86,7 +88,7 @@ ReadTcpRequest(transport::AsyncStream& stream, wire::Version version, session::C
                 !contiguous.empty()) {
                 target = ParseTcpRequest(version, contiguous, header_bytes);
             } else {
-                memory::Vector<uint8_t> header(inspect_bytes);
+                std::vector<uint8_t> header(inspect_bytes);
                 (void)received.CopyPrefixTo(header);
                 target = ParseTcpRequest(version, header, header_bytes);
             }

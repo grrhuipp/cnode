@@ -1,6 +1,5 @@
 #include "sniff/sniffer.hpp"
 
-#include "common/allocator.hpp"
 #include "common/byte_reader.hpp"
 #include "common/domain_name.hpp"
 #include "common/ip_utils.hpp"
@@ -20,6 +19,7 @@
 #include <cstring>
 #include <span>
 #include <string_view>
+#include <vector>
 
 namespace sniff {
 
@@ -418,7 +418,7 @@ constexpr size_t kMaxCrypto = 64 * 1024;
 constexpr size_t kMaxInputs = 64;
 
 // Explicit reservation prevents vector's geometric growth from exceeding the cap.
-void Grow(memory::ByteVector& bytes, size_t size) {
+void Grow(std::vector<uint8_t>& bytes, size_t size) {
     if (size > bytes.capacity()) {
         bytes.reserve(std::bit_ceil(std::max(size, size_t{256})));
     }
@@ -432,7 +432,7 @@ bool AesGcmDecrypt(std::span<const uint8_t, 16> key,
                    std::span<const uint8_t> unmasked_pn,
                    std::span<const uint8_t> ciphertext,
                    std::array<uint8_t, 1536>& stack_buf,
-                   memory::ByteVector& heap_buf,
+                   std::vector<uint8_t>& heap_buf,
                    std::span<const uint8_t>& plaintext) {
     if (ciphertext.size() <= 16) return false; // A QUIC packet must contain a frame.
     const auto tag = ciphertext.subspan(ciphertext.size() - 16, 16);
@@ -655,7 +655,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
 
     // Released on return: no plaintext is held while waiting for the next datagram.
     std::array<uint8_t, 1536> stack_decrypted;
-    memory::ByteVector heap_decrypted;
+    std::vector<uint8_t> heap_decrypted;
     std::span<const uint8_t> decrypted;
     size_t offset = 0;
     bool decrypted_initial = false;

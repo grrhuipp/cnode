@@ -10,7 +10,6 @@
 
 #include "app/proxyman/inbound/user_store.hpp"
 #include "proxy/aead.hpp"
-#include "common/allocator.hpp"
 #include "common/hash.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/target_address.hpp"

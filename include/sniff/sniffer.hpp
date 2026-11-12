@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/target_address.hpp"
 #include "core/constants.hpp"
 
@@ -11,6 +10,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 
 // ============================================================================
@@ -22,7 +22,7 @@ struct SniffResult {
     bool success = false;           // 是否嗅探成功
     bool need_more = false;         // 已识别协议，但还要更多字节（对齐 xray ErrProtoNeedMoreData）
     std::string_view protocol;      // 协议类型："tls", "http", "quic"（常量视图）
-    memory::String domain; // 嗅探到的域名
+    std::string domain; // 嗅探到的域名
     uint16_t port = 0;              // 嗅探到的端口（HTTP 可能有）
 };
 
@@ -60,8 +60,8 @@ public:
 
 private:
     // Stage-local, demand-grown storage; holes are tracked independently of bytes.
-    memory::ByteVector crypto_;
-    memory::ByteVector coverage_;
+    std::vector<uint8_t> crypto_;
+    std::vector<uint8_t> coverage_;
     std::array<uint8_t, 20> dcid_{};
     std::array<uint8_t, 16> hp_key_{};
     std::array<uint8_t, 16> key_{};

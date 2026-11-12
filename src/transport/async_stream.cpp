@@ -1,5 +1,4 @@
 #include "transport/async_stream.hpp"
-#include "common/allocator.hpp"
 #include "common/const_buffer_span.hpp"
 #include "transport/internet/tcp_stream.hpp"
 

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "app/relay.hpp"
 #include "common/asio_types.hpp"
 #include "common/error.hpp"
@@ -18,6 +17,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <unordered_map>
 
 namespace app {
 
@@ -154,7 +154,7 @@ struct InboundDatagramAssociationKeyHash {
 
 // One index per listener on its receiving Worker. Entries borrow the state
 // owned by a live association row; detached/prepared rows carry null entries.
-using InboundDatagramAssociationIndex = memory::UnorderedMap<
+using InboundDatagramAssociationIndex = std::unordered_map<
     InboundDatagramAssociationKey, InboundDatagramAssociation*,
     InboundDatagramAssociationKeyHash>;
 

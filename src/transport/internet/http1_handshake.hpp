@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/const_buffer_span.hpp"
 #include "common/unsafe.hpp"
@@ -27,7 +26,7 @@ namespace transport::internet {
 // owned storage only for bytes received. Bytes past the blank line are read-ahead.
 struct Http1MessageHead {
     buf::BufferGuard storage;
-    memory::String extended_storage;
+    std::string extended_storage;
     const uint8_t* bytes = nullptr;
     size_t header_end = 0;
     size_t size = 0;
@@ -139,11 +138,11 @@ struct Http1Request {
 // TLS 明文绝不进入 TCP 密文队列。
 void MoveReadAhead(AsyncStream& stream, Http1MessageHead& head);
 
-void AppendRequestStart(memory::String& request,
+void AppendRequestStart(std::string& request,
                         std::string_view method,
                         std::string_view path,
                         std::string_view host);
-void AppendHeaderLine(memory::String& out,
+void AppendHeaderLine(std::string& out,
                       std::string_view name,
                       std::string_view value);
 

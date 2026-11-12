@@ -22,7 +22,7 @@
 #include <vector>
 
 namespace {
-using Bytes = memory::Vector<uint8_t>;
+using Bytes = std::vector<uint8_t>;
 constexpr std::size_t kBytesPerWorkload = 16 * 1024 * 1024;
 constexpr std::size_t kGrowingAppends = 4;
 // Match the TLS operation's output bound; a 64 KiB append fills a fresh buffer.

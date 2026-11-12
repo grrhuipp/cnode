@@ -9,6 +9,8 @@
 #include <optional>
 #include <span>
 #include <tl/expected.hpp>
+#include <string>
+#include <vector>
 
 namespace transport::internet::h2 {
 inline constexpr size_t kHttp2FrameHeaderSize = 9;
@@ -66,7 +68,7 @@ struct H2Frame {
     H2FrameType type = H2FrameType::DATA;
     uint8_t flags = 0;
     uint32_t stream_id = 0;
-    memory::ByteVector payload;
+    std::vector<uint8_t> payload;
 };
 
 net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream);
@@ -179,12 +181,12 @@ public:
 private:
     int64_t size_ = kDefault;
 };
-[[nodiscard]] inline memory::ByteVector EncodeGrpcRequestHeaders(
+[[nodiscard]] inline std::vector<uint8_t> EncodeGrpcRequestHeaders(
     std::string_view authority,
     std::string_view path,
     bool tls,
     std::string_view user_agent) {
-    memory::ByteVector h;
+    std::vector<uint8_t> h;
     h.reserve(128 + authority.size() + path.size() + user_agent.size());
     AppendHpackIndexed(h, kHpackStaticMethodPost);
     AppendHpackIndexed(h, tls ? kHpackStaticSchemeHttps : kHpackStaticSchemeHttp);
@@ -257,7 +259,7 @@ net::awaitable<tl::expected<void, H2Error>> ReadH2HeaderFields(
     if ((frame.flags & kFlagEndHeaders) != 0) {
         co_return decode(*fragment);
     }
-    memory::ByteVector block(fragment->begin(), fragment->end());
+    std::vector<uint8_t> block(fragment->begin(), fragment->end());
     while (true) {
         auto continuation = co_await ReadH2Frame(stream);
         if (!continuation ||
@@ -276,9 +278,9 @@ net::awaitable<tl::expected<void, H2Error>> ReadH2HeaderFields(
     co_return decode(block);
 }
 struct H2RequestHeaders {
-    memory::String method;
-    memory::String path;
-    memory::String authority;
+    std::string method;
+    std::string path;
+    std::string authority;
     InboundTransportMetadata metadata;
 };
 
@@ -315,8 +317,8 @@ tl::expected<std::optional<uint32_t>, H2Error> PeerInitialWindowSetting(
     std::span<const uint8_t>);
 tl::expected<uint32_t, H2Error> WindowUpdateIncrement(const H2Frame&);
 net::awaitable<void> SendWindowUpdates(AsyncStream&, uint32_t, uint32_t, uint32_t);
-memory::ByteVector EncodeHttpRequestHeaders(std::string_view, bool, const HttpConfig&);
-memory::ByteVector EncodeHttpResponseHeaders(const HttpHeaders&);
+std::vector<uint8_t> EncodeHttpRequestHeaders(std::string_view, bool, const HttpConfig&);
+std::vector<uint8_t> EncodeHttpResponseHeaders(const HttpHeaders&);
 net::awaitable<tl::expected<std::optional<H2RequestHeaders>, H2Error>> ParseH2RequestHeaders(
     AsyncStream&, HpackDecoder&, H2Frame, std::string_view, bool);
 net::awaitable<TransportBuildResult> StartHttp2ServerSession(

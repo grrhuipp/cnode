@@ -1,7 +1,6 @@
 #include "transport/internet/http1_handshake.hpp"
 #include "common/binary_text_codec.hpp"
 
-#include "common/allocator.hpp"
 #include "common/const_buffer_span.hpp"
 #include "infra/log.hpp"
 #include "transport/internet/http_headers.hpp"
@@ -18,6 +17,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <string>
 
 namespace transport::internet {
 namespace {
@@ -377,7 +377,7 @@ private:
     }
 
     void ResetLine() noexcept {
-        memory::String{}.swap(line_);
+        std::string{}.swap(line_);
     }
 
     void ChargeBodyRead(size_t bytes) {
@@ -494,7 +494,7 @@ private:
     size_t max_trailer_lines_;
     size_t max_trailer_bytes_;
     bool count_trailer_terminator_;
-    memory::String line_;
+    std::string line_;
     size_t chunk_terminator_bytes_ = 0;
     size_t trailer_lines_ = 0;
     size_t trailer_bytes_ = 0;
@@ -659,7 +659,7 @@ net::awaitable<tl::expected<void, common::ErrorCode>> ReadHttp1MessageHead(
         head.size = head.extended_storage.size();
         head.header_end = 0;
         head.bytes = unsafe::ptr_cast<const uint8_t>(head.extended_storage.data());
-        if (head.extended_storage.empty()) memory::String{}.swap(head.extended_storage);
+        if (head.extended_storage.empty()) std::string{}.swap(head.extended_storage);
     }
     if (head.storage) {
         if (head.header_end != 0) {
@@ -1054,7 +1054,7 @@ std::string SanitizeHttpRequestLineForLog(const Http1RequestLine& line) {
     return out;
 }
 
-void AppendRequestStart(memory::String& request,
+void AppendRequestStart(std::string& request,
                         std::string_view method,
                         std::string_view path,
                         std::string_view host) {
@@ -1067,7 +1067,7 @@ void AppendRequestStart(memory::String& request,
     request.append("\r\n");
 }
 
-void AppendHeaderLine(memory::String& out,
+void AppendHeaderLine(std::string& out,
                       std::string_view name,
                       std::string_view value) {
     out.append(name);
@@ -1142,7 +1142,7 @@ ExecuteHttp1UpgradeClientHandshake(
         }
     }
 
-    memory::String request;
+    std::string request;
     request.reserve(reserve_size);
     AppendRequestStart(request, "GET", req_path, host);
     request.append("Upgrade: websocket\r\n");
@@ -1161,7 +1161,7 @@ ExecuteHttp1UpgradeClientHandshake(
     request.append("\r\n");
 
     const bool write_ok = co_await WriteFullToStream(stream, request);
-    memory::String{}.swap(request);
+    std::string{}.swap(request);
     if (!write_ok) {
         LOG_CONN_DEBUG(conn_id, "{} client failed to send upgrade request", scope);
         co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
@@ -1268,7 +1268,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
 
     RecordExtractedRealIp(request->head.Text(), cfg.real_ip_header, transport_metadata);
 
-    memory::String response;
+    std::string response;
     response.reserve(96 + cfg.headers.size() * 32);
     response.append("HTTP/1.1 200 OK\r\n");
     response.append("Cache-Control: no-store\r\n");
@@ -1305,7 +1305,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
         }
     }
 
-    memory::String request;
+    std::string request;
     request.reserve(reserve_size);
     AppendRequestStart(request, method, req_path, host);
     for (const auto& [key, value] : cfg.headers) {
@@ -1319,7 +1319,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
         LOG_CONN_DEBUG(conn_id, "HTTP client failed to send request");
         co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
-    memory::String{}.swap(request);
+    std::string{}.swap(request);
     if (auto response = co_await ReadClientResponse(*stream, "HTTP", conn_id, "200");
         !response) {
         co_return tl::unexpected(response.error());
@@ -1427,7 +1427,7 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     RecordExtractedRealIp(text, ws_cfg.real_ip_header, transport_metadata);
 
     const auto ws_accept = ws::EncodeWsAccept(ws_key);
-    memory::String response;
+    std::string response;
     response.reserve(kSwitchingProtocolsResponse.size() + 32 + ws_accept.size());
     response.append(kSwitchingProtocolsFields);
     response.append("Sec-WebSocket-Accept: ");

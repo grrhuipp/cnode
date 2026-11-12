@@ -29,6 +29,8 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <unordered_map>
+#include <vector>
 
 namespace common {
 
@@ -286,7 +288,7 @@ private:
     transport::internet::TimeoutScheduler& scheduler_;
     void* failure_context_ = nullptr;
     FailureCallback on_failure_ = nullptr;
-    memory::Vector<UdpAssociationHook*> heap_;
+    std::vector<UdpAssociationHook*> heap_;
     TimePoint armed_deadline_{};
     bool stopped_ = false;
     bool failed_ = false;
@@ -331,7 +333,7 @@ public:
         std::shared_ptr<const proxyman::inbound::ProtocolSettings> configuration,
         const proxy::InboundDatagramAssociationPolicy& policy);
 private:
-    memory::UnorderedMap<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
+    std::unordered_map<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
                          UdpHandoffIdentityHash> records_;
     UdpHandoffRecord* cursor_ = nullptr;
 };
@@ -470,11 +472,11 @@ private:
                              proxy::InboundDatagramAssociation* association) noexcept;
     void Unlink(UdpClientSession& row) noexcept;
 
-    memory::String tag_;
+    std::string tag_;
     std::unique_ptr<::proxy::Inbound> proxy_;
     UdpAssociationReclaimer& reclaimer_;
     UdpResourceBudget& budget_;
-    memory::UnorderedMap<const SocketState*, SocketStatePtr> sockets_;
+    std::unordered_map<const SocketState*, SocketStatePtr> sockets_;
     net::io_context& io_context_;
     common::SignalChannel completion_signal_;
     UdpHandoffDirectory handoff_directory_;
@@ -502,7 +504,7 @@ struct UdpSocketState final {
     UdpIngress::SocketPtr socket;
     std::optional<tcp::endpoint> local_endpoint;
     proxy::InboundDatagramAssociationIndex associations;
-    memory::UnorderedMap<ClientSessionKey, UdpIngress::UdpClientSession,
+    std::unordered_map<ClientSessionKey, UdpIngress::UdpClientSession,
                          ClientSessionKeyHash> sessions;
     memory::RingDeque<QueuedReply> pending;
     size_t queued_bytes = 0;

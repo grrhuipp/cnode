@@ -1,4 +1,5 @@
 #include "transport/internet/http2_server.hpp"
+#include <vector>
 
 namespace transport::internet::h2 {
 // The release signal lives in this frame and is published only while it
@@ -59,7 +60,7 @@ net::awaitable<void> Http2ServerSubStreamState::WaitSendCredit() {
 
 bool Http2ServerSubStreamState::EnqueueData(
     Http2ServerSession& session,
-    memory::ByteVector frame_payload,
+    std::vector<uint8_t> frame_payload,
     size_t offset,
     size_t size) {
     if (!AcceptsData()) return false;

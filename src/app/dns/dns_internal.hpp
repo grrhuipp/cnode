@@ -31,6 +31,11 @@
 #include <span>
 #include <string_view>
 #include <variant>
+#include <list>
+#include <memory_resource>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace app::dns {
 
@@ -69,7 +74,7 @@ public:
         const auto node = found->second;
         const auto now = common::steady_clock::now();
         if (now >= node->entry.expire_time) {
-            if (std::holds_alternative<memory::String>(node->entry.answer)) {
+            if (std::holds_alternative<std::pmr::string>(node->entry.answer)) {
                 // Keep only bounded recovery metadata, never serve an expired
                 // answer. It shares the cache's eviction slots, not a second map.
                 if (!node->entry.expired_negative) {
@@ -88,12 +93,12 @@ public:
 
         DnsCacheEntry& entry = node->entry;
         DnsResult result;
-        if (const auto* reason = std::get_if<memory::String>(&entry.answer)) {
+        if (const auto* reason = std::get_if<std::pmr::string>(&entry.answer)) {
             result.error = common::ErrorCode::DNS_NO_RECORD;
             result.error_msg.assign(reason->data(), reason->size());
             if (entry.negative_hits != UINT64_MAX) ++entry.negative_hits;
         } else {
-            const auto& addresses = std::get<memory::Vector<net::ip::address>>(entry.answer);
+            const auto& addresses = std::get<std::pmr::vector<net::ip::address>>(entry.answer);
             result.addresses.assign(addresses.begin(), addresses.end());
         }
         const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
@@ -121,12 +126,12 @@ public:
             return;
         }
 
-        DnsCacheEntry prepared;
+        DnsCacheEntry prepared(resource_);
         if (result.Ok()) {
-            auto& addresses = prepared.answer.emplace<memory::Vector<net::ip::address>>(resource_);
+            auto& addresses = prepared.answer.emplace<std::pmr::vector<net::ip::address>>(resource_);
             addresses.assign(result.addresses.begin(), result.addresses.end());
         } else {
-            prepared.answer.emplace<memory::String>(
+            prepared.answer.emplace<std::pmr::string>(
                 result.error_msg.data(), result.error_msg.size(), resource_);
         }
         const uint32_t ttl = result.ttl == 0 ? 0 : std::clamp(result.ttl, min_ttl_, max_ttl_);
@@ -177,22 +182,24 @@ public:
     }
 private:
     struct DnsCacheEntry {
-        std::variant<memory::Vector<net::ip::address>,
-                     memory::String> answer;
+        explicit DnsCacheEntry(std::pmr::memory_resource* resource)
+            : answer(std::in_place_type<std::pmr::vector<net::ip::address>>, resource) {}
+        std::variant<std::pmr::vector<net::ip::address>,
+                     std::pmr::string> answer;
         common::time_point expire_time;
         uint64_t negative_hits = 0;
         bool expired_negative = false;
     };
     struct CacheNode {
-        memory::String domain;
+        std::pmr::string domain;
         DnsCacheEntry entry;
 
         CacheNode(std::string_view name, DnsCacheEntry value, std::pmr::memory_resource* resource)
             : domain(name, resource), entry(std::move(value)) {}
     };
-    using NodeList = memory::List<CacheNode>;
+    using NodeList = std::pmr::list<CacheNode>;
     void Report(const CacheNode& node, std::string_view event) const noexcept {
-        const auto* reason = std::get_if<memory::String>(&node.entry.answer);
+        const auto* reason = std::get_if<std::pmr::string>(&node.entry.answer);
         if (!negative_event_ || !reason) return;
         try {
             negative_event_(std::string_view(node.domain), std::string_view(*reason),
@@ -205,7 +212,7 @@ private:
     std::pmr::memory_resource* resource_;
     // New and replaced entries move to the front. Read hits do not reorder.
     NodeList order_;
-    memory::UnorderedMap<std::string_view, NodeList::iterator> entries_;
+    std::pmr::unordered_map<std::string_view, NodeList::iterator> entries_;
     size_t capacity_;
     uint32_t min_ttl_;
     uint32_t max_ttl_;
@@ -436,7 +443,7 @@ private:
     udp::endpoint endpoint_;
     transport::internet::TimeoutScheduler& scheduler_;
     common::SignalChannel joined_;
-    memory::UnorderedMap<uint16_t, Pending*> pending_;
+    std::pmr::unordered_map<uint16_t, Pending*> pending_;
     std::array<uint8_t, 512> buffer_{};
     std::bitset<65536> used_ids_;
     size_t issued_ = 0;
@@ -453,7 +460,7 @@ class InflightResolves {
         Pending(net::io_context& io_context, std::string_view name)
             : domain(name), completion(io_context) {}
 
-        memory::String domain;
+        std::pmr::string domain;
         common::SignalChannel completion;
         std::optional<DnsResult> result;
         std::exception_ptr failure;
@@ -461,7 +468,7 @@ class InflightResolves {
         size_t waiters = 0;
     };
     using PendingPtr = std::shared_ptr<Pending>;
-    using Table = memory::UnorderedMap<std::string_view, PendingPtr>;
+    using Table = std::pmr::unordered_map<std::string_view, PendingPtr>;
 
     void Remove(Pending& pending) noexcept {
         const auto found = table_.find(std::string_view(pending.domain));

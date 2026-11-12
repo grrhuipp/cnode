@@ -22,6 +22,7 @@
 #include <atomic>
 #include <unordered_map>
 #include <asio/this_coro.hpp>
+#include <vector>
 
 namespace transport::internet {
 namespace {
@@ -395,11 +396,11 @@ private:
 
 // `close_connection` announces that the server ends the connection after this
 // response (RFC 9112 9.6); otherwise an HTTP/1.1 connection persists.
-[[nodiscard]] memory::String BuildXHttpResponseHeaders(
+[[nodiscard]] std::string BuildXHttpResponseHeaders(
     const HttpConfig& cfg,
     bool chunked_body,
     bool close_connection) {
-    memory::String response;
+    std::string response;
     response.reserve(192 + cfg.headers.size() * 32);
     response.append("HTTP/1.1 200 OK\r\n");
     response.append("X-Accel-Buffering: no\r\n");
@@ -427,9 +428,9 @@ private:
     return response;
 }
 
-[[nodiscard]] memory::String BuildEmptyHttp1Response(std::string_view status,
+[[nodiscard]] std::string BuildEmptyHttp1Response(std::string_view status,
                                                                 bool close_connection) {
-    memory::String response;
+    std::string response;
     response.reserve(64 + status.size());
     response.append("HTTP/1.1 ");
     response.append(status);
@@ -499,7 +500,7 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
     co_return payload;
 }
 
-[[nodiscard]] memory::String BuildXHttpReferer(std::string_view host,
+[[nodiscard]] std::string BuildXHttpReferer(std::string_view host,
                                                           std::string_view path,
                                                           bool tls) {
     const std::string_view scheme = tls ? "https://" : "http://";
@@ -507,7 +508,7 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
     const std::string_view req_path = detail::EffectiveHttpPath(path);
     constexpr std::string_view kPaddingKey = "x_padding=";
 
-    memory::String referer;
+    std::string referer;
     referer.reserve(scheme.size() + host_part.size() + req_path.size() + 1 +
                     kPaddingKey.size() + kXHttpRefererPadding.size());
     referer.append(scheme);
@@ -555,7 +556,7 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
            common::EqualsAsciiCI(key, "Transfer-Encoding");
 }
 
-[[nodiscard]] memory::String BuildXHttp1ClientRequest(
+[[nodiscard]] std::string BuildXHttp1ClientRequest(
     const HttpConfig& cfg,
     std::string_view host,
     std::string_view content_length,
@@ -566,7 +567,7 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
     const size_t reserve_size = 224 + method.size() + req_path.size() + host.size() +
                                 content_length.size() + cfg.headers.size() * 32;
 
-    memory::String request;
+    std::string request;
     request.reserve(reserve_size);
     AppendRequestStart(request, method, req_path, host);
     if (chunked_upload) {
@@ -858,8 +859,8 @@ public:
         const bool inserting = found == sessions_.end();
         if (found == sessions_.end()) {
             ::transport::internet::detail::XHttpPacketSessionKey key{
-                .session_id = memory::String(id),
-                .session_namespace = memory::String(session_namespace),
+                .session_id = std::string(id),
+                .session_namespace = std::string(session_namespace),
             };
             found = sessions_.try_emplace(std::move(key)).first;
         }
@@ -924,7 +925,7 @@ private:
         entry.previous = entry.next = nullptr;
     }
 
-    memory::UnorderedMap<
+    std::unordered_map<
         ::transport::internet::detail::XHttpPacketSessionKey, XHttpSessionTableEntry,
         ::transport::internet::detail::XHttpPacketSessionKeyHash,
         ::transport::internet::detail::XHttpPacketSessionKeyEq> sessions_;
@@ -1973,7 +1974,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
     }
 
     const bool chunked_upload = kind == XHttpClientRequestKind::StreamUp;
-    const memory::String request = BuildXHttp1ClientRequest(
+    const std::string request = BuildXHttp1ClientRequest(
         cfg, host, content_length, chunked_upload);
     if (chunked_upload) {
         // Send the head and initial chunk together; an owned reader drains

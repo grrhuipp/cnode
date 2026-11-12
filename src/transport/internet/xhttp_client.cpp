@@ -1,6 +1,5 @@
 #include "transport/internet/xhttp_client.hpp"
 
-#include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/const_buffer_span.hpp"
 #include "common/ip_utils.hpp"
@@ -22,6 +21,8 @@
 #include <span>
 #include <string_view>
 #include <utility>
+#include <string>
+#include <vector>
 
 namespace transport::internet {
 
@@ -36,10 +37,10 @@ namespace {
     return std::nullopt;
 }
 
-[[nodiscard]] memory::String BuildXHttpSplitPath(
+[[nodiscard]] std::string BuildXHttpSplitPath(
     const XHttpConfig& cfg,
     std::string_view session_id) {
-    memory::String path(cfg.normalized_path);
+    std::string path(cfg.normalized_path);
     path.append(session_id);
     return path;
 }
@@ -112,7 +113,7 @@ protected:
                                  std::unique_ptr<AsyncStream> downlink,
                                  const OutboundTransportTarget& target,
                                  const OutboundDialCandidate& candidate,
-                                 memory::String upload_path,
+                                 std::string upload_path,
                                  uint64_t conn_id,
                                  const char* missing_settings_error)
         : io_context_(io_context)
@@ -127,7 +128,7 @@ protected:
         }
         upload_path_.reserve(base_upload_path_size_ + 21);
         target_.single_candidate = candidate_;
-        memory::Vector<OutboundDialCandidate>{target_.candidates.get_allocator()}.swap(target_.candidates);
+        std::vector<OutboundDialCandidate>{target_.candidates.get_allocator()}.swap(target_.candidates);
         target_.xhttp_download_target.reset();
     }
 
@@ -326,7 +327,7 @@ protected:
     TcpStream* in_flight_upload_tcp_ = nullptr;
     OutboundTransportTarget target_;
     OutboundDialCandidate candidate_;
-    memory::String upload_path_;
+    std::string upload_path_;
     size_t base_upload_path_size_ = 0;
     transport::internet::AsyncWriteGate upload_gate_;
     DownlinkCancellation downlink_cancel_{*this};
@@ -353,7 +354,7 @@ public:
                            std::unique_ptr<AsyncStream> downlink,
                            const OutboundTransportTarget& target,
                            const OutboundDialCandidate& candidate,
-                           memory::String upload_path,
+                           std::string upload_path,
                            uint64_t conn_id)
         : XHttpSplitOutboundStreamBase(
               io_context,
@@ -660,7 +661,7 @@ public:
                               std::unique_ptr<AsyncStream> downlink,
                               const OutboundTransportTarget& target,
                               const OutboundDialCandidate& candidate,
-                              memory::String upload_path,
+                              std::string upload_path,
                               uint64_t conn_id)
         : XHttpSplitOutboundStreamBase(
               io_context,
@@ -844,9 +845,9 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
 
     const XHttpSessionId session_id = GenerateXHttpSessionId();
     const std::string_view session_id_text(session_id.data(), session_id.size());
-    const memory::String downlink_path = BuildXHttpSplitPath(
+    const std::string downlink_path = BuildXHttpSplitPath(
         downlink_target.stream_settings->xhttp, session_id_text);
-    const memory::String upload_path = BuildXHttpSplitPath(
+    const std::string upload_path = BuildXHttpSplitPath(
         target.stream_settings->xhttp, session_id_text);
 
     DialResult last_result =

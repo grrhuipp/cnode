@@ -1,7 +1,6 @@
 #pragma once
 
 #include "app/proxyman/inbound/user_store.hpp"
-#include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/target_address.hpp"
 #include "proxy/inbound.hpp"
@@ -22,6 +21,7 @@
 #include <utility>
 #include <vector>
 #include <variant>
+#include <unordered_map>
 
 namespace app {
 
@@ -93,7 +93,7 @@ private:
 
     void PruneExpired(std::chrono::steady_clock::time_point now);
 
-    memory::UnorderedMap<SessionKey, Session, SessionKeyHash> sessions_;
+    std::unordered_map<SessionKey, Session, SessionKeyHash> sessions_;
 };
 
 // The sole SS2022 path/replay authority, retained by the ingress directory

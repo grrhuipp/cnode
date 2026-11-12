@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+#include <vector>
 namespace proxy::vmess {
 
 std::array<uint8_t, 16> MD5Hash(const uint8_t* data, size_t len) {
@@ -121,7 +122,7 @@ void VmessKdfRecursive(
     }
 
     alignas(16) uint8_t inner_stack[512];
-    memory::ByteVector inner_heap;
+    std::vector<uint8_t> inner_heap;
     uint8_t* inner_input = inner_stack;
     if (64 + data_len > sizeof(inner_stack)) {
         inner_heap.resize(64 + data_len);

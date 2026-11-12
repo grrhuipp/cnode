@@ -6,6 +6,8 @@
 #include <map>
 #include <stdexcept>
 #include <utility>
+#include <string>
+#include <vector>
 
 namespace proxyman::outbound {
 
@@ -47,7 +49,7 @@ HandlerRegistry::HandlerRegistry(
     handlers_.reserve(configurations.size());
     for (const auto& configuration : configurations) {
         auto handler = Instantiate(configuration);
-        if (!handlers_.try_emplace(memory::String(configuration.tag), std::move(handler)).second) {
+        if (!handlers_.try_emplace(std::string(configuration.tag), std::move(handler)).second) {
             throw std::logic_error(
                 "duplicate prepared outbound tag '" + configuration.tag + "'");
         }
@@ -68,7 +70,7 @@ void HandlerRegistry::Replace(const PreparedOutboundConfig& configuration) {
         it->second = std::move(handler);
         return;
     }
-    handlers_.try_emplace(memory::String(configuration.tag), std::move(handler));
+    handlers_.try_emplace(std::string(configuration.tag), std::move(handler));
 }
 
 void HandlerRegistry::Remove(std::string_view tag) {

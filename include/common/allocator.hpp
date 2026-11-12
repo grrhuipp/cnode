@@ -4,18 +4,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <list>
-#include <map>
 #include <memory>
 #include <memory_resource>
 #include <new>
 #include <stdexcept>
-#include <string>
 #include <type_traits>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
-#include <vector>
 
 #include <mimalloc.h>
 
@@ -114,66 +108,6 @@ inline void CollectThreadHeap() noexcept {
     mi_collect(true);
 }
 
-// PMR allocator bound to one resource. Defaults use the process layer; copies
-// preserve the resource, and move assignment/swap carry it along.
-template <class T>
-class Allocator {
-    template <class U>
-    struct UsesAllocatorConstruction
-        : std::uses_allocator<U, std::pmr::polymorphic_allocator<T>> {};
-    // [allocator.uses.construction] propagates into pair members even though
-    // uses_allocator<pair<...>> itself is false.
-    template <class First, class Second>
-    struct UsesAllocatorConstruction<std::pair<First, Second>> : std::true_type {};
-
-public:
-    using value_type = T;
-    using propagate_on_container_move_assignment = std::true_type;
-    using propagate_on_container_swap = std::true_type;
-    Allocator() noexcept : resource_(process_resource()) {}
-    Allocator(std::pmr::memory_resource* resource) noexcept
-        : resource_(ResourceOrProcess(resource)) {}
-    Allocator(const Allocator&) noexcept = default;
-    Allocator& operator=(const Allocator&) noexcept = default;
-    Allocator(Allocator&&) noexcept = default;
-    Allocator& operator=(Allocator&&) noexcept = default;
-    template <class U>
-    Allocator(const Allocator<U>& other) noexcept
-        : resource_(other.resource_) {}
-    template <class U>
-    Allocator(const std::pmr::polymorphic_allocator<U>& other) noexcept
-        : Allocator(other.resource()) {}
-    template <class U> struct rebind { using other = Allocator<U>; };
-    [[nodiscard]] Allocator select_on_container_copy_construction() const noexcept {
-        return *this;
-    }
-    [[nodiscard]] std::pmr::memory_resource* resource() const noexcept {
-        return resource_;
-    }
-    [[nodiscard]] T* allocate(std::size_t count) {
-        return std::pmr::polymorphic_allocator<T>(resource_).allocate(count);
-    }
-    void deallocate(T* pointer, std::size_t count) noexcept {
-        std::pmr::polymorphic_allocator<T>(resource_).deallocate(pointer, count);
-    }
-    template <class U, class... Args>
-        requires (UsesAllocatorConstruction<std::remove_cv_t<U>>::value)
-    void construct(U* pointer, Args&&... args) {
-        std::pmr::polymorphic_allocator<T>(resource_).construct(
-            pointer, std::forward<Args>(args)...);
-    }
-    template <class U>
-    [[nodiscard]] bool operator==(const Allocator<U>& other) const noexcept {
-        return resource_ == other.resource_ || resource_->is_equal(*other.resource_);
-    }
-
-private:
-    template <class> friend class Allocator;
-
-    std::pmr::memory_resource* resource_;
-};
-template <class T> using Vector = std::vector<T, Allocator<T>>;
-
 // Zero-allocation-when-empty PMR ring deque. Allocates a contiguous power-of-2
 // array from its memory_resource on demand and returns it immediately when the
 // queue drains to empty, so idle sessions/substreams retain 0 bytes.
@@ -181,7 +115,7 @@ template <class T>
 class RingDeque {
 public:
     using value_type = T;
-    using allocator_type = Allocator<T>;
+    using allocator_type = std::pmr::polymorphic_allocator<T>;
     using size_type = std::size_t;
     using difference_type = std::ptrdiff_t;
     using reference = T&;
@@ -490,16 +424,4 @@ private:
     std::size_t size_ = 0;
     std::size_t capacity_ = 0;
 };
-
-template <class T> using List = std::list<T, Allocator<T>>;
-template <class Key, class Value, class Compare = std::less<Key>>
-using Map = std::map<Key, Value, Compare, Allocator<std::pair<const Key, Value>>>;
-template <class Key, class Value, class Hash = std::hash<Key>, class Eq = std::equal_to<Key>>
-using UnorderedMap = std::unordered_map<Key, Value, Hash, Eq,
-    Allocator<std::pair<const Key, Value>>>;
-template <class Key, class Hash = std::hash<Key>, class Eq = std::equal_to<Key>>
-using UnorderedSet = std::unordered_set<Key, Hash, Eq, Allocator<Key>>;
-using String = std::basic_string<char, std::char_traits<char>, Allocator<char>>;
-using ByteVector = Vector<uint8_t>;
-
 } // namespace memory

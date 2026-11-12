@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/hash_container_shrink.hpp"
 
 #include <openssl/mem.h>
@@ -12,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <utility>
+#include <unordered_map>
 
 // 带 TTL 与容量上限的密钥化过期表：防重放会话键（VMess）与 0-RTT 票据（VLESS）共用。
 namespace proxy {
@@ -130,7 +130,7 @@ private:
         entry.previous = entry.next = nullptr;
     }
 
-    memory::UnorderedMap<Key, Entry, SecretKeyedHash, TimingSafeEqual> entries_;
+    std::unordered_map<Key, Entry, SecretKeyedHash, TimingSafeEqual> entries_;
     size_t capacity_;
     Entry* first_ = nullptr;
     Entry* last_ = nullptr;

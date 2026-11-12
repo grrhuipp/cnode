@@ -10,6 +10,8 @@
 #include <span>
 #include <optional>
 #include <cstdint>
+#include <memory_resource>
+#include <vector>
 
 
 namespace common {
@@ -22,7 +24,7 @@ public:
     // Spilled descriptors live in `resource`; none named means the process layer.
     ConstBufferSpanBuilder() noexcept = default;
     explicit ConstBufferSpanBuilder(std::pmr::memory_resource* resource) noexcept
-        : resource_(resource) {}
+        : resource_(memory::ResourceOrProcess(resource)) {}
 
     void Append(net::const_buffer buffer) {
         if (buffer.size() == 0) {
@@ -115,8 +117,7 @@ private:
     void EnsureSpillCapacity(size_t additional) {
         const bool preparing = !spill_;
         if (preparing) spill_.emplace(resource_);
-        // Keep the inline prefix visible until the spill is populated. Preparing
-        // in place avoids copying the allocator's lifetime reference on a move.
+        // Keep the inline prefix visible until the spill is populated.
         try {
             const size_t used = size();
             const size_t maximum = spill_->max_size();
@@ -139,9 +140,9 @@ private:
         }
     }
 
-    std::pmr::memory_resource* resource_ = nullptr;
+    std::pmr::memory_resource* resource_ = memory::process_resource();
     std::array<net::const_buffer, StackCapacity> stack_;
-    std::optional<memory::Vector<net::const_buffer>> spill_;
+    std::optional<std::pmr::vector<net::const_buffer>> spill_;
     size_t count_ = 0;
 };
 

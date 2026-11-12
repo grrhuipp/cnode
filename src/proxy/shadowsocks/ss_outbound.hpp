@@ -5,7 +5,6 @@
 #include "app/relay.hpp"
 #include "proxy/uot/uot.hpp"
 #include "app/proxyman/inbound/user_store.hpp"
-#include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/initial_payload.hpp"
 #include "common/sharded_user_stats.hpp"

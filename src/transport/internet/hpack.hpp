@@ -8,13 +8,16 @@
 #include <span>
 #include <string_view>
 #include <type_traits>
+#include <cstdint>
+#include <string>
+#include <vector>
 
 namespace transport::internet::h2 {
-void AppendHpackInt(memory::ByteVector&, uint8_t, uint8_t, uint32_t);
-void AppendHpackString(memory::ByteVector&, std::string_view);
-void AppendHpackIndexed(memory::ByteVector&, uint32_t);
-void AppendHpackLiteralIndexedName(memory::ByteVector&, uint32_t, std::string_view);
-void AppendHpackLiteralNewName(memory::ByteVector&, std::string_view, std::string_view);
+void AppendHpackInt(std::vector<uint8_t>&, uint8_t, uint8_t, uint32_t);
+void AppendHpackString(std::vector<uint8_t>&, std::string_view);
+void AppendHpackIndexed(std::vector<uint8_t>&, uint32_t);
+void AppendHpackLiteralIndexedName(std::vector<uint8_t>&, uint32_t, std::string_view);
+void AppendHpackLiteralNewName(std::vector<uint8_t>&, std::string_view, std::string_view);
 inline constexpr uint32_t kHpackStaticAuthority = 1;
 inline constexpr uint32_t kHpackStaticMethodGet = 2;
 inline constexpr uint32_t kHpackStaticMethodPost = 3;
@@ -29,8 +32,8 @@ inline constexpr uint32_t kHpackMaxDynamicTableSize = 4096;
 inline constexpr size_t kHpackMaxHeaderFields = 256;
 inline constexpr size_t kHpackMaxHeaderListSize = 64 * 1024;
 struct HpackHeaderField {
-    memory::String name;
-    memory::String value;
+    std::string name;
+    std::string value;
 };
 
 // Connection-scoped HPACK decoder (RFC 7541). A failed Decode leaves the
@@ -310,9 +313,9 @@ private:
         return std::nullopt;
     }
 
-    static std::optional<memory::String> DecodeHuffman(
+    static std::optional<std::string> DecodeHuffman(
         std::span<const uint8_t> data) {
-        memory::String out;
+        std::string out;
         out.reserve(data.size());
         uint16_t node = 0;
         uint32_t code = 0;
@@ -345,7 +348,7 @@ private:
         return out;
     }
 
-    static std::optional<memory::String> ReadString(
+    static std::optional<std::string> ReadString(
         std::span<const uint8_t> block,
         size_t& offset) {
         if (offset >= block.size()) {
@@ -361,7 +364,7 @@ private:
         if (huffman) {
             return DecodeHuffman(encoded);
         }
-        return memory::String(
+        return std::string(
             unsafe::ptr_cast<const char>(encoded.data()),
             encoded.size());
     }
@@ -390,7 +393,7 @@ private:
         if (!name_index) {
             return std::nullopt;
         }
-        memory::String name;
+        std::string name;
         if (*name_index == 0) {
             auto decoded = ReadString(block, offset);
             if (!decoded) {

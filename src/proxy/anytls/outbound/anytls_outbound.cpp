@@ -11,7 +11,6 @@
 #include "app/dns/dns.hpp"
 #include "app/relay.hpp"
 #include "app/stats.hpp"
-#include "common/allocator.hpp"
 #include "common/ip_utils.hpp"
 #include "common/hash_container_shrink.hpp"
 #include "common/session.hpp"
@@ -37,6 +36,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_map>
 
 namespace {
 
@@ -235,7 +235,7 @@ struct Handler::ClientSession {
     uint32_t packet_index = 1;
     std::optional<SessionVersion> session_version;
     transport::internet::AsyncWriteGate write_gate;
-    ::memory::UnorderedMap<
+    std::unordered_map<
         uint32_t,
         std::weak_ptr<LogicalStream>>
         logical_streams;
@@ -292,7 +292,7 @@ struct Handler::ClientSession {
         write_gate.Cancel();
         auto streams = std::exchange(
             logical_streams,
-            ::memory::UnorderedMap<uint32_t, std::weak_ptr<LogicalStream>>{
+            std::unordered_map<uint32_t, std::weak_ptr<LogicalStream>>{
                 logical_streams.get_allocator()});
         for (auto& [sid, weak] : streams) {
             (void)sid;
@@ -313,7 +313,7 @@ struct Handler::ClientSession {
     }
 
     net::awaitable<tl::expected<void, common::ErrorCode>>
-    WriteOpenPacket(memory::ByteVector packet) {
+    WriteOpenPacket(std::vector<uint8_t> packet) {
         auto write_lease = write_gate.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
@@ -692,7 +692,7 @@ public:
     void Retire() noexcept {
         retired_ = true;
         Cancel();
-        memory::Vector<Entry> closing(entries_.get_allocator());
+        std::vector<Entry> closing(entries_.get_allocator());
         closing.swap(entries_);
         for (const auto& entry : closing) Close(entry.session);
     }
@@ -788,7 +788,7 @@ private:
     void StopIfEmpty() noexcept {
         if (!entries_.empty()) return;
         Cancel();
-        memory::Vector<Entry>{entries_.get_allocator()}.swap(entries_);
+        std::vector<Entry>{entries_.get_allocator()}.swap(entries_);
     }
 
     void Schedule() {
@@ -817,8 +817,8 @@ private:
     const Clock::duration check_interval_;
     const Clock::duration idle_timeout_;
     const size_t minimum_idle_;
-    const memory::String tag_;
-    memory::Vector<Entry> entries_;
+    const std::string tag_;
+    std::vector<Entry> entries_;
     bool retired_ = false;
     std::exception_ptr failure_;
 };
@@ -885,7 +885,7 @@ DialPhysicalSession(
 
     const size_t auth_packet_size = ::proxy::anytls::kAuthPrefixSize + static_cast<size_t>(auth_padding_size);
     std::array<uint8_t, 256> inline_auth{};
-    memory::ByteVector heap_auth;
+    std::vector<uint8_t> heap_auth;
     common::ScopedCleanse cleanse_auth_packet{inline_auth, heap_auth};
     uint8_t* auth_ptr = inline_auth.data();
     if (auth_packet_size > inline_auth.size()) {
@@ -914,7 +914,7 @@ DialPhysicalSession(
     co_return std::move(new_stream);
 }
 
-tl::expected<memory::ByteVector, common::ErrorCode> BuildOpenPacket(
+tl::expected<std::vector<uint8_t>, common::ErrorCode> BuildOpenPacket(
     uint32_t sid,
     bool is_udp,
     const common::TargetAddress& original_target,
@@ -933,7 +933,7 @@ tl::expected<memory::ByteVector, common::ErrorCode> BuildOpenPacket(
         return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
     }
 
-    memory::ByteVector packet;
+    std::vector<uint8_t> packet;
     packet.reserve((kFrameHeaderSize * 4) + 64 + target_size + 128);
     if (opening_scheme) {
         const auto settings = ClientSettings(*opening_scheme);

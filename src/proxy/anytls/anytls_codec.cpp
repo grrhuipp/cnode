@@ -2,7 +2,6 @@
 #include "proxy/handshake_errors.hpp"
 #include "proxy/anytls_padding.hpp"
 #include "common/byte_reader.hpp"
-#include "common/allocator.hpp"
 #include "transport/async_stream.hpp"
 
 #include <openssl/evp.h>
@@ -12,6 +11,8 @@
 #include <cstring>
 #include <random>
 #include <utility>
+#include <string>
+#include <vector>
 
 namespace proxy::anytls {
 
@@ -29,7 +30,7 @@ std::array<uint8_t, kFrameHeaderSize> BuildFrameHeaderBytes(
     return header;
 }
 
-void AppendWaste(memory::ByteVector& out, uint16_t payload_size) {
+void AppendWaste(std::vector<uint8_t>& out, uint16_t payload_size) {
     const auto header = BuildFrameHeaderBytes(kCmdWaste, 0, payload_size);
     const size_t offset = out.size();
     out.resize(offset + header.size() + payload_size, uint8_t{0});
@@ -250,8 +251,8 @@ tl::expected<PeerSettings, common::ErrorCode> ParsePeerSettings(std::string_view
     return result;
 }
 
-memory::String ClientSettings(const PaddingScheme& scheme) {
-    memory::String settings;
+std::string ClientSettings(const PaddingScheme& scheme) {
+    std::string settings;
     const auto& digest = scheme.Digest();
     settings.reserve(28 + digest.size());
     settings.append("v=2\nclient=cnode\npadding-md5=");
@@ -261,7 +262,7 @@ memory::String ClientSettings(const PaddingScheme& scheme) {
 
 
 tl::expected<void, common::ErrorCode> AppendFrameBytesTo(
-    memory::ByteVector& out,
+    std::vector<uint8_t>& out,
     uint8_t cmd,
     uint32_t sid,
     std::span<const uint8_t> payload) {
@@ -315,7 +316,7 @@ WriteFrame(transport::AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<
 net::awaitable<tl::expected<void, common::ErrorCode>>
 WritePacketWithPadding(transport::AsyncStream& stream,
                        std::span<const PaddingRecord> record_rules,
-                       memory::ByteVector packet) {
+                       std::vector<uint8_t> packet) {
     if (packet.empty()) {
         co_return tl::expected<void, common::ErrorCode>{};
     }
@@ -372,7 +373,7 @@ net::awaitable<tl::expected<void, common::ErrorCode>>
 WritePacketWithPadding(transport::AsyncStream& stream,
                        const PaddingScheme& scheme,
                        uint32_t packet_index,
-                       memory::ByteVector packet) {
+                       std::vector<uint8_t> packet) {
     return WritePacketWithPadding(stream, scheme.RecordFor(packet_index), std::move(packet));
 }
 
@@ -382,7 +383,7 @@ WritePaddedMultiBufferFrames(transport::AsyncStream& stream,
                              uint8_t cmd,
                              uint32_t sid,
                              buf::MultiBuffer mb) {
-    memory::ByteVector packet;
+    std::vector<uint8_t> packet;
     packet.reserve(mb.byte_size() + (mb.size() * kFrameHeaderSize));
     for (auto* buffer : mb) {
         if (!buffer || buffer->IsEmpty()) {
@@ -426,7 +427,7 @@ WritePaddedBufferFrames(transport::AsyncStream& stream,
         }
     }
 
-    memory::ByteVector packet;
+    std::vector<uint8_t> packet;
     packet.reserve(payload_bytes + (frame_count * kFrameHeaderSize));
     for (const net::const_buffer& buffer : buffers) {
         const auto* data = static_cast<const uint8_t*>(buffer.data());
@@ -478,9 +479,9 @@ ReadFrameHeader(transport::AsyncStream& stream) {
     co_return out;
 }
 
-net::awaitable<tl::expected<memory::String, common::ErrorCode>>
+net::awaitable<tl::expected<std::string, common::ErrorCode>>
 ReadFrameText(transport::AsyncStream& stream, uint16_t length) {
-    memory::String text(length, '\0');
+    std::string text(length, '\0');
     if (auto ok = co_await proxy::ReadHandshakeExact(
             stream,
             std::span<uint8_t>(reinterpret_cast<uint8_t*>(text.data()), length),

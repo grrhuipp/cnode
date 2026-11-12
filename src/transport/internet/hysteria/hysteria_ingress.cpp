@@ -50,6 +50,10 @@
 #include <optional>
 #include <stdexcept>
 #include <utility>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include "common/allocator.hpp"
 
 namespace transport::internet::hysteria {
 
@@ -190,7 +194,7 @@ struct SocketState final {
     udp::endpoint local;
     udp::endpoint remote;
     struct Output {
-        memory::ByteVector data;
+        std::vector<uint8_t> data;
         udp::endpoint remote;
         std::shared_ptr<Connection> connection;
         bool terminal = false;
@@ -1142,7 +1146,7 @@ void Connection::StartRawStream(int64_t stream_id, StreamRecord& stream) {
             const size_t inspect_bytes =
                 std::min(input.byte_size(), kMaxStreamHeaderBytes);
             auto prefix = input.PrefixSpan(inspect_bytes);
-            memory::Vector<uint8_t> header;
+            std::vector<uint8_t> header;
             if (prefix.empty()) {
                 header.resize(inspect_bytes);
                 (void)input.CopyPrefixTo(header);
@@ -1191,7 +1195,7 @@ net::awaitable<void> Connection::RunV1Control(int64_t stream_id) {
     if (it == core_->streams.end()) co_return;
     auto state = it->second.state;
     constexpr size_t kMaxHelloBytes = kMaxAuthLength + 32;
-    memory::Vector<uint8_t> hello_bytes;
+    std::vector<uint8_t> hello_bytes;
     tl::expected<V1ClientHello, ProtocolError> hello =
         tl::unexpected(ProtocolError::Incomplete);
     while (!hello) {
@@ -1217,7 +1221,7 @@ net::awaitable<void> Connection::RunV1Control(int64_t stream_id) {
         listener_->upload_bytes_per_second, "");
     co_await state->WriteMultiBuffer(CopyPacket(response));
     if (closed_) co_return;
-    memory::Vector<int64_t> waiting;
+    std::vector<int64_t> waiting;
     for (const auto& [id, candidate] : core_->streams) {
         if (candidate.raw && !candidate.delivered) waiting.push_back(id);
     }
@@ -1414,7 +1418,7 @@ void Connection::HandleUdpMessage(const UdpMessage& message) {
         ExpireUdpFragments(now);
         return;
     }
-    memory::Vector<uint8_t> payload;
+    std::vector<uint8_t> payload;
     payload.reserve(pending.bytes);
     for (size_t id = 0; id < pending.count; ++id) {
         const auto slot = pending.payload_slots[id];
@@ -1577,7 +1581,7 @@ bool HysteriaIngress::Queue(SocketState& socket, std::span<const uint8_t> data,
     }
     if (socket.output.size() >= kMaxQueuedSocketPackets) return false;
     socket.output.push_back({
-        memory::ByteVector(data.begin(), data.end()),
+        std::vector<uint8_t>(data.begin(), data.end()),
         remote, connection.shared_from_this(), terminal});
     (void)socket.changed.try_send(IoErrorCode{});
     return true;
@@ -1695,7 +1699,7 @@ HysteriaIngress::SocketPtr HysteriaIngress::AttachSocket(
     state->socket->non_blocking(true, error);
     if (error) return {};
     auto [it, inserted] = sockets.try_emplace(
-        memory::String(socket_key), state);
+        std::string(socket_key), state);
     return inserted ? it->second->socket : SocketPtr{};
 }
 
@@ -2050,7 +2054,7 @@ net::awaitable<void> UdpSessionStream::WriteMultiBuffer(buf::MultiBuffer packet)
         sent = owner->SendUdpMessage(
             session_id_, *datagram.target, datagram.single_buffer->Bytes());
     } else {
-        memory::Vector<uint8_t> payload;
+        std::vector<uint8_t> payload;
         payload.reserve(datagram.payload_size);
         for (const auto* buffer : packet) {
             if (!buffer || buffer->IsEmpty()) continue;

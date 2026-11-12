@@ -1,7 +1,6 @@
 #pragma once
 
 #include "common/asio_types.hpp"
-#include "common/allocator.hpp"
 #include "app/worker_mailbox.hpp"
 
 #include <asio/execution.hpp>

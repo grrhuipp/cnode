@@ -4,7 +4,6 @@
 #include "app/proxyman/inbound/user_store.hpp"
 #include "app/proxyman/outbound/handler.hpp"
 #include "infra/config_types.hpp"
-#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 

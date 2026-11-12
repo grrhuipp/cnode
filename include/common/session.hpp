@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/target_address.hpp"
 
@@ -29,22 +28,12 @@ using ID = uint64_t;
 [[nodiscard]] ID NewID(uint32_t worker_id) noexcept;
 
 // xray-core common/session.Inbound 对应的连接入站元数据。
-// 配置标签、协议与安全方式在会话中按值保存在 Worker 本地 PMR 存储。
+// 配置标签、协议与安全方式在会话中按值保存在 Worker 本地标准容器。
 struct Inbound {
     enum class ClientIpSource : uint8_t { Socket, ProxyProtocol, HttpHeader };
 
-    Inbound() : Inbound(nullptr) {}
-    explicit Inbound(std::pmr::memory_resource* resource)
-        : source_ip(resource)
-        , tag(resource)
-        , accounting_key(resource)
-        , tags(resource)
-        , user_email(resource)
-        , origin_tag(resource)
-        , origin_user_email(resource)
-        , origin_source_ip(resource) {}
     net::ip::address source_addr;
-    memory::String source_ip;
+    std::string source_ip;
     uint16_t source_port = 0;
     ClientIpSource client_ip_source = ClientIpSource::Socket;
 
@@ -52,18 +41,18 @@ struct Inbound {
         return client_ip_source == ClientIpSource::ProxyProtocol && !source_ip.empty();
     }
     std::optional<tcp::endpoint> local_endpoint;
-    memory::String tag;
-    memory::String accounting_key;
-    memory::Vector<memory::String> tags;
+    std::string tag;
+    std::string accounting_key;
+    std::vector<std::string> tags;
     int64_t user_id = 0;
-    memory::String user_email;
+    std::string user_email;
 
     // 链式代理透传自最初入站的标签、身份与真实客户端 IP。
-    memory::String origin_tag;
+    std::string origin_tag;
     int64_t origin_user_id = 0;
-    memory::String origin_user_email;
+    std::string origin_user_email;
     net::ip::address origin_source_addr;
-    memory::String origin_source_ip;
+    std::string origin_source_ip;
 
     // Connection-limit family lease of the physical connection this request
     // arrived on. Set by the inbound handler; substreams inherit it and take
@@ -163,11 +152,8 @@ struct Outbound {
 
 // xray-core common/session.Content 对应的内容元数据。
 struct Content {
-    Content() : Content(nullptr) {}
-    explicit Content(std::pmr::memory_resource* resource)
-        : protocol(resource) {}
     common::Network network = common::Network::TCP;
-    memory::String protocol;
+    std::string protocol;
     uint64_t speed_limit = 0;
 };
 
@@ -176,8 +162,8 @@ struct Traffic {
     uint64_t bytes_down = 0;
 };
 
-// Per-connection xray-style metadata stays Worker-local even though its
-// allocations use the process-lifetime resource.
+// Per-connection xray-style metadata and its standard-container owners stay
+// Worker-local.
 struct Context {
     Context() = default;
 

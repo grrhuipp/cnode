@@ -12,6 +12,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <limits>
+#include <vector>
 
 namespace {
 enum class Fault { None, Memory, Link, Cancelled, Timeout, Reset, Unexpected, NonStandard };
@@ -106,17 +107,17 @@ net::awaitable<common::ErrorCode> Invoke(Stream& stream, int operation) {
         case 10: co_return Result(co_await proxy::anytls::WriteBuffersAsFramesWithPadding(stream, no_padding, 0, 2, 1, std::span(buffers).first(1)));
         case 11: co_return Result(co_await proxy::anytls::WriteBuffersAsFramesWithPadding(stream, no_padding, 0, 2, 1, buffers));
         case 12: co_return Result(co_await proxy::anytls::WriteBuffersAsFramesWithPadding(stream, padding, 1, 2, 1, buffers));
-        case 13: co_return Result(co_await proxy::anytls::WritePacketWithPadding(stream, padding, 1, memory::ByteVector(bytes.begin(), bytes.end())));
-        case 14: co_return Result(co_await proxy::anytls::WritePacketWithPadding(stream, no_padding, 0, memory::ByteVector(bytes.begin(), bytes.end())));
+        case 13: co_return Result(co_await proxy::anytls::WritePacketWithPadding(stream, padding, 1, std::vector<uint8_t>(bytes.begin(), bytes.end())));
+        case 14: co_return Result(co_await proxy::anytls::WritePacketWithPadding(stream, no_padding, 0, std::vector<uint8_t>(bytes.begin(), bytes.end())));
         case 16: {
             const auto large = *proxy::anytls::ParsePaddingScheme("stop=2\n1=65535-65535,65535-65535\n");
             co_return Result(co_await proxy::anytls::WritePacketWithPadding(stream, large, 1,
-                memory::ByteVector(bytes.begin(), bytes.end())));
+                std::vector<uint8_t>(bytes.begin(), bytes.end())));
         }
         case 17: {
             const auto split = *proxy::anytls::ParsePaddingScheme("stop=2\n1=1-1,7-7,8-8\n");
             co_return Result(co_await proxy::anytls::WritePacketWithPadding(stream, split, 1,
-                memory::ByteVector(bytes.begin(), bytes.end())));
+                std::vector<uint8_t>(bytes.begin(), bytes.end())));
         }
         default: co_return Result(co_await proxy::anytls::WriteMultiBufferAsFramesWithPadding(stream, no_padding, 0, 2, 1, Payload(9)));
     }

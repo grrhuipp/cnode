@@ -1,11 +1,19 @@
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "transport/internet/xhttp_session.hpp"
 
 #include <cstdlib>
 #include <memory>
 
 namespace {
+thread_local bool reject_next_new = false;
+
+void RejectArmedNew(std::size_t) {
+    if (!reject_next_new) return;
+    reject_next_new = false;
+    throw std::bad_alloc();
+}
 
 class TestStream final {
 public:
@@ -21,6 +29,8 @@ private:
 };
 
 }  // namespace
+
+constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = RejectArmedNew};
 
 TEST(XhttpUploadStreamSlot, RejectsSecondOwnerAndRetainsInFlightSnapshotUntilReleased) {
     size_t first_destructions = 0;
@@ -51,9 +61,9 @@ TEST(XhttpUploadStreamSlot, AllocationFailurePreservesCallerOwnershipAndAllowsRe
     bool allocation_failed = false;
     {
         struct RestoreAllocationFault {
-            ~RestoreAllocationFault() { ::memory::reject_next_process_allocation = false; }
+            ~RestoreAllocationFault() { reject_next_new = false; }
         } restore_fault;
-        ::memory::reject_next_process_allocation = true;
+        reject_next_new = true;
         try {
             (void)slot.Attach(std::move(retained));
         } catch (const std::bad_alloc&) {

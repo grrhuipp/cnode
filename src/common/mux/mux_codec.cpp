@@ -1,6 +1,5 @@
 #include "common/mux/mux_codec.hpp"
 #include "common/address_codec.hpp"
-#include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/const_buffer_span.hpp"
 #include "common/byte_reader.hpp"

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/defaults.hpp"
 #include "common/error.hpp"
 #include "common/session.hpp"

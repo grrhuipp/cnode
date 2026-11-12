@@ -7,6 +7,9 @@
 #include "common/awaitable_task_group.hpp"
 #include "common/hash_container_shrink.hpp"
 #include "infra/log.hpp"
+#include <unordered_map>
+#include <vector>
+#include "common/allocator.hpp"
 
 namespace transport::internet::h2 {
 class Http2ServerSession;
@@ -39,7 +42,7 @@ public:
     // Queues a received DATA payload. False asks the session to reset the
     // stream: the per-stream or XHTTP session budget is exhausted. `session`
     // is the demultiplexer delivering the frame.
-    bool EnqueueData(Http2ServerSession& session, memory::ByteVector frame_payload,
+    bool EnqueueData(Http2ServerSession& session, std::vector<uint8_t> frame_payload,
                      size_t offset, size_t size);
     void CloseInput();
     void CancelFromSession(IoErrorCode error = io_error::operation_aborted) noexcept;
@@ -85,7 +88,7 @@ public:
 private:
     friend struct H2InboundPayload;
     struct QueuedDataFrame {
-        memory::ByteVector payload;
+        std::vector<uint8_t> payload;
         size_t offset = 0;
         size_t end = 0;
     };
@@ -985,14 +988,14 @@ private:
     std::unique_ptr<AsyncStream> stream_;
     std::shared_ptr<InboundTransportStreamHandler> stream_handler_;
     AsyncWriteGate write_gate_;
-    memory::UnorderedMap<uint32_t, std::shared_ptr<Http2ServerSubStreamState>>
+    std::unordered_map<uint32_t, std::shared_ptr<Http2ServerSubStreamState>>
         streams_;
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
     const HttpConfig* http_config_ = nullptr;
     const XHttpConfig* xhttp_config_ = nullptr;
     const GrpcConfig* grpc_config_ = nullptr;
     // HPACK blocks encoded once per connection; neither uses the dynamic table.
-    memory::ByteVector response_header_block_;
+    std::vector<uint8_t> response_header_block_;
     HpackDecoder hpack_decoder_;
     uint64_t conn_id_ = 0;
     uint32_t last_remote_stream_id_ = 0;

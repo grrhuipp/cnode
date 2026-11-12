@@ -7,7 +7,6 @@
 #include "app/proxyman/inbound/user_store.hpp"
 #include "app/session_group_executor.hpp"
 #include "common/address_codec.hpp"
-#include "common/allocator.hpp"
 #include "common/const_buffer_span.hpp"
 #include "common/eof_cancellation.hpp"
 #include "common/byte_reader.hpp"
@@ -32,6 +31,7 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 namespace proxy::vmess::encoding {
 
 namespace {
@@ -748,7 +748,7 @@ net::awaitable<void> ClientSession::EncodeRequestBodyEOF(transport::AsyncStream&
 
 net::awaitable<void> ClientSession::DecodeResponseHeader(transport::AsyncStream& stream) {
     auto reset_header_state = [this]() noexcept {
-        memory::ByteVector{}.swap(response_header_sealed_);
+        std::vector<uint8_t>{}.swap(response_header_sealed_);
         response_length_read_ = 0;
         response_header_read_ = 0;
     };

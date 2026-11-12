@@ -286,7 +286,7 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
         std::chrono::seconds TransportHandshakeTimeout() const noexcept override { return 5s; }
         std::chrono::seconds TransportIdleTimeout() const noexcept override { return 10s; }
         std::thread::id owner_thread;
-        ::memory::String local_tag;
+        std::string local_tag;
         std::unique_ptr<::transport::AsyncStream> logical;
     };
 

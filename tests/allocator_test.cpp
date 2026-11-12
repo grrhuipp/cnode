@@ -2,16 +2,11 @@
 
 #include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
-#include "common/session.hpp"
-#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
 #include <limits>
-#include <stdexcept>
 #include <thread>
-#include <tuple>
-#include <type_traits>
 #include <vector>
 
 namespace {
@@ -216,148 +211,6 @@ TEST(Allocator, AllocatorAwareDequeInsertionKeepsDestinationResource) {
     EXPECT_EQ(destination.live, 0u);
 }
 
-TEST(Allocator, ByteVectorInsertPreservesReservedAndGrowingPrefixes) {
-    CountingResource resource;
-    {
-        memory::Vector<uint8_t> bytes(&resource);
-        std::vector<uint8_t> expected;
-        bytes.reserve(1024);
-        for (const std::size_t count : {64u, 900u, 1024u, 16384u, 65536u}) {
-            std::vector<uint8_t> input(count);
-            for (std::size_t index = 0; index < count; ++index)
-                input[index] = static_cast<uint8_t>(index * 131 + count);
-            bytes.insert(bytes.end(), input.begin(), input.end());
-            expected.insert(expected.end(), input.begin(), input.end());
-            ASSERT_EQ(bytes.size(), expected.size());
-            EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin()));
-            EXPECT_EQ(bytes.get_allocator().resource(), &resource);
-        }
-        bytes.clear();
-        bytes.insert(bytes.end(), expected.begin(), expected.end());
-        EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin(), bytes.end()));
-    }
-    EXPECT_EQ(resource.live, 0u);
-}
-
-TEST(Allocator, VectorConstructionPropagatesNestedAllocators) {
-    CountingResource destination;
-    {
-        // The destination differs from the process layer, so default construction
-        // cannot accidentally satisfy the propagation checks.
-        memory::Vector<AllocatorAwareEntry> entries{
-            memory::Allocator<AllocatorAwareEntry>(&destination)};
-        for (int value = 0; value < 20; ++value) entries.emplace_back(value);
-        for (int value = 0; value < 20; ++value) {
-            ASSERT_EQ(entries[value].payload.size(), 1u);
-            EXPECT_EQ(entries[value].payload.front(), value);
-            EXPECT_EQ(entries[value].payload.get_allocator().resource(), &destination);
-        }
-    }
-    EXPECT_EQ(destination.live, 0u);
-}
-
-TEST(Allocator, PairConstructionPropagatesNestedAllocators) {
-    CountingResource destination;
-    {
-        using Strings = memory::Vector<memory::String>;
-        using Pair = std::pair<memory::String, Strings>;
-        memory::Vector<Pair> pairs{memory::Allocator<Pair>(&destination)};
-        pairs.emplace_back(std::piecewise_construct,
-            std::forward_as_tuple(80, 'p'), std::tuple<>{});
-        pairs.front().second.emplace_back(90, 'v');
-        pairs.push_back(pairs.front());
-        for (const auto& pair : pairs) {
-            EXPECT_EQ(pair.first, memory::String(80, 'p'));
-            EXPECT_EQ(pair.first.get_allocator().resource(), &destination);
-            EXPECT_EQ(pair.second.get_allocator().resource(), &destination);
-            ASSERT_EQ(pair.second.size(), 1u);
-            EXPECT_EQ(pair.second.front(), memory::String(90, 'v'));
-            EXPECT_EQ(pair.second.front().get_allocator().resource(), &destination);
-        }
-    }
-    EXPECT_EQ(destination.live, 0u);
-}
-
-TEST(Allocator, MapConstructionPropagatesNestedAllocators) {
-    CountingResource destination;
-    {
-        using Strings = memory::Vector<memory::String>;
-        using Map = memory::Map<memory::String, Strings>;
-        Map map{Map::allocator_type(&destination)};
-        map.try_emplace(memory::String(100, 'k')).first->second.emplace_back(110, 'x');
-        map.emplace(std::piecewise_construct,
-            std::forward_as_tuple(120, 'm'), std::tuple<>{}).first->second.emplace_back(130, 'y');
-        ASSERT_EQ(map.size(), 2u);
-        for (const auto& [key, values] : map) {
-            EXPECT_EQ(key.get_allocator().resource(), &destination);
-            EXPECT_EQ(values.get_allocator().resource(), &destination);
-            ASSERT_EQ(values.size(), 1u);
-            EXPECT_EQ(values.front().get_allocator().resource(), &destination);
-            const bool first = key.front() == 'k';
-            EXPECT_EQ(key, memory::String(first ? 100 : 120, first ? 'k' : 'm'));
-            EXPECT_EQ(values.front(), memory::String(first ? 110 : 130, first ? 'x' : 'y'));
-        }
-    }
-    EXPECT_EQ(destination.live, 0u);
-}
-
-TEST(Allocator, TrivialCopyStillUsesAllocatorExtendedConstruction) {
-    struct Entry {
-        using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
-        std::pmr::memory_resource* resource;
-        int value;
-
-        Entry(int value) : resource(nullptr), value(value) {}
-        Entry(std::allocator_arg_t, allocator_type allocator, const Entry& other)
-            : resource(allocator.resource()), value(other.value) {}
-    };
-    static_assert(std::is_trivially_copy_constructible_v<Entry>);
-    static_assert(std::uses_allocator_v<Entry, std::pmr::polymorphic_allocator<Entry>>);
-    CountingResource destination;
-    {
-        memory::Vector<Entry> entries{memory::Allocator<Entry>(&destination)};
-        const Entry source(42);
-        entries.push_back(source);
-        entries.reserve(entries.capacity() + 1);
-        entries.push_back(source);
-        for (const auto& entry : entries) {
-            EXPECT_EQ(entry.value, 42);
-            EXPECT_EQ(entry.resource, &destination);
-        }
-    }
-    EXPECT_EQ(destination.live, 0u);
-}
-
-TEST(Allocator, DefaultContainersUseProcessResourceWithoutChangingGlobalPmrDefault) {
-    CountingResource external_default;
-    struct DefaultGuard {
-        std::pmr::memory_resource* previous;
-        ~DefaultGuard() { std::pmr::set_default_resource(previous); }
-    } guard{std::pmr::set_default_resource(&external_default)};
-    external_default.LimitAllocations(0);
-    auto* const resource = process_resource();
-    EXPECT_EQ(std::pmr::get_default_resource(), &external_default);
-    EXPECT_EQ(Allocator<int>().resource(), resource);
-    EXPECT_EQ(ProcessAllocator<int>().resource(), resource);
-    EXPECT_EQ(Allocator<int>(nullptr).resource(), resource);
-    Vector<int> values;
-    values.push_back(42);
-    String text(100, 'x');
-    RingDeque<int> queue;
-    queue.push_back(71);
-    ::session::Context context;
-    context.inbound.tag = "process-default-inbound-tag-longer-than-sso";
-    context.content.protocol = "process-default-protocol-longer-than-sso";
-    EXPECT_EQ(values.get_allocator().resource(), resource);
-    EXPECT_EQ(text.get_allocator().resource(), resource);
-    EXPECT_EQ(queue.get_allocator().resource(), resource);
-    EXPECT_EQ(context.inbound.tag.get_allocator().resource(), resource);
-    EXPECT_EQ(context.content.protocol.get_allocator().resource(), resource);
-    EXPECT_EQ(values.front(), 42);
-    EXPECT_EQ(queue.front(), 71);
-    EXPECT_EQ(std::pmr::get_default_resource(), &external_default);
-}
-
 TEST(Allocator, ProcessResourceSupportsAlignmentAcrossSizeBoundaries) {
     auto* const resource = process_resource();
     for (size_t bytes : {0u, 1u, 24u, 31u, 128u, 2048u, 4000u, 8192u, 17408u, 32768u, 65536u}) {
@@ -435,41 +288,6 @@ TEST(Allocator, BufferAllocationFailureReturnsNullWithoutLeaking) {
     EXPECT_EQ(detail::test_buffers_live, live_before);
 }
 
-TEST(Allocator, SharedAllocationPreservesAlignmentAndWeakLifetime) {
-    struct alignas(64) SharedObject : std::enable_shared_from_this<SharedObject> {
-        SharedObject(std::unique_ptr<int> payload, int& destroyed)
-            : payload(std::move(payload)), destroyed(destroyed) {}
-        ~SharedObject() { ++destroyed; }
-        std::unique_ptr<int> payload;
-        int& destroyed;
-    };
-    CountingResource resource;
-    int destroyed = 0;
-    std::weak_ptr<SharedObject> weak;
-    {
-        auto object = std::allocate_shared<SharedObject>(Allocator<SharedObject>(&resource),
-            std::make_unique<int>(42), destroyed);
-        weak = object;
-        EXPECT_EQ(*object->payload, 42);
-        EXPECT_EQ(reinterpret_cast<uintptr_t>(object.get()) % alignof(SharedObject), 0u);
-        EXPECT_EQ(object->shared_from_this(), object);
-    }
-    EXPECT_EQ(destroyed, 1);
-    EXPECT_TRUE(weak.expired());
-    weak.reset();
-    EXPECT_EQ(resource.live, 0u);
-}
-
-TEST(Allocator, SharedConstructorFailureRollsBackStorage) {
-    struct ThrowingObject {
-        ThrowingObject() { throw std::runtime_error("construction failed"); }
-    };
-    CountingResource resource;
-    EXPECT_THROW((void)std::allocate_shared<ThrowingObject>(Allocator<ThrowingObject>(&resource)),
-        std::runtime_error);
-    EXPECT_EQ(resource.live, 0u);
-}
-
 TEST(Allocator, IdleDequeReleasesCallerOwnedStorageOnDrain) {
     CountingResource resource;
     RingDeque<int> queue(&resource);
@@ -481,35 +299,5 @@ TEST(Allocator, IdleDequeReleasesCallerOwnedStorageOnDrain) {
     EXPECT_TRUE(queue.empty());
     EXPECT_EQ(resource.live, 0u);
     EXPECT_EQ(resource.live_bytes, 0u);
-}
-
-TEST(Allocator, DefaultVectorAllocationFailurePreservesPayloadAndCanRetry) {
-    Vector<uint8_t> bytes;
-    bytes.reserve(8);
-    for (uint8_t value = 0; value < 8; ++value) bytes.push_back(value);
-    const std::array<uint8_t, 8> expected{0, 1, 2, 3, 4, 5, 6, 7};
-    const auto* const storage = bytes.data();
-    const auto capacity = bytes.capacity();
-    reject_next_process_allocation = true;
-    bool failed = false;
-    try { bytes.reserve(capacity + 1); }
-    catch (const std::bad_alloc&) { failed = true; }
-    reject_next_process_allocation = false;
-    EXPECT_TRUE(failed);
-    EXPECT_EQ(bytes.data(), storage);
-    EXPECT_EQ(bytes.capacity(), capacity);
-    EXPECT_TRUE(std::equal(bytes.begin(), bytes.end(), expected.begin(), expected.end()));
-    bytes.reserve(capacity + 1);
-    bytes.push_back(0x91);
-    ASSERT_EQ(bytes.size(), expected.size() + 1);
-    EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin()));
-    EXPECT_EQ(bytes.back(), 0x91);
-}
-
-TEST(Allocator, UnrepresentableVectorReservePreservesPayload) {
-    Vector<uint8_t> bytes{0x42, 0x91};
-    EXPECT_THROW(bytes.reserve(std::numeric_limits<size_t>::max()), std::length_error);
-    EXPECT_EQ(bytes.size(), 2u);
-    EXPECT_EQ(bytes.back(), 0x91);
 }
 } // namespace

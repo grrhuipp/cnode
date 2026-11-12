@@ -1,6 +1,7 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "app/worker/udp_ingress.hpp"
 #include "udp_ingress_fixture.hpp"
 #include "worker_coordinator_fixture.hpp"
@@ -31,6 +32,18 @@
 #include <utility>
 #include <tuple>
 #include <vector>
+
+namespace {
+thread_local bool reject_next_new = false;
+
+void RejectArmedNew(std::size_t) {
+    if (!reject_next_new) return;
+    reject_next_new = false;
+    throw std::bad_alloc();
+}
+}  // namespace
+
+constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = RejectArmedNew};
 
 namespace {
 
@@ -457,15 +470,16 @@ TEST(UdpResourceBudget, SessionConstructionFailureReleasesAssociationLease) {
             {}, endpoint, owner,
             std::chrono::steady_clock::now(), std::chrono::seconds::zero());
     };
+    (void)sockets.Get(first, "socket");
     AllocationFaultScope fault_scope;
-    ::memory::reject_next_process_allocation = true;
+    reject_next_new = true;
     bool association_oom = false;
     try {
         (void)create(first, 1);
     } catch (const std::bad_alloc&) {
-        association_oom = !::memory::reject_next_process_allocation;
+        association_oom = !reject_next_new;
     }
-    ::memory::reject_next_process_allocation = false;
+    reject_next_new = false;
     EXPECT_TRUE(association_oom) << "session construction failure leaked its association lease";
     EXPECT_EQ(budget.GetUsage().associations, 0) << "session construction failure leaked its association lease";
     EXPECT_EQ(first.GetResourceStats().associations, 0) << "session construction failure leaked its association lease";
@@ -1010,14 +1024,12 @@ TEST_F(UdpSocketOwnerTest, LongSocketKeysReleaseEveryCycleResource) {
         std::chrono::steady_clock::now(),
         std::chrono::seconds(60));
         ASSERT_TRUE(cycle_session) << "failed to create a long-key UDP session";
-#ifdef CNODE_TEST_ALLOCATOR
-        ::memory::reject_next_process_allocation = true;
+        reject_next_new = true;
         const auto inspected = worker.GetResourceStats();
-        const bool fault_unused = ::memory::reject_next_process_allocation;
-        ::memory::reject_next_process_allocation = false;
+        const bool fault_unused = reject_next_new;
+        reject_next_new = false;
         EXPECT_EQ(inspected.associations, 1u);
         EXPECT_TRUE(fault_unused);
-#endif
         // Reaching the pre-created row proves the borrowed long-key lookup.
         deliver_uplink(long_socket_key, long_socket, default_owner, cycle, 0x6c);
         EXPECT_EQ(worker.GetResourceStats().input_datagrams, 1) << "long UDP keys failed heterogeneous session lookup";

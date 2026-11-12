@@ -1,12 +1,13 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/string_hash.hpp"
 
 #include <memory>
 #include <regex>
 #include <string_view>
 #include <vector>
+#include <string>
+#include <unordered_map>
 
 namespace session {
 struct Context;
@@ -22,8 +23,8 @@ class DetectRulePolicy final {
 public:
     using RuleList = std::vector<DetectRule>;
     using RuleListPtr = std::shared_ptr<const RuleList>;
-    using InboundRule = memory::UnorderedMap<
-        memory::String,
+    using InboundRule = std::unordered_map<
+        std::string,
         RuleListPtr,
         common::TransparentStringHash,
         common::TransparentStringEq>;

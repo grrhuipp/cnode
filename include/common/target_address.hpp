@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/domain_name.hpp"
 #include "common/ip_utils.hpp"
 #include "core/constants.hpp"
@@ -53,7 +52,7 @@ struct UserProfile {
 // ============================================================================
 struct TargetAddress {
     AddressType type = AddressType::Invalid;
-    memory::String host;  // 域名；IP 目标只保留 resolved_addr
+    std::string host;  // 域名；IP 目标只保留 resolved_addr
     uint16_t port = 0;
 
     // DNS 解析后的地址
@@ -236,9 +235,9 @@ struct ForwardedMetadataView {
 // 链式代理透传的最初入站身份与真实客户端 IP 拥有型存储。
 struct ForwardedMetadata {
     int64_t user_id = 0;
-    memory::String user_email;
+    std::string user_email;
     std::optional<net::ip::address> client_ip;
-    memory::String inbound_tag;
+    std::string inbound_tag;
 
     [[nodiscard]] bool Empty() const noexcept {
         return user_id <= 0 && user_email.empty() &&

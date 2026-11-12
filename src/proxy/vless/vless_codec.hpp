@@ -1,7 +1,6 @@
 #pragma once
 
 #include "common/address_codec.hpp"
-#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/binary_text_codec.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
@@ -70,7 +69,7 @@ enum class Command : uint8_t {
 
 struct RequestHeader {
     std::array<uint8_t, 16> uuid{};
-    memory::String flow;
+    std::string flow;
     Command command = Command::TCP;
     common::TargetAddress target;
     std::optional<common::ForwardedMetadata> forwarded;

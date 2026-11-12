@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "features/routing/router.hpp"
 #include "geo/geodata.hpp"

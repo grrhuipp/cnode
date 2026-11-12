@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "app/session_group_executor.hpp"
 #include "proxy/shadowsocks/ss_salt_pool.hpp"
 
@@ -14,6 +15,20 @@
 #include <chrono>
 #include <future>
 #include <thread>
+
+namespace {
+thread_local bool reject_next_new = false;
+thread_local size_t rejected_new_allocations = 0;
+
+void RejectArmedNew(std::size_t) {
+    if (!reject_next_new) return;
+    reject_next_new = false;
+    ++rejected_new_allocations;
+    throw std::bad_alloc();
+}
+}  // namespace
+
+constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = RejectArmedNew};
 
 namespace {
 using Admission = proxy::shadowsocks::Ss2022SaltAdmission;
@@ -82,12 +97,12 @@ TEST(Ss2022SaltPool, AllocationFailureRejectsWithoutForgettingAcceptedSalt) {
     const auto first = Salt(1), second = Salt(2);
     const auto now = Clock::time_point{};
     ASSERT_EQ(pool.Admit(first.span(), now), Admission::Accepted);
-    const auto failures = memory::rejected_process_allocations;
-    memory::reject_next_process_allocation = true;
+    const auto failures = rejected_new_allocations;
+    reject_next_new = true;
     const auto result = pool.Admit(second.span(), now);
-    memory::reject_next_process_allocation = false;
+    reject_next_new = false;
     EXPECT_EQ(result, Admission::Limited);
-    EXPECT_EQ(memory::rejected_process_allocations, failures + 1);
+    EXPECT_EQ(rejected_new_allocations, failures + 1);
     EXPECT_EQ(pool.Size(), 1u);
     EXPECT_EQ(pool.Admit(first.span(), now), Admission::Replayed);
     EXPECT_EQ(pool.Admit(second.span(), now), Admission::Accepted);

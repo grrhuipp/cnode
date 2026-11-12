@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/error.hpp"
@@ -18,6 +17,7 @@
 #include <new>
 #include <span>
 #include <type_traits>
+#include <vector>
 
 namespace transport::internet {
 
@@ -134,7 +134,7 @@ public:
 
 private:
     buf::BufferGuard small_;
-    memory::ByteVector large_;
+    std::vector<uint8_t> large_;
 };
 
 // 不终止监听的收包错误：队列暂空、被信号打断，以及 ICMP 回报的对端不可达/重置

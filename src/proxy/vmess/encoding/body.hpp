@@ -12,7 +12,6 @@
 #include "app/proxyman/inbound/user_store.hpp"
 #include "common/asio_types.hpp"
 #include "common/address_codec.hpp"
-#include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/error.hpp"
 #include "common/target_address.hpp"
@@ -31,6 +30,7 @@
 #include <string_view>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace app {
 
@@ -318,7 +318,7 @@ private:
     // Response header progress survives a cancelled read.
     std::array<uint8_t, kSealedHeaderLengthSize> response_length_{};
     size_t response_length_read_ = 0;
-    memory::ByteVector response_header_sealed_;
+    std::vector<uint8_t> response_header_sealed_;
     size_t response_header_read_ = 0;
     bool response_header_received_ = false;
 };

@@ -1,7 +1,6 @@
 #include "transport/internet/outbound_target_builder.hpp"
 
 #include "app/dns/dns.hpp"
-#include "common/allocator.hpp"
 #include "common/ip_utils.hpp"
 #include "infra/log.hpp"
 #include "transport/internet/tcp_stream.hpp"
@@ -15,6 +14,7 @@
 #include <span>
 #include <string_view>
 #include <utility>
+#include <string>
 
 
 namespace transport::internet {
@@ -122,7 +122,7 @@ bool AutoPrefersIPv6(const OutboundBind& bind,
 
 // The explicit host is resolved once by stream-settings normalization; only
 // the dial-address fallback is formatted per target.
-[[nodiscard]] memory::String BuildHttpHostHeader(
+[[nodiscard]] std::string BuildHttpHostHeader(
     const StreamSettings& settings,
     std::string_view fallback_host,
     uint16_t port) {
@@ -131,7 +131,7 @@ bool AutoPrefersIPv6(const OutboundBind& bind,
         return {};
     }
     if (!settings.configured_http_host.empty()) {
-        return memory::String(settings.configured_http_host);
+        return std::string(settings.configured_http_host);
     }
     if (settings.IsGrpc() && settings.IsReality()) {
         return {};
@@ -140,7 +140,7 @@ bool AutoPrefersIPv6(const OutboundBind& bind,
         (settings.IsReality() && !settings.reality.server_name.empty())
             ? std::string_view(settings.reality.server_name)
             : fallback_host;
-    memory::String out;
+    std::string out;
     iputil::FormatHttpHostHeaderInto(
         out, effective_host, port, settings.IsTlsLike());
     return out;

@@ -15,6 +15,8 @@
 #include <span>
 #include <stdexcept>
 #include <utility>
+#include <memory_resource>
+#include <vector>
 
 namespace buf {
 
@@ -691,7 +693,7 @@ private:
             return;
         }
         // Do not publish spilled state until the only fallible step succeeds.
-        memory::Vector<Buffer*> prepared;
+        std::vector<Buffer*> prepared;
         prepared.reserve(std::max(capacity, kInlineCapacity * 2));
         spill_.emplace(std::move(prepared));
         for (size_t i = 0; i < size_; ++i) {
@@ -747,7 +749,7 @@ private:
     size_t start_ = 0;
     size_t size_ = 0;
     size_t total_bytes_ = 0;
-    std::optional<memory::Vector<Buffer*>> spill_;
+    std::optional<std::vector<Buffer*>> spill_;
 };
 
 // A completed UDP message owns a buffer even when it carries no data. An empty
@@ -989,7 +991,8 @@ public:
     ContiguousBufferView& operator=(const ContiguousBufferView&) = delete;
     ContiguousBufferView(const MultiBuffer&&) = delete;
 
-    explicit ContiguousBufferView(const MultiBuffer& buffers) : owned_(nullptr) {
+    explicit ContiguousBufferView(const MultiBuffer& buffers)
+        : owned_(memory::process_resource()) {
         const Buffer* single = nullptr;
         size_t buffer_count = 0;
         size_t total_size = 0;
@@ -1021,7 +1024,7 @@ public:
 
     ContiguousBufferView(std::span<const net::const_buffer> buffers,
                          std::pmr::memory_resource* resource = nullptr)
-        : owned_(resource) {
+        : owned_(memory::ResourceOrProcess(resource)) {
         const net::const_buffer* single = nullptr;
         size_t buffer_count = 0;
         size_t total_size = 0;
@@ -1068,7 +1071,7 @@ private:
         total_size += size;
     }
 
-    memory::ByteVector owned_;
+    std::pmr::vector<uint8_t> owned_;
     std::span<const uint8_t> bytes_;
 };
 

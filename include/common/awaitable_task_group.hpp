@@ -1,7 +1,6 @@
 #pragma once
 
 #include "common/asio_types.hpp"
-#include "common/allocator.hpp"
 #include "transport/link.hpp"
 
 #include <asio/async_result.hpp>

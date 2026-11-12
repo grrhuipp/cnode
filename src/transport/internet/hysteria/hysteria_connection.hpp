@@ -7,6 +7,10 @@
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <openssl/ssl.h>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include "common/allocator.hpp"
 
 namespace transport::internet::hysteria {
 
@@ -40,10 +44,10 @@ public:
 private:
     friend class HysteriaIngress;
     struct H3Request {
-        memory::String method;
-        memory::String path;
-        memory::String authority;
-        memory::String auth;
+        std::string method;
+        std::string path;
+        std::string authority;
+        std::string auth;
     };
     struct StreamRecord {
         explicit StreamRecord(std::shared_ptr<QuicStreamState> state_value)
@@ -77,15 +81,15 @@ private:
         udp::endpoint local;
         udp::endpoint remote;
         ngtcp2_cid server_cid{};
-        memory::UnorderedMap<int64_t, StreamRecord> streams;
+        std::unordered_map<int64_t, StreamRecord> streams;
         int64_t next_output_stream = -1;
-        memory::UnorderedMap<int64_t, H3Request> h3_requests;
-        memory::RingDeque<memory::ByteVector> datagrams;
-        memory::UnorderedMap<uint32_t, UdpSessionStream*> udp_sessions;
+        std::unordered_map<int64_t, H3Request> h3_requests;
+        memory::RingDeque<std::vector<uint8_t>> datagrams;
+        std::unordered_map<uint32_t, UdpSessionStream*> udp_sessions;
     };
     struct PendingFragments {
         common::TargetAddress target;
-        memory::Vector<memory::ByteVector> payloads;
+        std::vector<std::vector<uint8_t>> payloads;
         std::array<uint8_t, 256> payload_slots{};
         std::bitset<256> received_fragments;
         uint8_t count = 0;
@@ -161,7 +165,7 @@ private:
     static int PathValidated(ngtcp2_conn*, uint32_t, const ngtcp2_path*, const ngtcp2_path*,
         ngtcp2_path_validation_result, void*);
     HysteriaIngress* listener_;
-    memory::Vector<ConnectionId> connection_ids_;
+    std::vector<ConnectionId> connection_ids_;
     common::AwaitableTaskGroup* tasks_ = nullptr;
     common::SignalChannel closed_signal_;
     std::optional<Core> core_;
@@ -170,7 +174,7 @@ private:
     app::ConnectionLimiter::Reservation physical_reservation_;
     std::optional<common::UserOnlineSessionGuard> online_session_;
     std::shared_ptr<InboundTransportStreamHandler> stream_sink_;
-    memory::UnorderedMap<uint64_t, PendingFragments> fragments_;
+    std::unordered_map<uint64_t, PendingFragments> fragments_;
     ngtcp2_tstamp fragment_expiry_ = std::numeric_limits<ngtcp2_tstamp>::max();
     uint32_t next_udp_session_id_ = 1;
     uint16_t next_udp_packet_id_ = 0;

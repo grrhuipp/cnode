@@ -8,6 +8,7 @@
 #include <cstring>
 #include <optional>
 #include <regex>
+#include <string>
 
 namespace rule {
 
@@ -28,7 +29,7 @@ void DetectRulePolicy::UpdateRule(std::string_view tag,
         it->second = std::move(new_rule_list);
         return;
     }
-    rules_.emplace(memory::String(tag), std::move(new_rule_list));
+    rules_.emplace(std::string(tag), std::move(new_rule_list));
 }
 
 bool DetectRulePolicy::Blocked(const session::Context& ctx) {

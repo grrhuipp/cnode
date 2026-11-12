@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "allocation_hook.hpp"
 #include "common/initial_payload.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
 
@@ -10,6 +11,19 @@
 
 namespace {
 thread_local size_t failures = 0;
+thread_local int new_allocation_budget = -1;
+thread_local size_t rejected_new_allocations = 0;
+
+void FailBudgetedNew(std::size_t) {
+    if (new_allocation_budget < 0) return;
+    if (new_allocation_budget == 0) {
+        ++rejected_new_allocations;
+        throw std::bad_alloc();
+    }
+    --new_allocation_budget;
+}
+
+enum class FaultDomain { Process, GlobalNew, Both };
 
 static_assert(alignof(buf::Buffer) <= alignof(std::max_align_t));
 
@@ -56,38 +70,47 @@ buf::MultiBuffer Packet(std::span<const uint8_t> data) {
 }
 
 template <typename Function>
-bool Inject(int budget, Function operation) {
-    const auto rejected_before = memory::rejected_process_allocations;
-    memory::process_allocation_budget = budget;
+bool Inject(int budget, Function operation, FaultDomain domain = FaultDomain::Both) {
+    const auto rejected_before = memory::rejected_process_allocations + rejected_new_allocations;
+    struct ResetBudgets {
+        ~ResetBudgets() {
+            memory::process_allocation_budget = -1;
+            new_allocation_budget = -1;
+        }
+    } reset;
+    memory::process_allocation_budget = domain == FaultDomain::GlobalNew ? -1 : budget;
+    new_allocation_budget = domain == FaultDomain::Process ? -1 : budget;
     bool success = false;
     try { success = operation(); }
     catch (const std::bad_alloc&) {}
-    memory::process_allocation_budget = -1;
-    failures = memory::rejected_process_allocations - rejected_before;
+    failures = memory::rejected_process_allocations + rejected_new_allocations - rejected_before;
     return success;
 }
 
 template <typename Function>
 void FaultMatrix(const char* name, Function operation) {
-    bool reached_success = false;
-    for (int budget = 0; budget < 48; ++budget) {
-        SCOPED_TRACE(name);
-        SCOPED_TRACE(budget);
-        const auto live_before = memory::detail::test_buffers_live;
-        EXPECT_TRUE(operation(budget, reached_success));
-        EXPECT_EQ(memory::detail::test_buffers_live, live_before);
-        if (reached_success) break;
+    for (const auto domain : {FaultDomain::Process, FaultDomain::GlobalNew}) {
+        bool reached_success = false;
+        for (int budget = 0; budget < 48; ++budget) {
+            SCOPED_TRACE(name);
+            SCOPED_TRACE(domain == FaultDomain::Process ? "process resource" : "global new");
+            SCOPED_TRACE(budget);
+            const auto live_before = memory::detail::test_buffers_live;
+            EXPECT_TRUE(operation(budget, reached_success, domain));
+            EXPECT_EQ(memory::detail::test_buffers_live, live_before);
+            if (reached_success) break;
+        }
+        EXPECT_TRUE(reached_success);
     }
-    EXPECT_TRUE(reached_success);
 }
 
 TEST(BufferOwnership, SpanAppendRollsBackEveryAllocationFailureAndCanRetry) {
-    FaultMatrix("span append rolls back data and pointer allocation failures", [](int budget, bool& complete) {
+    FaultMatrix("span append rolls back data and pointer allocation failures", [](int budget, bool& complete, FaultDomain domain) {
         const auto before = Pattern(33);
         const auto added = Pattern(90000);
         auto payload = Packet(before);
         auto* original = *payload.begin();
-        complete = Inject(budget, [&] { return buf::AppendSpanToMultiBuffer(added, payload); });
+        complete = Inject(budget, [&] { return buf::AppendSpanToMultiBuffer(added, payload); }, domain);
         const bool unchanged = complete || (failures != 0 && Flatten(payload) == before &&
             Consistent(payload) && payload.size() == 1 && *payload.begin() == original);
         if (!complete && !buf::AppendSpanToMultiBuffer(added, payload)) return false;
@@ -101,12 +124,12 @@ class BufferInsertionFailure : public ::testing::TestWithParam<size_t> {};
 
 TEST_P(BufferInsertionFailure, ConsumedGuardIsReleasedWhenSlotInsertionFails) {
     const size_t count = GetParam();
-    FaultMatrix("consumed guard is released when pointer insertion fails", [count](int budget, bool& complete) {
+    FaultMatrix("consumed guard is released when pointer insertion fails", [count](int budget, bool& complete, FaultDomain domain) {
             buf::MultiBuffer payload;
             for (size_t i = 0; i < count; ++i) payload.push_back(Buffer(1));
             auto before = Flatten(payload);
             auto extra = Buffer(5, 0x11);
-            complete = Inject(budget, [&] { payload.push_back(std::move(extra)); return true; });
+            complete = Inject(budget, [&] { payload.push_back(std::move(extra)); return true; }, domain);
             if (extra) return false;
             if (!complete) return failures != 0 && Flatten(payload) == before && Consistent(payload);
             before.insert(before.end(), 5, 0x11);
@@ -122,7 +145,7 @@ class BufferTransferFailure : public ::testing::TestWithParam<bool> {};
 TEST_P(BufferTransferFailure, PreservesBothContainersAndUdpMetadataOnFailure) {
     const bool prefix = GetParam();
     FaultMatrix(prefix ? "prefix split" : "whole transfer",
-            [prefix](int budget, bool& complete) {
+            [prefix](int budget, bool& complete, FaultDomain domain) {
                 const auto source_bytes = Pattern(buf::Buffer::kSize + 100);
                 const auto target_bytes = Pattern(buf::Buffer::kSize * 8);
                 auto source = Packet(source_bytes);
@@ -136,7 +159,7 @@ TEST_P(BufferTransferFailure, PreservesBothContainersAndUdpMetadataOnFailure) {
                     source.MoveTo(target, true);
                     return true;
                 };
-                complete = Inject(budget, operation);
+                complete = Inject(budget, operation, domain);
                 const bool unchanged = complete || (failures != 0 &&
                     Flatten(source) == source_bytes && Flatten(target) == target_bytes &&
                     Consistent(source) && Consistent(target) && *source.begin() == original &&
@@ -208,7 +231,7 @@ TEST(BufferOwnership, UdpPrefixAllocationFailureRollsBackBothContainersAndCanRet
     const auto source_bytes = Pattern(91);
     constexpr size_t prefix_bytes = 23;
     FaultMatrix("UDP prefix buffer and target-copy failures roll back both containers",
-        [&](int budget, bool& complete) {
+        [&](int budget, bool& complete, FaultDomain domain) {
             const common::TargetAddress long_target{
                 "split-copy-target-host-name-longer-than-sso.example.com", 14321};
             auto source = Packet(source_bytes);
@@ -219,7 +242,7 @@ TEST(BufferOwnership, UdpPrefixAllocationFailureRollsBackBothContainersAndCanRet
 
             complete = Inject(budget, [&] {
                 return source.MovePrefixTo(destination, prefix_bytes);
-            });
+            }, domain);
             const bool rolled_back = complete || (failures != 0 &&
                 source.size() == 1 && *source.begin() == original &&
                 Flatten(source) == source_bytes && source.byte_size() == source_bytes.size() &&
@@ -319,6 +342,8 @@ TEST(BufferOwnership, WholePrefixTransferSkipsEmptySlotsAndPreservesByteCounts) 
 }
 }
 
+constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = FailBudgetedNew};
+
 
 TEST(BufferOwnership, PartialConsumptionReleasesConsumedBlocksWithoutCopyingPayload) {
     const auto live_before = memory::detail::test_buffers_live;
@@ -395,9 +420,11 @@ TEST(BufferOwnership, FailedFirstSpillPreservesInlinePayloadAndCanRetry) {
     std::array<buf::Buffer*, buf::MultiBuffer::kInlineCapacity> original;
     std::copy(payload.begin(), payload.end(), original.begin());
 
-    memory::reject_next_process_allocation = true;
-    EXPECT_THROW(payload.reserve(buf::MultiBuffer::kInlineCapacity + 1), std::bad_alloc);
-    memory::reject_next_process_allocation = false;
+    EXPECT_FALSE(Inject(0, [&] {
+        payload.reserve(buf::MultiBuffer::kInlineCapacity + 1);
+        return true;
+    }, FaultDomain::GlobalNew));
+    EXPECT_GT(failures, 0u);
     EXPECT_EQ(Flatten(payload), expected);
     EXPECT_TRUE(Consistent(payload));
     EXPECT_TRUE(std::equal(payload.begin(), payload.end(), original.begin(), original.end()));
@@ -442,9 +469,11 @@ TEST(BufferOwnership, CoalescingPreparesNewSlotsBeforeChangingBytesOrUdpBoundari
     const auto before = Flatten(target);
     const auto added = Flatten(source);
 
-    memory::reject_next_process_allocation = true;
-    EXPECT_THROW(target.AppendAndCoalesce(std::move(source)), std::bad_alloc);
-    memory::reject_next_process_allocation = false;
+    EXPECT_FALSE(Inject(0, [&] {
+        target.AppendAndCoalesce(std::move(source));
+        return true;
+    }, FaultDomain::GlobalNew));
+    EXPECT_GT(failures, 0u);
     EXPECT_EQ(Flatten(target), before);
     EXPECT_EQ(Flatten(source), added);
     ASSERT_EQ(source.size(), 4);
@@ -559,9 +588,9 @@ TEST(BufferOwnership, PacketStreamRetiresPartiallyAppendedInputOnRequiredAllocat
     for (size_t i = 0; i <= buf::MultiBuffer::kInlineCapacity; ++i)
         input.push_back(Buffer(buf::Buffer::kSize, static_cast<uint8_t>(i)));
 
-    memory::reject_next_process_allocation = true;
-    EXPECT_THROW((void)stream.Append(std::move(input)), std::bad_alloc);
-    memory::reject_next_process_allocation = false;
+    EXPECT_FALSE(Inject(0, [&] { return stream.Append(std::move(input)); },
+                        FaultDomain::GlobalNew));
+    EXPECT_GT(failures, 0u);
     EXPECT_EQ(stream.PendingBytes(), 0);
     buf::MultiBuffer output;
     EXPECT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Invalid);

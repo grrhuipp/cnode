@@ -1,4 +1,6 @@
 #include "transport/internet/h2_frame.hpp"
+#include <string>
+#include <vector>
 
 namespace transport::internet::h2 {
 // Returns nullopt only on a clean EOF at a frame boundary.
@@ -119,14 +121,14 @@ net::awaitable<void> WriteH2Frame(
             ? std::span<const net::const_buffer>{}
             : std::span<const net::const_buffer>(&buffer, 1));
 }
-[[nodiscard]] memory::ByteVector EncodeHttpRequestHeaders(
+[[nodiscard]] std::vector<uint8_t> EncodeHttpRequestHeaders(
     std::string_view authority,
     bool tls,
     const HttpConfig& cfg) {
     const std::string_view method = cfg.method.empty()
         ? std::string_view("PUT") : std::string_view(cfg.method);
     const std::string_view req_path = detail::EffectiveHttpPath(cfg.path);
-    memory::ByteVector h;
+    std::vector<uint8_t> h;
     h.reserve(128 + authority.size() + req_path.size() + method.size() +
               cfg.headers.size() * 32);
 
@@ -155,8 +157,8 @@ net::awaitable<void> WriteH2Frame(
     return h;
 }
 
-[[nodiscard]] memory::ByteVector EncodeHttpResponseHeaders(const HttpHeaders& headers) {
-    memory::ByteVector h;
+[[nodiscard]] std::vector<uint8_t> EncodeHttpResponseHeaders(const HttpHeaders& headers) {
+    std::vector<uint8_t> h;
     h.reserve(64 + headers.size() * 32);
     AppendHpackIndexed(h, kHpackStaticStatusOk);
     AppendHpackLiteralNewName(h, "cache-control", "no-store");
@@ -273,14 +275,14 @@ ParseH2RequestHeaders(
     AsyncStream& stream, HpackDecoder& decoder, H2Frame frame,
     std::string_view real_ip_header, bool trailers) {
     H2RequestHeaders request;
-    std::optional<memory::String> host;
+    std::optional<std::string> host;
     bool has_method = false;
     bool has_path = false;
     bool has_authority = false;
     bool has_scheme = false;
     bool seen_regular = false;
     bool valid = true;
-    const auto take_once = [](bool& seen, memory::String& out,
+    const auto take_once = [](bool& seen, std::string& out,
                               std::string_view value) {
         if (seen) return false;
         seen = true;

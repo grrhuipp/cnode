@@ -2,7 +2,6 @@
 
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
-#include "common/allocator.hpp"
 #include "common/ip_utils.hpp"
 #include "common/session.hpp"
 #include "infra/config_types.hpp"
@@ -16,6 +15,8 @@
 #include <map>
 #include <new>
 #include <stdexcept>
+#include <string>
+#include <vector>
 namespace proxyman::inbound {
 
 namespace {
@@ -528,7 +529,7 @@ HandlerRegistry::HandlerPtr HandlerRegistry::ReplaceHandler(std::unique_ptr<Hand
         return nullptr;
     }
 
-    memory::String tag(handler->Tag());
+    std::string tag(handler->Tag());
     auto shared_handler = std::shared_ptr<Handler>(std::move(handler));
     auto it = handlers_.find(tag);
     if (it == handlers_.end()) {

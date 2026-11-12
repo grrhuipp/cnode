@@ -16,6 +16,8 @@
 #include <optional>
 #include <openssl/mem.h>
 #include <openssl/rand.h>
+#include <cstdint>
+#include <list>
 
 namespace proxy::vless {
 
@@ -297,7 +299,7 @@ private:
     static constexpr size_t kBlockSize = 128;
     std::array<uint8_t, kBlockSize> inline_{};
     size_t inline_used_ = 0;
-    memory::List<std::array<uint8_t, kBlockSize>> overflow_;
+    std::list<std::array<uint8_t, kBlockSize>> overflow_;
     size_t overflow_used_ = 0;
 };
 

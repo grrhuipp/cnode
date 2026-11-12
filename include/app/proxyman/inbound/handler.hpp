@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "common/string_hash.hpp"
 #include "app/rate_limiter.hpp"
@@ -26,6 +25,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <unordered_map>
 
 namespace infra {
 
@@ -290,8 +290,8 @@ public:
     GetOnlineDevices(std::string_view tag) const;
 
 private:
-    using HandlerMap = memory::UnorderedMap<
-        memory::String,
+    using HandlerMap = std::unordered_map<
+        std::string,
         std::shared_ptr<Handler>,
         common::TransparentStringHash,
         common::TransparentStringEq>;

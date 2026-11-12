@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/unsafe.hpp"
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"
@@ -33,6 +32,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <unordered_set>
 namespace app {
 
 class GroupCoordinator;
@@ -312,7 +312,7 @@ struct VlessEncryptionClientNfsHello {
     std::array<uint8_t, kVlessEncryptionIvSize> iv{};
     VlessEncryptionNfsKey nfs_key;
     // iv followed by the obfuscated relays.
-    memory::ByteVector bytes;
+    std::vector<uint8_t> bytes;
 };
 
 struct VlessEncryptionServerNfsOpenResult {
@@ -399,7 +399,7 @@ OpenVlessEncryptionServerPfsResponse(
         encrypted_ticket,
     VlessEncryptionAeadCipher cipher) noexcept;
 
-[[nodiscard]] std::optional<memory::ByteVector> BuildVlessEncryptionPadding(
+[[nodiscard]] std::optional<std::vector<uint8_t>> BuildVlessEncryptionPadding(
     const VlessEncryptionConfig& config,
     VlessEncryptionAead& aead) noexcept;
 
@@ -635,7 +635,7 @@ private:
     struct Session {
         VlessEncryptionPfsKey pfs_key;
         std::optional<std::array<uint8_t, 16>> identity;
-        memory::UnorderedSet<NfsKeyDigest, proxy::SecretKeyedHash, proxy::TimingSafeEqual>
+        std::unordered_set<NfsKeyDigest, proxy::SecretKeyedHash, proxy::TimingSafeEqual>
             seen_nfs_keys;
     };
 

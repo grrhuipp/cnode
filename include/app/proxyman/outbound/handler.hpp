@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "app/relay.hpp"
 #include "common/asio_types.hpp"
 #include "common/string_hash.hpp"
@@ -17,6 +16,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <unordered_map>
 namespace common {
 
 class AwaitableTaskGroup;
@@ -191,7 +191,7 @@ private:
     app::dns::DNS& dns_;
     const std::chrono::seconds dial_timeout_;
     common::AwaitableTaskGroup& tasks_;
-    memory::UnorderedMap<memory::String, std::shared_ptr<Handler>,
+    std::unordered_map<std::string, std::shared_ptr<Handler>,
                          common::TransparentStringHash, common::TransparentStringEq> handlers_;
 };
 

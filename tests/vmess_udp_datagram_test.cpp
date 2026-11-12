@@ -21,6 +21,7 @@
 #include <string_view>
 #include <tuple>
 #include <memory_resource>
+#include <vector>
 
 namespace {
 
@@ -86,11 +87,11 @@ public:
         return length_cipher_ ? length_cipher_->Overhead() + 2 : 2;
     }
 
-    memory::ByteVector Encode(std::span<const uint8_t> payload) {
+    std::vector<uint8_t> Encode(std::span<const uint8_t> payload) {
         const size_t padding = padding_ && mask_ ? mask_->NextMask() % 64 : 0;
         const size_t body_size = payload.size() + cipher_.Overhead();
         const size_t total_size = body_size + padding;
-        memory::ByteVector wire(HeaderSize() + total_size);
+        std::vector<uint8_t> wire(HeaderSize() + total_size);
         EXPECT_EQ((cipher_.Encrypt(payload.data(), payload.size(), wire.data() + HeaderSize())), (static_cast<ssize_t>(body_size))) << "VMess test request encryption failed";
         if (length_cipher_) {
             const auto plain_size = static_cast<uint16_t>(total_size - length_cipher_->Overhead());
@@ -136,7 +137,7 @@ public:
         }
     }
 
-    memory::ByteVector Decode(std::span<const uint8_t> wire, size_t& offset) {
+    std::vector<uint8_t> Decode(std::span<const uint8_t> wire, size_t& offset) {
         const size_t padding = padding_ && mask_ ? mask_->NextMask() % 64 : 0;
         const size_t header_size = length_cipher_ ? length_cipher_->Overhead() + 2 : 2;
         if (offset > wire.size() || wire.size() - offset < header_size)
@@ -157,7 +158,7 @@ public:
         if (total_size < padding + cipher_.Overhead() || wire.size() - offset < total_size)
             throw std::runtime_error("VMess response chunk body truncated");
         const size_t sealed_size = total_size - padding;
-        memory::ByteVector payload(sealed_size - cipher_.Overhead());
+        std::vector<uint8_t> payload(sealed_size - cipher_.Overhead());
         EXPECT_EQ((cipher_.Decrypt(wire.data() + offset, sealed_size, payload.data())), (static_cast<ssize_t>(payload.size()))) << "VMess response chunk payload failed authentication";
         offset += total_size;
         return payload;
@@ -294,8 +295,8 @@ void CheckPayload(const buf::MultiBuffer& result, std::span<const uint8_t> expec
     }
 }
 
-memory::ByteVector MakePayload(size_t size, uint8_t seed) {
-    memory::ByteVector payload(size);
+std::vector<uint8_t> MakePayload(size_t size, uint8_t seed) {
+    std::vector<uint8_t> payload(size);
     for (size_t i = 0; i < size; ++i) {
         payload[i] = static_cast<uint8_t>(seed + i * 17);
     }
@@ -358,7 +359,7 @@ void TestBatchCancellation(proxy::vmess::Security security, uint8_t options) {
     proxy::vmess::encoding::ServerSession session("batch-cancellation-test");
     session.SetRequest(request);
     auto reader = session.DecodeRequestBody(connection.stream);
-    memory::ByteVector prefix(first_wire.begin(), first_wire.end());
+    std::vector<uint8_t> prefix(first_wire.begin(), first_wire.end());
     const size_t cut = encoder.HeaderSize() + 5;
     prefix.insert(prefix.end(), second_wire.begin(), second_wire.begin() + cut);
     connection.stream.PrependReadData(prefix);
@@ -518,7 +519,7 @@ void TestResponseAuthenticatedLength(proxy::vmess::Security security) {
         WriteReady(connection, *writer, std::move(payload));
     }
 
-    memory::ByteVector wire;
+    std::vector<uint8_t> wire;
     connection.peer.non_blocking(true);
     for (;;) {
         std::array<uint8_t, 4096> block{};
@@ -540,7 +541,7 @@ void TestResponseAuthenticatedLength(proxy::vmess::Security security) {
     EXPECT_EQ((offset), (wire.size())) << "VMess response carried unexpected trailing bytes";
 }
 
-memory::ByteVector MakeClientResponse(Connection& connection,
+std::vector<uint8_t> MakeClientResponse(Connection& connection,
                                      proxy::vmess::encoding::ClientSession& client,
                                      const proxy::vmess::MemoryAccount& account,
                                      const AES_KEY& auth_id_key,
@@ -579,7 +580,7 @@ memory::ByteVector MakeClientResponse(Connection& connection,
     }
     if (failure) std::rethrow_exception(failure);
     EXPECT_TRUE((completed && !failure)) << "VMess client request header did not complete";
-    memory::ByteVector header(connection.peer.available());
+    std::vector<uint8_t> header(connection.peer.available());
     EXPECT_TRUE((!header.empty() && net::read(connection.peer, net::buffer(header)) == header.size())) << "VMess client request header was not written";
     proxy::vmess::encoding::ServerSession server(tag);
     auto [request, consumed] = server.DecodeRequestHeader(header.data(), header.size());
@@ -593,7 +594,7 @@ memory::ByteVector MakeClientResponse(Connection& connection,
     if (!writer) throw std::runtime_error("VMess server response writer was not created");
     WriteReady(connection, *writer,
                buf::MultiBuffer{MakeBuffer(113, is_udp ? &udp_target : nullptr, 0x53)});
-    memory::ByteVector response(connection.peer.available());
+    std::vector<uint8_t> response(connection.peer.available());
     EXPECT_TRUE((response.size() > 38 &&
               net::read(connection.peer, net::buffer(response)) == response.size())) << "VMess server response was not written";
     return response;
@@ -712,7 +713,7 @@ void TestBodyReadFailure(proxy::vmess::Command command, size_t cut) {
         command);
     RequestEncoder encoder(request);
     auto prefix = command == proxy::vmess::Command::TCP
-        ? encoder.Encode(MakePayload(37, 0x12)) : memory::ByteVector{};
+        ? encoder.Encode(MakePayload(37, 0x12)) : std::vector<uint8_t>{};
     const auto wire = encoder.Encode(MakePayload(113, 0x47));
     const proxy::vmess::encoding::BodyKey key{request.body_key, request.body_iv};
     proxy::vmess::encoding::BodyDecoder decoder({request.security, request.options, command}, key, key);
@@ -822,12 +823,12 @@ void TestEmptyUdpWrite(proxy::vmess::Security security) {
     buf::MultiBuffer later_empty{MakeBuffer(0, &request.target, 0x6d)};
     reject(writer->WriteMultiBuffer(std::move(later_empty)));
     const size_t available = connection.peer.available();
-    memory::ByteVector wire(available);
+    std::vector<uint8_t> wire(available);
     EXPECT_EQ((net::read(connection.peer, net::buffer(wire))), (wire.size())) << "VMess UDP response wire was incomplete";
     ResponseDecoder decoder(request);
     size_t offset = 38;
     const auto decoded = decoder.Decode(wire, offset);
-    EXPECT_TRUE((decoded == memory::ByteVector(17, 0x42) && offset == wire.size())) << "rejected empty VMess UDP consumed framing state or appended EOF";
+    EXPECT_TRUE((decoded == std::vector<uint8_t>(17, 0x42) && offset == wire.size())) << "rejected empty VMess UDP consumed framing state or appended EOF";
 
     const proxy::vmess::encoding::BodyKey key{request.body_key, request.body_iv};
     proxy::vmess::encoding::BodyEncoder encoder({security, options, proxy::vmess::Command::UDP}, key, key);
@@ -865,7 +866,7 @@ public:
         if (!interrupted_) {
             interrupted_ = true;
             if (write_closed) throw transport::WriteClosed();
-            memory::ByteVector prefix;
+            std::vector<uint8_t> prefix;
             for (const auto buffer : buffers) {
                 const auto* bytes = static_cast<const uint8_t*>(buffer.data());
                 const size_t size = std::min(buffer.size(), size_t{7} - prefix.size());
@@ -886,7 +887,7 @@ public:
     int NativeHandle() const override { return connection_.stream.NativeHandle(); }
     bool IsOpen() const override { return connection_.stream.IsOpen(); }
 
-    memory::ByteVector published;
+    std::vector<uint8_t> published;
     bool write_closed = false;
 
 private:
@@ -1001,7 +1002,7 @@ void TestWriteEnd(bool server_side, proxy::vmess::Command command) {
     proxy::vmess::encoding::ServerSession server("write-eof");
     server.SetRequest(request);
     auto writer = server.EncodeResponseBodyWithHeader(connection.stream);
-    const auto response = server_side ? memory::ByteVector{}
+    const auto response = server_side ? std::vector<uint8_t>{}
         : MakeClientResponse(connection, client, *account, auth_key, request.target, command);
     auto finish = [&]() -> net::awaitable<void> {
         if (server_side) co_await writer->AsyncShutdownWrite();
@@ -1171,7 +1172,7 @@ TEST(VmessUdpDatagram, BodyEncoderRejectsAliasBeforeAdvancing) {
     buf::MultiBuffer encoded;
     encoder.Encode(payload, encoded);
     RequestEncoder reference(request);
-    const auto expected = reference.Encode(memory::ByteVector(19, 0x31));
+    const auto expected = reference.Encode(std::vector<uint8_t>(19, 0x31));
     const buf::ContiguousBufferView actual(encoded);
     EXPECT_TRUE((std::equal(actual.Bytes().begin(), actual.Bytes().end(),
                      expected.begin(), expected.end()))) << "VMess alias rejection advanced nonce or mask";
@@ -1267,7 +1268,7 @@ TEST(VmessUdpDatagram, LowerWriteClosedPreservesReverseRead) {
         auto account = proxy::vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
         const auto auth_key = proxy::vmess::ExpandAuthIDEncryptKey(account->auth_key);
         proxy::vmess::encoding::ClientSession client(request.security, request.command);
-        const auto response = server_side ? memory::ByteVector{}
+        const auto response = server_side ? std::vector<uint8_t>{}
             : MakeClientResponse(
                   connection, client, *account, auth_key, request.target, request.command);
         proxy::vmess::encoding::ServerSession server("lower-write-closed");
@@ -1311,7 +1312,7 @@ TEST(VmessUdpDatagram, PreCancelledWritePreservesNextRecord) {
                     "11111111-1111-4111-8111-111111111111");
                 const auto auth_key = proxy::vmess::ExpandAuthIDEncryptKey(account->auth_key);
                 proxy::vmess::encoding::ClientSession client(request.security, command);
-                memory::ByteVector response;
+                std::vector<uint8_t> response;
                 if (!server_side && entry != 3) {
                     response = MakeClientResponse(
                         connection, client, *account, auth_key, request.target, command, &request);
@@ -1319,7 +1320,7 @@ TEST(VmessUdpDatagram, PreCancelledWritePreservesNextRecord) {
                 proxy::vmess::encoding::ServerSession server("pre-cancel-write");
                 server.SetRequest(request);
                 auto writer = server.EncodeResponseBodyWithHeader(connection.stream);
-                const memory::ByteVector payload(19, 0x63);
+                const std::vector<uint8_t> payload(19, 0x63);
                 const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
                 auto write_payload = [&]() -> net::awaitable<void> {
                     if (entry == 0) {
@@ -1378,7 +1379,7 @@ TEST(VmessUdpDatagram, PreCancelledWritePreservesNextRecord) {
                     std::rethrow_exception(error);
                 }
                 if (server_side) {
-                    memory::ByteVector wire(connection.peer.available());
+                    std::vector<uint8_t> wire(connection.peer.available());
                     net::read(connection.peer, net::buffer(wire));
                     ResponseDecoder decoder(request);
                     size_t offset = 38;

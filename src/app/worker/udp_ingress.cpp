@@ -7,7 +7,6 @@
 #include "common/initial_payload.hpp"
 #include "common/ip_utils.hpp"
 #include "common/session.hpp"
-#include "common/allocator.hpp"
 #include "common/hash_container_shrink.hpp"
 #include "common/string_hash.hpp"
 #include "features/routing/dispatcher.hpp"

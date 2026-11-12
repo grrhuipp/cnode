@@ -13,6 +13,8 @@
 #include <span>
 #include <string_view>
 #include <utility>
+#include <map>
+#include <string>
 
 namespace transport::internet::detail {
 
@@ -32,7 +34,7 @@ struct BasicXHttpPacketSessionKey {
 };
 
 using XHttpPacketSessionKey =
-    BasicXHttpPacketSessionKey<memory::String>;
+    BasicXHttpPacketSessionKey<std::string>;
 
 struct XHttpPacketSessionKeyHash {
     using is_transparent = void;
@@ -67,15 +69,14 @@ public:
         if (!stream || current_) {
             return false;
         }
-        // Commit the unique owner only after the PMR control block exists.
+        // Commit the unique owner only after the shared control block exists.
         struct DeleteAfterCommit {
             bool committed = false;
             void operator()(Stream* value) const noexcept {
                 if (committed) delete value;
             }
         };
-        std::shared_ptr<Stream> shared(stream.get(), DeleteAfterCommit{},
-                                      memory::Allocator<Stream>());
+        std::shared_ptr<Stream> shared(stream.get(), DeleteAfterCommit{});
         std::get_deleter<DeleteAfterCommit>(shared)->committed = true;
         (void)stream.release();
         current_ = std::move(shared);
@@ -247,7 +248,7 @@ private:
     }
 
     memory::RingDeque<buf::MultiBuffer> ready_;
-    memory::Map<uint64_t, buf::MultiBuffer> pending_;
+    std::map<uint64_t, buf::MultiBuffer> pending_;
     size_t queued_bytes_ = 0;
     size_t queued_packets_ = 0;
     size_t queued_capacity_ = 0;
