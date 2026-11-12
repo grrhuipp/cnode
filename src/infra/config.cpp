@@ -1649,8 +1649,8 @@ bool LoadSidecarFile(const std::filesystem::path& config_dir,
     return true;
 }
 
-template <typename AddFn>
-void LoadConfigItems(const json::value& value, AddFn&& add) {
+template <typename Item>
+void LoadConfigItems(const json::value& value, std::vector<Item>& destination) {
     if (!value.is_array()) {
         throw std::invalid_argument("config list must be an array of objects");
     }
@@ -1658,24 +1658,8 @@ void LoadConfigItems(const json::value& value, AddFn&& add) {
         if (!item.is_object()) {
             throw std::invalid_argument("config list entries must be objects");
         }
-        add(item.as_object());
+        destination.push_back(Item::FromJson(item.as_object()));
     }
-}
-
-void LoadInboundItems(
-    std::vector<StaticInboundConfig>& inbounds,
-    const json::value& value) {
-    LoadConfigItems(value, [&](const json::object& item) {
-        inbounds.push_back(StaticInboundConfig::FromJson(item));
-    });
-}
-
-void LoadOutboundItems(
-    std::vector<infra::OutboundSourceConfig>& outbounds,
-    const json::value& value) {
-    LoadConfigItems(value, [&](const json::object& item) {
-        outbounds.push_back(infra::OutboundSourceConfig::FromJson(item));
-    });
 }
 
 std::vector<std::string> GetUsedRouteRuleTags(
@@ -1777,11 +1761,11 @@ std::optional<Config> LoadConfig(const std::filesystem::path& path) {
     const bool sidecars_loaded =
         LoadSidecarFile(config_dir, constants::paths::kInboundFile,
             [&](const json::value& value) {
-                LoadInboundItems(cfg.static_inbounds, value);
+                LoadConfigItems(value, cfg.static_inbounds);
             }) &&
         LoadSidecarFile(config_dir, constants::paths::kOutboundFile,
             [&](const json::value& value) {
-                LoadOutboundItems(cfg.outbounds, value);
+                LoadConfigItems(value, cfg.outbounds);
             }) &&
         LoadSidecarFile(config_dir, constants::paths::kRouteFile,
             [&](const json::value& value) {

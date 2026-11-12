@@ -1110,8 +1110,7 @@ public:
             first_ = std::move(payload);
             occupied_ = true;
         } else {
-            if (!overflow_) overflow_.emplace();
-            overflow_->push_back(std::move(payload));
+            overflow_.push_back(std::move(payload));
         }
         bytes_ += bytes;
     }
@@ -1120,9 +1119,9 @@ public:
         if (!occupied_) return {};
         MultiBuffer result = std::move(first_);
         bytes_ -= result.byte_size();
-        if (overflow_ && !overflow_->empty()) {
-            first_ = std::move(overflow_->front());
-            overflow_->pop_front();
+        if (!overflow_.empty()) {
+            first_ = std::move(overflow_.front());
+            overflow_.pop_front();
         } else {
             occupied_ = false;
         }
@@ -1134,14 +1133,14 @@ public:
 
     void clear() noexcept {
         first_.clear();
-        overflow_.reset();
+        overflow_.clear();
         bytes_ = 0;
         occupied_ = false;
     }
 
 private:
     MultiBuffer first_;
-    std::optional<memory::RingDeque<MultiBuffer>> overflow_;
+    memory::RingDeque<MultiBuffer> overflow_;
     size_t bytes_ = 0;
     bool occupied_ = false;
 };

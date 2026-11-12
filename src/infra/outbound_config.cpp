@@ -180,7 +180,8 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const json::ob
         return TrojanSettings{
             .server = Server(*server, 443),
             .password = Password(*server),
-            .server_name = JsonStringOr(*server, "serverName", ""),
+            .server_name = RequireJson(NormalizeTlsServerName(
+                JsonStringOr(*server, "serverName", ""), "trojan serverName")),
             .allow_insecure = JsonBoolOr(*server, "allowInsecure", false),
             .alpn = RequireJson(ParseJsonStringArray(*server, "alpn")).value_or(std::vector<std::string>{}),
         };

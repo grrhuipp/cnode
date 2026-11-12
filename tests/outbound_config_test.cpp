@@ -107,6 +107,15 @@ TEST(OutboundConfig, EndpointValidationRejectsWrongTypesAndAmbiguousArrays) {
     }
 }
 
+TEST(OutboundConfig, TrojanRejectsMalformedTlsNamesBeforeRuntimePreparation) {
+    for (const auto body : {
+        R"({"address":"127.0.0.1","password":"secret","serverName":"bad/name","allowInsecure":true})",
+        R"({"servers":[{"address":"127.0.0.1","password":"secret","serverName":"bad/name","allowInsecure":true}]})"}) {
+        SCOPED_TRACE(body);
+        EXPECT_THROW(Parse("trojan", body), std::invalid_argument);
+    }
+}
+
 TEST(OutboundConfig, FreedomOnlyAcceptsHandlerLevelBinding) {
     const auto source = json::parse(
         R"({"protocol":"freedom","settings":{"sendThrough":"auto"}})",

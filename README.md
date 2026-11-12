@@ -260,6 +260,7 @@ geosite.dat
 - XHTTP `mode` 只接受 `auto`（或省略）、`packet-up`、`stream-up`、`stream-one`。
 - REALITY 服务端支持 `dest`、`xver`（0/1/2）、`serverNames`、`shortIds`、`privateKey`、`minClientVer`、`maxClientVer`、`maxTimeDiff`、`mldsa65Seed`；客户端支持 `serverName`、`publicKey`、`shortId`、`fingerprint`（`chrome`/`firefox`/`safari`/`ios`/`android`/`edge`/`360`/`qq`/`random`）、`spiderX`、`mldsa65Verify`。`show`、`type`、`masterKeyLog` 会被拒绝。未认证连接透明回落到 `dest`，使用 `timeouts.dial`、`connIdle`、`write`、`uplinkOnly`、`downlinkOnly`。V2Board `tls=2` 节点自动同步为 REALITY。
 - 出站 `settings` 的每层对象均拒绝未知键。Trojan/Shadowsocks 可用扁平服务器字段或单元素 `servers` 数组；VLESS/VMess 可用扁平字段或单元素 `vnext` 数组及其中的单元素 `users` 数组，不能混用两种结构。
+- Trojan 出站 `serverName` 与 `tlsSettings.serverName` 使用相同取值规则：非空时必须是 IP 或 DNS 主机名，不能填写端口或路径。非法值在配置加载时拒绝，`allowInsecure` 不跳过名称校验。
 - VLESS 出站身份字段为 `id`，支持 UUID 或 1–30 字节自定义 ID，并按 [Xray 的 UUIDv5 映射](https://xtls.github.io/config/outbounds/vless.html#outboundconfigurationobject)处理。Vision flow 要求 TCP 搭配 TLS、REALITY 或 VLESS Encryption。`packetEncoding` 接受 `none`、`packetaddr`、`xudp`（默认）；[PacketAddr 与 XUDP](https://sing-box.sagernet.org/configuration/outbound/vless/#packet_encoding)分别对应 V2Ray 5+ 与 Xray 的 UDP 封装。
 - VMess 出站 `security` 接受 `auto`、`aes-128-gcm`、`chacha20-poly1305`、`none`、`zero`；`alterId` 仅接受 `0`。Shadowsocks 与 Trojan 的凭据字段为 `password`。
 - Shadowsocks 出站省略 `method` 时使用 `aes-256-gcm`；SS2022 每段 PSK 必须符合方法密钥长度，身份链只支持 AES 方法。`"uot": true` 开启 UoT（默认 v2），`"uotVersion": 1` 选择 v1，也可写 `"uot": {"enabled": true, "version": 2}`。Shadowsocks 与 AnyTLS 入站自动识别 UoT v1/v2。
