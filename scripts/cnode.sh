@@ -2,7 +2,8 @@
 
 # cnode 一键部署脚本
 # 用法: bash <(curl -sL <url>) -name xxx -api_host xxx -api_key xxx -node_id 1,2 -node_type vmess
-# 无参数时更新二进制和 geodata；部署模式添加/覆盖一个 panel，已有 config.json 不会被覆盖，
+# 无参数时更新二进制和 geodata，并迁移 timeouts.idle；部署模式添加/覆盖一个 panel，
+# 其余已有配置保留，
 # 指定 URL 的 sidecar 文件会覆盖下载。
 
 ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url v debug_file"
@@ -116,6 +117,7 @@ install_dependency() {
 
 install_cnode() {
     BINARY_UPDATED=0
+    CONFIG_UPDATED=0
     install_dependency curl curl
     install_dependency jq jq
 
@@ -202,6 +204,7 @@ install_cnode() {
     fi
 
     if [ "$NEED_BINARY_UPDATE" -eq 0 ] && [ "$NEED_DEBUG_DOWNLOAD" -eq 0 ]; then
+        migrate_timeouts_config || exit 1
         echo "cnode 已是最新版本: $REMOTE_VERSION"
         return 0
     fi
@@ -230,7 +233,17 @@ install_cnode() {
             echo "版本校验失败，保留原二进制: 期望 ${REMOTE_VERSION:-有效版本标识}，实际 $NEW_ID"
             exit 1
         fi
+        if ! migrate_timeouts_config; then
+            rm -f "$BINARY_TMP"
+            exit 1
+        fi
         if ! mv -f "$BINARY_TMP" "$BIN_PATH"; then
+            if [ "$CONFIG_UPDATED" -eq 1 ]; then
+                if ! cp -p "$MIGRATION_BACKUP" "$MIGRATION_TMP" || ! mv "$MIGRATION_TMP" "$CONFIG_JSON"; then
+                    echo "错误: 二进制替换及配置回滚失败；原配置备份: $MIGRATION_BACKUP"
+                    exit 1
+                fi
+            fi
             rm -f "$BINARY_TMP"
             echo "cnode 替换失败，保留原二进制。"
             exit 1
@@ -238,6 +251,7 @@ install_cnode() {
         BINARY_UPDATED=1
         echo "cnode 已更新: $NEW_ID"
     else
+        migrate_timeouts_config || exit 1
         echo "cnode 已是最新版本: $REMOTE_VERSION"
     fi
 
@@ -413,8 +427,61 @@ ensure_config_json_valid() {
             .value | type == "array" and all(.[]; type == "object"))
     ' "$CONFIG_JSON" >/dev/null 2>&1; then
         echo "错误: config.json 无效或存在大小写冲突的字段，保留原文件，请手动修复"
-        exit 1
+        return 1
     fi
+}
+
+migrate_timeouts_config() {
+    CONFIG_UPDATED=0
+    [ -f "$CONFIG_JSON" ] || return 0
+    ensure_config_json_valid || return 1
+
+    if ! jq -e '
+        all(to_entries[] | select(.key | ascii_downcase == "timeouts");
+            .value | type == "object")
+    ' "$CONFIG_JSON" >/dev/null 2>&1; then
+        echo "错误: timeouts 必须是对象，保留原配置和二进制"
+        return 1
+    fi
+    if ! jq -e '
+        any(to_entries[] | select(.key | ascii_downcase == "timeouts");
+            .value | keys_unsorted | any(ascii_downcase == "idle"))
+    ' "$CONFIG_JSON" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    MIGRATION_BACKUP=$(mktemp "$CONFIG_JSON.before-connIdle.XXXXXX") || return 1
+    MIGRATION_TMP=$(mktemp "$CONFIG_JSON.XXXXXX") || {
+        rm -f "$MIGRATION_BACKUP"
+        return 1
+    }
+    # 先快照再变换，保留文件元数据和不透明值；两种字段并存时不猜测取值。
+    if ! cp -p "$CONFIG_JSON" "$MIGRATION_BACKUP" ||
+        ! cp -p "$MIGRATION_BACKUP" "$MIGRATION_TMP" ||
+        ! jq '
+            (keys_unsorted | map(select(ascii_downcase == "timeouts")) | .[0]) as $timeouts |
+            .[$timeouts] |= (
+                (keys_unsorted | map(select(ascii_downcase == "idle")) | .[0]) as $idle |
+                if any(keys_unsorted[]; ascii_downcase == "connidle") then
+                    error("timeouts 同时包含 idle 和 connIdle")
+                elif (.[$idle] | type) != "number" then
+                    error("timeouts.idle 必须是正整数")
+                elif .[$idle] < 1 or .[$idle] > 4294967295 or (.[$idle] | floor) != .[$idle] then
+                    error("timeouts.idle 必须是 uint32 正整数")
+                else with_entries(if .key == $idle then .key = "connIdle" else . end) end
+            )
+        ' "$MIGRATION_BACKUP" > "$MIGRATION_TMP"; then
+        rm -f "$MIGRATION_TMP" "$MIGRATION_BACKUP"
+        echo "错误: timeouts.idle 迁移失败，保留原配置和二进制"
+        return 1
+    fi
+    if ! cmp -s "$CONFIG_JSON" "$MIGRATION_BACKUP" || ! mv "$MIGRATION_TMP" "$CONFIG_JSON"; then
+        rm -f "$MIGRATION_TMP"
+        echo "错误: 配置已变化或迁移写入失败，保留原文件；备份: $MIGRATION_BACKUP"
+        return 1
+    fi
+    CONFIG_UPDATED=1
+    echo "已迁移 timeouts.idle -> timeouts.connIdle；原配置备份: $MIGRATION_BACKUP"
 }
 
 # ============================================================================
@@ -453,7 +520,7 @@ upsert_panel() {
              | if $key  != "" then .tlskey = $key else . end')
     fi
 
-    ensure_config_json_valid
+    ensure_config_json_valid || exit 1
 
     # Match keys case-insensitively, but preserve names, values and unrelated
     # configuration spelling. Panel identity itself remains case-sensitive.
@@ -486,7 +553,7 @@ main() {
         update_geodata || exit 1
         install_cnode
         if [ "$WAS_ACTIVE" -eq 1 ]; then
-            if [ "$GEODATA_UPDATED" -eq 1 ] || [ "${BINARY_UPDATED:-0}" -eq 1 ]; then
+            if [ "$GEODATA_UPDATED" -eq 1 ] || [ "${BINARY_UPDATED:-0}" -eq 1 ] || [ "${CONFIG_UPDATED:-0}" -eq 1 ]; then
                 systemctl restart "$SERVICE_NAME" || exit 1
             else
                 systemctl start "$SERVICE_NAME" || exit 1
@@ -530,7 +597,7 @@ main() {
         echo "   journalctl -u $SERVICE_NAME -f"
         echo ""
         echo " 再次添加 panel（同一 cnode 实例）:"
-        echo "   bash <(curl -sL https://raw.githubusercontent.com/$REPO/master/scripts/cnode.sh) -name xxx -api_host xxx -api_key xxx -node_id 1,2 -node_type vmess"
+        echo "   bash <(curl -sL https://raw.githubusercontent.com/$REPO/main/scripts/cnode.sh) -name xxx -api_host xxx -api_key xxx -node_id 1,2 -node_type vmess"
         echo "========================================="
     else
         echo "cnode 启动失败，请检查日志:"

@@ -117,7 +117,7 @@ Inbound Handler::Process
 部署或追加一个面板：
 
 ```sh
-bash <(curl -sL https://raw.githubusercontent.com/grrhuipp/cnode/master/scripts/cnode.sh) \
+bash <(curl -sL https://raw.githubusercontent.com/grrhuipp/cnode/main/scripts/cnode.sh) \
   -name xxx -api_host https://panel.example.com -api_key xxx -node_id 1,2 -node_type vmess
 ```
 
@@ -133,7 +133,7 @@ bash <(curl -sL https://raw.githubusercontent.com/grrhuipp/cnode/master/scripts/
 
 部署模式依次更新 geodata 与二进制、写入 systemd 服务、仅在不存在时创建 `config.json`、下载指定的侧车文件、按名称添加或替换面板，最后重启服务。侧车文件先下载到临时文件并通过 JSON 校验后才替换，下载失败或内容无效时保留原文件并以失败退出，不重启服务。面板按大小写无关的字段名查找、按区分大小写的面板名称替换，不改写其他配置键；`config.json` 损坏、`panels` 类型错误或存在大小写冲突的字段时停止写入并保留原文件。
 
-不带参数运行时只更新二进制及 `geoip.dat`、`geosite.dat`，不改写既有配置。二进制先下载到同目录临时文件并校验版本，再原子替换；下载、空文件或版本校验失败时保留原二进制，不停止现有服务。二进制或 geo 数据变化后重启原本运行中的服务；geo 下载失败保留旧数据。
+不带参数运行时更新二进制及 `geoip.dat`、`geosite.dat`。更新和部署均会将已有 `timeouts.idle` 自动改名为 `connIdle`，保留原数值及其他配置，并在配置文件旁保存 `config.json.before-connIdle.*` 备份；已有新字段或未配置旧字段时不改写文件，两字段并存、旧值非法或字段大小写冲突时停止更新。二进制先下载到同目录临时文件并校验版本，再迁移配置并原子替换二进制；下载、空文件或版本校验失败时保留原二进制和配置，不停止现有服务。二进制、geo 数据变化或配置迁移后重启原本运行中的服务；geo 下载失败保留旧数据。
 
 ## Release 产物
 
