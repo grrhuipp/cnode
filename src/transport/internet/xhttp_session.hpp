@@ -25,8 +25,10 @@ struct XHttpPacketSessionKeyRef {
 
 template <typename StringType>
 struct BasicXHttpPacketSessionKey {
-    StringType session_id;
-    StringType session_namespace;
+    StringType session_id = std::make_obj_using_allocator<StringType>(
+        std::pmr::polymorphic_allocator<char>{memory::process_resource()});
+    StringType session_namespace = std::make_obj_using_allocator<StringType>(
+        std::pmr::polymorphic_allocator<char>{memory::process_resource()});
 
     [[nodiscard]] constexpr operator XHttpPacketSessionKeyRef() const noexcept {
         return {session_id, session_namespace};
@@ -34,7 +36,7 @@ struct BasicXHttpPacketSessionKey {
 };
 
 using XHttpPacketSessionKey =
-    BasicXHttpPacketSessionKey<std::string>;
+    BasicXHttpPacketSessionKey<std::pmr::string>;
 
 struct XHttpPacketSessionKeyHash {
     using is_transparent = void;
@@ -248,7 +250,7 @@ private:
     }
 
     memory::RingDeque<buf::MultiBuffer> ready_;
-    std::map<uint64_t, buf::MultiBuffer> pending_;
+    std::pmr::map<uint64_t, buf::MultiBuffer> pending_{memory::process_resource()};
     size_t queued_bytes_ = 0;
     size_t queued_packets_ = 0;
     size_t queued_capacity_ = 0;

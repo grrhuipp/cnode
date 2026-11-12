@@ -1,9 +1,10 @@
 #include "transport/internet/hpack.hpp"
+#include "common/allocator.hpp"
 #include <string>
 #include <vector>
 
 namespace transport::internet::h2 {
-void AppendHpackInt(std::vector<uint8_t>& out,
+void AppendHpackInt(std::pmr::vector<uint8_t>& out,
                     uint8_t prefix_bits,
                     uint8_t first_mask,
                     uint32_t value) {
@@ -22,23 +23,23 @@ void AppendHpackInt(std::vector<uint8_t>& out,
     out.push_back(static_cast<uint8_t>(value));
 }
 
-void AppendHpackString(std::vector<uint8_t>& out, std::string_view value) {
+void AppendHpackString(std::pmr::vector<uint8_t>& out, std::string_view value) {
     AppendHpackInt(out, 7, 0, static_cast<uint32_t>(value.size()));
     out.insert(out.end(), value.begin(), value.end());
 }
 
-void AppendHpackIndexed(std::vector<uint8_t>& out, uint32_t index) {
+void AppendHpackIndexed(std::pmr::vector<uint8_t>& out, uint32_t index) {
     AppendHpackInt(out, 7, 0x80, index);
 }
 
-void AppendHpackLiteralIndexedName(std::vector<uint8_t>& out,
+void AppendHpackLiteralIndexedName(std::pmr::vector<uint8_t>& out,
                                    uint32_t name_index,
                                    std::string_view value) {
     AppendHpackInt(out, 4, 0, name_index);
     AppendHpackString(out, value);
 }
 
-void AppendHpackLiteralNewName(std::vector<uint8_t>& out,
+void AppendHpackLiteralNewName(std::pmr::vector<uint8_t>& out,
                                std::string_view name,
                                std::string_view value) {
     out.push_back(0);

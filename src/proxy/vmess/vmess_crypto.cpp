@@ -1,4 +1,5 @@
 #include "proxy/vmess/vmess_crypto.hpp"
+#include "common/allocator.hpp"
 #include "common/byte_reader.hpp"
 #include "proxy/aead.hpp"
 #include "common/binary_text_codec.hpp"
@@ -122,7 +123,7 @@ void VmessKdfRecursive(
     }
 
     alignas(16) uint8_t inner_stack[512];
-    std::vector<uint8_t> inner_heap;
+    std::pmr::vector<uint8_t> inner_heap{memory::process_resource()};
     uint8_t* inner_input = inner_stack;
     if (64 + data_len > sizeof(inner_stack)) {
         inner_heap.resize(64 + data_len);

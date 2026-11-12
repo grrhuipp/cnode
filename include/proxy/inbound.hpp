@@ -13,6 +13,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <memory_resource>
 #include <memory>
 #include <optional>
 #include <span>
@@ -154,7 +155,7 @@ struct InboundDatagramAssociationKeyHash {
 
 // One index per listener on its receiving Worker. Entries borrow the state
 // owned by a live association row; detached/prepared rows carry null entries.
-using InboundDatagramAssociationIndex = std::unordered_map<
+using InboundDatagramAssociationIndex = std::pmr::unordered_map<
     InboundDatagramAssociationKey, InboundDatagramAssociation*,
     InboundDatagramAssociationKeyHash>;
 

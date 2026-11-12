@@ -67,7 +67,7 @@ struct transport::internet::TlsStream::Impl final : private transport::Cancellat
         // Only unsent ciphertext needs owned storage; bound handshake flights
         // and never retain a library buffer across another SSL call.
         static constexpr std::size_t kOutputLimit = 64 * 1024;
-        std::optional<std::vector<uint8_t>> output;
+        std::optional<std::pmr::vector<uint8_t>> output;
         IoErrorCode transport_error;
         std::exception_ptr failure;
         std::uint64_t generation = 0;
@@ -247,7 +247,7 @@ struct transport::internet::TlsStream::Impl final : private transport::Cancellat
             if (sent == count) return static_cast<int>(count);
         }
         try {
-            if (!call.output) call.output.emplace();
+            if (!call.output) call.output.emplace(memory::process_resource());
             auto& output = *call.output;
             const auto required = output.size() + count - sent;
             if (required > output.capacity())
@@ -783,7 +783,7 @@ net::awaitable<bool> TlsStream::Handshake() {
 
     if (reality_client_state_ &&
         !VerifyRealityClientHandshake(NativeSsl(), *reality_client_state_)) {
-        std::string spider_x = std::move(reality_client_state_->spider_x);
+        std::pmr::string spider_x = std::move(reality_client_state_->spider_x);
         ClearRealityClientState(NativeSsl(), reality_client_state_);
         if (!spider_x.empty()) {
             const char* sni = SSL_get_servername(
@@ -807,7 +807,7 @@ net::awaitable<bool> TlsStream::Handshake() {
             };
             try {
                 co_await impl_->Write(request_buffers);
-                std::string{}.swap(spider_x);
+                std::pmr::string{spider_x.get_allocator()}.swap(spider_x);
                 (void)co_await impl_->ReadMultiBuffer();
             } catch (const std::exception&) {
                 // The camouflage exchange is best-effort; authentication still

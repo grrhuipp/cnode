@@ -1,4 +1,5 @@
 #include "transport/internet/h2_frame.hpp"
+#include "common/allocator.hpp"
 #include <string>
 #include <vector>
 
@@ -121,14 +122,14 @@ net::awaitable<void> WriteH2Frame(
             ? std::span<const net::const_buffer>{}
             : std::span<const net::const_buffer>(&buffer, 1));
 }
-[[nodiscard]] std::vector<uint8_t> EncodeHttpRequestHeaders(
+[[nodiscard]] std::pmr::vector<uint8_t> EncodeHttpRequestHeaders(
     std::string_view authority,
     bool tls,
     const HttpConfig& cfg) {
     const std::string_view method = cfg.method.empty()
         ? std::string_view("PUT") : std::string_view(cfg.method);
     const std::string_view req_path = detail::EffectiveHttpPath(cfg.path);
-    std::vector<uint8_t> h;
+    std::pmr::vector<uint8_t> h{memory::process_resource()};
     h.reserve(128 + authority.size() + req_path.size() + method.size() +
               cfg.headers.size() * 32);
 
@@ -157,8 +158,8 @@ net::awaitable<void> WriteH2Frame(
     return h;
 }
 
-[[nodiscard]] std::vector<uint8_t> EncodeHttpResponseHeaders(const HttpHeaders& headers) {
-    std::vector<uint8_t> h;
+[[nodiscard]] std::pmr::vector<uint8_t> EncodeHttpResponseHeaders(const HttpHeaders& headers) {
+    std::pmr::vector<uint8_t> h{memory::process_resource()};
     h.reserve(64 + headers.size() * 32);
     AppendHpackIndexed(h, kHpackStaticStatusOk);
     AppendHpackLiteralNewName(h, "cache-control", "no-store");
@@ -275,14 +276,14 @@ ParseH2RequestHeaders(
     AsyncStream& stream, HpackDecoder& decoder, H2Frame frame,
     std::string_view real_ip_header, bool trailers) {
     H2RequestHeaders request;
-    std::optional<std::string> host;
+    std::optional<std::pmr::string> host;
     bool has_method = false;
     bool has_path = false;
     bool has_authority = false;
     bool has_scheme = false;
     bool seen_regular = false;
     bool valid = true;
-    const auto take_once = [](bool& seen, std::string& out,
+    const auto take_once = [](bool& seen, std::pmr::string& out,
                               std::string_view value) {
         if (seen) return false;
         seen = true;
@@ -326,7 +327,7 @@ ParseH2RequestHeaders(
                     valid = false;
                     return;
                 }
-                host.emplace(value);
+                host.emplace(value, memory::process_resource());
             } else if (!trailers && !real_ip_header.empty() &&
                        common::EqualsAsciiCI(name, real_ip_header)) {
                 if (request.metadata.real_ip.empty()) {

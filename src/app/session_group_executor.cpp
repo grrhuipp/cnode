@@ -1,4 +1,5 @@
 #include "app/session_group_executor.hpp"
+#include "common/allocator.hpp"
 #include "common/error.hpp"
 #include "infra/log.hpp"
 
@@ -31,7 +32,7 @@ struct app::GroupCoordinator::ReservedState {
     bool stopping = false;
     bool joined = false;
     std::atomic<uint32_t> worker_count{0};
-    std::vector<net::io_context*> workers;
+    std::pmr::vector<net::io_context*> workers{memory::process_resource()};
 };
 
 namespace app {

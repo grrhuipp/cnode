@@ -7,6 +7,7 @@
 
 #include "app/proxyman/inbound/handler.hpp"
 #include "app/stats.hpp"
+#include "common/allocator.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/buf/length_prefixed_packet_buffer.hpp"
 #include "common/initial_payload.hpp"
@@ -88,7 +89,7 @@ ReadTcpRequest(transport::AsyncStream& stream, wire::Version version, session::C
                 !contiguous.empty()) {
                 target = ParseTcpRequest(version, contiguous, header_bytes);
             } else {
-                std::vector<uint8_t> header(inspect_bytes);
+                std::pmr::vector<uint8_t> header(inspect_bytes, memory::process_resource());
                 (void)received.CopyPrefixTo(header);
                 target = ParseTcpRequest(version, header, header_bytes);
             }

@@ -22,7 +22,7 @@
 #include <vector>
 
 namespace {
-using Bytes = std::vector<uint8_t>;
+using Bytes = std::pmr::vector<uint8_t>;
 constexpr std::size_t kBytesPerWorkload = 16 * 1024 * 1024;
 constexpr std::size_t kGrowingAppends = 4;
 // Match the TLS operation's output bound; a 64 KiB append fills a fresh buffer.
@@ -64,7 +64,7 @@ TEST(AllocatorAppendBenchmark, TrackedResource) {
             // Validate the measured append path and preserved prefixes before timing.
             std::size_t sampled_capacity = 0;
             {
-                Bytes probe;
+                Bytes probe(memory::process_resource());
                 if (!growing) probe.reserve(append_bytes);
                 for (std::size_t part = 0; part < appends; ++part) {
                     Append(probe, input);
@@ -75,14 +75,14 @@ TEST(AllocatorAppendBenchmark, TrackedResource) {
                 sampled_capacity = probe.capacity();
             }
 
-            Bytes reserved;
+            Bytes reserved(memory::process_resource());
             if (!growing) reserved.reserve(append_bytes);
             timespec cpu_start{}, cpu_end{};
             ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_start), 0);
             const auto wall_start = std::chrono::steady_clock::now();
             if (growing) {
                 for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
-                    Bytes output;
+                    Bytes output(memory::process_resource());
                     for (std::size_t part = 0; part < appends; ++part) {
                         Append(output, input);
                         Observe(output);

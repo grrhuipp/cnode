@@ -156,14 +156,14 @@ private:
     // DATA payload taken off the wire; [offset, end) is body, and the whole
     // payload (padding included) is the flow-controlled length (6.1).
     struct ReceivedData {
-        std::vector<uint8_t> payload;
+        std::pmr::vector<uint8_t> payload{memory::process_resource()};
         size_t offset = 0;
         size_t end = 0;
         uint32_t flow_bytes = 0;
     };
 
     void ReleaseDataFrame() noexcept {
-        std::vector<uint8_t>{data_frame_.get_allocator()}.swap(data_frame_);
+        std::pmr::vector<uint8_t>{data_frame_.get_allocator()}.swap(data_frame_);
         data_offset_ = 0;
         data_end_ = 0;
     }
@@ -703,7 +703,7 @@ private:
     // Received DATA the reader has not taken yet.
     memory::RingDeque<ReceivedData> received_;
     // Current DATA frame payload; [data_offset_, data_end_) is unread body.
-    std::vector<uint8_t> data_frame_;
+    std::pmr::vector<uint8_t> data_frame_{memory::process_resource()};
     size_t data_offset_ = 0;
     size_t data_end_ = 0;
     H2SendWindow conn_send_window_;

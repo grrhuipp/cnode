@@ -288,7 +288,7 @@ private:
     transport::internet::TimeoutScheduler& scheduler_;
     void* failure_context_ = nullptr;
     FailureCallback on_failure_ = nullptr;
-    std::vector<UdpAssociationHook*> heap_;
+    std::pmr::vector<UdpAssociationHook*> heap_{memory::process_resource()};
     TimePoint armed_deadline_{};
     bool stopped_ = false;
     bool failed_ = false;
@@ -333,8 +333,8 @@ public:
         std::shared_ptr<const proxyman::inbound::ProtocolSettings> configuration,
         const proxy::InboundDatagramAssociationPolicy& policy);
 private:
-    std::unordered_map<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
-                         UdpHandoffIdentityHash> records_;
+    std::pmr::unordered_map<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
+                            UdpHandoffIdentityHash> records_{memory::process_resource()};
     UdpHandoffRecord* cursor_ = nullptr;
 };
 
@@ -472,11 +472,11 @@ private:
                              proxy::InboundDatagramAssociation* association) noexcept;
     void Unlink(UdpClientSession& row) noexcept;
 
-    std::string tag_;
+    std::pmr::string tag_;
     std::unique_ptr<::proxy::Inbound> proxy_;
     UdpAssociationReclaimer& reclaimer_;
     UdpResourceBudget& budget_;
-    std::unordered_map<const SocketState*, SocketStatePtr> sockets_;
+    std::pmr::unordered_map<const SocketState*, SocketStatePtr> sockets_{memory::process_resource()};
     net::io_context& io_context_;
     common::SignalChannel completion_signal_;
     UdpHandoffDirectory handoff_directory_;
@@ -503,9 +503,9 @@ struct UdpSocketState final {
     UdpIngress* owner = nullptr;
     UdpIngress::SocketPtr socket;
     std::optional<tcp::endpoint> local_endpoint;
-    proxy::InboundDatagramAssociationIndex associations;
-    std::unordered_map<ClientSessionKey, UdpIngress::UdpClientSession,
-                         ClientSessionKeyHash> sessions;
+    proxy::InboundDatagramAssociationIndex associations{memory::process_resource()};
+    std::pmr::unordered_map<ClientSessionKey, UdpIngress::UdpClientSession,
+                            ClientSessionKeyHash> sessions{memory::process_resource()};
     memory::RingDeque<QueuedReply> pending;
     size_t queued_bytes = 0;
     uint64_t active_id = 0;

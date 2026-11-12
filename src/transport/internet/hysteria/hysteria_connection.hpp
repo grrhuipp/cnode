@@ -44,10 +44,10 @@ public:
 private:
     friend class HysteriaIngress;
     struct H3Request {
-        std::string method;
-        std::string path;
-        std::string authority;
-        std::string auth;
+        std::pmr::string method{memory::process_resource()};
+        std::pmr::string path{memory::process_resource()};
+        std::pmr::string authority{memory::process_resource()};
+        std::pmr::string auth{memory::process_resource()};
     };
     struct StreamRecord {
         explicit StreamRecord(std::shared_ptr<QuicStreamState> state_value)
@@ -81,15 +81,15 @@ private:
         udp::endpoint local;
         udp::endpoint remote;
         ngtcp2_cid server_cid{};
-        std::unordered_map<int64_t, StreamRecord> streams;
+        std::pmr::unordered_map<int64_t, StreamRecord> streams{memory::process_resource()};
         int64_t next_output_stream = -1;
-        std::unordered_map<int64_t, H3Request> h3_requests;
-        memory::RingDeque<std::vector<uint8_t>> datagrams;
-        std::unordered_map<uint32_t, UdpSessionStream*> udp_sessions;
+        std::pmr::unordered_map<int64_t, H3Request> h3_requests{memory::process_resource()};
+        memory::RingDeque<std::pmr::vector<uint8_t>> datagrams{memory::process_resource()};
+        std::pmr::unordered_map<uint32_t, UdpSessionStream*> udp_sessions{memory::process_resource()};
     };
     struct PendingFragments {
         common::TargetAddress target;
-        std::vector<std::vector<uint8_t>> payloads;
+        std::pmr::vector<std::pmr::vector<uint8_t>> payloads{memory::process_resource()};
         std::array<uint8_t, 256> payload_slots{};
         std::bitset<256> received_fragments;
         uint8_t count = 0;
@@ -165,7 +165,7 @@ private:
     static int PathValidated(ngtcp2_conn*, uint32_t, const ngtcp2_path*, const ngtcp2_path*,
         ngtcp2_path_validation_result, void*);
     HysteriaIngress* listener_;
-    std::vector<ConnectionId> connection_ids_;
+    std::pmr::vector<ConnectionId> connection_ids_{memory::process_resource()};
     common::AwaitableTaskGroup* tasks_ = nullptr;
     common::SignalChannel closed_signal_;
     std::optional<Core> core_;
@@ -174,7 +174,7 @@ private:
     app::ConnectionLimiter::Reservation physical_reservation_;
     std::optional<common::UserOnlineSessionGuard> online_session_;
     std::shared_ptr<InboundTransportStreamHandler> stream_sink_;
-    std::unordered_map<uint64_t, PendingFragments> fragments_;
+    std::pmr::unordered_map<uint64_t, PendingFragments> fragments_{memory::process_resource()};
     ngtcp2_tstamp fragment_expiry_ = std::numeric_limits<ngtcp2_tstamp>::max();
     uint32_t next_udp_session_id_ = 1;
     uint16_t next_udp_packet_id_ = 0;

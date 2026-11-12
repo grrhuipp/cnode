@@ -1349,7 +1349,7 @@ private:
     common::SignalChannel main_signal;
     ReplyQueueState reply_queue;
     ClientReadQueueState client_reads;
-    std::unordered_map<uint16_t, std::unique_ptr<MuxSubSession>> sub_sessions;
+    std::pmr::unordered_map<uint16_t, std::unique_ptr<MuxSubSession>> sub_sessions{memory::process_resource()};
     buf::MultiBuffer frame_buf;
     const uint64_t parent_conn_id;
     bool running = true;

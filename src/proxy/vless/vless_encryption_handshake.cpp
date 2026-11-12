@@ -563,7 +563,7 @@ OpenVlessEncryptionServerPfsResponse(
     return result;
 }
 
-std::optional<std::vector<uint8_t>> BuildVlessEncryptionPadding(
+std::optional<std::pmr::vector<uint8_t>> BuildVlessEncryptionPadding(
     const VlessEncryptionConfig& config,
     VlessEncryptionAead& aead) noexcept {
     const auto padding_length = PickPaddingLength(config);
@@ -577,7 +577,7 @@ std::optional<std::vector<uint8_t>> BuildVlessEncryptionPadding(
         encrypted_body_length - kVlessEncryptionTagSize;
     auto encoded_length = EncodeVlessEncryptionLength(encrypted_body_length);
 
-    std::vector<uint8_t> out(*padding_length);
+    std::pmr::vector<uint8_t> out(*padding_length, memory::process_resource());
     auto sealed_length = aead.Seal(
         encoded_length,
         {},
@@ -723,7 +723,7 @@ net::awaitable<tl::expected<void, VlessEncryptionHandshakeFailure>> ReadAndOpenP
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
-    std::vector<uint8_t> padding(*encrypted_body_length);
+    std::pmr::vector<uint8_t> padding(*encrypted_body_length, memory::process_resource());
     if (!co_await reader.ReadExact(padding.data(), padding.size())) {
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Truncated);
     }
@@ -907,7 +907,7 @@ RunVlessEncryptionClientHandshake(
         if (zero) {
             try {
                 co_await WriteVlessBytes(raw_writer, nfs->bytes);
-                std::vector<uint8_t>{}.swap(nfs->bytes);
+                std::pmr::vector<uint8_t>{nfs->bytes.get_allocator()}.swap(nfs->bytes);
                 co_await WriteVlessBytes(raw_writer, zero->bytes);
             } catch (...) {
                 ticket_cache->Clear();
@@ -933,10 +933,9 @@ RunVlessEncryptionClientHandshake(
     }
 
     co_await WriteVlessBytes(raw_writer, nfs->bytes);
-    std::vector<uint8_t>{}.swap(nfs->bytes);
+    std::pmr::vector<uint8_t>{nfs->bytes.get_allocator()}.swap(nfs->bytes);
     co_await WriteVlessBytes(raw_writer, pfs->encrypted);
     co_await WriteVlessBytes(raw_writer, *padding);
-    std::vector<uint8_t>{}.swap(*padding);
     padding.reset();
 
     std::array<uint8_t, kVlessEncryptionEncryptedServerPfsPublicSize>
@@ -1087,7 +1086,6 @@ net::awaitable<VlessEncryptionHandshakeResult> CompleteServerPfs(
     co_await WriteVlessBytes(raw_writer, response->encrypted_ticket);
     response.reset();
     co_await WriteVlessBytes(raw_writer, *padding);
-    std::vector<uint8_t>{}.swap(*padding);
     padding.reset();
 
     if (auto padding_result = co_await ReadAndOpenPadding(raw_reader, nfs_aead);
@@ -1113,7 +1111,8 @@ RunVlessEncryptionServerHandshake(
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
-    std::vector<uint8_t> iv_and_relays(kVlessEncryptionIvSize + *relays_len);
+    std::pmr::vector<uint8_t> iv_and_relays(
+        kVlessEncryptionIvSize + *relays_len, memory::process_resource());
     size_t progress = 0;
     if (!co_await raw_reader.ReadExact(
             iv_and_relays.data(),
@@ -1123,7 +1122,7 @@ RunVlessEncryptionServerHandshake(
             : VlessEncryptionHandshakeFailure::Truncated);
     }
     auto nfs = OpenVlessEncryptionClientNfsHello(config, iv_and_relays);
-    std::vector<uint8_t>{}.swap(iv_and_relays);
+    std::pmr::vector<uint8_t>{iv_and_relays.get_allocator()}.swap(iv_and_relays);
     if (!nfs) {
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }

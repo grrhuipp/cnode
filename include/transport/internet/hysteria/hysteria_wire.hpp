@@ -1,4 +1,5 @@
 #pragma once
+#include "common/allocator.hpp"
 
 #include "common/ip_utils.hpp"
 #include "common/target_address.hpp"
@@ -41,7 +42,7 @@ inline constexpr size_t kMaxUdpPayloadLength = 4096;
 struct V1ClientHello {
     uint64_t send_bps = 0;
     uint64_t receive_bps = 0;
-    std::string auth;
+    std::pmr::string auth{memory::process_resource()};
 };
 
 struct V1Request {
@@ -67,14 +68,14 @@ struct UdpMessage {
 [[nodiscard]] tl::expected<V1ClientHello, ProtocolError>
 ParseV1ClientHello(std::span<const uint8_t> input);
 
-[[nodiscard]] std::vector<uint8_t>
+[[nodiscard]] std::pmr::vector<uint8_t>
 EncodeV1ServerHello(bool accepted, uint64_t send_bps, uint64_t receive_bps,
                     std::string_view message);
 
 [[nodiscard]] tl::expected<V1Request, ProtocolError>
 ParseV1Request(std::span<const uint8_t> input);
 
-[[nodiscard]] std::vector<uint8_t>
+[[nodiscard]] std::pmr::vector<uint8_t>
 EncodeV1Response(bool accepted, uint32_t udp_session_id, std::string_view message);
 
 [[nodiscard]] tl::expected<V2TcpRequest, ProtocolError>
@@ -88,7 +89,7 @@ ParseUdpMessage(Version version, std::span<const uint8_t> input);
 UdpMessageHeaderSize(Version version, const common::TargetAddress& target);
 
 // 输出归属当前分配域，可直接移动到连接的待发送队列。
-[[nodiscard]] tl::expected<std::vector<uint8_t>, ProtocolError>
+[[nodiscard]] tl::expected<std::pmr::vector<uint8_t>, ProtocolError>
 EncodeUdpMessage(Version version, const UdpMessage& message);
 
 // 已格式化的 UDP 目标：分片发送时地址只格式化一次，逐片复用。
@@ -111,7 +112,7 @@ UdpTargetHeaderSize(Version version, const UdpTargetText& text);
 
 // 以预格式化目标编码一片；|message.target| 不读，分片号与载荷上限由调用方
 // 按 |header_size|（UdpTargetHeaderSize 的结果）预先约束。
-[[nodiscard]] tl::expected<std::vector<uint8_t>, ProtocolError> EncodeUdpFragment(
+[[nodiscard]] tl::expected<std::pmr::vector<uint8_t>, ProtocolError> EncodeUdpFragment(
     Version version, const UdpMessage& message, const UdpTargetText& text,
     size_t header_size);
 

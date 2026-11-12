@@ -236,7 +236,7 @@ public:
 
     DatagramExchange(net::io_context& io, udp::endpoint endpoint)
         : socket_(io), endpoint_(endpoint), scheduler_(transport::internet::TimeoutScheduler::ForIoContext(io)),
-          joined_(io) {}
+          joined_(io), pending_(memory::process_resource()) {}
 
     void RequestStop() noexcept {
         if (stopping_) return;
@@ -458,7 +458,7 @@ private:
 class InflightResolves {
     struct Pending {
         Pending(net::io_context& io_context, std::string_view name)
-            : domain(name), completion(io_context) {}
+            : domain(name, memory::process_resource()), completion(io_context) {}
 
         std::pmr::string domain;
         common::SignalChannel completion;
@@ -585,7 +585,7 @@ public:
 
 private:
     net::io_context& io_context_;
-    Table table_;
+    Table table_{memory::process_resource()};
     size_t capacity_;
     size_t active_ = 0;
     bool stopping_ = false;

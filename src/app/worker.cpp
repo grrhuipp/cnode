@@ -6,6 +6,7 @@
 #include "common/awaitable_task_group.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "app/stats.hpp"
+#include "common/allocator.hpp"
 #include "common/session.hpp"
 #include "common/rule.hpp"
 #include "common/buf/multi_buffer.hpp"
@@ -128,15 +129,16 @@ struct app::Worker::ListenerSlot {
 
 struct app::Worker::ListenerState {
     using SlotPtr = std::shared_ptr<ListenerSlot>;
-    using ListenerSlotMap = std::unordered_map<
-        std::string, SlotPtr, common::TransparentStringHash, common::TransparentStringEq>;
+    using ListenerSlotMap = std::pmr::unordered_map<
+        std::pmr::string, SlotPtr, common::TransparentStringHash, common::TransparentStringEq>;
 
-    ListenerSlotMap listener_slots;
+    ListenerSlotMap listener_slots{memory::process_resource()};
     [[nodiscard]] auto FindOrCreateSlot(std::string_view tag) {
         const auto existing = listener_slots.find(tag);
         if (existing != listener_slots.end()) return std::pair{existing, false};
         auto slot = std::make_shared<ListenerSlot>();
-        return listener_slots.try_emplace(std::string(tag), std::move(slot));
+        return listener_slots.try_emplace(
+            std::pmr::string(tag, memory::process_resource()), std::move(slot));
     }
     uint64_t udp_resource_drops = 0;
     size_t udp_receive_loops = 0;
@@ -219,8 +221,8 @@ struct app::Worker::ListenerState {
 
     net::awaitable<void> AcceptLoop(
         app::Worker& worker,
-        std::string listener_key,
-        std::string tag,
+        std::pmr::string listener_key,
+        std::pmr::string tag,
         app::worker_detail::TcpListenerOwner::AcceptorPtr acceptor,
         SlotPtr slot);
 
@@ -344,8 +346,8 @@ namespace {
 constexpr auto kAcceptErrorBackoff = std::chrono::milliseconds(5);
 constexpr auto kAcceptResourceBackoff = std::chrono::milliseconds(100);
 
-std::string BuildListenerKey(std::string_view tag, std::string_view listen, uint16_t port) {
-    std::string key;
+std::pmr::string BuildListenerKey(std::string_view tag, std::string_view listen, uint16_t port) {
+    std::pmr::string key(memory::process_resource());
     key.reserve(tag.size() + listen.size() + 12);
     key.append(tag);
     key.push_back('|');
@@ -451,7 +453,7 @@ net::awaitable<void> Worker::DrainRuntimeTask() {
         IoErrorCode ec;
         co_await listeners.changed.async_wait(net::redirect_error(net::use_awaitable, ec));
     }
-    std::vector<ListenerState::SlotPtr> slots;
+    std::pmr::vector<ListenerState::SlotPtr> slots(memory::process_resource());
     slots.reserve(listeners.listener_slots.size());
     for (auto& [tag, slot] : listeners.listener_slots) {
         (void)tag;
@@ -680,10 +682,10 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     auto replacement_listeners =
         std::make_unique<app::worker_detail::TcpListenerOwner>();
     struct PreparedListener {
-        std::string key;
+        std::pmr::string key{memory::process_resource()};
         app::worker_detail::TcpListenerOwner::AcceptorPtr acceptor;
     };
-    std::vector<PreparedListener> prepared_listeners;
+    std::pmr::vector<PreparedListener> prepared_listeners(memory::process_resource());
 
     const auto listen_candidates = binding.listen.Candidates();
     prepared_listeners.reserve(listen_candidates.size());
@@ -695,7 +697,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         IoErrorCode ec;
 
         tcp::endpoint ep(addr, binding.port);
-        const auto listener_key = BuildListenerKey(binding.tag, listen_addr, binding.port);
+        auto listener_key = BuildListenerKey(binding.tag, listen_addr, binding.port);
         auto candidate_acceptor =
             replacement_listeners->CreateAcceptor(listener_key, worker.runtime_->io_context);
         if (!candidate_acceptor) {
@@ -762,7 +764,7 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
         }
 
 
-        prepared_listeners.push_back({listener_key, std::move(candidate_acceptor)});
+        prepared_listeners.push_back({std::move(listener_key), std::move(candidate_acceptor)});
         ++bound_count;
     }
 
@@ -788,7 +790,9 @@ bool Worker::ListenerState::StartListening(Worker& worker, const PortBinding& bi
     for (auto& prepared : prepared_listeners) {
         const auto& listener_key = prepared.key;
         auto registration = std::make_unique<TaskCancellation>(*this);
-        Spawn(worker, AcceptLoop(worker, listener_key, std::string(binding.tag),
+        Spawn(worker, AcceptLoop(worker,
+                                 std::pmr::string(listener_key, memory::process_resource()),
+                                 std::pmr::string(binding.tag, memory::process_resource()),
                                  std::move(prepared.acceptor), slot_it->second),
               true, std::move(registration));
 
@@ -826,8 +830,8 @@ net::awaitable<void> Worker::ListenerState::RetireUdpListening(std::string_view 
 
 net::awaitable<void> Worker::ListenerState::AcceptLoop(
     Worker& worker,
-    std::string listener_key,
-    std::string tag,
+    std::pmr::string listener_key,
+    std::pmr::string tag,
     app::worker_detail::TcpListenerOwner::AcceptorPtr acceptor,
     SlotPtr slot) {
     const auto owns_acceptor = [&]() {
@@ -943,7 +947,7 @@ bool Worker::RegisterInbound(
         std::make_unique<proxyman::inbound::Handler>(
             std::move(receiver), std::move(handler), *runtime_->admission);
     const auto& settings = inbound_handler->ReceiverSettings();
-    const std::string key(settings.inbound_tag);
+    const std::pmr::string key(settings.inbound_tag, memory::process_resource());
     auto [slot_it, slot_inserted] =
         runtime_->listener_state->FindOrCreateSlot(key);
     std::shared_ptr<proxyman::inbound::Handler> registered;
@@ -1235,10 +1239,10 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
             binding.tag, std::move(handler), *worker.runtime_->udp_association_reclaimer,
             worker.runtime_->udp_resource_budget, worker.runtime_->io_context);
     struct PreparedSocket {
-        std::string key;
+        std::pmr::string key{memory::process_resource()};
         app::worker_detail::UdpIngress::SocketStatePtr state;
     };
-    std::vector<PreparedSocket> prepared_sockets;
+    std::pmr::vector<PreparedSocket> prepared_sockets(memory::process_resource());
 
     const auto listen_candidates = binding.listen.Candidates();
     prepared_sockets.reserve(listen_candidates.size());
@@ -1275,7 +1279,7 @@ net::awaitable<bool> Worker::ListenerState::StartUdpListening(
         app::worker_detail::UdpIngress::SocketStatePtr state;
         net::awaitable<void> receive;
     };
-    std::vector<PreparedReceive> prepared_receives;
+    std::pmr::vector<PreparedReceive> prepared_receives(memory::process_resource());
     ListenerSlotMap::iterator slot_it;
     bool inserted_slot = false;
     try {

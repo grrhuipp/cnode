@@ -153,12 +153,12 @@ bool DomainRuleSet::Match(std::string_view domain) const {
     }
 
     char stack_buf[256];
-    std::optional<std::string> heap_buf;
+    std::optional<std::pmr::string> heap_buf;
     std::string_view lower_domain = domain;
     if (std::ranges::any_of(domain, [](char ch) { return 'A' <= ch && ch <= 'Z'; })) {
         char* lower = stack_buf;
         if (domain.size() > sizeof(stack_buf)) {
-            lower = heap_buf.emplace(domain.size(), '\0').data();
+            lower = heap_buf.emplace(domain.size(), '\0', memory::process_resource()).data();
         }
         std::ranges::transform(domain, lower, [](char ch) {
             return common::ToLowerAscii(ch);

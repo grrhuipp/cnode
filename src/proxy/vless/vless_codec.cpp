@@ -299,7 +299,7 @@ private:
     static constexpr size_t kBlockSize = 128;
     std::array<uint8_t, kBlockSize> inline_{};
     size_t inline_used_ = 0;
-    std::list<std::array<uint8_t, kBlockSize>> overflow_;
+    std::pmr::list<std::array<uint8_t, kBlockSize>> overflow_{memory::process_resource()};
     size_t overflow_used_ = 0;
 };
 

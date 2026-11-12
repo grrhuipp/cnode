@@ -467,7 +467,7 @@ UdpIngress::UdpIngress(
     UdpAssociationReclaimer& reclaimer,
     UdpResourceBudget& budget,
     net::io_context& io_context)
-    : tag_(tag)
+    : tag_(tag, memory::process_resource())
     , proxy_(std::move(proxy))
     , reclaimer_(reclaimer)
     , budget_(budget)
@@ -1088,7 +1088,7 @@ void UdpIngress::CleanupClientSessions(SocketState& socket) noexcept {
         (void)key;
         Unlink(row);
     }
-    decltype(socket.sessions) detached;
+    decltype(socket.sessions) detached(socket.sessions.get_allocator());
     detached.swap(socket.sessions);
     for (auto& [key, row] : detached) {
         (void)key;

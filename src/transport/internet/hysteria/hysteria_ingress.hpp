@@ -273,7 +273,7 @@ private:
     net::awaitable<void> SendLoop(std::shared_ptr<SocketState> socket);
 
     app::DatagramSessionEnvironment environment;
-    std::unordered_map<Connection*, std::shared_ptr<Connection>> sessions;
+    std::pmr::unordered_map<Connection*, std::shared_ptr<Connection>> sessions{memory::process_resource()};
     uint32_t worker_id;
     uint32_t worker_count;
     net::io_context& io;
@@ -281,10 +281,10 @@ private:
     uint64_t upload_bytes_per_second = 0;
     uint64_t download_bytes_per_second = 0;
     std::unique_ptr<SslContext> ssl_context;
-    std::unordered_map<std::string,
-        std::shared_ptr<SocketState>, common::TransparentStringHash, common::TransparentStringEq> sockets;
-    std::unordered_map<
-        ConnectionId, std::shared_ptr<Connection>, ConnectionIdHash> connections;
+    std::pmr::unordered_map<std::pmr::string,
+        std::shared_ptr<SocketState>, common::TransparentStringHash, common::TransparentStringEq> sockets{memory::process_resource()};
+    std::pmr::unordered_map<
+        ConnectionId, std::shared_ptr<Connection>, ConnectionIdHash> connections{memory::process_resource()};
     // AsyncJoin 的唤醒信号：每个已启动任务结束时取消一次等待。
     net::steady_timer changed;
     size_t tasks = 0;

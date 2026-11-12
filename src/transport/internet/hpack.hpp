@@ -13,11 +13,11 @@
 #include <vector>
 
 namespace transport::internet::h2 {
-void AppendHpackInt(std::vector<uint8_t>&, uint8_t, uint8_t, uint32_t);
-void AppendHpackString(std::vector<uint8_t>&, std::string_view);
-void AppendHpackIndexed(std::vector<uint8_t>&, uint32_t);
-void AppendHpackLiteralIndexedName(std::vector<uint8_t>&, uint32_t, std::string_view);
-void AppendHpackLiteralNewName(std::vector<uint8_t>&, std::string_view, std::string_view);
+void AppendHpackInt(std::pmr::vector<uint8_t>&, uint8_t, uint8_t, uint32_t);
+void AppendHpackString(std::pmr::vector<uint8_t>&, std::string_view);
+void AppendHpackIndexed(std::pmr::vector<uint8_t>&, uint32_t);
+void AppendHpackLiteralIndexedName(std::pmr::vector<uint8_t>&, uint32_t, std::string_view);
+void AppendHpackLiteralNewName(std::pmr::vector<uint8_t>&, std::string_view, std::string_view);
 inline constexpr uint32_t kHpackStaticAuthority = 1;
 inline constexpr uint32_t kHpackStaticMethodGet = 2;
 inline constexpr uint32_t kHpackStaticMethodPost = 3;
@@ -32,8 +32,8 @@ inline constexpr uint32_t kHpackMaxDynamicTableSize = 4096;
 inline constexpr size_t kHpackMaxHeaderFields = 256;
 inline constexpr size_t kHpackMaxHeaderListSize = 64 * 1024;
 struct HpackHeaderField {
-    std::string name;
-    std::string value;
+    std::pmr::string name{memory::process_resource()};
+    std::pmr::string value{memory::process_resource()};
 };
 
 // Connection-scoped HPACK decoder (RFC 7541). A failed Decode leaves the
@@ -313,9 +313,9 @@ private:
         return std::nullopt;
     }
 
-    static std::optional<std::string> DecodeHuffman(
+    static std::optional<std::pmr::string> DecodeHuffman(
         std::span<const uint8_t> data) {
-        std::string out;
+        std::pmr::string out{memory::process_resource()};
         out.reserve(data.size());
         uint16_t node = 0;
         uint32_t code = 0;
@@ -348,7 +348,7 @@ private:
         return out;
     }
 
-    static std::optional<std::string> ReadString(
+    static std::optional<std::pmr::string> ReadString(
         std::span<const uint8_t> block,
         size_t& offset) {
         if (offset >= block.size()) {
@@ -364,9 +364,9 @@ private:
         if (huffman) {
             return DecodeHuffman(encoded);
         }
-        return std::string(
+        return std::pmr::string(
             unsafe::ptr_cast<const char>(encoded.data()),
-            encoded.size());
+            encoded.size(), memory::process_resource());
     }
 
     // Static entries first, then the dynamic table newest-first (RFC 7541 2.3.3).
@@ -393,7 +393,7 @@ private:
         if (!name_index) {
             return std::nullopt;
         }
-        std::string name;
+        std::pmr::string name{memory::process_resource()};
         if (*name_index == 0) {
             auto decoded = ReadString(block, offset);
             if (!decoded) {

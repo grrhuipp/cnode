@@ -364,7 +364,7 @@ private:
         write_gate_.Cancel();
         auto streams = std::exchange(
             streams_,
-            std::unordered_map<uint32_t, std::shared_ptr<AnyTLSSubStream>>{
+            std::pmr::unordered_map<uint32_t, std::shared_ptr<AnyTLSSubStream>>{
                 streams_.get_allocator()});
         for (auto& [sid, sub] : streams) {
             (void)sid;
@@ -449,7 +449,7 @@ private:
     std::chrono::seconds control_idle_timeout_{};
     const PaddingScheme* padding_scheme_ = nullptr;
     transport::internet::AsyncWriteGate write_gate_;
-    std::unordered_map<uint32_t, std::shared_ptr<AnyTLSSubStream>> streams_;
+    std::pmr::unordered_map<uint32_t, std::shared_ptr<AnyTLSSubStream>> streams_{memory::process_resource()};
     uint32_t last_stream_id_ = 0;
     bool cancelled_ = false;
     std::optional<common::ErrorCode> physical_write_error_;

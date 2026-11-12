@@ -1,4 +1,5 @@
 #pragma once
+#include "common/allocator.hpp"
 
 #include "common/error.hpp"
 #include "common/target_address.hpp"
@@ -18,7 +19,7 @@ using TransportBuildResult = tl::expected<std::unique_ptr<AsyncStream>, common::
 
 // 入站传输握手期间从请求中提取、随逻辑流交给入站处理的元数据。
 struct InboundTransportMetadata {
-    std::string real_ip;
+    std::pmr::string real_ip{memory::process_resource()};
     // 传输层已识别的原生 UDP 会话的首个目标；有值即该逻辑流是 UDP 会话（Network::UDP）。
     std::optional<common::TargetAddress> udp_session_target;
 };

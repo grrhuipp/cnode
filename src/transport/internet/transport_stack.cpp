@@ -1,4 +1,5 @@
 #include "transport/internet/transport_stack.hpp"
+#include "common/allocator.hpp"
 
 #include "transport/internet/http1_handshake.hpp"
 #include "transport/internet/http2_session.hpp"
@@ -86,7 +87,7 @@ net::awaitable<void> RunRealityFallbackProxy(
     const InboundFallbackContext& fallback,
     std::unique_ptr<TcpStream> client_tcp,
     const RealityConfig& reality,
-    std::vector<uint8_t> initial_bytes) {
+    std::pmr::vector<uint8_t> initial_bytes) {
     session::Context& ctx = fallback.ctx;
     const infra::TimeoutsConfig& timeouts = fallback.timeouts;
 
@@ -134,7 +135,7 @@ net::awaitable<void> RunRealityFallbackProxy(
         first_ok = buf::AppendSpanToMultiBuffer(std::span<const uint8_t>(proxy_header.data(), proxy_header_len), first);
     }
     first_ok = first_ok && buf::AppendSpanToMultiBuffer(initial_bytes, first);
-    std::vector<uint8_t>{}.swap(initial_bytes);
+    std::pmr::vector<uint8_t>{initial_bytes.get_allocator()}.swap(initial_bytes);
     if (!first_ok) {
         dest_stream->CloseAbortive();
         client_tcp->CloseAbortive();
@@ -192,7 +193,7 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
             LOG_CONN_ERROR(conn_id, "REALITY dest fallback requires an inbound fallback context");
             co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
         }
-        std::vector<uint8_t> initial_bytes;
+        std::pmr::vector<uint8_t> initial_bytes{memory::process_resource()};
         {
             // The caller's absolute phase deadline covers sniffing and SSL_accept;
             // never restart it when another record/fragment arrives.
@@ -235,7 +236,7 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
             co_return std::unique_ptr<AsyncStream>{};
         }
         tcp->PrependReadData(initial_bytes);
-        std::vector<uint8_t>{}.swap(initial_bytes);
+        std::pmr::vector<uint8_t>{initial_bytes.get_allocator()}.swap(initial_bytes);
     }
     std::unique_ptr<TlsStream> tls;
     if (reality_conn_state) {

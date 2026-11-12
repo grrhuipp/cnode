@@ -1,4 +1,5 @@
 #include "transport/internet/reality_tls.hpp"
+#include "common/allocator.hpp"
 #include "transport/internet/tls_context.hpp"
 #include "transport/internet/tls_stream.hpp"
 #include "transport/internet/stream_settings.hpp"
@@ -267,8 +268,8 @@ void FreeRealityServerConnState(void* /*parent*/,
         common::LoadU24BE(hello.client_hello + 1) == hello.client_hello_len - 4;
 }
 
-[[nodiscard]] std::vector<uint8_t> FramedClientHello(const SSL_CLIENT_HELLO& hello) {
-    std::vector<uint8_t> framed;
+[[nodiscard]] std::pmr::vector<uint8_t> FramedClientHello(const SSL_CLIENT_HELLO& hello) {
+    std::pmr::vector<uint8_t> framed{memory::process_resource()};
     if (HasHandshakeHeader(hello)) {
         framed.assign(hello.client_hello,
                       hello.client_hello + hello.client_hello_len);
@@ -930,7 +931,7 @@ struct RealityClientHelloExtensions {
 
 [[nodiscard]] std::unique_ptr<RealityServerConnState>
 VerifyRealityClientHelloHandshake(
-    std::vector<uint8_t> handshake,
+    std::pmr::vector<uint8_t> handshake,
     const RealityServerState& state) {
     // This is the reassembled handshake, including its four-byte header.
     common::ByteReader reader(handshake);
@@ -1380,7 +1381,7 @@ bool TlsStream::SetRealityClient(const RealityConfig& reality) {
 }
 
 std::unique_ptr<RealityServerConnState> VerifyRealityClientHello(
-    std::vector<uint8_t> handshake,
+    std::pmr::vector<uint8_t> handshake,
     const SslContext& ctx) {
     const SSL_CTX* ssl_ctx = ctx.Native();
     const auto* state = ssl_ctx

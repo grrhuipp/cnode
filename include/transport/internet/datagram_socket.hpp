@@ -1,4 +1,5 @@
 #pragma once
+#include "common/allocator.hpp"
 
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"
@@ -134,7 +135,7 @@ public:
 
 private:
     buf::BufferGuard small_;
-    std::vector<uint8_t> large_;
+    std::pmr::vector<uint8_t> large_{memory::process_resource()};
 };
 
 // 不终止监听的收包错误：队列暂空、被信号打断，以及 ICMP 回报的对端不可达/重置

@@ -1,4 +1,5 @@
 #include "transport/internet/xhttp_session.hpp"
+#include "common/allocator.hpp"
 
 #include "transport/internet/http1_handshake.hpp"
 #include "app/session_group_executor.hpp"
@@ -396,11 +397,11 @@ private:
 
 // `close_connection` announces that the server ends the connection after this
 // response (RFC 9112 9.6); otherwise an HTTP/1.1 connection persists.
-[[nodiscard]] std::string BuildXHttpResponseHeaders(
+[[nodiscard]] std::pmr::string BuildXHttpResponseHeaders(
     const HttpConfig& cfg,
     bool chunked_body,
     bool close_connection) {
-    std::string response;
+    std::pmr::string response{memory::process_resource()};
     response.reserve(192 + cfg.headers.size() * 32);
     response.append("HTTP/1.1 200 OK\r\n");
     response.append("X-Accel-Buffering: no\r\n");
@@ -428,9 +429,9 @@ private:
     return response;
 }
 
-[[nodiscard]] std::string BuildEmptyHttp1Response(std::string_view status,
+[[nodiscard]] std::pmr::string BuildEmptyHttp1Response(std::string_view status,
                                                                 bool close_connection) {
-    std::string response;
+    std::pmr::string response{memory::process_resource()};
     response.reserve(64 + status.size());
     response.append("HTTP/1.1 ");
     response.append(status);
@@ -500,7 +501,7 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
     co_return payload;
 }
 
-[[nodiscard]] std::string BuildXHttpReferer(std::string_view host,
+[[nodiscard]] std::pmr::string BuildXHttpReferer(std::string_view host,
                                                           std::string_view path,
                                                           bool tls) {
     const std::string_view scheme = tls ? "https://" : "http://";
@@ -508,7 +509,7 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
     const std::string_view req_path = detail::EffectiveHttpPath(path);
     constexpr std::string_view kPaddingKey = "x_padding=";
 
-    std::string referer;
+    std::pmr::string referer{memory::process_resource()};
     referer.reserve(scheme.size() + host_part.size() + req_path.size() + 1 +
                     kPaddingKey.size() + kXHttpRefererPadding.size());
     referer.append(scheme);
@@ -556,7 +557,7 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
            common::EqualsAsciiCI(key, "Transfer-Encoding");
 }
 
-[[nodiscard]] std::string BuildXHttp1ClientRequest(
+[[nodiscard]] std::pmr::string BuildXHttp1ClientRequest(
     const HttpConfig& cfg,
     std::string_view host,
     std::string_view content_length,
@@ -567,7 +568,7 @@ net::awaitable<std::optional<buf::MultiBuffer>> ReadXHttpPacketBody(
     const size_t reserve_size = 224 + method.size() + req_path.size() + host.size() +
                                 content_length.size() + cfg.headers.size() * 32;
 
-    std::string request;
+    std::pmr::string request{memory::process_resource()};
     request.reserve(reserve_size);
     AppendRequestStart(request, method, req_path, host);
     if (chunked_upload) {
@@ -859,8 +860,8 @@ public:
         const bool inserting = found == sessions_.end();
         if (found == sessions_.end()) {
             ::transport::internet::detail::XHttpPacketSessionKey key{
-                .session_id = std::string(id),
-                .session_namespace = std::string(session_namespace),
+                .session_id = std::pmr::string(id, memory::process_resource()),
+                .session_namespace = std::pmr::string(session_namespace, memory::process_resource()),
             };
             found = sessions_.try_emplace(std::move(key)).first;
         }
@@ -925,10 +926,10 @@ private:
         entry.previous = entry.next = nullptr;
     }
 
-    std::unordered_map<
+    std::pmr::unordered_map<
         ::transport::internet::detail::XHttpPacketSessionKey, XHttpSessionTableEntry,
         ::transport::internet::detail::XHttpPacketSessionKeyHash,
-        ::transport::internet::detail::XHttpPacketSessionKeyEq> sessions_;
+        ::transport::internet::detail::XHttpPacketSessionKeyEq> sessions_{memory::process_resource()};
     XHttpSessionTableEntry* first_ = nullptr;
     XHttpSessionTableEntry* last_ = nullptr;
     size_t active_ = 0;
@@ -1523,7 +1524,8 @@ HttpConfig XHttpClientHttpConfig(const XHttpConfig& cfg,
         http.headers.emplace("content-type", "application/grpc");
     }
     if (!FindHttpHeader(http.headers, "Referer")) {
-        http.headers.emplace("referer", BuildXHttpReferer(http.host, http.path, tls));
+        http.headers.emplace(
+            "referer", std::string(BuildXHttpReferer(http.host, http.path, tls)));
     }
     return http;
 }
@@ -1974,7 +1976,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
     }
 
     const bool chunked_upload = kind == XHttpClientRequestKind::StreamUp;
-    const std::string request = BuildXHttp1ClientRequest(
+    const std::pmr::string request = BuildXHttp1ClientRequest(
         cfg, host, content_length, chunked_upload);
     if (chunked_upload) {
         // Send the head and initial chunk together; an owned reader drains

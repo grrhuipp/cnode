@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/allocator.hpp"
 #include "app/relay.hpp"
 #include "common/asio_types.hpp"
 #include "common/string_hash.hpp"
@@ -191,8 +192,9 @@ private:
     app::dns::DNS& dns_;
     const std::chrono::seconds dial_timeout_;
     common::AwaitableTaskGroup& tasks_;
-    std::unordered_map<std::string, std::shared_ptr<Handler>,
-                         common::TransparentStringHash, common::TransparentStringEq> handlers_;
+    std::pmr::unordered_map<std::pmr::string, std::shared_ptr<Handler>,
+                            common::TransparentStringHash, common::TransparentStringEq>
+        handlers_{memory::process_resource()};
 };
 
 }  // namespace proxyman::outbound

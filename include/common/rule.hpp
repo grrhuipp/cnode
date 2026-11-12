@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/allocator.hpp"
 #include "common/string_hash.hpp"
 
 #include <memory>
@@ -23,8 +24,8 @@ class DetectRulePolicy final {
 public:
     using RuleList = std::vector<DetectRule>;
     using RuleListPtr = std::shared_ptr<const RuleList>;
-    using InboundRule = std::unordered_map<
-        std::string,
+    using InboundRule = std::pmr::unordered_map<
+        std::pmr::string,
         RuleListPtr,
         common::TransparentStringHash,
         common::TransparentStringEq>;
@@ -41,7 +42,7 @@ public:
     [[nodiscard]] bool Blocked(
         const session::Context& ctx);
 private:
-    InboundRule rules_;
+    InboundRule rules_{memory::process_resource()};
 };
 
 }  // namespace rule

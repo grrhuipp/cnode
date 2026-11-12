@@ -30,7 +30,7 @@
 
 namespace {
 // Armed together with memory::reject_next_process_allocation; whichever
-// allocation (coroutine frame or string via operator new, or raw Buffer)
+// allocation (coroutine frame via operator new, or process-layer string/Buffer)
 // comes first consumes the single injected failure.
 thread_local bool fail_next_allocation = false;
 thread_local size_t operator_new_failures = 0;

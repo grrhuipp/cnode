@@ -1,4 +1,5 @@
 #pragma once
+#include "common/allocator.hpp"
 #include "transport/internet/http2_session.hpp"
 #include "transport/internet/http1_handshake.hpp"
 #include "transport/internet/hpack.hpp"
@@ -68,7 +69,7 @@ struct H2Frame {
     H2FrameType type = H2FrameType::DATA;
     uint8_t flags = 0;
     uint32_t stream_id = 0;
-    std::vector<uint8_t> payload;
+    std::pmr::vector<uint8_t> payload{memory::process_resource()};
 };
 
 net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream);
@@ -181,12 +182,12 @@ public:
 private:
     int64_t size_ = kDefault;
 };
-[[nodiscard]] inline std::vector<uint8_t> EncodeGrpcRequestHeaders(
+[[nodiscard]] inline std::pmr::vector<uint8_t> EncodeGrpcRequestHeaders(
     std::string_view authority,
     std::string_view path,
     bool tls,
     std::string_view user_agent) {
-    std::vector<uint8_t> h;
+    std::pmr::vector<uint8_t> h{memory::process_resource()};
     h.reserve(128 + authority.size() + path.size() + user_agent.size());
     AppendHpackIndexed(h, kHpackStaticMethodPost);
     AppendHpackIndexed(h, tls ? kHpackStaticSchemeHttps : kHpackStaticSchemeHttp);
@@ -259,7 +260,7 @@ net::awaitable<tl::expected<void, H2Error>> ReadH2HeaderFields(
     if ((frame.flags & kFlagEndHeaders) != 0) {
         co_return decode(*fragment);
     }
-    std::vector<uint8_t> block(fragment->begin(), fragment->end());
+    std::pmr::vector<uint8_t> block(fragment->begin(), fragment->end(), memory::process_resource());
     while (true) {
         auto continuation = co_await ReadH2Frame(stream);
         if (!continuation ||
@@ -278,9 +279,9 @@ net::awaitable<tl::expected<void, H2Error>> ReadH2HeaderFields(
     co_return decode(block);
 }
 struct H2RequestHeaders {
-    std::string method;
-    std::string path;
-    std::string authority;
+    std::pmr::string method{memory::process_resource()};
+    std::pmr::string path{memory::process_resource()};
+    std::pmr::string authority{memory::process_resource()};
     InboundTransportMetadata metadata;
 };
 
@@ -317,8 +318,8 @@ tl::expected<std::optional<uint32_t>, H2Error> PeerInitialWindowSetting(
     std::span<const uint8_t>);
 tl::expected<uint32_t, H2Error> WindowUpdateIncrement(const H2Frame&);
 net::awaitable<void> SendWindowUpdates(AsyncStream&, uint32_t, uint32_t, uint32_t);
-std::vector<uint8_t> EncodeHttpRequestHeaders(std::string_view, bool, const HttpConfig&);
-std::vector<uint8_t> EncodeHttpResponseHeaders(const HttpHeaders&);
+std::pmr::vector<uint8_t> EncodeHttpRequestHeaders(std::string_view, bool, const HttpConfig&);
+std::pmr::vector<uint8_t> EncodeHttpResponseHeaders(const HttpHeaders&);
 net::awaitable<tl::expected<std::optional<H2RequestHeaders>, H2Error>> ParseH2RequestHeaders(
     AsyncStream&, HpackDecoder&, H2Frame, std::string_view, bool);
 net::awaitable<TransportBuildResult> StartHttp2ServerSession(

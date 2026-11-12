@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/allocator.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "common/string_hash.hpp"
 #include "app/rate_limiter.hpp"
@@ -290,14 +291,14 @@ public:
     GetOnlineDevices(std::string_view tag) const;
 
 private:
-    using HandlerMap = std::unordered_map<
-        std::string,
+    using HandlerMap = std::pmr::unordered_map<
+        std::pmr::string,
         std::shared_ptr<Handler>,
         common::TransparentStringHash,
         common::TransparentStringEq>;
 
     const AdmissionEnvironment& environment_;
-    HandlerMap handlers_;
+    HandlerMap handlers_{memory::process_resource()};
 };
 
 }  // namespace proxyman::inbound

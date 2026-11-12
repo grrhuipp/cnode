@@ -529,7 +529,7 @@ HandlerRegistry::HandlerPtr HandlerRegistry::ReplaceHandler(std::unique_ptr<Hand
         return nullptr;
     }
 
-    std::string tag(handler->Tag());
+    std::pmr::string tag(handler->Tag(), memory::process_resource());
     auto shared_handler = std::shared_ptr<Handler>(std::move(handler));
     auto it = handlers_.find(tag);
     if (it == handlers_.end()) {

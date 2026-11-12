@@ -188,7 +188,7 @@ CompleteVlessInboundHandshake(
     proxy::InboundAuthentication authentication,
     const proxyman::inbound::ReceiverSettings& receiver,
     session::Context& ctx) {
-    const auto tag = ctx.inbound.tag;
+    const std::string_view tag = ctx.inbound.tag;
     const auto& client_ip = ctx.inbound.source_ip;
     auto* active_reader = &protocol_reader;
     auto* active_writer = &protocol_writer;

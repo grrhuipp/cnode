@@ -271,14 +271,13 @@ foreach(name IN ITEMS
         allocator anytls_codec_errors anytls_outbound_lifecycle buffer_ownership
         buffer_span_builder dispatcher_cancellation dns_datagram http_handshake_read_ahead
         quic_stream relay_initial_payload substream_inbound_lifecycle tcp_read
-        tls_record_buffer udp_socket_owner uot_ss2022 vless_udp_framing)
+        tls_record_buffer udp_socket_owner uot_ss2022 vless_udp_framing ss2022_salt_pool)
     cnode_unit(${name} LIBRARY cnode_test_core)
 endforeach()
 foreach(name IN ITEMS protocol_registration inbound_tls_policy runtime_sampling worker_udp_retirement_runtime)
     cnode_unit(${name} LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core>")
 endforeach()
 cnode_unit(awaitable_batch LIBRARY cnode_build_options)
-cnode_unit(ss2022_salt_pool)
 cnode_unit(awaitable_task_group LIBRARY cnode_build_options)
 cnode_unit(shadowsocks_stream_crypto LIBRARY cnode_build_options SOURCES src/proxy/shadowsocks/shadowsocks_protocol.cpp)
 cnode_unit(timeout_scheduler LIBRARY cnode_build_options SOURCES src/transport/internet/timeout_scheduler.cpp src/app/session_group_executor.cpp src/infra/log.cpp)
@@ -312,11 +311,11 @@ target_compile_definitions(cnode_shadowsocks_stream_crypto_test PRIVATE
 target_link_options(cnode_shadowsocks_stream_crypto_test PRIVATE
     -Wl,--wrap=malloc -Wl,--wrap=EVP_AEAD_CTX_new)
 foreach(target IN ITEMS cnode_anytls_outbound_lifecycle_test cnode_anytls_padding_test
-                        cnode_buffer_ownership_test cnode_xhttp_upload_stream_slot_test
+                        cnode_xhttp_upload_stream_slot_test
                         cnode_awaitable_batch_test cnode_awaitable_task_group_test
                         cnode_cancellation_source_test cnode_dns_inflight_test cnode_grpc_hunk_test
                         cnode_timeout_scheduler_test
-                        cnode_ss2022_salt_pool_test cnode_udp_socket_owner_test
+                        cnode_udp_socket_owner_test
                         cnode_user_store_batch_test)
     target_link_libraries(${target} PRIVATE cnode_allocation_hook)
 endforeach()

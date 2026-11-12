@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/allocator.hpp"
 #include "common/hash_container_shrink.hpp"
 
 #include <openssl/mem.h>
@@ -63,7 +64,8 @@ public:
     };
 
     explicit ExpiringKeyedMap(size_t capacity)
-        : entries_(0, SecretKeyedHash::Random()), capacity_(capacity) {}
+        : entries_(0, SecretKeyedHash::Random(), TimingSafeEqual{}, memory::process_resource())
+        , capacity_(capacity) {}
     ExpiringKeyedMap(const ExpiringKeyedMap&) = delete;
     ExpiringKeyedMap& operator=(const ExpiringKeyedMap&) = delete;
 
@@ -130,7 +132,7 @@ private:
         entry.previous = entry.next = nullptr;
     }
 
-    std::unordered_map<Key, Entry, SecretKeyedHash, TimingSafeEqual> entries_;
+    std::pmr::unordered_map<Key, Entry, SecretKeyedHash, TimingSafeEqual> entries_;
     size_t capacity_;
     Entry* first_ = nullptr;
     Entry* last_ = nullptr;

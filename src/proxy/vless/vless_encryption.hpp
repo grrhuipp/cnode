@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/allocator.hpp"
 #include "common/unsafe.hpp"
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"
@@ -312,7 +313,7 @@ struct VlessEncryptionClientNfsHello {
     std::array<uint8_t, kVlessEncryptionIvSize> iv{};
     VlessEncryptionNfsKey nfs_key;
     // iv followed by the obfuscated relays.
-    std::vector<uint8_t> bytes;
+    std::pmr::vector<uint8_t> bytes{memory::process_resource()};
 };
 
 struct VlessEncryptionServerNfsOpenResult {
@@ -399,7 +400,7 @@ OpenVlessEncryptionServerPfsResponse(
         encrypted_ticket,
     VlessEncryptionAeadCipher cipher) noexcept;
 
-[[nodiscard]] std::optional<std::vector<uint8_t>> BuildVlessEncryptionPadding(
+[[nodiscard]] std::optional<std::pmr::vector<uint8_t>> BuildVlessEncryptionPadding(
     const VlessEncryptionConfig& config,
     VlessEncryptionAead& aead) noexcept;
 
@@ -635,8 +636,8 @@ private:
     struct Session {
         VlessEncryptionPfsKey pfs_key;
         std::optional<std::array<uint8_t, 16>> identity;
-        std::unordered_set<NfsKeyDigest, proxy::SecretKeyedHash, proxy::TimingSafeEqual>
-            seen_nfs_keys;
+        std::pmr::unordered_set<NfsKeyDigest, proxy::SecretKeyedHash, proxy::TimingSafeEqual>
+            seen_nfs_keys{memory::process_resource()};
     };
 
     using SessionMap = proxy::ExpiringKeyedMap<kVlessEncryptionTicketSize, Session,

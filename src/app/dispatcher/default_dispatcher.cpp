@@ -1,6 +1,7 @@
 #include "app/dispatcher/default_dispatcher.hpp"
 #include "app/relay.hpp"
 
+#include "common/allocator.hpp"
 #include "common/awaitable_task_group.hpp"
 
 #include "app/stats.hpp"
@@ -120,7 +121,7 @@ net::awaitable<bool> SniffInitialPayload(
     static constexpr size_t kSniffMaxDatagrams = 64;
     static constexpr auto kSniffWindow = std::chrono::milliseconds(200);
     buf::MultiBuffer sniff_payload;
-    std::vector<uint8_t> sniff_scratch;
+    std::pmr::vector<uint8_t> sniff_scratch(memory::process_resource());
     sniff::Sniffer sniffer;
     size_t cached_bytes = 0;
     size_t cached_datagrams = 0;
@@ -238,7 +239,7 @@ net::awaitable<bool> SniffInitialPayload(
                 break;
             }
             read = {};
-            std::vector<uint8_t>().swap(sniff_scratch);
+            std::pmr::vector<uint8_t>(sniff_scratch.get_allocator()).swap(sniff_scratch);
             transport::internet::AsyncDelay delay(io_context);
             auto next = co_await (read_more() || delay.WaitFor(remaining));
             if (sniff_cancellation.cancelled() != net::cancellation_type::none) {

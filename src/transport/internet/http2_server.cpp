@@ -1,4 +1,5 @@
 #include "transport/internet/http2_server.hpp"
+#include "common/allocator.hpp"
 #include <vector>
 
 namespace transport::internet::h2 {
@@ -60,7 +61,7 @@ net::awaitable<void> Http2ServerSubStreamState::WaitSendCredit() {
 
 bool Http2ServerSubStreamState::EnqueueData(
     Http2ServerSession& session,
-    std::vector<uint8_t> frame_payload,
+    std::pmr::vector<uint8_t> frame_payload,
     size_t offset,
     size_t size) {
     if (!AcceptsData()) return false;

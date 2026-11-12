@@ -748,7 +748,7 @@ net::awaitable<void> ClientSession::EncodeRequestBodyEOF(transport::AsyncStream&
 
 net::awaitable<void> ClientSession::DecodeResponseHeader(transport::AsyncStream& stream) {
     auto reset_header_state = [this]() noexcept {
-        std::vector<uint8_t>{}.swap(response_header_sealed_);
+        std::pmr::vector<uint8_t>{response_header_sealed_.get_allocator()}.swap(response_header_sealed_);
         response_length_read_ = 0;
         response_header_read_ = 0;
     };

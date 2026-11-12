@@ -106,7 +106,7 @@ void VlessEncryptionServerTicketStore::Store(
     sessions_.Insert(key, now + std::chrono::seconds(seconds), Session{
         .pfs_key = pfs_key, .identity = std::nullopt,
         .seen_nfs_keys = decltype(Session::seen_nfs_keys)(
-            0, sessions_.hash_function(), proxy::TimingSafeEqual{}),
+            0, sessions_.hash_function(), proxy::TimingSafeEqual{}, memory::process_resource()),
     }, [this](auto& entry) noexcept {
         seen_nfs_keys_ -= entry.value.seen_nfs_keys.size();
     });

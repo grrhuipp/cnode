@@ -235,10 +235,10 @@ struct Handler::ClientSession {
     uint32_t packet_index = 1;
     std::optional<SessionVersion> session_version;
     transport::internet::AsyncWriteGate write_gate;
-    std::unordered_map<
+    std::pmr::unordered_map<
         uint32_t,
         std::weak_ptr<LogicalStream>>
-        logical_streams;
+        logical_streams{memory::process_resource()};
     size_t active_streams = 0;
     bool closed = false;
     // First terminal cause. The physical loop can fail inline while Adopt
@@ -292,7 +292,7 @@ struct Handler::ClientSession {
         write_gate.Cancel();
         auto streams = std::exchange(
             logical_streams,
-            std::unordered_map<uint32_t, std::weak_ptr<LogicalStream>>{
+            std::pmr::unordered_map<uint32_t, std::weak_ptr<LogicalStream>>{
                 logical_streams.get_allocator()});
         for (auto& [sid, weak] : streams) {
             (void)sid;
@@ -313,7 +313,7 @@ struct Handler::ClientSession {
     }
 
     net::awaitable<tl::expected<void, common::ErrorCode>>
-    WriteOpenPacket(std::vector<uint8_t> packet) {
+    WriteOpenPacket(std::pmr::vector<uint8_t> packet) {
         auto write_lease = write_gate.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
@@ -648,7 +648,7 @@ public:
         , check_interval_(check)
         , idle_timeout_(timeout)
         , minimum_idle_(minimum)
-        , tag_(name) {
+        , tag_(name, memory::process_resource()) {
         if (check <= Clock::duration::zero() || timeout <= Clock::duration::zero()) {
             throw std::invalid_argument("AnyTLS session intervals must be positive");
         }
@@ -692,7 +692,7 @@ public:
     void Retire() noexcept {
         retired_ = true;
         Cancel();
-        std::vector<Entry> closing(entries_.get_allocator());
+        std::pmr::vector<Entry> closing(entries_.get_allocator());
         closing.swap(entries_);
         for (const auto& entry : closing) Close(entry.session);
     }
@@ -788,7 +788,7 @@ private:
     void StopIfEmpty() noexcept {
         if (!entries_.empty()) return;
         Cancel();
-        std::vector<Entry>{entries_.get_allocator()}.swap(entries_);
+        std::pmr::vector<Entry>{entries_.get_allocator()}.swap(entries_);
     }
 
     void Schedule() {
@@ -817,8 +817,8 @@ private:
     const Clock::duration check_interval_;
     const Clock::duration idle_timeout_;
     const size_t minimum_idle_;
-    const std::string tag_;
-    std::vector<Entry> entries_;
+    const std::pmr::string tag_;
+    std::pmr::vector<Entry> entries_{memory::process_resource()};
     bool retired_ = false;
     std::exception_ptr failure_;
 };
@@ -885,7 +885,7 @@ DialPhysicalSession(
 
     const size_t auth_packet_size = ::proxy::anytls::kAuthPrefixSize + static_cast<size_t>(auth_padding_size);
     std::array<uint8_t, 256> inline_auth{};
-    std::vector<uint8_t> heap_auth;
+    std::pmr::vector<uint8_t> heap_auth{memory::process_resource()};
     common::ScopedCleanse cleanse_auth_packet{inline_auth, heap_auth};
     uint8_t* auth_ptr = inline_auth.data();
     if (auth_packet_size > inline_auth.size()) {
@@ -914,7 +914,7 @@ DialPhysicalSession(
     co_return std::move(new_stream);
 }
 
-tl::expected<std::vector<uint8_t>, common::ErrorCode> BuildOpenPacket(
+tl::expected<std::pmr::vector<uint8_t>, common::ErrorCode> BuildOpenPacket(
     uint32_t sid,
     bool is_udp,
     const common::TargetAddress& original_target,
@@ -933,7 +933,7 @@ tl::expected<std::vector<uint8_t>, common::ErrorCode> BuildOpenPacket(
         return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
     }
 
-    std::vector<uint8_t> packet;
+    std::pmr::vector<uint8_t> packet{memory::process_resource()};
     packet.reserve((kFrameHeaderSize * 4) + 64 + target_size + 128);
     if (opening_scheme) {
         const auto settings = ClientSettings(*opening_scheme);
@@ -980,7 +980,7 @@ Handler::Handler(std::string_view tag,
                  net::io_context& io_context,
                  std::shared_ptr<const infra::AnyTlsSettings> settings,
                  common::AwaitableTaskGroup& tasks)
-    : tag_(tag)
+    : tag_(tag, memory::process_resource())
     , settings_(std::move(settings))
     , padding_(std::make_shared<PaddingState>())
     , pool_(std::make_shared<SessionPool>(

@@ -208,7 +208,7 @@ struct Parsed2022Body {
 
 struct PlaintextScratch {
     buf::BufferGuard pooled;
-    std::vector<uint8_t> large;
+    std::pmr::vector<uint8_t> large{memory::process_resource()};
     size_t len = 0;
 
     ~PlaintextScratch() noexcept {

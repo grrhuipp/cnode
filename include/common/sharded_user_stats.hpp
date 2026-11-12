@@ -7,6 +7,7 @@
 // notices release quotas without blocking. Reporting reads domain-local leases.
 // ============================================================================
 
+#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/string_hash.hpp"
 
@@ -73,19 +74,19 @@ private:
     friend class UserOnlineSessionGuard;
     struct DeviceReservation;
     using DeviceIpMap =
-        std::unordered_map<std::string,
+        std::pmr::unordered_map<std::pmr::string,
                                         uint32_t,
                                         TransparentStringHash,
                                         TransparentStringEq>;
-    using UserDeviceMap = std::unordered_map<uint64_t, DeviceIpMap>;
+    using UserDeviceMap = std::pmr::unordered_map<uint64_t, DeviceIpMap>;
     using TagDeviceMap =
-        std::unordered_map<std::string,
+        std::pmr::unordered_map<std::pmr::string,
                                         UserDeviceMap,
                                         TransparentStringHash,
                                         TransparentStringEq>;
 
     app::GroupCoordinator& coordinator_;
-    TagDeviceMap devices_;
+    TagDeviceMap devices_{memory::process_resource()};
 };
 
 class UserOnlineSessionGuard {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/allocator.hpp"
 #include "common/domain_name.hpp"
 #include "common/ip_utils.hpp"
 #include "core/constants.hpp"
@@ -52,13 +53,21 @@ struct UserProfile {
 // ============================================================================
 struct TargetAddress {
     AddressType type = AddressType::Invalid;
-    std::string host;  // 域名；IP 目标只保留 resolved_addr
+    std::pmr::string host{memory::process_resource()};  // 域名；IP 目标只保留 resolved_addr
     uint16_t port = 0;
 
     // DNS 解析后的地址
     std::optional<net::ip::address> resolved_addr;
 
     TargetAddress() = default;
+    TargetAddress(const TargetAddress& other)
+        : type(other.type), host(other.host, memory::process_resource()),
+          port(other.port), resolved_addr(other.resolved_addr) {}
+    TargetAddress(TargetAddress&&) noexcept = default;
+    TargetAddress& operator=(const TargetAddress&) = default;
+    // Every constructor binds host to the process resource; assignment retains it.
+    TargetAddress& operator=(TargetAddress&&) noexcept = default;
+
 
     TargetAddress(std::string_view h, uint16_t p)
         : port(p) {
@@ -235,9 +244,9 @@ struct ForwardedMetadataView {
 // 链式代理透传的最初入站身份与真实客户端 IP 拥有型存储。
 struct ForwardedMetadata {
     int64_t user_id = 0;
-    std::string user_email;
+    std::pmr::string user_email{memory::process_resource()};
     std::optional<net::ip::address> client_ip;
-    std::string inbound_tag;
+    std::pmr::string inbound_tag{memory::process_resource()};
 
     [[nodiscard]] bool Empty() const noexcept {
         return user_id <= 0 && user_email.empty() &&

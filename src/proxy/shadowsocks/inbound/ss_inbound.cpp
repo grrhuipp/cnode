@@ -430,7 +430,7 @@ PrepareSsTcpSession(
     const proxyman::inbound::AdmissionEnvironment& environment,
     proxy::InboundAuthentication authentication,
     session::Context& ctx) {
-    const auto tag = ctx.inbound.tag;
+    const std::string_view tag = ctx.inbound.tag;
     const auto& client_ip = ctx.inbound.source_ip;
     auto session_result = co_await proxy::shadowsocks::ReadTCPSession(
         stream,

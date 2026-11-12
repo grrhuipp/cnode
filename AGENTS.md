@@ -92,7 +92,7 @@ flowchart TD
 
 - **唯一后端**：统一 mimalloc；daemon 和测试全局替换 malloc/new，测试经链接期 `--wrap` 观察或注入 new/delete 失败，不另行替换全局分配函数。`process_resource()` 是进程生命周期、线程安全的 PMR 适配器，直接使用调用线程原生 mimalloc 堆，不建 Worker/连接/协议级 heap/pool。
 - **原生机制优先**：分页、页元数据、空闲块复用、对齐分配、空页回收、延迟 purge 全交 mimalloc；不叠加 slab、块缓存、空闲队列、回收线程、块头、对齐取整或重复系统调用/运行期覆盖。优先原生默认值与构建选项（如 `MI_NO_THP`）；禁用 Asio handler 小块与协程帧缓存（`ASIO_DISABLE_SMALL_BLOCK_RECYCLING`、`ASIO_DISABLE_AWAITABLE_FRAME_RECYCLING`）。
-- **默认资源**：普通容器直接使用标准 STL 与 `std::allocator`，普通对象使用标准 RAII/智能指针工厂，经全局 mimalloc 覆盖落到同一后端，不封装通用 allocator 或容器别名。需要显式资源的路径使用原生 `std::pmr`，保留既有 `process_resource()` 默认与 `nullptr` 归一化契约；显式调用方 PMR 优先，寿命由调用方保证。不建无状态选池包装，不按 Worker/执行上下文/应用层 `thread_local` 隐式选池，不替换全局默认 PMR。
+- **默认资源**：可控资源的容器统一使用原生 `std::pmr`，不封装通用 allocator 或容器别名；默认显式绑定 `process_resource()`，接受可空资源的接口在入口归一化 `nullptr`。标准库、第三方或外部契约要求普通容器时在边界转换，普通对象仍使用标准 RAII/智能指针工厂。显式调用方 PMR 优先，寿命由调用方保证；复制时明确目标资源，移动赋值不假定传播资源，`swap` 必须满足资源相等前提。不建无状态选池包装，不按 Worker/执行上下文/应用层 `thread_local` 隐式选池，不替换全局默认 PMR。
 - **阶段内存**：monotonic arena 仅用于请求/握手等明确阶段或初始化后封存的同寿命结构；持续流量的 payload、Buffer、子流、队列和会话状态逐块释放，不用连接级 arena。握手、认证、探测、路由、拨号临时缓冲/凭据放在独立子协程，稳态转发前释放；单帧/记录处理完、下次等待前释放借用缓冲和溢出容器，禁止仅 `clear()` 留容量或跨 `co_await` 放数 KiB 栈数组。
 - **空闲与长期资源**：等待可读前不预借缓冲；未启动任务组只存 executor，首次 `Spawn` 才建 join 状态与自持有任务组。会话队列空态零分配、排空即释放，采用环形/内联结构，短帧/握手头用栈或 SBO。连接超时统一用执行器调度器，不设每连接常驻定时器、超时协程或堆定时节点。跨请求复用资源由 Worker 本地地址稳定宿主持有，按准入身份/配置快照隔离；短请求结束不销毁健康资源，退役先停新借用，再等已有请求与常驻任务结束。
 - **QUIC 轻量化**：`ngtcp2`/`nghttp3` 共用 mimalloc；连接只留协议状态和有界队列，不设独立分配域、`ResidentTaskGroup` 或 `TimeoutSchedulerService`。UDP 队列和超时最小堆按 Worker/监听入口共享；关闭后 ACK 保留、分片、流队列和路径状态须可达地释放。

@@ -1,4 +1,5 @@
 #include "transport/internet/outbound_target_builder.hpp"
+#include "common/allocator.hpp"
 
 #include "app/dns/dns.hpp"
 #include "common/ip_utils.hpp"
@@ -122,25 +123,25 @@ bool AutoPrefersIPv6(const OutboundBind& bind,
 
 // The explicit host is resolved once by stream-settings normalization; only
 // the dial-address fallback is formatted per target.
-[[nodiscard]] std::string BuildHttpHostHeader(
+[[nodiscard]] std::pmr::string BuildHttpHostHeader(
     const StreamSettings& settings,
     std::string_view fallback_host,
     uint16_t port) {
     if (!settings.IsWs() && !settings.IsHttpUpgrade() &&
         !settings.IsHttp() && !settings.IsGrpc() && !settings.IsXHttp()) {
-        return {};
+        return std::pmr::string{memory::process_resource()};
     }
     if (!settings.configured_http_host.empty()) {
-        return std::string(settings.configured_http_host);
+        return std::pmr::string(settings.configured_http_host, memory::process_resource());
     }
     if (settings.IsGrpc() && settings.IsReality()) {
-        return {};
+        return std::pmr::string{memory::process_resource()};
     }
     const std::string_view effective_host =
         (settings.IsReality() && !settings.reality.server_name.empty())
             ? std::string_view(settings.reality.server_name)
             : fallback_host;
-    std::string out;
+    std::pmr::string out{memory::process_resource()};
     iputil::FormatHttpHostHeaderInto(
         out, effective_host, port, settings.IsTlsLike());
     return out;

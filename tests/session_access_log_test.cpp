@@ -35,9 +35,9 @@ TEST_F(SessionAccessLog, ReportsEndpointsRouteVerifiedIdentityAndActualLocalAddr
 TEST_F(SessionAccessLog, ForwardedOriginDoesNotReplaceVerifiedLocalIdentity) {
     ctx.inbound.ApplyForwardedMetadata(::common::ForwardedMetadata{
         .user_id = 1001,
-        .user_email = ::std::string("alice@origin.example"),
+        .user_email = ::std::pmr::string("alice@origin.example", ::memory::process_resource()),
         .client_ip = ::net::ip::make_address("203.0.113.88"),
-        .inbound_tag = ::std::string("panel/site-a/10/vless/443"),
+        .inbound_tag = ::std::pmr::string("panel/site-a/10/vless/443", ::memory::process_resource()),
     });
     const auto access = ::common::FormatAccessLog(ctx);
     EXPECT_NE(access.find(" origin:203.0.113.88|panel/site-a/10/vless/443|1001|alice@origin.example "), std::string::npos);
@@ -49,9 +49,9 @@ TEST_F(SessionAccessLog, ForwardedOriginDoesNotReplaceVerifiedLocalIdentity) {
 TEST_F(SessionAccessLog, PartialForwardedMetadataReplacesRatherThanMergesOrigin) {
     ctx.inbound.ApplyForwardedMetadata(::common::ForwardedMetadata{
         .user_id = 1001,
-        .user_email = ::std::string("alice@origin.example"),
+        .user_email = ::std::pmr::string("alice@origin.example", ::memory::process_resource()),
         .client_ip = ::net::ip::make_address("203.0.113.88"),
-        .inbound_tag = ::std::string("panel/site-a/10/vless/443"),
+        .inbound_tag = ::std::pmr::string("panel/site-a/10/vless/443", ::memory::process_resource()),
     });
     ::common::ForwardedMetadata partial;
     partial.user_email = "bob@origin.example";
@@ -66,9 +66,9 @@ TEST_F(SessionAccessLog, PartialForwardedMetadataReplacesRatherThanMergesOrigin)
 TEST_F(SessionAccessLog, EmptyForwardedMetadataClearsPreviousOrigin) {
     ctx.inbound.ApplyForwardedMetadata(::common::ForwardedMetadata{
         .user_id = 1001,
-        .user_email = ::std::string("alice@origin.example"),
+        .user_email = ::std::pmr::string("alice@origin.example", ::memory::process_resource()),
         .client_ip = ::net::ip::make_address("203.0.113.88"),
-        .inbound_tag = ::std::string("panel/site-a/10/vless/443"),
+        .inbound_tag = ::std::pmr::string("panel/site-a/10/vless/443", ::memory::process_resource()),
     });
     ctx.inbound.ApplyForwardedMetadata(::common::ForwardedMetadata{});
     EXPECT_FALSE(ctx.inbound.HasOriginIdentity());

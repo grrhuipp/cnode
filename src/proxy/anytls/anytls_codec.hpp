@@ -3,6 +3,7 @@
 #include "proxy/outbound_endpoint_base.hpp"
 #include "transport/internet/outbound_target_builder.hpp"
 #include "app/relay.hpp"
+#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/buf/multi_buffer.hpp"
 #include "common/error.hpp"
@@ -105,15 +106,15 @@ private:
     static constexpr size_t kInlineFrames = buf::MultiBuffer::kInlineCapacity;
     std::array<std::array<uint8_t, kFrameHeaderSize>, kInlineFrames> headers_{};
     std::array<net::const_buffer, kInlineFrames * 2> buffers_{};
-    std::vector<std::array<uint8_t, kFrameHeaderSize>> spill_headers_;
-    std::vector<net::const_buffer> spill_buffers_;
+    std::pmr::vector<std::array<uint8_t, kFrameHeaderSize>> spill_headers_{memory::process_resource()};
+    std::pmr::vector<net::const_buffer> spill_buffers_{memory::process_resource()};
     size_t count_ = 0;
     bool spilled_ = false;
 };
 
-[[nodiscard]] std::string ClientSettings(const PaddingScheme& scheme);
+[[nodiscard]] std::pmr::string ClientSettings(const PaddingScheme& scheme);
 [[nodiscard]] tl::expected<void, common::ErrorCode> AppendFrameBytesTo(
-    std::vector<uint8_t>& out,
+    std::pmr::vector<uint8_t>& out,
     uint8_t cmd,
     uint32_t sid,
     std::span<const uint8_t> payload);
@@ -129,13 +130,13 @@ WriteFrame(transport::AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<
 net::awaitable<tl::expected<void, common::ErrorCode>>
 WritePacketWithPadding(transport::AsyncStream& stream,
                        std::span<const PaddingRecord> record_rules,
-                       std::vector<uint8_t> packet);
+                       std::pmr::vector<uint8_t> packet);
 
 net::awaitable<tl::expected<void, common::ErrorCode>>
 WritePacketWithPadding(transport::AsyncStream& stream,
                        const PaddingScheme& scheme,
                        uint32_t packet_index,
-                       std::vector<uint8_t> packet);
+                       std::pmr::vector<uint8_t> packet);
 
 net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteMultiBufferAsFrameBatch(transport::AsyncStream& stream, uint8_t cmd, uint32_t sid, buf::MultiBuffer mb);
@@ -165,7 +166,7 @@ WriteBuffersAsFramesWithPadding(transport::AsyncStream& stream,
 net::awaitable<tl::expected<FrameHeader, common::ErrorCode>>
 ReadFrameHeader(transport::AsyncStream& stream);
 
-net::awaitable<tl::expected<std::string, common::ErrorCode>>
+net::awaitable<tl::expected<std::pmr::string, common::ErrorCode>>
 ReadFrameText(transport::AsyncStream& stream, uint16_t length);
 
 net::awaitable<tl::expected<void, common::ErrorCode>>
@@ -252,7 +253,7 @@ private:
         const infra::TimeoutsConfig& timeouts, app::StatsShard& stats, const app::RelayConfig& relay_config,
         buf::MultiBufferBatch first_payload,
         std::shared_ptr<ClientSession> session, bool& reusable);
-    std::string tag_;
+    std::pmr::string tag_;
     std::shared_ptr<const infra::AnyTlsSettings> settings_;
     std::shared_ptr<PaddingState> padding_;
     std::shared_ptr<SessionPool> pool_;

@@ -1,4 +1,5 @@
 #include "transport/internet/hysteria/hysteria_wire.hpp"
+#include "common/allocator.hpp"
 
 #include "common/byte_reader.hpp"
 
@@ -16,25 +17,25 @@ namespace transport::internet::hysteria {
 
 namespace {
 
-void AppendU16(std::vector<uint8_t>& output, uint16_t value) {
+void AppendU16(std::pmr::vector<uint8_t>& output, uint16_t value) {
     std::array<uint8_t, 2> bytes{};
     common::StoreU16BE(bytes.data(), value);
     output.insert(output.end(), bytes.begin(), bytes.end());
 }
 
-void AppendU32(std::vector<uint8_t>& output, uint32_t value) {
+void AppendU32(std::pmr::vector<uint8_t>& output, uint32_t value) {
     std::array<uint8_t, 4> bytes{};
     common::StoreU32BE(bytes.data(), value);
     output.insert(output.end(), bytes.begin(), bytes.end());
 }
 
-void AppendU64(std::vector<uint8_t>& output, uint64_t value) {
+void AppendU64(std::pmr::vector<uint8_t>& output, uint64_t value) {
     std::array<uint8_t, 8> bytes{};
     common::StoreU64BE(bytes.data(), value);
     output.insert(output.end(), bytes.begin(), bytes.end());
 }
 
-bool AppendVarint(std::vector<uint8_t>& output, uint64_t value) {
+bool AppendVarint(std::pmr::vector<uint8_t>& output, uint64_t value) {
     const size_t width = common::QuicVarintSize(value);
     if (width == 0) return false;
     const uint8_t prefix = static_cast<uint8_t>(
@@ -108,10 +109,10 @@ tl::expected<size_t, ProtocolError> UdpTargetHeaderSize(
     return 8 + width + text.authority_size;
 }
 
-tl::expected<std::vector<uint8_t>, ProtocolError> EncodeUdpFragment(
+tl::expected<std::pmr::vector<uint8_t>, ProtocolError> EncodeUdpFragment(
     Version version, const UdpMessage& message, const UdpTargetText& text,
     size_t header_size) {
-    std::vector<uint8_t> output;
+    std::pmr::vector<uint8_t> output{memory::process_resource()};
     output.reserve(header_size + message.payload.size());
     AppendU32(output, message.session_id);
     if (version == Version::V1) {
@@ -163,10 +164,10 @@ ParseV1ClientHello(std::span<const uint8_t> input) {
     return hello;
 }
 
-std::vector<uint8_t> EncodeV1ServerHello(
+std::pmr::vector<uint8_t> EncodeV1ServerHello(
     bool accepted, uint64_t send_bps, uint64_t receive_bps, std::string_view message) {
     message = message.substr(0, std::min(message.size(), kMaxMessageLength));
-    std::vector<uint8_t> output;
+    std::pmr::vector<uint8_t> output{memory::process_resource()};
     output.reserve(19 + message.size());
     output.push_back(accepted ? 1 : 0);
     AppendU64(output, send_bps);
@@ -197,10 +198,10 @@ ParseV1Request(std::span<const uint8_t> input) {
     return V1Request{udp != 0, std::move(*target), reader.Position()};
 }
 
-std::vector<uint8_t> EncodeV1Response(
+std::pmr::vector<uint8_t> EncodeV1Response(
     bool accepted, uint32_t udp_session_id, std::string_view message) {
     message = message.substr(0, std::min(message.size(), kMaxMessageLength));
-    std::vector<uint8_t> output;
+    std::pmr::vector<uint8_t> output{memory::process_resource()};
     output.reserve(7 + message.size());
     output.push_back(accepted ? 1 : 0);
     AppendU32(output, udp_session_id);
@@ -310,7 +311,7 @@ UdpMessageHeaderSize(Version version, const common::TargetAddress& target) {
     return UdpTargetHeaderSize(version, *text);
 }
 
-tl::expected<std::vector<uint8_t>, ProtocolError>
+tl::expected<std::pmr::vector<uint8_t>, ProtocolError>
 EncodeUdpMessage(Version version, const UdpMessage& message) {
     if (!ValidFragmentIndex(version, message.fragment_id, message.fragment_count) ||
         message.payload.size() > kMaxUdpPayloadLength)

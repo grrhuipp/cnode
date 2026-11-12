@@ -1,4 +1,5 @@
 #pragma once
+#include "common/allocator.hpp"
 
 #include "common/byte_reader.hpp"
 #include "transport/internet/transport_stack.hpp"
@@ -140,7 +141,7 @@ public:
 
     void Clear() noexcept {
         prefix_size_ = message_size_ = data_offset_ = data_end_ = 0;
-        std::vector<uint8_t>{}.swap(message_);
+        std::pmr::vector<uint8_t>{message_.get_allocator()}.swap(message_);
     }
 
     [[nodiscard]] bool AtMessageBoundary() const noexcept { return prefix_size_ == 0; }
@@ -212,7 +213,7 @@ private:
     std::array<uint8_t, 5> prefix_{};
     size_t prefix_size_ = 0;
     size_t message_size_ = 0;
-    std::vector<uint8_t> message_;
+    std::pmr::vector<uint8_t> message_{memory::process_resource()};
     size_t data_offset_ = 0;
     size_t data_end_ = 0;
 };

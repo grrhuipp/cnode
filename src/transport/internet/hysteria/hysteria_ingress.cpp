@@ -194,7 +194,7 @@ struct SocketState final {
     udp::endpoint local;
     udp::endpoint remote;
     struct Output {
-        std::vector<uint8_t> data;
+        std::pmr::vector<uint8_t> data{memory::process_resource()};
         udp::endpoint remote;
         std::shared_ptr<Connection> connection;
         bool terminal = false;
@@ -1146,7 +1146,7 @@ void Connection::StartRawStream(int64_t stream_id, StreamRecord& stream) {
             const size_t inspect_bytes =
                 std::min(input.byte_size(), kMaxStreamHeaderBytes);
             auto prefix = input.PrefixSpan(inspect_bytes);
-            std::vector<uint8_t> header;
+            std::pmr::vector<uint8_t> header{memory::process_resource()};
             if (prefix.empty()) {
                 header.resize(inspect_bytes);
                 (void)input.CopyPrefixTo(header);
@@ -1195,7 +1195,7 @@ net::awaitable<void> Connection::RunV1Control(int64_t stream_id) {
     if (it == core_->streams.end()) co_return;
     auto state = it->second.state;
     constexpr size_t kMaxHelloBytes = kMaxAuthLength + 32;
-    std::vector<uint8_t> hello_bytes;
+    std::pmr::vector<uint8_t> hello_bytes{memory::process_resource()};
     tl::expected<V1ClientHello, ProtocolError> hello =
         tl::unexpected(ProtocolError::Incomplete);
     while (!hello) {
@@ -1221,7 +1221,7 @@ net::awaitable<void> Connection::RunV1Control(int64_t stream_id) {
         listener_->upload_bytes_per_second, "");
     co_await state->WriteMultiBuffer(CopyPacket(response));
     if (closed_) co_return;
-    std::vector<int64_t> waiting;
+    std::pmr::vector<int64_t> waiting{memory::process_resource()};
     for (const auto& [id, candidate] : core_->streams) {
         if (candidate.raw && !candidate.delivered) waiting.push_back(id);
     }
@@ -1360,7 +1360,7 @@ void Connection::ExpireUdpFragments(ngtcp2_tstamp now) noexcept {
         }
     }
     if (fragments_.empty()) {
-        decltype(fragments_) released;
+        decltype(fragments_) released{fragments_.get_allocator()};
         fragments_.swap(released);
     }
 }
@@ -1418,7 +1418,7 @@ void Connection::HandleUdpMessage(const UdpMessage& message) {
         ExpireUdpFragments(now);
         return;
     }
-    std::vector<uint8_t> payload;
+    std::pmr::vector<uint8_t> payload{memory::process_resource()};
     payload.reserve(pending.bytes);
     for (size_t id = 0; id < pending.count; ++id) {
         const auto slot = pending.payload_slots[id];
@@ -1446,7 +1446,7 @@ void Connection::DeliverUdpPacket(
     if (!session->Push(target, payload)) return;
     core_->udp_sessions.emplace(session_id, session.get());
     SpawnOwned(DeliverStream(std::move(session),
-        InboundTransportMetadata{.real_ip = {}, .udp_session_target = target}));
+        InboundTransportMetadata{.udp_session_target = target}));
 }
 
 bool Connection::SendUdpMessage(
@@ -1581,7 +1581,7 @@ bool HysteriaIngress::Queue(SocketState& socket, std::span<const uint8_t> data,
     }
     if (socket.output.size() >= kMaxQueuedSocketPackets) return false;
     socket.output.push_back({
-        std::vector<uint8_t>(data.begin(), data.end()),
+        std::pmr::vector<uint8_t>(data.begin(), data.end(), memory::process_resource()),
         remote, connection.shared_from_this(), terminal});
     (void)socket.changed.try_send(IoErrorCode{});
     return true;
@@ -1699,7 +1699,7 @@ HysteriaIngress::SocketPtr HysteriaIngress::AttachSocket(
     state->socket->non_blocking(true, error);
     if (error) return {};
     auto [it, inserted] = sockets.try_emplace(
-        std::string(socket_key), state);
+        std::pmr::string(socket_key, memory::process_resource()), state);
     return inserted ? it->second->socket : SocketPtr{};
 }
 
@@ -2054,7 +2054,7 @@ net::awaitable<void> UdpSessionStream::WriteMultiBuffer(buf::MultiBuffer packet)
         sent = owner->SendUdpMessage(
             session_id_, *datagram.target, datagram.single_buffer->Bytes());
     } else {
-        std::vector<uint8_t> payload;
+        std::pmr::vector<uint8_t> payload{memory::process_resource()};
         payload.reserve(datagram.payload_size);
         for (const auto* buffer : packet) {
             if (!buffer || buffer->IsEmpty()) continue;

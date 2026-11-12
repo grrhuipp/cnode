@@ -1,4 +1,5 @@
 #include "transport/internet/datagram_socket.hpp"
+#include "common/allocator.hpp"
 
 #include "transport/internet/connection_timeouts.hpp"
 #include "common/const_buffer_span.hpp"
@@ -73,7 +74,7 @@ std::size_t PeekDatagramSize(udp::socket& socket, IoErrorCode& error) noexcept {
 void UdpReceiveBuffer::Release() noexcept {
     small_ = buf::BufferGuard{};
     if (large_.capacity() != 0) {
-        std::vector<uint8_t> empty{large_.get_allocator()};
+        std::pmr::vector<uint8_t> empty{large_.get_allocator()};
         large_.swap(empty);
     }
 }
@@ -82,7 +83,7 @@ net::mutable_buffer UdpReceiveBuffer::Prepare(std::size_t available_bytes) {
     const std::size_t capacity = std::clamp<std::size_t>(available_bytes, 1, kMaxWireBytes);
     if (capacity <= buf::Buffer::kSize) {
         if (large_.capacity() != 0) {
-            std::vector<uint8_t> empty{large_.get_allocator()};
+            std::pmr::vector<uint8_t> empty{large_.get_allocator()};
             large_.swap(empty);
         }
         if (!small_) {
@@ -312,7 +313,7 @@ net::awaitable<void> DatagramSocket::Impl::SendBuffers(
     std::size_t total = 0;
     ValidateBuffers(buffers, MaxUdpPayload(ipv6), total);
 
-    std::vector<uint8_t> merged;
+    std::pmr::vector<uint8_t> merged{memory::process_resource()};
     std::array<net::const_buffer, 1> single{};
     if (buffers.size() > kMaxNativeBuffers) {
         try {

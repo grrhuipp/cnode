@@ -194,7 +194,10 @@ public:
     MultiBuffer& operator=(MultiBuffer&& other) noexcept {
         if (this != &other) {
             ReleaseOwnedBuffers();
-            spill_ = std::move(other.spill_);
+            // Reconstruct the vector to transfer its allocator with its storage;
+            // PMR move assignment need not be allocation-free.
+            spill_.reset();
+            if (other.spill_) spill_.emplace(std::move(*other.spill_));
             start_ = 0;
             size_ = 0;
             total_bytes_ = 0;
@@ -693,7 +696,7 @@ private:
             return;
         }
         // Do not publish spilled state until the only fallible step succeeds.
-        std::vector<Buffer*> prepared;
+        std::pmr::vector<Buffer*> prepared(memory::process_resource());
         prepared.reserve(std::max(capacity, kInlineCapacity * 2));
         spill_.emplace(std::move(prepared));
         for (size_t i = 0; i < size_; ++i) {
@@ -749,7 +752,7 @@ private:
     size_t start_ = 0;
     size_t size_ = 0;
     size_t total_bytes_ = 0;
-    std::optional<std::vector<Buffer*>> spill_;
+    std::optional<std::pmr::vector<Buffer*>> spill_;
 };
 
 // A completed UDP message owns a buffer even when it carries no data. An empty

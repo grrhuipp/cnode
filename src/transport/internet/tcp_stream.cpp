@@ -1,4 +1,5 @@
 #include "transport/internet/tcp_stream.hpp"
+#include "common/allocator.hpp"
 #include "common/const_buffer_span.hpp"
 #include "transport/internet/timeout_scheduler.hpp"
 #include "transport/internet/connection_timeouts.hpp"
@@ -612,7 +613,7 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
         co_return ProxyReadResult(ProxyProtocolReadStatus::Ok, std::move(result));
     }
 
-    std::vector<uint8_t> buf;
+    std::pmr::vector<uint8_t> buf{memory::process_resource()};
 
     while (buf.size() < kProxyHeaderMaxBytes) {
         auto [read_ec, n] = co_await AsyncReceiveSome(net::buffer(probe));

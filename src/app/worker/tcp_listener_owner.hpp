@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/hash_container_shrink.hpp"
 #include "common/string_hash.hpp"
@@ -37,7 +38,7 @@ public:
                                              net::io_context& io_context) {
         if (acceptors_.contains(listener_key)) return nullptr;
         auto acceptor = std::make_shared<tcp::acceptor>(io_context);
-        acceptors_.try_emplace(std::string(listener_key), acceptor);
+        acceptors_.try_emplace(std::pmr::string(listener_key, memory::process_resource()), acceptor);
         return acceptor;
     }
 
@@ -63,8 +64,9 @@ public:
     }
 
 private:
-    std::unordered_map<std::string, AcceptorPtr,
-                         common::TransparentStringHash, common::TransparentStringEq> acceptors_;
+    std::pmr::unordered_map<std::pmr::string, AcceptorPtr,
+                            common::TransparentStringHash, common::TransparentStringEq>
+        acceptors_{memory::process_resource()};
 };
 
 }  // namespace app::worker_detail

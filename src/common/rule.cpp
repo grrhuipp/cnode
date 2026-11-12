@@ -29,7 +29,7 @@ void DetectRulePolicy::UpdateRule(std::string_view tag,
         it->second = std::move(new_rule_list);
         return;
     }
-    rules_.emplace(std::string(tag), std::move(new_rule_list));
+    rules_.emplace(std::pmr::string(tag, memory::process_resource()), std::move(new_rule_list));
 }
 
 bool DetectRulePolicy::Blocked(const session::Context& ctx) {

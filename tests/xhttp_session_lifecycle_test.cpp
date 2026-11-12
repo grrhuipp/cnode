@@ -274,7 +274,7 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
 
     struct OriginBoundSink final : ::transport::internet::InboundTransportStreamHandler {
         explicit OriginBoundSink(std::thread::id owner)
-            : owner_thread(owner), local_tag(128, 'x') {}
+            : owner_thread(owner), local_tag(128, 'x', ::memory::process_resource()) {}
         ~OriginBoundSink() noexcept override {
             EXPECT_EQ(std::this_thread::get_id(), owner_thread);
         }
@@ -286,7 +286,7 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
         std::chrono::seconds TransportHandshakeTimeout() const noexcept override { return 5s; }
         std::chrono::seconds TransportIdleTimeout() const noexcept override { return 10s; }
         std::thread::id owner_thread;
-        std::string local_tag;
+        std::pmr::string local_tag;
         std::unique_ptr<::transport::AsyncStream> logical;
     };
 

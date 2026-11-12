@@ -153,7 +153,7 @@ net::awaitable<bool> VlessEncryptionReader::ReadRecordHeader() {
 
 size_t VlessEncryptionReader::OpenRecord(VlessEncryptionAead& aead, std::span<uint8_t> encrypted_span) {
     const auto& header = read_header_;
-    std::vector<uint8_t> rekey_context;
+    std::pmr::vector<uint8_t> rekey_context{memory::process_resource()};
     if (WillReachVlessEncryptionMaxNonce(aead.Nonce())) {
         rekey_context.resize(header.size() + encrypted_span.size());
         auto next = std::copy(header.begin(), header.end(), rekey_context.begin());
