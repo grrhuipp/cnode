@@ -48,50 +48,54 @@ enum class HttpMethod : uint8_t {
 };
 
 
-std::string CompactLogText(std::string_view text) {
+std::string CompactLogText(std::string_view text, std::string_view api_key) {
     std::string result;
     result.reserve(text.size() < kHttpErrorDetailLimit ? text.size()
                                                        : kHttpErrorDetailLimit);
 
-    bool truncated  = false;
+    bool truncated = false;
     bool last_space = false;
-    for (char ch : text) {
+    for (size_t offset = 0; offset < text.size();) {
         if (result.size() >= kHttpErrorDetailLimit) {
             truncated = true;
             break;
         }
-
+        // Mask before truncating so a key crossing the preview boundary cannot leak.
+        if (!api_key.empty() && text.substr(offset).starts_with(api_key)) {
+            constexpr std::string_view redacted = "[redacted]";
+            if (redacted.size() > kHttpErrorDetailLimit - result.size()) {
+                truncated = true;
+                break;
+            }
+            result += redacted;
+            offset += api_key.size();
+            last_space = false;
+            continue;
+        }
+        char ch = text[offset++];
         const unsigned char uch = static_cast<unsigned char>(ch);
         if (ch == '\r' || ch == '\n' || ch == '\t') {
             ch = ' ';
         } else if (std::iscntrl(uch)) {
             continue;
         }
-
         if (ch == ' ') {
             if (last_space) continue;
             last_space = true;
         } else {
             last_space = false;
         }
-
         result.push_back(ch);
     }
-
-    while (!result.empty() && result.back() == ' ') {
-        result.pop_back();
-    }
-
-    if (truncated) {
-        result += "...";
-    }
+    while (!result.empty() && result.back() == ' ') result.pop_back();
+    if (truncated) result += "...";
     return result;
 }
 
 std::string FormatHttpFailure(const HttpResponse& resp) {
     // Server response bodies can echo request queries, API keys or credentials.
     // Only locally generated transport/parser diagnostics are safe to include.
-    const std::string detail = resp.status <= 0 ? CompactLogText(resp.body) : std::string{};
+    const std::string detail = resp.status <= 0 ? CompactLogText(resp.body, {}) : std::string{};
 
     if (resp.status <= 0) {
         if (!detail.empty()) {
@@ -104,6 +108,18 @@ std::string FormatHttpFailure(const HttpResponse& resp) {
     }
 
     return std::format("HTTP status {}", resp.status);
+}
+
+std::string FormatReportFailure(const HttpResponse& response, std::string_view api_key) {
+    auto summary = FormatHttpFailure(response);
+    if (response.status > 0) {
+        const auto detail = CompactLogText(response.body, api_key);
+        if (!detail.empty()) {
+            summary.reserve(summary.size() + 2 + detail.size());
+            summary.append(": ").append(detail);
+        }
+    }
+    return summary;
 }
 
 std::string MethodName(HttpMethod method) {
@@ -636,7 +652,7 @@ APIClient::ReportUserTraffic(const std::vector<::api::UserTraffic>& data) {
         HttpMethod::Post, std::move(path), json::serialize(json::value(std::move(body))), {});
 
     if (resp.status != 200) {
-        LOG_PANEL_WARN(log_context_, "Traffic API acceptance unknown: {}", FormatHttpFailure(resp));
+        LOG_PANEL_WARN(log_context_, "Traffic API acceptance unknown: {}", FormatReportFailure(resp, config_.Key));
         co_return false;
     }
 
@@ -656,7 +672,7 @@ APIClient::ReportNodeOnlineUsers(const std::vector<::api::OnlineUser>& online_us
         auto alive_resp = co_await HttpRequest(
             HttpMethod::Post, alive_path, json::serialize(json::value(std::move(report.alive_body))), {});
         if (alive_resp.status != 200) {
-            LOG_PANEL_WARN(log_context_, "Online device report failed: {}", FormatHttpFailure(alive_resp));
+            LOG_PANEL_WARN(log_context_, "Online device report failed: {}", FormatReportFailure(alive_resp, config_.Key));
             co_return false;
         }
     }

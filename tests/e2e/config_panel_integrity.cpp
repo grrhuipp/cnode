@@ -244,5 +244,75 @@ TEST(PanelIntegrity, InvalidRuleCandidateNeverAdmitsOrPartiallyReplacesCommitted
     panel.Join();
     echo.Join();
 }
+enum class ReportBody { Json, Text, Boundary };
+class ReportErrorLog : public testing::TestWithParam<ReportBody> {};
+
+TEST_P(ReportErrorLog, PrintsBoundedResponseDetailsWithoutLeakingTheRequestKey) {
+    TempDir directory;
+    auto reservation = Socket::ReserveTcp();
+    const auto node = reservation.Port();
+    const auto mode = GetParam();
+    LoopServer echo([](Socket socket) {
+        const auto bytes = socket.ReadExact(Payload.size(), 3s);
+        socket.Write(bytes);
+        EXPECT_TRUE(socket.Read(1, 10s).empty());
+    });
+    LoopServer panel([&](Socket socket) {
+        const auto request = ReadHttp(socket);
+        if (request.method == "GET") {
+            if (request.path.find("/config?") != std::string::npos) {
+                Reply(socket, 200, Json({{"server_port", node}, {"network", "tcp"}, {"tls", 0},
+                    {"base_config", {{"pull_interval", 1}, {"push_interval", 1}}}}).dump());
+            } else {
+                Reply(socket, 200, Json({{"users", Json::array({{{"id", 1}, {"uuid", UserA}}})}}).dump());
+            }
+            return;
+        }
+        const bool traffic = request.path.find("/push?") != std::string::npos;
+        const std::string marker = traffic ? "TRAFFIC_RESPONSE_DETAIL" : "ONLINE_RESPONSE_DETAIL";
+        const auto& key = request.headers.at("x-api-key");
+        std::string body;
+        if (mode == ReportBody::Json) {
+            body = Json({{"message", marker}, {"token", key}}).dump();
+        } else if (mode == ReportBody::Text) {
+            body = marker + "\r\nFORGED_RECORD";
+            body.push_back('\x1b');
+            body += "[31m token=" + key + std::string(1024, 'x') + "OUTSIDE_PREVIEW";
+        } else {
+            body = marker;
+            body.append(247 - body.size(), 'x');
+            body += key + std::string(1024, 'x') + "OUTSIDE_PREVIEW";
+        }
+        Reply(socket, traffic ? 503 : 401, body);
+    });
+    PanelConfig(directory.Path(), panel.Port(), "report-errors");
+    reservation.Close();
+    auto child = Start(directory.Path());
+    WaitEcho(*child, node, echo.Port());
+    auto link = Socket::Connect(node, "127.0.0.1", 1s);
+    link.Write("PROXY TCP4 192.0.2.7 127.0.0.1 12345 " + std::to_string(node) + "\r\n" +
+               VlessRequest(echo.Port(), Payload, 1, "127.0.0.1", UserA));
+    EXPECT_EQ(link.ReadExact(Payload.size() + 2, 3s), std::string("\0\0", 2) + std::string(Payload));
+    child->WaitForLog("ONLINE_RESPONSE_DETAIL");
+    link.Close();
+    EXPECT_EQ(child->Stop(10s), 0);
+    panel.Join();
+    echo.Join();
+
+    const auto logs = Logs(directory.Path());
+    for (const auto marker : {"TRAFFIC_RESPONSE_DETAIL", "ONLINE_RESPONSE_DETAIL"}) {
+        const auto offset = logs.find(marker);
+        ASSERT_NE(offset, std::string::npos);
+        const auto end = logs.find('\n', offset);
+        EXPECT_LT(logs.substr(offset, end - offset).size(), 1024u);
+    }
+    EXPECT_EQ(logs.find("fixture-secret-must-not-persist"), std::string::npos);
+    EXPECT_EQ(logs.find("OUTSIDE_PREVIEW"), std::string::npos);
+    EXPECT_EQ(logs.find("\nFORGED_RECORD"), std::string::npos);
+}
+
+INSTANTIATE_TEST_SUITE_P(ResponseForms, ReportErrorLog,
+    testing::Values(ReportBody::Json, ReportBody::Text, ReportBody::Boundary));
+
 } // namespace
 } // namespace cnode::e2e::config_panel
