@@ -125,23 +125,6 @@ net::awaitable<void> WriteH2FrameBuffers(
         throw;
     }
 }
-
-net::awaitable<void> WriteH2Frame(
-    AsyncStream& stream,
-    H2FrameType type,
-    uint8_t flags,
-    uint32_t stream_id,
-    std::span<const uint8_t> payload) {
-    const net::const_buffer buffer{payload.data(), payload.size()};
-    co_await WriteH2FrameBuffers(
-        stream,
-        type,
-        flags,
-        stream_id,
-        payload.empty()
-            ? std::span<const net::const_buffer>{}
-            : std::span<const net::const_buffer>(&buffer, 1));
-}
 [[nodiscard]] HpackBuffer EncodeHttpRequestHeaders(
     std::string_view authority,
     bool tls,
@@ -311,10 +294,14 @@ net::awaitable<void> SendWindowUpdates(AsyncStream& stream,
     }
     return std::span<const uint8_t>(payload.data() + start, end - start);
 }
-[[nodiscard]] net::awaitable<tl::expected<std::optional<H2RequestHeaders>, H2Error>>
-ParseH2RequestHeaders(
-    AsyncStream& stream, HpackDecoder& decoder, H2Frame frame,
-    std::string_view real_ip_header, bool trailers) {
+namespace {
+
+struct H2RequestHeaderCollector final {
+    H2RequestHeaderCollector(std::string_view real_ip, bool is_trailers) noexcept
+        : real_ip_header(real_ip), trailers(is_trailers) {}
+
+    std::string_view real_ip_header;
+    bool trailers = false;
     H2RequestHeaders request;
     std::optional<std::string> host;
     bool has_method = false;
@@ -323,77 +310,110 @@ ParseH2RequestHeaders(
     bool has_scheme = false;
     bool seen_regular = false;
     bool valid = true;
-    const auto take_once = [](bool& seen, std::string& out,
-                              std::string_view value) {
+
+    static bool TakeOnce(bool& seen, std::string& out, std::string_view value) {
         if (seen) return false;
         seen = true;
         out.assign(value);
         return true;
-    };
-    const auto decoded = co_await ReadH2HeaderFields(
-        stream, decoder, std::move(frame),
-        [&](std::string_view name, std::string_view value) {
-            if (!valid) return;
-            if (name.starts_with(':')) {
-                if (trailers || seen_regular) {
-                    valid = false;
-                    return;
-                }
-                bool accepted = false;
-                if (name == ":method") {
-                    accepted = take_once(has_method, request.method, value);
-                } else if (name == ":path") {
-                    accepted = take_once(has_path, request.path, value);
-                } else if (name == ":authority") {
-                    accepted = take_once(has_authority, request.authority, value);
-                } else if (name == ":scheme") {
-                    if (!has_scheme && !value.empty()) {
-                        has_scheme = true;
-                        accepted = true;
-                    }
-                }
-                if (!accepted) {
-                    valid = false;
-                }
-                return;
-            }
-            if (!IsValidHttp2HeaderName(name)) {
+    }
+
+    void OnField(std::string_view name, std::string_view value) {
+        if (!valid) return;
+        if (name.starts_with(':')) {
+            if (trailers || seen_regular) {
                 valid = false;
                 return;
             }
-            seen_regular = true;
-            if (name == "host") {
-                if (host) {
-                    valid = false;
-                    return;
-                }
-                host.emplace(value);
-            } else if (!trailers && !real_ip_header.empty() &&
-                       common::EqualsAsciiCI(name, real_ip_header)) {
-                if (request.metadata.real_ip.empty()) {
-                    const std::string_view real_ip =
-                        common::TrimAscii(value.substr(0, value.find(',')));
-                    if (!real_ip.empty()) {
-                        request.metadata.real_ip.assign(real_ip);
-                    }
+            bool accepted = false;
+            if (name == ":method") {
+                accepted = TakeOnce(has_method, request.method, value);
+            } else if (name == ":path") {
+                accepted = TakeOnce(has_path, request.path, value);
+            } else if (name == ":authority") {
+                accepted = TakeOnce(has_authority, request.authority, value);
+            } else if (name == ":scheme") {
+                if (!has_scheme && !value.empty()) {
+                    has_scheme = true;
+                    accepted = true;
                 }
             }
+            if (!accepted) {
+                valid = false;
+            }
+            return;
+        }
+        if (!IsValidHttp2HeaderName(name)) {
+            valid = false;
+            return;
+        }
+        seen_regular = true;
+        if (name == "host") {
+            if (host) {
+                valid = false;
+                return;
+            }
+            host.emplace(value);
+        } else if (!trailers && !real_ip_header.empty() &&
+                   common::EqualsAsciiCI(name, real_ip_header)) {
+            if (request.metadata.real_ip.empty()) {
+                const std::string_view real_ip =
+                    common::TrimAscii(value.substr(0, value.find(',')));
+                if (!real_ip.empty()) {
+                    request.metadata.real_ip.assign(real_ip);
+                }
+            }
+        }
+    }
+
+    [[nodiscard]] std::optional<H2RequestHeaders> Finish() {
+        if (!valid) {
+            return std::nullopt;
+        }
+        if (host) {
+            if (has_authority && !common::EqualsAsciiCI(request.authority, *host)) {
+                return std::nullopt;
+            }
+            if (!has_authority) request.authority = std::move(*host);
+        }
+        if (!trailers && (request.method.empty() || request.path.empty() || !has_scheme)) {
+            return std::nullopt;
+        }
+        return std::optional<H2RequestHeaders>{std::move(request)};
+    }
+};
+
+}  // namespace
+
+[[nodiscard]] tl::expected<std::optional<H2RequestHeaders>, H2Error>
+TryParseSingleH2RequestHeaders(
+    HpackDecoder& decoder, const H2Frame& frame,
+    std::string_view real_ip_header, bool trailers) {
+    H2RequestHeaderCollector collector(real_ip_header, trailers);
+    const auto decoded = DecodeSingleH2HeaderBlock(
+        decoder, frame,
+        [&collector](std::string_view name, std::string_view value) {
+            collector.OnField(name, value);
+        });
+    if (!decoded) {
+        return tl::unexpected(decoded.error());
+    }
+    return collector.Finish();
+}
+
+[[nodiscard]] net::awaitable<tl::expected<std::optional<H2RequestHeaders>, H2Error>>
+ParseH2RequestHeaders(
+    AsyncStream& stream, HpackDecoder& decoder, H2Frame frame,
+    std::string_view real_ip_header, bool trailers) {
+    H2RequestHeaderCollector collector(real_ip_header, trailers);
+    const auto decoded = co_await ReadH2HeaderFields(
+        stream, decoder, std::move(frame),
+        [&collector](std::string_view name, std::string_view value) {
+            collector.OnField(name, value);
         });
     if (!decoded) {
         co_return tl::unexpected(decoded.error());
     }
-    if (!valid) {
-        co_return std::optional<H2RequestHeaders>{};
-    }
-    if (host) {
-        if (has_authority && !common::EqualsAsciiCI(request.authority, *host)) {
-            co_return std::optional<H2RequestHeaders>{};
-        }
-        if (!has_authority) request.authority = std::move(*host);
-    }
-    if (!trailers && (request.method.empty() || request.path.empty() || !has_scheme)) {
-        co_return std::optional<H2RequestHeaders>{};
-    }
-    co_return std::optional<H2RequestHeaders>{std::move(request)};
+    co_return collector.Finish();
 }
 }  // namespace transport

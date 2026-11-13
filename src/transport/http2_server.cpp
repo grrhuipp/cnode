@@ -741,8 +741,8 @@ net::awaitable<void> Http2ServerSession::RunReadLoop() {
                 throw IoSystemError(io_error::connection_reset, "HTTP/2 missing END_STREAM");
             }
 
-            // DATA, the dominant frame, is accounted synchronously; only
-            // fault reporting suspends.
+            // DATA and WINDOW_UPDATE, the dominant steady-state frames, are
+            // accounted synchronously; only fault reporting suspends.
             if (frame->type == H2FrameType::DATA) {
                 if (!IsKnownClientStream(frame->stream_id)) {
                     (void)co_await FailConnection(H2Error::Protocol);
@@ -754,6 +754,18 @@ net::awaitable<void> Http2ServerSession::RunReadLoop() {
                     } else if (!co_await ResetStream(frame->stream_id, fault->error) &&
                                fault->error == H2Error::ExcessiveLoad) {
                         CancelAll();
+                    }
+                }
+                continue;
+            }
+            if (frame->type == H2FrameType::WINDOW_UPDATE) {
+                if (const auto fault = ReceiveWindowUpdate(*frame)) {
+                    if (fault->connection) {
+                        (void)co_await FailConnection(fault->error);
+                        break;
+                    }
+                    if (!co_await ResetStream(frame->stream_id, fault->error)) {
+                        break;
                     }
                 }
                 continue;
@@ -963,8 +975,6 @@ net::awaitable<bool> Http2ServerSession::DispatchFrame(H2Frame frame) {
                 H2FrameType::PING, kFlagAck, 0, frame.Payload());
         }
         break;
-    case H2FrameType::WINDOW_UPDATE:
-        co_return co_await ReceiveWindowUpdate(frame);
     case H2FrameType::HEADERS: {
         const auto id = frame.stream_id;
         bool exhausted = false;
@@ -1018,33 +1028,34 @@ std::optional<H2Error> Http2ServerSession::ApplyPeerSettings(std::span<const uin
     return std::nullopt;
 }
 
-net::awaitable<bool> Http2ServerSession::ReceiveWindowUpdate(const H2Frame& frame) {
+std::optional<Http2ServerSession::DataFault> Http2ServerSession::ReceiveWindowUpdate(
+    const H2Frame& frame) {
     const auto increment = WindowUpdateIncrement(frame);
     if (frame.stream_id == 0) {
-        if (!increment) co_return co_await FailConnection(increment.error());
+        if (!increment) return DataFault{increment.error(), true};
         if (!conn_send_window_.Adjust(*increment)) {
-            co_return co_await FailConnection(H2Error::FlowControl);
+            return DataFault{H2Error::FlowControl, true};
         }
         for (auto& [stream_id, sub] : streams_) {
             (void)stream_id;
             sub->WakeSendWaiter();
         }
-        co_return true;
+        return std::nullopt;
     }
     if (!IsKnownClientStream(frame.stream_id)) {
-        co_return co_await FailConnection(H2Error::Protocol);
+        return DataFault{H2Error::Protocol, true};
     }
     if (!increment && increment.error() == H2Error::FrameSize) {
-        co_return co_await FailConnection(H2Error::FrameSize);
+        return DataFault{H2Error::FrameSize, true};
     }
     const auto it = streams_.find(frame.stream_id);
-    if (it == streams_.end()) co_return true;
-    if (!increment) co_return co_await ResetStream(frame.stream_id, increment.error());
+    if (it == streams_.end()) return std::nullopt;
+    if (!increment) return DataFault{increment.error(), false};
     if (!it->second->SendWindow().Adjust(*increment)) {
-        co_return co_await ResetStream(frame.stream_id, H2Error::FlowControl);
+        return DataFault{H2Error::FlowControl, false};
     }
     it->second->WakeSendWaiter();
-    co_return true;
+    return std::nullopt;
 }
 
 net::awaitable<bool> Http2ServerSession::ReceiveHeaders(H2Frame frame) {
@@ -1062,9 +1073,12 @@ net::awaitable<bool> Http2ServerSession::ReceiveHeaders(H2Frame frame) {
         !trailers && (stream_id & 1u) != 0 && stream_id <= last_remote_stream_id_;
     tl::expected<std::optional<H2RequestHeaders>, H2Error> parsed;
     try {
-        parsed = co_await ParseH2RequestHeaders(
-            *stream_, hpack_decoder_, std::move(frame),
-            real_ip_header, trailers || closed_client_stream);
+        parsed = (frame.flags & kFlagEndHeaders) != 0
+            ? TryParseSingleH2RequestHeaders(
+                  hpack_decoder_, frame, real_ip_header, trailers || closed_client_stream)
+            : co_await ParseH2RequestHeaders(
+                  *stream_, hpack_decoder_, std::move(frame),
+                  real_ip_header, trailers || closed_client_stream);
     } catch (const std::bad_alloc&) {
         CancelAll();
         throw;
@@ -1339,6 +1353,8 @@ std::optional<Http2ServerSession::DataFault> Http2ServerSession::ReceiveData(H2F
     ReturnReceiveCredit(&sub, flow_size - data_size);
     return std::nullopt;
 }
+namespace {
+
 net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
@@ -1381,6 +1397,8 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     co_await session->Run();
     co_return std::unique_ptr<AsyncStream>{};
 }
+
+}  // namespace
 
 net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
     app::GroupCoordinator& coordinator,

@@ -84,8 +84,6 @@ net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream);
 net::awaitable<void> WriteH2FrameBuffers(
     AsyncStream&, H2FrameType, uint8_t, uint32_t,
     std::span<const net::const_buffer>);
-net::awaitable<void> WriteH2Frame(
-    AsyncStream&, H2FrameType, uint8_t, uint32_t, std::span<const uint8_t> = {});
 std::optional<std::span<const uint8_t>> H2HeaderBlockFragment(const H2Frame&);
 std::span<const uint8_t> H2DataPayload(const H2Frame&);
 
@@ -241,6 +239,26 @@ inline constexpr std::array<uint8_t, 15> kGrpcTrailerBlock{
     }
     return true;
 }
+// Decodes a complete single-frame HEADERS/PUSH_PROMISE block without
+// allocating a coroutine frame (the steady-state kFlagEndHeaders path).
+template <typename Visitor>
+[[nodiscard]] tl::expected<void, H2Error> DecodeSingleH2HeaderBlock(
+    HpackDecoder& decoder, const H2Frame& frame, Visitor&& on_field) {
+    const auto fragment = H2HeaderBlockFragment(frame);
+    if (!fragment) {
+        // RFC 9113 6.2: padding at least as long as the payload.
+        return tl::unexpected(H2Error::Protocol);
+    }
+    if (fragment->size() > kHttp2MaxHeaderBlockSize) {
+        return tl::unexpected(H2Error::ExcessiveLoad);
+    }
+    // RFC 7541 2.3 / RFC 9113 4.3: undecodable block is COMPRESSION_ERROR.
+    if (!decoder.Decode(*fragment, on_field)) {
+        return tl::unexpected(H2Error::Compression);
+    }
+    return {};
+}
+
 // Reads the CONTINUATION frames completing `frame` (RFC 9113 6.10) and
 // decodes the whole block. Every block is decoded, including rejected
 // streams', to keep the connection-wide HPACK state in sync. Every failure
@@ -248,25 +266,17 @@ inline constexpr std::array<uint8_t, 15> kGrpcTrailerBlock{
 template <typename Visitor>
 net::awaitable<tl::expected<void, H2Error>> ReadH2HeaderFields(
     AsyncStream& stream, HpackDecoder& decoder, H2Frame frame, Visitor&& on_field) {
+    if ((frame.flags & kFlagEndHeaders) != 0) {
+        co_return DecodeSingleH2HeaderBlock(
+            decoder, frame, std::forward<Visitor>(on_field));
+    }
     const uint32_t stream_id = frame.stream_id;
     const auto fragment = H2HeaderBlockFragment(frame);
     if (!fragment) {
-        // RFC 9113 6.2: padding at least as long as the payload.
         co_return tl::unexpected(H2Error::Protocol);
     }
     if (fragment->size() > kHttp2MaxHeaderBlockSize) {
         co_return tl::unexpected(H2Error::ExcessiveLoad);
-    }
-    // RFC 7541 2.3 / RFC 9113 4.3: undecodable block is COMPRESSION_ERROR.
-    const auto decode = [&decoder, &on_field](std::span<const uint8_t> block)
-        -> tl::expected<void, H2Error> {
-        if (!decoder.Decode(block, on_field)) {
-            return tl::unexpected(H2Error::Compression);
-        }
-        return {};
-    };
-    if ((frame.flags & kFlagEndHeaders) != 0) {
-        co_return decode(*fragment);
     }
     std::vector<uint8_t> block(fragment->begin(), fragment->end());
     while (true) {
@@ -285,7 +295,10 @@ net::awaitable<tl::expected<void, H2Error>> ReadH2HeaderFields(
             break;
         }
     }
-    co_return decode(block);
+    if (!decoder.Decode(block, on_field)) {
+        co_return tl::unexpected(H2Error::Compression);
+    }
+    co_return tl::expected<void, H2Error>{};
 }
 struct H2RequestHeaders {
     std::string method;
@@ -337,17 +350,11 @@ HpackBuffer EncodeHttpRequestHeaders(
     std::string_view, bool, const HttpClientRequestView&);
 std::vector<uint8_t> EncodeHttpResponseHeaders(
     const HttpHeaders& headers, std::string_view default_content_type = {});
+[[nodiscard]] tl::expected<std::optional<H2RequestHeaders>, H2Error>
+TryParseSingleH2RequestHeaders(
+    HpackDecoder&, const H2Frame&, std::string_view, bool);
 net::awaitable<tl::expected<std::optional<H2RequestHeaders>, H2Error>> ParseH2RequestHeaders(
     AsyncStream&, HpackDecoder&, H2Frame, std::string_view, bool);
-net::awaitable<TransportBuildResult> StartHttp2ServerSession(
-    app::GroupCoordinator& coordinator,
-    std::unique_ptr<AsyncStream>, uint32_t, H2PayloadCodec, net::io_context&,
-    std::shared_ptr<InboundTransportStreamHandler>, uint64_t,
-    const HttpConfig*, const XHttpConfig*, const GrpcConfig*);
-net::awaitable<TransportBuildResult> OpenHttp2ClientStream(
-    std::unique_ptr<AsyncStream>, std::optional<uint32_t>, std::span<const uint8_t>,
-    H2PayloadCodec, bool, std::string_view, std::string_view, std::string_view, uint64_t);
-
 [[nodiscard]] inline std::array<uint8_t, 8> EncodeGoaway(
     uint32_t last_stream, H2Error error) noexcept {
     std::array<uint8_t, 8> payload{};

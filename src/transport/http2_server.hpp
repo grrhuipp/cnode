@@ -364,8 +364,8 @@ private:
         return stream_id != 0 && (stream_id & 1u) != 0 && stream_id <= last_remote_stream_id_;
     }
 
-    // Non-DATA frames (RunReadLoop accounts DATA itself). Returns false once
-    // the connection must stop reading.
+    // Control/HEADERS frames (RunReadLoop accounts DATA and WINDOW_UPDATE
+    // synchronously). Returns false once the connection must stop reading.
     net::awaitable<bool> DispatchFrame(H2Frame frame);
 
     // SETTINGS_INITIAL_WINDOW_SIZE moves every open stream window by the
@@ -374,8 +374,7 @@ private:
 
     // RFC 9113 6.9: connection-level faults fail the connection; stream-level
     // ones reset only that stream. Closed streams may still receive updates.
-    net::awaitable<bool> ReceiveWindowUpdate(const H2Frame& frame);
-
+    [[nodiscard]] std::optional<DataFault> ReceiveWindowUpdate(const H2Frame& frame);
     // A new request, or trailers ending an open one.
     net::awaitable<bool> ReceiveHeaders(H2Frame frame);
     net::awaitable<bool> RouteXHttpRequest(

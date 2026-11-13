@@ -9,15 +9,7 @@ struct H2InboundPayload final {
     GrpcHunkDecoder decoder;
 
     template <class Source>
-    bool Ready(Source& source) noexcept {
-        return codec == H2PayloadCodec::RawData
-            ? source.RawReady() : !decoder.Payload().empty();
-    }
-
-    template <class Source>
-    net::awaitable<bool> Ensure(Source& source) {
-        if (codec == H2PayloadCodec::RawData)
-            co_return co_await source.WaitForDataFrame();
+    net::awaitable<bool> EnsureGrpc(Source& source) {
         while (decoder.Payload().empty()) {
             if (!co_await source.WaitForDataFrame()) {
                 if (!decoder.AtMessageBoundary()) {
@@ -38,8 +30,7 @@ struct H2InboundPayload final {
     }
 
     template <class Source>
-    size_t Consume(Source& source, net::mutable_buffer buffer) noexcept {
-        if (codec == H2PayloadCodec::RawData) return source.ConsumeRaw(buffer);
+    size_t ConsumeGrpc(Source& source, net::mutable_buffer buffer) noexcept {
         const auto bytes = decoder.Payload();
         const size_t size = std::min(buffer.size(), bytes.size());
         std::memcpy(buffer.data(), bytes.data(), size);
@@ -50,19 +41,29 @@ struct H2InboundPayload final {
 
     template <class Source>
     net::awaitable<size_t> Read(Source& source, net::mutable_buffer buffer) {
-        if (buffer.size() == 0 || (!Ready(source) && !co_await Ensure(source))) co_return 0;
-        co_return Consume(source, buffer);
+        if (buffer.size() == 0) co_return 0;
+        if (codec == H2PayloadCodec::RawData) {
+            if (!source.RawReady() && !co_await source.WaitForDataFrame()) co_return 0;
+            co_return source.ConsumeRaw(buffer);
+        }
+        if (decoder.Payload().empty() && !co_await EnsureGrpc(source)) co_return 0;
+        co_return ConsumeGrpc(source, buffer);
     }
 
     template <class Source>
     net::awaitable<common::MultiBuffer> ReadMultiBuffer(Source& source) {
-        if (!Ready(source) && !co_await Ensure(source)) co_return common::MultiBuffer{};
         if (codec == H2PayloadCodec::RawData) {
+            if (!source.RawReady() && !co_await source.WaitForDataFrame()) {
+                co_return common::MultiBuffer{};
+            }
             co_return source.ConsumeRawMultiBuffer();
+        }
+        if (decoder.Payload().empty() && !co_await EnsureGrpc(source)) {
+            co_return common::MultiBuffer{};
         }
         common::BufferGuard buffer{common::Buffer::New()};
         if (!buffer) throw std::bad_alloc();
-        const size_t size = Consume(source,
+        const size_t size = ConsumeGrpc(source,
             net::buffer(buffer->Tail().data(), buffer->Available()));
         if (size == 0) co_return common::MultiBuffer{};
         buffer->Produce(size);
