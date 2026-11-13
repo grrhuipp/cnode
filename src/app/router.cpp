@@ -8,7 +8,6 @@
 #include "infra/log.hpp"
 
 #include <algorithm>
-#include <optional>
 #include <stdexcept>
 #include <span>
 #include <string>

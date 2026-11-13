@@ -22,8 +22,8 @@ using XHttpSessionId = std::array<char, kXHttpSessionIdLength>;
 // 各次上行请求与普通拨号共用这一步，绑定地址与超时语义保持一致。
 [[nodiscard]] net::awaitable<DialResult> ConnectOutboundCandidate(
     net::io_context& io_context,
-    const OutboundTransportTarget& target,
-    const OutboundDialCandidate& candidate);
+    const OutboundDialCandidate& candidate,
+    std::chrono::seconds timeout);
 
 // 按候选顺序建立下行后返回组合流，上行请求在写入时才拨号；
 // |target| 的 XHTTP 模式必须解析为 PacketUp 或 StreamUp，否则返回失败。

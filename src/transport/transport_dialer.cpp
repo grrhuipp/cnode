@@ -34,7 +34,7 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
     const OutboundTransportTarget& target,
     const OutboundDialCandidate& candidate) {
 
-    auto tcp_result = co_await ConnectOutboundCandidate(io_context, target, candidate);
+    auto tcp_result = co_await ConnectOutboundCandidate(io_context, candidate, target.timeout);
     if (!tcp_result.Ok()) {
         co_return tcp_result;
     }
@@ -271,13 +271,13 @@ AttachXHttpDownloadTarget(
 
 net::awaitable<DialResult> ConnectOutboundCandidate(
     net::io_context& io_context,
-    const OutboundTransportTarget& target,
-    const OutboundDialCandidate& candidate) {
+    const OutboundDialCandidate& candidate,
+    std::chrono::seconds timeout) {
     return TcpStream::Connect(
         io_context,
         candidate.endpoint,
         candidate.bind_local ? &*candidate.bind_local : nullptr,
-        target.timeout);
+        timeout);
 }
 
 __attribute__((weak)) net::awaitable<DialResult> DialOutboundTransport(

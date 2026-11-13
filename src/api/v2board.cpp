@@ -15,7 +15,6 @@
 #include <asio/redirect_error.hpp>
 #include <asio/cancel_after.hpp>
 #include <algorithm>
-#include <array>
 #include <cctype>
 #include <cstdint>
 #include <format>
@@ -436,6 +435,9 @@ APIClient::HttpExchange(HttpMethod method,
     }
     request += "\r\n";
     request += body_text;
+    std::string{}.swap(path);
+    std::string{}.swap(body_text);
+    std::string{}.swap(if_none_match);
 
     if (url_parts_.use_ssl) {
         co_return co_await ConnectAndExchange<ssl::stream<tcp::socket>>(endpoints, request);
@@ -510,9 +512,10 @@ APIClient::FetchConditionalResource(std::string_view endpoint,
                                     bool log_not_modified) {
     std::string path = std::format("/api/v1/server/UniProxy/{}?node_id={}&node_type={}",
                                    endpoint, config_.NodeID, ApiNodeType());
-    auto resp = co_await HttpRequest(HttpMethod::Get, std::move(path), {}, committed_etag);
+    const bool has_etag = !committed_etag.empty();
+    auto resp = co_await HttpRequest(HttpMethod::Get, std::move(path), {}, std::move(committed_etag));
     if (resp.not_modified) {
-        if (committed_etag.empty()) {
+        if (!has_etag) {
             co_return tl::unexpected(FetchResult::Fail(
                 common::ErrorCode::PANEL_INVALID_RESPONSE,
                 std::string(missing_etag_error)));

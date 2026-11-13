@@ -1027,9 +1027,10 @@ net::awaitable<void> Controller::Impl::UserInfoMonitor(PanelRuntime& panel,
         LOG_PANEL_ERROR(log_context, "Traffic journal failed: operation=push reason={}", e.what());
     }
 
+    const size_t traffic_users = batch.traffic.size();
+    batch = {};
     auto online = co_await GetOnlineSnapshot(tag);
     ns.online_count = online.user_count;
-    const auto& traffic_data = batch.traffic;
 
     app::ThrowIfStopping(stopping_);
     bool online_ok = false;
@@ -1046,7 +1047,7 @@ net::awaitable<void> Controller::Impl::UserInfoMonitor(PanelRuntime& panel,
         "Panel report: state={} operation=push traffic={} traffic_users={} online={} online_users={} devices={}",
         report_ok ? "ok" : "degraded",
         (traffic_ok && journal_ok) ? "ok" : "failed",
-        traffic_data.size(),
+        traffic_users,
         online_ok ? "ok" : "failed",
         online.user_count,
         online.entries.size());

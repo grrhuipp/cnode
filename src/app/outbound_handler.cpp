@@ -66,13 +66,8 @@ std::shared_ptr<OutboundHandler> OutboundHandlerRegistry::GetHandler(std::string
 
 void OutboundHandlerRegistry::Replace(const PreparedOutboundConfig& configuration) {
     auto handler = Instantiate(configuration);
-    if (const auto it = handlers_.find(configuration.tag); it != handlers_.end()) {
-        // In-flight requests keep the retired handler through their own handles.
-        it->second = std::move(handler);
-        return;
-    }
-    handlers_.try_emplace(configuration.tag,
-                          std::move(handler));
+    // In-flight requests keep any retired handler through their own handles.
+    handlers_.insert_or_assign(configuration.tag, std::move(handler));
 }
 
 void OutboundHandlerRegistry::Remove(std::string_view tag) {

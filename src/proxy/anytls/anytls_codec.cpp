@@ -2,6 +2,7 @@
 #include "proxy/handshake_errors.hpp"
 #include "proxy/anytls_padding.hpp"
 #include "common/byte_reader.hpp"
+#include "common/const_buffer_span.hpp"
 #include "transport/async_stream.hpp"
 
 #include <openssl/evp.h>
@@ -28,13 +29,6 @@ std::array<uint8_t, kFrameHeaderSize> BuildFrameHeaderBytes(
     common::StoreU32BE(header.data() + 1, sid);
     common::StoreU16BE(header.data() + 5, static_cast<uint16_t>(payload_size));
     return header;
-}
-
-void AppendWaste(std::vector<uint8_t>& out, uint16_t payload_size) {
-    const auto header = BuildFrameHeaderBytes(kCmdWaste, 0, payload_size);
-    const size_t offset = out.size();
-    out.resize(offset + header.size() + payload_size, uint8_t{0});
-    std::memcpy(out.data() + offset, header.data(), header.size());
 }
 
 
@@ -308,60 +302,108 @@ WriteFrame(transport::AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<
     co_return tl::expected<void, common::ErrorCode>{};
 }
 
-net::awaitable<tl::expected<void, common::ErrorCode>>
-WriteAnyTlsPacketWithPadding(transport::AsyncStream& stream,
+static net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteSlicesWithPadding(transport::AsyncStream& stream,
                        std::span<const PaddingRecord> record_rules,
-                       std::vector<uint8_t> packet) {
-    if (packet.empty()) {
+                       std::span<const net::const_buffer> buffers) {
+    size_t remaining = 0;
+    for (const net::const_buffer& buf : buffers) {
+        remaining += buf.size();
+    }
+    if (remaining == 0) {
         co_return tl::expected<void, common::ErrorCode>{};
     }
-
+    auto write_span = [&stream](std::span<const net::const_buffer> out)
+        -> net::awaitable<tl::expected<void, common::ErrorCode>> {
+        if (out.empty()) {
+            co_return tl::expected<void, common::ErrorCode>{};
+        }
+        try {
+            co_await stream.WriteBuffers(out);
+        } catch (const IoSystemError& e) {
+            co_return tl::unexpected(common::MapAsioError(e.code()));
+        }
+        co_return tl::expected<void, common::ErrorCode>{};
+    };
     if (record_rules.empty()) {
-        co_return co_await WriteAll(
-            stream,
-            std::span<const uint8_t>(packet.data(), packet.size()));
+        co_return co_await write_span(buffers);
     }
-    size_t offset = 0;
+
+    static constexpr std::array<uint8_t, 4096> kZeroWaste{};
+    size_t buf_idx = 0;
+    size_t buf_off = 0;
+    auto append_data = [&](auto& out, size_t count) {
+        remaining -= count;
+        while (count > 0) {
+            while (buf_idx < buffers.size() && buffers[buf_idx].size() <= buf_off) {
+                ++buf_idx;
+                buf_off = 0;
+            }
+            const auto* ptr = static_cast<const uint8_t*>(buffers[buf_idx].data()) + buf_off;
+            const size_t avail = buffers[buf_idx].size() - buf_off;
+            const size_t take = std::min(count, avail);
+            out.Append(net::const_buffer(ptr, take));
+            buf_off += take;
+            count -= take;
+        }
+    };
+    auto append_waste = [](auto& out,
+                           std::array<uint8_t, kFrameHeaderSize>& header_buf,
+                           uint16_t payload_size) {
+        header_buf = BuildFrameHeaderBytes(kCmdWaste, 0, payload_size);
+        out.Append(net::const_buffer(header_buf.data(), header_buf.size()));
+        size_t zeros = payload_size;
+        while (zeros > 0) {
+            const size_t chunk = std::min(zeros, kZeroWaste.size());
+            out.Append(net::const_buffer(kZeroWaste.data(), chunk));
+            zeros -= chunk;
+        }
+    };
+
     for (const PaddingRecord& rule : record_rules) {
         const int sampled_size = rule.SampleSize();
         if (sampled_size == -1) {
-            if (offset >= packet.size()) {
+            if (remaining == 0) {
                 break;
             }
             continue;
         }
         // Compiled records are positive and every possible Waste fits uint16.
         const size_t size = static_cast<size_t>(sampled_size);
-        const size_t remaining = packet.size() - offset;
-        std::span<const uint8_t> output;
+        common::ConstBufferSpanBuilder<24> out;
+        std::array<uint8_t, kFrameHeaderSize> waste_header{};
         if (remaining >= size) {
-            output = std::span<const uint8_t>(packet).subspan(offset, size);
-            offset += size;
+            append_data(out, size);
         } else if (remaining > 0) {
-            const size_t chunk_offset = offset;
-            if (size - remaining > kFrameHeaderSize) {
-                AppendWaste(packet, static_cast<uint16_t>(size - remaining - kFrameHeaderSize));
+            const size_t tail = remaining;
+            append_data(out, tail);
+            if (size - tail > kFrameHeaderSize) {
+                append_waste(out, waste_header,
+                             static_cast<uint16_t>(size - tail - kFrameHeaderSize));
             }
-            offset = packet.size();
-            output = std::span<const uint8_t>(packet).subspan(chunk_offset);
         } else {
-            packet.clear();
-            AppendWaste(packet, static_cast<uint16_t>(size));
-            offset = packet.size();
-            output = packet;
+            append_waste(out, waste_header, static_cast<uint16_t>(size));
         }
-
-        auto ok = co_await WriteAll(stream, output);
+        auto ok = co_await write_span(out.Span());
         if (!ok) {
             co_return tl::unexpected(ok.error());
         }
     }
-    if (offset < packet.size()) {
-        co_return co_await WriteAll(
-            stream,
-            std::span<const uint8_t>(packet.data() + offset, packet.size() - offset));
+    if (remaining > 0) {
+        common::ConstBufferSpanBuilder<8> tail_out;
+        append_data(tail_out, remaining);
+        co_return co_await write_span(tail_out.Span());
     }
     co_return tl::expected<void, common::ErrorCode>{};
+}
+
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteAnyTlsPacketWithPadding(transport::AsyncStream& stream,
+                             std::span<const PaddingRecord> record_rules,
+                             std::vector<uint8_t> packet) {
+    const net::const_buffer single(packet.data(), packet.size());
+    co_return co_await WriteSlicesWithPadding(
+        stream, record_rules, {&single, packet.empty() ? size_t{0} : size_t{1}});
 }
 
 static net::awaitable<tl::expected<void, common::ErrorCode>>
@@ -370,21 +412,15 @@ WritePaddedMultiBufferFrames(transport::AsyncStream& stream,
                              uint8_t cmd,
                              uint32_t sid,
                              common::MultiBuffer mb) {
-    std::span<const uint8_t> remaining = mb.FrontSpan();
-    const size_t frames = remaining.empty()
-        ? 0 : 1 + (remaining.size() - 1) / kMaxFramePayload;
-    std::vector<uint8_t> packet;
-    packet.reserve(remaining.size() + frames * kFrameHeaderSize);
-    while (!remaining.empty()) {
-        const size_t chunk = std::min(remaining.size(), kMaxFramePayload);
-        auto ok = AppendFrameBytesTo(packet, cmd, sid, remaining.first(chunk));
-        if (!ok) {
-            co_return tl::unexpected(ok.error());
-        }
-        remaining = remaining.subspan(chunk);
+    FrameBatch batch;
+    auto encoded = batch.Encode(cmd, sid, mb);
+    if (!encoded) {
+        mb.clear();
+        co_return encoded;
     }
+    auto res = co_await WriteSlicesWithPadding(stream, records, batch.Buffers());
     mb.clear();
-    co_return co_await WriteAnyTlsPacketWithPadding(stream, records, std::move(packet));
+    co_return res;
 }
 
 net::awaitable<tl::expected<void, common::ErrorCode>>
@@ -407,37 +443,12 @@ WritePaddedBufferFrames(transport::AsyncStream& stream,
                         uint8_t cmd,
                         uint32_t sid,
                         std::span<const net::const_buffer> buffers) {
-    size_t payload_bytes = 0;
-    size_t frame_count = 0;
-    for (const net::const_buffer& buffer : buffers) {
-        if (buffer.data() && buffer.size() > 0) {
-            payload_bytes += buffer.size();
-            frame_count += 1 + (buffer.size() - 1) / kMaxFramePayload;
-        }
+    FrameBatch batch;
+    auto encoded = batch.Encode(cmd, sid, buffers);
+    if (!encoded) {
+        co_return encoded;
     }
-
-    std::vector<uint8_t> packet;
-    packet.reserve(payload_bytes + (frame_count * kFrameHeaderSize));
-    for (const net::const_buffer& buffer : buffers) {
-        const auto* data = static_cast<const uint8_t*>(buffer.data());
-        if (!data || buffer.size() == 0) {
-            continue;
-        }
-        std::span<const uint8_t> remaining(data, buffer.size());
-        while (!remaining.empty()) {
-            const size_t chunk_size = std::min(remaining.size(), kMaxFramePayload);
-            auto ok = AppendFrameBytesTo(
-                packet,
-                cmd,
-                sid,
-                remaining.first(chunk_size));
-            if (!ok) {
-                co_return tl::unexpected(ok.error());
-            }
-            remaining = remaining.subspan(chunk_size);
-        }
-    }
-    co_return co_await WriteAnyTlsPacketWithPadding(stream, records, std::move(packet));
+    co_return co_await WriteSlicesWithPadding(stream, records, batch.Buffers());
 }
 
 net::awaitable<tl::expected<void, common::ErrorCode>>

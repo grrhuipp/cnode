@@ -18,18 +18,16 @@ DetectRulePolicy::~DetectRulePolicy() = default;
 void DetectRulePolicy::UpdateRule(std::string_view tag,
                                   RuleListPtr new_rule_list) {
     if (tag.empty()) return;
-    const auto it = rules_.find(tag);
     if (!new_rule_list || new_rule_list->empty()) {
-        if (it != rules_.end()) {
+        if (const auto it = rules_.find(tag); it != rules_.end()) {
             rules_.erase(it);
         }
         return;
     }
-    if (it != rules_.end()) {
+    auto [it, inserted] = rules_.try_emplace(std::string(tag), std::move(new_rule_list));
+    if (!inserted) {
         it->second = std::move(new_rule_list);
-        return;
     }
-    rules_.emplace(std::string(tag), std::move(new_rule_list));
 }
 
 bool DetectRulePolicy::Blocked(const Context& ctx) {

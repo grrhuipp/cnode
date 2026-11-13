@@ -128,6 +128,9 @@ private:
     void OnHttpHeader(int64_t stream_id, int32_t token, nghttp3_rcbuf* name, nghttp3_rcbuf* value);
     void ProcessUdpMessage(const HysteriaUdpMessage& message);
     void ExpireUdpFragments(ngtcp2_tstamp now) noexcept;
+    template <typename AppendFn>
+    void DeliverUdpPayload(uint32_t session_id, const common::TargetAddress& target,
+                           size_t total_bytes, AppendFn&& append);
     void DeliverUdpPacket(uint32_t session_id, const common::TargetAddress& target,
                           std::span<const uint8_t> payload);
     static int ReceiveStreamData(ngtcp2_conn*, uint32_t flags, int64_t stream_id,

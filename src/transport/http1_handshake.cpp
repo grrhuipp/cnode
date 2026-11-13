@@ -542,17 +542,17 @@ net::awaitable<tl::expected<void, common::ErrorCode>> ReadClientResponse(
     std::string_view scope,
     uint64_t conn_id,
     std::string_view status_code) {
-    auto head = co_await ReadHttp1MessageHead(stream);
-    if (!head) {
-        LogHeadReadFailure(scope, conn_id, head.error());
-        co_return tl::unexpected(head.error());
+    Http1MessageHead head;
+    if (auto read = co_await ReadHttp1MessageHead(stream, head); !read) {
+        LogHeadReadFailure(scope, conn_id, read.error());
+        co_return tl::unexpected(read.error());
     }
-    const std::string_view status_line = ExtractStartLine(head->Text());
+    const std::string_view status_line = ExtractStartLine(head.Text());
     if (!HasStatusCode(status_line, status_code)) {
         LOG_CONN_DEBUG(conn_id, "{} client request rejected", scope);
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    MoveReadAhead(stream, *head);
+    MoveReadAhead(stream, head);
     co_return tl::expected<void, common::ErrorCode>{};
 }
 
@@ -790,15 +790,6 @@ net::awaitable<tl::expected<void, common::ErrorCode>> ReadHttp1MessageHead(
             head.bytes = reinterpret_cast<const uint8_t*>(head.extended_storage.data());
         }
     }
-}
-
-net::awaitable<tl::expected<Http1MessageHead, common::ErrorCode>> ReadHttp1MessageHead(
-    AsyncStream& stream, std::span<const uint8_t> initial, Http1HeadReadLimits limits) {
-    Http1MessageHead head;
-    if (auto res = co_await ReadHttp1MessageHead(stream, head, initial, limits); !res) {
-        co_return tl::unexpected(res.error());
-    }
-    co_return std::move(head);
 }
 
 std::string_view ExtractStartLine(std::string_view head) {
@@ -1163,12 +1154,12 @@ ExecuteHttp1UpgradeClientHandshake(
         co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
 
-    auto head = co_await ReadHttp1MessageHead(stream);
-    if (!head) {
-        LogHeadReadFailure(scope, conn_id, head.error());
-        co_return tl::unexpected(head.error());
+    Http1MessageHead head;
+    if (auto read = co_await ReadHttp1MessageHead(stream, head); !read) {
+        LogHeadReadFailure(scope, conn_id, read.error());
+        co_return tl::unexpected(read.error());
     }
-    const std::string_view response = head->Text();
+    const std::string_view response = head.Text();
     const std::string_view status_line = ExtractStartLine(response);
     if (!HasStatusCode(status_line, "101")) {
         LOG_CONN_DEBUG(conn_id, "{} client upgrade rejected", scope);
@@ -1177,7 +1168,7 @@ ExecuteHttp1UpgradeClientHandshake(
     if (!HasWebSocketUpgradeHeaders(response)) {
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    co_return std::move(*head);
+    co_return std::move(head);
 }
 
 net::awaitable<bool> WriteFullToStream(AsyncStream& stream, std::string_view bytes) {

@@ -45,7 +45,7 @@ TEST(GroupCoordinator, RoutesWorkerCallsAndReservedOperationsToControlExecutor) 
         struct Returned final : app::GroupCoordinator::ReservedOperation {
             std::promise<void>& complete;
             explicit Returned(std::promise<void>& value) : complete(value) {}
-            void Invoke() noexcept override { complete.set_value(); }
+            void Invoke() noexcept { complete.set_value(); }
         };
         coordinator->PostReserved(std::make_unique<Returned>(reserved_done));
         reserved_fut.get();

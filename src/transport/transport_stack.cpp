@@ -377,6 +377,46 @@ void LogLayerFailure(uint64_t conn_id, std::string_view layer, common::ErrorCode
     LOG_CONN_DEBUG(conn_id, "{} failed > {}", layer, common::ErrorCodeToString(error));
 }
 
+
+net::awaitable<TransportBuildResult> BuildInboundXHttpTransport(
+    app::GroupCoordinator& coordinator,
+    std::unique_ptr<AsyncStream> stream,
+    const XHttpConfig& xhttp,
+    net::io_context& io_context,
+    std::shared_ptr<InboundTransportStreamHandler> stream_handler,
+    uint64_t conn_id,
+    InboundTransportMetadata* metadata) {
+    // Outlives the HTTP/2 session, which borrows it until the call returns.
+    const HttpConfig http = XHttpStreamOneHttpConfig(xhttp, false);
+    co_return co_await DoHttpServerHandshake(
+        coordinator,
+        std::move(stream),
+        http,
+        io_context,
+        std::move(stream_handler),
+        conn_id,
+        metadata,
+        &xhttp);
+}
+
+net::awaitable<TransportBuildResult> BuildOutboundXHttpStreamOne(
+    std::unique_ptr<AsyncStream> stream,
+    const StreamSettings& s,
+    std::string_view authority_fallback,
+    uint64_t conn_id) {
+    if (const XHttpMode mode = ResolveXHttpOutboundMode(s); mode != XHttpMode::StreamOne) {
+        LOG_CONN_ERROR(conn_id, "XHTTP client {} requires the split dialer",
+                  XHttpModeName(mode));
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
+    }
+    const HttpConfig http = XHttpStreamOneHttpConfig(s.xhttp, true);
+    co_return co_await DoHttp2ClientHandshake(
+        std::move(stream),
+        http,
+        ResolveConfiguredHttpHost(http.host, &http.headers, authority_fallback),
+        s.IsTlsLike(),
+        conn_id);
+}
 }  // namespace
 
 net::awaitable<TransportBuildResult> BuildInboundTransport(
@@ -444,16 +484,9 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
 
     // 4. XHTTP 层（服务端：H2 stream-one 或 H1 packet-up）
     if (s.IsXHttp()) {
-        // Outlives the HTTP/2 session, which borrows it until the call returns.
-        const HttpConfig http = XHttpStreamOneHttpConfig(s.xhttp, false);
-        auto xhttp_result = co_await DoHttpServerHandshake(coordinator, 
-            std::move(stream),
-            http,
-            io_context,
-            std::move(stream_handler),
-            conn_id,
-            metadata,
-            &s.xhttp);
+        auto xhttp_result = co_await BuildInboundXHttpTransport(
+            coordinator, std::move(stream), s.xhttp, io_context,
+            std::move(stream_handler), conn_id, metadata);
         if (!xhttp_result) {
             LogLayerFailure(conn_id, "XHTTP server handshake", xhttp_result.error());
             co_return tl::unexpected(xhttp_result.error());
@@ -559,19 +592,8 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
 
     // 4. XHTTP stream-one 层（客户端，HTTP/2 raw body/response）
     if (s.IsXHttp()) {
-        if (const XHttpMode mode = ResolveXHttpOutboundMode(s); mode != XHttpMode::StreamOne) {
-            LOG_CONN_ERROR(conn_id, "XHTTP client {} requires the split dialer",
-                      XHttpModeName(mode));
-            co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
-        }
-        const HttpConfig http = XHttpStreamOneHttpConfig(s.xhttp, true);
-        auto xhttp_result = co_await DoHttp2ClientHandshake(
-            std::move(stream),
-            http,
-            ResolveConfiguredHttpHost(
-                http.host, &http.headers, authority_fallback),
-            s.IsTlsLike(),
-            conn_id);
+        auto xhttp_result = co_await BuildOutboundXHttpStreamOne(
+            std::move(stream), s, authority_fallback, conn_id);
         if (!xhttp_result) {
             LogLayerFailure(conn_id, "XHTTP client handshake", xhttp_result.error());
             co_return tl::unexpected(xhttp_result.error());

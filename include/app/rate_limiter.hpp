@@ -61,7 +61,7 @@ private:
         bool physical = false;
         bool child = false;
         bool admitted = false;
-        void Invoke() noexcept override;
+        void Invoke() noexcept;
     };
 public:
     class Reservation {

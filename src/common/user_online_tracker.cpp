@@ -106,7 +106,7 @@ struct DeviceReturn final : app::GroupCoordinator::ReservedOperation {
     std::string ip;
     uint64_t user = 0;
     bool admitted = false;
-    void Invoke() noexcept override { quota->Release(tag, user, ip); }
+    void Invoke() noexcept { quota->Release(tag, user, ip); }
 };
 
 } // namespace

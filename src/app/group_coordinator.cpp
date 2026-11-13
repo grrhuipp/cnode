@@ -66,8 +66,7 @@ uint32_t GroupCoordinator::WorkerCount() const noexcept {
 }
 
 
-void GroupCoordinator::PostReserved(std::unique_ptr<ReservedOperation> operation) noexcept {
-    auto* node = operation.release();
+void GroupCoordinator::PostReservedNode(ReservedOperation* node) noexcept {
     auto* previous = reserved_->incoming.load(std::memory_order_relaxed);
     do { node->next = previous; }
     while (!reserved_->incoming.compare_exchange_weak(previous, node,
@@ -92,9 +91,9 @@ void GroupCoordinator::DrainReserved() noexcept {
             batch = next;
         }
         while (fifo) {
-            std::unique_ptr<ReservedOperation> operation(fifo);
+            auto* current = fifo;
             fifo = fifo->next;
-            operation->Invoke();
+            current->complete(current);
         }
     }
 }

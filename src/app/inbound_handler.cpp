@@ -15,7 +15,6 @@
 #include <new>
 #include <stdexcept>
 #include <string>
-#include <vector>
 namespace app {
 
 namespace {
@@ -525,15 +524,8 @@ InboundHandlerRegistry::HandlerPtr InboundHandlerRegistry::ReplaceHandler(std::u
 
     std::string tag(handler->Tag());
     auto shared_handler = std::shared_ptr<InboundHandler>(std::move(handler));
-    auto it = handlers_.find(tag);
-    if (it == handlers_.end()) {
-        auto [inserted_it, inserted] = handlers_.try_emplace(
-            std::move(tag), std::move(shared_handler));
-        return inserted ? inserted_it->second : nullptr;
-    }
-
-    it->second = std::move(shared_handler);
-    return it->second;
+    return handlers_.insert_or_assign(
+        std::move(tag), std::move(shared_handler)).first->second;
 }
 
 void InboundHandlerRegistry::RemoveHandler(std::string_view tag) {

@@ -1974,7 +1974,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
     }
 
     const bool chunked_upload = kind == XHttpClientRequestKind::StreamUp;
-    const std::string request = BuildXHttp1ClientRequest(
+    std::string request = BuildXHttp1ClientRequest(
         cfg, host, content_length, chunked_upload);
     if (chunked_upload) {
         // Send the head and initial chunk together; an owned reader drains
@@ -2000,7 +2000,9 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
         co_return std::make_unique<XHttpUploadClientStream>(
             executor, services, std::move(body));
     }
-    if (!co_await WriteFullToStream(*stream, request)) {
+    const bool wrote_head = co_await WriteFullToStream(*stream, request);
+    std::string{}.swap(request);
+    if (!wrote_head) {
         co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
     if (kind == XHttpClientRequestKind::PacketUp && payload_len > 0) {
@@ -2011,11 +2013,11 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
         }
     }
 
-    auto head = co_await ReadHttp1MessageHead(*stream);
-    if (!head) {
-        co_return tl::unexpected(head.error());
+    Http1MessageHead head;
+    if (auto read = co_await ReadHttp1MessageHead(*stream, head); !read) {
+        co_return tl::unexpected(read.error());
     }
-    const std::string_view response = head->Text();
+    const std::string_view response = head.Text();
     if (!HasStatusCode(ExtractStartLine(response), "200")) {
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
@@ -2031,7 +2033,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
     LOG_CONN_DEBUG(conn_id, "XHTTP client H1 downlink ready path={}",
                   PublicHttpTargetForLog(EffectiveHttpPath(cfg.path)));
     co_return MakeHttp1BodyStream(
-        std::move(stream), read_framing, false, head->TakeReadAheadMultiBuffer());
+        std::move(stream), read_framing, false, head.TakeReadAheadMultiBuffer());
 }
 
 }  // namespace transport

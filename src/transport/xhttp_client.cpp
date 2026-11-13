@@ -127,20 +127,16 @@ protected:
                                  const char* missing_settings_error)
         : io_context_(io_context)
         , downlink_(std::move(downlink))
-        , target_{
-              .single_candidate = candidate,
-              .candidates = {},
-              .tls_server_name = target.tls_server_name,
-              .ws_host = std::string(target.ws_host),
-              .stream_settings = target.stream_settings,
-              .security_context = target.security_context,
-              .timeout = target.timeout,
-              .xhttp_download_target = {}}
+        , stream_settings_(target.stream_settings)
+        , security_context_(target.security_context)
+        , tls_server_name_(target.tls_server_name)
+        , ws_host_(target.ws_host)
         , candidate_(candidate)
         , upload_path_(std::move(upload_path))
         , base_upload_path_size_(upload_path_.size())
+        , timeout_(target.timeout)
         , conn_id_(conn_id) {
-        if (!target_.stream_settings) {
+        if (!stream_settings_) {
             throw IoSystemError(io_error::broken_pipe, missing_settings_error);
         }
         upload_path_.reserve(base_upload_path_size_ + 21);
@@ -281,7 +277,7 @@ protected:
         XHttpClientRequestKind kind,
         std::span<const net::const_buffer> payloads) {
         const bool stream_up = kind == XHttpClientRequestKind::StreamUp;
-        auto tcp_result = co_await ConnectOutboundCandidate(io_context_, target_, candidate_);
+        auto tcp_result = co_await ConnectOutboundCandidate(io_context_, candidate_, timeout_);
         if (!tcp_result.Ok()) {
             if (tcp_result.error == common::ErrorCode::DIAL_TIMEOUT) {
                 upload_write_expired_ = true;
@@ -299,19 +295,19 @@ protected:
                 stream_up ? "xhttp stream-up closed while dialing"
                           : "xhttp packet-up closed while dialing");
         }
-        tcp_result.stream->SetIdleTimeout(target_.timeout);
+        tcp_result.stream->SetIdleTimeout(timeout_);
         tcp_result.stream->SetWriteTimeout(write_timeout_);
-        (void)tcp_result.stream->StartPhaseDeadline(target_.timeout);
+        (void)tcp_result.stream->StartPhaseDeadline(timeout_);
 
         TransportBuildResult build_result;
         {
             InFlightUploadScope in_flight_scope(*this, BaseTcpStreamOf(*tcp_result.stream));
             build_result = co_await BuildOutboundXHttpClientRequest(
                 std::move(tcp_result.stream),
-                *target_.stream_settings,
-                target_.security_context,
-                target_.tls_server_name,
-                target_.ws_host,
+                *stream_settings_,
+                security_context_,
+                tls_server_name_,
+                ws_host_,
                 path,
                 kind,
                 payloads,
@@ -339,12 +335,16 @@ protected:
     net::io_context& io_context_;
     std::unique_ptr<AsyncStream> downlink_;
     TcpStream* in_flight_upload_tcp_ = nullptr;
-    OutboundTransportTarget target_;
+    const StreamSettings* stream_settings_ = nullptr;
+    SslContext* security_context_ = nullptr;
+    std::string tls_server_name_;
+    std::string ws_host_;
     OutboundDialCandidate candidate_;
     std::string upload_path_;
     size_t base_upload_path_size_ = 0;
     AsyncWriteGate upload_gate_;
     DownlinkCancellation downlink_cancel_{*this};
+    std::chrono::seconds timeout_{0};
     std::chrono::seconds write_timeout_{0};
     uint64_t conn_id_ = 0;
     bool upload_write_expired_ = false;
@@ -767,7 +767,7 @@ net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
     XHttpClientRequestKind kind,
     std::span<const net::const_buffer> packet_payload = {}) {
 
-    auto tcp_result = co_await ConnectOutboundCandidate(io_context, target, candidate);
+    auto tcp_result = co_await ConnectOutboundCandidate(io_context, candidate, target.timeout);
     if (!tcp_result.Ok()) {
         co_return tcp_result;
     }

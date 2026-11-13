@@ -192,6 +192,9 @@ public:
     ~UdpSessionStream() noexcept override;
 
     [[nodiscard]] bool Push(const common::TargetAddress& target, std::span<const uint8_t> payload);
+    template <typename AppendFn>
+    [[nodiscard]] bool PushWith(
+        const common::TargetAddress& target, size_t total_bytes, AppendFn&& append);
     // The owning connection closed; pending reads end and writes fail.
     void Detach() noexcept;
 

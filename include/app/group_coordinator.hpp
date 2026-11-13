@@ -4,6 +4,7 @@
 #include "app/worker_mailbox.hpp"
 
 #include <asio/execution.hpp>
+#include <concepts>
 #include <cstdint>
 #include <exception>
 #include <functional>
@@ -25,10 +26,17 @@ public:
 
     struct ReservedOperation {
         ReservedOperation* next = nullptr;
-        virtual ~ReservedOperation() = default;
-        virtual void Invoke() noexcept = 0;
+        void (*complete)(ReservedOperation*) noexcept = nullptr;
     };
-    void PostReserved(std::unique_ptr<ReservedOperation> operation) noexcept;
+    template <typename Op>
+        requires std::derived_from<Op, ReservedOperation>
+    void PostReserved(std::unique_ptr<Op> operation) noexcept {
+        operation->ReservedOperation::complete = +[](ReservedOperation* base) noexcept {
+            std::unique_ptr<Op> owned(static_cast<Op*>(base));
+            owned->Invoke();
+        };
+        PostReservedNode(operation.release());
+    }
     template<class Function> auto PostCall(Function function) {
         return mailbox_.PostCall([this, function = std::move(function)]() mutable
             -> std::invoke_result_t<Function&> {
@@ -46,6 +54,7 @@ public:
     void ReleaseServices() noexcept { services_.reset(); }
 private:
     struct ReservedState;
+    void PostReservedNode(ReservedOperation* node) noexcept;
     void EnsureStarted();
     void ArmReserved();
     void DrainReserved() noexcept;

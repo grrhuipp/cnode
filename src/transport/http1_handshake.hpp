@@ -73,9 +73,6 @@ ReadHttp1MessageHead(AsyncStream& stream,
                      Http1MessageHead& head,
                      std::span<const uint8_t> initial = {},
                      Http1HeadReadLimits limits = {});
-[[nodiscard]] net::awaitable<tl::expected<Http1MessageHead, common::ErrorCode>>
-ReadHttp1MessageHead(AsyncStream& stream, std::span<const uint8_t> initial = {},
-                     Http1HeadReadLimits limits = {});
 
 [[nodiscard]] std::string_view ExtractStartLine(std::string_view head);
 struct Http1RequestLine {

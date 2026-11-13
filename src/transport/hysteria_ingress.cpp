@@ -1364,6 +1364,42 @@ void HysteriaConnection::ExpireUdpFragments(ngtcp2_tstamp now) noexcept {
     }
 }
 
+template <typename AppendFn>
+bool UdpSessionStream::PushWith(
+    const common::TargetAddress& target, size_t total_bytes, AppendFn&& append) {
+    if (closed_ || cancelled_) return false;
+    // Datagrams cannot share a block. Count rounded capacity before allocating,
+    // without subtracting an externally sized payload from the byte budget.
+    const size_t buffer_count = total_bytes == 0
+        ? 1 : 1 + (total_bytes - 1) / common::Buffer::kSize;
+    if (buffer_count > kMaxQueuedBytes / common::Buffer::kSize - queued_buffer_count_)
+        return false;
+    common::MultiBuffer packet;
+    if (!append(packet) || !common::SetUdpTarget(packet, target)) return false;
+    input_.push_back(std::move(packet));
+    queued_buffer_count_ += buffer_count;
+    WakeReader();
+    return true;
+}
+
+template <typename AppendFn>
+void HysteriaConnection::DeliverUdpPayload(
+    uint32_t session_id, const common::TargetAddress& target,
+    size_t total_bytes, AppendFn&& append) {
+    if (auto it = core_->udp_sessions.find(session_id);
+        it != core_->udp_sessions.end()) {
+        (void)it->second->PushWith(target, total_bytes, std::forward<AppendFn>(append));
+        return;
+    }
+    if (core_->udp_sessions.size() >= kMaxUdpSessions) return;
+    auto session = std::make_unique<UdpSessionStream>(
+        Reactor(), session_id, weak_from_this());
+    if (!session->PushWith(target, total_bytes, std::forward<AppendFn>(append))) return;
+    core_->udp_sessions.emplace(session_id, session.get());
+    SpawnOwned(DeliverStream(std::move(session),
+        InboundTransportMetadata{.real_ip = {}, .udp_session_target = target}));
+}
+
 void HysteriaConnection::ProcessUdpMessage(const HysteriaUdpMessage& message) {
     if (message.fragment_count == 1) {
         if (message.target.IsValid())
@@ -1417,35 +1453,26 @@ void HysteriaConnection::ProcessUdpMessage(const HysteriaUdpMessage& message) {
         ExpireUdpFragments(now);
         return;
     }
-    std::vector<uint8_t> payload;
-    payload.reserve(pending.bytes);
-    for (size_t id = 0; id < pending.count; ++id) {
-        const auto slot = pending.payload_slots[id];
-        if (slot == 0) continue;
-        const auto& fragment = pending.payloads[slot - 1];
-        payload.insert(payload.end(), fragment.begin(), fragment.end());
-    }
+    const size_t total_bytes = pending.bytes;
     const common::TargetAddress target = std::move(pending.target);
+    DeliverUdpPayload(message.session_id, target, total_bytes,
+        [&pending](common::MultiBuffer& packet) {
+            for (size_t id = 0; id < pending.count; ++id) {
+                const auto slot = pending.payload_slots[id];
+                if (slot == 0) continue;
+                if (!packet.AppendSpan(pending.payloads[slot - 1])) return false;
+            }
+            return true;
+        });
     fragments_.erase(it);
     ExpireUdpFragments(now);
-    DeliverUdpPacket(message.session_id, target, payload);
 }
 
 void HysteriaConnection::DeliverUdpPacket(
     uint32_t session_id, const common::TargetAddress& target,
     std::span<const uint8_t> payload) {
-    if (auto it = core_->udp_sessions.find(session_id);
-        it != core_->udp_sessions.end()) {
-        (void)it->second->Push(target, payload);
-        return;
-    }
-    if (core_->udp_sessions.size() >= kMaxUdpSessions) return;
-    auto session = std::make_unique<UdpSessionStream>(
-        Reactor(), session_id, weak_from_this());
-    if (!session->Push(target, payload)) return;
-    core_->udp_sessions.emplace(session_id, session.get());
-    SpawnOwned(DeliverStream(std::move(session),
-        InboundTransportMetadata{.real_ip = {}, .udp_session_target = target}));
+    DeliverUdpPayload(session_id, target, payload.size(),
+        [payload](common::MultiBuffer& packet) { return packet.AppendSpan(payload); });
 }
 
 bool HysteriaConnection::SendUdpMessage(
@@ -1988,20 +2015,8 @@ UdpSessionStream::~UdpSessionStream() noexcept {
 
 bool UdpSessionStream::Push(
     const common::TargetAddress& target, std::span<const uint8_t> payload) {
-    if (closed_ || cancelled_) return false;
-    // Datagrams cannot share a block. Count rounded capacity before allocating,
-    // without subtracting an externally sized payload from the byte budget.
-    const size_t buffer_count = payload.empty()
-        ? 1 : 1 + (payload.size() - 1) / common::Buffer::kSize;
-    if (buffer_count > kMaxQueuedBytes / common::Buffer::kSize - queued_buffer_count_)
-        return false;
-    common::MultiBuffer packet;
-    if (!packet.AppendSpan(payload) ||
-        !common::SetUdpTarget(packet, target)) return false;
-    input_.push_back(std::move(packet));
-    queued_buffer_count_ += buffer_count;
-    WakeReader();
-    return true;
+    return PushWith(target, payload.size(),
+        [payload](common::MultiBuffer& packet) { return packet.AppendSpan(payload); });
 }
 
 void UdpSessionStream::Detach() noexcept {
