@@ -82,47 +82,6 @@ constexpr size_t kMaxFrameMetadataBytes = 4 + 1 + kMaxEncodedAddressSize + 8;
     return meta.Ok() && meta.Remaining() == 0;
 }
 
-// prefix 必须是帧首至少 min(total_len, size_t{2} + meta_len + 2) 字节。
-[[nodiscard]] std::optional<FrameHeader> DecodeFramePrefix(
-    std::span<const uint8_t> prefix,
-    size_t total_len) {
-    if (prefix.size() < 2) {
-        return std::nullopt;
-    }
-
-    const uint16_t meta_len = LoadU16BE(prefix.data());
-    if (meta_len < 4 || meta_len > kMaxFrameMetadataBytes) {
-        return FrameHeader{};
-    }
-    const size_t metadata_end = 2 + static_cast<size_t>(meta_len);
-    if (prefix.size() < metadata_end) {
-        return std::nullopt;
-    }
-
-    ByteReader meta(prefix.data() + 2, meta_len);
-    FrameHeader out;
-    if (!DecodeFrameMetadata(meta, out)) {
-        return FrameHeader{};
-    }
-
-    size_t frame_size = metadata_end;
-    if ((out.option & kOptionData) != 0) {
-        if (prefix.size() < frame_size + 2) {
-            return std::nullopt;
-        }
-        const uint16_t data_len = LoadU16BE(prefix.data() + frame_size);
-        frame_size += 2 + static_cast<size_t>(data_len);
-        if (total_len < frame_size) {
-            return std::nullopt;
-        }
-        out.has_data = true;
-        out.data_len = data_len;
-        out.data_offset = frame_size - data_len;
-    }
-    out.frame_size = frame_size;
-    return out;
-}
-
 }  // namespace
 
 std::optional<FrameHeader> DecodeFrame(const MultiBuffer& data) {
@@ -134,7 +93,33 @@ std::optional<FrameHeader> DecodeFrame(const MultiBuffer& data) {
     if (meta_len < 4 || meta_len > kMaxFrameMetadataBytes) {
         return FrameHeader{};
     }
-    return DecodeFramePrefix(front, front.size());
+    const size_t metadata_end = 2 + static_cast<size_t>(meta_len);
+    if (front.size() < metadata_end) {
+        return std::nullopt;
+    }
+
+    ByteReader meta(front.data() + 2, meta_len);
+    FrameHeader out;
+    if (!DecodeFrameMetadata(meta, out)) {
+        return FrameHeader{};
+    }
+
+    size_t frame_size = metadata_end;
+    if ((out.option & kOptionData) != 0) {
+        if (front.size() < frame_size + 2) {
+            return std::nullopt;
+        }
+        const uint16_t data_len = LoadU16BE(front.data() + frame_size);
+        frame_size += 2 + static_cast<size_t>(data_len);
+        if (front.size() < frame_size) {
+            return std::nullopt;
+        }
+        out.has_data = true;
+        out.data_len = data_len;
+        out.data_offset = frame_size - data_len;
+    }
+    out.frame_size = frame_size;
+    return out;
 }
 
 // ============================================================================

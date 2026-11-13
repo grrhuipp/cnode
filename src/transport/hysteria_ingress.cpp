@@ -808,6 +808,8 @@ void HysteriaConnection::Flush() {
     // so exhausting blocked candidates still reaches a transport-only write.
     const size_t attempt_limit = packet_limit + core_->streams.size() +
         core_->h3_requests.size() + 3;
+    const auto local = MakeAddress(core_->local);
+    const auto remote = MakeAddress(core_->remote);
     size_t packets = 0;
     for (size_t attempt = 0;
          attempt < attempt_limit && packets < packet_limit; ++attempt) {
@@ -858,8 +860,6 @@ void HysteriaConnection::Flush() {
                 if (vector_count == vectors.size()) break;
             }
         }
-        auto local = MakeAddress(core_->local);
-        auto remote = MakeAddress(core_->remote);
         ngtcp2_path_storage write_path{};
         ngtcp2_path_storage_init(
             &write_path, local.addr, local.addrlen, remote.addr, remote.addrlen,
@@ -2017,7 +2017,12 @@ net::awaitable<size_t> QuicStream::AsyncRead(net::mutable_buffer buffer) {
 }
 
 net::awaitable<size_t> QuicStream::AsyncWrite(net::const_buffer buffer) {
-    co_await WriteBuffers(std::span(&buffer, 1));
+    if (closed_) throw transport::LinkError(common::ErrorCode::CONNECTION_CLOSED);
+    common::MultiBuffer payload;
+    const auto bytes = std::span(
+        static_cast<const uint8_t*>(buffer.data()), buffer.size());
+    if (!payload.AppendSpan(bytes)) throw std::bad_alloc();
+    co_await state_->WriteMultiBuffer(std::move(payload));
     co_return buffer.size();
 }
 
@@ -2037,14 +2042,19 @@ net::awaitable<void> QuicStream::WriteMultiBuffer(common::MultiBuffer payload) {
 
 net::awaitable<void> QuicStream::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
-    if (closed_) throw transport::LinkError(common::ErrorCode::CONNECTION_CLOSED);
+    if (closed_) return WriteMultiBuffer({});
     common::MultiBuffer payload;
     for (const auto& buffer : buffers) {
         const auto bytes = std::span(
             static_cast<const uint8_t*>(buffer.data()), buffer.size());
-        if (!payload.AppendSpan(bytes)) throw std::bad_alloc();
+        if (!payload.AppendSpan(bytes)) {
+            return [](common::MultiBuffer) -> net::awaitable<void> {
+                throw std::bad_alloc();
+                co_return;
+            }(std::move(payload));
+        }
     }
-    co_await WriteMultiBuffer(std::move(payload));
+    return state_->WriteMultiBuffer(std::move(payload));
 }
 
 void QuicStream::ShutdownWrite() {

@@ -504,7 +504,7 @@ private:
     size_t depth_ = 0;
 };
 
-void SerializeString(const std::string& s, std::string& out) {
+void SerializeString(std::string_view s, std::string& out) {
     out.push_back('"');
     for (const unsigned char c : s) {
         switch (c) {
@@ -578,8 +578,11 @@ void SerializeValue(const value& v, std::string& out) {
         }
     });
 }
-
 }  // namespace
+
+void append_json_string(std::string& out, std::string_view s) {
+    SerializeString(s, out);
+}
 
 value parse(std::string_view text, KeyComparison comparison) {
     return Parser(text, comparison).Parse();

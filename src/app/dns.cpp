@@ -47,10 +47,11 @@ struct DNSWorker::Impl {
 
     net::awaitable<DnsResult> ResolveUncached(std::string_view domain);
     net::awaitable<DnsResult> DoResolve(std::string_view domain);
-    net::awaitable<DnsResult> QueryServer(
+    net::awaitable<void> QueryServer(
         DatagramExchange& server,
         std::string_view domain,
-        bool query_aaaa);
+        bool query_aaaa,
+        DnsResult& out);
     // Leaves the ID zero; DatagramExchange writes an unpredictable ID before send.
     static size_t BuildQueryTo(std::span<uint8_t, 280> query,
                                std::string_view domain,
@@ -175,11 +176,10 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
         // serialize their RTTs or hold AAAA behind them. Join all children before
         // returning or moving to another upstream, including cancellation/OOM.
         std::array<DnsResult, kAddressQueryAttempts + 1> answers;
-        auto collect = [&](size_t index) -> net::awaitable<void> {
-            answers[index] = co_await QueryServer(*server, domain, index == kAddressQueryAttempts);
-        };
         co_await common::RunAwaitableTaskGroup(co_await net::this_coro::executor, [&](common::AwaitableTaskGroup& group) {
-            for (size_t i = 0; i < answers.size(); ++i) group.Spawn(collect(i));
+            for (size_t i = 0; i < answers.size(); ++i) {
+                group.Spawn(QueryServer(*server, domain, i == kAddressQueryAttempts, answers[i]));
+            }
         });
         if (stopping || std::ranges::any_of(answers, [](const DnsResult& answer) {
                 return answer.error == common::ErrorCode::CANCELLED;
@@ -250,11 +250,11 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
     co_return last_result;
 }
 
-net::awaitable<DnsResult> DNSWorker::Impl::QueryServer(
+net::awaitable<void> DNSWorker::Impl::QueryServer(
     DatagramExchange& server,
     std::string_view domain,
-    bool query_aaaa) {
-    DnsResult result;
+    bool query_aaaa,
+    DnsResult& out) {
     // BuildQueryTo and Exchange write every byte of [0, query_size).
     std::array<uint8_t, 280> query;
     const size_t query_size = BuildQueryTo(query, domain, query_aaaa);
@@ -262,15 +262,15 @@ net::awaitable<DnsResult> DNSWorker::Impl::QueryServer(
         std::span<uint8_t>(query.data(), query_size),
         std::chrono::seconds(config.timeout_sec));
     if (response.error) {
-        result.error = response.error == io_error::timed_out ? common::ErrorCode::DNS_TIMEOUT :
+        out.error = response.error == io_error::timed_out ? common::ErrorCode::DNS_TIMEOUT :
             response.error == io_error::operation_aborted ? common::ErrorCode::CANCELLED :
             response.error == io_error::no_buffer_space ? common::ErrorCode::RESOURCE_EXHAUSTED :
             common::ErrorCode::DNS_RESOLVE_FAILED;
-        result.error_msg = response.error.message();
-        co_return result;
+        out.error_msg = response.error.message();
+        co_return;
     }
     const uint16_t txid = common::LoadU16BE(query.data());
-    co_return ParseResponse(
+    out = ParseResponse(
         std::span<const uint8_t>(response.bytes.data(), response.size),
         txid,
         query_aaaa);

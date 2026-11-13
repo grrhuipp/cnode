@@ -2,6 +2,7 @@
 
 #include "app/relay.hpp"
 #include "common/multi_buffer.hpp"
+#include "common/session.hpp"
 #include "transport/tcp_stream.hpp"
 #include "transport/timeout_scheduler.hpp"
 #include <asio/co_spawn.hpp>

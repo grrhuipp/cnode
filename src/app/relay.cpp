@@ -1,5 +1,6 @@
 #include "app/relay.hpp"
 #include "app/token_bucket.hpp"
+#include "common/session.hpp"
 
 #include "infra/log.hpp"
 #include "transport/async_delay.hpp"

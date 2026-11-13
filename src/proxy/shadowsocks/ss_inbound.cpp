@@ -6,7 +6,6 @@
 #include "transport/async_stream.hpp"
 #include "common/address_codec.hpp"
 #include "proxy/uot/uot.hpp"
-#include "app/rate_limiter.hpp"
 #include "app/relay.hpp"
 #include "app/stats.hpp"
 #include "routing/dispatcher.hpp"
@@ -21,7 +20,6 @@
 #include <openssl/crypto.h>
 #include <algorithm>
 #include <cstring>
-#include <new>
 #include <optional>
 #include <span>
 #include <utility>
@@ -280,20 +278,12 @@ net::awaitable<tl::expected<ReadTCPSessionResult, common::ErrorCode>> ReadTCPSes
             proxy::ClassifyInboundHandshakeException(std::current_exception(), &stream));
     }
 }
-
-}  // namespace
-
-net::awaitable<tl::expected<ReadTCPSessionResult, common::ErrorCode>> ReadTCPSession(
+net::awaitable<tl::expected<ReadTCPSessionResult, common::ErrorCode>> ReadTCPSessionClassic(
     transport::AsyncStream& stream,
     const SsCipherInfo& cipher_info,
     std::string_view tag,
     size_t& last_matched_index) {
     try {
-    if (Is2022Cipher(cipher_info.type)) {
-        co_return co_await ReadTCPSession2022(
-            stream, cipher_info, tag, last_matched_index);
-    }
-
     const size_t salt_size = cipher_info.salt_size;
     const size_t key_size = cipher_info.key_size;
     if (salt_size > KeyBytes::kMaxSize || key_size > KeyBytes::kMaxSize) {
@@ -381,6 +371,18 @@ net::awaitable<tl::expected<ReadTCPSessionResult, common::ErrorCode>> ReadTCPSes
     }
 }
 
+}  // namespace
+
+net::awaitable<tl::expected<ReadTCPSessionResult, common::ErrorCode>> ReadTCPSession(
+    transport::AsyncStream& stream,
+    const SsCipherInfo& cipher_info,
+    std::string_view tag,
+    size_t& last_matched_index) {
+    if (Is2022Cipher(cipher_info.type)) {
+        return ReadTCPSession2022(stream, cipher_info, tag, last_matched_index);
+    }
+    return ReadTCPSessionClassic(stream, cipher_info, tag, last_matched_index);
+}
 tl::expected<SsStreamWriter, common::ErrorCode> WriteTCPResponse(
     const app::UserStore::ShadowsocksCredential& user,
     const SsCipherInfo& cipher_info,

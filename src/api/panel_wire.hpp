@@ -63,7 +63,7 @@ namespace api {
 }
 
 struct OnlineReportPayload {
-    infra::object alive_body;
+    std::string alive_json;
     size_t user_count = 0;
     size_t device_count = 0;
 };

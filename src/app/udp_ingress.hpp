@@ -33,20 +33,12 @@ namespace common {
 struct TargetAddress;
 
 }  // namespace common
-namespace app {
-
-struct StatsShard;
-
-}  // namespace app
 namespace infra {
 
 struct TimeoutsConfig;
 
 }  // namespace infra
 
-namespace routing {
-class Dispatcher;
-}
 
 namespace app {
 

@@ -259,11 +259,10 @@ private:
     }
 
     net::awaitable<void> SendGrpcHunkMessage(std::span<const uint8_t> data) {
-        (void)co_await ForEachGrpcHunkRecord(data,
-            [this](std::span<const net::const_buffer> record) -> net::awaitable<bool> {
-                co_await SendData(record);
-                co_return true;
-            });
+        GrpcHunkCursor cursor(data);
+        do {
+            co_await SendData(cursor.Next());
+        } while (!cursor.Done());
     }
 
     // Moves the next received DATA payload to the read position and returns

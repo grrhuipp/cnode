@@ -1,4 +1,3 @@
-#include "common/mux_codec.hpp"
 #include "proxy/handshake_errors.hpp"
 #include "proxy/mux/mux_server.hpp"
 #include "app/relay.hpp"
@@ -6,7 +5,6 @@
 #include "proxy/inbound.hpp"
 #include "common/user_online_tracker.hpp"
 #include "transport/async_stream.hpp"
-#include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "routing/dispatcher.hpp"
 #include "proxy/vmess/body.hpp"
@@ -14,7 +12,6 @@
 #include "app/inbound_handler.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
-#include "common/multi_buffer.hpp"
 #include "common/session.hpp"
 #include "common/scoped_cleanse.hpp"
 

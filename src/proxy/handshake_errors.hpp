@@ -22,6 +22,11 @@ namespace proxy {
            stream.ConsumeReadTimeout();
 }
 
+[[nodiscard]] inline bool ConsumeStreamWriteTimeout(
+    transport::AsyncStream& stream) noexcept {
+    return stream.ConsumePhaseDeadline() || stream.ConsumeIdleTimeout() ||
+           stream.ConsumeWriteTimeout();
+}
 [[nodiscard]] inline common::ErrorCode ResolveHandshakeReadFailure(
     transport::AsyncStream& stream,
     common::ErrorCode fallback = common::ErrorCode::SOCKET_READ_FAILED) noexcept {
@@ -44,8 +49,7 @@ namespace proxy {
 [[nodiscard]] inline common::ErrorCode ClassifyHandshakeWriteException(
     transport::AsyncStream& stream,
     const IoSystemError& error) noexcept {
-    if (stream.ConsumePhaseDeadline() || stream.ConsumeIdleTimeout() ||
-        stream.ConsumeWriteTimeout() || error.code() == io_error::timed_out) {
+    if (ConsumeStreamWriteTimeout(stream) || error.code() == io_error::timed_out) {
         return common::ErrorCode::TIMEOUT;
     }
     if (error.code() == io_error::operation_aborted) {

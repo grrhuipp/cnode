@@ -206,8 +206,8 @@ private:
 [[nodiscard]] value parse(
     std::string_view text,
     KeyComparison comparison = KeyComparison::CaseSensitive);
+void append_json_string(std::string& out, std::string_view s);
 [[nodiscard]] std::string serialize(const value& v);
-
 
 // 配置加载器统一在此将值语义的字段错误转换为 invalid_argument。
 template <typename T>

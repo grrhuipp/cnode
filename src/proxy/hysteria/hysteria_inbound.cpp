@@ -6,7 +6,6 @@
 #include "app/inbound_handler.hpp"
 #include "app/stats.hpp"
 #include "common/multi_buffer.hpp"
-#include "common/length_prefixed_packet_buffer.hpp"
 #include "common/session.hpp"
 #include "common/constants.hpp"
 #include "routing/dispatcher.hpp"
@@ -138,8 +137,7 @@ public:
             } catch (const transport::LinkError& error) {
                 co_return RejectInbound(
                     stats_, stream.get(),
-                    (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout() ||
-                     stream->ConsumeWriteTimeout() ? common::ErrorCode::TIMEOUT : error.code()));
+                    (ConsumeStreamWriteTimeout(*stream) ? common::ErrorCode::TIMEOUT : error.code()));
             } catch (const IoSystemError& error) {
                 co_return RejectInbound(
                     stats_, stream.get(),

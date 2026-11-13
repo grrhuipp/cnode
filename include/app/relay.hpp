@@ -2,7 +2,6 @@
 
 #include "common/defaults.hpp"
 #include "common/error.hpp"
-#include "common/session.hpp"
 #include "common/multi_buffer.hpp"
 #include "transport/async_stream.hpp"
 #include "app/stats.hpp"
@@ -10,12 +9,15 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
-#include <cstddef>
 #include <utility>
 
 // ============================================================================
 // Relay 配置
 // ============================================================================
+namespace common {
+struct Context;
+}  // namespace common
+
 namespace app {
 
 struct RelayConfig {

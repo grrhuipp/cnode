@@ -13,7 +13,6 @@ class AsyncStream;
 }  // namespace transport
 namespace app {
 
-class ConnectionLimiter;
 struct StatsShard;
 struct AdmissionEnvironment;
 

@@ -678,10 +678,13 @@ net::awaitable<bool> Http2ServerSession::WriteInitialPreface(uint32_t initial_wi
 net::awaitable<bool> Http2ServerSession::WriteGrpcMessageSerialized(
     uint32_t stream_id,
     std::span<const uint8_t> data) {
-    return ForEachGrpcHunkRecord(data,
-        [this, stream_id](std::span<const net::const_buffer> record) {
-            return WriteDataSerialized(stream_id, record);
-        });
+    GrpcHunkCursor cursor(data);
+    do {
+        if (!co_await WriteDataSerialized(stream_id, cursor.Next())) {
+            co_return false;
+        }
+    } while (!cursor.Done());
+    co_return true;
 }
 
 net::awaitable<bool> Http2ServerSession::WriteDataSerialized(

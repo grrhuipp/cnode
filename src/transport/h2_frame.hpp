@@ -4,7 +4,6 @@
 #include "transport/hpack.hpp"
 #include "common/byte_reader.hpp"
 #include <algorithm>
-#include <array>
 #include <cstring>
 #include <optional>
 #include <span>
@@ -306,19 +305,13 @@ struct H2RequestHeaders {
         return true;
     }
     const auto strip_port = [](std::string_view value) noexcept {
-        if (value.starts_with('[')) {
-            const size_t close = value.find(']');
-            if (close != std::string_view::npos) {
-                return value.substr(0, close + 1);
-            }
+        const auto split = common::SplitHostPort(value);
+        if (!split || !split->has_port) {
             return value;
         }
-        const size_t colon = value.find(':');
-        if (colon != std::string_view::npos &&
-            value.find(':', colon + 1) == std::string_view::npos) {
-            return value.substr(0, colon);
-        }
-        return value;
+        return split->bracketed
+            ? value.substr(0, split->host.size() + 2)
+            : split->host;
     };
     return strip_port(expected_host) == expected_host &&
            common::EqualsAsciiCI(strip_port(authority), expected_host);
@@ -363,19 +356,29 @@ net::awaitable<TransportBuildResult> OpenHttp2ClientStream(
     return payload;
 }
 
-// 两端共用的 Hunk 分片边界；发送窗口和串行门仍归各物理会话所有。
-template <class WriteRecord>
-net::awaitable<bool> ForEachGrpcHunkRecord(
-    std::span<const uint8_t> data, WriteRecord write) {
-    do {
-        const size_t size = std::min(data.size(), kGrpcHunkRecordPayloadLimit);
-        const GrpcHunkPrefix prefix(size);
-        const std::array<net::const_buffer, 2> record{
-            prefix.Buffer(), net::buffer(data.data(), size)};
-        if (!co_await write(record)) co_return false;
-        data = data.subspan(size);
-    } while (!data.empty());
-    co_return true;
-}
+// 两端共用的 Sans-I/O Hunk 分片游标；零额外协程帧，发送窗口与串行门仍归各物理会话所有。
+class GrpcHunkCursor {
+public:
+    explicit GrpcHunkCursor(std::span<const uint8_t> data) noexcept
+        : remaining_(data) {}
+
+    [[nodiscard]] std::span<const net::const_buffer> Next() noexcept {
+        const size_t size = std::min(remaining_.size(), kGrpcHunkRecordPayloadLimit);
+        prefix_.emplace(size);
+        record_[0] = prefix_->Buffer();
+        record_[1] = net::buffer(remaining_.data(), size);
+        remaining_ = remaining_.subspan(size);
+        done_ = remaining_.empty();
+        return record_;
+    }
+
+    [[nodiscard]] bool Done() const noexcept { return done_; }
+
+private:
+    std::span<const uint8_t> remaining_;
+    std::optional<GrpcHunkPrefix> prefix_;
+    std::array<net::const_buffer, 2> record_{};
+    bool done_ = false;
+};
 
 }  // namespace transport

@@ -710,12 +710,12 @@ APIClient::ReportNodeOnlineUsers(const std::vector<OnlineUser>& online_users) {
     const int node_id = config_.NodeID;
     auto report = BuildOnlineReportPayload(online_users, node_id);
 
-    if (!report.alive_body.empty()) {
-        const std::string alive_path = std::format(
+    if (!report.alive_json.empty()) {
+        std::string alive_path = std::format(
             "/api/v1/server/UniProxy/alive?node_id={}&node_type={}",
             node_id, ApiNodeType());
         auto alive_resp = co_await HttpRequest(
-            HttpMethod::Post, alive_path, infra::serialize(infra::value(std::move(report.alive_body))), {});
+            HttpMethod::Post, std::move(alive_path), std::move(report.alive_json), {});
         if (alive_resp.status != 200) {
             LOG_PANEL_WARN(log_context_, "Online device report failed: {}", FormatReportFailure(alive_resp, config_.Key));
             co_return false;
@@ -1132,21 +1132,48 @@ OnlineReportPayload BuildFromCanonicalDevices(
     if (devices.empty()) {
         return result;
     }
-    const std::string suffix = "_" + std::to_string(node_id);
-    result.device_count = devices.size();
+    char node_buf[24];
+    node_buf[0] = '_';
+    const auto [node_end, node_ec] = std::to_chars(
+        node_buf + 1, node_buf + sizeof(node_buf), node_id);
+    (void)node_ec;
+    const std::string_view suffix(
+        node_buf, static_cast<size_t>(node_end - node_buf));
 
+    result.device_count = devices.size();
+    result.alive_json.reserve(2 + devices.size() * (24 + suffix.size()));
+    result.alive_json.push_back('{');
+
+    char uid_buf[24];
+    std::string endpoint;
+    endpoint.reserve(48 + suffix.size());
     for (size_t i = 0; i < devices.size();) {
+        if (result.user_count != 0) {
+            result.alive_json.push_back(',');
+        }
         const int64_t uid = devices[i].UID;
+        result.alive_json.push_back('"');
+        const auto [uid_end, uid_ec] = std::to_chars(
+            uid_buf, uid_buf + sizeof(uid_buf), uid);
+        (void)uid_ec;
+        result.alive_json.append(uid_buf, uid_end);
+        result.alive_json.append("\":[");
+
         size_t j = i;
-        infra::array alive_devices;
         while (j < devices.size() && devices[j].UID == uid) {
-            alive_devices.push_back(devices[j].IP + suffix);
+            if (j != i) {
+                result.alive_json.push_back(',');
+            }
+            endpoint.assign(devices[j].IP);
+            endpoint.append(suffix);
+            infra::append_json_string(result.alive_json, endpoint);
             ++j;
         }
-        result.alive_body[std::to_string(uid)] = std::move(alive_devices);
+        result.alive_json.push_back(']');
         ++result.user_count;
         i = j;
     }
+    result.alive_json.push_back('}');
     return result;
 }
 
