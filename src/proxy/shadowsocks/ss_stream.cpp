@@ -36,7 +36,10 @@ net::awaitable<void> SsStreamWriter::AsyncShutdownWrite() {
             if (!ok) {
                 ThrowSsWriteError("Shadowsocks server init write cipher failed");
             }
-            co_await FlushPendingAndWrite(*stream_, {});
+            if (pending_prefix_.byte_size() != 0) {
+                shutdown_started = true;
+                co_await stream_->WriteMultiBuffer(std::move(pending_prefix_));
+            }
         }
         shutdown_started = true;
         co_await stream_->AsyncShutdownWrite();
@@ -121,33 +124,19 @@ net::awaitable<void> SsStreamWriter::WriteEncrypted(
         }
         owned.clear();
 
-        write_started = true;
-        co_await FlushPendingAndWrite(stream, std::move(out_mb));
+        if (pending_prefix_.byte_size() != 0) {
+            out_mb.MoveTo(pending_prefix_);
+            out_mb = std::move(pending_prefix_);
+        }
+        if (out_mb.byte_size() != 0) {
+            write_started = true;
+            co_await stream.WriteMultiBuffer(std::move(out_mb));
+        }
     } catch (const transport::WriteClosed&) {
         Finish();
         throw;
     } catch (const std::bad_alloc&) {
         if (write_nonce_ != initial_nonce || write_started) Retire();
-        throw;
-    } catch (...) {
-        Retire();
-        throw;
-    }
-}
-
-net::awaitable<void> SsStreamWriter::FlushPendingAndWrite(
-    transport::AsyncStream& stream,
-    common::MultiBuffer out_mb) {
-    if (out_mb.byte_size() == 0 && pending_prefix_.byte_size() == 0) {
-        co_return;
-    }
-    if (pending_prefix_.byte_size() != 0) {
-        out_mb.MoveTo(pending_prefix_);
-        out_mb = std::move(pending_prefix_);
-    }
-    try {
-        co_await stream.WriteMultiBuffer(std::move(out_mb));
-    } catch (const transport::WriteClosed&) {
         throw;
     } catch (...) {
         Retire();

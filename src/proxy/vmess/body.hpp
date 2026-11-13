@@ -238,7 +238,6 @@ private:
     enum class State { Active, Finished, Failed };
 
 
-    net::awaitable<common::MultiBuffer> ReadChunk(transport::MultiBufferReader& src);
     [[noreturn]] void Fail(const char* what);
     void FinishRecord() noexcept;
 

@@ -419,19 +419,133 @@ net::awaitable<common::MultiBuffer> BodyDecoder::Read(transport::MultiBufferRead
     // A later chunk in a stream batch can suspend after earlier chunks decoded.
     // Keep that output owned by the decoder until this invocation returns it.
     try {
-        if (cipher_.PacketMode()) {
-            co_return co_await ReadChunk(src);
-        }
-        while (pending_output_chunks_ < kStreamReadBatchChunks) {
-            if (pending_output_.byte_size() != 0 && !header_decoded_ && header_read_ == 0 &&
+        const bool packet_mode = cipher_.PacketMode();
+        const size_t overhead = cipher_.Overhead();
+        while (packet_mode || pending_output_chunks_ < kStreamReadBatchChunks) {
+            if (!packet_mode && pending_output_.byte_size() != 0 &&
+                !header_decoded_ && header_read_ == 0 &&
                 pending_read_.byte_size() == 0) {
                 break;
             }
-            common::MultiBuffer chunk = co_await ReadChunk(src);
-            if (chunk.byte_size() == 0) {
+            if (state_ == State::Failed) {
+                Fail("VMess body reader is failed");
+            }
+            if (state_ == State::Finished) {
+                if (packet_mode) {
+                    co_return common::MultiBuffer{};
+                }
                 break;
             }
-            chunk.MoveTo(pending_output_);
+
+            if (!header_decoded_) {
+                const size_t length_size = cipher_.LengthSize();
+                const auto header_span = std::span<uint8_t>(header_.data(), length_size);
+                if (!proxy::BufferedStreamReader::ReadBufferedFrom(
+                        pending_read_, header_span.data(), header_span.size(), header_read_) &&
+                    !co_await proxy::BufferedStreamReader::ReadExactFrom(
+                        src, pending_read_, header_span.data(), header_span.size(), &header_read_)) {
+                    if (header_read_ != 0) {
+                        Fail("VMess body length truncated");
+                    }
+                    state_ = State::Finished;
+                    FinishRecord();
+                    if (packet_mode) {
+                        co_return common::MultiBuffer{};
+                    }
+                    break;
+                }
+                padding_len_ = cipher_.NextPaddingSize();
+                const auto chunk_len = cipher_.DecodeLength(header_.data());
+                if (!chunk_len) {
+                    Fail("VMess body length authentication failed");
+                }
+                if (*chunk_len < overhead + padding_len_ ||
+                    *chunk_len > MAX_CHUNK_SIZE + overhead + kMaxPaddingSize) {
+                    LOG_NET_DEBUG("invalid chunk length {} overhead={} padding={}",
+                                  *chunk_len, overhead, padding_len_);
+                    Fail("VMess body chunk length invalid");
+                }
+                chunk_len_ = *chunk_len;
+                header_decoded_ = true;
+            }
+
+            const size_t chunk_len = chunk_len_;
+            if (chunk_len == overhead + padding_len_) {
+                // The EOF chunk is at most a tag plus 63 padding bytes; the decoded
+                // length no longer needs the inline header storage.
+                const auto eof_span = std::span<uint8_t>(header_.data(), chunk_len);
+                if (!proxy::BufferedStreamReader::ReadBufferedFrom(
+                        pending_read_, eof_span.data(), eof_span.size(), body_read_) &&
+                    !co_await proxy::BufferedStreamReader::ReadExactFrom(
+                        src, pending_read_, eof_span.data(), eof_span.size(), &body_read_)) {
+                    Fail("VMess body EOF chunk truncated");
+                }
+                if (overhead > 0 &&
+                    cipher_.Payload().Decrypt(header_.data(), overhead, header_.data()) != 0) {
+                    Fail("VMess body EOF authentication failed");
+                }
+                state_ = State::Finished;
+                FinishRecord();
+                if (packet_mode) {
+                    co_return common::MultiBuffer{};
+                }
+                break;
+            }
+
+            const size_t data_len = chunk_len - padding_len_;
+            if (body_read_ == 0 && read_buffer_.Empty()) {
+                if (auto sealed = pending_read_.TakeFrontIfLen(chunk_len)) {
+                    const ssize_t opened = cipher_.Payload().Decrypt(
+                        sealed->Bytes().data(), data_len, sealed->Bytes().data());
+                    if (opened < 0) {
+                        Fail("VMess body authentication failed");
+                    }
+                    sealed->end = sealed->start + static_cast<uint32_t>(opened);
+                    FinishRecord();
+                    if (packet_mode) {
+                        co_return common::MultiBuffer{std::move(sealed)};
+                    }
+                    if (sealed->IsEmpty()) {
+                        break;
+                    }
+                    pending_output_.push_back(std::move(sealed));
+                    ++pending_output_chunks_;
+                    continue;
+                }
+                (void)read_buffer_.Prepare(chunk_len);
+            }
+
+            uint8_t* sealed = read_buffer_.Data();
+            const auto body_span = std::span<uint8_t>(sealed, chunk_len);
+            if (!proxy::BufferedStreamReader::ReadBufferedFrom(
+                    pending_read_, body_span.data(), body_span.size(), body_read_) &&
+                !co_await proxy::BufferedStreamReader::ReadExactFrom(
+                    src, pending_read_, body_span.data(), body_span.size(), &body_read_)) {
+                Fail("VMess body chunk truncated");
+            }
+            const ssize_t opened = cipher_.Payload().Decrypt(sealed, data_len, sealed);
+            if (opened < 0) {
+                Fail("VMess body authentication failed");
+            }
+            if (packet_mode) {
+                common::MultiBuffer out;
+                const bool appended = read_buffer_.TryAppendTo(static_cast<size_t>(opened), out);
+                FinishRecord();
+                if (!appended) {
+                    throw std::bad_alloc();
+                }
+                co_return out;
+            }
+            if (opened == 0) {
+                FinishRecord();
+                break;
+            }
+            const bool appended =
+                read_buffer_.TryAppendTo(static_cast<size_t>(opened), pending_output_);
+            FinishRecord();
+            if (!appended) {
+                throw std::bad_alloc();
+            }
             ++pending_output_chunks_;
         }
         pending_output_chunks_ = 0;
@@ -445,97 +559,6 @@ net::awaitable<common::MultiBuffer> BodyDecoder::Read(transport::MultiBufferRead
         Abort();
         throw;
     }
-}
-
-net::awaitable<common::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferReader& src) {
-    if (state_ == State::Failed) {
-        Fail("VMess body reader is failed");
-    }
-    if (state_ == State::Finished) {
-        co_return common::MultiBuffer{};
-    }
-
-    const size_t overhead = cipher_.Overhead();
-    if (!header_decoded_) {
-        const size_t length_size = cipher_.LengthSize();
-        const auto header_span = std::span<uint8_t>(header_.data(), length_size);
-        if (!proxy::BufferedStreamReader::ReadBufferedFrom(pending_read_, header_span.data(), header_span.size(), header_read_) &&
-            !co_await proxy::BufferedStreamReader::ReadExactFrom(
-                src, pending_read_, header_span.data(), header_span.size(), &header_read_)) {
-            if (header_read_ != 0) {
-                Fail("VMess body length truncated");
-            }
-            state_ = State::Finished;
-            FinishRecord();
-            co_return common::MultiBuffer{};
-        }
-        padding_len_ = cipher_.NextPaddingSize();
-        const auto chunk_len = cipher_.DecodeLength(header_.data());
-        if (!chunk_len) {
-            Fail("VMess body length authentication failed");
-        }
-        if (*chunk_len < overhead + padding_len_ ||
-            *chunk_len > MAX_CHUNK_SIZE + overhead + kMaxPaddingSize) {
-            LOG_NET_DEBUG("invalid chunk length {} overhead={} padding={}",
-                          *chunk_len, overhead, padding_len_);
-            Fail("VMess body chunk length invalid");
-        }
-        chunk_len_ = *chunk_len;
-        header_decoded_ = true;
-    }
-
-    const size_t chunk_len = chunk_len_;
-    if (chunk_len == overhead + padding_len_) {
-        // The EOF chunk is at most a tag plus 63 padding bytes; the decoded
-        // length no longer needs the inline header storage.
-        const auto eof_span = std::span<uint8_t>(header_.data(), chunk_len);
-        if (!proxy::BufferedStreamReader::ReadBufferedFrom(pending_read_, eof_span.data(), eof_span.size(), body_read_) &&
-            !co_await proxy::BufferedStreamReader::ReadExactFrom(
-                src, pending_read_, eof_span.data(), eof_span.size(), &body_read_)) {
-            Fail("VMess body EOF chunk truncated");
-        }
-        if (overhead > 0 &&
-            cipher_.Payload().Decrypt(header_.data(), overhead, header_.data()) != 0) {
-            Fail("VMess body EOF authentication failed");
-        }
-        state_ = State::Finished;
-        FinishRecord();
-        co_return common::MultiBuffer{};
-    }
-
-    const size_t data_len = chunk_len - padding_len_;
-    if (body_read_ == 0 && read_buffer_.Empty()) {
-        if (auto sealed = pending_read_.TakeFrontIfLen(chunk_len)) {
-            const ssize_t opened = cipher_.Payload().Decrypt(
-                sealed->Bytes().data(), data_len, sealed->Bytes().data());
-            if (opened < 0) {
-                Fail("VMess body authentication failed");
-            }
-            sealed->end = sealed->start + static_cast<uint32_t>(opened);
-            FinishRecord();
-            co_return common::MultiBuffer{std::move(sealed)};
-        }
-        (void)read_buffer_.Prepare(chunk_len);
-    }
-
-    uint8_t* sealed = read_buffer_.Data();
-    const auto body_span = std::span<uint8_t>(sealed, chunk_len);
-    if (!proxy::BufferedStreamReader::ReadBufferedFrom(pending_read_, body_span.data(), body_span.size(), body_read_) &&
-        !co_await proxy::BufferedStreamReader::ReadExactFrom(
-            src, pending_read_, body_span.data(), body_span.size(), &body_read_)) {
-        Fail("VMess body chunk truncated");
-    }
-    const ssize_t opened = cipher_.Payload().Decrypt(sealed, data_len, sealed);
-    if (opened < 0) {
-        Fail("VMess body authentication failed");
-    }
-    common::MultiBuffer out;
-    const bool appended = read_buffer_.TryAppendTo(static_cast<size_t>(opened), out);
-    FinishRecord();
-    if (!appended) {
-        throw std::bad_alloc();
-    }
-    co_return out;
 }
 
 void BodyDecoder::Abort() noexcept {

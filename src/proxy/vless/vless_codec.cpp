@@ -751,6 +751,8 @@ net::awaitable<common::MultiBuffer> VisionReader::ReadFramedMultiBuffer() {
             common::MultiBuffer raw = co_await src_.ReadMultiBuffer();
             if (raw.byte_size() == 0) {
                 co_await common::ThrowIfCancelledOnEof();
+            } else if (traffic_.packets_to_filter > 0) {
+                traffic_.FilterTLS(raw.FrontSpan());
             }
             co_return raw;
         }

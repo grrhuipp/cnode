@@ -368,9 +368,6 @@ constexpr size_t kVlessEncryptionCtrKeySize = 32;
 
 using CtrKey = std::array<uint8_t, kVlessEncryptionCtrKeySize>;
 
-[[nodiscard]] bool FitsEvpInt(size_t value) noexcept {
-    return value <= static_cast<size_t>(std::numeric_limits<int>::max());
-}
 
 [[nodiscard]] CtrKey DeriveCtrKey(std::span<const uint8_t> key) noexcept {
     CtrKey out{};
@@ -384,63 +381,34 @@ using CtrKey = std::array<uint8_t, kVlessEncryptionCtrKeySize>;
     return out;
 }
 
-[[nodiscard]] bool InitCtr(EVP_CIPHER_CTX* ctx,
-                           std::span<const uint8_t> key,
-                           std::span<const uint8_t, kVlessEncryptionCtrIvSize> iv) noexcept {
-    auto derived = DeriveCtrKey(key);
-    const bool ok = EVP_EncryptInit_ex(
-                        ctx,
-                        EVP_aes_256_ctr(),
-                        nullptr,
-                        derived.data(),
-                        iv.data()) == 1;
-    OPENSSL_cleanse(derived.data(), derived.size());
-    if (!ok) {
-        ERR_clear_error();
-    }
-    return ok;
-}
-
-[[nodiscard]] bool CtrXorInPlace(EVP_CIPHER_CTX* ctx,
-                                 std::span<uint8_t> data) noexcept {
-    if (!FitsEvpInt(data.size())) {
-        return false;
-    }
-    if (data.empty()) {
-        return true;
-    }
-    int out_len = 0;
-    if (EVP_EncryptUpdate(
-            ctx,
-            data.data(),
-            &out_len,
-            data.data(),
-            static_cast<int>(data.size())) != 1 ||
-        out_len != static_cast<int>(data.size())) {
-        ERR_clear_error();
-        return false;
-    }
-    return true;
-}
-
 }  // namespace
 
 std::optional<VlessEncryptionCtr> VlessEncryptionCtr::Create(
     std::span<const uint8_t> key,
     std::span<const uint8_t, kVlessEncryptionCtrIvSize> iv) noexcept {
-    bssl::UniquePtr<EVP_CIPHER_CTX> ctx(EVP_CIPHER_CTX_new());
-    if (!ctx) {
-        ERR_clear_error();
+    VlessEncryptionCtr ctr;
+    auto derived = DeriveCtrKey(key);
+    const int rc = AES_set_encrypt_key(derived.data(), 256, &ctr.key_);
+    OPENSSL_cleanse(derived.data(), derived.size());
+    if (rc != 0) {
         return std::nullopt;
     }
-    if (!InitCtr(ctx.get(), key, iv)) {
-        return std::nullopt;
-    }
-    return VlessEncryptionCtr(std::move(ctx));
+    std::copy(iv.begin(), iv.end(), ctr.ivec_.begin());
+    return ctr;
 }
 
 bool VlessEncryptionCtr::XorInPlace(std::span<uint8_t> data) noexcept {
-    return CtrXorInPlace(ctx_.get(), data);
+    if (!data.empty()) {
+        AES_ctr128_encrypt(
+            data.data(),
+            data.data(),
+            data.size(),
+            &key_,
+            ivec_.data(),
+            ecount_.data(),
+            &num_);
+    }
+    return true;
 }
 
 bool XorVlessEncryptionInPlace(
@@ -450,18 +418,8 @@ bool XorVlessEncryptionInPlace(
     if (data.empty()) {
         return true;
     }
-    thread_local bssl::UniquePtr<EVP_CIPHER_CTX> tls_ctx;
-    if (!tls_ctx) {
-        tls_ctx.reset(EVP_CIPHER_CTX_new());
-        if (!tls_ctx) {
-            ERR_clear_error();
-            return false;
-        }
-    }
-    const bool ok = InitCtr(tls_ctx.get(), key, iv) &&
-                    CtrXorInPlace(tls_ctx.get(), data);
-    EVP_CIPHER_CTX_reset(tls_ctx.get());
-    return ok;
+    auto ctr = VlessEncryptionCtr::Create(key, iv);
+    return ctr && ctr->XorInPlace(data);
 }
 
 std::optional<VlessEncryptionHeaderXor> VlessEncryptionHeaderXor::Create(

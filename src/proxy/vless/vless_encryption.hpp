@@ -12,7 +12,7 @@
 
 #include <openssl/aead.h>
 #include <openssl/base.h>
-#include <openssl/cipher.h>
+#include <openssl/aes.h>
 #include <openssl/evp.h>
 #include <openssl/mem.h>
 #include <openssl/mlkem.h>
@@ -237,6 +237,32 @@ inline constexpr size_t kVlessEncryptionCtrIvSize = 16;
 
 class VlessEncryptionCtr {
 public:
+    VlessEncryptionCtr() noexcept = default;
+    ~VlessEncryptionCtr() noexcept { Cleanse(); }
+
+    VlessEncryptionCtr(const VlessEncryptionCtr&) = delete;
+    VlessEncryptionCtr& operator=(const VlessEncryptionCtr&) = delete;
+
+    VlessEncryptionCtr(VlessEncryptionCtr&& other) noexcept
+        : key_(other.key_)
+        , ivec_(other.ivec_)
+        , ecount_(other.ecount_)
+        , num_(other.num_) {
+        other.Cleanse();
+    }
+
+    VlessEncryptionCtr& operator=(VlessEncryptionCtr&& other) noexcept {
+        if (this != &other) {
+            Cleanse();
+            key_ = other.key_;
+            ivec_ = other.ivec_;
+            ecount_ = other.ecount_;
+            num_ = other.num_;
+            other.Cleanse();
+        }
+        return *this;
+    }
+
     [[nodiscard]] static std::optional<VlessEncryptionCtr> Create(
         std::span<const uint8_t> key,
         std::span<const uint8_t, kVlessEncryptionCtrIvSize> iv) noexcept;
@@ -244,10 +270,17 @@ public:
     [[nodiscard]] bool XorInPlace(std::span<uint8_t> data) noexcept;
 
 private:
-    explicit VlessEncryptionCtr(bssl::UniquePtr<EVP_CIPHER_CTX> ctx) noexcept
-        : ctx_(std::move(ctx)) {}
+    void Cleanse() noexcept {
+        OPENSSL_cleanse(&key_, sizeof(key_));
+        OPENSSL_cleanse(ivec_.data(), ivec_.size());
+        OPENSSL_cleanse(ecount_.data(), ecount_.size());
+        num_ = 0;
+    }
 
-    bssl::UniquePtr<EVP_CIPHER_CTX> ctx_;
+    AES_KEY key_{};
+    std::array<uint8_t, kVlessEncryptionCtrIvSize> ivec_{};
+    std::array<uint8_t, kVlessEncryptionCtrIvSize> ecount_{};
+    unsigned int num_ = 0;
 };
 
 [[nodiscard]] bool XorVlessEncryptionInPlace(
@@ -467,7 +500,8 @@ public:
 
 private:
     net::awaitable<common::MultiBuffer> ReadRawBytes();
-    net::awaitable<bool> ReadRecordHeader();
+    net::awaitable<common::MultiBuffer> ReadEncryptedMultiBuffer();
+    void DecodeLoadedRecordHeader();
     size_t OpenRecord(VlessEncryptionAead& aead, std::span<uint8_t> encrypted);
 
     [[nodiscard]] VlessEncryptionAead& KeyDeferredRead(
@@ -513,7 +547,7 @@ private:
     enum class State : uint8_t { Active, Finished, Failed };
 
     void CheckWritable() const;
-    net::awaitable<void> WriteRecord(std::span<const uint8_t> plain, std::span<uint8_t> frame);
+    net::const_buffer SealRecordForWrite(std::span<const uint8_t> plain, std::span<uint8_t> frame);
     // By value: the range must stay in this frame until the write completes.
     template <typename BufferRange>
     net::awaitable<void> WriteEncrypted(BufferRange source);

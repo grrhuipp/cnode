@@ -720,7 +720,7 @@ public:
             mb.clear();
             CheckWritable();
         }
-        return AsyncStream::WriteMultiBuffer(std::move(mb));
+        return SendPacket({}, std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
@@ -744,8 +744,20 @@ private:
         }
     }
 
-    net::awaitable<void> SendPacket(std::span<const net::const_buffer> payloads) {
-        if (!HasNonEmptyBuffer(payloads)) {
+    net::awaitable<void> SendPacket(
+        std::span<const net::const_buffer> payloads,
+        common::MultiBuffer owned = {}) {
+        struct ClearOwned {
+            common::MultiBuffer& mb;
+            ~ClearOwned() noexcept { mb.clear(); }
+        } clear_owned{owned};
+        net::const_buffer single_owned;
+        if (!owned.empty()) {
+            const auto bytes = owned.FrontSpan();
+            if (bytes.empty()) co_return;
+            single_owned = net::buffer(bytes.data(), bytes.size());
+            payloads = {&single_owned, 1};
+        } else if (!HasNonEmptyBuffer(payloads)) {
             co_return;
         }
         auto lease = upload_gate_.TryAcquire();

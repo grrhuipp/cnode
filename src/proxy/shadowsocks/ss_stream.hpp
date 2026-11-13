@@ -111,7 +111,6 @@ private:
         std::span<const net::const_buffer> buffers,
         common::MultiBuffer owned = {});
 
-    net::awaitable<void> FlushPendingAndWrite(transport::AsyncStream& stream, common::MultiBuffer out_mb);
 
     bool InitResponseCipher();
 

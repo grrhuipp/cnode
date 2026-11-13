@@ -116,37 +116,16 @@ net::awaitable<common::MultiBuffer> VlessEncryptionReader::ReadRawBytes() {
     co_return out;
 }
 
-net::awaitable<bool> VlessEncryptionReader::ReadRecordHeader() {
+void VlessEncryptionReader::DecodeLoadedRecordHeader() {
     auto& header = read_header_;
-        const bool have_header =
-            src_.ReadBuffered(header.data(), header.size(), header_read_) ||
-            co_await src_.ReadExact(
-                header.data(), header.size(), &header_read_);
-        if (!have_header) {
-            if (header_read_ != 0) {
-                ThrowVlessEncryptionIoError("VLESS Encryption record header truncated");
-            }
-            const auto cancellation =
-                co_await net::this_coro::cancellation_state;
-            if (cancellation.cancelled() !=
-                net::cancellation_type::none) {
-                throw IoSystemError(
-                    io_error::operation_aborted,
-                    "VLESS Encryption read cancelled");
-            }
-            RejectDeferredTicket();
-            read_record_.Reset();
-            co_return false;
-        }
-        if (header_xor_ && !header_xor_->XorInboundInPlace(header)) {
-            ThrowVlessEncryptionIoError("VLESS Encryption header xor failed");
-        }
-        const auto encrypted_len = DecodeVlessEncryptionRecordHeader(header);
-        if (!encrypted_len) {
-            ThrowVlessEncryptionIoError("VLESS Encryption record header invalid");
-        }
-        encrypted_size_ = *encrypted_len;
-    co_return true;
+    if (header_xor_ && !header_xor_->XorInboundInPlace(header)) {
+        ThrowVlessEncryptionIoError("VLESS Encryption header xor failed");
+    }
+    const auto encrypted_len = DecodeVlessEncryptionRecordHeader(header);
+    if (!encrypted_len) {
+        ThrowVlessEncryptionIoError("VLESS Encryption record header invalid");
+    }
+    encrypted_size_ = *encrypted_len;
 }
 
 size_t VlessEncryptionReader::OpenRecord(VlessEncryptionAead& aead, std::span<uint8_t> encrypted_span) {
@@ -176,7 +155,13 @@ size_t VlessEncryptionReader::OpenRecord(VlessEncryptionAead& aead, std::span<ui
 }
 
 net::awaitable<common::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
-    if (raw_read_) co_return co_await ReadRawBytes();
+    if (raw_read_) {
+        return ReadRawBytes();
+    }
+    return ReadEncryptedMultiBuffer();
+}
+
+net::awaitable<common::MultiBuffer> VlessEncryptionReader::ReadEncryptedMultiBuffer() {
     try {
         auto* aead = std::get_if<VlessEncryptionAead>(&keys_);
         if (!aead) {
@@ -188,10 +173,26 @@ net::awaitable<common::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
         }
 
         for (;;) {
-
-            if (encrypted_size_ == 0 && !co_await ReadRecordHeader())
-                co_return common::MultiBuffer{};
-
+            if (encrypted_size_ == 0) {
+                auto& header = read_header_;
+                if (!src_.ReadBuffered(header.data(), header.size(), header_read_) &&
+                    !co_await src_.ReadExact(header.data(), header.size(), &header_read_)) {
+                    if (header_read_ != 0) {
+                        ThrowVlessEncryptionIoError("VLESS Encryption record header truncated");
+                    }
+                    const auto cancellation =
+                        co_await net::this_coro::cancellation_state;
+                    if (cancellation.cancelled() != net::cancellation_type::none) {
+                        throw IoSystemError(
+                            io_error::operation_aborted,
+                            "VLESS Encryption read cancelled");
+                    }
+                    RejectDeferredTicket();
+                    read_record_.Reset();
+                    co_return common::MultiBuffer{};
+                }
+                DecodeLoadedRecordHeader();
+            }
             // `encrypted_size_` is bounded by kVlessEncryptionMaxRecordCiphertextSize.
             if (bytes_read_ == 0 && read_record_.Empty()) {
                 (void)read_record_.Prepare(encrypted_size_);
@@ -260,7 +261,7 @@ void VlessEncryptionWriter::CheckWritable() const {
     }
 }
 
-net::awaitable<void> VlessEncryptionWriter::WriteRecord(
+net::const_buffer VlessEncryptionWriter::SealRecordForWrite(
     std::span<const uint8_t> plain, std::span<uint8_t> frame) {
     const auto written = SealVlessEncryptionRecord(
         aead_,
@@ -278,9 +279,7 @@ net::awaitable<void> VlessEncryptionWriter::WriteRecord(
         !header_xor_->XorOutboundInPlace(frame_view)) {
         ThrowVlessEncryptionIoError("VLESS Encryption write xor failed");
     }
-    net::const_buffer buffer{frame_view.data(), frame_view.size()};
-    co_await dst_.WriteBuffers(
-        std::span<const net::const_buffer>{&buffer, 1});
+    return net::const_buffer{frame_view.data(), frame_view.size()};
 }
 
 template <typename BufferRange>
@@ -374,7 +373,9 @@ net::awaitable<void> VlessEncryptionWriter::WriteEncrypted(BufferRange source) {
             // Seal advances the nonce even if record encryption subsequently fails.
             // Keep this set across every record in the public write request.
             record_started = true;
-            co_await WriteRecord(plain, frame);
+            const net::const_buffer record_buf = SealRecordForWrite(plain, frame);
+            co_await dst_.WriteBuffers(
+                std::span<const net::const_buffer>{&record_buf, 1});
         }
     } catch (const transport::WriteClosed&) {
         state_ = State::Finished;
