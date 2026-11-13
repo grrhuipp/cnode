@@ -491,10 +491,19 @@ Http2ServerSession::Http2ServerSession(
         throw std::invalid_argument("HTTP/2 requires a physical transport with deferred write cancellation");
     }
     if (payload_codec_ == H2PayloadCodec::RawData) {
-        if (!http_config_) {
-            throw std::invalid_argument("HTTP/2 raw session requires an HTTP config");
+        if (xhttp_config_) {
+            const std::string_view default_ct =
+                (!xhttp_config_->no_sse_header &&
+                 !FindHttpHeader(xhttp_config_->headers, "Content-Type"))
+                    ? std::string_view("text/event-stream")
+                    : std::string_view{};
+            response_header_block_ =
+                EncodeHttpResponseHeaders(xhttp_config_->headers, default_ct);
+        } else if (http_config_) {
+            response_header_block_ = EncodeHttpResponseHeaders(http_config_->headers);
+        } else {
+            throw std::invalid_argument("HTTP/2 raw session requires an HTTP or XHTTP config");
         }
-        response_header_block_ = EncodeHttpResponseHeaders(http_config_->headers);
     }
     Resubscribe(stream_->Cancellation());
 }
@@ -1093,7 +1102,7 @@ net::awaitable<bool> Http2ServerSession::RouteXHttpRequest(
     H2RequestHeaders request,
     std::shared_ptr<Http2ServerSubStreamState> sub) {
     if (const std::string_view expected_host =
-            ResolveConfiguredHttpHost(http_config_->host, &http_config_->headers);
+            ResolveConfiguredHttpHost(xhttp_config_->host, &xhttp_config_->headers);
         !expected_host.empty() &&
         !AuthorityMatchesHost(request.authority, expected_host)) {
         LOG_CONN_DEBUG(conn_id_,
@@ -1104,7 +1113,7 @@ net::awaitable<bool> Http2ServerSession::RouteXHttpRequest(
     }
 
     const auto meta = ParseXHttpRequestMeta(
-        http_config_->path,
+        xhttp_config_->normalized_path,
         request.path,
         request.method);
     if (!XHttpKindAllowed(meta.kind, *xhttp_config_))
@@ -1343,19 +1352,21 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
 net::awaitable<TransportBuildResult> RunHttp2ServerSession(
     app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
-    const HttpConfig& cfg,
+    const HttpConfig* cfg,
     const XHttpConfig* xhttp_cfg,
     net::io_context& io_context,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
     uint64_t conn_id) {
+    const uint32_t initial_window = (cfg && cfg->initial_window_size)
+        ? *cfg->initial_window_size : kDefaultInitialWindow;
     return StartHttp2ServerSession(coordinator,
         std::move(stream),
-        cfg.initial_window_size.value_or(kDefaultInitialWindow),
+        initial_window,
         H2PayloadCodec::RawData,
         io_context,
         std::move(stream_handler),
         conn_id,
-        &cfg,
+        cfg,
         xhttp_cfg,
         nullptr);
 }

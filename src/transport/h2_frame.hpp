@@ -321,7 +321,8 @@ net::awaitable<void> SendWindowUpdates(AsyncStream&, uint32_t, uint32_t, uint32_
 struct HttpClientRequestView;
 std::vector<uint8_t> EncodeHttpRequestHeaders(
     std::string_view, bool, const HttpClientRequestView&);
-std::vector<uint8_t> EncodeHttpResponseHeaders(const HttpHeaders&);
+std::vector<uint8_t> EncodeHttpResponseHeaders(
+    const HttpHeaders& headers, std::string_view default_content_type = {});
 net::awaitable<tl::expected<std::optional<H2RequestHeaders>, H2Error>> ParseH2RequestHeaders(
     AsyncStream&, HpackDecoder&, H2Frame, std::string_view, bool);
 net::awaitable<TransportBuildResult> StartHttp2ServerSession(

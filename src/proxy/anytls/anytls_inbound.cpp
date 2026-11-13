@@ -222,8 +222,14 @@ public:
     net::awaitable<app::RelayResult> Run();
 
     net::awaitable<tl::expected<void, common::ErrorCode>>
-    WriteFrameSerialized(uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload) {
-        const auto sub = sid != 0 ? FindStream(sid) : nullptr;
+    WriteFrameSerialized(uint8_t cmd, uint32_t sid, std::span<const uint8_t> payload,
+                         AnyTLSSubStream* known_sub = nullptr) {
+        std::shared_ptr<AnyTLSSubStream> pinned_sub;
+        AnyTLSSubStream* sub = known_sub;
+        if (!sub && sid != 0) {
+            pinned_sub = FindStream(sid);
+            sub = pinned_sub.get();
+        }
         struct WriteCancelSubscription final : transport::CancellationSubscription {
             transport::AsyncWriteGate& gate;
             transport::AsyncStream* stream = nullptr;
@@ -480,7 +486,7 @@ net::awaitable<void> AnyTLSSubStream::AsyncShutdownWrite() {
     queued_input_.clear();
     WakeInputReader();
     WakeInputWriter();
-    if (auto result = co_await session_.WriteFrameSerialized(kCmdFIN, sid_, {}); !result)
+    if (auto result = co_await session_.WriteFrameSerialized(kCmdFIN, sid_, {}, this); !result)
         throw transport::LinkError(result.error());
 }
 
@@ -518,7 +524,7 @@ net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessStream(
         if (session_version_ == SessionVersion::V2) {
             constexpr std::string_view message = "connection rejected";
             (void)co_await WriteFrameSerialized(kCmdSYNACK, sub.Sid(),
-                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(message.data()), message.size()));
+                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(message.data()), message.size()), &sub);
         }
         co_return common::ErrorCode::BLOCKED;
     }
@@ -542,7 +548,7 @@ net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessStream(
                 uot_version ? common::TargetAddress{} : std::move(parsed->target),
                 std::move(parsed->forwarded)});
         if (session_version_ == SessionVersion::V2) {
-            if (auto ok = co_await WriteFrameSerialized(kCmdSYNACK, sub.Sid(), {}); !ok)
+            if (auto ok = co_await WriteFrameSerialized(kCmdSYNACK, sub.Sid(), {}, &sub); !ok)
                 co_return ok.error();
         }
         co_return common::ErrorCode::OK;

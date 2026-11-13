@@ -397,11 +397,13 @@ private:
 // `close_connection` announces that the server ends the connection after this
 // response (RFC 9112 9.6); otherwise an HTTP/1.1 connection persists.
 [[nodiscard]] std::string BuildXHttpResponseHeaders(
-    const HttpConfig& cfg,
+    const XHttpConfig& xhttp_cfg,
     bool chunked_body,
     bool close_connection) {
+    const bool add_sse = !xhttp_cfg.no_sse_header &&
+                         !FindHttpHeader(xhttp_cfg.headers, "Content-Type");
     std::string response;
-    response.reserve(192 + cfg.headers.size() * 32);
+    response.reserve(192 + (xhttp_cfg.headers.size() + (add_sse ? 1 : 0)) * 32);
     response.append("HTTP/1.1 200 OK\r\n");
     response.append("X-Accel-Buffering: no\r\n");
     response.append("Cache-Control: no-store\r\n");
@@ -415,7 +417,7 @@ private:
     if (close_connection) {
         response.append("Connection: close\r\n");
     }
-    for (const auto& [key, value] : cfg.headers) {
+    for (const auto& [key, value] : xhttp_cfg.headers) {
         if (key.empty() ||
             common::EqualsAsciiCI(key, "Transfer-Encoding") ||
             common::EqualsAsciiCI(key, "Content-Length") ||
@@ -423,6 +425,9 @@ private:
             continue;
         }
         AppendHeaderLine(response, key, value);
+    }
+    if (add_sse) {
+        AppendHeaderLine(response, "content-type", "text/event-stream");
     }
     response.append("\r\n");
     return response;
@@ -1481,18 +1486,6 @@ std::unique_ptr<AsyncStream> MakeXHttpSplitStream(
         std::move(session), std::move(downlink));
 }
 
-HttpConfig XHttpStreamOneServerHttpConfig(const XHttpConfig& cfg) {
-    HttpConfig http;
-    http.path = cfg.normalized_path;
-    http.host = cfg.host;
-    http.headers = cfg.headers;
-    http.force_http2 = true;
-    if (!cfg.no_sse_header && !FindHttpHeader(http.headers, "Content-Type")) {
-        http.headers.emplace("content-type", "text/event-stream");
-    }
-    return http;
-}
-
 std::string_view XHttpRefererScratch::Format(
     std::string_view host,
     std::string_view path,
@@ -1564,7 +1557,7 @@ common::ErrorCode OwnerMissError(AsyncStream& stream, XHttpRequestMeta::Kind kin
 
 net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest(
     std::unique_ptr<AsyncStream>& stream,
-    const HttpConfig& cfg,
+    const XHttpConfig& xhttp_cfg,
     uint64_t conn_id,
     XHttpRequestMeta::Kind kind,
     std::string_view session_id,
@@ -1615,7 +1608,7 @@ net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest
                 co_return tl::unexpected(common::ErrorCode::TIMEOUT);
             }
             if (!co_await WriteFullToStream(
-                    *body, BuildXHttpResponseHeaders(cfg, false, true))) {
+                    *body, BuildXHttpResponseHeaders(xhttp_cfg, false, true))) {
                 co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
             }
             LOG_CONN_TRACE(conn_id, "XHTTP server packet-up payload accepted seq={}",
@@ -1677,7 +1670,7 @@ net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest
         }
         session.reset();
         const auto response = rejection.empty()
-            ? BuildXHttpResponseHeaders(cfg, false, !keep_alive)
+            ? BuildXHttpResponseHeaders(xhttp_cfg, false, !keep_alive)
             : BuildEmptyHttp1Response(rejection, !keep_alive);
         if (!co_await WriteFullToStream(*stream, response)) {
             co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
@@ -1736,7 +1729,7 @@ net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest
 net::awaitable<tl::expected<void, common::ErrorCode>> HandOffXHttpUpload(
     app::GroupCoordinator& coordinator,
     net::io_context* owner, DetachedXHttpStream detached,
-    const HttpConfig& cfg, const XHttpConfig& xhttp_cfg, uint64_t conn_id,
+    const XHttpConfig& xhttp_cfg, uint64_t conn_id,
     XHttpUploadTimeouts timeouts, XHttpRequestMeta::Kind kind,
     std::string session_id, uint64_t seq, Http1ReadFraming framing,
     bool expect_100_continue, bool keep_alive);
@@ -1745,7 +1738,6 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
     app::GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> stream,
-    const HttpConfig& cfg,
     const XHttpConfig& xhttp_cfg,
     uint64_t conn_id,
     InboundTransportMetadata* transport_metadata,
@@ -1783,17 +1775,14 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
         const auto request_line = received_request->start_line;
         const auto method = received_request->line.method;
         const auto meta = ParseXHttpRequestMeta(
-            cfg.path, received_request->line.target, method);
+            xhttp_cfg.normalized_path, received_request->line.target, method);
         if (method.empty() || meta.kind == XHttpRequestMeta::Kind::Unknown)
             co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         if (RejectHostMismatch("XHTTP server", conn_id,
-                ResolveConfiguredHttpHost(cfg.host, &cfg.headers), received_request->host))
+                ResolveConfiguredHttpHost(xhttp_cfg.host, &xhttp_cfg.headers), received_request->host))
             co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         if (!XHttpKindAllowed(meta.kind, xhttp_cfg))
             co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
-
-        RecordExtractedRealIp(request, cfg.real_ip_header, transport_metadata);
-
         if (meta.kind == XHttpRequestMeta::Kind::PacketDown) {
             if (!stream_handler) {
                 co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
@@ -1806,7 +1795,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
             XHttpDownlinkClaim claim(*session);
             if (!claim) co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
             if (!co_await WriteFullToStream(
-                    *stream, BuildXHttpResponseHeaders(cfg, true, false))) {
+                    *stream, BuildXHttpResponseHeaders(xhttp_cfg, true, false))) {
                 co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
             }
             // This physical GET becomes the dedicated downlink of a logical
@@ -1863,7 +1852,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
                 }
                 auto handed = co_await net::co_spawn(*owner_reactor,
                     HandOffXHttpUpload(coordinator, owner_reactor, std::move(*detached),
-                        cfg, xhttp_cfg, conn_id,
+                        xhttp_cfg, conn_id,
                         XHttpUploadTimeouts{
                             .handshake_timeout = timeouts.handshake_timeout,
                             .idle_timeout = timeouts.idle_timeout,
@@ -1876,7 +1865,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
             }
             common::MultiBuffer read_ahead = head->TakeReadAheadMultiBuffer();
             auto upload_result = co_await ExecuteXHttp1UploadRequest(
-                stream, cfg, conn_id, meta.kind, meta.session_id, meta.seq,
+                stream, xhttp_cfg, conn_id, meta.kind, meta.session_id, meta.seq,
                 *body_framing, expect_100_continue, keep_alive,
                 std::move(read_ahead), std::move(head->storage),
                 std::move(resolution.session), timeouts);
@@ -1895,7 +1884,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
             !co_await WriteFullToStream(*stream, kContinueResponse)) {
             co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
         }
-        if (!co_await WriteFullToStream(*stream, BuildXHttpResponseHeaders(cfg, true, false))) {
+        if (!co_await WriteFullToStream(*stream, BuildXHttpResponseHeaders(xhttp_cfg, true, false))) {
             co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
         }
         auto body = MakeHttp1BodyStream(
@@ -1916,7 +1905,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
 net::awaitable<tl::expected<void, common::ErrorCode>> HandOffXHttpUpload(
     app::GroupCoordinator& coordinator,
     net::io_context* owner, DetachedXHttpStream detached,
-    const HttpConfig& cfg, const XHttpConfig& xhttp_cfg, uint64_t conn_id,
+    const XHttpConfig& xhttp_cfg, uint64_t conn_id,
     XHttpUploadTimeouts timeouts, XHttpRequestMeta::Kind kind,
     std::string session_id, uint64_t seq, Http1ReadFraming framing,
     bool expect_100_continue, bool keep_alive) {
@@ -1930,13 +1919,13 @@ net::awaitable<tl::expected<void, common::ErrorCode>> HandOffXHttpUpload(
         !timeouts.active, &restored->Cancellation());
     if (!resolution.owner) co_return tl::unexpected(OwnerMissError(*restored, kind));
     auto first = co_await ExecuteXHttp1UploadRequest(
-        restored, cfg, conn_id, kind, session_id, seq, framing,
+        restored, xhttp_cfg, conn_id, kind, session_id, seq, framing,
         expect_100_continue, keep_alive, {}, {}, std::move(resolution.session), timeouts);
     if (!first) co_return tl::unexpected(first.error());
     if (!*first) co_return tl::expected<void, common::ErrorCode>{};
     const std::shared_ptr<InboundTransportStreamHandler> no_handler;
     auto result = co_await RunXHttp1ServerHandshake(coordinator, 
-        *owner, std::move(restored), cfg, xhttp_cfg, conn_id, nullptr,
+        *owner, std::move(restored), xhttp_cfg, conn_id, nullptr,
         {}, no_handler, timeouts, true);
     if (!result) co_return tl::unexpected(result.error());
     if (*result) co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -1949,7 +1938,6 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     app::GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> stream,
-    const HttpConfig& cfg,
     const XHttpConfig& xhttp_cfg,
     uint64_t conn_id,
     InboundTransportMetadata* transport_metadata,
@@ -1966,7 +1954,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         .active = (stream_handler != nullptr),
     };
     co_return co_await RunXHttp1ServerHandshake(coordinator, 
-        io_context, std::move(stream), cfg, xhttp_cfg, conn_id,
+        io_context, std::move(stream), xhttp_cfg, conn_id,
         transport_metadata, initial, stream_handler, timeouts, false);
 }
 

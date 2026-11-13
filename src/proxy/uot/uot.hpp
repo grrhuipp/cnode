@@ -121,6 +121,7 @@ private:
     transport::MultiBufferWriter& writer_;
     bool is_connect_ = false;
     common::TargetAddress destination_;
+    std::array<uint8_t, common::kMaxBaseEncodedAddressSize + 2> header_{};
 };
 
 template <typename Underlying>

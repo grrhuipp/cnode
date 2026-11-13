@@ -253,12 +253,11 @@ net::awaitable<void> UotPacketWriter::WriteMultiBuffer(common::MultiBuffer mb) {
     if (is_connect_ && !destination_.IsValid()) {
         throw transport::LinkError(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
-    PacketHeader header{};
     const size_t header_size = EncodePacketHeader(
         is_connect_, is_connect_ ? destination_ : *datagram->target,
-        static_cast<uint16_t>(datagram->payload_size), header);
+        static_cast<uint16_t>(datagram->payload_size), header_);
     co_await WriteFramedDatagram(
-        writer_, std::span<const uint8_t>(header.data(), header_size), mb);
+        writer_, std::span<const uint8_t>(header_.data(), header_size), mb);
 }
 
 net::awaitable<void> UotPacketWriter::WriteBuffers(
@@ -267,11 +266,10 @@ net::awaitable<void> UotPacketWriter::WriteBuffers(
         throw transport::LinkError(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
     const size_t payload_size = RequireUdpPayloadSize(buffers);
-    PacketHeader header{};
     const size_t header_size = EncodePacketHeader(
-        is_connect_, destination_, static_cast<uint16_t>(payload_size), header);
+        is_connect_, destination_, static_cast<uint16_t>(payload_size), header_);
     co_await WriteFramedDatagram(
-        writer_, std::span<const uint8_t>(header.data(), header_size), buffers);
+        writer_, std::span<const uint8_t>(header_.data(), header_size), buffers);
 }
 
 net::awaitable<void> UotPacketWriter::AsyncShutdownWrite() {

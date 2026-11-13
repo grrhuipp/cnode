@@ -168,9 +168,11 @@ net::awaitable<void> WriteH2Frame(
     return h;
 }
 
-[[nodiscard]] std::vector<uint8_t> EncodeHttpResponseHeaders(const HttpHeaders& headers) {
+[[nodiscard]] std::vector<uint8_t> EncodeHttpResponseHeaders(
+    const HttpHeaders& headers, std::string_view default_content_type) {
+    const size_t count = headers.size() + (!default_content_type.empty() ? 1 : 0);
     std::vector<uint8_t> h;
-    h.reserve(64 + headers.size() * 32);
+    h.reserve(64 + count * 32);
     AppendHpackIndexed(h, kHpackStaticStatusOk);
     AppendHpackLiteralNewName(h, "cache-control", "no-store");
     for (const auto& [key, value] : headers) {
@@ -178,6 +180,9 @@ net::awaitable<void> WriteH2Frame(
             continue;
         }
         AppendHpackLiteralNewName(h, key, value);
+    }
+    if (!default_content_type.empty()) {
+        AppendHpackLiteralNewName(h, "content-type", default_content_type);
     }
     return h;
 }

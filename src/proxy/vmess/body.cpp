@@ -474,7 +474,8 @@ net::awaitable<common::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBuffe
         const size_t length_size = cipher_.LengthSize();
         const auto header_span = std::span<uint8_t>(header_.data(), length_size);
         if (!proxy::BufferedStreamReader::ReadBufferedFrom(pending_read_, header_span.data(), header_span.size(), header_read_) &&
-            !co_await ReadExact(src, header_span, header_read_)) {
+            !co_await proxy::BufferedStreamReader::ReadExactFrom(
+                src, pending_read_, header_span.data(), header_span.size(), &header_read_)) {
             if (header_read_ != 0) {
                 Fail("VMess body length truncated");
             }
@@ -503,7 +504,8 @@ net::awaitable<common::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBuffe
         // length no longer needs the inline header storage.
         const auto eof_span = std::span<uint8_t>(header_.data(), chunk_len);
         if (!proxy::BufferedStreamReader::ReadBufferedFrom(pending_read_, eof_span.data(), eof_span.size(), body_read_) &&
-            !co_await ReadExact(src, eof_span, body_read_)) {
+            !co_await proxy::BufferedStreamReader::ReadExactFrom(
+                src, pending_read_, eof_span.data(), eof_span.size(), &body_read_)) {
             Fail("VMess body EOF chunk truncated");
         }
         if (overhead > 0 &&
@@ -533,7 +535,8 @@ net::awaitable<common::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBuffe
     uint8_t* sealed = read_buffer_.Data();
     const auto body_span = std::span<uint8_t>(sealed, chunk_len);
     if (!proxy::BufferedStreamReader::ReadBufferedFrom(pending_read_, body_span.data(), body_span.size(), body_read_) &&
-        !co_await ReadExact(src, body_span, body_read_)) {
+        !co_await proxy::BufferedStreamReader::ReadExactFrom(
+            src, pending_read_, body_span.data(), body_span.size(), &body_read_)) {
         Fail("VMess body chunk truncated");
     }
     const ssize_t opened = cipher_.Payload().Decrypt(sealed, data_len, sealed);

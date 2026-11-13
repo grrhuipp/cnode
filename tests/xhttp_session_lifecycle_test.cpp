@@ -290,8 +290,6 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
         std::unique_ptr<::transport::AsyncStream> logical;
     };
 
-    ::transport::HttpConfig http_cfg;
-    http_cfg.path = "/fixture";
     ::transport::XHttpConfig xhttp_cfg;
     xhttp_cfg.path = "/fixture";
     xhttp_cfg.normalized_path = "/fixture/";
@@ -319,7 +317,7 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
                 auto sink = std::make_shared<OriginBoundSink>(std::this_thread::get_id());
                 auto res = co_await DoXHttp1ServerHandshake(
                     *coordinator,                     *worker1, std::make_unique<::transport::TcpStream>(std::move(sock)),
-                    http_cfg, xhttp_cfg, 1, nullptr, {}, sink);
+                    xhttp_cfg, 1, nullptr, {}, sink);
                 EXPECT_TRUE(res.has_value() && !*res) << "packet-up handoff failed";
             }, net::use_future);
 
@@ -336,7 +334,7 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
                 auto sink = std::make_shared<OriginBoundSink>(std::this_thread::get_id());
                 auto res = co_await DoXHttp1ServerHandshake(
                     *coordinator,                     *worker0, std::make_unique<::transport::TcpStream>(std::move(sock)),
-                    http_cfg, xhttp_cfg, 2, nullptr, {}, sink);
+                    xhttp_cfg, 2, nullptr, {}, sink);
                 EXPECT_TRUE(res.has_value() && !*res && sink->logical != nullptr) << "packet-down did not produce logical stream";
                 if (!sink->logical) co_return std::string{};
                 std::array<char, 5> buf{};

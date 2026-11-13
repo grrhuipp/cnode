@@ -61,7 +61,7 @@ inline constexpr std::string_view kHttp2ClientPreface =
 [[nodiscard]] net::awaitable<TransportBuildResult> RunHttp2ServerSession(
     app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
-    const HttpConfig& cfg,
+    const HttpConfig* cfg,
     const XHttpConfig* xhttp_cfg,
     net::io_context& io_context,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,

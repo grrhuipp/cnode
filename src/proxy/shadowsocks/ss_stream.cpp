@@ -173,7 +173,6 @@ bool SsStreamWriter::InitResponseCipher() {
     }
 
     write_cipher_.emplace(cipher_type_, write_subkey.data(), key_size);
-    OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
     write_nonce_ = 0;
 
     if (!pending_prefix_.AppendSpan(
@@ -257,7 +256,6 @@ bool SsStreamWriter::InitResponseCipher2022(
     }
 
     write_cipher_.emplace(cipher_type_, write_subkey.data(), key_size);
-    OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
 
     const size_t fixed_plain_size = 1 + 8 + key_size + 2;
     fixed_plain[0] = 1;

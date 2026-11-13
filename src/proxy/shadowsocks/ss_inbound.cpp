@@ -17,7 +17,6 @@
 #include "common/session.hpp"
 
 #include "common/byte_reader.hpp"
-#include "common/multi_buffer.hpp"
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
 #include <algorithm>

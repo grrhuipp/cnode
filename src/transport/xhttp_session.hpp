@@ -450,7 +450,6 @@ struct XHttpRefererScratch {
         std::string_view host, std::string_view path, bool tls);
 };
 
-[[nodiscard]] HttpConfig XHttpStreamOneServerHttpConfig(const XHttpConfig& cfg);
 [[nodiscard]] HttpClientRequestView MakeXHttpClientRequestView(
     const XHttpConfig& cfg,
     std::string_view path,
@@ -462,7 +461,6 @@ struct XHttpRefererScratch {
     app::GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> stream,
-    const HttpConfig& cfg,
     const XHttpConfig& xhttp_cfg,
     uint64_t conn_id,
     InboundTransportMetadata* transport_metadata,

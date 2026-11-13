@@ -1,6 +1,5 @@
 #pragma once
 
-#include "app/relay.hpp"
 #include "common/asio_types.hpp"
 #include "common/hash.hpp"
 #include "infra/config_types.hpp"
@@ -24,6 +23,7 @@ class AwaitableTaskGroup;
 namespace app {
 
 class DNS;
+struct RelayConfig;
 
 struct OutboundProtocolSettings {
 protected:

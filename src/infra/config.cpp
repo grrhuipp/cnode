@@ -634,12 +634,11 @@ RouteRuleConfig RouteRuleConfig::FromJson(const object& j) {
     RouteRuleConfig rule;
 
     // 域名匹配 - 处理 xray 格式 (domain 数组可能包含 geosite:xxx, full:xxx 等)
-    if (j.contains("domain")) {
-        auto arr = JsonStringArrayOrEmpty(j, "domain");
-        if (arr.empty()) {
+    if (auto arr = RequireJson(ParseJsonStringArray(j, "domain"))) {
+        if (arr->empty()) {
             throw std::invalid_argument("routing domain must not be empty");
         }
-        for (std::string& val : arr) {
+        for (std::string& val : *arr) {
             // 解析前缀
             if (val.starts_with("geosite:")) {
                 rule.geosite.push_back(RequireRoutingSelector(
@@ -681,24 +680,23 @@ RouteRuleConfig RouteRuleConfig::FromJson(const object& j) {
          +[](std::string value) { return RequireRoutingSelector(std::move(value), "geosite tag", true); }},
     };
     for (const auto& field : fields) {
-        if (!j.contains(field.key)) continue;
-        auto values = JsonStringArrayOrEmpty(j, field.key);
-        if (values.empty()) {
+        auto values = RequireJson(ParseJsonStringArray(j, field.key));
+        if (!values) continue;
+        if (values->empty()) {
             throw std::invalid_argument(std::format("routing {} must not be empty", field.key));
         }
         auto& destination = rule.*field.member;
-        for (auto& value : values) {
+        for (auto& value : *values) {
             destination.push_back(field.normalize(std::move(value)));
         }
     }
 
     // IP 匹配 - 处理 xray 格式 (ip 数组可能包含 geoip:xxx)
-    if (j.contains("ip")) {
-        auto arr = JsonStringArrayOrEmpty(j, "ip");
-        if (arr.empty()) {
+    if (auto arr = RequireJson(ParseJsonStringArray(j, "ip"))) {
+        if (arr->empty()) {
             throw std::invalid_argument("routing ip must not be empty");
         }
-        for (std::string& val : arr) {
+        for (std::string& val : *arr) {
             if (val.starts_with("geoip:")) {
                 rule.geoip.push_back(RequireRoutingSelector(
                     val.substr(6), "geoip tag", true));
@@ -707,13 +705,12 @@ RouteRuleConfig RouteRuleConfig::FromJson(const object& j) {
             }
         }
     }
-    if (j.contains("geoip")) {
-        auto arr = JsonStringArrayOrEmpty(j, "geoip");
-        if (arr.empty()) {
+    if (auto arr = RequireJson(ParseJsonStringArray(j, "geoip"))) {
+        if (arr->empty()) {
             throw std::invalid_argument(
                 "routing geoip tag must not be empty");
         }
-        for (auto& value : arr) {
+        for (auto& value : *arr) {
             rule.geoip.push_back(RequireRoutingSelector(
                 std::move(value), "geoip tag", true));
         }
@@ -947,12 +944,11 @@ std::shared_ptr<const transport::XHttpDownloadSettings> ParseXHttpDownloadSettin
 
 // Xray-core SplitHTTPConfig.Build rejects any mode outside this set.
 transport::XHttpMode ParseXHttpMode(std::string_view value) {
-    const std::string mode = common::LowerAscii(std::string(value));
-    if (mode.empty() || mode == "auto") return transport::XHttpMode::Auto;
-    if (mode == "packet-up") return transport::XHttpMode::PacketUp;
-    if (mode == "stream-up") return transport::XHttpMode::StreamUp;
-    if (mode == "stream-one") return transport::XHttpMode::StreamOne;
-    throw std::invalid_argument(std::format("xhttp mode '{}' is not supported", mode));
+    if (value.empty() || common::EqualsAsciiCI(value, "auto")) return transport::XHttpMode::Auto;
+    if (common::EqualsAsciiCI(value, "packet-up")) return transport::XHttpMode::PacketUp;
+    if (common::EqualsAsciiCI(value, "stream-up")) return transport::XHttpMode::StreamUp;
+    if (common::EqualsAsciiCI(value, "stream-one")) return transport::XHttpMode::StreamOne;
+    throw std::invalid_argument(std::format("xhttp mode '{}' is not supported", common::LowerAscii(value)));
 }
 
 transport::XHttpConfig ParseXHttpConfig(const object& j) {
@@ -1001,60 +997,49 @@ transport::RealityConfig ParseRealityConfig(const object& j) {
                        "maxTimeDiff", "mldsa65Seed", "mldsa65Verify", "fingerprint", "serverName", "publicKey",
                        "shortId", "spiderX"}, "realitySettings");
     infra::RealityServerInput server;
-    if (j.contains("dest")) {
-        server.dest = JsonStringOr(j, "dest", "");
-    }
+    server.dest = RequireJson(ParseJsonString(j, "dest"));
     server.xver = RequireJson(ParseJsonUint64(j, "xver")).value_or(0);
     server.server_names = JsonStringArrayOrEmpty(j, "serverNames");
-    if (j.contains("privateKey")) {
-        server.private_key = JsonStringOr(j, "privateKey", "");
-    }
+    server.private_key = RequireJson(ParseJsonString(j, "privateKey"));
     server.short_ids = JsonStringArrayOrEmpty(j, "shortIds");
     server.min_client_ver = JsonStringOr(j, "minClientVer", "");
     server.max_client_ver = JsonStringOr(j, "maxClientVer", "");
     server.max_time_diff = RequireJson(ParseJsonUint64(j, "maxTimeDiff")).value_or(0);
-    if (j.contains("mldsa65Seed")) {
-        server.mldsa65_seed = JsonStringOr(j, "mldsa65Seed", "");
-    }
+    server.mldsa65_seed = RequireJson(ParseJsonString(j, "mldsa65Seed"));
     RequireJson(infra::ApplyRealityServerInput(server, cfg));
-    const std::string mldsa65_verify = JsonStringOr(j, "mldsa65Verify", "");
-    if (!mldsa65_verify.empty()) {
-        auto parsed =
-            transport::ParseRealityMldsa65PublicKey(mldsa65_verify);
+    if (const auto mldsa65_verify = RequireJson(ParseJsonString(j, "mldsa65Verify"))) {
+        auto parsed = transport::ParseRealityMldsa65PublicKey(*mldsa65_verify);
         if (!parsed) {
             throw std::invalid_argument("REALITY mldsa65Verify is invalid");
         }
         cfg.mldsa65_verify =
-            std::make_shared<const transport::RealityMldsa65PublicKey>(
-                *parsed);
-    } else if (j.contains("mldsa65Verify")) {
-        throw std::invalid_argument("REALITY mldsa65Verify is invalid");
+            std::make_shared<const transport::RealityMldsa65PublicKey>(*parsed);
     }
-    const std::string fingerprint = JsonStringOr(j, "fingerprint", "");
-    if (!fingerprint.empty()) {
-        auto normalized =
-            transport::NormalizeRealityFingerprint(fingerprint);
+    if (const auto fingerprint = RequireJson(ParseJsonString(j, "fingerprint"))) {
+        if (fingerprint->empty()) {
+            throw std::invalid_argument("realitySettings.fingerprint must not be empty");
+        }
+        auto normalized = transport::NormalizeRealityFingerprint(*fingerprint);
         if (!normalized) {
             throw std::invalid_argument("REALITY fingerprint is invalid");
         }
         cfg.fingerprint = std::move(*normalized);
-    } else if (j.contains("fingerprint")) {
-        throw std::invalid_argument("realitySettings.fingerprint must not be empty");
     }
-    cfg.server_name = common::LowerAscii(JsonStringOr(j, "serverName", ""));
-    if (j.contains("serverName") &&
-        !infra::IsValidRealityServerName(cfg.server_name)) {
-        throw std::invalid_argument("REALITY serverName is invalid");
+    if (const auto server_name = RequireJson(ParseJsonString(j, "serverName"))) {
+        cfg.server_name = common::LowerAscii(*server_name);
+        if (!infra::IsValidRealityServerName(cfg.server_name)) {
+            throw std::invalid_argument("REALITY serverName is invalid");
+        }
     }
-    const std::string public_key = JsonStringOr(j, "publicKey", "");
-    if (!public_key.empty()) {
-        auto parsed = transport::ParseRealityKey(public_key);
+    if (const auto public_key = RequireJson(ParseJsonString(j, "publicKey"))) {
+        if (public_key->empty()) {
+            throw std::invalid_argument("realitySettings.publicKey must not be empty");
+        }
+        auto parsed = transport::ParseRealityKey(*public_key);
         if (!parsed) {
             throw std::invalid_argument("REALITY publicKey is invalid");
         }
         cfg.public_key = *parsed;
-    } else if (j.contains("publicKey")) {
-        throw std::invalid_argument("realitySettings.publicKey must not be empty");
     }
     auto short_id = transport::ParseRealityShortId(
         JsonStringOr(j, "shortId", ""));
@@ -1433,12 +1418,12 @@ StaticInboundConfig StaticInboundConfig::FromJson(const object& j) {
     }
 
     cfg.routing_enabled = JsonBoolOr(j, "routingEnabled", false);
-    if (j.contains("outboundTag")) {
-        cfg.outbound_tag = JsonStringOr(j, "outboundTag", "");
-        if (cfg.outbound_tag->empty()) {
+    if (auto outbound_tag = RequireJson(ParseJsonString(j, "outboundTag"))) {
+        if (outbound_tag->empty()) {
             throw std::invalid_argument(
                 "static inbound outboundTag must not be empty");
         }
+        cfg.outbound_tag = std::move(*outbound_tag);
     }
 
     return cfg;
@@ -1659,9 +1644,10 @@ std::vector<std::string> GetUsedRouteRuleTags(
     const RoutingConfig& routing,
     const std::vector<std::string> RouteRuleConfig::* field) {
     std::vector<std::string> tags;
+    std::unordered_set<std::string_view> seen;
     for (const auto& rule : routing.rules) {
         for (const auto& tag : rule.*field) {
-            if (std::ranges::find(tags, tag) == tags.end()) {
+            if (seen.insert(tag).second) {
                 tags.push_back(tag);
             }
         }
@@ -1986,7 +1972,7 @@ bool ValidateConfig(const Config& config) {
         }
         for (const int node_id : panel.NodeIDs.Values()) {
             auto key = common::BuildPanelNodeAccountingKey(panel.Name, node_id);
-            if (!panel_nodes.insert(key).second) {
+            if (!panel_nodes.insert(std::move(key)).second) {
                 const PanelLogContext log_context{panel.Name, panel.APIHost, node_id, panel.NodeType};
                 LOG_PANEL_ERROR(log_context, "Duplicate panel node identity");
                 return false;

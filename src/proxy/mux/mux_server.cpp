@@ -928,13 +928,12 @@ private:
     }
     net::awaitable<bool> WritePayloadFrameToClient(MuxReply& reply) {
                 const size_t payload_size = reply.PayloadSize();
-                std::array<uint8_t, 2 + 4 + 1 + common::kMaxBaseEncodedAddressSize + 2> write_frame{};
                 size_t header_len = 0;
                 if (reply.is_udp) {
                     // 入队前已校验整份 datagram 带同一合法目标；队列不改写 Buffer 标签。
                     const auto datagram = common::InspectUdpDatagram(reply.payload);
                     header_len = datagram.target == nullptr ? 0 : common::EncodeKeepUDPHeaderTo(
-                        write_frame,
+                        write_frame_,
                         reply.session_id,
                         *datagram.target,
                         payload_size);
@@ -949,7 +948,7 @@ private:
                     }
                 } else {
                     header_len = common::EncodeKeepDataHeaderTo(
-                        write_frame,
+                        write_frame_,
                         reply.session_id,
                         payload_size);
                     if (header_len == 0) {
@@ -965,7 +964,7 @@ private:
 
                 std::array<net::const_buffer, 2> framed;
                 size_t count = 0;
-                if (header_len != 0) framed[count++] = net::const_buffer(write_frame.data(), header_len);
+                if (header_len != 0) framed[count++] = net::const_buffer(write_frame_.data(), header_len);
                 if (const auto bytes = reply.payload.FrontSpan(); !bytes.empty()) {
                     framed[count++] = net::const_buffer(bytes.data(), bytes.size());
                 }
@@ -999,11 +998,10 @@ private:
                     if (!reply.is_end) {
                         continue;
                     }
-                    std::array<uint8_t, 6> write_frame{};
                     const size_t header_len = common::EncodeEndTo(
-                        write_frame, reply.session_id, reply.is_error);
+                        std::span<uint8_t>(write_frame_).first<6>(), reply.session_id, reply.is_error);
                     if (!co_await WriteFrameToClient(
-                            std::span<const uint8_t>(write_frame.data(), header_len))) {
+                            std::span<const uint8_t>(write_frame_.data(), header_len))) {
                         running = false;
                         break;
                     }
@@ -1264,10 +1262,10 @@ private:
                     // 映射项只由 dispatch_done 回包移除：此处提前移除会让排队中的
                     // 旧回包在同 sid 的新 NEW 之后误删新子会话。
                     if (!known_session) {
-                        std::array<uint8_t, 6> write_frame{};
-                        const size_t header_len = common::EncodeEndTo(write_frame, sid);
+                        const size_t header_len = common::EncodeEndTo(
+                            std::span<uint8_t>(write_frame_).first<6>(), sid);
                         if (!co_await WriteFrameToClient(
-                                std::span<const uint8_t>(write_frame.data(), header_len))) {
+                                std::span<const uint8_t>(write_frame_.data(), header_len))) {
                             running = false;
                         }
                     }
@@ -1346,6 +1344,7 @@ private:
     ClientReadQueueState client_reads;
     std::unordered_map<uint16_t, std::unique_ptr<MuxSubSession>> sub_sessions;
     common::MultiBuffer frame_buf;
+    std::array<uint8_t, 2 + 4 + 1 + common::kMaxBaseEncodedAddressSize + 2> write_frame_{};
     const uint64_t parent_conn_id;
     bool running = true;
     bool client_input_done = false;

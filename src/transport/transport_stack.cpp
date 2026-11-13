@@ -297,7 +297,7 @@ net::awaitable<TransportBuildResult> ConnectOutboundSecurity(
 net::awaitable<TransportBuildResult> DoHttpServerHandshake(
     app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
-    const HttpConfig& cfg,
+    const HttpConfig* cfg,
     net::io_context& io_context,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
     uint64_t conn_id,
@@ -332,10 +332,9 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
 
     const std::span<const uint8_t> initial(first.data(), total);
     if (xhttp_config) {
-        co_return co_await DoXHttp1ServerHandshake(coordinator, 
+        co_return co_await DoXHttp1ServerHandshake(coordinator,
             io_context,
             std::move(stream),
-            cfg,
             *xhttp_config,
             conn_id,
             transport_metadata,
@@ -343,7 +342,7 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
             stream_handler);
     }
     co_return co_await DoHttp1ServerHandshake(
-        std::move(stream), cfg, conn_id, transport_metadata, initial);
+        std::move(stream), *cfg, conn_id, transport_metadata, initial);
 }
 
 net::awaitable<TransportBuildResult> DoXHttp2PacketUpClientRequest(
@@ -377,27 +376,6 @@ void LogLayerFailure(uint64_t conn_id, std::string_view layer, common::ErrorCode
     LOG_CONN_DEBUG(conn_id, "{} failed > {}", layer, common::ErrorCodeToString(error));
 }
 
-
-net::awaitable<TransportBuildResult> BuildInboundXHttpTransport(
-    app::GroupCoordinator& coordinator,
-    std::unique_ptr<AsyncStream> stream,
-    const XHttpConfig& xhttp,
-    net::io_context& io_context,
-    std::shared_ptr<InboundTransportStreamHandler> stream_handler,
-    uint64_t conn_id,
-    InboundTransportMetadata* metadata) {
-    // Outlives the HTTP/2 session, which borrows it until the call returns.
-    const HttpConfig http = XHttpStreamOneServerHttpConfig(xhttp);
-    co_return co_await DoHttpServerHandshake(
-        coordinator,
-        std::move(stream),
-        http,
-        io_context,
-        std::move(stream_handler),
-        conn_id,
-        metadata,
-        &xhttp);
-}
 
 net::awaitable<TransportBuildResult> BuildOutboundXHttpStreamOne(
     std::unique_ptr<AsyncStream> stream,
@@ -474,9 +452,9 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
 
     // 3. HTTP / h2 层（服务端）
     if (s.IsHttp()) {
-        auto http_result = co_await DoHttpServerHandshake(coordinator, 
+        auto http_result = co_await DoHttpServerHandshake(coordinator,
             std::move(stream),
-            s.http,
+            &s.http,
             io_context,
             std::move(stream_handler),
             conn_id,
@@ -491,9 +469,9 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
 
     // 4. XHTTP 层（服务端：H2 stream-one 或 H1 packet-up）
     if (s.IsXHttp()) {
-        auto xhttp_result = co_await BuildInboundXHttpTransport(
-            coordinator, std::move(stream), s.xhttp, io_context,
-            std::move(stream_handler), conn_id, metadata);
+        auto xhttp_result = co_await DoHttpServerHandshake(
+            coordinator, std::move(stream), nullptr, io_context,
+            std::move(stream_handler), conn_id, metadata, &s.xhttp);
         if (!xhttp_result) {
             LogLayerFailure(conn_id, "XHTTP server handshake", xhttp_result.error());
             co_return tl::unexpected(xhttp_result.error());

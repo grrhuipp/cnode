@@ -158,13 +158,17 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const object& 
             result.uot_version = Uot(*server);
             return result;
         }
+        auto alpn = RequireJson(ParseJsonStringArray(*server, "alpn")).value_or(std::vector<std::string>{});
+        if (!transport::IsValidTlsAlpn(alpn)) {
+            throw std::invalid_argument("invalid Trojan ALPN policy");
+        }
         return TrojanSettings{
             .server = Server(*server, 443),
             .password = Password(*server),
             .server_name = RequireJson(NormalizeTlsServerName(
                 JsonStringOr(*server, "serverName", ""), "trojan serverName")),
             .allow_insecure = JsonBoolOr(*server, "allowInsecure", false),
-            .alpn = RequireJson(ParseJsonStringArray(*server, "alpn")).value_or(std::vector<std::string>{}),
+            .alpn = std::move(alpn),
         };
     }
     if (protocol == common::kVless || protocol == common::kVmess) {

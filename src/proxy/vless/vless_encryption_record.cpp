@@ -321,6 +321,7 @@ net::awaitable<void> VlessEncryptionWriter::WriteEncrypted(BufferRange source) {
         };
 
         skip_empty();
+        common::ContiguousWriteBuffer frame_buffer;
         while (idx < buffers.size()) {
             const auto* first_data =
                 static_cast<const uint8_t*>(buffers[idx].data()) + offset;
@@ -346,7 +347,6 @@ net::awaitable<void> VlessEncryptionWriter::WriteEncrypted(BufferRange source) {
             }
             const size_t frame_capacity =
                 kVlessEncryptionRecordHeaderSize + planned_len + kVlessEncryptionTagSize;
-            common::ContiguousWriteBuffer frame_buffer;
             uint8_t* frame_ptr = frame_buffer.TryPrepare(frame_capacity);
             if (!frame_ptr) {
                 ThrowVlessEncryptionIoError("VLESS Encryption buffer allocation failed");

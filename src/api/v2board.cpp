@@ -696,20 +696,29 @@ std::unique_ptr<API> CreatePanelClient(
 
 namespace {
 
+tl::expected<uint16_t, std::string> ParsePanelPort(
+    const infra::value& raw,
+    std::string_view invalid_type_error,
+    std::string_view out_of_range_error) {
+    const auto result = PanelUnsignedInteger(raw);
+    if (!result) {
+        return tl::unexpected(std::string(invalid_type_error));
+    }
+    if (*result == 0 || *result > std::numeric_limits<uint16_t>::max()) {
+        return tl::unexpected(std::string(out_of_range_error));
+    }
+    return static_cast<uint16_t>(*result);
+}
+
 tl::expected<uint16_t, std::string> ParseServerPort(const infra::object& source) {
     const auto* raw = source.if_contains("server_port");
     if (!raw || raw->is_null()) {
         return tl::unexpected("server_port is required");
     }
-    const auto result = PanelUnsignedInteger(*raw);
-    if (!result) {
-        return tl::unexpected(
-            "server_port must be an integer or decimal integer string");
-    }
-    if (*result == 0 || *result > std::numeric_limits<uint16_t>::max()) {
-        return tl::unexpected("server_port must be between 1 and 65535");
-    }
-    return static_cast<uint16_t>(*result);
+    return ParsePanelPort(
+        *raw,
+        "server_port must be an integer or decimal integer string",
+        "server_port must be between 1 and 65535");
 }
 
 // 0 keeps the local default cadence; the bound keeps the value representable
@@ -944,12 +953,14 @@ tl::expected<void, std::string> MapRealitySettings(
     const infra::value* const server_port = *server_port_res;
     std::optional<uint16_t> sp_port;
     if (server_port) {
-        const auto port = PanelUnsignedInteger(*server_port);
-        if (!port || *port == 0 ||
-            *port > std::numeric_limits<uint16_t>::max()) {
-            return tl::unexpected("REALITY tls_settings.server_port is invalid");
+        auto port = ParsePanelPort(
+            *server_port,
+            "REALITY tls_settings.server_port is invalid",
+            "REALITY tls_settings.server_port is invalid");
+        if (!port) {
+            return tl::unexpected(std::move(port.error()));
         }
-        sp_port = static_cast<uint16_t>(*port);
+        sp_port = *port;
     }
     if (const auto* dest = rs.if_contains("dest"); dest && !dest->is_null()) {
         if (!dest->is_string()) {

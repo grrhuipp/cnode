@@ -65,7 +65,7 @@ namespace {
         stream.ws.path = node_config.Path;
         if (!node_config.Host.empty()) {
             stream.ws.headers.emplace(
-                common::LowerAscii("Host"),
+                "host",
                 node_config.Host);
         }
         break;
