@@ -288,75 +288,6 @@ PrepareTCPRequestLegacy(const common::TargetAddress& target,
     return prepared;
 }
 
-net::awaitable<tl::expected<WriteTCPRequestResult, common::ErrorCode>>
-WriteTCPRequest2022(const common::TargetAddress& target,
-                    const SsCipherInfo& cipher_info,
-                    const KeyBytes& master_key,
-                    std::span<const KeyBytes> psk_chain,
-                    transport::AsyncStream& stream,
-                    common::ForwardedMetadataView forwarded) {
-    common::MultiBuffer handshake_mb;
-    std::optional<SsAeadCipher> write_cipher;
-    KeyBytes request_salt;
-    {
-        auto prepared = PrepareTCPRequest2022(
-            target, cipher_info, master_key, psk_chain, forwarded);
-        if (!prepared) {
-            co_return tl::unexpected(prepared.error());
-        }
-        handshake_mb = std::move(prepared->handshake_mb);
-        write_cipher = std::move(prepared->write_cipher);
-        request_salt = prepared->request_salt;
-    }
-    try {
-        co_await stream.WriteMultiBuffer(std::move(handshake_mb));
-    } catch (...) {
-        co_return tl::unexpected(transport::ClassifyFailure(
-            std::current_exception(), common::ErrorCode::SOCKET_WRITE_FAILED));
-    }
-
-    co_return WriteTCPRequestResult{
-        .request_writer = SsStreamWriter(std::move(*write_cipher), 2, stream),
-        .request_salt = request_salt,
-    };
-}
-
-net::awaitable<tl::expected<WriteTCPRequestResult, common::ErrorCode>>
-WriteTCPRequestLegacy(const common::TargetAddress& target,
-                      const SsCipherInfo& cipher_info,
-                      const KeyBytes& master_key,
-                      transport::AsyncStream& stream,
-                      common::ForwardedMetadataView forwarded) {
-    try {
-        common::MultiBuffer handshake_mb;
-        std::optional<SsAeadCipher> write_cipher;
-        {
-            auto prepared = PrepareTCPRequestLegacy(
-                target, cipher_info, master_key, forwarded);
-            if (!prepared) {
-                co_return tl::unexpected(prepared.error());
-            }
-            handshake_mb = std::move(prepared->handshake_mb);
-            write_cipher = std::move(prepared->write_cipher);
-        }
-
-        try {
-            co_await stream.WriteMultiBuffer(std::move(handshake_mb));
-        } catch (...) {
-            co_return tl::unexpected(transport::ClassifyFailure(
-                std::current_exception(), common::ErrorCode::SOCKET_WRITE_FAILED));
-        }
-
-        co_return WriteTCPRequestResult{
-            .request_writer = SsStreamWriter(std::move(*write_cipher), 2, stream),
-            .request_salt = {},
-        };
-    } catch (...) {
-        co_return tl::unexpected(transport::ClassifyFailure(
-            std::current_exception(), common::ErrorCode::SOCKET_WRITE_FAILED));
-    }
-}
-
 }  // namespace
 
 net::awaitable<tl::expected<WriteTCPRequestResult, common::ErrorCode>>
@@ -366,13 +297,37 @@ WriteTCPRequest(const common::TargetAddress& target,
                 std::span<const KeyBytes> psk_chain,
                 transport::AsyncStream& stream,
                 common::ForwardedMetadataView forwarded) {
-    if (Is2022Cipher(cipher_info.type)) {
-        return WriteTCPRequest2022(
-            target, cipher_info, master_key, psk_chain, stream, forwarded);
+    common::MultiBuffer handshake_mb;
+    std::optional<SsAeadCipher> write_cipher;
+    KeyBytes request_salt{};
+    try {
+        auto prepared = Is2022Cipher(cipher_info.type)
+            ? PrepareTCPRequest2022(target, cipher_info, master_key, psk_chain, forwarded)
+            : PrepareTCPRequestLegacy(target, cipher_info, master_key, forwarded);
+        if (!prepared) {
+            co_return tl::unexpected(prepared.error());
+        }
+        handshake_mb = std::move(prepared->handshake_mb);
+        write_cipher = std::move(prepared->write_cipher);
+        request_salt = prepared->request_salt;
+    } catch (...) {
+        co_return tl::unexpected(transport::ClassifyFailure(
+            std::current_exception(), common::ErrorCode::SOCKET_WRITE_FAILED));
     }
-    return WriteTCPRequestLegacy(target, cipher_info, master_key, stream, forwarded);
-}
 
+    try {
+        co_await stream.WriteMultiBuffer(std::move(handshake_mb));
+    } catch (...) {
+        OPENSSL_cleanse(request_salt.bytes.data(), request_salt.bytes.size());
+        co_return tl::unexpected(transport::ClassifyFailure(
+            std::current_exception(), common::ErrorCode::SOCKET_WRITE_FAILED));
+    }
+
+    co_return WriteTCPRequestResult{
+        .request_writer = SsStreamWriter(std::move(*write_cipher), 2, stream),
+        .request_salt = request_salt,
+    };
+}
 namespace {
 net::awaitable<tl::expected<SsAeadCipher, common::ErrorCode>> ReadResponseCipher(
     transport::AsyncStream& stream, const SsCipherInfo& info, const KeyBytes& master_key) {
@@ -561,66 +516,6 @@ common::TargetAddress MakeServerTarget(const transport::OutboundServer& server) 
 }
 
 
-net::awaitable<tl::expected<proxy::WriteTCPRequestResult, common::ErrorCode>>
-SendShadowsocksHandshake(
-    transport::AsyncStream& stream,
-    const proxy::SsPreparedSettings& prepared,
-    bool use_uot,
-    const common::TargetAddress& target,
-    std::chrono::seconds handshake_timeout,
-    const transport::PhaseDeadlineToken& outbound_protocol_deadline,
-    const transport::OutboundDialer& dialer,
-    const common::Context& ctx) {
-    const common::TargetAddress uot_magic_target = use_uot
-        ? common::TargetAddress(proxy::MagicAddress(*prepared.config.uot_version), 0)
-        : common::TargetAddress{};
-    const common::TargetAddress& protocol_target = use_uot ? uot_magic_target : target;
-
-    stream.SetIdleTimeout(handshake_timeout);
-
-    auto request_writer_result = co_await proxy::WriteTCPRequest(
-        protocol_target,
-        prepared.credentials.Cipher(),
-        prepared.credentials.MasterKey(),
-        prepared.credentials.PskChain(),
-        stream,
-        dialer.ForwardedMetadata(ctx));
-    if (!request_writer_result) {
-        const bool timed_out = proxy::ConsumeOutboundHandshakeTimeout(
-            stream, outbound_protocol_deadline);
-        stream.Cancel();
-        co_return tl::unexpected(timed_out
-            ? common::ErrorCode::TIMEOUT
-            : request_writer_result.error());
-    }
-    co_return std::move(*request_writer_result);
-}
-
-net::awaitable<tl::expected<void, common::ErrorCode>>
-WriteUotRequest(
-    ShadowsocksOutboundEndpoint& target_endpoint,
-    const common::TargetAddress& target,
-    const transport::PhaseDeadlineToken& outbound_protocol_deadline,
-    const transport::OutboundDialer& dialer,
-    const common::Context& ctx) {
-    auto request = proxy::EncodeUotRequest(
-        false, target, dialer.ForwardedMetadata(ctx));
-    if (!request) {
-        target_endpoint.RelayControl().Cancel();
-        co_return tl::unexpected(request.error());
-    }
-    const std::array<net::const_buffer, 1> request_buffers{
-        net::buffer(request->bytes.data(), request->size)};
-    try {
-        co_await target_endpoint.WriteBuffers(request_buffers);
-    } catch (...) {
-        const common::ErrorCode code = proxy::ClassifyOutboundHandshakeException(
-            target_endpoint.RelayControl(), outbound_protocol_deadline);
-        target_endpoint.RelayControl().Cancel();
-        co_return tl::unexpected(code);
-    }
-    co_return tl::expected<void, common::ErrorCode>{};
-}
 net::awaitable<tl::expected<std::unique_ptr<transport::AsyncStream>, common::ErrorCode>>
 DialAndHandshakeShadowsocks(
     common::Context& ctx,
@@ -636,40 +531,57 @@ DialAndHandshakeShadowsocks(
     auto stream = std::move(*dialed);
     transport::PhaseDeadlineToken outbound_protocol_deadline =
         stream->StartPhaseDeadline(handshake_timeout);
+    stream->SetIdleTimeout(handshake_timeout);
 
-    auto request_session = co_await SendShadowsocksHandshake(
-        *stream,
-        prepared,
-        use_uot,
-        ctx.outbound.target,
-        handshake_timeout,
-        outbound_protocol_deadline,
-        dialer,
-        ctx);
-    if (!request_session) {
-        stream->CloseAbortive();
-        co_return tl::unexpected(request_session.error());
+    {
+        const common::TargetAddress uot_magic_target = use_uot
+            ? common::TargetAddress(proxy::MagicAddress(*prepared.config.uot_version), 0)
+            : common::TargetAddress{};
+        const common::TargetAddress& protocol_target = use_uot ? uot_magic_target : ctx.outbound.target;
+        auto request_writer_result = co_await proxy::WriteTCPRequest(
+            protocol_target,
+            prepared.credentials.Cipher(),
+            prepared.credentials.MasterKey(),
+            prepared.credentials.PskChain(),
+            *stream,
+            dialer.ForwardedMetadata(ctx));
+        if (!request_writer_result) {
+            const bool timed_out = proxy::ConsumeOutboundHandshakeTimeout(
+                *stream, outbound_protocol_deadline);
+            stream->Cancel();
+            stream->CloseAbortive();
+            co_return tl::unexpected(timed_out
+                ? common::ErrorCode::TIMEOUT
+                : request_writer_result.error());
+        }
+        target_endpoint.emplace(
+            std::move(request_writer_result->request_writer),
+            prepared.credentials.Cipher(),
+            prepared.credentials.MasterKey(),
+            request_writer_result->request_salt,
+            *stream);
     }
 
-    target_endpoint.emplace(
-        std::move(request_session->request_writer),
-        prepared.credentials.Cipher(),
-        prepared.credentials.MasterKey(),
-        request_session->request_salt,
-        *stream);
-
-    if (use_uot &&
-        *prepared.config.uot_version != proxy::UotVersion::V1) {
-        if (auto ok = co_await WriteUotRequest(
-                *target_endpoint,
-                ctx.outbound.target,
-                outbound_protocol_deadline,
-                dialer,
-                ctx);
-            !ok) {
+    if (use_uot && *prepared.config.uot_version != proxy::UotVersion::V1) {
+        auto request = proxy::EncodeUotRequest(
+            false, ctx.outbound.target, dialer.ForwardedMetadata(ctx));
+        if (!request) {
             target_endpoint.reset();
+            stream->Cancel();
             stream->CloseAbortive();
-            co_return tl::unexpected(ok.error());
+            co_return tl::unexpected(request.error());
+        }
+        const std::array<net::const_buffer, 1> request_buffers{
+            net::buffer(request->bytes.data(), request->size)};
+        try {
+            co_await target_endpoint->WriteBuffers(request_buffers);
+        } catch (...) {
+            const common::ErrorCode code = proxy::ClassifyOutboundHandshakeException(
+                target_endpoint->RelayControl(), outbound_protocol_deadline);
+            target_endpoint.reset();
+            stream->Cancel();
+            stream->CloseAbortive();
+            co_return tl::unexpected(code);
         }
     }
     co_return std::move(stream);

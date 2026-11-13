@@ -267,6 +267,68 @@ AttachXHttpDownloadTarget(
         std::make_unique<OutboundTransportTarget>(std::move(*download_target));
     co_return target;
 }
+
+// Synchronous fast path for IP-literal next hops without XHTTP downloadSettings:
+// avoids allocating BuildOutboundTransportTarget + AttachXHttpDownloadTarget
+// coroutine frames on steady-state proxy outbound dials.
+[[nodiscard]] std::optional<tl::expected<OutboundTransportTarget, common::ErrorCode>>
+TryBuildLiteralOutboundTarget(const OutboundTargetOptions& options) {
+    if (!options.stream_settings || options.port == 0) {
+        return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
+    }
+    if (!options.literal_address && options.address.empty()) {
+        return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
+    }
+    if (options.stream_settings->IsXHttp() &&
+        options.stream_settings->xhttp.download_settings) {
+        return std::nullopt;
+    }
+    const auto literal = options.literal_address
+        ? options.literal_address
+        : common::ParseLiteral(options.address);
+    if (!literal) {
+        return std::nullopt;
+    }
+
+    const OutboundBind unbound;
+    const auto& bind = options.send_through ? *options.send_through : unbound;
+    const auto default_ordered =
+        (!options.ordered_bind_v4 || !options.ordered_bind_v6)
+            ? SelectOrderedBind(
+                  bind,
+                  options.inbound_source_ip,
+                  options.inbound_user_id,
+                  options.inbound_user_email,
+                  options.inbound_tag)
+            : std::nullopt;
+    const OutboundDialer::OrderedBind resolved_ordered{
+        .v4 = options.ordered_bind_v4
+            ? *options.ordered_bind_v4
+            : (default_ordered ? default_ordered->v4 : OutboundBind::Selection{}),
+        .v6 = options.ordered_bind_v6
+            ? *options.ordered_bind_v6
+            : (default_ordered ? default_ordered->v6 : OutboundBind::Selection{}),
+    };
+    const OutboundDialer::OrderedBind* const ordered_ptr =
+        bind.GetMode() == OutboundBind::Mode::Ordered ? &resolved_ordered : nullptr;
+
+    OutboundTransportTarget target;
+    target.timeout = options.timeout;
+    target.stream_settings = options.stream_settings;
+    target.security_context = options.security ? options.security->Context() : nullptr;
+    target.tls_server_name = ResolveOutboundTlsServerName(
+        *options.stream_settings, options.address);
+    target.ws_host = BuildHttpHostHeader(
+        *options.stream_settings, options.address, options.port);
+    target.single_candidate = MakeDialCandidate(
+        *literal, options.port, bind, options.inbound_local_addr, ordered_ptr);
+    return target;
+}
+
+[[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, common::ErrorCode>>
+MakeImmediateDialError(common::ErrorCode code) {
+    co_return tl::unexpected(code);
+}
 }  // namespace
 
 net::awaitable<DialResult> ConnectOutboundCandidate(
@@ -316,13 +378,9 @@ std::string_view ResolveOutboundTlsServerName(
 
 net::awaitable<tl::expected<OutboundTransportTarget, common::ErrorCode>>
 BuildOutboundTransportTarget(OutboundTargetOptions options) {
-    if (!options.stream_settings || options.port == 0) {
-        co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
+    if (auto sync_built = TryBuildLiteralOutboundTarget(options)) {
+        co_return std::move(*sync_built);
     }
-    if (!options.literal_address && options.address.empty()) {
-        co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
-    }
-
     const std::optional<tcp::endpoint> inbound_local = options.inbound_local_addr
         ? std::optional<tcp::endpoint>(*options.inbound_local_addr)
         : std::nullopt;
@@ -428,6 +486,9 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
     if (target.candidates.empty() && !target.single_candidate) {
         co_return tl::unexpected(common::ErrorCode::DNS_RESOLVE_FAILED);
     }
+    if (!has_download) {
+        co_return target;
+    }
     co_return co_await AttachXHttpDownloadTarget(
         std::move(target),
         options,
@@ -464,6 +525,36 @@ std::optional<OutboundDialer::OrderedBind> OutboundDialer::SelectOrderedBind(
 net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, common::ErrorCode>>
 OutboundDialer::Dial(common::Context& ctx, const OutboundServer& server,
                      const OrderedBind* ordered) {
+    const OutboundTargetOptions options{
+        .dns_service = &dns_,
+        .address = server.address,
+        .literal_address = server.literal_address,
+        .port = server.port,
+        .stream_settings = &sender_.stream_settings,
+        .security = &security_,
+        .timeout = timeout_,
+        .send_through = &sender_.send_through,
+        .inbound_local_addr = ctx.inbound.local_endpoint
+            ? &*ctx.inbound.local_endpoint : nullptr,
+        .inbound_source_ip = ctx.inbound.EffectiveClientIp(),
+        .inbound_user_id = ctx.inbound.EffectiveUserId(),
+        .inbound_user_email = ctx.inbound.EffectiveUserEmail(),
+        .inbound_tag = ctx.inbound.EffectiveInboundTag(),
+        .ordered_bind_v4 = ordered ? std::optional{ordered->v4} : std::nullopt,
+        .ordered_bind_v6 = ordered ? std::optional{ordered->v6} : std::nullopt,
+    };
+    if (auto sync_target = TryBuildLiteralOutboundTarget(options)) {
+        if (!*sync_target) {
+            return MakeImmediateDialError(sync_target->error());
+        }
+        return DialTarget(ctx, std::move(**sync_target));
+    }
+    return DialServerSlow(ctx, server, ordered);
+}
+
+net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, common::ErrorCode>>
+OutboundDialer::DialServerSlow(common::Context& ctx, const OutboundServer& server,
+                               const OrderedBind* ordered) {
     auto target = co_await BuildOutboundTransportTarget(OutboundTargetOptions{
         .dns_service = &dns_,
         .address = server.address,
@@ -488,35 +579,58 @@ OutboundDialer::Dial(common::Context& ctx, const OutboundServer& server,
         }
         co_return tl::unexpected(target.error());
     }
-    co_return co_await DialTarget(ctx, *target);
+    co_return co_await DialTarget(ctx, std::move(*target));
 }
 
 net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, common::ErrorCode>>
 OutboundDialer::Dial(common::Context& ctx, const common::TargetAddress& target,
                      AddressFamilyPolicy policy) {
-    if (!target.IsValid()) co_return tl::unexpected(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    if (!target.IsValid()) {
+        return MakeImmediateDialError(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    }
     if (!target.IsDomain()) {
-        if (!target.resolved_addr) co_return tl::unexpected(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        if (!target.resolved_addr) {
+            return MakeImmediateDialError(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
         if (!policy.restricts_literals) {
             policy.accepts_v4 = true;
             policy.accepts_v6 = true;
         }
-        co_return co_await DialAddresses(ctx, {&*target.resolved_addr, 1}, target.port, policy);
+        auto built = BuildResolvedTarget(ctx, {&*target.resolved_addr, 1}, target.port, policy);
+        if (!built) {
+            return MakeImmediateDialError(built.error());
+        }
+        return DialTarget(ctx, std::move(*built));
     }
-    auto resolved = co_await dns_.Resolve(target.host);
-    if (!resolved.Ok()) co_return tl::unexpected(common::ErrorCode::DNS_RESOLVE_FAILED);
-    co_return co_await DialAddresses(ctx, resolved.addresses, target.port, policy);
+    return DialDomainTarget(ctx, target, policy);
 }
 
 net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, common::ErrorCode>>
-OutboundDialer::DialAddresses(common::Context& ctx,
-                              std::span<const net::ip::address> addresses,
-                              uint16_t port, AddressFamilyPolicy policy) {
+OutboundDialer::DialDomainTarget(common::Context& ctx, const common::TargetAddress& target,
+                                 AddressFamilyPolicy policy) {
+    auto resolved = co_await dns_.Resolve(target.host);
+    if (!resolved.Ok()) {
+        co_return tl::unexpected(common::ErrorCode::DNS_RESOLVE_FAILED);
+    }
+    auto built = BuildResolvedTarget(ctx, resolved.addresses, target.port, policy);
+    std::vector<net::ip::address>{}.swap(resolved.addresses);
+    if (!built) {
+        co_return tl::unexpected(built.error());
+    }
+    co_return co_await DialTarget(ctx, std::move(*built));
+}
+
+tl::expected<OutboundTransportTarget, common::ErrorCode>
+OutboundDialer::BuildResolvedTarget(const common::Context& ctx,
+                                    std::span<const net::ip::address> addresses,
+                                    uint16_t port, AddressFamilyPolicy policy) const {
     const auto accepts = [&](const net::ip::address& remote) {
         return common::NormalizeAddress(remote).is_v6() ? policy.accepts_v6 : policy.accepts_v4;
     };
     const auto count = static_cast<size_t>(std::ranges::count_if(addresses, accepts));
-    if (count == 0) co_return tl::unexpected(common::ErrorCode::DNS_NO_RECORD);
+    if (count == 0) {
+        return tl::unexpected(common::ErrorCode::DNS_NO_RECORD);
+    }
     const auto& bind = sender_.send_through;
     const auto ordered = SelectOrderedBind(ctx);
     const tcp::endpoint* inbound_local =
@@ -535,11 +649,11 @@ OutboundDialer::DialAddresses(common::Context& ctx,
             ordered ? &*ordered : nullptr, count, policy.prefers_v6, accepts);
     }
     LOG_CONN_DEBUG(ctx, "dialing {} resolved candidates port={}", count, port);
-    co_return co_await DialTarget(ctx, target);
+    return target;
 }
 
 net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, common::ErrorCode>>
-OutboundDialer::DialTarget(common::Context& ctx, const OutboundTransportTarget& target) {
+OutboundDialer::DialTarget(common::Context& ctx, OutboundTransportTarget target) {
     auto dialed = co_await DialOutboundTransport(IoContext(), ctx, target);
     if (!dialed.Ok()) {
         ctx.outbound.connected_local_addr.reset();

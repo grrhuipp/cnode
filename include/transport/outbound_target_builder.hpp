@@ -205,11 +205,17 @@ public:
     void RecordConnected(common::Context& ctx, const AsyncStream& stream) const;
 
 private:
+    [[nodiscard]] tl::expected<OutboundTransportTarget, common::ErrorCode>
+    BuildResolvedTarget(const common::Context& ctx, std::span<const net::ip::address> addresses,
+                        uint16_t port, AddressFamilyPolicy policy) const;
     [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, common::ErrorCode>>
-    DialAddresses(common::Context& ctx, std::span<const net::ip::address> addresses,
-                  uint16_t port, AddressFamilyPolicy policy);
+    DialServerSlow(common::Context& ctx, const OutboundServer& server,
+                   const OrderedBind* ordered);
     [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, common::ErrorCode>>
-    DialTarget(common::Context& ctx, const OutboundTransportTarget& target);
+    DialDomainTarget(common::Context& ctx, const common::TargetAddress& target,
+                     AddressFamilyPolicy policy);
+    [[nodiscard]] net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, common::ErrorCode>>
+    DialTarget(common::Context& ctx, OutboundTransportTarget target);
     [[nodiscard]] tl::expected<net::ip::address, common::ErrorCode> SelectDatagramBind(
         const common::Context& ctx, const DatagramRemote& remote) const;
     void ReportDatagramFailure(const common::Context& ctx,
