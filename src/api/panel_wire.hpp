@@ -77,7 +77,8 @@ ExtractBlockDetectRules(const infra::object& config);
 
 [[nodiscard]] tl::expected<std::vector<UserInfo>, std::string>
 ParseUserList(const infra::object& source);
-
+[[nodiscard]] tl::expected<std::vector<UserInfo>, std::string>
+ParseUserList(infra::object&& source);
 [[nodiscard]] OnlineReportPayload BuildOnlineReportPayload(
     std::span<const OnlineUser> online_devices,
     int node_id);

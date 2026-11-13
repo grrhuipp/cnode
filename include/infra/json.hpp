@@ -79,6 +79,7 @@ public:
     [[nodiscard]] bool is_array() const noexcept;
 
     [[nodiscard]] bool as_bool() const;
+    [[nodiscard]] std::string& as_string();
     [[nodiscard]] const std::string& as_string() const;
     [[nodiscard]] int64_t as_int64() const;
     [[nodiscard]] uint64_t as_uint64() const;

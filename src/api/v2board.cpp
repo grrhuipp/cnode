@@ -566,6 +566,7 @@ APIClient::GetNodeInfo(std::string committed_etag) {
     infra::value jv;
     try {
         jv = infra::parse(resp.body);
+        std::string{}.swap(resp.body);
     } catch (const std::exception& e) {
         LOG_PANEL_ERROR(log_context_, "Node configuration parsing failed: {}", e.what());
         co_return NodeInfoFetchResult::Fail(common::ErrorCode::PANEL_INVALID_RESPONSE, e.what());
@@ -617,15 +618,16 @@ APIClient::GetUserList(std::string committed_etag) {
     auto& resp = *fetched;
     try {
         auto jv = infra::parse(resp.body);
+        std::string{}.swap(resp.body);
         if (!jv.is_object()) {
             LOG_PANEL_ERROR(log_context_, "User list parsing failed: root JSON value must be an object");
             co_return UserListFetchResult::Fail(
                 common::ErrorCode::PANEL_INVALID_RESPONSE,
                 "root JSON value must be an object");
         }
-        auto& j = jv.as_object();
 
-        auto users = ParseUserList(j);
+        auto users = ParseUserList(std::move(jv.as_object()));
+        jv = infra::value{};
         if (!users) {
             LOG_PANEL_ERROR(log_context_, "User list parsing failed: {}", users.error());
             co_return UserListFetchResult::Fail(
@@ -1100,11 +1102,12 @@ tl::expected<uint64_t, std::string> ParseOptionalLimit(
     return *limit;
 }
 
+template <typename Object>
 tl::expected<std::string, std::string> ParseOptionalString(
-    const infra::object& source,
+    Object&& source,
     std::string_view field,
     size_t user_index) {
-    const auto* value = source.if_contains(field);
+    auto* value = source.if_contains(field);
     if (!value || value->is_null()) return std::string{};
     if (!value->is_string()) {
         return tl::unexpected(std::format(
@@ -1114,7 +1117,12 @@ tl::expected<std::string, std::string> ParseOptionalString(
         return tl::unexpected(std::format(
             "users[{}].{} contains control characters", user_index, field));
     }
-    return std::string(value->as_string());
+    if constexpr (!std::is_const_v<std::remove_reference_t<Object>> &&
+                  !std::is_lvalue_reference_v<Object>) {
+        return std::move(value->as_string());
+    } else {
+        return std::string(value->as_string());
+    }
 }
 
 bool IsValidDevice(const OnlineUser& device) noexcept {
@@ -1158,8 +1166,6 @@ OnlineReportPayload BuildFromCanonicalDevices(
     result.alive_json.push_back('{');
 
     char uid_buf[24];
-    std::string endpoint;
-    endpoint.reserve(48 + suffix.size());
     for (size_t i = 0; i < devices.size();) {
         if (result.user_count != 0) {
             result.alive_json.push_back(',');
@@ -1177,9 +1183,10 @@ OnlineReportPayload BuildFromCanonicalDevices(
             if (j != i) {
                 result.alive_json.push_back(',');
             }
-            endpoint.assign(devices[j].IP);
-            endpoint.append(suffix);
-            infra::append_json_string(result.alive_json, endpoint);
+            infra::append_json_string(result.alive_json, devices[j].IP);
+            result.alive_json.pop_back();
+            result.alive_json.append(suffix);
+            result.alive_json.push_back('"');
             ++j;
         }
         result.alive_json.push_back(']');
@@ -1490,9 +1497,15 @@ tl::expected<std::vector<common::DetectRule>, std::string> ExtractBlockDetectRul
     return rules;
 }
 
+namespace {
+
+template <typename Object>
 tl::expected<std::vector<UserInfo>, std::string>
-ParseUserList(const infra::object& source) {
-    const auto* users_value = source.if_contains("users");
+ParseUserListImpl(Object&& source) {
+    constexpr bool kCanConsume =
+        !std::is_const_v<std::remove_reference_t<Object>> &&
+        !std::is_lvalue_reference_v<Object>;
+    auto* users_value = source.if_contains("users");
     if (!users_value) {
         return tl::unexpected("users is required");
     }
@@ -1500,7 +1513,7 @@ ParseUserList(const infra::object& source) {
         return tl::unexpected("users must be an array");
     }
 
-    const auto& users_array = users_value->as_array();
+    auto& users_array = users_value->as_array();
     std::vector<UserInfo> users;
     users.reserve(users_array.size());
     // A repeated id would merge accounting for two users. Credentials are
@@ -1508,11 +1521,11 @@ ParseUserList(const infra::object& source) {
     std::unordered_set<int64_t> seen_ids;
     seen_ids.reserve(users_array.size());
     for (size_t i = 0; i < users_array.size(); ++i) {
-        const auto& user_value = users_array[i];
+        auto& user_value = users_array[i];
         if (!user_value.is_object()) {
             return tl::unexpected(std::format("users[{}] must be an object", i));
         }
-        const auto& source_user = user_value.as_object();
+        auto& source_user = user_value.as_object();
         UserInfo user;
 
         const auto* id = source_user.if_contains("id");
@@ -1527,7 +1540,7 @@ ParseUserList(const infra::object& source) {
             return tl::unexpected(std::format("users[{}].id duplicates another user", i));
         }
 
-        const auto* uuid = source_user.if_contains("uuid");
+        auto* uuid = source_user.if_contains("uuid");
         if (!uuid || !uuid->is_string() || uuid->as_string().empty()) {
             return tl::unexpected(std::format(
                 "users[{}].uuid must be a non-empty string", i));
@@ -1536,9 +1549,19 @@ ParseUserList(const infra::object& source) {
             return tl::unexpected(std::format(
                 "users[{}].uuid contains control characters", i));
         }
-        user.UUID = std::string(uuid->as_string());
+        if constexpr (kCanConsume) {
+            user.UUID = std::move(uuid->as_string());
+        } else {
+            user.UUID = std::string(uuid->as_string());
+        }
 
-        auto flow = ParseOptionalString(source_user, "flow", i);
+        auto flow = [&]() {
+            if constexpr (kCanConsume) {
+                return ParseOptionalString(std::move(source_user), "flow", i);
+            } else {
+                return ParseOptionalString(source_user, "flow", i);
+            }
+        }();
         if (!flow) return tl::unexpected(std::move(flow.error()));
         user.Flow = common::LowerAscii(std::move(*flow));
 
@@ -1564,12 +1587,33 @@ ParseUserList(const infra::object& source) {
         }
         user.DeviceLimit = static_cast<uint32_t>(*device_limit);
 
-        auto email = ParseOptionalString(source_user, "email", i);
+        auto email = [&]() {
+            if constexpr (kCanConsume) {
+                return ParseOptionalString(std::move(source_user), "email", i);
+            } else {
+                return ParseOptionalString(source_user, "email", i);
+            }
+        }();
         if (!email) return tl::unexpected(std::move(email.error()));
         user.Email = std::move(*email);
+        if constexpr (kCanConsume) {
+            user_value = infra::value{};
+        }
         users.push_back(std::move(user));
     }
     return users;
+}
+
+}  // namespace
+
+tl::expected<std::vector<UserInfo>, std::string>
+ParseUserList(const infra::object& source) {
+    return ParseUserListImpl(source);
+}
+
+tl::expected<std::vector<UserInfo>, std::string>
+ParseUserList(infra::object&& source) {
+    return ParseUserListImpl(std::move(source));
 }
 
 OnlineReportPayload BuildOnlineReportPayload(

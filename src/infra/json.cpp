@@ -195,6 +195,7 @@ bool value::is_object() const noexcept { return std::holds_alternative<object_pt
 bool value::is_array() const noexcept { return std::holds_alternative<array_ptr>(data_); }
 
 bool value::as_bool() const { return std::get<bool>(data_); }
+std::string& value::as_string() { return std::get<std::string>(data_); }
 const std::string& value::as_string() const { return std::get<std::string>(data_); }
 int64_t value::as_int64() const { return std::get<int64_t>(data_); }
 uint64_t value::as_uint64() const { return std::get<uint64_t>(data_); }
