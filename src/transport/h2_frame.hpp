@@ -1,5 +1,4 @@
 #pragma once
-#include "common/allocator.hpp"
 #include "transport/http2_session.hpp"
 #include "transport/http1_handshake.hpp"
 #include "transport/hpack.hpp"

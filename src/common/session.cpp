@@ -1,5 +1,5 @@
 #include "common/session.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 
 #include <charconv>
 #include <array>

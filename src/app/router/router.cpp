@@ -1,6 +1,5 @@
 #include "app/router/router.hpp"
 #include "routing/sniffed_protocol.hpp"
-#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/session.hpp"
 #include "common/constants.hpp"

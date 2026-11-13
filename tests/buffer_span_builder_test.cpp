@@ -198,7 +198,7 @@ TEST(BufferSpanBuilder, ContiguousMultiBufferAlwaysBorrowsZeroCopy) {
     const auto live_before = ::common::test_buffers_live;
     std::array<uint8_t, 6> expected{0, 0x42, 0, 0x7f, 0x80, 0xff};
     ::common::MultiBuffer source;
-    ASSERT_TRUE(::common::AppendSpanToMultiBuffer(expected, source));
+    ASSERT_TRUE(source.AppendSpan(expected));
     {
         const ContiguousView view(std::as_const(source));
         EXPECT_EQ(view.Bytes().data(), source.FrontSpan().data());

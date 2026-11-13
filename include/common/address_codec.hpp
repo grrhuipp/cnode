@@ -2,7 +2,6 @@
 
 #include "common/asio_types.hpp"
 #include "common/multi_buffer.hpp"
-#include "common/eof_cancellation.hpp"
 #include "common/byte_reader.hpp"
 #include "common/error.hpp"
 #include "common/target_address.hpp"

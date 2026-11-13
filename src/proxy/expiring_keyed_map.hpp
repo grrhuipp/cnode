@@ -1,7 +1,6 @@
 #pragma once
 
 #include "common/allocator.hpp"
-#include "common/hash_container_shrink.hpp"
 
 #include <openssl/mem.h>
 #include <openssl/rand.h>

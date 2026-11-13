@@ -6,7 +6,7 @@
 #include "common/byte_reader.hpp"
 #include "common/address_codec.hpp"
 
-#include "common/eof_cancellation.hpp"
+#include "common/asio_types.hpp"
 #include "common/length_prefixed_packet_buffer.hpp"
 #include <array>
 #include <cstring>

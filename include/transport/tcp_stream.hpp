@@ -62,7 +62,7 @@ public:
 
     // Return bytes read ahead by a completed handshake before unread socket data.
     // Only for this byte layer; a TLS owner must retain plaintext at its own layer.
-    void PrependReadData(std::span<const uint8_t> data) override;
+    void PrependReadBytes(std::span<const uint8_t> data) override;
     void PrependReadMultiBuffer(common::MultiBuffer&& mb) override;
     [[nodiscard]] std::optional<DetachedTcpState> DetachForHandoff(
         common::MultiBuffer prefix = {});
@@ -84,7 +84,7 @@ public:
     void SetWriteTimeout(std::chrono::seconds timeout) override;
     bool ConsumeReadTimeout() noexcept;
     bool ConsumeWriteTimeout() noexcept override;
-    PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout);
+    PhaseDeadlineToken StartPhaseDeadline(std::chrono::seconds timeout);
     void ClearPhaseDeadline();
     bool ConsumePhaseDeadline() noexcept;
     void TouchActivity() noexcept;

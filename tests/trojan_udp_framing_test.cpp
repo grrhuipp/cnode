@@ -78,7 +78,7 @@ void Run(Factory&& factory) {
 
 common::MultiBuffer MakeInput(std::span<const uint8_t> bytes) {
     common::MultiBuffer input;
-    EXPECT_TRUE((common::AppendSpanToMultiBuffer(bytes, input))) << "input allocation failed";
+    EXPECT_TRUE((input.AppendSpan(bytes))) << "input allocation failed";
     return input;
 }
 
@@ -236,7 +236,7 @@ TEST(TrojanUdpFraming, LargeDatagramAndScatterWritePreserveMessageBoundary) {
     const common::TargetAddress target("1.1.1.1", 53);
     const std::vector<uint8_t> source(common::Buffer::kSize + 257, 0x6d);
     common::MultiBuffer payload;
-    EXPECT_TRUE((common::AppendSpanToMultiBuffer(source, payload))) << "failed to allocate Trojan UDP test payload";
+    EXPECT_TRUE((payload.AppendSpan(source))) << "failed to allocate Trojan UDP test payload";
     for (common::Buffer* buffer : payload) {
         if (buffer && !buffer->IsEmpty()) {
             buffer->SetUDP(target);

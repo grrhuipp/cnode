@@ -2,7 +2,7 @@
 #include "proxy/udp_datagram_frame.hpp"
 #include "common/address_codec.hpp"
 #include "common/const_buffer_span.hpp"
-#include "common/eof_cancellation.hpp"
+#include "common/asio_types.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/byte_reader.hpp"
 #include "common/error.hpp"
@@ -276,7 +276,7 @@ struct CompleteRecords {
 
 
 using VisionFrameBufferBuilder =
-    common::ConstBufferSpanBuilder<common::MultiBuffer::kInlineCapacity * 3>;
+    common::ConstBufferSpanBuilder<3>;
 
 class VisionHeaderArena {
 public:

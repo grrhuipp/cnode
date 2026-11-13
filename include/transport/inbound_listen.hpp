@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common/asio_types.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 #include "common/constants.hpp"
 #include "transport/http_headers.hpp"
 #include <array>

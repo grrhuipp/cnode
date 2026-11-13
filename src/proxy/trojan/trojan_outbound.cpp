@@ -1,6 +1,6 @@
 #include "common/domain_name.hpp"
 #include "common/scoped_cleanse.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 #include <openssl/mem.h>
 #include "proxy/outbound.hpp"
 #include "proxy/trojan/trojan_codec.hpp"
@@ -9,7 +9,6 @@
 #include "app/relay.hpp"
 #include "app/proxyman/outbound_handler.hpp"
 #include "app/dns/dns.hpp"
-#include "common/hash_container_shrink.hpp"
 #include "infra/config_types.hpp"
 #include "transport/link.hpp"
 #include "transport/outbound_target_builder.hpp"
@@ -71,7 +70,7 @@ SendTrojanHandshake(
     common::Context& ctx,
     const transport::OutboundDialer& dialer) {
     stream.SetIdleTimeout(handshake_timeout);
-    transport::PhaseDeadlineHandle outbound_protocol_deadline =
+    transport::PhaseDeadlineToken outbound_protocol_deadline =
         stream.StartPhaseDeadline(handshake_timeout);
 
     std::array<uint8_t, kRequestPrefixSize + common::kMaxEncodedAddressSize + 2> header_buf{};

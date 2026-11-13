@@ -1,7 +1,7 @@
 #include "transport/outbound_bind.hpp"
 #include "common/ascii.hpp"
 #include "common/hash.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 #include "common/constants.hpp"
 
 #include <algorithm>

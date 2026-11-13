@@ -8,7 +8,7 @@
 
 #include "app/proxyman/inbound_handler.hpp"
 #include "app/stats.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "common/session.hpp"
 #include "common/target_address.hpp"
 #include "routing/dispatcher.hpp"
@@ -100,7 +100,7 @@ class AcceptedReplyResponse final : public ::proxy::InboundDatagramResponse {
 public:
     ::common::MultiBuffer Encode(::proxy::UDPPacketView packet) override {
         ::common::MultiBuffer result;
-        if (!::common::AppendSpanToMultiBuffer(packet.data, result)) throw std::bad_alloc();
+        if (!result.AppendSpan(packet.data)) throw std::bad_alloc();
         return result;
     }
 };
@@ -172,7 +172,7 @@ struct DatagramSource {
         : coordinator(io),
           limiter(::app::ConnectionLimiter::Acquire({}, coordinator.Get())),
           online_users(*coordinator.Get()) {
-        coordinator.Get()->RegisterWorker(io);
+        coordinator.Get()->RegisterWorker();
     }
     WorkerCoordinatorFixture coordinator;
     std::shared_ptr<::app::ConnectionLimiter> limiter;

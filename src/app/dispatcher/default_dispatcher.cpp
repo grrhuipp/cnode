@@ -1,7 +1,6 @@
 #include "app/dispatcher/default_dispatcher.hpp"
 #include "app/relay.hpp"
 
-#include "common/allocator.hpp"
 
 #include "app/stats.hpp"
 #include "app/request_load.hpp"
@@ -122,30 +121,13 @@ net::awaitable<bool> SniffInitialPayload(
     static constexpr size_t kSniffMaxDatagrams = 64;
     static constexpr auto kSniffWindow = std::chrono::milliseconds(200);
     common::MultiBuffer sniff_payload;
-    std::vector<uint8_t> sniff_scratch;
     sniff::Sniffer sniffer;
     size_t cached_bytes = 0;
     size_t cached_datagrams = 0;
 
-    auto copy_cached_bytes = [&](const common::MultiBuffer& mb) {
-        const size_t total = mb.byte_size();
-        if (total == 0) {
-            return std::span<const uint8_t>{};
-        }
-        const size_t want = std::min(total, sniff_byte_limit);
-        if (auto direct = mb.PrefixSpan(want); !direct.empty()) {
-            return direct;
-        }
-        sniff_scratch.resize(want);
-        const size_t copied = mb.CopyPrefixTo(
-            std::span<uint8_t>(sniff_scratch.data(), sniff_scratch.size()));
-        return copied == 0
-            ? std::span<const uint8_t>{}
-            : std::span<const uint8_t>(sniff_scratch.data(), copied);
-    };
-
     auto sniff_cached = [&]() {
-        const auto sniff_data = copy_cached_bytes(sniff_payload);
+        const size_t want = std::min(sniff_payload.byte_size(), sniff_byte_limit);
+        const auto sniff_data = sniff_payload.PrefixSpan(want);
         if (sniff_data.empty()) {
             return sniff::SniffResult{};
         }

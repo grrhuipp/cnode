@@ -3,7 +3,7 @@
 #include "transport/stream_settings.hpp"
 #include "transport/transport_security.hpp"
 #include "common/domain_name.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 #include "common/unsafe.hpp"
 #include "infra/log.hpp"
 #include <openssl/asn1.h>
@@ -206,8 +206,8 @@ std::unique_ptr<SslContext> SslContext::CreateQuicServer(
     return std::unique_ptr<SslContext>(new SslContext(std::move(owner)));
 }
 
-std::shared_ptr<SSL_CTX> SslContext::AcquireNative() const noexcept {
-    return renewal_ ? renewal_->Acquire() : native_owner_;
+SSL_CTX* SslContext::AcquireNative() const noexcept {
+    return renewal_ ? renewal_->Acquire() : native_owner_.get();
 }
 
 bool ConfigureTlsServerAlpn(
@@ -539,13 +539,13 @@ private:
     std::jthread thread_;
 };
 
-AutoSignContextRenewal::AutoSignContextRenewal(std::shared_ptr<SSL_CTX> initial, TlsConfig config)
+AutoSignContextRenewal::AutoSignContextRenewal(bssl::UniquePtr<SSL_CTX> initial, TlsConfig config)
     : config_(std::move(config)) {
     if (!Publish(std::move(initial)))
         throw std::invalid_argument("auto-sign certificate has invalid validity");
 }
 
-bool AutoSignContextRenewal::Publish(std::shared_ptr<SSL_CTX> context) {
+bool AutoSignContextRenewal::Publish(bssl::UniquePtr<SSL_CTX> context) {
     if (!context) return false;
     const X509* certificate = SSL_CTX_get0_certificate(context.get());
     int64_t expires_seconds = 0;
@@ -553,29 +553,32 @@ bool AutoSignContextRenewal::Publish(std::shared_ptr<SSL_CTX> context) {
         return false;
     const auto expires = Clock::time_point(std::chrono::seconds(expires_seconds));
     if (expires <= Clock::now()) return false;
-    const auto previous = current_.load(std::memory_order_acquire);
+    std::lock_guard lock(publish_mutex_);
+    const Snapshot* previous = current_.load(std::memory_order_relaxed);
     if (previous && expires <= previous->expires) return false;
-    current_.store(std::make_shared<const Snapshot>(Snapshot{std::move(context), expires}),
-                   std::memory_order_release);
+    auto snapshot = std::make_unique<const Snapshot>(Snapshot{std::move(context), expires});
+    const Snapshot* published = snapshot.get();
+    history_.push_back(std::move(snapshot));
+    current_.store(published, std::memory_order_release);
     next_attempt_.store(expires - std::chrono::hours(24 * 30), std::memory_order_release);
     return true;
 }
 
 std::shared_ptr<AutoSignContextRenewal> AutoSignContextRenewal::Start(
-    std::shared_ptr<SSL_CTX> initial, TlsConfig config) {
+    bssl::UniquePtr<SSL_CTX> initial, TlsConfig config) {
     auto state = std::shared_ptr<AutoSignContextRenewal>(
         new AutoSignContextRenewal(std::move(initial), std::move(config)));
     AutoSignRenewalScheduler::Instance().Add(state);
     return state;
 }
 
-std::shared_ptr<SSL_CTX> AutoSignContextRenewal::Acquire(Clock::time_point now) const noexcept {
-    const auto snapshot = current_.load(std::memory_order_acquire);
-    if (!snapshot || now >= snapshot->expires) return {};
-    return snapshot->context;
+SSL_CTX* AutoSignContextRenewal::Acquire(Clock::time_point now) const noexcept {
+    const Snapshot* snapshot = current_.load(std::memory_order_acquire);
+    if (!snapshot || now >= snapshot->expires) return nullptr;
+    return snapshot->context.get();
 }
 
-std::shared_ptr<SSL_CTX> AutoSignContextRenewal::Rebuild() const {
+bssl::UniquePtr<SSL_CTX> AutoSignContextRenewal::Rebuild() const {
     return CreateAutoSignServerContext(config_);
 }
 

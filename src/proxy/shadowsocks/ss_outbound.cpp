@@ -22,7 +22,7 @@ private:
 }  // namespace proxy
 #include "common/scoped_cleanse.hpp"
 #include "common/domain_name.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 #include "common/constants.hpp"
 #include "common/address_codec.hpp"
 #include "common/multi_buffer.hpp"
@@ -544,7 +544,7 @@ SendShadowsocksHandshake(
     bool use_uot,
     const common::TargetAddress& target,
     std::chrono::seconds handshake_timeout,
-    const transport::PhaseDeadlineHandle& outbound_protocol_deadline,
+    const transport::PhaseDeadlineToken& outbound_protocol_deadline,
     const transport::OutboundDialer& dialer,
     const common::Context& ctx) {
     const common::TargetAddress uot_magic_target = use_uot
@@ -576,7 +576,7 @@ net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteUotRequest(
     ShadowsocksOutboundEndpoint& target_endpoint,
     const common::TargetAddress& target,
-    const transport::PhaseDeadlineHandle& outbound_protocol_deadline,
+    const transport::PhaseDeadlineToken& outbound_protocol_deadline,
     const transport::OutboundDialer& dialer,
     const common::Context& ctx) {
     auto request = proxy::EncodeUotRequest(
@@ -650,7 +650,7 @@ net::awaitable<proxy::OutboundProcessResult> proxy::SsOutboundHandler::Process(
     auto stream = std::move(*dialed);
     std::optional<ShadowsocksOutboundEndpoint> target_endpoint;
     {
-        transport::PhaseDeadlineHandle outbound_protocol_deadline =
+        transport::PhaseDeadlineToken outbound_protocol_deadline =
             stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
 
         auto request_session = co_await SendShadowsocksHandshake(

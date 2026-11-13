@@ -1,9 +1,9 @@
 {
   "log": {
     "loglevel": "info",
-    "access": "/var/log/cnode/access.log",
-    "error": "/var/log/cnode/error.log",
-    "logDir": "/var/log/cnode"
+    "access": "/opt/cnode/log/access.log",
+    "error": "/opt/cnode/log/error.log",
+    "logDir": "/opt/cnode/log"
   },
   "workers": 0,
   "limits": {
@@ -22,7 +22,7 @@
     "maxTTL": 3600
   },
   "timeouts": {
-    "handshake": 10,
+    "handshake": 60,
     "dial": 10,
     "read": 15,
     "write": 30,

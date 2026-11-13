@@ -5,7 +5,7 @@
 #include "common/scoped_cleanse.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "proxy/inbound.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "proxy/vless/vless_codec.hpp"
 #include "proxy/vless/vless_encryption.hpp"
 #include "app/worker_mailbox.hpp"
@@ -77,7 +77,7 @@ private:
             co_return;
         }
         header_sent_ = true;
-        common::ConstBufferSpanBuilder<1 + common::MultiBuffer::kInlineCapacity> out;
+        common::ConstBufferSpanBuilder<2> out;
         out.Append(HeaderBuffer());
         out.AppendMultiBuffer(mb);
         co_await dst_.WriteBuffers(out.Span());
@@ -89,7 +89,7 @@ private:
             co_return;
         }
         header_sent_ = true;
-        common::ConstBufferSpanBuilder<1 + common::MultiBuffer::kInlineCapacity> out;
+        common::ConstBufferSpanBuilder<2> out;
         out.Append(HeaderBuffer());
         out.AppendBuffers(buffers);
         co_await dst_.WriteBuffers(out.Span());

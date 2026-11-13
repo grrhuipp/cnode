@@ -1,7 +1,7 @@
 #include "transport/proxy_protocol.hpp"
 #include "common/byte_reader.hpp"
 #include "infra/log.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 
 #include <algorithm>
 #include <array>

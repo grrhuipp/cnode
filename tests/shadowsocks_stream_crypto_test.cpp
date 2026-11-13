@@ -159,7 +159,7 @@ void TestLargeRecord(size_t payload_size, proxy::SsCipherType cipher_type) {
 
     proxy::SsAeadCipher decryptor(cipher_type, key.data(), key.size());
     common::MultiBuffer encrypted;
-    EXPECT_TRUE((common::AppendSpanToMultiBuffer(ciphertext, encrypted))) << "encrypted fixture allocation failed";
+    EXPECT_TRUE((encrypted.AppendSpan(ciphertext))) << "encrypted fixture allocation failed";
     common::MultiBuffer decoded;
     EXPECT_TRUE((proxy::DecryptStreamPayload(
               decryptor, nonce, std::move(encrypted), decoded))) << "large Shadowsocks record decrypt failed";
@@ -188,7 +188,7 @@ void TestInvalidTagDoesNotPublishPartialPlaintext() {
 
     proxy::SsAeadCipher decryptor(proxy::SsCipherType::AES_256_GCM, key.data(), key.size());
     common::MultiBuffer encrypted;
-    EXPECT_TRUE((common::AppendSpanToMultiBuffer(ciphertext, encrypted))) << "encrypted fixture allocation failed";
+    EXPECT_TRUE((encrypted.AppendSpan(ciphertext))) << "encrypted fixture allocation failed";
     common::MultiBuffer decoded;
     EXPECT_FALSE((proxy::DecryptStreamPayload(
                decryptor, nonce, std::move(encrypted), decoded))) << "invalid Shadowsocks record tag was accepted";
@@ -224,7 +224,7 @@ public:
         if (cut_ < cuts.size()) count = std::min(count, cuts[cut_] - offset_);
         EXPECT_TRUE((count != 0)) << "invalid encrypted wire cutpoint";
         common::MultiBuffer raw;
-        EXPECT_TRUE((common::AppendSpanToMultiBuffer({wire_.data() + offset_, count}, raw))) << "wire input allocation failed";
+        EXPECT_TRUE((raw.AppendSpan({wire_.data() + offset_, count}))) << "wire input allocation failed";
         offset_ += count;
 #ifdef CNODE_TEST_ALLOCATOR
         if (fail_payload_allocation) {

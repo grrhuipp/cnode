@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/unsafe.hpp"
 #include "common/asio_types.hpp"
 #include "common/multi_buffer.hpp"

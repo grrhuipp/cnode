@@ -1,6 +1,3 @@
-#ifndef CNODE_TEST_ALLOCATOR
-#define CNODE_TEST_ALLOCATOR
-#endif
 #include <gtest/gtest.h>
 
 #include "app/dns/dns_internal.hpp"

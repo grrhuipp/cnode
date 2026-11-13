@@ -1,5 +1,4 @@
 #include "transport/hpack.hpp"
-#include "common/allocator.hpp"
 #include <string>
 #include <vector>
 

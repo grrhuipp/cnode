@@ -6,7 +6,7 @@
 #include "app/dns/dns.hpp"
 #include "app/prepared_inbound.hpp"
 #include "app/proxyman/user_store.hpp"
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
 #include "app/router/router.hpp"
@@ -347,9 +347,8 @@ WorkerRuntimeConfig MakeWorkerRuntimeConfig(
     WorkerRuntimeConfig runtime_config;
     runtime_config.timeouts = config.timeouts;
     runtime_config.limits = config.limits;
-    runtime_config.routing = std::move(routing);
     runtime_config.router = std::make_shared<const app::Router>(
-        runtime_config.routing, geo_database);
+        routing, geo_database);
     runtime_config.outbounds = std::move(outbounds);
     runtime_config.workers = config.workers;
     runtime_config.pressure_threshold = ComputePressureThreshold(runtime_config);
@@ -919,7 +918,7 @@ void RunDataThread(RuntimeOwner& owner, size_t index) noexcept {
     auto& context = *owner.env.worker_pool.io_contexts[index];
     owner.env.worker_pool.workers[index]->RunEventLoop();
     // Live state and maintenance have already joined. Release cancels the
-    // scheduler's final timer; drain that completion before destroying its PMR
+    // scheduler's final timer; drain that completion before destroying its
     // container capacity on this same thread.
     transport::TimeoutScheduler::ReleaseForIoContext(context);
     context.restart();

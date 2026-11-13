@@ -8,7 +8,7 @@
 #include "app/stats.hpp"
 #include "common/asio_types.hpp"
 #include "common/session.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "common/target_address.hpp"
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"

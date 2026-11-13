@@ -1,7 +1,8 @@
 #include "app/proxyman/inbound_handler.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
-#include "common/ip_utils.hpp"
+#include "common/allocator.hpp"
+#include "common/ip_address.hpp"
 #include "common/session.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
@@ -542,6 +543,7 @@ void InboundHandlerRegistry::RemoveHandler(std::string_view tag) {
     }
 
     handlers_.erase(it);
+    common::MaybeShrinkHashContainer(handlers_, 8);
 }
 
 }  // namespace app

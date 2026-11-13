@@ -13,7 +13,7 @@ StreamPhaseDeadline::~StreamPhaseDeadline() noexcept {
     Clear();
 }
 
-PhaseDeadlineHandle StreamPhaseDeadline::Start(std::chrono::seconds timeout) {
+PhaseDeadlineToken StreamPhaseDeadline::Start(std::chrono::seconds timeout) {
     ++generation_;
     expired_ = 0;
     if (timeout <= std::chrono::seconds::zero() || !owner_.IsOpen()) {
@@ -58,7 +58,7 @@ net::awaitable<void> AsyncStream::WriteMultiBuffer(common::MultiBuffer mb) {
         mb.clear();
         co_return;
     }
-    common::ConstBufferSpanBuilder<common::MultiBuffer::kInlineCapacity> buffers;
+    common::ConstBufferSpanBuilder<1> buffers;
     buffers.AppendMultiBuffer(mb);
     try {
         co_await WriteBuffers(buffers.Span());
@@ -118,7 +118,7 @@ void AsyncStream::CloseAbortive() {
     SetAbortiveClose(true);
     Close();
 }
-void AsyncStream::PrependReadData(std::span<const uint8_t> data) {
+void AsyncStream::PrependReadBytes(std::span<const uint8_t> data) {
     if (data.empty()) {
         return;
     }
@@ -164,7 +164,7 @@ bool AsyncStream::ConsumeWriteTimeout() noexcept {
     return tcp && tcp->ConsumeWriteTimeout();
 }
 
-PhaseDeadlineHandle AsyncStream::StartPhaseDeadline(std::chrono::seconds timeout) {
+PhaseDeadlineToken AsyncStream::StartPhaseDeadline(std::chrono::seconds timeout) {
     if (auto* deadline = LogicalPhaseDeadline()) {
         return deadline->Start(timeout);
     }

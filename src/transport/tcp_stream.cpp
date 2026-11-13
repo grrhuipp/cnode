@@ -1,5 +1,4 @@
 #include "transport/tcp_stream.hpp"
-#include "common/allocator.hpp"
 #include "common/const_buffer_span.hpp"
 #include "transport/timeout_scheduler.hpp"
 #include "transport/connection_timeouts.hpp"
@@ -376,7 +375,7 @@ net::awaitable<void> TcpStream::WriteMultiBuffer(common::MultiBuffer mb) {
         mb.clear();
         throw IoSystemError(io_error::broken_pipe);
     }
-    common::ConstBufferSpanBuilder<common::MultiBuffer::kInlineCapacity> builder;
+    common::ConstBufferSpanBuilder<1> builder;
     try {
         builder.AppendMultiBuffer(mb);
         auto buffers = builder.Span();
@@ -633,9 +632,8 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
         }
         if (result.consumed < buf.size()) {
             ReleasePendingData();
-            if (!common::AppendSpanToMultiBuffer(
-                    std::span<const uint8_t>(buf).subspan(result.consumed),
-                    impl_->pending_data)) {
+            if (!impl_->pending_data.AppendSpan(
+                    std::span<const uint8_t>(buf).subspan(result.consumed))) {
                 throw std::bad_alloc();
             }
         }
@@ -645,13 +643,13 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
     co_return ProxyReadResult(ProxyProtocolReadStatus::TooLarge, std::move(result));
 }
 
-void TcpStream::PrependReadData(std::span<const uint8_t> data) {
+void TcpStream::PrependReadBytes(std::span<const uint8_t> data) {
     if (data.empty()) return;
     if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
         throw IoSystemError(io_error::operation_aborted, "TCP read closed");
     }
     common::MultiBuffer prefix;
-    if (!common::AppendSpanToMultiBuffer(data, prefix)) {
+    if (!prefix.AppendSpan(data)) {
         throw std::bad_alloc();
     }
     PrependReadMultiBuffer(std::move(prefix));
@@ -703,7 +701,7 @@ std::optional<DetachedTcpState> TcpStream::DetachForHandoff(
 std::optional<DetachedTcpState> TcpStream::DetachForHandoff(
     std::span<const uint8_t> prefix) {
     common::MultiBuffer mb;
-    if (!prefix.empty() && !common::AppendSpanToMultiBuffer(prefix, mb)) {
+    if (!prefix.empty() && !mb.AppendSpan(prefix)) {
         throw std::bad_alloc();
     }
     return DetachForHandoff(std::move(mb));
@@ -976,7 +974,7 @@ bool TcpStream::ConsumeWriteTimeout() noexcept {
     return impl_->timeouts.ConsumeWriteTimeout();
 }
 
-PhaseDeadlineHandle TcpStream::StartPhaseDeadline(std::chrono::seconds timeout) {
+PhaseDeadlineToken TcpStream::StartPhaseDeadline(std::chrono::seconds timeout) {
     if (!impl_->socket.is_open()) return {};
     return impl_->timeouts.StartPhaseDeadline(timeout);
 }

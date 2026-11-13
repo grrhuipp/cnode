@@ -5,12 +5,11 @@
 #include "common/allocator.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/const_buffer_span.hpp"
-#include "common/hash_container_shrink.hpp"
 #include "common/error.hpp"
 #include "common/hash.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 #include "common/session.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "common/string_hash.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
@@ -353,7 +352,7 @@ public:
         udp::endpoint endpoint;
         common::MultiBuffer payload;
         UdpResourceBudget::PayloadReservation reservation;
-        common::ConstBufferSpanBuilder<common::MultiBuffer::kInlineCapacity> send_buffers;
+        common::ConstBufferSpanBuilder<1> send_buffers;
 
         [[nodiscard]] std::span<const net::const_buffer> SendBuffers() const noexcept;
     };
@@ -552,8 +551,8 @@ public:
 private:
     friend class UdpIngress;
 
-    struct RequestData {
-        explicit RequestData(routing::DispatchPolicy dispatch_policy)
+    struct SessionDispatchState {
+        explicit SessionDispatchState(routing::DispatchPolicy dispatch_policy)
             : policy(std::move(dispatch_policy)) {}
         common::Context context;
         routing::DispatchPolicy policy;
@@ -588,7 +587,7 @@ private:
     common::ErrorCode terminal_error_ = common::ErrorCode::OK;
     ::proxy::InboundDatagramOwner session_owner_;
     transport::CancellationSource cancellation_;
-    std::optional<RequestData> request_;
+    std::optional<SessionDispatchState> request_;
     ClientSession* job_previous_ = nullptr;
     ClientSession* job_next_ = nullptr;
     ClientSession* notify_next_ = nullptr;

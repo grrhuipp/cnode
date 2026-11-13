@@ -1,6 +1,6 @@
 #include "common/rule.hpp"
 
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 #include "common/session.hpp"
 
 #include <algorithm>

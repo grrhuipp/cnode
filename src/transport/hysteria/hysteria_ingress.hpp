@@ -7,7 +7,7 @@
 #include "common/multi_buffer.hpp"
 #include "common/hash.hpp"
 #include "common/session.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "common/asio_types.hpp"
 #include "common/string_hash.hpp"
 

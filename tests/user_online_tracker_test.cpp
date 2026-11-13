@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "transport_coordinator_fixture.hpp"
 
 #include <asio/co_spawn.hpp>
@@ -18,7 +18,7 @@ std::optional<common::UserOnlineSessionGuard> RunDeviceAdmission(
 TEST(UserOnlineTracker, ExplicitCoordinatorSharesDeviceQuotaAndReturnsReservationsAcrossWorkers) {
     net::io_context first, second;
     TransportCoordinatorFixture control(first);
-    control.Coordinator().RegisterWorker(second);
+    control.Coordinator().RegisterWorker();
     common::UserOnlineTracker first_users(control.Coordinator()), second_users(control.Coordinator());
     auto first_lease = RunDeviceAdmission(first, first_users.TryConnectSession("tag", 42, "192.0.2.1", 1));
     ASSERT_TRUE(first_lease);

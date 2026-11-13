@@ -5,9 +5,9 @@
 #include "proxy/inbound_admission.hpp"
 
 #include "common/initial_payload.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 #include "common/session.hpp"
-#include "common/hash_container_shrink.hpp"
+#include "common/allocator.hpp"
 #include "common/string_hash.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"

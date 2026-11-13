@@ -3,7 +3,7 @@
 #include "allocation_hook.hpp"
 #include "transport/timeout_scheduler.hpp"
 #include "transport/async_delay.hpp"
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 #include "app/worker.hpp"
 
 #include <asio/co_spawn.hpp>

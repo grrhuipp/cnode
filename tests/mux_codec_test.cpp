@@ -15,8 +15,8 @@ namespace {
 std::optional<::common::FrameHeader> Decode(std::span<const uint8_t> frame, size_t split) {
     ::common::MultiBuffer input, suffix;
     split = std::min(split, frame.size());
-    if (!::common::AppendSpanToMultiBuffer(frame.first(split), input) ||
-        !::common::AppendSpanToMultiBuffer(frame.subspan(split), suffix)) {
+    if (!input.AppendSpan(frame.first(split)) ||
+        !suffix.AppendSpan(frame.subspan(split))) {
         throw std::bad_alloc();
     }
     suffix.MoveTo(input);
@@ -26,7 +26,7 @@ std::optional<::common::FrameHeader> Decode(std::span<const uint8_t> frame, size
 class TruncatedXudp : public testing::TestWithParam<std::vector<uint8_t>> {};
 TEST_P(TruncatedXudp, EofRejectsPartialLengthOrPayload) {
     common::MultiBuffer input, packet;
-    ASSERT_TRUE(common::AppendSpanToMultiBuffer(GetParam(), input));
+    ASSERT_TRUE(input.AppendSpan(GetParam()));
     common::LengthPrefixedPacketBuffer decoder;
     ASSERT_TRUE(decoder.Append(std::move(input)));
     EXPECT_EQ(decoder.Pop(packet), common::LengthPrefixedPacketBuffer::PopResult::NeedMore);
@@ -152,7 +152,7 @@ TEST(XudpCodec, RecoversDatagramLargerThanSingleBuffer) {
     std::vector<uint8_t> wire{static_cast<uint8_t>(packet.size() >> 8), static_cast<uint8_t>(packet.size())};
     wire.insert(wire.end(), packet.begin(), packet.end());
     common::MultiBuffer input, output;
-    ASSERT_TRUE(common::AppendSpanToMultiBuffer(wire, input));
+    ASSERT_TRUE(input.AppendSpan(wire));
     common::LengthPrefixedPacketBuffer decoder;
     ASSERT_TRUE(decoder.Append(std::move(input)));
     EXPECT_EQ(decoder.Pop(output), common::LengthPrefixedPacketBuffer::PopResult::Packet);
@@ -166,7 +166,7 @@ TEST(XudpCodec, RecoversDatagramLargerThanSingleBuffer) {
 TEST(XudpCodec, EmptyPacketConsumesItsHeaderWithoutCorruptingSuccessor) {
     const std::array<uint8_t, 5> wire{0, 0, 0, 1, 0x4f};
     common::MultiBuffer input, output;
-    ASSERT_TRUE(common::AppendSpanToMultiBuffer(wire, input));
+    ASSERT_TRUE(input.AppendSpan(wire));
     common::LengthPrefixedPacketBuffer decoder;
     ASSERT_TRUE(decoder.Append(std::move(input)));
     EXPECT_EQ(decoder.Pop(output), common::LengthPrefixedPacketBuffer::PopResult::Packet);

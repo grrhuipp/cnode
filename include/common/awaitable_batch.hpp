@@ -101,19 +101,5 @@ inline net::awaitable<void> RunAwaitableBatch(
     }
 }
 
-// Fans out one task per Worker index and joins them as RunAwaitableBatch does.
-// Tasks are built at the call, so the caller must co_await the result at once.
-template <typename WorkerRange, typename TaskFactory>
-[[nodiscard]] net::awaitable<void> RunWorkerBatch(
-    net::any_io_executor executor,
-    WorkerRange& workers,
-    TaskFactory task_factory) {
-    std::vector<net::awaitable<void>> tasks;
-    tasks.reserve(workers.size());
-    for (size_t i = 0; i < workers.size(); ++i) {
-        tasks.push_back(task_factory(*workers[i], i));
-    }
-    return RunAwaitableBatch(std::move(executor), std::move(tasks));
-}
 
 }  // namespace common

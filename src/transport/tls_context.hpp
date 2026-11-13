@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -40,19 +41,27 @@ class AutoSignContextRenewal {
 public:
     using Clock = std::chrono::system_clock;
     static std::shared_ptr<AutoSignContextRenewal> Start(
-        std::shared_ptr<SSL_CTX> initial, TlsConfig config);
-    [[nodiscard]] std::shared_ptr<SSL_CTX> Acquire(Clock::time_point now = Clock::now()) const noexcept;
+        bssl::UniquePtr<SSL_CTX> initial, TlsConfig config);
+    [[nodiscard]] SSL_CTX* Acquire(Clock::time_point now = Clock::now()) const noexcept;
 private:
     friend class AutoSignRenewalScheduler;
     struct Snapshot {
-        std::shared_ptr<SSL_CTX> context;
+        bssl::UniquePtr<SSL_CTX> context;
         Clock::time_point expires;
     };
-    AutoSignContextRenewal(std::shared_ptr<SSL_CTX> initial, TlsConfig config);
-    bool Publish(std::shared_ptr<SSL_CTX> context);
+    static_assert(std::atomic<const Snapshot*>::is_always_lock_free);
+    AutoSignContextRenewal(bssl::UniquePtr<SSL_CTX> initial, TlsConfig config);
+    bool Publish(bssl::UniquePtr<SSL_CTX> context);
     // Runs on the scheduler thread only; null when signing or setup fails.
-    [[nodiscard]] std::shared_ptr<SSL_CTX> Rebuild() const;
-    std::atomic<std::shared_ptr<const Snapshot>> current_;
+    [[nodiscard]] bssl::UniquePtr<SSL_CTX> Rebuild() const;
+    // Atomic invariant: Publish() constructs an immutable Snapshot at a fixed
+    // heap address owned by history_ under publish_mutex_, then publishes it
+    // with memory_order_release; Acquire() loads with memory_order_acquire.
+    // Reclamation waits until ~AutoSignContextRenewal(), while active SSL
+    // connections hold BoringSSL's own SSL_CTX reference count.
+    mutable std::mutex publish_mutex_;
+    std::vector<std::unique_ptr<const Snapshot>> history_;
+    std::atomic<const Snapshot*> current_{nullptr};
     const TlsConfig config_;
     std::atomic<Clock::time_point> next_attempt_{Clock::time_point::min()};
 };

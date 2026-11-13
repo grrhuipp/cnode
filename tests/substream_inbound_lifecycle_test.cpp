@@ -5,7 +5,7 @@
 #include "app/proxyman/inbound_handler.hpp"
 #include "app/proxyman/user_store.hpp"
 #include "app/stats.hpp"
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 #include "common/allocator.hpp"
 #include "common/mux_codec.hpp"
 #include "proxy/mux/mux_server.hpp"
@@ -51,7 +51,7 @@ public:
         : io_(io),
           coordinator_(std::make_shared<app::GroupCoordinator>(io)) {
         UserStore::ClearWorkerView();
-        coordinator_->RegisterWorker(io);
+        coordinator_->RegisterWorker();
         limiter_ = app::ConnectionLimiter::Acquire({}, coordinator_);
     }
     ~DomainFixture() {
@@ -193,7 +193,7 @@ public:
         std::array<uint8_t, 8192> data{};
         const auto count = co_await AsyncRead(net::buffer(data));
         common::MultiBuffer result;
-        if (count && !common::AppendSpanToMultiBuffer(std::span(data).first(count), result))
+        if (count && !result.AppendSpan(std::span(data).first(count)))
             throw std::bad_alloc();
         co_return result;
     }
@@ -1163,7 +1163,7 @@ void RunMuxUdpCase(int mode) {
             }
         }
         common::MultiBuffer output;
-        EXPECT_TRUE(common::AppendSpanToMultiBuffer(stream.output, output));
+        EXPECT_TRUE(output.AppendSpan(stream.output));
         size_t replies = 0;
         while (!output.empty()) {
             const auto frame = common::DecodeFrame(output);

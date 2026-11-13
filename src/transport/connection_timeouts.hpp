@@ -3,7 +3,6 @@
 #include "common/error.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/timeout_scheduler.hpp"
-#include "common/allocator.hpp"
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -54,7 +53,7 @@ public:
         Reconcile();
     }
 
-    [[nodiscard]] PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
+    [[nodiscard]] PhaseDeadlineToken StartPhaseDeadline(std::chrono::seconds timeout) {
         ++phase_generation_;
         phase_expired_ = false;
         UpdateFlags();

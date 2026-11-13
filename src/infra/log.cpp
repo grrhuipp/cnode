@@ -81,13 +81,6 @@ std::mutex g_lifecycle_mutex;
 // The writer drains continuously. Keep a bounded burst window without paying
 // for 65K preallocated LogRecord slots throughout the process lifetime.
 constexpr size_t kAsyncLogQueueCapacity = 8 * 1024;
-// Blocks are allocated only when the queue reaches a new high-water mark and
-// are recycled through the queue's free list instead of being freed, so idle
-// processes hold none and steady bursts allocate nothing. pending_ still
-// bounds the record count at kAsyncLogQueueCapacity.
-struct AsyncLogQueueTraits : moodycamel::ConcurrentQueueDefaultTraits {
-    static constexpr bool RECYCLE_ALLOCATED_BLOCKS = true;
-};
 constexpr size_t kWriterBatchSize = 64;
 // Retry delay after a daily rotation fails to open the new files; the old
 // files stay active until a retry succeeds.
@@ -1330,7 +1323,7 @@ private:
         }
     }
 
-    moodycamel::ConcurrentQueue<LogRecord, AsyncLogQueueTraits> queue_;
+    moodycamel::ConcurrentQueue<LogRecord> queue_;
     moodycamel::LightweightSemaphore writer_wakeup_{0, 0};
     std::atomic_bool accepting_{false};
     std::atomic_bool running_{false};
@@ -1485,16 +1478,16 @@ void Log::WriteConnection(LogLevel level,
 
 void Log::WriteConnection(LogLevel level,
                           uint64_t conn_id,
-                          std::string_view message,
+                          std::string message,
                           std::source_location location) {
     ConnectionLogContext log_context;
     log_context.conn_id = conn_id;
-    WriteConnection(level, std::move(log_context), std::string(message), location);
+    WriteConnection(level, std::move(log_context), std::move(message), location);
 }
 
 void Log::WriteConnection(LogLevel level,
                           const common::Context& ctx,
-                          std::string_view message,
+                          std::string message,
                           std::source_location location) {
     ConnectionLogContext log_context;
     log_context.conn_id = ctx.conn_id;
@@ -1506,7 +1499,7 @@ void Log::WriteConnection(LogLevel level,
     if (outbound != log_context.inbound_tag) {
         log_context.outbound_tag = outbound;
     }
-    WriteConnection(level, std::move(log_context), std::string(message), location);
+    WriteConnection(level, std::move(log_context), std::move(message), location);
 }
 
 void Log::WriteAccess(std::string message) {

@@ -349,7 +349,11 @@ init_config() {
     if [ ! -f "$CONFIG_JSON" ]; then
         # 未指定 -dns 时不写 servers，cnode 使用 /etc/resolv.conf 中的系统 DNS。
         DNS_SERVERS_LINE=""
-        if [ -n "$dns" ] && echo "$dns" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        if [ -n "$dns" ]; then
+            if ! printf '%s\n' "$dns" | grep -Eq '^[0-9A-Fa-f:.%\[\]]+$'; then
+                echo "错误: 无效的 -dns 参数: $dns"
+                exit 1
+            fi
             DNS_SERVERS_LINE="    \"servers\": [\"$dns\"],
 "
         fi
@@ -365,7 +369,7 @@ init_config() {
   "workers": 0,
   "dns": {
 ${DNS_SERVERS_LINE}    "timeout": 5,
-    "cacheSize": 10000,
+    "cacheSize": 10240,
     "minTTL": 60,
     "maxTTL": 3600
   },

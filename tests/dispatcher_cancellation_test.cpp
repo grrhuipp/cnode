@@ -28,7 +28,7 @@ using namespace std::chrono_literals;
 common::MultiBuffer Payload(size_t size) {
     std::vector<uint8_t> bytes(size, 0x42);
     common::MultiBuffer payload;
-    if (!common::AppendSpanToMultiBuffer(bytes, payload)) throw std::bad_alloc();
+    if (!payload.AppendSpan(bytes)) throw std::bad_alloc();
     return payload;
 }
 

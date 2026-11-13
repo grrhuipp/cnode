@@ -8,14 +8,14 @@
 
 #include "app/proxyman/user_store.hpp"
 #include "app/rate_limiter.hpp"
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 #include "app/stats.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/byte_reader.hpp"
-#include "common/ip_utils.hpp"
-#include "common/hash_container_shrink.hpp"
+#include "common/ip_address.hpp"
+#include "common/allocator.hpp"
 #include "common/session.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "common/string_hash.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
@@ -52,7 +52,6 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include "common/allocator.hpp"
 
 namespace transport {
 
@@ -178,7 +177,7 @@ constexpr uint64_t kMaxStreams = 1024;
 
 [[nodiscard]] common::MultiBuffer CopyPacket(std::span<const uint8_t> bytes) {
     common::MultiBuffer output;
-    if (!common::AppendSpanToMultiBuffer(bytes, output)) throw std::bad_alloc();
+    if (!output.AppendSpan(bytes)) throw std::bad_alloc();
     return output;
 }
 
@@ -310,7 +309,7 @@ int HysteriaConnection::ReceiveDatagram(ngtcp2_conn*, uint32_t flags,
     if ((flags & NGTCP2_DATAGRAM_FLAG_0RTT) || !self.authenticated_)
         return 0;
     auto message = ParseUdpMessage(self.listener_->version, {data, length});
-    if (message) self.HandleUdpMessage(*message);
+    if (message) self.ProcessUdpMessage(*message);
     return 0;
 }
 
@@ -1359,12 +1358,11 @@ void HysteriaConnection::ExpireUdpFragments(ngtcp2_tstamp now) noexcept {
         }
     }
     if (fragments_.empty()) {
-        decltype(fragments_) released{fragments_.get_allocator()};
-        fragments_.swap(released);
+        fragments_ = {};
     }
 }
 
-void HysteriaConnection::HandleUdpMessage(const HysteriaUdpMessage& message) {
+void HysteriaConnection::ProcessUdpMessage(const HysteriaUdpMessage& message) {
     if (message.fragment_count == 1) {
         if (message.target.IsValid())
             DeliverUdpPacket(message.session_id, message.target, message.payload);
@@ -1752,7 +1750,7 @@ bool QuicStreamState::PushInput(std::span<const uint8_t> data, bool fin) {
             std::min(input_.byte_size(), kMaxQueuedInputBytes)) {
         return false;
     }
-    if (!common::AppendSpanToMultiBuffer(data, input_)) return false;
+    if (!input_.AppendSpan(data)) return false;
     input_done_ = fin;
     WakeReader();
     return true;
@@ -1945,7 +1943,7 @@ net::awaitable<void> QuicStream::WriteBuffers(
     for (const auto& buffer : buffers) {
         const auto bytes = std::span(
             static_cast<const uint8_t*>(buffer.data()), buffer.size());
-        if (!common::AppendSpanToMultiBuffer(bytes, payload)) throw std::bad_alloc();
+        if (!payload.AppendSpan(bytes)) throw std::bad_alloc();
     }
     co_await WriteMultiBuffer(std::move(payload));
 }
@@ -1996,7 +1994,7 @@ bool UdpSessionStream::Push(
     if (buffer_count > kMaxQueuedBytes / common::Buffer::kSize - queued_buffer_count_)
         return false;
     common::MultiBuffer packet;
-    if (!common::AppendSpanToMultiBuffer(payload, packet) ||
+    if (!packet.AppendSpan(payload) ||
         !common::SetUdpTarget(packet, target)) return false;
     input_.push_back(std::move(packet));
     queued_buffer_count_ += buffer_count;
@@ -2050,20 +2048,8 @@ net::awaitable<void> UdpSessionStream::WriteMultiBuffer(common::MultiBuffer pack
         packet.clear();
         throw transport::LinkError(common::ErrorCode::CONNECTION_CLOSED);
     }
-    bool sent = false;
-    if (datagram.buffer_count == 1) {
-        sent = owner->SendUdpMessage(
-            session_id_, *datagram.target, datagram.single_buffer->Bytes());
-    } else {
-        std::vector<uint8_t> payload;
-        payload.reserve(datagram.payload_size);
-        for (const auto* buffer : packet) {
-            if (!buffer || buffer->IsEmpty()) continue;
-            const auto bytes = buffer->Bytes();
-            payload.insert(payload.end(), bytes.begin(), bytes.end());
-        }
-        sent = owner->SendUdpMessage(session_id_, *datagram.target, payload);
-    }
+    const bool sent = owner->SendUdpMessage(
+        session_id_, *datagram.target, datagram.single_buffer->Bytes());
     packet.clear();
     if (!sent) throw transport::LinkError(common::ErrorCode::RESOURCE_EXHAUSTED);
 }

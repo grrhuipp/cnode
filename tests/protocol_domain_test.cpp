@@ -151,7 +151,7 @@ TEST_P(ProtocolDomainTest, TrojanUdpFrame) {
     proxy::TrojanFramedUdpPacket packet;
     if (!domain.accepted) {
         common::MultiBuffer input;
-        ASSERT_TRUE(common::AppendSpanToMultiBuffer(wire, input));
+        ASSERT_TRUE(input.AppendSpan(wire));
         framer.Feed(std::move(input));
         try {
             (void)framer.Next(packet);
@@ -163,11 +163,11 @@ TEST_P(ProtocolDomainTest, TrojanUdpFrame) {
     }
 
     common::MultiBuffer prefix;
-    ASSERT_TRUE(common::AppendSpanToMultiBuffer(std::span(wire).first(split), prefix));
+    ASSERT_TRUE(prefix.AppendSpan(std::span(wire).first(split)));
     framer.Feed(std::move(prefix));
     EXPECT_FALSE(framer.Next(packet));
     common::MultiBuffer remainder;
-    ASSERT_TRUE(common::AppendSpanToMultiBuffer(std::span(wire).subspan(split), remainder));
+    ASSERT_TRUE(remainder.AppendSpan(std::span(wire).subspan(split)));
     framer.Feed(std::move(remainder));
     ASSERT_TRUE(framer.Next(packet));
     ExpectTarget(packet.target, domain);

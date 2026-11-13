@@ -198,29 +198,30 @@ TEST_P(PanelRuntime, RequestLifecycleAndListenerOwnership) {
             }, 12s);
             loser = winner == 1 ? 2 : 1;
         } else WaitEvent(*child, "Panel configuration ready:", 1);
-        EXPECT_TRUE(Listening(port));
+        EXPECT_TRUE(Listening(port, fixture.ListenAddress()));
         fixture.ReleaseCompanion();
         WaitEvent(*child, "Panel sync unavailable: operation=pull", loser, 8s);
         const auto expected = mode == Mode::StaticCollision ?
             "tag=panel/replay-panel/2/vmess/" + std::to_string(port) + " owner=static-owner port=" + std::to_string(port) :
             "owner=replay-panel/" + std::to_string(3 - loser) + " port=" + std::to_string(port);
         Until([&] { return Logs(directory.Path() / "logs").find(expected) != std::string::npos; }, 1s);
-        EXPECT_TRUE(Listening(port));
+        EXPECT_TRUE(Listening(port, fixture.ListenAddress()));
         EXPECT_EQ(child->Stop(10s), 0);
         EXPECT_EQ(Events(child->LogPath(), "Panel configuration ready:", loser), 0u);
         return;
     }
     if (mode == Mode::Lifecycle) {
         const auto node = fixture.NodePort(), companion = fixture.CompanionPort();
-        Until([&] { return Listening(node) && Listening(companion); }, 12s);
+        const auto& addr = fixture.ListenAddress();
+        Until([&] { return Listening(node, addr) && Listening(companion, addr); }, 12s);
         EXPECT_TRUE(fixture.WaitForConfigStatus(503));
-        EXPECT_TRUE(Listening(node)); EXPECT_TRUE(Listening(companion));
+        EXPECT_TRUE(Listening(node, addr)); EXPECT_TRUE(Listening(companion, addr));
         EXPECT_TRUE(fixture.WaitForUserRequests(2));
-        EXPECT_TRUE(Listening(node)); EXPECT_TRUE(Listening(companion));
+        EXPECT_TRUE(Listening(node, addr)); EXPECT_TRUE(Listening(companion, addr));
         EXPECT_TRUE(fixture.WaitForConfigStatus(404));
-        EXPECT_TRUE(Listening(node)); EXPECT_TRUE(Listening(companion));
+        EXPECT_TRUE(Listening(node, addr)); EXPECT_TRUE(Listening(companion, addr));
         EXPECT_TRUE(fixture.WaitForUserRequests(3));
-        EXPECT_TRUE(Listening(node)); EXPECT_TRUE(Listening(companion));
+        EXPECT_TRUE(Listening(node, addr)); EXPECT_TRUE(Listening(companion, addr));
         EXPECT_EQ(child->Stop(10s), 0);
         return;
     }

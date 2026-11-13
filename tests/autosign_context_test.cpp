@@ -13,12 +13,12 @@ namespace {
 using Renewal = ::transport::AutoSignContextRenewal;
 using namespace std::chrono_literals;
 
-std::shared_ptr<SSL_CTX> Context(long validity_seconds) {
+bssl::UniquePtr<SSL_CTX> Context(long validity_seconds) {
     auto certificate = ::transport::AutoSignCertificate::Create("renewal.example");
     if (!certificate || !X509_gmtime_adj(X509_get_notAfter(certificate->Certificate()), validity_seconds) ||
         X509_sign(certificate->Certificate(), certificate->Key(), EVP_sha256()) <= 0)
         throw std::runtime_error("test certificate construction failed");
-    std::shared_ptr<SSL_CTX> context(SSL_CTX_new(TLS_server_method()), SSL_CTX_free);
+    bssl::UniquePtr<SSL_CTX> context(SSL_CTX_new(TLS_server_method()));
     if (!context || SSL_CTX_use_certificate(context.get(), certificate->Certificate()) != 1 ||
         SSL_CTX_use_PrivateKey(context.get(), certificate->Key()) != 1)
         throw std::runtime_error("test SSL_CTX construction failed");
@@ -42,37 +42,41 @@ template<class Predicate> bool Await(Predicate predicate) {
 TEST(AutosignContext, RenewalPublishesNewSnapshotWithoutMutatingEstablishedConnection) {
     constexpr long kTenDays = 10L * 24 * 60 * 60;
     auto initial = Context(kTenDays);
-    std::unique_ptr<SSL, decltype(&SSL_free)> established(SSL_new(initial.get()), SSL_free);
+    SSL_CTX* initial_ptr = initial.get();
+    std::unique_ptr<SSL, decltype(&SSL_free)> established(SSL_new(initial_ptr), SSL_free);
     ASSERT_NE(established, nullptr);
-    auto renewal = Renewal::Start(initial, RenewalConfig("renewal.example"));
-    ASSERT_TRUE(Await([&] { return renewal->Acquire().get() != initial.get(); }));
-    auto replacement = renewal->Acquire();
+    auto renewal = Renewal::Start(std::move(initial), RenewalConfig("renewal.example"));
+    ASSERT_TRUE(Await([&] { return renewal->Acquire() != initial_ptr; }));
+    SSL_CTX* replacement = renewal->Acquire();
     ASSERT_NE(replacement, nullptr);
-    EXPECT_EQ(SSL_get_SSL_CTX(established.get()), initial.get());
-    EXPECT_NE(SSL_CTX_get0_certificate(replacement.get()), SSL_get_certificate(established.get()));
+    EXPECT_EQ(SSL_get_SSL_CTX(established.get()), initial_ptr);
+    EXPECT_NE(SSL_CTX_get0_certificate(replacement), SSL_get_certificate(established.get()));
     EXPECT_EQ(renewal->Acquire(Renewal::Clock::now() + std::chrono::hours(24 * 11)), replacement);
 }
 
 TEST(AutosignContext, FailedRenewalRetainsValidSnapshotButRejectsExpiredSnapshot) {
     constexpr long kTenDays = 10L * 24 * 60 * 60;
     auto old = Context(kTenDays);
+    SSL_CTX* old_ptr = old.get();
     auto config = RenewalConfig("failing.example");
     config.min_version = ::transport::TlsVersion::V1_3;
     config.max_version = ::transport::TlsVersion::V1_2;
-    auto failing = Renewal::Start(old, config);
+    auto failing = Renewal::Start(std::move(old), config);
 
     // The scheduler processes due registrations in order. A later successful
     // renewal is a barrier proving the earlier failed renewal was attempted.
     auto barrier_context = Context(kTenDays);
-    auto barrier = Renewal::Start(barrier_context, RenewalConfig("renewal.example"));
-    ASSERT_TRUE(Await([&] { return barrier->Acquire().get() != barrier_context.get(); }));
-    EXPECT_EQ(failing->Acquire(), old);
+    SSL_CTX* barrier_ptr = barrier_context.get();
+    auto barrier = Renewal::Start(std::move(barrier_context), RenewalConfig("renewal.example"));
+    ASSERT_TRUE(Await([&] { return barrier->Acquire() != barrier_ptr; }));
+    EXPECT_EQ(failing->Acquire(), old_ptr);
     EXPECT_EQ(failing->Acquire(Renewal::Clock::now() + std::chrono::hours(24 * 11)), nullptr);
 }
 
 TEST(AutosignContext, RenewedSnapshotFailsClosedAfterNotAfter) {
     auto initial = Context(10L * 24 * 60 * 60);
-    auto renewal = Renewal::Start(initial, RenewalConfig("renewal.example"));
-    ASSERT_TRUE(Await([&] { return renewal->Acquire().get() != initial.get(); }));
+    SSL_CTX* initial_ptr = initial.get();
+    auto renewal = Renewal::Start(std::move(initial), RenewalConfig("renewal.example"));
+    ASSERT_TRUE(Await([&] { return renewal->Acquire() != initial_ptr; }));
     EXPECT_EQ(renewal->Acquire(Renewal::Clock::now() + std::chrono::hours(24 * 366)), nullptr);
 }

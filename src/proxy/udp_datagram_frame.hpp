@@ -65,7 +65,7 @@ inline net::awaitable<void> WriteFramedDatagram(
     transport::MultiBufferWriter& writer,
     std::span<const uint8_t> header,
     const common::MultiBuffer& payload) {
-    common::ConstBufferSpanBuilder<1 + common::MultiBuffer::kInlineCapacity> framed;
+    common::ConstBufferSpanBuilder<2> framed;
     framed.Append(net::buffer(header.data(), header.size()));
     framed.AppendMultiBuffer(payload);
     co_await writer.WriteBuffers(framed.Span());

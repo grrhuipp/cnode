@@ -1,5 +1,4 @@
 #include "proxy/vmess/vmess_crypto.hpp"
-#include "common/allocator.hpp"
 #include "common/byte_reader.hpp"
 #include "proxy/aead.hpp"
 #include "common/binary_text_codec.hpp"

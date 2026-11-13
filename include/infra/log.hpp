@@ -91,13 +91,13 @@ public:
     static void WriteConnection(
         LogLevel level,
         uint64_t conn_id,
-        std::string_view message,
+        std::string message,
         std::source_location location = std::source_location::current());
 
     static void WriteConnection(
         LogLevel level,
         const common::Context& ctx,
-        std::string_view message,
+        std::string message,
         std::source_location location = std::source_location::current());
 
     static void WriteConsole(

@@ -1,9 +1,8 @@
 #include "transport/xhttp_client.hpp"
-#include "common/allocator.hpp"
 
 #include "common/multi_buffer.hpp"
 #include "common/const_buffer_span.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 #include "infra/log.hpp"
 #include "transport/async_write_gate.hpp"
 #include "transport/tcp_stream.hpp"
@@ -407,9 +406,8 @@ public:
         if (!upload_ &&
             buffer.size() <= kMaxDeferredUploadBytes - pending_initial_.byte_size()) {
             const auto* data = static_cast<const uint8_t*>(buffer.data());
-            if (!common::AppendSpanToMultiBuffer(
-                    std::span<const uint8_t>(data, buffer.size()),
-                    pending_initial_)) {
+            if (!pending_initial_.AppendSpan(
+                    std::span<const uint8_t>(data, buffer.size()))) {
                 throw std::bad_alloc();
             }
             co_return buffer.size();

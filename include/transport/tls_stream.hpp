@@ -64,8 +64,8 @@ public:
     ~SslContext();
 
     SSL_CTX* Native() const noexcept { return native_owner_.get(); }
-    // Pin a published immutable context until SSL_new takes its own reference.
-    [[nodiscard]] std::shared_ptr<SSL_CTX> AcquireNative() const noexcept;
+    // Borrow a published immutable context; SSL_new takes BoringSSL's own ref.
+    [[nodiscard]] SSL_CTX* AcquireNative() const noexcept;
 
     // 禁止拷贝
     SslContext(const SslContext&) = delete;
@@ -77,7 +77,7 @@ private:
     explicit SslContext(std::shared_ptr<AutoSignContextRenewal> renewal) noexcept
         : renewal_(std::move(renewal)) {}
 
-    std::shared_ptr<SSL_CTX> native_owner_;
+    bssl::UniquePtr<SSL_CTX> native_owner_;
     std::shared_ptr<AutoSignContextRenewal> renewal_;
 };
 
@@ -129,7 +129,7 @@ public:
 
     // Return decrypted handshake read-ahead before OpenSSL's unread plaintext.
     // Never forwards these bytes to the TCP ciphertext layer.
-    void PrependReadData(std::span<const uint8_t> data) override;
+    void PrependReadBytes(std::span<const uint8_t> data) override;
     void PrependReadMultiBuffer(common::MultiBuffer&& mb) override;
     // Vision cmd2 read-direction cutover; retain already-decrypted bytes,
     // then read the raw TCP stream without touching the independent writer.

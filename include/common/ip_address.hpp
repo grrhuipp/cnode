@@ -188,9 +188,8 @@ inline bool NeedsIpv6Brackets(std::string_view host) noexcept {
            !(host.size() >= 2 && host.front() == '[' && host.back() == ']');
 }
 
-template<class Allocator>
 inline void FormatHttpHostHeaderInto(
-    std::basic_string<char, std::char_traits<char>, Allocator>& out,
+    std::string& out,
     std::string_view host,
     uint16_t port,
     bool use_ssl) {

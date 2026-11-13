@@ -4,7 +4,7 @@
 #include "app/relay.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "proxy/inbound.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "transport/async_stream.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"

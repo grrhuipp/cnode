@@ -1,8 +1,8 @@
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 
 #include "common/string_hash.hpp"
-#include "common/hash_container_shrink.hpp"
-#include "app/session_group_executor.hpp"
+#include "common/allocator.hpp"
+#include "app/group_coordinator.hpp"
 
 #include <string>
 #include <unordered_map>

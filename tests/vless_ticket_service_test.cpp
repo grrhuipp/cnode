@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include "proxy/vless/vless_encryption.hpp"
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/executor_work_guard.hpp>
 #include <asio/use_future.hpp>
@@ -39,8 +39,8 @@ protected:
         identity[0] = 7;
         nfs.bytes[0] = 31;
         coordinator = std::make_shared<app::GroupCoordinator>(control, 1);
-        coordinator->RegisterWorker(io0);
-        coordinator->RegisterWorker(io1);
+        coordinator->RegisterWorker();
+        coordinator->RegisterWorker();
         worker0 = std::thread([this] { io0.run(); });
         worker1 = std::thread([this] { io1.run(); });
         manager = std::thread([this] { control.run(); });

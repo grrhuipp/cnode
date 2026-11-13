@@ -1,6 +1,6 @@
 #include "common/domain_name.hpp"
 #include "proxy/outbound_endpoint_base.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 #include <openssl/mem.h>
 #include "proxy/outbound.hpp"
 #include "proxy/vless/vless_codec.hpp"
@@ -11,7 +11,7 @@
 #include "app/proxyman/outbound_handler.hpp"
 #include "app/relay.hpp"
 #include "common/const_buffer_span.hpp"
-#include "common/eof_cancellation.hpp"
+#include "common/asio_types.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/length_prefixed_packet_buffer.hpp"
 #include "common/error.hpp"
@@ -315,7 +315,7 @@ public:
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
         const auto datagram = proxy::RequireUdpDatagram(mb, &udp_target_);
         if (!datagram) co_return;
-        common::ConstBufferSpanBuilder<common::MultiBuffer::kInlineCapacity> payload;
+        common::ConstBufferSpanBuilder<1> payload;
         payload.AppendMultiBuffer(mb);
         co_await WriteDatagram(*datagram->target, payload.Span());
     }
@@ -441,7 +441,7 @@ SendVlessHandshake(
     tickets.Acquire(local_tickets);
     const auto original_expiry = local_tickets.expires_at;
     stream.SetIdleTimeout(handshake_timeout);
-    transport::PhaseDeadlineHandle outbound_protocol_deadline =
+    transport::PhaseDeadlineToken outbound_protocol_deadline =
         stream.StartPhaseDeadline(handshake_timeout);
 
     if (config.encryption) {

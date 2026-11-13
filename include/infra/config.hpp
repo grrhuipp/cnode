@@ -72,12 +72,12 @@ struct PanelApiUrlParts {
 // ============================================================================
 struct PanelConfig {
     std::string Name;                        // 面板名称
-    std::string Type = std::string(common::kV2BoardType);  // 面板类型
+    std::string Type = std::string(common::kV2Board);  // 面板类型
     std::string APIHost;                      // API 地址
     std::string Key;                          // API 密钥
     std::chrono::seconds RequestTimeout{common::kPanelRequestTimeout};
     PanelNodeIds NodeIDs;
-    std::string NodeType = std::string(common::kDefaultNodeType);
+    std::string NodeType = std::string(common::kDefaultNodeProtocol);
     // Local durable accounting state; resolved relative to the loaded config directory.
     std::filesystem::path TrafficJournalDir = "traffic-journal";
     transport::InboundListen ListenIP;

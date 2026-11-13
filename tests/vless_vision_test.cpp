@@ -51,7 +51,7 @@ public:
         common::MultiBuffer mb;
         if (offset_ < bytes_.size()) {
             const auto n = std::min(chunk_, bytes_.size() - offset_);
-            EXPECT_TRUE((common::AppendSpanToMultiBuffer(std::span(bytes_).subspan(offset_, n), mb))) << "allocation";
+            EXPECT_TRUE((mb.AppendSpan(std::span(bytes_).subspan(offset_, n)))) << "allocation";
             offset_ += n;
         }
         co_return mb;

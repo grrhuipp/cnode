@@ -155,7 +155,7 @@ private:
     friend struct H2InboundPayload;
     // DATA payload taken off the wire; [offset, end) is body, and the whole
     // payload (padding included) is the flow-controlled length (6.1).
-    struct ReceivedData {
+    struct QueuedDataFrame {
         std::vector<uint8_t> payload;
         size_t offset = 0;
         size_t end = 0;
@@ -593,7 +593,7 @@ private:
             co_return;
         }
         const size_t offset = static_cast<size_t>(data.data() - frame.payload.data());
-        received_.push_back(ReceivedData{
+        received_.push_back(QueuedDataFrame{
             .payload = std::move(frame.payload),
             .offset = offset,
             .end = offset + data.size(),
@@ -701,7 +701,7 @@ private:
     H2InboundPayload inbound_;
     HpackDecoder response_decoder_;
     // Received DATA the reader has not taken yet.
-    common::RingDeque<ReceivedData> received_;
+    common::RingDeque<QueuedDataFrame> received_;
     // Current DATA frame payload; [data_offset_, data_end_) is unread body.
     std::vector<uint8_t> data_frame_;
     size_t data_offset_ = 0;

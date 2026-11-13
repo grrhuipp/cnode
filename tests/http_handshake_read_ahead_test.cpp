@@ -82,7 +82,7 @@ std::span<const uint8_t> Bytes(std::string_view value) {
     return {reinterpret_cast<const uint8_t*>(value.data()), value.size()};
 }
 void Prepend(::transport::AsyncStream& stream, std::string_view value) {
-    stream.PrependReadData(Bytes(value));
+    stream.PrependReadBytes(Bytes(value));
 }
 std::string Flatten(const ::common::MultiBuffer& data) {
     std::string result;
@@ -223,7 +223,7 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
                 if (n == 0) throw std::runtime_error("cannot continue with truncated residual");
                 retained.append(block.data(), n);
             }
-            raw->PrependReadData(Bytes(retained));
+            raw->PrependReadBytes(Bytes(retained));
         }
         ::transport::TransportBuildResult built;
         if (outbound) {
@@ -401,8 +401,8 @@ void ExistingTcpResidual() {
     // More than eight blocks exercises spill metadata while the old residual
     // is transferred behind the new prefix without copying its payload.
     const std::string tail(10 * ::common::Buffer::kSize, 't');
-    stream.PrependReadData(Bytes(tail));
-    stream.PrependReadData(Bytes("head"));
+    stream.PrependReadBytes(Bytes(tail));
+    stream.PrependReadBytes(Bytes("head"));
     bool done = false;
     std::exception_ptr error;
     auto read = [&]() -> net::awaitable<void> {
@@ -412,7 +412,7 @@ void ExistingTcpResidual() {
         auto data = co_await stream.ReadMultiBuffer();
         EXPECT_EQ(Flatten(data), "ead" + tail) << "preexisting residual was lost or reordered";
         data.clear();
-        stream.PrependReadData(Bytes("discard"));
+        stream.PrependReadBytes(Bytes("discard"));
         stream.Close();
         EXPECT_EQ((co_await stream.ReadMultiBuffer()).byte_size(), 0) << "close leaked old residual";
     };
@@ -617,8 +617,8 @@ void WsResume(bool client, bool multi_buffer, size_t size, size_t cut, uint8_t o
     // Handshake residual is deterministic: the entire prefix is consumed before
     // the first socket wait, then Cancel interrupts that actual lower read.
     ::common::MultiBuffer residual;
-    ASSERT_TRUE(::common::AppendSpanToMultiBuffer(
-        {reinterpret_cast<const uint8_t*>(frame.data()), cut}, residual));
+    ASSERT_TRUE(residual.AppendSpan(
+        {reinterpret_cast<const uint8_t*>(frame.data()), cut}));
     stream.SetPendingMultiBuffer(std::move(residual));
     const std::string application = opcode == 2 || opcode == 1 ? payload : "application";
     bool cancelled = false;
@@ -828,8 +828,8 @@ void WsReject(std::string_view frame, bool client, bool multi_buffer) {
     acceptor.accept(peer);
     ::transport::BaseWsStream stream(std::make_unique<::transport::TcpStream>(std::move(socket)), client);
     ::common::MultiBuffer residual;
-    ASSERT_TRUE(::common::AppendSpanToMultiBuffer(
-        {reinterpret_cast<const uint8_t*>(frame.data()), frame.size()}, residual));
+    ASSERT_TRUE(residual.AppendSpan(
+        {reinterpret_cast<const uint8_t*>(frame.data()), frame.size()}));
     stream.SetPendingMultiBuffer(std::move(residual));
     peer.shutdown(::tcp::socket::shutdown_send);
     bool rejected = false, done = false;

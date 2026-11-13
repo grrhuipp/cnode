@@ -109,7 +109,7 @@ std::vector<uint8_t> Pattern(size_t size, uint8_t seed = 17) {
 common::MultiBuffer MakePayload(
     const common::TargetAddress& target, const std::vector<uint8_t>& bytes) {
     common::MultiBuffer payload;
-    EXPECT_TRUE(common::AppendSpanToMultiBuffer(bytes, payload));
+    EXPECT_TRUE(payload.AppendSpan(bytes));
     for (auto* buffer : payload) buffer->SetUDP(target);
     return payload;
 }

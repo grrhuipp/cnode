@@ -6,7 +6,6 @@
 #include "transport/hysteria/hysteria_ingress.hpp"
 #include "app/proxyman/inbound_handler.hpp"
 #include "app/stats.hpp"
-#include "common/allocator.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/length_prefixed_packet_buffer.hpp"
 #include "common/initial_payload.hpp"
@@ -74,7 +73,7 @@ ReadTcpRequest(transport::AsyncStream& stream, transport::HysteriaVersion versio
                 stream, received.byte_size() == 0 ? common::ErrorCode::SOCKET_EOF
                                                   : common::ErrorCode::PROTOCOL_DECODE_FAILED));
         }
-        common::AppendCoalescedStreamInput(received, std::move(chunk));
+        chunk.MoveTo(received, true);
 
         size_t header_bytes = 0;
         tl::expected<common::TargetAddress, transport::ProtocolError> target =

@@ -1,5 +1,4 @@
 #include "transport/http1_handshake.hpp"
-#include "common/allocator.hpp"
 #include "common/binary_text_codec.hpp"
 
 #include "common/const_buffer_span.hpp"

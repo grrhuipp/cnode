@@ -10,7 +10,6 @@
 
 #include "proxy/vmess/vmess_crypto.hpp"
 #include "app/proxyman/user_store.hpp"
-#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/address_codec.hpp"
 #include "common/multi_buffer.hpp"

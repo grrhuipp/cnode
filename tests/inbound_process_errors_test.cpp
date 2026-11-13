@@ -3,7 +3,7 @@
 #include "app/proxyman/inbound_handler.hpp"
 #include "app/relay.hpp"
 #include "app/rate_limiter.hpp"
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 #include "common/allocator.hpp"
 #include "common/session.hpp"
 #include "transport/tls_stream.hpp"
@@ -38,7 +38,7 @@ template<class Scenario>
 void RunFixture(const app::RateLimitConfig& config, Scenario scenario) {
     net::io_context io;
     auto coordinator = std::make_shared<app::GroupCoordinator>(io);
-    coordinator->RegisterWorker(io);
+    coordinator->RegisterWorker();
     auto limiter = app::ConnectionLimiter::Acquire(config, coordinator);
     common::UserOnlineTracker tracker(*coordinator);
     app::StatsShard stats;

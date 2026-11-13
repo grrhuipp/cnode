@@ -1,5 +1,4 @@
 #include "transport/h2_frame.hpp"
-#include "common/allocator.hpp"
 #include <string>
 #include <vector>
 

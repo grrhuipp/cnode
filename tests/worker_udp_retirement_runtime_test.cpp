@@ -8,7 +8,7 @@
 #include "app/stats.hpp"
 #include "app/worker.hpp"
 #include "worker_coordinator_fixture.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "common/allocator.hpp"
 #include "common/session.hpp"
 #include "infra/config_types.hpp"

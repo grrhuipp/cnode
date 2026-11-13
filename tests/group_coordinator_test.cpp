@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/executor_work_guard.hpp>
@@ -16,15 +16,15 @@
 namespace {
 
 
-TEST(SessionGroupExecutor, RoutesWorkerCallsAndReservedOperationsToControlExecutor) {
+TEST(GroupCoordinator, RoutesWorkerCallsAndReservedOperationsToControlExecutor) {
     net::io_context control, first, second;
     auto control_work = net::make_work_guard(control);
     auto first_work = net::make_work_guard(first);
     auto second_work = net::make_work_guard(second);
 
     auto coordinator = std::make_shared<app::GroupCoordinator>(control, 2);
-    coordinator->RegisterWorker(first);
-    coordinator->RegisterWorker(second);
+    coordinator->RegisterWorker();
+    coordinator->RegisterWorker();
 
     EXPECT_EQ(coordinator->WorkerCount(), 2u);
 

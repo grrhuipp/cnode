@@ -7,7 +7,6 @@
 #include "common/const_buffer_span.hpp"
 #include "infra/log.hpp"
 #include "common/unsafe.hpp"
-#include "common/allocator.hpp"
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -38,8 +37,8 @@ namespace transport {
 
 namespace {
 
-// Populated explicitly before Worker startup. BIO_METHOD and SSL-owned memory
-// stay with the library allocator; our operation payload uses the process resource.
+// Populated explicitly before Worker startup; BIO_METHOD and SSL-owned memory
+// use BoringSSL's allocator hooks (routed to mimalloc).
 std::unique_ptr<BIO_METHOD, decltype(&BIO_meth_free)> tls_bio_method{nullptr, BIO_meth_free};
 
 bool IsBenignServerHandshakeError(unsigned long err_code) {
@@ -129,13 +128,8 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
         if (!tcp) throw std::invalid_argument("TlsStream requires TcpStream");
         if (!tls_bio_method)
             throw std::logic_error("TlsStream::InitializeIo must precede Worker startup");
-        SSL_CTX* raw = context.Native();
-        std::shared_ptr<SSL_CTX> snapshot;
-        if (raw == nullptr) {
-            snapshot = context.AcquireNative();
-            raw = snapshot.get();
-            if (!raw) throw std::runtime_error("TLS certificate expired without a renewed snapshot");
-        }
+        SSL_CTX* raw = context.AcquireNative();
+        if (!raw) throw std::runtime_error("TLS certificate expired without a renewed snapshot");
         ssl.reset(SSL_new(raw));
         if (!ssl) throw std::bad_alloc();
         SSL_set_max_send_fragment(ssl.get(), common::Buffer::kSize);
@@ -534,7 +528,7 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
             common::MultiBuffer& mb;
             ~ClearOwned() noexcept { mb.clear(); }
         } clear_owned{owned};
-        common::ConstBufferSpanBuilder<common::MultiBuffer::kInlineCapacity> owned_spans;
+        common::ConstBufferSpanBuilder<1> owned_spans;
         if (!owned.empty()) {
             if (owned.byte_size() == 0) co_return;
             owned_spans.AppendMultiBuffer(owned);
@@ -695,7 +689,7 @@ std::optional<DetachedTlsState> TlsStream::DetachForHandoff(
 std::optional<DetachedTlsState> TlsStream::DetachForHandoff(
     std::span<const uint8_t> plaintext_prefix) {
     common::MultiBuffer mb;
-    if (!plaintext_prefix.empty() && !common::AppendSpanToMultiBuffer(plaintext_prefix, mb)) {
+    if (!plaintext_prefix.empty() && !mb.AppendSpan(plaintext_prefix)) {
         throw std::bad_alloc();
     }
     return DetachForHandoff(std::move(mb));
@@ -839,13 +833,13 @@ bool TlsStream::EnableRawRead() noexcept {
     return true;
 }
 
-void TlsStream::PrependReadData(std::span<const uint8_t> data) {
+void TlsStream::PrependReadBytes(std::span<const uint8_t> data) {
     if (data.empty()) return;
     if (!impl_->tcp->CanRead()) {
         throw IoSystemError(io_error::operation_aborted, "TLS read closed");
     }
     common::MultiBuffer prefix;
-    if (!common::AppendSpanToMultiBuffer(data, prefix)) {
+    if (!prefix.AppendSpan(data)) {
         throw std::bad_alloc();
     }
     PrependReadMultiBuffer(std::move(prefix));

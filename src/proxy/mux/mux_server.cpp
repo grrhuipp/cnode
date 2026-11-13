@@ -9,7 +9,6 @@
 #include "common/multi_buffer.hpp"
 #include "common/const_buffer_span.hpp"
 #include "common/byte_reader.hpp"
-#include "common/hash_container_shrink.hpp"
 #include "common/session.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
@@ -555,11 +554,6 @@ public:
             throw transport::WriteClosed{};
         }
 
-        for (common::Buffer*& buffer : mb) {
-            if (!buffer || buffer->IsEmpty()) {
-                mb.FreeSlot(buffer);
-            }
-        }
         const size_t payload_bytes = mb.byte_size();
         if (payload_bytes == 0) {
             mb.clear();
@@ -970,7 +964,7 @@ private:
                     co_return true;
                 }
 
-                common::ConstBufferSpanBuilder<1 + common::MultiBuffer::kInlineCapacity> framed;
+                common::ConstBufferSpanBuilder<2> framed;
                 framed.Append(net::const_buffer(write_frame.data(), header_len));
                 framed.AppendMultiBuffer(reply.payload);
                 try {

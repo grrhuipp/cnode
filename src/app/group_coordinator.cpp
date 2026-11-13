@@ -1,5 +1,4 @@
-#include "app/session_group_executor.hpp"
-#include "common/allocator.hpp"
+#include "app/group_coordinator.hpp"
 #include "common/error.hpp"
 #include "infra/log.hpp"
 
@@ -58,7 +57,7 @@ void GroupCoordinator::Start() {
 }
 
 
-void GroupCoordinator::RegisterWorker(net::io_context&) {
+void GroupCoordinator::RegisterWorker() noexcept {
     reserved_->worker_count.fetch_add(1, std::memory_order_release);
 }
 

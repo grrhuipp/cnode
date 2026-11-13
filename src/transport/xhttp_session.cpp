@@ -1,8 +1,7 @@
 #include "transport/xhttp_session.hpp"
-#include "common/allocator.hpp"
 
 #include "transport/http1_handshake.hpp"
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 #include "common/awaitable_task_group.hpp"
 #include "common/const_buffer_span.hpp"
 #include "infra/log.hpp"
@@ -986,7 +985,6 @@ net::awaitable<size_t> XHttpPacketUpSession::Upload::Read(
         const size_t n = co_await stream_.AsyncRead(net::buffer(
             tail->Tail().data(), std::min(limit, size_t{tail->Available()})));
         tail->Produce(static_cast<uint32_t>(n));
-        payload.RecordTailProduced(n);
         co_return n;
     }
     common::MultiBuffer chunk = co_await stream_.ReadMultiBuffer();
@@ -1002,7 +1000,7 @@ net::awaitable<size_t> XHttpPacketUpSession::Upload::Read(
     stream_.PrependReadMultiBuffer(std::move(chunk));
     const size_t n = std::min<size_t>(limit, first->Len());
     if (n < first->Len()) {
-        stream_.PrependReadData(first->Bytes().subspan(n));
+        stream_.PrependReadBytes(first->Bytes().subspan(n));
         first->end = first->start + static_cast<uint32_t>(n);
     }
     payload.push_back(std::move(first));

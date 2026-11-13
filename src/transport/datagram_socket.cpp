@@ -1,5 +1,4 @@
 #include "transport/datagram_socket.hpp"
-#include "common/allocator.hpp"
 
 #include "transport/connection_timeouts.hpp"
 #include "common/const_buffer_span.hpp"
@@ -102,7 +101,7 @@ net::mutable_buffer UdpReceiveBuffer::Prepare(std::size_t available_bytes) {
     return net::buffer(large_.data(), large_.size());
 }
 
-std::span<const uint8_t> UdpReceiveBuffer::Data(std::size_t bytes) const noexcept {
+std::span<const uint8_t> UdpReceiveBuffer::Bytes(std::size_t bytes) const noexcept {
     if (!large_.empty()) {
         return std::span<const uint8_t>(large_.data(), std::min(bytes, large_.size()));
     }
@@ -373,43 +372,30 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
     if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
     if (cancellation_state.cancelled() != net::cancellation_type::none)
         throw IoSystemError(io_error::operation_aborted);
-    if (payload.size() <= common::MultiBuffer::kInlineCapacity) {
-        std::array<net::const_buffer, common::MultiBuffer::kInlineCapacity> inline_buffers;
-        std::size_t count = 0;
-        for (const auto* buffer : payload) {
-            const auto bytes = buffer->Bytes();
-            if (!bytes.empty()) {
-                inline_buffers[count++] = net::buffer(bytes.data(), bytes.size());
-            }
-        }
-        const std::span<const net::const_buffer> buffers(inline_buffers.data(), count);
-        IoErrorCode send_ec;
-        std::size_t sent = 0;
-        {
-            const net::const_buffer empty_datagram{};
-            sent = socket.send_to(
-                count == 0 ? std::span<const net::const_buffer>(&empty_datagram, 1) : buffers,
-                destination, 0, send_ec);
-        }
-        if (!send_ec) {
-            if (sent != total) throw LinkError(common::ErrorCode::INTERNAL);
-            timeouts.TouchActivity();
-            co_return;
-        }
-        if (send_ec != io_error::would_block && send_ec != io_error::try_again) {
-            throw IoSystemError(send_ec);
-        }
-        // Nothing suspended since the EAGAIN: wait before resending these descriptors.
-        co_await SendBuffers(operation, std::move(destination), buffers, true);
+    std::array<net::const_buffer, 1> inline_buffers;
+    std::size_t count = 0;
+    if (const auto bytes = payload.FrontSpan(); !bytes.empty()) {
+        inline_buffers[count++] = net::buffer(bytes.data(), bytes.size());
+    }
+    const std::span<const net::const_buffer> buffers(inline_buffers.data(), count);
+    IoErrorCode send_ec;
+    std::size_t sent = 0;
+    {
+        const net::const_buffer empty_datagram{};
+        sent = socket.send_to(
+            count == 0 ? std::span<const net::const_buffer>(&empty_datagram, 1) : buffers,
+            destination, 0, send_ec);
+    }
+    if (!send_ec) {
+        if (sent != total) throw LinkError(common::ErrorCode::INTERNAL);
+        timeouts.TouchActivity();
         co_return;
     }
-    common::ConstBufferSpanBuilder<common::MultiBuffer::kInlineCapacity> spans;
-    try {
-        spans.AppendMultiBuffer(payload);
-    } catch (const std::bad_alloc&) {
-        throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED);
+    if (send_ec != io_error::would_block && send_ec != io_error::try_again) {
+        throw IoSystemError(send_ec);
     }
-    co_await SendBuffers(operation, std::move(destination), spans.Span(), false);
+    // Nothing suspended since the EAGAIN: wait before resending these descriptors.
+    co_await SendBuffers(operation, std::move(destination), buffers, true);
 }
 
 DatagramSocket::ReadOperation::ReadOperation(Impl& impl)
@@ -509,7 +495,7 @@ void DatagramSocket::SetWriteTimeout(std::chrono::seconds timeout) {
     try { impl_->timeouts.SetWriteTimeout(timeout); }
     catch (const std::bad_alloc&) { throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED); }
 }
-PhaseDeadlineHandle DatagramSocket::StartPhaseDeadline(std::chrono::seconds timeout) {
+PhaseDeadlineToken DatagramSocket::StartPhaseDeadline(std::chrono::seconds timeout) {
     try { return impl_->timeouts.StartPhaseDeadline(timeout); }
     catch (const std::bad_alloc&) { throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED); }
 }

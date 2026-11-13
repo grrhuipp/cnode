@@ -3,7 +3,7 @@
 #include "app/relay.hpp"
 #include "common/scoped_cleanse.hpp"
 #include "proxy/inbound.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "transport/async_stream.hpp"
 #include "proxy/trojan/trojan_codec.hpp"
 #include "app/rate_limiter.hpp"

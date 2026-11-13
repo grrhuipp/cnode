@@ -35,7 +35,7 @@ common::MultiBuffer Packet(const common::TargetAddress& target, size_t size) {
     std::vector<uint8_t> bytes(size);
     for (size_t i = 0; i < size; ++i) bytes[i] = static_cast<uint8_t>(i * 37);
     common::MultiBuffer payload;
-    EXPECT_TRUE(common::AppendSpanToMultiBuffer(bytes, payload));
+    EXPECT_TRUE(payload.AppendSpan(bytes));
     for (auto* buffer : payload) buffer->SetUDP(target);
     return payload;
 }
@@ -336,7 +336,7 @@ class UdpDeadlineTest : public UdpRequestTest,
 TEST_P(UdpDeadlineTest, PendingReadExpiresOnceAtItsDeadline) {
     Run([&]() -> net::awaitable<void> {
         auto& channel = Request();
-        transport::PhaseDeadlineHandle phase;
+        transport::PhaseDeadlineToken phase;
         const auto kind = GetParam();
         if (kind == Deadline::Idle) channel.RelayControl().SetIdleTimeout(1s);
         if (kind == Deadline::Read) channel.RelayControl().SetReadTimeout(1s);

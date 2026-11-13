@@ -9,7 +9,6 @@
 #include "common/awaitable_task_group.hpp"
 #include "common/byte_reader.hpp"
 #include "common/clock.hpp"
-#include "common/hash_container_shrink.hpp"
 #include "transport/timeout_scheduler.hpp"
 #include <asio/as_tuple.hpp>
 #include <asio/experimental/channel.hpp>

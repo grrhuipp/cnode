@@ -10,7 +10,7 @@
 
 #include "app/proxyman/inbound_handler.hpp"
 #include "app/stats.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "common/session.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
@@ -47,7 +47,7 @@ class NativeResponse final : public ::proxy::InboundDatagramResponse {
 public:
     ::common::MultiBuffer Encode(::proxy::UDPPacketView packet) override {
         ::common::MultiBuffer payload;
-        if (!::common::AppendSpanToMultiBuffer(packet.data, payload)) return {};
+        if (!payload.AppendSpan(packet.data)) return {};
         return payload;
     }
 };
@@ -216,7 +216,7 @@ protected:
     const ::app::AdmissionEnvironment admission{
         *coordinator.Get(), *limiter, tracker, stats};
     ::app::RequestLoadState request_load{1024, 0};
-    UdpNativeLifecycleTest() { coordinator.Get()->RegisterWorker(io); }
+    UdpNativeLifecycleTest() { coordinator.Get()->RegisterWorker(); }
     ::transport::TimeoutScheduler& scheduler = ::transport::TimeoutScheduler::ForIoContext(io);
     Reclaimer reclaimer{scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); }};
 };
@@ -600,7 +600,7 @@ protected:
     std::vector<uint8_t> packet;
 
     void SetUp() override {
-        coordinator.Get()->RegisterWorker(io);
+        coordinator.Get()->RegisterWorker();
         const auto parsed = ::proxy::ParseCipherMethod(GetParam());
         ASSERT_TRUE(parsed);
         cipher = *parsed;

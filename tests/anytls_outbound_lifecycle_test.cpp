@@ -5,7 +5,7 @@
 #include "app/relay.hpp"
 #include "app/dns/dns.hpp"
 #include "app/stats.hpp"
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 #include "common/session.hpp"
 #include "infra/config_types.hpp"
 #include "transport/tls_stream.hpp"
@@ -1329,7 +1329,7 @@ void RunPoolLifecycle(bool join_before_retirement) {
 void RunDomainPoolIsolation() {
     net::io_context io;
     auto coordinator = std::make_shared<app::GroupCoordinator>(io, 2);
-    coordinator->RegisterWorker(io);
+    coordinator->RegisterWorker();
     app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
     app::DNSWorker dns_worker(io, dns_config, 8);

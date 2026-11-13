@@ -4,7 +4,7 @@
 #include "app/prepared_inbound.hpp"
 #include "app/proxyman/outbound_handler.hpp"
 #include "app/stats.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "common/constants.hpp"
 #include "infra/config_types.hpp"
 #include "infra/config.hpp"

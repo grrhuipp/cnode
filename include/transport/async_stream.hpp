@@ -22,11 +22,11 @@ class AsyncStream;
 
 // Borrowed observation of one owner's absolute phase deadline. The owner must
 // outlive the handle; replacing or clearing a deadline invalidates older views.
-class PhaseDeadlineHandle {
+class PhaseDeadlineToken {
 public:
-    PhaseDeadlineHandle() = default;
+    PhaseDeadlineToken() = default;
 
-    PhaseDeadlineHandle(
+    PhaseDeadlineToken(
         const uint8_t* flags,
         uint8_t expired_mask,
         const uint32_t* generation,
@@ -62,7 +62,7 @@ public:
     StreamPhaseDeadline(const StreamPhaseDeadline&) = delete;
     StreamPhaseDeadline& operator=(const StreamPhaseDeadline&) = delete;
 
-    [[nodiscard]] PhaseDeadlineHandle Start(std::chrono::seconds timeout);
+    [[nodiscard]] PhaseDeadlineToken Start(std::chrono::seconds timeout);
     // Clear invalidates borrowed handles; Consume only acknowledges expiry.
     void Clear() noexcept;
     [[nodiscard]] bool Consume() noexcept;
@@ -218,7 +218,7 @@ public:
      * @return true 如果连接仍然有效
      */
     virtual bool IsOpen() const = 0;
-    virtual void PrependReadData(std::span<const uint8_t> data);
+    virtual void PrependReadBytes(std::span<const uint8_t> data);
     virtual void PrependReadMultiBuffer(common::MultiBuffer&& mb);
 
     // ========================================================================
@@ -239,7 +239,7 @@ public:
 
     // Logical streams select their inline deadline owner below; ordinary byte
     // streams continue to use the physical connection's aggregate deadlines.
-    [[nodiscard]] PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout);
+    [[nodiscard]] PhaseDeadlineToken StartPhaseDeadline(std::chrono::seconds timeout);
     void ClearPhaseDeadline();
     [[nodiscard]] bool ConsumePhaseDeadline() noexcept;
 

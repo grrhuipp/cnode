@@ -209,7 +209,7 @@ protected:
             const auto bytes = std::span<const uint8_t>(
                 static_cast<const uint8_t*>(buffer.data()),
                 buffer.size());
-            if (!common::AppendSpanToMultiBuffer(bytes, payload)) {
+            if (!payload.AppendSpan(bytes)) {
                 throw std::bad_alloc();
             }
         }

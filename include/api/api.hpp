@@ -29,7 +29,7 @@ struct Config {
     std::string Key;
     std::chrono::seconds RequestTimeout{common::kPanelRequestTimeout};
     int NodeID = 0;
-    std::string NodeType = std::string(common::kDefaultNodeType);
+    std::string NodeType = std::string(common::kDefaultNodeProtocol);
 };
 
 // ============================================================================

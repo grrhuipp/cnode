@@ -1,5 +1,5 @@
 #include "app/worker.hpp"
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 #include "app/datagram_session_environment.hpp"
 #include "app/prepared_inbound.hpp"
 #include "app/rate_limiter.hpp"
@@ -10,8 +10,7 @@
 #include "common/session.hpp"
 #include "common/rule.hpp"
 #include "common/multi_buffer.hpp"
-#include "common/ip_utils.hpp"
-#include "common/hash_container_shrink.hpp"
+#include "common/ip_address.hpp"
 #include "common/string_hash.hpp"
 #include "infra/log.hpp"
 #include "app/proxyman/user_store.hpp"
@@ -388,7 +387,7 @@ Worker::Worker(uint32_t id, net::io_context& io_context,
     , group_coordinator_(std::move(coordinator)) {
     if (!group_coordinator_)
         throw std::invalid_argument("Worker requires a group coordinator");
-    group_coordinator_->RegisterWorker(io_context_);
+    group_coordinator_->RegisterWorker();
 }
 
 Worker::~Worker() = default;
@@ -578,7 +577,7 @@ void Worker::RuntimeState::Start(Worker& worker) {
         ? config->router
         : std::make_shared<const app::Router>(config->routing, geo_database);
     LOG_DEBUG("router initialized worker={} rules={}",
-              worker.id_, config->routing.rules.size());
+              worker.id_, router->RuleCount());
     outbound_tasks = std::make_unique<common::ResidentTaskGroup>(io_context.get_executor());
     outbound_handlers = std::make_unique<OutboundHandlerRegistry>(
         config->outbounds, io_context, dns, timeouts.DialTimeout(), outbound_tasks->Tasks());

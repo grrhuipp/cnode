@@ -99,14 +99,19 @@ class AccountingFault : public testing::TestWithParam<std::string> {};
 TEST_P(AccountingFault, QuarantinesAmbiguousRequestsAcrossRestartUntilExplicitReconciliation) {
     const auto mode = GetParam();
     TempDir directory;
-    auto reservation = Socket::ReserveTcp();
-    const auto node = reservation.Port();
+    auto reservation = ReserveRuntimePort();
+    const auto node = reservation.tcp.Port();
     LoopServer echo(EchoPeer, "0.0.0.0");
     IntegrityPanel panel(node);
     panel.Mode(mode);
     PanelConfig(directory.Path(), panel.Port(), "integrity");
+    auto config = Json::parse(ReadFile(directory.Path() / "config.json"));
+    config["panels"][0]["listenIP"] = reservation.address;
+    WriteJson(directory.Path(), "config.json", config);
+    reservation.tcp.Close();
+    reservation.udp.Close();
     auto child = Start(directory.Path());
-    WaitEcho(*child, node, echo.Port());
+    WaitEcho(*child, node, echo.Port(), "127.0.0.1", reservation.address);
     Until([&] { return panel.Posts(true) != 0; }, 12s);
     Until([&] { return !Records(directory.Path(), "unknown").empty(); }, 12s);
     if (mode == "kill") { child->Signal(SIGKILL); EXPECT_NE(child->Wait(), 0); }
@@ -164,14 +169,19 @@ INSTANTIATE_TEST_SUITE_P(HttpAmbiguity, AccountingFault, testing::Values("non2xx
 
 TEST(PanelIntegrity, GracefulShutdownPersistsUnsampledCountersAndReplaysExactlyOnce) {
     TempDir directory;
-    auto reservation = Socket::ReserveTcp();
-    const auto node = reservation.Port();
+    auto reservation = ReserveRuntimePort();
+    const auto node = reservation.tcp.Port();
     LoopServer echo(EchoPeer);
     IntegrityPanel panel(node);
     panel.PushInterval(3600);
     PanelConfig(directory.Path(), panel.Port(), "integrity");
+    auto config = Json::parse(ReadFile(directory.Path() / "config.json"));
+    config["panels"][0]["listenIP"] = reservation.address;
+    WriteJson(directory.Path(), "config.json", config);
+    reservation.tcp.Close();
+    reservation.udp.Close();
     auto child = Start(directory.Path());
-    WaitEcho(*child, node, echo.Port());
+    WaitEcho(*child, node, echo.Port(), "127.0.0.1", reservation.address);
     EXPECT_EQ(child->Stop(10s), 0);
     EXPECT_FALSE(Records(directory.Path(), "ready").empty());
     EXPECT_EQ(panel.Posts(true), 0u);
@@ -249,8 +259,8 @@ class ReportErrorLog : public testing::TestWithParam<ReportBody> {};
 
 TEST_P(ReportErrorLog, PrintsBoundedResponseDetailsWithoutLeakingTheRequestKey) {
     TempDir directory;
-    auto reservation = Socket::ReserveTcp();
-    const auto node = reservation.Port();
+    auto reservation = ReserveRuntimePort();
+    const auto node = reservation.tcp.Port();
     const auto mode = GetParam();
     LoopServer echo([](Socket socket) {
         const auto bytes = socket.ReadExact(Payload.size(), 3s);
@@ -286,11 +296,15 @@ TEST_P(ReportErrorLog, PrintsBoundedResponseDetailsWithoutLeakingTheRequestKey) 
         Reply(socket, traffic ? 503 : 401, body);
     });
     PanelConfig(directory.Path(), panel.Port(), "report-errors");
-    reservation.Close();
+    auto config = Json::parse(ReadFile(directory.Path() / "config.json"));
+    config["panels"][0]["listenIP"] = reservation.address;
+    WriteJson(directory.Path(), "config.json", config);
+    reservation.tcp.Close();
+    reservation.udp.Close();
     auto child = Start(directory.Path());
-    WaitEcho(*child, node, echo.Port());
-    auto link = Socket::Connect(node, "127.0.0.1", 1s);
-    link.Write("PROXY TCP4 192.0.2.7 127.0.0.1 12345 " + std::to_string(node) + "\r\n" +
+    WaitEcho(*child, node, echo.Port(), "127.0.0.1", reservation.address);
+    auto link = Socket::Connect(node, reservation.address, 1s);
+    link.Write("PROXY TCP4 192.0.2.7 " + reservation.address + " 12345 " + std::to_string(node) + "\r\n" +
                VlessRequest(echo.Port(), Payload, 1, "127.0.0.1", UserA));
     EXPECT_EQ(link.ReadExact(Payload.size() + 2, 3s), std::string("\0\0", 2) + std::string(Payload));
     child->WaitForLog("ONLINE_RESPONSE_DETAIL");

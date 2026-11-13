@@ -1,7 +1,7 @@
 #pragma once
 
 #include "infra/config_types.hpp"
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 
 #include <array>
 #include <cstddef>

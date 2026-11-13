@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "api/panel_data.hpp"
+#include "api/panel_wire.hpp"
 #include <vector>
 
 TEST(V2BoardOnlineReport, DeduplicatesDevicesAndExcludesInvalidUsers) {

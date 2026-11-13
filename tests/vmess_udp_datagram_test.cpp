@@ -312,7 +312,7 @@ void TestCancellationResume(proxy::VmessSecurity security, uint8_t options,
     const auto eof_wire = encoder.Encode({});
     const size_t request_prefix = payload_size > common::Buffer::kSize ? 1 : 0;
     Connection connection;
-    connection.stream.PrependReadData(std::span<const uint8_t>(wire).first(request_prefix));
+    connection.stream.PrependReadBytes(std::span<const uint8_t>(wire).first(request_prefix));
     proxy::ServerSession session("cancellation-test");
     session.SetRequest(request);
     auto reader = session.DecodeRequestBody(connection.stream);
@@ -321,23 +321,23 @@ void TestCancellationResume(proxy::VmessSecurity security, uint8_t options,
     const std::array<size_t, 5> cuts{
         request_prefix, 1, encoder.HeaderSize(), encoder.HeaderSize() + 7, wire.size() - 1};
     for (size_t i = 0; i < cuts.size(); ++i) {
-        connection.stream.PrependReadData(
+        connection.stream.PrependReadBytes(
             std::span<const uint8_t>(wire).subspan(supplied, cuts[i] - supplied));
         supplied = cuts[i];
         CancelBlockedRead(connection, *reader, (i % 2) == 0);
     }
 
-    connection.stream.PrependReadData(std::span<const uint8_t>(wire).subspan(supplied));
+    connection.stream.PrependReadBytes(std::span<const uint8_t>(wire).subspan(supplied));
     CheckPayload(ReadReady(connection, *reader), payload, request);
-    connection.stream.PrependReadData(later_wire);
+    connection.stream.PrependReadBytes(later_wire);
     CheckPayload(ReadReady(connection, *reader), later_payload, request);
 
     // The EOF marker is itself a framed record and must also survive a partial
     // read without re-consuming its authenticated length or padding mask.
-    connection.stream.PrependReadData(
+    connection.stream.PrependReadBytes(
         std::span<const uint8_t>(eof_wire).first(eof_wire.size() - 1));
     CancelBlockedRead(connection, *reader, false);
-    connection.stream.PrependReadData(std::span<const uint8_t>(eof_wire).last(1));
+    connection.stream.PrependReadBytes(std::span<const uint8_t>(eof_wire).last(1));
     EXPECT_TRUE((ReadReady(connection, *reader).empty())) << "VMess EOF marker did not finish the reader";
     EXPECT_TRUE((ReadReady(connection, *reader).empty())) << "VMess EOF marker was not permanent";
 }
@@ -360,11 +360,11 @@ void TestBatchCancellation(proxy::VmessSecurity security, uint8_t options) {
     std::vector<uint8_t> prefix(first_wire.begin(), first_wire.end());
     const size_t cut = encoder.HeaderSize() + 5;
     prefix.insert(prefix.end(), second_wire.begin(), second_wire.begin() + cut);
-    connection.stream.PrependReadData(prefix);
+    connection.stream.PrependReadBytes(prefix);
     CancelBlockedRead(connection, *reader, false);
-    connection.stream.PrependReadData(std::span<const uint8_t>(second_wire).subspan(cut));
+    connection.stream.PrependReadBytes(std::span<const uint8_t>(second_wire).subspan(cut));
     CheckPayload(ReadReady(connection, *reader), expected, request);
-    connection.stream.PrependReadData(third_wire);
+    connection.stream.PrependReadBytes(third_wire);
     CheckPayload(ReadReady(connection, *reader), third_payload, request);
 }
 
@@ -374,7 +374,7 @@ void TestTransportEOF(proxy::VmessSecurity security, uint8_t options, size_t pre
     const auto payload = MakePayload(113, 0x57);
     const auto wire = encoder.Encode(payload);
     Connection connection;
-    connection.stream.PrependReadData(std::span<const uint8_t>(wire).first(prefix_size));
+    connection.stream.PrependReadBytes(std::span<const uint8_t>(wire).first(prefix_size));
     proxy::ServerSession session("transport-eof-test");
     session.SetRequest(request);
     auto reader = session.DecodeRequestBody(connection.stream);
@@ -406,9 +406,9 @@ void TestAuthenticationFailure(proxy::VmessSecurity security, uint8_t options,
     proxy::ServerSession session("authentication-failure-test");
     session.SetRequest(request);
     auto reader = session.DecodeRequestBody(connection.stream);
-    connection.stream.PrependReadData(std::span<const uint8_t>(wire).first(1));
+    connection.stream.PrependReadBytes(std::span<const uint8_t>(wire).first(1));
     CancelBlockedRead(connection, *reader, false);
-    connection.stream.PrependReadData(std::span<const uint8_t>(wire).subspan(1));
+    connection.stream.PrependReadBytes(std::span<const uint8_t>(wire).subspan(1));
     for (int attempt = 0; attempt != 2; ++attempt) {
         CheckReadFailed(connection, reader->ReadMultiBuffer(),
                         "resumed VMess read suppressed an authentication failure");
@@ -422,7 +422,7 @@ void TestAuthenticationFailure(proxy::VmessSecurity security, uint8_t options,
         RequestEncoder eof_encoder(request);
         auto eof_wire = eof_encoder.Encode({});
         eof_wire[encoder.HeaderSize()] ^= 0x80;
-        eof_connection.stream.PrependReadData(eof_wire);
+        eof_connection.stream.PrependReadBytes(eof_wire);
         for (int attempt = 0; attempt != 2; ++attempt) {
             CheckReadFailed(eof_connection, eof_reader->ReadMultiBuffer(),
                             "corrupted VMess EOF chunk authentication tag was accepted");
@@ -619,12 +619,12 @@ void TestClientAuthenticationFailure(size_t corrupt_offset,
     corrupted[corrupt_offset] ^= 0x80;
     const size_t prefix_size = corrupt_offset < 18 ? 18
         : corrupt_offset < 38 ? 38 : corrupted.size();
-    connection.stream.PrependReadData(
+    connection.stream.PrependReadBytes(
         std::span<const uint8_t>(corrupted).first(prefix_size));
     CheckReadFailed(connection, client.DecodeResponse(connection.stream),
                     "VMess client accepted a corrupt response");
     // A second authentic header and body must not revive the failed response.
-    connection.stream.PrependReadData(response);
+    connection.stream.PrependReadBytes(response);
     CheckReadFailed(connection, client.DecodeResponse(connection.stream),
                     "VMess client revived after response authentication failure");
 }
@@ -638,11 +638,11 @@ void TestClientTruncation(proxy::VmessCommand command, size_t cut) {
     proxy::ClientSession client(proxy::VmessSecurity::AES_128_GCM, command);
     const auto response = MakeClientResponse(
         connection, client, *account, auth_id_key, target, command);
-    connection.stream.PrependReadData(std::span<const uint8_t>(response).first(cut));
+    connection.stream.PrependReadBytes(std::span<const uint8_t>(response).first(cut));
     connection.peer.shutdown(tcp::socket::shutdown_send);
     CheckReadFailed(connection, client.DecodeResponse(connection.stream),
                     "VMess client accepted a truncated response");
-    connection.stream.PrependReadData(response);
+    connection.stream.PrependReadBytes(response);
     CheckReadFailed(connection, client.DecodeResponse(connection.stream),
                     "VMess client revived after response truncation");
 }
@@ -658,12 +658,12 @@ void TestClientHeaderCancellation(proxy::VmessSecurity security, proxy::VmessCom
         connection, client, *account, auth_id_key, target, command);
     size_t supplied = 0;
     for (const size_t cut : {size_t{0}, size_t{1}, size_t{17}, size_t{18}, size_t{23}, size_t{37}}) {
-        connection.stream.PrependReadData(
+        connection.stream.PrependReadBytes(
             std::span<const uint8_t>(response).subspan(supplied, cut - supplied));
         supplied = cut;
         CancelBlockedRead(connection, ReadClientBody(connection, client, cut % 2 == 0));
     }
-    connection.stream.PrependReadData(std::span<const uint8_t>(response).subspan(supplied));
+    connection.stream.PrependReadBytes(std::span<const uint8_t>(response).subspan(supplied));
     const auto payload = ReadReady(connection, client.DecodeResponse(connection.stream));
     const common::ContiguousBufferView bytes(payload);
     EXPECT_TRUE((bytes.Bytes().size() == 113 &&
@@ -1028,7 +1028,7 @@ void TestWriteEnd(bool server_side, proxy::VmessCommand command) {
         auto reader = server.DecodeRequestBody(connection.stream);
         CheckPayload(ReadReady(connection, *reader), payload, request);
     } else {
-        connection.stream.PrependReadData(response);
+        connection.stream.PrependReadBytes(response);
         const auto result = ReadReady(connection, client.DecodeResponse(connection.stream));
         const common::ContiguousBufferView bytes(result);
         EXPECT_TRUE((bytes.Bytes().size() == 113 &&
@@ -1195,7 +1195,7 @@ TEST(VmessUdpDatagram, RequestHeaderInputRejectionPreservesKeys) {
     target = common::TargetAddress("127.0.0.1", 5353);
     const auto response = MakeClientResponse(
         connection, client, *account, auth_key, target, proxy::VmessCommand::TCP);
-    connection.stream.PrependReadData(response);
+    connection.stream.PrependReadBytes(response);
     const auto decoded = ReadReady(connection, client.DecodeResponse(connection.stream));
     const common::ContiguousBufferView bytes(decoded);
     EXPECT_TRUE((bytes.Bytes().size() == 113 &&
@@ -1225,7 +1225,7 @@ TEST(VmessUdpDatagram, BodyInputRejectionPreservesNextRecord) {
                   "VMess accepted one byte beyond its authenticated payload limit",
                   common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     common::MultiBuffer large_packet;
-    EXPECT_TRUE((common::AppendSpanToMultiBuffer(oversized, large_packet))) << "VMess oversized test packet allocation failed";
+    EXPECT_TRUE((large_packet.AppendSpan(oversized))) << "VMess oversized test packet allocation failed";
     ExpectLinkError([&] { encoder.Encode(large_packet, encoded); },
                   "VMess accepted oversized multi-buffer UDP",
                   common::ErrorCode::PROTOCOL_ENCODE_FAILED);
@@ -1285,7 +1285,7 @@ TEST(VmessUdpDatagram, LowerWriteClosedPreservesReverseRead) {
             auto reader = server.DecodeRequestBody(stream);
             CheckPayload(ReadReady(connection, *reader), payload, request);
         } else {
-            connection.stream.PrependReadData(response);
+            connection.stream.PrependReadBytes(response);
             const auto decoded = ReadReady(connection, client.DecodeResponse(stream));
             const common::ContiguousBufferView bytes(decoded);
             EXPECT_TRUE((bytes.Bytes().size() == 113 &&
@@ -1383,7 +1383,7 @@ TEST(VmessUdpDatagram, PreCancelledWritePreservesNextRecord) {
                     EXPECT_EQ((decoder.Decode(wire, offset)), (payload)) << "pre-cancelled VMess response advanced its next record";
                     EXPECT_TRUE((decoder.Decode(wire, offset).empty() && offset == wire.size())) << "pre-cancelled VMess response damaged EOF framing";
                 } else {
-                    connection.stream.PrependReadData(response);
+                    connection.stream.PrependReadBytes(response);
                     const auto decoded = ReadReady(connection, client.DecodeResponse(connection.stream));
                     const common::ContiguousBufferView bytes(decoded);
                     EXPECT_TRUE((bytes.Bytes().size() == 113 &&

@@ -111,8 +111,8 @@ public:
             throw std::runtime_error("invalid encrypted stream interruption boundary");
         }
         common::MultiBuffer out;
-        if (!common::AppendSpanToMultiBuffer(
-                std::span<const uint8_t>(bytes_.data() + offset_, end - offset_), out)) {
+        if (!out.AppendSpan(
+                std::span<const uint8_t>(bytes_.data() + offset_, end - offset_))) {
             throw std::bad_alloc();
         }
         offset_ = end;

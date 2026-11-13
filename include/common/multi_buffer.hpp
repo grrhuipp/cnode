@@ -125,8 +125,6 @@ using BufferGuard = std::unique_ptr<Buffer, BufferDeleter>;
 // ============================================================================
 class MultiBuffer {
 public:
-    static constexpr size_t kInlineCapacity = 1;
-
     MultiBuffer() noexcept = default;
 
     explicit MultiBuffer(BufferGuard buffer) noexcept
@@ -159,8 +157,6 @@ public:
     [[nodiscard]] Buffer* back() noexcept { return buf_; }
     [[nodiscard]] const Buffer* back() const noexcept { return buf_; }
 
-    void reserve(size_t) {}
-
     void push_back(BufferGuard buffer) {
         if (!buffer) {
             return;
@@ -186,12 +182,6 @@ public:
 
     [[nodiscard]] BufferGuard pop_front() noexcept {
         return BufferGuard{std::exchange(buf_, nullptr)};
-    }
-
-    void drop_front(size_t n) noexcept {
-        if (n > 0) {
-            clear();
-        }
     }
 
     size_t DropPrefixBytes(size_t bytes) noexcept {
@@ -290,20 +280,6 @@ public:
         }
     }
 
-    void RecordTailProduced(size_t) {}
-
-    [[nodiscard]] BufferGuard ReleaseSlot(Buffer*& slot) noexcept {
-        Buffer* buffer = std::exchange(slot, nullptr);
-        if (buffer == buf_) {
-            buf_ = nullptr;
-        }
-        return BufferGuard{buffer};
-    }
-
-    void FreeSlot(Buffer*& slot) noexcept {
-        (void)ReleaseSlot(slot);
-    }
-
     void MoveTo(MultiBuffer& dst, bool clear_udp = false) {
         if (std::addressof(dst) == this) {
             return;
@@ -391,11 +367,7 @@ private:
                 next_mixed = true;
             }
         } else if (src_untagged_nonempty) {
-            if (existing_has_udp || next_udp.has_value()) {
-                next_untagged = true;
-            } else {
-                next_untagged = true;
-            }
+            next_untagged = true;
         }
 
         if (buf_->Available() >= bytes.size()) {
@@ -469,14 +441,12 @@ enum class UdpDatagramStatus : uint8_t {
     Valid,
     MissingTarget,
     MixedTarget,
-    SizeOverflow,
 };
 
 struct UdpDatagramInfo {
     UdpDatagramStatus status = UdpDatagramStatus::Empty;
     const TargetAddress* target = nullptr;
     const Buffer* single_buffer = nullptr;
-    size_t buffer_count = 0;
     size_t payload_size = 0;
 
     [[nodiscard]] bool Valid() const noexcept {
@@ -502,17 +472,11 @@ struct UdpDatagramInfo {
     info.status = UdpDatagramStatus::Valid;
     info.target = std::addressof(buffer->UDP());
     info.single_buffer = buffer;
-    info.buffer_count = 1;
     info.payload_size = buffer->Len();
     return info;
 }
 
 UdpDatagramInfo InspectUdpDatagram(const MultiBuffer&&) = delete;
-
-[[nodiscard]] inline bool AppendSpanToMultiBuffer(std::span<const uint8_t> data,
-                                                  MultiBuffer& out_mb) {
-    return out_mb.AppendSpan(data);
-}
 
 class ContiguousWriteBuffer {
 public:

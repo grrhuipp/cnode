@@ -42,9 +42,9 @@ std::vector<uint8_t> Flatten(const common::MultiBuffer& mb) {
 
 common::MultiBuffer MakePacket(std::string_view payload, const common::TargetAddress& target) {
     common::MultiBuffer packet;
-    if (!common::AppendSpanToMultiBuffer(
+    if (!packet.AppendSpan(
             std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(payload.data()), payload.size()), packet) ||
+                reinterpret_cast<const uint8_t*>(payload.data()), payload.size())) ||
         !common::SetUdpTarget(packet, target)) {
         throw std::runtime_error("packet fixture allocation failed");
     }
@@ -93,8 +93,8 @@ public:
             : bytes_.size() - offset_;
         const size_t size = std::min(requested, bytes_.size() - offset_);
         common::MultiBuffer out;
-        if (!common::AppendSpanToMultiBuffer(
-                std::span<const uint8_t>(bytes_.data() + offset_, size), out)) {
+        if (!out.AppendSpan(
+                std::span<const uint8_t>(bytes_.data() + offset_, size))) {
             throw std::runtime_error("reader fixture allocation failed");
         }
         offset_ += size;
@@ -751,7 +751,7 @@ TEST(UotSs2022, NonConnectIpPacketDecodesFromPendingWithUnusedDomainRequestAndRe
 #endif
         {
             common::MultiBuffer pending;
-            ASSERT_TRUE(common::AppendSpanToMultiBuffer(wire, pending));
+            ASSERT_TRUE(pending.AppendSpan(wire));
             FragmentReader source({}, {});
             std::optional<proxy::UotPacketReader> reader;
             common::TargetAddress unused(domain, 53);

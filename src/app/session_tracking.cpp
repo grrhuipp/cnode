@@ -1,6 +1,6 @@
 #include "app/stats.hpp"
 
-#include "common/hash_container_shrink.hpp"
+#include "common/allocator.hpp"
 #include "common/session.hpp"
 
 #include <stdexcept>

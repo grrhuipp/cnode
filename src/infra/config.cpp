@@ -1,7 +1,7 @@
 #include "infra/config.hpp"
 #include "common/ascii.hpp"
 #include "common/domain_name.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 #include "common/target_address.hpp"
 #include "common/constants.hpp"
 #include "infra/json.hpp"
@@ -2244,9 +2244,9 @@ PanelConfig PanelConfig::FromJson(const object& j) {
 
     PanelConfig cfg;
     cfg.Name = JsonStringOr(j, "name", "");
-    cfg.Type = JsonStringOr(j, "type", common::kV2BoardType);
-    if (common::EqualsAsciiCI(cfg.Type, common::kV2BoardType)) {
-        cfg.Type = std::string(common::kV2BoardType);
+    cfg.Type = JsonStringOr(j, "type", common::kV2Board);
+    if (common::EqualsAsciiCI(cfg.Type, common::kV2Board)) {
+        cfg.Type = std::string(common::kV2Board);
     }
     cfg.APIHost   = JsonStringOr(j, "apiHost", "");
     cfg.Key       = JsonStringOr(j, "key", "");
@@ -2255,7 +2255,7 @@ PanelConfig PanelConfig::FromJson(const object& j) {
         JsonUint32Or(j, "requestTimeout", static_cast<uint32_t>(cfg.RequestTimeout.count())));
 
     cfg.NodeType = common::LowerAscii(
-        JsonStringOr(j, "nodeType", common::kDefaultNodeType));
+        JsonStringOr(j, "nodeType", common::kDefaultNodeProtocol));
 
     if (const auto* node_ids = j.if_contains("nodeIDs")) {
         cfg.NodeIDs = PanelNodeIds::Parse(*node_ids);
@@ -2334,8 +2334,8 @@ bool PanelConfig::Validate() const {
         LOG_PANEL_ERROR(log_context, "Panel NodeIDs is required");
         return false;
     }
-    if (Type != common::kV2BoardType) {
-        LOG_PANEL_ERROR(log_context, "Panel Type must be {}", common::kV2BoardType);
+    if (Type != common::kV2Board) {
+        LOG_PANEL_ERROR(log_context, "Panel Type must be {}", common::kV2Board);
         return false;
     }
     if (NodeType != common::kVmess &&

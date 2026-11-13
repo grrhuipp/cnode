@@ -31,7 +31,7 @@ struct TestEvent final : transport::TimeoutEvent {
 common::MultiBuffer Payload(size_t size, uint8_t byte) {
     std::vector<uint8_t> bytes(size, byte);
     common::MultiBuffer result;
-    if (!common::AppendSpanToMultiBuffer(bytes, result)) throw std::bad_alloc();
+    if (!result.AppendSpan(bytes)) throw std::bad_alloc();
     return result;
 }
 
@@ -144,7 +144,7 @@ struct Endpoint : transport::TimeoutEvent {
     void SetIdleTimeout(std::chrono::seconds) noexcept {}
     void SetReadTimeout(std::chrono::seconds) noexcept {}
     void SetWriteTimeout(std::chrono::seconds) noexcept {}
-    transport::PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
+    transport::PhaseDeadlineToken StartPhaseDeadline(std::chrono::seconds timeout) {
         if (!io) return {};
         ++phase_generation;
         phase_expired = false;

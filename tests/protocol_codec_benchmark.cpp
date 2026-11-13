@@ -70,7 +70,7 @@ public:
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
         const auto span = std::span(
             static_cast<const uint8_t*>(buffer.data()), buffer.size());
-        Require(common::AppendSpanToMultiBuffer(span, pending_));
+        Require(pending_.AppendSpan(span));
         co_return buffer.size();
     }
 
@@ -87,7 +87,7 @@ public:
         for (const auto& buf : buffers) {
             const auto span = std::span(
                 static_cast<const uint8_t*>(buf.data()), buf.size());
-            Require(common::AppendSpanToMultiBuffer(span, pending_));
+            Require(pending_.AppendSpan(span));
         }
         co_return;
     }
@@ -205,7 +205,7 @@ TEST(ProtocolCodecBenchmark, VlessHeaderAndUdpFraming) {
 
     RunBenchCase("vless", "udp_framing_1200b", datagram.size(), iterations, [&] {
         common::MultiBuffer pkt;
-        Require(common::AppendSpanToMultiBuffer(datagram, pkt));
+        Require(pkt.AppendSpan(datagram));
         Require(common::SetUdpTarget(pkt, target));
         auto write_fut = net::co_spawn(
             io, proxy::WriteVlessUdpDatagram(loop, std::move(pkt), false), net::use_future);
@@ -349,7 +349,7 @@ TEST(ProtocolCodecBenchmark, UotAndMuxCoolFraming) {
 
     RunBenchCase("uot", "datagram_framing_1200b", datagram.size(), iterations, [&] {
         common::MultiBuffer mb;
-        Require(common::AppendSpanToMultiBuffer(datagram, mb));
+        Require(mb.AppendSpan(datagram));
         Require(common::SetUdpTarget(mb, target));
         auto write_fut = net::co_spawn(io, uot_writer.WriteMultiBuffer(std::move(mb)), net::use_future);
         io.restart();
@@ -369,8 +369,8 @@ TEST(ProtocolCodecBenchmark, UotAndMuxCoolFraming) {
             mux_hdr, 7, common::NetworkType::TCP, target, datagram.size(), true);
         Require(hdr_len > 0, "Mux header encode failed");
         common::MultiBuffer frame;
-        Require(common::AppendSpanToMultiBuffer({mux_hdr.data(), hdr_len}, frame));
-        Require(common::AppendSpanToMultiBuffer(datagram, frame));
+        Require(frame.AppendSpan({mux_hdr.data(), hdr_len}));
+        Require(frame.AppendSpan(datagram));
         const auto decoded = common::DecodeFrame(frame);
         Require(decoded.has_value() && decoded->frame_size == hdr_len + datagram.size(),
                 "Mux frame decode failed");

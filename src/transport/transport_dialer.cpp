@@ -1,8 +1,7 @@
 #include "transport/outbound_target_builder.hpp"
-#include "common/allocator.hpp"
 
 #include "app/dns/dns.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 #include "infra/log.hpp"
 #include "transport/tcp_stream.hpp"
 #include "transport/transport_stack.hpp"
@@ -264,9 +263,8 @@ AttachXHttpDownloadTarget(
         co_return tl::unexpected(download_target.error());
     }
 
-    // Dial configuration value, not connection state: process layer.
     target.xhttp_download_target =
-        std::make_shared<OutboundTransportTarget>(std::move(*download_target));
+        std::make_unique<OutboundTransportTarget>(std::move(*download_target));
     co_return target;
 }
 }  // namespace

@@ -1,5 +1,4 @@
 #pragma once
-#include "common/allocator.hpp"
 
 #include "common/multi_buffer.hpp"
 #include "common/const_buffer_span.hpp"
@@ -55,7 +54,7 @@ struct Http1MessageHead {
         common::MultiBuffer mb;
         const auto read_ahead = ReadAhead();
         size = header_end;
-        if (!common::AppendSpanToMultiBuffer(read_ahead, mb)) {
+        if (!mb.AppendSpan(read_ahead)) {
             throw std::bad_alloc();
         }
         return mb;

@@ -1,5 +1,4 @@
 #include "transport/hysteria/hysteria_wire.hpp"
-#include "common/allocator.hpp"
 
 #include "common/byte_reader.hpp"
 

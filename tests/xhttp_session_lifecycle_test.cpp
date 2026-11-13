@@ -3,7 +3,7 @@
 
 #include "transport/xhttp_session.hpp"
 #include "transport/tcp_stream.hpp"
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -259,8 +259,8 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
     auto work_0 = std::make_optional(net::make_work_guard(*worker0));
     auto work_1 = std::make_optional(net::make_work_guard(*worker1));
     auto coordinator = std::make_shared<::app::GroupCoordinator>(control);
-    coordinator->RegisterWorker(*worker0);
-    coordinator->RegisterWorker(*worker1);
+    coordinator->RegisterWorker();
+    coordinator->RegisterWorker();
 
     std::thread thread_c([&] { control.run(); });
     std::thread thread_0([&] {

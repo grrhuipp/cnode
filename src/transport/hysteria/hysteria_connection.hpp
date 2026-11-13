@@ -125,7 +125,7 @@ private:
     bool SetupHttp3();
     void SubmitHttpStatus(int64_t stream_id, std::string_view status, bool authenticated);
     void OnHttpHeader(int64_t stream_id, int32_t token, nghttp3_rcbuf* name, nghttp3_rcbuf* value);
-    void HandleUdpMessage(const HysteriaUdpMessage& message);
+    void ProcessUdpMessage(const HysteriaUdpMessage& message);
     void ExpireUdpFragments(ngtcp2_tstamp now) noexcept;
     void DeliverUdpPacket(uint32_t session_id, const common::TargetAddress& target,
                           std::span<const uint8_t> payload);

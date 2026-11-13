@@ -28,17 +28,13 @@ inline constexpr size_t kPacketStreamPendingLimit = 256 * 1024;
     return total;
 }
 
-inline void AppendCoalescedStreamInput(MultiBuffer& pending, MultiBuffer input) {
-    input.MoveTo(pending, true);
-}
-
 // Input rejection is a framing result, not an operating-system I/O failure.
 [[nodiscard]] inline bool AppendPacketStreamInput(MultiBuffer& pending, MultiBuffer input) {
     if (pending.byte_size() > kPacketStreamPendingLimit ||
         input.byte_size() > kPacketStreamPendingLimit - pending.byte_size()) {
         return false;
     }
-    AppendCoalescedStreamInput(pending, std::move(input));
+    input.MoveTo(pending, true);
     return true;
 }
 

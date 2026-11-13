@@ -1,5 +1,4 @@
 #include "transport/reality_tls.hpp"
-#include "common/allocator.hpp"
 #include "transport/tls_context.hpp"
 #include "transport/tls_stream.hpp"
 #include "transport/stream_settings.hpp"

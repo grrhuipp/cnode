@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <exception>
 #include <filesystem>
+#include <optional>
 #include <fstream>
 #include <iostream>
 #include <mutex>
@@ -49,14 +50,17 @@ public:
         second_.open(tcp::v4());
         second_.bind({asio::ip::make_address("127.77.0.3"), panel_port_});
         second_.listen();
-        tcp::acceptor node_port(io_, {asio::ip::address_v4::loopback(), 0});
-        node_port_ = node_port.local_endpoint().port();
+        node_guard_.emplace(io_, tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+        node_port_ = node_guard_->local_endpoint().port();
+        listen_address_ = mode == Mode::StaticCollision
+            ? "127.0.0.1"
+            : "127.78." + std::to_string(node_port_ >> 8) + "." + std::to_string(node_port_ & 0xff);
         if (mode == Mode::Lifecycle) {
-            tcp::acceptor companion(io_, {asio::ip::address_v4::loopback(), 0});
-            companion_port_ = companion.local_endpoint().port();
+            companion_guard_.emplace(io_, tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+            companion_port_ = companion_guard_->local_endpoint().port();
         }
         if (CollisionMode()) companion_port_ = node_port_;
-        node_port.close();
+        if (mode == Mode::StaticCollision) node_guard_.reset();
         auto report = [](std::exception_ptr failure) {
             if (!failure) return;
             try { std::rethrow_exception(failure); }
@@ -85,7 +89,7 @@ public:
                << R"(","key":"local-test-key","nodeIDs":)"
                << (mode_ == Mode::StaticCollision ? "[2]" :
                    mode_ == Mode::Lifecycle || CollisionMode() ? "[1,2]" : "[1]")
-               << R"(,"nodeType":"vmess","listenIP":"127.0.0.1","requestTimeout":)"
+               << R"(,"nodeType":"vmess","listenIP":")" << listen_address_ << R"(","requestTimeout":)"
                << (mode_ == Mode::Timeout ? 1 : mode_ == Mode::Heartbeat ? 120 : 30) << "}]}";
         if (!config) return false;
         if (mode_ == Mode::StaticCollision) {
@@ -136,6 +140,7 @@ public:
 
     unsigned short NodePort() const noexcept { return node_port_; }
     unsigned short CompanionPort() const noexcept { return companion_port_; }
+    const std::string& ListenAddress() const noexcept { return listen_address_; }
 
     void ReleaseCompanion() noexcept { companion_released_.store(true); }
 
@@ -280,6 +285,9 @@ private:
     unsigned short panel_port_ = 0;
     unsigned short node_port_ = 0;
     unsigned short companion_port_ = 0;
+    std::optional<tcp::acceptor> node_guard_;
+    std::optional<tcp::acceptor> companion_guard_;
+    std::string listen_address_;
     std::mutex mutex_;
     std::condition_variable posted_;
     std::vector<Post> posts_;

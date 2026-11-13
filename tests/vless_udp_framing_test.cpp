@@ -75,13 +75,13 @@ void Run(Factory&& factory) {
 common::MultiBuffer MakeDatagram(const std::vector<uint8_t>& source,
                               const common::TargetAddress& target) {
     common::MultiBuffer payload;
-    EXPECT_TRUE((common::AppendSpanToMultiBuffer(source, payload))) << "failed to allocate VLESS UDP test payload";
+    EXPECT_TRUE((payload.AppendSpan(source))) << "failed to allocate VLESS UDP test payload";
     EXPECT_TRUE((common::SetUdpTarget(payload, target))) << "failed to tag VLESS UDP test payload";
     return payload;
 }
 common::MultiBuffer MakeInput(std::span<const uint8_t> bytes) {
     common::MultiBuffer input;
-    EXPECT_TRUE((common::AppendSpanToMultiBuffer(bytes, input))) << "input allocation failed";
+    EXPECT_TRUE((input.AppendSpan(bytes))) << "input allocation failed";
     return input;
 }
 

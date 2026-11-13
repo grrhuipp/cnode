@@ -2,7 +2,7 @@
 #include "app/relay.hpp"
 
 #include "app/dns/dns.hpp"
-#include "common/hash_container_shrink.hpp"
+#include "common/allocator.hpp"
 #include <map>
 #include <stdexcept>
 #include <utility>

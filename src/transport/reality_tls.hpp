@@ -1,5 +1,4 @@
 #pragma once
-#include "common/allocator.hpp"
 
 #include "common/byte_reader.hpp"
 #include "transport/stream_settings.hpp"

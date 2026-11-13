@@ -7,7 +7,7 @@
 #include "app/proxyman/user_store.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/initial_payload.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "common/target_address.hpp"
 #include <openssl/mem.h>
 #include "proxy/inbound.hpp"

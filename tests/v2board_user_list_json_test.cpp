@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "api/panel_data.hpp"
+#include "api/panel_wire.hpp"
 #include <limits>
 #include <string_view>
 

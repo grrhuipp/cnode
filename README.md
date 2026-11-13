@@ -364,15 +364,16 @@ time="2026-11-05T12:30:00+08:00" level=info msg="Panel status: state=ready inbou
 
 ```text
 include/              公共 API 和窄接口
-src/app/              Worker、dispatcher、router、proxyman、stats、bootstrap
+src/app/              Worker、DNS、dispatcher、router、proxyman、准入与监控、bootstrap
 src/proxy/            协议实现
 src/transport/        传输层实现
-src/service/          控制面 controller
+src/controller/       控制面节点同步与流量账本
 src/api/              面板 API client
 src/infra/            配置、JSON、日志、校验
-src/common/           通用类型、buffer、allocator、session、mux
+src/common/           通用类型、缓冲、队列、在线配额、会话、mux
 src/geo/              geoip / geosite 数据读取
 src/sniff/            HTTP / TLS / QUIC sniffing
+tools/                流量账本离线对账工具
 config/               示例配置
 scripts/              部署与更新脚本
 ```

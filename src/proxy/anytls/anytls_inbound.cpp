@@ -21,7 +21,7 @@
 #include "transport/timeout_scheduler.hpp"
 #include "app/proxyman/user_store.hpp"
 #include "common/address_codec.hpp"
-#include "common/hash_container_shrink.hpp"
+#include "common/allocator.hpp"
 
 #include <asio/experimental/channel.hpp>
 #include <openssl/crypto.h>
@@ -116,7 +116,7 @@ public:
             mb.clear();
             co_return;
         }
-        common::AppendCoalescedStreamInput(queued_input_, std::move(mb));
+        mb.MoveTo(queued_input_, true);
         WakeInputReader();
     }
 

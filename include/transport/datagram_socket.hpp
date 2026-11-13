@@ -1,5 +1,4 @@
 #pragma once
-#include "common/allocator.hpp"
 
 #include "common/asio_types.hpp"
 #include "common/multi_buffer.hpp"
@@ -93,7 +92,7 @@ public:
     void SetIdleTimeout(std::chrono::seconds timeout);
     void SetReadTimeout(std::chrono::seconds timeout);
     void SetWriteTimeout(std::chrono::seconds timeout);
-    [[nodiscard]] PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout);
+    [[nodiscard]] PhaseDeadlineToken StartPhaseDeadline(std::chrono::seconds timeout);
     void ClearPhaseDeadline() noexcept;
     [[nodiscard]] bool ConsumeIdleTimeout() noexcept;
     [[nodiscard]] bool ConsumeReadTimeout() noexcept;
@@ -131,7 +130,7 @@ public:
     void Release() noexcept;
     // 返回空缓冲表示分配失败，调用方应丢弃队首数据报。
     [[nodiscard]] net::mutable_buffer Prepare(std::size_t available_bytes);
-    [[nodiscard]] std::span<const uint8_t> Data(std::size_t bytes) const noexcept;
+    [[nodiscard]] std::span<const uint8_t> Bytes(std::size_t bytes) const noexcept;
 
 private:
     common::BufferGuard small_;
@@ -248,7 +247,7 @@ net::awaitable<void> RunUdpReceiveLoop(
                 continue;
             }
 
-            const auto payload = receive_buffer.Data(received_bytes);
+            const auto payload = receive_buffer.Bytes(received_bytes);
             try {
                 process_datagram(peer, payload);
             } catch (const std::bad_alloc&) {

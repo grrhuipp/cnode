@@ -1,6 +1,6 @@
 #pragma once
 
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/use_future.hpp>

@@ -20,7 +20,6 @@ struct transport::TimeoutScheduler::Impl {
 
     net::io_context& context;
     net::steady_timer timer;
-    // Shared Worker bookkeeping uses the process allocator.
     std::vector<transport::TimeoutEvent*> heap;
     uint64_t next_sequence = 0;
     std::optional<common::SignalChannel> join;

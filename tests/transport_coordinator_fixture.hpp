@@ -1,7 +1,7 @@
 #pragma once
 
 #include <gtest/gtest.h>
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/executor_work_guard.hpp>
 #include <asio/use_future.hpp>
@@ -13,7 +13,8 @@ public:
     explicit TransportCoordinatorFixture(net::io_context& worker)
         : guard_(net::make_work_guard(control_)),
           coordinator_(std::make_shared<app::GroupCoordinator>(control_)) {
-        coordinator_->RegisterWorker(worker);
+        (void)worker;
+        coordinator_->RegisterWorker();
         thread_ = std::thread([this] { control_.run(); });
     }
     ~TransportCoordinatorFixture() {

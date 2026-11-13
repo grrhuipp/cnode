@@ -79,7 +79,7 @@ private:
             if (received) {
                 if (pending.byte_size() > maximum || incoming.byte_size() > maximum - pending.byte_size())
                     throw IoSystemError(io_error::message_size, "stream pending buffer exceeded");
-                common::AppendCoalescedStreamInput(pending, std::move(incoming));
+                incoming.MoveTo(pending, true);
             }
             if ((co_await net::this_coro::cancellation_state).cancelled() != net::cancellation_type::none)
                 throw IoSystemError(io_error::operation_aborted);

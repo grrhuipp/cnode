@@ -1,7 +1,6 @@
 #pragma once
 
 #include "common/address_codec.hpp"
-#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/binary_text_codec.hpp"
 #include "common/length_prefixed_packet_buffer.hpp"

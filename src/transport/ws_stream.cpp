@@ -94,14 +94,8 @@ bool BaseWsStream::Utf8State::Consume(std::span<const uint8_t> bytes) noexcept {
 
 bool BaseWsStream::HasPendingBytes() noexcept {
     if (closed_ || read_closed_) return false;
-    while (!pending_data_.empty()) {
-        if (const common::Buffer* front = *pending_data_.begin();
-            front && !front->IsEmpty()) {
-            return true;
-        }
-        pending_data_.drop_front(1);
-    }
-    return false;
+    pending_data_.ReleaseIfIdle();
+    return pending_data_.byte_size() > 0;
 }
 
 bool BaseWsStream::TryFillHeaderFromPending() noexcept {

@@ -1,5 +1,5 @@
 #include "proxy/shadowsocks/ss_salt_pool.hpp"
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 
 #include <algorithm>
 #include <array>

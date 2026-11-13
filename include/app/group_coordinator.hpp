@@ -19,8 +19,8 @@ public:
     explicit GroupCoordinator(net::io_context& io, size_t capacity = 1024);
     ~GroupCoordinator();
     void Start();
-    // Register fixed Worker routes before their request admission starts.
-    void RegisterWorker(net::io_context& reactor);
+    // Record fixed Worker count before request admission starts.
+    void RegisterWorker() noexcept;
     [[nodiscard]] uint32_t WorkerCount() const noexcept;
 
     struct ReservedOperation {

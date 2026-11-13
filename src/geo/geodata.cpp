@@ -1,5 +1,4 @@
 #include "geo/geodata.hpp"
-#include "common/allocator.hpp"
 #include "common/byte_reader.hpp"
 #include "common/domain_name.hpp"
 #include "common/unsafe.hpp"

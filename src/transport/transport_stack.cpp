@@ -1,5 +1,4 @@
 #include "transport/transport_stack.hpp"
-#include "common/allocator.hpp"
 
 #include "transport/http1_handshake.hpp"
 #include "transport/http2_session.hpp"
@@ -131,9 +130,9 @@ net::awaitable<void> RunRealityFallbackProxy(
             client_tcp->RemoteEndpoint(),
             client_tcp->LocalEndpoint(),
             proxy_header);
-        first_ok = common::AppendSpanToMultiBuffer(std::span<const uint8_t>(proxy_header.data(), proxy_header_len), first);
+        first_ok = first.AppendSpan(std::span<const uint8_t>(proxy_header.data(), proxy_header_len));
     }
-    first_ok = first_ok && common::AppendSpanToMultiBuffer(initial_bytes, first);
+    first_ok = first_ok && first.AppendSpan(initial_bytes);
     std::vector<uint8_t>{}.swap(initial_bytes);
     if (!first_ok) {
         dest_stream->CloseAbortive();
@@ -234,7 +233,7 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
                 std::move(initial_bytes));
             co_return std::unique_ptr<AsyncStream>{};
         }
-        tcp->PrependReadData(initial_bytes);
+        tcp->PrependReadBytes(initial_bytes);
         std::vector<uint8_t>{}.swap(initial_bytes);
     }
     std::unique_ptr<TlsStream> tls;

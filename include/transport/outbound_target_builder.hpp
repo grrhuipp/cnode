@@ -1,11 +1,10 @@
 #pragma once
-#include "common/allocator.hpp"
 
 #include "common/asio_types.hpp"
 #include "common/defaults.hpp"
 #include "common/domain_name.hpp"
 #include "common/error.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 #include "common/session.hpp"
 #include "common/target_address.hpp"
 #include "transport/async_stream.hpp"
@@ -79,7 +78,7 @@ struct OutboundTransportTarget {
     std::chrono::seconds timeout{common::kDialTimeout};
 
     // XHTTP packet-up / stream-up 可用独立下行入口；仅保存已解析候选和不可变配置视图。
-    std::shared_ptr<const OutboundTransportTarget> xhttp_download_target;
+    std::unique_ptr<const OutboundTransportTarget> xhttp_download_target;
 
     [[nodiscard]] std::span<const OutboundDialCandidate> Candidates() const noexcept {
         return single_candidate

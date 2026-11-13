@@ -4,7 +4,7 @@
 #include "app/proxyman/user_store.hpp"
 #include "common/length_prefixed_packet_buffer.hpp"
 #include "common/multi_buffer.hpp"
-#include "common/eof_cancellation.hpp"
+#include "common/asio_types.hpp"
 #include "common/byte_reader.hpp"
 #include "common/unsafe.hpp"
 #include "proxy/aead.hpp"
@@ -284,7 +284,7 @@ ReadAndDecryptStreamPayload(
     if (auto read = co_await proxy::ReadHandshakeExact(stream, tag,
             proxy::HandshakeProgress::Started); !read)
         co_return tl::unexpected(read.error());
-    if (!common::AppendSpanToMultiBuffer(tag, ciphertext))
+    if (!ciphertext.AppendSpan(tag))
         co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
     if (!DecryptStreamPayload(cipher, nonce, std::move(ciphertext), output))
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -328,7 +328,7 @@ public:
                 }
                 co_return common::MultiBuffer{};
             }
-            try { common::AppendCoalescedStreamInput(ciphertext_, std::move(raw)); }
+            try { raw.MoveTo(ciphertext_, true); }
             catch (...) { Fail(); }
         }
     }

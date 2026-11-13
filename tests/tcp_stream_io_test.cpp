@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include "transport/tcp_stream.hpp"
-#include "common/allocator.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -20,9 +19,9 @@ namespace {
 namespace net = ::net;
 using namespace std::chrono_literals;
 
-class AsioOperationAllocatorTest : public ::testing::Test {
+class TcpStreamIoTest : public ::testing::Test {
 protected:
-    AsioOperationAllocatorTest()
+    TcpStreamIoTest()
         : acceptor_(io_, {net::ip::address_v4::loopback(), 0}),
           peer_(io_), stream_(Connect()) {}
 
@@ -39,7 +38,7 @@ protected:
     ::transport::TcpStream stream_;
 };
 
-TEST_F(AsioOperationAllocatorTest, NativeWriteDeliversEveryByteToPeer) {
+TEST_F(TcpStreamIoTest, NativeWriteDeliversEveryByteToPeer) {
     constexpr std::array<char, 4> sent{'a', '\0', 'b', '\xff'};
     std::array<char, sent.size()> received{};
     auto written = net::co_spawn(io_, [&]() -> net::awaitable<std::size_t> {
@@ -70,7 +69,7 @@ TEST_F(AsioOperationAllocatorTest, NativeWriteDeliversEveryByteToPeer) {
     EXPECT_EQ(received, sent);
 }
 
-TEST_F(AsioOperationAllocatorTest, NativeReadReturnsPeerPayload) {
+TEST_F(TcpStreamIoTest, NativeReadReturnsPeerPayload) {
     constexpr std::array<char, 4> sent{'x', '\0', 'y', '\xff'};
     std::array<char, sent.size()> received{};
     net::write(peer_, net::buffer(sent));
@@ -96,7 +95,7 @@ TEST_F(AsioOperationAllocatorTest, NativeReadReturnsPeerPayload) {
 }
 
 enum class ReadKind { Readiness, Bytes, MultiBuffer };
-class NativeReadCancellation : public AsioOperationAllocatorTest,
+class NativeReadCancellation : public TcpStreamIoTest,
                                public ::testing::WithParamInterface<ReadKind> {};
 
 TEST_P(NativeReadCancellation, CancelsPendingOperationWithoutClosingConnection) {
@@ -152,7 +151,7 @@ TEST_P(NativeReadCancellation, CancelsPendingOperationWithoutClosingConnection) 
 INSTANTIATE_TEST_SUITE_P(AllNativeReads, NativeReadCancellation,
     ::testing::Values(ReadKind::Readiness, ReadKind::Bytes, ReadKind::MultiBuffer));
 
-TEST_F(AsioOperationAllocatorTest, QueuedReadinessOwnsPayloadUntilCallbackCompletes) {
+TEST_F(TcpStreamIoTest, QueuedReadinessOwnsPayloadUntilCallbackCompletes) {
     auto payload = ::common::BufferGuard{::common::Buffer::New()};
     ASSERT_TRUE(payload);
     bool consumed = false;
@@ -188,7 +187,7 @@ TEST_F(AsioOperationAllocatorTest, QueuedReadinessOwnsPayloadUntilCallbackComple
     EXPECT_TRUE(released);
 }
 
-TEST(AsioOperationAllocator, ReactorDestructionReleasesPendingHandlerOnShutdownThread) {
+TEST(TcpStreamIo, ReactorDestructionReleasesPendingHandlerOnShutdownThread) {
     auto reactor = std::make_unique<net::io_context>();
     auto timer = std::make_unique<net::steady_timer>(*reactor, 1h);
     std::thread::id destruction_thread;

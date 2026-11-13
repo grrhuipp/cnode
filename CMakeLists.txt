@@ -107,7 +107,7 @@ set(CNODE_CORE_SOURCES
     # Common
     src/common/rule.cpp
     src/common/session.cpp
-    src/common/sharded_user_stats.cpp
+    src/common/user_online_tracker.cpp
     src/common/mux_codec.cpp
 
     # Geo & Sniff
@@ -125,7 +125,7 @@ set(CNODE_CORE_SOURCES
     src/app/proxyman/user_store.cpp
     src/app/proxyman/outbound_handler.cpp
     src/app/worker.cpp
-    src/app/session_group_executor.cpp
+    src/app/group_coordinator.cpp
     src/app/prepared_inbound.cpp
     src/app/bootstrap.cpp
     src/app/router/router.cpp
@@ -239,7 +239,7 @@ endfunction()
 # 只有特殊链接的单元测试在此显式登记；其余 tests/*_test.cpp 由下方 glob 按默认方式登记。
 foreach(name IN ITEMS
         allocator anytls_codec_errors anytls_outbound_lifecycle buffer_ownership
-        buffer_span_builder dispatcher_cancellation dns_datagram http_handshake_read_ahead
+        buffer_span_builder dispatcher_cancellation dns_cache dns_datagram http_handshake_read_ahead
         quic_stream relay_initial_payload substream_inbound_lifecycle tcp_read
         tls_record_buffer udp_socket_owner uot_ss2022 vless_udp_framing ss2022_salt_pool)
     cnode_unit(${name} LIBRARY cnode_test_core)
@@ -250,7 +250,7 @@ endforeach()
 cnode_unit(awaitable_batch LIBRARY cnode_build_options)
 cnode_unit(awaitable_task_group LIBRARY cnode_build_options)
 cnode_unit(shadowsocks_stream_crypto LIBRARY cnode_build_options SOURCES src/proxy/shadowsocks/shadowsocks_protocol.cpp)
-cnode_unit(timeout_scheduler LIBRARY cnode_build_options SOURCES src/transport/timeout_scheduler.cpp src/app/session_group_executor.cpp src/infra/log.cpp)
+cnode_unit(timeout_scheduler LIBRARY cnode_build_options SOURCES src/transport/timeout_scheduler.cpp src/app/group_coordinator.cpp src/infra/log.cpp)
 cnode_unit(vmess_cipher LIBRARY cnode_build_options SOURCES src/proxy/vmess/vmess_crypto.cpp)
 
 file(GLOB unit_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cpp")

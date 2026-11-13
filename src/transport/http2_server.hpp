@@ -5,11 +5,10 @@
 #include "transport/async_write_gate.hpp"
 #include "transport/tcp_stream.hpp"
 #include "common/awaitable_task_group.hpp"
-#include "common/hash_container_shrink.hpp"
+#include "common/allocator.hpp"
 #include "infra/log.hpp"
 #include <unordered_map>
 #include <vector>
-#include "common/allocator.hpp"
 
 namespace transport {
 class Http2ServerSession;

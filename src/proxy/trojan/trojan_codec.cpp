@@ -2,7 +2,7 @@
 #include "common/address_codec.hpp"
 #include "common/binary_text_codec.hpp"
 #include "common/length_prefixed_packet_buffer.hpp"
-#include "common/eof_cancellation.hpp"
+#include "common/asio_types.hpp"
 #include "common/byte_reader.hpp"
 #include "proxy/udp_datagram_frame.hpp"
 

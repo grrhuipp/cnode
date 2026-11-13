@@ -1,6 +1,6 @@
 #include "proxy/vless/vless_encryption.hpp"
 #include "common/const_buffer_span.hpp"
-#include "common/eof_cancellation.hpp"
+#include "common/asio_types.hpp"
 
 #include <asio/this_coro.hpp>
 #include <algorithm>
@@ -296,7 +296,7 @@ net::awaitable<void> VlessEncryptionWriter::WriteEncrypted(BufferRange source) {
     }
     struct NoBuilder {};
     [[maybe_unused]] std::conditional_t<kOwnsBuffers,
-                       common::ConstBufferSpanBuilder<common::MultiBuffer::kInlineCapacity>,
+                       common::ConstBufferSpanBuilder<1>,
                        NoBuilder> builder;
     std::span<const net::const_buffer> buffers;
     if constexpr (kOwnsBuffers) {

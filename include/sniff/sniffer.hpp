@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/allocator.hpp"
 #include "common/target_address.hpp"
 #include "common/constants.hpp"
 #include <algorithm>

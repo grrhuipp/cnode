@@ -97,7 +97,7 @@ inline net::awaitable<void> PrepareWire(Wire& wire, const PreparedShadowsocksUse
     Require(bool(request));
     common::MultiBuffer payload;
     const std::array<uint8_t, 3> data{0x17, 0x29, 0x41};
-    Require(common::AppendSpanToMultiBuffer(data, payload));
+    Require(payload.AppendSpan(data));
     co_await request->request_writer.WriteMultiBuffer(std::move(payload));
 }
 

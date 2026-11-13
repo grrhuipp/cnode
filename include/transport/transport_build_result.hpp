@@ -1,5 +1,4 @@
 #pragma once
-#include "common/allocator.hpp"
 
 #include "common/error.hpp"
 #include "common/target_address.hpp"

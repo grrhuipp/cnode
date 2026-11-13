@@ -94,7 +94,7 @@ enum class HandshakeProgress : uint8_t {
 
 [[nodiscard]] inline bool ConsumeOutboundHandshakeTimeout(
     transport::AsyncStream& stream,
-    const transport::PhaseDeadlineHandle& deadline) noexcept {
+    const transport::PhaseDeadlineToken& deadline) noexcept {
     return deadline.Expired() || ConsumeStreamReadTimeout(stream) ||
            stream.ConsumeWriteTimeout();
 }
@@ -103,7 +103,7 @@ enum class HandshakeProgress : uint8_t {
 // transport::ClassifyFailure，本函数只叠加握手截止期语义。
 [[nodiscard]] inline common::ErrorCode ClassifyOutboundHandshakeException(
     transport::AsyncStream& stream,
-    const transport::PhaseDeadlineHandle& deadline,
+    const transport::PhaseDeadlineToken& deadline,
     common::ErrorCode fallback = common::ErrorCode::SOCKET_WRITE_FAILED) noexcept {
     const common::ErrorCode code = transport::ClassifyFailure(std::current_exception(), fallback);
     if (code == common::ErrorCode::RESOURCE_EXHAUSTED) return code;

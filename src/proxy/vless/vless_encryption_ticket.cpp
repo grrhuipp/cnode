@@ -1,5 +1,5 @@
 #include "proxy/vless/vless_encryption.hpp"
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 #include "infra/log.hpp"
 
 #include <blake3.h>

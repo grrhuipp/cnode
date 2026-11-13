@@ -59,8 +59,6 @@ inline constexpr std::string_view kChacha20IetfPoly1305 = "chacha20-ietf-poly130
 inline constexpr std::string_view kSs2022Blake3Aes128Gcm = "2022-blake3-aes-128-gcm";
 inline constexpr std::string_view kSs2022Blake3Aes256Gcm = "2022-blake3-aes-256-gcm";
 inline constexpr std::string_view kSs2022Blake3Chacha20Poly1305 = "2022-blake3-chacha20-poly1305";
-inline constexpr std::string_view kV2BoardType = kV2Board;
-inline constexpr std::string_view kDefaultNodeType = kDefaultNodeProtocol;
 
 inline constexpr uint16_t kTestPort = 10086;
 inline constexpr std::string_view kTestVmessUuid =

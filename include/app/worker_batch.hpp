@@ -59,19 +59,21 @@ template <typename WorkerRange, typename OperationFactory,
     const bool& stopping,
     OperationFactory make_operation) {
     ThrowIfStopping(stopping);
+    std::vector<net::awaitable<void>> tasks;
+    tasks.reserve(workers.size());
     if constexpr (std::is_void_v<T>) {
-        co_await common::RunWorkerBatch(std::move(executor), workers,
-            [&stopping, &make_operation](auto& worker, size_t index) {
-                return AwaitUnlessStopping(
-                    &stopping, make_operation(worker, index));
-            });
+        for (size_t i = 0; i < workers.size(); ++i) {
+            tasks.push_back(AwaitUnlessStopping(
+                &stopping, make_operation(*workers[i], i)));
+        }
+        co_await common::RunAwaitableBatch(std::move(executor), std::move(tasks));
     } else {
         std::vector<T> results(workers.size());
-        co_await common::RunWorkerBatch(std::move(executor), workers,
-            [&stopping, &make_operation, &results](auto& worker, size_t index) {
-                return AwaitUnlessStopping(
-                    &stopping, make_operation(worker, index), &results[index]);
-            });
+        for (size_t i = 0; i < workers.size(); ++i) {
+            tasks.push_back(AwaitUnlessStopping(
+                &stopping, make_operation(*workers[i], i), &results[i]));
+        }
+        co_await common::RunAwaitableBatch(std::move(executor), std::move(tasks));
         co_return results;
     }
 }

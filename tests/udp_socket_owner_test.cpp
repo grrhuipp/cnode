@@ -8,7 +8,7 @@
 #include "app/relay.hpp"
 #include "app/proxyman/inbound_handler.hpp"
 #include "app/stats.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/shadowsocks/ss_udp.hpp"
@@ -80,7 +80,7 @@ public:
         result.session_owner = script_->owner;
         result.session_id = script_->session_id;
         result.target = script_->target;
-        if (!::common::AppendSpanToMultiBuffer(request.payload, result.payload))
+        if (!result.payload.AppendSpan(request.payload))
             return tl::unexpected(::common::ErrorCode::RESOURCE_EXHAUSTED);
 #ifdef CNODE_TEST_ALLOCATOR
         if (script_->fail_next_allocation) {
@@ -104,7 +104,7 @@ public:
         last_size = packet.data.size();
         last_target = packet.target;
         ::common::MultiBuffer encoded;
-        if (!::common::AppendSpanToMultiBuffer(packet.data, encoded)) throw std::bad_alloc();
+        if (!encoded.AppendSpan(packet.data)) throw std::bad_alloc();
         return encoded;
     }
 
@@ -206,7 +206,7 @@ protected:
     AllocationFaultScope fault_scope;
 
     void SetUp() override {
-        coordinator.Get()->RegisterWorker(io_context);
+        coordinator.Get()->RegisterWorker();
         const std::array<uint8_t, 1> bytes{1};
         ASSERT_TRUE(default_owner.Assign(bytes));
         uplink_script.target = callback_source;
@@ -229,7 +229,7 @@ protected:
     ::common::MultiBuffer make_tiny_payload() {
         ::common::MultiBuffer payload;
         const std::array<uint8_t, 1> bytes{0x7a};
-        if (!::common::AppendSpanToMultiBuffer(bytes, payload)) throw std::bad_alloc();
+        if (!payload.AppendSpan(bytes)) throw std::bad_alloc();
         return payload;
     }
     ::app::UdpIngress::SocketPtr attach_uplink_socket(std::string_view key) {
@@ -288,7 +288,7 @@ TEST(UdpResourceBudget, MovedReservationsReleaseOnlyTheirOriginBudget) {
         .payload_capacity = ::common::Buffer::kSize});
     ::common::MultiBuffer payload;
     const std::array<uint8_t, 1> bytes{0x73};
-    ASSERT_TRUE(::common::AppendSpanToMultiBuffer(bytes, payload));
+    ASSERT_TRUE(payload.AppendSpan(bytes));
     std::array<Budget::AssociationLease, kMigrating> associations;
     std::array<Budget::PayloadReservation, kMigrating> reservations;
     for (size_t i = 0; i < kMigrating; ++i) {
@@ -645,7 +645,7 @@ TEST_P(UdpPayloadLimitTest, ReplyAdmissionReleasesCapacityOnQueueDestruction) {
     auto payload = [] {
         ::common::MultiBuffer result;
         const std::array<uint8_t, 1> bytes{0x55};
-        if (!::common::AppendSpanToMultiBuffer(bytes, result)) throw std::bad_alloc();
+        if (!result.AppendSpan(bytes)) throw std::bad_alloc();
         return result;
     };
     using Result = ::app::UdpIngress::ReplyEnqueueResult;
@@ -711,7 +711,7 @@ TEST(UdpResourceBudget, EmptyDatagramsRetainBoundariesAndReleaseQueueReservation
         [&](std::exception_ptr error, ::common::MultiBuffer packet) {
             const auto datagram = ::common::InspectUdpDatagram(packet);
             empty_read = !error && datagram.Valid() && datagram.payload_size == 0 &&
-                datagram.buffer_count == 1 && datagram.target->SameEndpoint(target);
+                datagram.single_buffer != nullptr && datagram.target->SameEndpoint(target);
         });
     io.poll();
     io.restart();
@@ -882,7 +882,7 @@ TEST_F(UdpSocketOwnerTest, ReceivePreservesDatagramsLargerThanOneBuffer) {
                 sender_endpoint,
                 ::net::as_tuple(::net::use_awaitable));
             if (receive_ec) co_return;
-            const auto received = receive_buffer.Data(bytes);
+            const auto received = receive_buffer.Bytes(bytes);
             large_received = received.size() == large_payload.size() &&
                 std::equal(received.begin(), received.end(), large_payload.begin());
         },
@@ -1105,8 +1105,8 @@ TEST_P(UdpReplyEndpointTest, MultibufferReplyUsesCurrentEndpointWithoutSplitting
     std::vector<uint8_t> callback_large_payload(
         ::common::Buffer::kSize + 257, 0x6d);
     ::common::MultiBuffer callback_large_buffers;
-    EXPECT_TRUE(::common::AppendSpanToMultiBuffer(
-                callback_large_payload, callback_large_buffers)) << "failed to allocate large UDP callback payload";
+    EXPECT_TRUE(callback_large_buffers.AppendSpan(
+                callback_large_payload)) << "failed to allocate large UDP callback payload";
     for (::common::Buffer* buffer : callback_large_buffers) {
         if (buffer && !buffer->IsEmpty()) {
             buffer->SetUDP(callback_source);
@@ -1408,7 +1408,7 @@ TEST(UdpSocketOwner, ReplySenderDrain) {
     ::udp::socket peer(io, {::net::ip::address_v4::loopback(), 0});
     ::common::MultiBuffer payload;
     const std::array<uint8_t, 1> bytes{0x31};
-    ASSERT_TRUE(::common::AppendSpanToMultiBuffer(bytes, payload));
+    ASSERT_TRUE(payload.AppendSpan(bytes));
     DrainReplyIngress drain{io, ingress};
     ASSERT_TRUE(ingress.SendReply(socket, peer.local_endpoint(), std::move(payload), 0));
     EXPECT_EQ(budget.GetUsage().datagrams, 1u);

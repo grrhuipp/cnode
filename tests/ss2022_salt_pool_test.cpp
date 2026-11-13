@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 #include "proxy/shadowsocks/ss_salt_pool.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -103,8 +103,8 @@ protected:
 
     void Start(size_t capacity) {
         coordinator = std::make_shared<app::GroupCoordinator>(control, capacity);
-        coordinator->RegisterWorker(first);
-        coordinator->RegisterWorker(second);
+        coordinator->RegisterWorker();
+        coordinator->RegisterWorker();
         control_thread = std::thread([this] { control.run(); });
         first_thread = std::thread([this] { first.run(); });
         second_thread = std::thread([this] { second.run(); });

@@ -7,7 +7,6 @@
 // notices release quotas without blocking. Reporting reads domain-local leases.
 // ============================================================================
 
-#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/string_hash.hpp"
 

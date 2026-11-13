@@ -3,11 +3,10 @@
 #include "proxy/outbound_endpoint_base.hpp"
 #include "transport/outbound_target_builder.hpp"
 #include "app/relay.hpp"
-#include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/error.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "common/target_address.hpp"
 #include <openssl/mem.h>
 #include "infra/outbound_types.hpp"
@@ -103,7 +102,7 @@ private:
     void Begin(size_t frames);
     [[nodiscard]] bool Append(uint8_t cmd, uint32_t sid, std::span<const uint8_t> bytes);
 
-    static constexpr size_t kInlineFrames = common::MultiBuffer::kInlineCapacity;
+    static constexpr size_t kInlineFrames = 1;
     std::array<std::array<uint8_t, kFrameHeaderSize>, kInlineFrames> headers_{};
     std::array<net::const_buffer, kInlineFrames * 2> buffers_{};
     std::vector<std::array<uint8_t, kFrameHeaderSize>> spill_headers_;

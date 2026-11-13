@@ -46,7 +46,7 @@ std::vector<uint8_t> Pattern(size_t bytes) {
 
 common::MultiBuffer Packet(std::span<const uint8_t> data) {
     common::MultiBuffer result;
-    if (!common::AppendSpanToMultiBuffer(data, result)) throw std::bad_alloc();
+    if (!result.AppendSpan(data)) throw std::bad_alloc();
     return result;
 }
 
@@ -87,10 +87,10 @@ TEST(BufferOwnership, SpanAppendRollsBackEveryAllocationFailureAndCanRetry) {
         const auto added = Pattern(90000);
         auto payload = Packet(before);
         auto* original = *payload.begin();
-        complete = Inject(budget, [&] { return common::AppendSpanToMultiBuffer(added, payload); });
+        complete = Inject(budget, [&] { return payload.AppendSpan(added); });
         const bool unchanged = complete || (failures != 0 && Flatten(payload) == before &&
             Consistent(payload) && payload.size() == 1 && *payload.begin() == original);
-        if (!complete && !common::AppendSpanToMultiBuffer(added, payload)) return false;
+        if (!complete && !payload.AppendSpan(added)) return false;
         auto expected = before;
         expected.insert(expected.end(), added.begin(), added.end());
         return unchanged && Flatten(payload) == expected && Consistent(payload);

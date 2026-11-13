@@ -1,6 +1,6 @@
 #include "common/domain_name.hpp"
 #include "proxy/outbound_endpoint_base.hpp"
-#include "common/ip_utils.hpp"
+#include "common/ip_address.hpp"
 #include <openssl/mem.h>
 #include "proxy/outbound.hpp"
 #include "proxy/vmess/body.hpp"
@@ -129,7 +129,7 @@ SendVMessHandshake(
     std::chrono::seconds handshake_timeout,
     common::Context& ctx) {
     stream.SetIdleTimeout(handshake_timeout);
-    transport::PhaseDeadlineHandle outbound_protocol_deadline =
+    transport::PhaseDeadlineToken outbound_protocol_deadline =
         stream.StartPhaseDeadline(handshake_timeout);
 
     auto handshake_result = co_await vmess_session.EncodeRequestHeader(

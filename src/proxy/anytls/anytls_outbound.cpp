@@ -11,8 +11,7 @@
 #include "app/dns/dns.hpp"
 #include "app/relay.hpp"
 #include "app/stats.hpp"
-#include "common/ip_utils.hpp"
-#include "common/hash_container_shrink.hpp"
+#include "common/ip_address.hpp"
 #include "common/session.hpp"
 #include "infra/log.hpp"
 #include "common/error.hpp"
@@ -76,7 +75,7 @@ struct AnyTlsOutboundHandler::ClientSession {
                 if (ec) co_return;
             }
             if (closed_) co_return;
-            common::AppendCoalescedStreamInput(queued_payload_, std::move(mb));
+            mb.MoveTo(queued_payload_, true);
             WakePayloadReader();
         }
 
@@ -224,10 +223,8 @@ struct AnyTlsOutboundHandler::ClientSession {
     uint32_t packet_index = 1;
     std::optional<SessionVersion> session_version;
     transport::AsyncWriteGate write_gate;
-    std::unordered_map<
-        uint32_t,
-        std::weak_ptr<LogicalStream>>
-        logical_streams;
+    uint32_t active_sid = 0;
+    std::weak_ptr<LogicalStream> active_stream;
     size_t active_streams = 0;
     bool closed = false;
     // First terminal cause. The physical loop can fail inline while Adopt
@@ -265,13 +262,16 @@ struct AnyTlsOutboundHandler::ClientSession {
     std::shared_ptr<LogicalStream> RegisterLogicalStream(uint32_t sid) {
         auto logical = std::make_shared<LogicalStream>(
             net::any_io_executor(io_context_.get_executor()));
-        logical_streams[sid] = logical;
+        active_sid = sid;
+        active_stream = logical;
         return logical;
     }
 
-    void UnregisterLogicalStream(uint32_t sid) {
-        logical_streams.erase(sid);
-        common::MaybeShrinkHashContainer(logical_streams, 8);
+    void UnregisterLogicalStream(uint32_t sid) noexcept {
+        if (active_sid == sid) {
+            active_sid = 0;
+            active_stream.reset();
+        }
     }
 
     void CloseAll(common::ErrorCode error) noexcept {
@@ -279,14 +279,9 @@ struct AnyTlsOutboundHandler::ClientSession {
         closed = true;
         close_error = error;
         write_gate.Cancel();
-        auto streams = std::exchange(
-            logical_streams,
-            std::unordered_map<uint32_t, std::weak_ptr<LogicalStream>>{});
-        for (auto& [sid, weak] : streams) {
-            (void)sid;
-            if (auto logical = weak.lock()) {
-                logical->Close(error);
-            }
+        active_sid = 0;
+        if (auto logical = std::exchange(active_stream, {}).lock()) {
+            logical->Close(error);
         }
         if (stream) {
             stream->CloseAbortive();
@@ -397,12 +392,9 @@ struct AnyTlsOutboundHandler::ClientSession {
         if (!write_lease || closed || !stream) {
             co_return tl::unexpected(ClosedError());
         }
-        if (cmd == kCmdFIN) {
-            const auto found = logical_streams.find(sid);
-            if (found != logical_streams.end()) {
-                if (auto logical = found->second.lock(); logical && logical->RemoteClosed())
-                    co_return tl::expected<void, common::ErrorCode>{};
-            }
+        if (cmd == kCmdFIN && active_sid == sid) {
+            if (auto logical = active_stream.lock(); logical && logical->RemoteClosed())
+                co_return tl::expected<void, common::ErrorCode>{};
         }
 
         try {
@@ -504,12 +496,9 @@ struct AnyTlsOutboundHandler::ClientSession {
             }
 
             std::shared_ptr<LogicalStream> logical;
-            auto stream_it = logical_streams.find(header->sid);
-            logical = stream_it == logical_streams.end()
-                ? std::shared_ptr<LogicalStream>{}
-                : stream_it->second.lock();
-            if (!logical && stream_it != logical_streams.end()) {
-                logical_streams.erase(stream_it);
+            if (active_sid == header->sid) {
+                logical = active_stream.lock();
+                if (!logical) active_sid = 0;
             }
             if (!logical) {
                 if (auto ok = co_await discard_current(); !ok) {

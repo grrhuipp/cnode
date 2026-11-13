@@ -57,7 +57,7 @@ private:
 
 class Router final : public ::routing::Router {
 public:
-    // Immutable process-allocated routing snapshot, shared by session domains.
+    // Immutable routing snapshot shared across Workers.
     // Failed builds never publish partial matchers.
     Router(const infra::RoutingConfig& config, const ::geo::GeoDatabase* geo_database);
     ~Router() noexcept override;
@@ -68,6 +68,7 @@ public:
     [[nodiscard]] ::routing::RouteDecision Route(const common::Context& ctx) const override;
 
     [[nodiscard]] ::routing::DomainStrategy DomainStrategy() const noexcept override;
+    [[nodiscard]] size_t RuleCount() const noexcept { return compound_rules_.size(); }
 
 private:
     std::vector<CompoundRoutingRule> compound_rules_;

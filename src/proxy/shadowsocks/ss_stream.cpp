@@ -103,7 +103,6 @@ net::awaitable<void> SsStreamWriter::WriteEncrypted(BufferRange buffers) {
         }
 
         common::MultiBuffer out_mb;
-        out_mb.reserve(buffers.size());
         for (const auto& buffer : buffers) {
             const auto bytes = ChunkBytes(buffer);
             if (bytes.empty()) continue;
@@ -177,9 +176,8 @@ bool SsStreamWriter::InitResponseCipher() {
     OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
     write_nonce_ = 0;
 
-    if (!common::AppendSpanToMultiBuffer(
-            std::span<const uint8_t>(server_salt.data(), key_size),
-            pending_prefix_)) {
+    if (!pending_prefix_.AppendSpan(
+            std::span<const uint8_t>(server_salt.data(), key_size))) {
         return false;
     }
     ClearHandshakeKeys();
@@ -279,12 +277,10 @@ bool SsStreamWriter::InitResponseCipher2022(
     write_nonce_ = 1;
 
     pending_prefix_.clear();
-    if (!common::AppendSpanToMultiBuffer(
-            std::span<const uint8_t>(server_salt.data(), key_size),
-            pending_prefix_) ||
-        !common::AppendSpanToMultiBuffer(
-            std::span<const uint8_t>(fixed_cipher.data(), fixed_cipher_size),
-            pending_prefix_)) {
+    if (!pending_prefix_.AppendSpan(
+            std::span<const uint8_t>(server_salt.data(), key_size)) ||
+        !pending_prefix_.AppendSpan(
+            std::span<const uint8_t>(fixed_cipher.data(), fixed_cipher_size))) {
         pending_prefix_.clear();
         return false;
     }

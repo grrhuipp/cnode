@@ -5,14 +5,13 @@
 #include "common/scoped_cleanse.hpp"
 
 #include "app/proxyman/user_store.hpp"
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 #include "common/address_codec.hpp"
 #include "common/const_buffer_span.hpp"
-#include "common/eof_cancellation.hpp"
+#include "common/asio_types.hpp"
 #include "common/byte_reader.hpp"
-#include "common/hash_container_shrink.hpp"
 #include "common/error.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "common/string_hash.hpp"
 #include "infra/log.hpp"
 #include "transport/link.hpp"
@@ -233,7 +232,7 @@ net::awaitable<void> BodyEncoder::WriteFirstEncodedChunks(
     std::span<const uint8_t> first_header,
     bool& header_sent) {
     header_sent = true;
-    common::ConstBufferSpanBuilder<1 + common::MultiBuffer::kInlineCapacity> framed;
+    common::ConstBufferSpanBuilder<2> framed;
     framed.Append(net::buffer(first_header.data(), first_header.size()));
     framed.AppendMultiBuffer(chunks);
     co_await stream.WriteBuffers(framed.Span());

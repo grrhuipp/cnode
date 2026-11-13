@@ -41,7 +41,7 @@ struct PreparedNextHop {
 // The one application of a protocol's stream defaults (TLS requirement,
 // fallback SNI, ALPN) to the source streamSettings. Without an explicit
 // fallback server name the next hop's address is used.
-[[nodiscard]] inline transport::StreamSettings PrepareOutboundStream(
+[[nodiscard]] inline PreparedNextHop PrepareNextHop(
     const infra::OutboundSourceConfig& source,
     const transport::OutboundServer& server,
     transport::OutboundStreamDefaults defaults) {
@@ -50,16 +50,9 @@ struct PreparedNextHop {
     }
     auto settings = transport::NormalizeOutboundStreamSettings(source.stream_settings, defaults);
     transport::TransportSecurity::Prepare(settings, transport::StreamEndpointRole::Outbound);
-    return settings;
-}
-
-[[nodiscard]] inline PreparedNextHop PrepareNextHop(
-    const infra::OutboundSourceConfig& source,
-    const transport::OutboundServer& server,
-    const transport::OutboundStreamDefaults& defaults) {
     return PreparedNextHop{
         .server = server,
-        .sender = {.stream_settings = PrepareOutboundStream(source, server, defaults),
+        .sender = {.stream_settings = std::move(settings),
                    .send_through = {}},
     };
 }

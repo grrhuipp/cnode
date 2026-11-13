@@ -3,7 +3,7 @@
 #include "common/byte_reader.hpp"
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
 #include "common/address_codec.hpp"
-#include "common/hash_container_shrink.hpp"
+#include "common/allocator.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/aead.h>
@@ -264,8 +264,8 @@ struct PlaintextScratch {
                 return false;
             }
         }
-        return common::AppendSpanToMultiBuffer(
-            std::span<const uint8_t>(large.data() + offset, payload_len), out);
+        return out.AppendSpan(
+            std::span<const uint8_t>(large.data() + offset, payload_len));
     }
 };
 

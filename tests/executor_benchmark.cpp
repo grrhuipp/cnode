@@ -3,7 +3,7 @@
 
 #include <gtest/gtest.h>
 
-#include "app/session_group_executor.hpp"
+#include "app/group_coordinator.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>
@@ -18,7 +18,7 @@ namespace {
 TEST(ExecutorBenchmark, NativeIoContextDispatch) {
     net::io_context worker;
     auto coordinator = std::make_shared<app::GroupCoordinator>(worker, 64);
-    coordinator->RegisterWorker(worker);
+    coordinator->RegisterWorker();
 
     constexpr std::size_t kIterations = 10000;
     std::size_t completed = 0;

@@ -40,7 +40,7 @@ std::vector<uint8_t> Flatten(const common::MultiBuffer& payload) {
 common::MultiBuffer MakePayload(const std::vector<uint8_t>& source,
                              const common::TargetAddress& target) {
     common::MultiBuffer payload;
-    EXPECT_TRUE((common::AppendSpanToMultiBuffer(source, payload))) << "failed to allocate Shadowsocks UDP test payload";
+    EXPECT_TRUE((payload.AppendSpan(source))) << "failed to allocate Shadowsocks UDP test payload";
     EXPECT_TRUE((common::SetUdpTarget(payload, target))) << "failed to mark Shadowsocks UDP test datagram";
     return payload;
 }
@@ -488,7 +488,7 @@ net::awaitable<void> WriteTcpPayload(transport::MultiBufferWriter& writer, bool 
         co_await writer.WriteBuffers(buffers);
     } else {
         common::MultiBuffer mb;
-        EXPECT_TRUE((common::AppendSpanToMultiBuffer(payload, mb))) << "TCP write fixture allocation failed";
+        EXPECT_TRUE((mb.AppendSpan(payload))) << "TCP write fixture allocation failed";
         co_await writer.WriteMultiBuffer(std::move(mb));
     }
 }

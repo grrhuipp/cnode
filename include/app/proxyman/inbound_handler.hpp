@@ -1,7 +1,6 @@
 #pragma once
 
-#include "common/allocator.hpp"
-#include "common/sharded_user_stats.hpp"
+#include "common/user_online_tracker.hpp"
 #include "common/string_hash.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/proxyman/user_store.hpp"
