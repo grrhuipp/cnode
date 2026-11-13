@@ -532,8 +532,17 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
             if (bytes.empty()) co_return;
             owned_buffer = net::buffer(bytes.data(), bytes.size());
             buffers = {&owned_buffer, 1};
+        } else {
+            while (!buffers.empty() && buffers.front().size() == 0) {
+                buffers = buffers.subspan(1);
+            }
+            if (buffers.empty()) co_return;
         }
         ActiveDirection active(write_active);
+        const bool deferred = tcp->IsWriteCancellationDeferred();
+        bool shielded = false;
+        bool previous_throw = true;
+        std::exception_ptr failure;
         try {
             // Bound each application operation's output independently of the
             // caller's payload size and keep SSL retries stable. A fragment is
@@ -577,9 +586,17 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
                 int sync_result = 0;
                 if (!TryInvokeOnce(
                         Kind::Write, lease, call, epoch, {}, fragment, nullptr, sync_result)) {
+                    if (deferred && !shielded) {
+                        // Isolate the whole physical frame once suspension is
+                        // needed: coroutine cancellation must not abandon later
+                        // TLS records mid-frame.
+                        previous_throw = co_await net::this_coro::throw_if_cancelled();
+                        co_await net::this_coro::throw_if_cancelled(false);
+                        shielded = true;
+                    }
                     sync_result = co_await FinishPerform(
                         Kind::Write, std::move(lease), std::move(call), epoch,
-                        tcp->IsWriteCancellationDeferred(), {}, fragment, nullptr);
+                        deferred, {}, fragment, nullptr);
                 }
                 auto n = static_cast<std::size_t>(sync_result);
                 while (n != 0) {
@@ -593,7 +610,13 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
             // A cancelled/failed logical frame may already have sent records.
             // Never reuse that byte transport with an incomplete frame.
             Abort();
-            throw;
+            failure = std::current_exception();
+        }
+        if (shielded) {
+            co_await net::this_coro::throw_if_cancelled(previous_throw);
+        }
+        if (failure) {
+            std::rethrow_exception(failure);
         }
     }
     std::unique_ptr<TcpStream> tcp;
@@ -917,8 +940,7 @@ net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buffer) {
 }
 
 net::awaitable<void> TlsStream::WriteMultiBuffer(common::MultiBuffer mb) {
-    if (mb.byte_size() != 0 && handshake_done_ && !shutdown_initiated_ &&
-        impl_->tcp->CanWrite() && !impl_->tcp->IsWriteCancellationDeferred()) {
+    if (handshake_done_ && !shutdown_initiated_ && impl_->tcp->CanWrite()) {
         return impl_->Write({}, std::move(mb));
     }
     return AsyncStream::WriteMultiBuffer(std::move(mb));
@@ -926,8 +948,7 @@ net::awaitable<void> TlsStream::WriteMultiBuffer(common::MultiBuffer mb) {
 
 net::awaitable<void> TlsStream::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
-    if (handshake_done_ && !shutdown_initiated_ &&
-        impl_->tcp->CanWrite() && !impl_->tcp->IsWriteCancellationDeferred()) {
+    if (handshake_done_ && !shutdown_initiated_ && impl_->tcp->CanWrite()) {
         return impl_->Write(buffers);
     }
     return WriteBuffersSlow(buffers);
@@ -939,24 +960,7 @@ net::awaitable<void> TlsStream::WriteBuffersSlow(
         throw IoSystemError(io_error::broken_pipe);
     if (!handshake_done_ && !co_await Handshake())
         throw IoSystemError(io_error::connection_reset, "TLS handshake failed during write");
-    while (!buffers.empty() && buffers.front().size() == 0) buffers = buffers.subspan(1);
-    if (buffers.empty()) co_return;
-    if (impl_->tcp->IsWriteCancellationDeferred()) {
-        // Isolate the whole physical frame, not just individual socket writes:
-        // coroutine cancellation must not abandon later TLS records mid-frame.
-        const bool previous_throw = co_await net::this_coro::throw_if_cancelled();
-        co_await net::this_coro::throw_if_cancelled(false);
-        std::exception_ptr failure;
-        try {
-            co_await impl_->Write(buffers);
-        } catch (...) {
-            failure = std::current_exception();
-        }
-        co_await net::this_coro::throw_if_cancelled(previous_throw);
-        if (failure) std::rethrow_exception(failure);
-    } else {
-        co_await impl_->Write(buffers);
-    }
+    co_await impl_->Write(buffers);
 }
 
 void TlsStream::ShutdownRead() {

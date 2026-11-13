@@ -4,6 +4,9 @@
 #include "common/ip_address.hpp"
 #include "common/constants.hpp"
 #include <charconv>
+#include <concepts>
+#include <type_traits>
+#include <utility>
 #include <format>
 #include <optional>
 #include <string>
@@ -67,6 +70,14 @@ struct TargetAddress {
     TargetAddress(std::string_view h, uint16_t p)
         : port(p) {
         InitFromHost(h);
+    }
+
+    template <typename Host>
+        requires (!std::is_lvalue_reference_v<Host> &&
+                  std::same_as<std::remove_cvref_t<Host>, std::string>)
+    TargetAddress(Host&& h, uint16_t p)
+        : port(p) {
+        InitFromOwnedHost(std::move(h));
     }
 
     TargetAddress(const net::ip::address& addr, uint16_t p)
@@ -164,6 +175,31 @@ private:
         if (IsValidDnsHostname(
                 h, TrailingDotPolicy::Allow)) {
             host.assign(h);
+            NormalizeDnsHostnameInPlace(host);
+            type = AddressType::Domain;
+        }
+    }
+
+    void InitFromOwnedHost(std::string&& h) {
+        type = AddressType::Invalid;
+        resolved_addr.reset();
+        host.clear();
+        if (h.empty()) {
+            return;
+        }
+        if (auto literal = ParseLiteral(h)) {
+            const auto addr = NormalizeAddress(*literal);
+            if (addr.is_v4()) {
+                type = AddressType::IPv4;
+                resolved_addr = addr;
+            } else if (addr.is_v6()) {
+                type = AddressType::IPv6;
+                resolved_addr = addr;
+            }
+            return;
+        }
+        if (IsValidDnsHostname(h, TrailingDotPolicy::Allow)) {
+            host = std::move(h);
             NormalizeDnsHostnameInPlace(host);
             type = AddressType::Domain;
         }

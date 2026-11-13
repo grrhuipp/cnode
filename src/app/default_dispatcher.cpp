@@ -34,7 +34,7 @@ namespace {
 void ApplySniffOverride(
     common::Context& ctx,
     const routing::SniffConfig& sniffing,
-    const sniff::SniffResult& result) {
+    sniff::SniffResult&& result) {
     if (!result.success) {
         return;
     }
@@ -52,7 +52,7 @@ void ApplySniffOverride(
     const uint16_t final_port = result.port > 0
         ? result.port
         : ctx.outbound.target.port;
-    common::TargetAddress sniffed(sniff_domain, final_port);
+    common::TargetAddress sniffed(std::move(result.domain), final_port);
     if (!sniffed.IsValid() || !sniffed.IsDomain()) {
         return;
     }
@@ -97,12 +97,65 @@ std::chrono::seconds ResolveRelayIdleTimeout(
     return idle_timeout;
 }
 
-net::awaitable<bool> SniffInitialPayload(
+struct SniffStageState {
+    sniff::Sniffer sniffer;
+    common::MultiBuffer payload;
+    size_t cached_bytes = 0;
+    size_t cached_datagrams = 0;
+    int no_clue_attempts = 0;
+};
+
+// Synchronous fast path when `first_packet` is already present: avoids
+// allocating a SniffRemainingPayload coroutine frame or arming AsyncDelay when
+// the initial packet completes TLS/HTTP/BitTorrent/QUIC sniffing immediately.
+[[nodiscard]] bool TryFinishFirstPacketSniff(
+    const routing::SniffConfig& sniffing,
+    common::InitialPayload& first_packet,
+    SniffStageState& stage,
+    common::Context& ctx,
+    common::MultiBufferBatch& outbound_first_payload) {
+    if (first_packet.empty()) {
+        return false;
+    }
+    const bool datagram = ctx.content.network == common::Network::UDP;
+    const size_t sniff_byte_limit = datagram ? 64 * 1024 : 4096;
+    stage.payload = std::move(first_packet).MoveToMultiBuffer();
+    stage.cached_bytes = stage.payload.byte_size();
+    stage.cached_datagrams = 1;
+    const size_t want = std::min(stage.cached_bytes, sniff_byte_limit);
+    auto sniffed = want != 0
+        ? stage.sniffer.Sniff(stage.payload.PrefixSpan(want), ctx.content.network)
+        : sniff::SniffResult{};
+    if (datagram) {
+        // Keep each original read result intact. Only decrypted handshake
+        // fragments are combined inside the sniffer.
+        outbound_first_payload.Push(std::move(stage.payload));
+    }
+    if (sniffed.success) {
+        ApplySniffOverride(ctx, sniffing, std::move(sniffed));
+        if (!stage.payload.empty()) {
+            outbound_first_payload.Push(std::move(stage.payload));
+        }
+        return true;
+    }
+    if ((datagram && !sniffed.need_more) || stage.cached_bytes >= sniff_byte_limit) {
+        if (!stage.payload.empty()) {
+            outbound_first_payload.Push(std::move(stage.payload));
+        }
+        return true;
+    }
+    if (!sniffed.need_more) {
+        stage.no_clue_attempts = 1;
+    }
+    return false;
+}
+
+net::awaitable<bool> SniffRemainingPayload(
     net::io_context& io_context,
     const routing::SniffConfig& sniffing,
     transport::MultiBufferReader* inbound_reader,
     transport::AsyncStream* inbound_control,
-    common::InitialPayload& first_packet,
+    SniffStageState stage,
     common::Context& ctx,
     StatsShard& stats,
     common::MultiBufferBatch& outbound_first_payload,
@@ -114,18 +167,14 @@ net::awaitable<bool> SniffInitialPayload(
     const size_t sniff_byte_limit = datagram ? 64 * 1024 : 4096;
     static constexpr size_t kSniffMaxDatagrams = 64;
     static constexpr auto kSniffWindow = std::chrono::milliseconds(200);
-    common::MultiBuffer sniff_payload;
-    sniff::Sniffer sniffer;
-    size_t cached_bytes = 0;
-    size_t cached_datagrams = 0;
 
     auto sniff_cached = [&]() {
-        const size_t want = std::min(sniff_payload.byte_size(), sniff_byte_limit);
-        const auto sniff_data = sniff_payload.PrefixSpan(want);
+        const size_t want = std::min(stage.payload.byte_size(), sniff_byte_limit);
+        const auto sniff_data = stage.payload.PrefixSpan(want);
         if (sniff_data.empty()) {
             return sniff::SniffResult{};
         }
-        return sniffer.Sniff(sniff_data, ctx.content.network);
+        return stage.sniffer.Sniff(sniff_data, ctx.content.network);
     };
 
     bool read_timed_out = false;
@@ -148,7 +197,7 @@ net::awaitable<bool> SniffInitialPayload(
                 try {
                     payload = co_await inbound_reader->ReadMultiBuffer();
                 } catch (const IoSystemError& e) {
-                    if (e.code() == net::error::eof && cached_bytes > 0) {
+                    if (e.code() == net::error::eof && stage.cached_bytes > 0) {
                         co_return;
                     }
                     throw;
@@ -160,12 +209,12 @@ net::awaitable<bool> SniffInitialPayload(
                     }
                     co_return;
                 }
-                cached_bytes += payload.byte_size();
-                ++cached_datagrams;
+                stage.cached_bytes += payload.byte_size();
+                ++stage.cached_datagrams;
                 if (datagram) {
-                    sniff_payload = std::move(payload);
+                    stage.payload = std::move(payload);
                 } else {
-                    sniff_payload.AppendAndCoalesce(std::move(payload));
+                    stage.payload.AppendAndCoalesce(std::move(payload));
                 }
                 read.received = true;
             } catch (...) {
@@ -173,42 +222,7 @@ net::awaitable<bool> SniffInitialPayload(
             }
         };
         const auto sniff_started = std::chrono::steady_clock::now();
-        if (!first_packet.empty()) {
-            sniff_payload = std::move(first_packet).MoveToMultiBuffer();
-            cached_bytes = sniff_payload.byte_size();
-            cached_datagrams = 1;
-        }
-
-        int no_clue_attempts = 0;
         for (;;) {
-            if (!sniff_payload.empty()) {
-                const auto sniffed = sniff_cached();
-                if (datagram) {
-                    // Keep each original read result intact. Only decrypted
-                    // handshake fragments are combined inside the sniffer.
-                    outbound_first_payload.Push(std::move(sniff_payload));
-                }
-                if (sniffed.success) {
-                    ApplySniffOverride(ctx, sniffing, sniffed);
-                    break;
-                }
-                if (datagram && !sniffed.need_more) {
-                    break;
-                }
-                if (!sniffed.need_more) {
-                    ++no_clue_attempts;
-                    if (no_clue_attempts >= 2) {
-                        break;
-                    }
-                }
-                // Stop before another read once the inspection budget is
-                // exhausted. Preserve an already-read final datagram even
-                // when it crosses the byte limit (at most one UDP packet).
-                if (cached_bytes >= sniff_byte_limit ||
-                    (datagram && cached_datagrams >= kSniffMaxDatagrams)) {
-                    break;
-                }
-            }
             const auto remaining = kSniffWindow -
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - sniff_started);
@@ -234,9 +248,35 @@ net::awaitable<bool> SniffInitialPayload(
                 }
             }
             if (!read.received) break;
+            if (!stage.payload.empty()) {
+                auto sniffed = sniff_cached();
+                if (datagram) {
+                    outbound_first_payload.Push(std::move(stage.payload));
+                }
+                if (sniffed.success) {
+                    ApplySniffOverride(ctx, sniffing, std::move(sniffed));
+                    break;
+                }
+                if (datagram && !sniffed.need_more) {
+                    break;
+                }
+                if (!sniffed.need_more) {
+                    ++stage.no_clue_attempts;
+                    if (stage.no_clue_attempts >= 2) {
+                        break;
+                    }
+                }
+                // Stop before another read once the inspection budget is
+                // exhausted. Preserve an already-read final datagram even
+                // when it crosses the byte limit (at most one UDP packet).
+                if (stage.cached_bytes >= sniff_byte_limit ||
+                    (datagram && stage.cached_datagrams >= kSniffMaxDatagrams)) {
+                    break;
+                }
+            }
         }
-        if (!sniff_payload.empty()) {
-            outbound_first_payload.Push(std::move(sniff_payload));
+        if (!stage.payload.empty()) {
+            outbound_first_payload.Push(std::move(stage.payload));
         }
     } catch (...) {
         // 分配失败交给 Dispatch 的统一收尾；其余失败经唯一分类入口取得错误码，
@@ -423,10 +463,13 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     common::MultiBufferBatch outbound_first_payload;
     const auto sniff_cancellation = co_await net::this_coro::cancellation_state;
     if (policy.sniffing.enabled && !policy.sniffing.metadata_only) {
-        if (!co_await SniffInitialPayload(
+        SniffStageState sniff_stage;
+        if (!TryFinishFirstPacketSniff(
+                policy.sniffing, first_packet, sniff_stage, ctx, outbound_first_payload) &&
+            !co_await SniffRemainingPayload(
                 io_context, policy.sniffing, inbound_reader, inbound_control,
-                first_packet, ctx, stats, outbound_first_payload, result,
-                cancellation_reason, sniff_cancellation)) {
+                std::move(sniff_stage), ctx, stats, outbound_first_payload,
+                result, cancellation_reason, sniff_cancellation)) {
             co_return;
         }
     }
