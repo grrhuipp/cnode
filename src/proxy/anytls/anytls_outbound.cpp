@@ -62,9 +62,22 @@ struct AnyTlsOutboundHandler::ClientSession {
         LogicalStream(const LogicalStream&) = delete;
         LogicalStream& operator=(const LogicalStream&) = delete;
 
-        net::awaitable<void> PushPayload(common::MultiBuffer mb) {
+        [[nodiscard]] bool TryPushPayload(common::MultiBuffer& mb) {
             const size_t bytes = mb.byte_size();
-            if (bytes == 0 || closed_) co_return;
+            if (bytes == 0 || closed_) {
+                mb.clear();
+                return true;
+            }
+            if (queued_payload_.byte_size() + bytes > kMaxLogicalQueuedPayloadBytes) {
+                return false;
+            }
+            mb.MoveTo(queued_payload_, true);
+            WakePayloadReader();
+            return true;
+        }
+
+        net::awaitable<void> PushPayloadSlow(common::MultiBuffer mb) {
+            const size_t bytes = mb.byte_size();
             // The physical reader owns this payload while capacity is used
             // by the logical queue. Awaiting consumption also stops TLS reads.
             while (!closed_ && queued_payload_.byte_size() + bytes > kMaxLogicalQueuedPayloadBytes) {
@@ -146,12 +159,12 @@ struct AnyTlsOutboundHandler::ClientSession {
             co_return tl::expected<void, common::ErrorCode>{};
         }
 
-        net::awaitable<tl::expected<common::MultiBuffer, common::ErrorCode>> ReadPayload() {
+        net::awaitable<common::MultiBuffer> ReadMultiBuffer() {
             while (queued_payload_.empty() && !closed_) {
                 auto [ec] = co_await payload_signal_.async_receive(
                     net::as_tuple(net::use_awaitable));
                 if (ec) {
-                    co_return tl::unexpected(common::ErrorCode::CANCELLED);
+                    throw transport::LinkError(common::ErrorCode::CANCELLED);
                 }
             }
             if (!queued_payload_.empty()) {
@@ -161,7 +174,10 @@ struct AnyTlsOutboundHandler::ClientSession {
                 co_return payload;
             }
             queued_payload_.ReleaseIfIdle();
-            co_return tl::unexpected(error_);
+            if (error_ == common::ErrorCode::OK) {
+                co_return common::MultiBuffer{};
+            }
+            throw transport::LinkError(error_);
         }
 
     private:
@@ -478,16 +494,14 @@ struct AnyTlsOutboundHandler::ClientSession {
                 co_return;
             }
 
-            auto discard_current = [&]() -> net::awaitable<tl::expected<void, common::ErrorCode>> {
-                return DiscardFramePayload(*stream, header->length);
-            };
-
             if (header->sid == 0) {
                 switch (header->cmd) {
                     case kCmdWaste:
-                        if (auto ok = co_await discard_current(); !ok) {
-                            CloseAll(ok.error());
-                            co_return;
+                        if (header->length != 0) {
+                            if (auto ok = co_await DiscardFramePayload(*stream, header->length); !ok) {
+                                CloseAll(ok.error());
+                                co_return;
+                            }
                         }
                         break;
                     case kCmdServerSettings: {
@@ -526,7 +540,9 @@ struct AnyTlsOutboundHandler::ClientSession {
                         }
                         break;
                     case kCmdAlert: {
-                        (void)co_await DiscardFramePayload(*stream, header->length);
+                        if (header->length != 0) {
+                            (void)co_await DiscardFramePayload(*stream, header->length);
+                        }
                         CloseAll(common::ErrorCode::PROTOCOL_DECODE_FAILED);
                         co_return;
                     }
@@ -551,9 +567,11 @@ struct AnyTlsOutboundHandler::ClientSession {
                 if (!logical) active_sid = 0;
             }
             if (!logical) {
-                if (auto ok = co_await discard_current(); !ok) {
-                    CloseAll(ok.error());
-                    co_return;
+                if (header->length != 0) {
+                    if (auto ok = co_await DiscardFramePayload(*stream, header->length); !ok) {
+                        CloseAll(ok.error());
+                        co_return;
+                    }
                 }
                 continue;
             }
@@ -573,9 +591,11 @@ struct AnyTlsOutboundHandler::ClientSession {
                     }
                     break;
                 case kCmdWaste:
-                    if (auto ok = co_await discard_current(); !ok) {
-                        CloseAll(ok.error());
-                        co_return;
+                    if (header->length != 0) {
+                        if (auto ok = co_await DiscardFramePayload(*stream, header->length); !ok) {
+                            CloseAll(ok.error());
+                            co_return;
+                        }
                     }
                     break;
                 case kCmdPSH: {
@@ -584,20 +604,26 @@ struct AnyTlsOutboundHandler::ClientSession {
                         CloseAll(payload.error());
                         co_return;
                     }
-                    co_await logical->PushPayload(std::move(*payload));
+                    if (!logical->TryPushPayload(*payload)) {
+                        co_await logical->PushPayloadSlow(std::move(*payload));
+                    }
                     break;
                 }
                 case kCmdFIN:
-                    if (auto ok = co_await discard_current(); !ok) {
-                        CloseAll(ok.error());
-                        co_return;
+                    if (header->length != 0) {
+                        if (auto ok = co_await DiscardFramePayload(*stream, header->length); !ok) {
+                            CloseAll(ok.error());
+                            co_return;
+                        }
                     }
                     logical->CloseRemote();
                     break;
                 case kCmdAlert: {
-                    if (auto ok = co_await DiscardFramePayload(*stream, header->length); !ok) {
-                        CloseAll(ok.error());
-                        co_return;
+                    if (header->length != 0) {
+                        if (auto ok = co_await DiscardFramePayload(*stream, header->length); !ok) {
+                            CloseAll(ok.error());
+                            co_return;
+                        }
                     }
                     logical->Close(common::ErrorCode::PROTOCOL_DECODE_FAILED);
                     break;
@@ -1182,14 +1208,7 @@ net::awaitable<OutboundProcessResult> AnyTlsOutboundHandler::ProcessSession(
             , sid(stream_id) {}
 
         net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
-            auto payload = co_await logical.ReadPayload();
-            if (!payload) {
-                if (payload.error() == common::ErrorCode::OK) {
-                    co_return common::MultiBuffer{};
-                }
-                throw transport::LinkError(payload.error());
-            }
-            co_return std::move(*payload);
+            return logical.ReadMultiBuffer();
         }
 
         transport::EofAction ReadEofAction() const noexcept override { return transport::EofAction::CloseLink; }

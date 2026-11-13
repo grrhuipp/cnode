@@ -90,13 +90,23 @@ public:
 
     common::Context ctx;
 
-    net::awaitable<void> PushInput(common::MultiBuffer mb) {
+    [[nodiscard]] bool TryPushInput(common::MultiBuffer& mb) {
         const size_t bytes = mb.byte_size();
         if (cancelled_ || input_done_ || bytes == 0 ||
             bytes > kMaxSubStreamQueuedPayloadBytes) {
             mb.clear();
-            co_return;
+            return true;
         }
+        if (queued_input_.byte_size() + bytes > kMaxSubStreamQueuedPayloadBytes) {
+            return false;
+        }
+        mb.MoveTo(queued_input_, true);
+        WakeInputReader();
+        return true;
+    }
+
+    net::awaitable<void> PushInputSlow(common::MultiBuffer mb) {
+        const size_t bytes = mb.byte_size();
         while (!cancelled_ &&
                !input_done_ &&
                queued_input_.byte_size() + bytes > kMaxSubStreamQueuedPayloadBytes) {
@@ -467,7 +477,8 @@ private:
     net::awaitable<void> RunStream(
         std::shared_ptr<AnyTLSSubStream> sub, std::chrono::steady_clock::time_point opened_at);
     net::awaitable<app::RelayResult> ReadClientSettings(const AnyTlsFrameHeader& header);
-    net::awaitable<app::RelayResult> OpenClientStream(const AnyTlsFrameHeader& header, common::AwaitableTaskGroup& tasks);
+    [[nodiscard]] bool TryOpenClientStream(const AnyTlsFrameHeader& header, common::AwaitableTaskGroup& tasks);
+    net::awaitable<app::RelayResult> RejectOrRefuseClientStream(const AnyTlsFrameHeader& header);
     net::awaitable<app::RelayResult> ReadFrames(common::AwaitableTaskGroup& tasks);
 
     std::unique_ptr<transport::AsyncStream> stream_;
@@ -708,39 +719,47 @@ net::awaitable<app::RelayResult> AnyTLSDemuxSession::ReadClientSettings(const An
     co_return result;
 }
 
-net::awaitable<app::RelayResult> AnyTLSDemuxSession::OpenClientStream(const AnyTlsFrameHeader& header, common::AwaitableTaskGroup& tasks) {
+bool AnyTLSDemuxSession::TryOpenClientStream(
+    const AnyTlsFrameHeader& header, common::AwaitableTaskGroup& tasks) {
+    const auto sid = header.sid;
+    if (!session_version_ || sid <= last_stream_id_ || header.length != 0 ||
+        streams_.size() >= kMaxConcurrentSubstreams) {
+        return false;
+    }
+    const auto opened_at = std::chrono::steady_clock::now();
+    auto sub = std::make_shared<AnyTLSSubStream>(io_context_, *this, sid);
+    sub->ctx.InitSubstreamFrom(session_ctx_);
+    sub->ctx.content.network = common::Network::TCP;
+    streams_.emplace(sid, sub);
+    last_stream_id_ = sid; // Commit after the complete stream was inserted.
+    tasks.Spawn(RunStream(std::move(sub), opened_at));
+    return true;
+}
+
+net::awaitable<app::RelayResult> AnyTLSDemuxSession::RejectOrRefuseClientStream(
+    const AnyTlsFrameHeader& header) {
     app::RelayResult result;
     const auto sid = header.sid;
-            std::string_view rejection;
-            if (!session_version_) rejection = "client did not send its settings";
-            else if (sid <= last_stream_id_) rejection = "stream IDs must increase";
-            else if (header.length != 0) rejection = "SYN must not carry data";
-            if (!rejection.empty())
-                co_return co_await RejectSession(rejection, common::ErrorCode::PROTOCOL_INVALID_COMMAND);
-            if (streams_.size() >= kMaxConcurrentSubstreams) {
-                proxy::LogInboundRequestRejected(session_ctx_, "concurrent stream limit");
-                last_stream_id_ = sid; // A refused ID is retired, never reusable.
-                environment_.stats.OnError();
-                if (session_version_ == SessionVersion::V2) {
-                    constexpr std::string_view message = "concurrent stream limit";
-                    auto ok = co_await WriteFrameSerialized(kCmdSYNACK, sid,
-                        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(message.data()), message.size()));
-                    if (!ok) { result.error = ok.error(); co_return result; }
-                }
-                if (auto ok = co_await WriteFrameSerialized(kCmdFIN, sid, {}); !ok) {
-                    result.error = ok.error();
-                    co_return result;
-                }
-                co_return result;
-            }
-            const auto opened_at = std::chrono::steady_clock::now();
-            auto sub = std::make_shared<AnyTLSSubStream>(io_context_, *this, sid);
-            sub->ctx.InitSubstreamFrom(session_ctx_);
-            sub->ctx.content.network = common::Network::TCP;
-            streams_.emplace(sid, sub);
-            last_stream_id_ = sid; // Commit after the complete stream was inserted.
-            tasks.Spawn(RunStream(std::move(sub), opened_at));
-
+    std::string_view rejection;
+    if (!session_version_) rejection = "client did not send its settings";
+    else if (sid <= last_stream_id_) rejection = "stream IDs must increase";
+    else if (header.length != 0) rejection = "SYN must not carry data";
+    if (!rejection.empty()) {
+        co_return co_await RejectSession(rejection, common::ErrorCode::PROTOCOL_INVALID_COMMAND);
+    }
+    proxy::LogInboundRequestRejected(session_ctx_, "concurrent stream limit");
+    last_stream_id_ = sid; // A refused ID is retired, never reusable.
+    environment_.stats.OnError();
+    if (session_version_ == SessionVersion::V2) {
+        constexpr std::string_view message = "concurrent stream limit";
+        auto ok = co_await WriteFrameSerialized(kCmdSYNACK, sid,
+            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(message.data()), message.size()));
+        if (!ok) { result.error = ok.error(); co_return result; }
+    }
+    if (auto ok = co_await WriteFrameSerialized(kCmdFIN, sid, {}); !ok) {
+        result.error = ok.error();
+        co_return result;
+    }
     co_return result;
 }
 
@@ -778,24 +797,30 @@ net::awaitable<app::RelayResult> AnyTLSDemuxSession::ReadFrames(common::Awaitabl
             continue;
         }
         if (header->cmd == kCmdWaste) {
-            if (auto ok = co_await DiscardFramePayload(*stream_, header->length); !ok) {
-                result.error = resolve_handshake_error(ok.error());
-                break;
+            if (header->length != 0) {
+                if (auto ok = co_await DiscardFramePayload(*stream_, header->length); !ok) {
+                    result.error = resolve_handshake_error(ok.error());
+                    break;
+                }
             }
             continue;
         }
 
         const uint32_t sid = header->sid;
         if (header->cmd == kCmdSYN) {
-            auto opened = co_await OpenClientStream(*header, tasks);
-            if (!opened.Ok()) co_return opened;
+            if (!TryOpenClientStream(*header, tasks)) {
+                auto rejected = co_await RejectOrRefuseClientStream(*header);
+                if (!rejected.Ok()) co_return rejected;
+            }
             continue;
         }
         if ((header->cmd != kCmdFIN && header->cmd != kCmdPSH) ||
             sid == 0 || sid > last_stream_id_) {
-            if (auto ok = co_await DiscardFramePayload(*stream_, header->length); !ok) {
-                result.error = ok.error();
-                break;
+            if (header->length != 0) {
+                if (auto ok = co_await DiscardFramePayload(*stream_, header->length); !ok) {
+                    result.error = ok.error();
+                    break;
+                }
             }
             result.error = common::ErrorCode::PROTOCOL_INVALID_COMMAND;
             break;
@@ -805,9 +830,11 @@ net::awaitable<app::RelayResult> AnyTLSDemuxSession::ReadFrames(common::Awaitabl
         // Retain the stream itself, never an iterator into the live index.
         const auto sub = FindStream(sid);
         if (!sub || header->cmd == kCmdFIN || sub->IsClosed()) {
-            if (auto ok = co_await DiscardFramePayload(*stream_, header->length); !ok) {
-                result.error = ok.error();
-                break;
+            if (header->length != 0) {
+                if (auto ok = co_await DiscardFramePayload(*stream_, header->length); !ok) {
+                    result.error = ok.error();
+                    break;
+                }
             }
             if (sub && header->cmd == kCmdFIN) {
                 sub->CloseRemote();
@@ -821,7 +848,9 @@ net::awaitable<app::RelayResult> AnyTLSDemuxSession::ReadFrames(common::Awaitabl
             break;
         }
 
-        co_await sub->PushInput(std::move(*payload));
+        if (!sub->TryPushInput(*payload)) {
+            co_await sub->PushInputSlow(std::move(*payload));
+        }
     }
 
     co_return result;

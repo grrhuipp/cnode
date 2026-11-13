@@ -536,6 +536,9 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
             while (!buffers.empty() && buffers.front().size() == 0) {
                 buffers = buffers.subspan(1);
             }
+            while (!buffers.empty() && buffers.back().size() == 0) {
+                buffers = buffers.first(buffers.size() - 1);
+            }
             if (buffers.empty()) co_return;
         }
         ActiveDirection active(write_active);

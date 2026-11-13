@@ -304,11 +304,12 @@ WriteFrame(transport::AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<
     }
 
     auto header = BuildFrameHeaderBytes(cmd, sid, payload.size());
-    std::array<net::const_buffer, 2> buffers{
+    const std::array<net::const_buffer, 2> buffers{
         net::const_buffer(header.data(), header.size()),
         net::const_buffer(payload.data(), payload.size())};
     try {
-        co_await stream.WriteBuffers(buffers);
+        co_await stream.WriteBuffers(
+            std::span<const net::const_buffer>(buffers.data(), payload.empty() ? 1 : 2));
     } catch (const IoSystemError& e) {
         co_return tl::unexpected(common::MapAsioError(e.code()));
     }
@@ -418,9 +419,20 @@ net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteAnyTlsPacketWithPadding(transport::AsyncStream& stream,
                              std::span<const PaddingRecord> record_rules,
                              std::span<const uint8_t> packet) {
+    if (packet.empty()) {
+        co_return tl::expected<void, common::ErrorCode>{};
+    }
     const net::const_buffer single(packet.data(), packet.size());
+    if (record_rules.empty()) {
+        try {
+            co_await stream.WriteBuffers(std::span<const net::const_buffer>(&single, 1));
+        } catch (const IoSystemError& e) {
+            co_return tl::unexpected(common::MapAsioError(e.code()));
+        }
+        co_return tl::expected<void, common::ErrorCode>{};
+    }
     co_return co_await WriteSlicesWithPadding(
-        stream, record_rules, {&single, packet.empty() ? size_t{0} : size_t{1}});
+        stream, record_rules, std::span<const net::const_buffer>(&single, 1));
 }
 
 static net::awaitable<tl::expected<void, common::ErrorCode>>
