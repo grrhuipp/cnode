@@ -25,30 +25,6 @@
 
 namespace proxy {
 
-namespace {
-
-net::awaitable<tl::expected<void, common::ErrorCode>> ReadStreamPayload(
-    transport::AsyncStream& stream,
-    SsAeadCipher& cipher,
-    std::span<const uint8_t, 12> nonce,
-    size_t payload_len,
-    common::MultiBuffer& output) {
-    try {
-        auto res = co_await ReadAndDecryptStreamPayload(
-            stream, cipher, nonce, payload_len, output);
-        if (!res) {
-            co_return tl::unexpected(
-                proxy::ResolveHandshakeReadFailure(stream, res.error()));
-        }
-        co_return res;
-    } catch (...) {
-        co_return tl::unexpected(
-            proxy::ClassifyInboundHandshakeException(std::current_exception(), &stream));
-    }
-}
-
-}  // namespace
-
 
 namespace {
 
@@ -260,10 +236,11 @@ net::awaitable<tl::expected<ReadTCPSessionResult, common::ErrorCode>> ReadTCPSes
     }
 
     common::MultiBuffer variable_mb;
-    if (auto decrypt_res = co_await ReadStreamPayload(
+    if (auto decrypt_res = co_await ReadAndDecryptStreamPayload(
             stream, read_cipher, MakeNonce(1), variable_len, variable_mb);
         !decrypt_res) {
-        co_return tl::unexpected(decrypt_res.error());
+        co_return tl::unexpected(
+            proxy::ResolveHandshakeReadFailure(stream, decrypt_res.error()));
     }
 
     if (auto parsed = ParseInitialRequest(result, std::move(variable_mb), true); !parsed)
@@ -351,10 +328,11 @@ net::awaitable<tl::expected<ReadTCPSessionResult, common::ErrorCode>> ReadTCPSes
     }
 
     common::MultiBuffer payload_mb;
-    if (auto decrypt_res = co_await ReadStreamPayload(
+    if (auto decrypt_res = co_await ReadAndDecryptStreamPayload(
             stream, read_cipher, MakeNonce(read_nonce), payload_len, payload_mb);
         !decrypt_res) {
-        co_return tl::unexpected(decrypt_res.error());
+        co_return tl::unexpected(
+            proxy::ResolveHandshakeReadFailure(stream, decrypt_res.error()));
     }
     ++read_nonce;
 

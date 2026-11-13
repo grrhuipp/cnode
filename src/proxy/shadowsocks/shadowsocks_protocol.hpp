@@ -188,22 +188,30 @@ inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
             return;
         }
     }
+    if (remaining == 0) {
+        return;
+    }
 
+    constexpr size_t kChunkWireOverhead = kLenHeaderSize + SsAeadCipher::kTagSize;
+    const size_t chunks = 1 + (remaining - 1) / kStreamChunkPayloadSize;
+    if (chunks > (std::numeric_limits<size_t>::max() - remaining) / kChunkWireOverhead) {
+        throw std::length_error("Shadowsocks encrypted stream overflow");
+    }
+    const size_t total_wire = remaining + chunks * kChunkWireOverhead;
+    common::BufferGuard out{common::Buffer::New(total_wire)};
+    if (!out) {
+        throw std::bad_alloc();
+    }
+    uint8_t* dst = out->Tail().data();
+    size_t written = 0;
     while (remaining > 0) {
         const size_t chunk_size = std::min(remaining, kStreamChunkPayloadSize);
-        common::BufferGuard out{common::Buffer::New()};
-        if (!out) {
-            throw std::bad_alloc();
-        }
-
-        uint8_t* dst = out->Tail().data();
-
         const uint8_t len_plain[2] = {
             static_cast<uint8_t>(chunk_size >> 8),
-            static_cast<uint8_t>(chunk_size & 0xFF)
+            static_cast<uint8_t>(chunk_size & 0xFF),
         };
         const auto nonce_l = MakeNonce(nonce);
-        if (!cipher.Encrypt(nonce_l.data(), len_plain, 2, dst)) {
+        if (!cipher.Encrypt(nonce_l.data(), len_plain, 2, dst + written)) {
             throw IoSystemError(
                 io_error::connection_reset,
                 "Shadowsocks stream encrypt length failed");
@@ -213,23 +221,19 @@ inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
         const auto nonce_p = MakeNonce(nonce);
         if (!cipher.Encrypt(
                 nonce_p.data(), data, chunk_size,
-                dst + kLenHeaderSize)) {
+                dst + written + kLenHeaderSize)) {
             throw IoSystemError(
                 io_error::connection_reset,
                 "Shadowsocks stream encrypt payload failed");
         }
         ++nonce;
 
-        const size_t output_size =
-            kLenHeaderSize +
-            chunk_size +
-            SsAeadCipher::kTagSize;
-        out->Produce(static_cast<uint32_t>(output_size));
-        out_mb.push_back(std::move(out));
-
+        written += kChunkWireOverhead + chunk_size;
         data += chunk_size;
         remaining -= chunk_size;
     }
+    out->Produce(written);
+    out_mb.push_back(std::move(out));
 }
 
 // BoringSSL authenticates one complete record. Reuse a single input block in
@@ -257,27 +261,49 @@ ReadAndDecryptStreamPayload(
     std::span<const uint8_t, 12> nonce,
     size_t payload_len,
     common::MultiBuffer& output) {
-    common::MultiBuffer ciphertext;
-    size_t remaining = payload_len;
-    while (remaining > 0) {
-        common::BufferGuard block{common::Buffer::New()};
-        if (!block) co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
-        const size_t count = std::min(remaining, size_t(block->Available()));
-        if (auto read = co_await proxy::ReadHandshakeExact(stream,
-                {block->Tail().data(), count}, proxy::HandshakeProgress::Started); !read)
-            co_return tl::unexpected(read.error());
-        block->Produce(static_cast<uint32_t>(count));
-        ciphertext.push_back(std::move(block));
-        remaining -= count;
-    }
-    std::array<uint8_t, SsAeadCipher::kTagSize> tag{};
-    if (auto read = co_await proxy::ReadHandshakeExact(stream, tag,
-            proxy::HandshakeProgress::Started); !read)
-        co_return tl::unexpected(read.error());
-    if (!ciphertext.AppendSpan(tag))
-        co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
-    if (!DecryptStreamPayload(cipher, nonce, std::move(ciphertext), output))
+    if (payload_len > std::numeric_limits<size_t>::max() - SsAeadCipher::kTagSize) {
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+    const size_t wire_size = payload_len + SsAeadCipher::kTagSize;
+    common::BufferGuard block{common::Buffer::New()};
+    if (!block) co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
+    size_t filled = 0;
+    while (filled < wire_size) {
+        if (filled == block->capacity) {
+            const size_t next_cap = std::min(wire_size, block->capacity * 2);
+            common::BufferGuard grown{common::Buffer::New(next_cap)};
+            if (!grown) co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
+            std::memcpy(grown->data, block->data, filled);
+            grown->Produce(filled);
+            block = std::move(grown);
+        }
+        const size_t count = std::min(wire_size - filled, block->Available());
+        if (auto read = co_await proxy::ReadHandshakeExact(
+                stream, {block->Tail().data(), count}, proxy::HandshakeProgress::Started);
+            !read) {
+            co_return tl::unexpected(read.error());
+        }
+        block->Produce(count);
+        filled += count;
+    }
+    if (wire_size > common::Buffer::kSize) {
+        try {
+            common::CheckTestAllocationFault();
+        } catch (const std::bad_alloc&) {
+            co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
+        }
+    }
+    if (!cipher.Decrypt(nonce.data(), block->data, wire_size, block->data)) {
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+    block->end = payload_len;
+    if (payload_len != 0) {
+        try {
+            output.push_back(std::move(block));
+        } catch (const std::bad_alloc&) {
+            co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
+        }
+    }
     co_return tl::expected<void, common::ErrorCode>{};
 }
 
@@ -348,19 +374,43 @@ private:
                 ciphertext_.DropPrefixBytes(header.size());
                 ++nonce_;
             }
-            if (ciphertext_.byte_size() < *length_ + SsAeadCipher::kTagSize) return {};
-            common::MultiBuffer record;
-            if (!ciphertext_.MovePrefixTo(record, *length_ + SsAeadCipher::kTagSize))
-                throw std::bad_alloc();
-            common::MultiBuffer decoded;
+            const size_t payload_len = *length_;
+            const size_t wire_size = payload_len + SsAeadCipher::kTagSize;
+            if (ciphertext_.byte_size() < wire_size) return {};
             const auto nonce = MakeNonce(nonce_);
-            if (!DecryptStreamPayload(cipher_, nonce, std::move(record), decoded))
+            if (payload_len == 0) {
+                // An authenticated zero-length record carries no application
+                // data; verify it in place without allocating an 8 KiB Buffer.
+                uint8_t empty_out = 0;
+                const auto tag_span = ciphertext_.PrefixSpan(SsAeadCipher::kTagSize);
+                if (!cipher_.Decrypt(nonce.data(), tag_span.data(), tag_span.size(), &empty_out))
+                    throw transport::LinkError(common::ErrorCode::PROTOCOL_AUTH_FAILED);
+                ciphertext_.DropPrefixBytes(SsAeadCipher::kTagSize);
+                length_.reset();
+                ++nonce_;
+                continue;
+            }
+            if (ciphertext_.byte_size() == wire_size) {
+                common::MultiBuffer decoded;
+                if (!DecryptStreamPayload(cipher_, nonce, std::move(ciphertext_), decoded))
+                    throw transport::LinkError(common::ErrorCode::PROTOCOL_AUTH_FAILED);
+                length_.reset();
+                ++nonce_;
+                return decoded;
+            }
+            if (wire_size > common::Buffer::kSize) {
+                common::CheckTestAllocationFault();
+            }
+            common::BufferGuard out{common::Buffer::New(payload_len)};
+            if (!out) throw std::bad_alloc();
+            const auto slice = ciphertext_.PrefixSpan(wire_size);
+            if (!cipher_.Decrypt(nonce.data(), slice.data(), slice.size(), out->Tail().data()))
                 throw transport::LinkError(common::ErrorCode::PROTOCOL_AUTH_FAILED);
+            out->Produce(payload_len);
+            ciphertext_.DropPrefixBytes(wire_size);
             length_.reset();
             ++nonce_;
-            if (decoded.byte_size() != 0) return decoded;
-            // An authenticated zero-length record carries no application data;
-            // it is not transport EOF and cannot hide later malformed bytes.
+            return common::MultiBuffer{std::move(out)};
         }
     }
 
