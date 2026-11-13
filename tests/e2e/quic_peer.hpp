@@ -271,7 +271,6 @@ public:
                     return;
                 }
                 CheckQuic(result, "read packet");
-                if (Clock::now() >= deadline) break;
             }
         }
         HandleExpiry();

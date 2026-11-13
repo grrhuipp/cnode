@@ -87,6 +87,7 @@ public:
         connections_.reserve(expected);
     }
     uint16_t Port() const { return listener_.Port(); }
+    bool Upload() const { return upload_; }
     size_t Accepted() const { return connections_.size(); }
     size_t Completed() const { return completed_; }
     uint64_t Verified() const { return verified_; }
@@ -249,7 +250,7 @@ public:
                 // transfers provide their own activity; idle streams still
                 // need heartbeats during another stream's measured phase.
                 for (const auto& stream : client.streams) {
-                    if (stream.transferring) continue;
+                    if (target_.Upload() && stream.transferring) continue;
                     client.peer->Send(stream.id, "P");
                     ++heartbeat_bytes;
                 }
