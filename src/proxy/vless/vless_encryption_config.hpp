@@ -6,7 +6,6 @@
 #include <tl/expected.hpp>
 
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -47,20 +46,43 @@ struct VlessEncryptionPadding {
     int to = 0;
 };
 
+struct SharedEvpPkey {
+    bssl::UniquePtr<EVP_PKEY> ptr;
+
+    SharedEvpPkey() noexcept = default;
+    SharedEvpPkey(std::nullptr_t) noexcept {}
+    explicit SharedEvpPkey(bssl::UniquePtr<EVP_PKEY> p) noexcept : ptr(std::move(p)) {}
+    SharedEvpPkey(const SharedEvpPkey& other) noexcept
+        : ptr(other.ptr ? bssl::UpRef(other.ptr) : nullptr) {}
+    SharedEvpPkey& operator=(const SharedEvpPkey& other) noexcept {
+        if (this != &other) {
+            ptr = other.ptr ? bssl::UpRef(other.ptr) : nullptr;
+        }
+        return *this;
+    }
+    SharedEvpPkey(SharedEvpPkey&&) noexcept = default;
+    SharedEvpPkey& operator=(SharedEvpPkey&&) noexcept = default;
+
+    [[nodiscard]] EVP_PKEY* get() const noexcept { return ptr.get(); }
+    [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(ptr); }
+    friend bool operator==(const SharedEvpPkey& k, std::nullptr_t) noexcept { return !k.ptr; }
+    friend bool operator!=(const SharedEvpPkey& k, std::nullptr_t) noexcept { return static_cast<bool>(k.ptr); }
+};
+
 struct VlessClientPfsKey {
     std::vector<uint8_t> public_key;
-    std::shared_ptr<EVP_PKEY> mlkem_key;
+    SharedEvpPkey mlkem_key;
 };
 
 struct VlessServerPfsKey {
     std::vector<uint8_t> private_key;
     std::vector<uint8_t> public_key;
-    std::shared_ptr<EVP_PKEY> mlkem_key;
+    SharedEvpPkey mlkem_key;
 
     VlessServerPfsKey() = default;
     VlessServerPfsKey(std::vector<uint8_t> priv,
                       std::vector<uint8_t> pub,
-                      std::shared_ptr<EVP_PKEY> mlkem) noexcept
+                      SharedEvpPkey mlkem) noexcept
         : private_key(std::move(priv))
         , public_key(std::move(pub))
         , mlkem_key(std::move(mlkem)) {}

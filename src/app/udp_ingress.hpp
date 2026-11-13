@@ -60,7 +60,7 @@ struct ClientSessionKey final {
     ClientSessionKey(proxy::InboundDatagramOwner authenticated_owner,
                      std::optional<uint64_t> protocol_session_id,
                      udp::endpoint client_endpoint = {},
-                     const ProtocolSettings* configuration_identity = nullptr) noexcept
+                     const void* configuration_identity = nullptr) noexcept
         : owner(authenticated_owner), session_id(protocol_session_id),
           endpoint(protocol_session_id ? udp::endpoint{} :
               udp::endpoint(common::NormalizeAddress(client_endpoint.address()), client_endpoint.port())),
@@ -74,7 +74,7 @@ struct ClientSessionKey final {
     proxy::InboundDatagramOwner owner;
     std::optional<uint64_t> session_id;
     udp::endpoint endpoint;
-    const ProtocolSettings* configuration = nullptr;
+    const void* configuration = nullptr;
 };
 
 struct ClientSessionKeyHash final {
@@ -325,7 +325,7 @@ class UdpHandoffDirectory final {
 public:
     [[nodiscard]] std::shared_ptr<UdpHandoffRecord> Claim(
         const UdpHandoffIdentity& key,
-        std::shared_ptr<const ProtocolSettings> configuration,
+        std::shared_ptr<const PreparedInboundSettings> configuration,
         const proxy::InboundDatagramAssociationPolicy& policy);
 private:
     std::unordered_map<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
@@ -490,7 +490,7 @@ struct UdpIngress::UdpClientSession {
     UdpAssociationHook reclaim_hook;
 };
 
-struct UdpSocketState final {
+struct UdpSocketState final : std::enable_shared_from_this<UdpSocketState> {
     struct QueuedReply {
         udp::endpoint endpoint;
         common::MultiBuffer payload;
@@ -601,7 +601,7 @@ private:
 struct UdpHandoffRecord {
     std::unique_ptr<proxy::InboundDatagramAssociation> association;
     std::weak_ptr<UdpIngress::ClientSession> session;
-    std::shared_ptr<const ProtocolSettings> configuration;
+    std::shared_ptr<const PreparedInboundSettings> configuration;
     UdpSocketStatePtr socket_pin;
     // 借用节点内的键；unordered_map rehash 不移动节点，摘除时先解除借用。
     const UdpHandoffIdentity* identity = nullptr;

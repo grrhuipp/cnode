@@ -7,7 +7,6 @@
 #include "common/binary_text_codec.hpp"
 #include "common/byte_reader.hpp"
 #include "common/scoped_cleanse.hpp"
-#include "common/unsafe.hpp"
 #include "infra/log.hpp"
 #include <openssl/aead.h>
 #include <openssl/asn1.h>
@@ -309,7 +308,7 @@ void FreeRealityServerConnState(void* /*parent*/,
              shared.size(),
              random_salt.data(),
              random_salt.size(),
-             common::ptr_cast<const uint8_t>(kRealityInfo.data()),
+             reinterpret_cast<const uint8_t*>(kRealityInfo.data()),
              kRealityInfo.size()) != 1) {
         return std::nullopt;
     }

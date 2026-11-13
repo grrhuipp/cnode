@@ -9,7 +9,6 @@
 #include "proxy/outbound.hpp"
 #include "proxy/outbound_stream_endpoint.hpp"
 #include "transport/outbound_target_builder.hpp"
-#include <chrono>
 #include <memory>
 #include <optional>
 #include <string_view>

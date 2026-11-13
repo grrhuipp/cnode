@@ -876,15 +876,9 @@ AnyTlsInboundHandler::Process(
 }
 
 namespace {
-class AnyTlsSettings final
-    : public ::app::ProtocolSettings {
-public:
-    std::shared_ptr<const AnyTlsPaddingScheme> padding_scheme;
-};
-
-[[nodiscard]] const AnyTlsSettings* GetAnyTlsSettings(
+[[nodiscard]] const ::app::AnyTlsInboundSettings* GetAnyTlsSettings(
     const ::app::BuildRequest& req) noexcept {
-    return dynamic_cast<const AnyTlsSettings*>(req.settings.get());
+    return req.settings ? std::get_if<::app::AnyTlsInboundSettings>(req.settings.get()) : nullptr;
 }
 
 const bool kInboundRegistered = [] {
@@ -908,10 +902,10 @@ const bool kInboundRegistered = [] {
     reg.prepare_settings =
         [](std::string_view tag, const ::infra::InboundProtocolSettings& config)
             -> std::optional<std::shared_ptr<
-                const ::app::ProtocolSettings>> {
+                const ::app::PreparedInboundSettings>> {
             // Text was validated (size and grammar) by infra::ParseAnyTlsPaddingScheme;
             // this only builds the runtime scheme object.
-            auto settings = std::make_shared<AnyTlsSettings>();
+            ::app::AnyTlsInboundSettings settings;
             if (!config.padding_scheme.empty()) {
                 auto parsed =
                     ::proxy::ParseAnyTlsPaddingScheme(config.padding_scheme);
@@ -920,10 +914,10 @@ const bool kInboundRegistered = [] {
                         "AnyTLS inbound '{}': invalid padding scheme", tag);
                     return std::nullopt;
                 }
-                settings->padding_scheme =
+                settings.padding_scheme =
                     std::make_shared<const ::proxy::AnyTlsPaddingScheme>(std::move(*parsed));
             }
-            return settings;
+            return std::make_shared<const ::app::PreparedInboundSettings>(std::move(settings));
         };
 
     reg.build_users =

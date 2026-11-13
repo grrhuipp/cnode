@@ -205,5 +205,10 @@ std::optional<tcp::endpoint> AsyncStream::RemoteEndpoint() const {
     return std::nullopt;
 }
 
+TcpStream* AsyncStream::AsDirectTcpStream() noexcept {
+    auto* tcp = BaseTcpStream();
+    return static_cast<AsyncStream*>(tcp) == this ? tcp : nullptr;
+}
+
 }  // namespace transport
 

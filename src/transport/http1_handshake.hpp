@@ -2,7 +2,6 @@
 
 #include "common/multi_buffer.hpp"
 #include "common/const_buffer_span.hpp"
-#include "common/unsafe.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/stream_settings.hpp"
 #include "transport/transport_build_result.hpp"
@@ -33,7 +32,7 @@ struct Http1MessageHead {
 
     // Start line and header fields through the terminating blank line.
     [[nodiscard]] std::string_view Text() const noexcept {
-        return {common::ptr_cast<const char>(bytes), header_end};
+        return {reinterpret_cast<const char*>(bytes), header_end};
     }
     [[nodiscard]] std::span<const uint8_t> ReadAhead() const noexcept {
         return {bytes + header_end, size - header_end};

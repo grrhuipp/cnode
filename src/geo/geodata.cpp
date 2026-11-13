@@ -1,7 +1,6 @@
 #include "geo/geodata.hpp"
 #include "common/byte_reader.hpp"
 #include "common/domain_name.hpp"
-#include "common/unsafe.hpp"
 
 #include <algorithm>
 #include <array>
@@ -293,7 +292,7 @@ private:
 };
 
 [[nodiscard]] std::string_view AsText(std::span<const uint8_t> bytes) noexcept {
-    return {common::ptr_cast<const char>(bytes.data()), bytes.size()};
+    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
 
 [[nodiscard]] std::string LowerTag(std::string_view tag) {
@@ -315,7 +314,7 @@ private:
     }
     std::vector<uint8_t> bytes(static_cast<size_t>(size));
     file.seekg(0);
-    if (!file.read(common::ptr_cast<char>(bytes.data()), static_cast<std::streamsize>(size))) {
+    if (!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size))) {
         throw std::runtime_error(std::format("failed to read geodata '{}'", path.string()));
     }
     return bytes;

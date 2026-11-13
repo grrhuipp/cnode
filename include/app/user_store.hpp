@@ -2,6 +2,8 @@
 
 #include "common/hash.hpp"
 #include "common/target_address.hpp"
+#include "proxy/ss_cipher.hpp"
+#include "transport/hysteria_wire.hpp"
 #include <openssl/mem.h>
 
 #include <openssl/aes.h>
@@ -20,24 +22,16 @@
 #include <unordered_map>
 #include <variant>
 #include <vector>
+namespace proxy {
+class AnyTlsPaddingScheme;
+struct VlessEncryptionConfig;
+}  // namespace proxy
+
 namespace app {
 
 // ============================================================================
 // BuildRequest - prepared inbound handler construction input
 // ============================================================================
-class ProtocolSettings {
-public:
-    virtual ~ProtocolSettings() noexcept = default;
-};
-
-struct BuildRequest {
-    std::string tag;
-    std::string protocol;
-    // The concrete type is private to the registered protocol implementation.
-    // Generic runtime layers only carry the immutable prepared value.
-    std::shared_ptr<const ProtocolSettings> settings;
-};
-
 struct PreparedKeyBytes {
     static constexpr size_t kMaxSize = 32;
 
@@ -69,6 +63,33 @@ struct PreparedKeyBytes {
         size = src.size();
         return true;
     }
+};
+
+struct AnyTlsInboundSettings {
+    std::shared_ptr<const proxy::AnyTlsPaddingScheme> padding_scheme;
+};
+
+struct ShadowsocksInboundSettings {
+    proxy::SsCipherInfo cipher{};
+    PreparedKeyBytes identity_key;
+    bool uuid_derived_user_key = false;
+};
+
+struct VlessInboundSettings {
+    std::shared_ptr<const proxy::VlessEncryptionConfig> decryption;
+};
+
+using PreparedInboundSettings = std::variant<
+    std::monostate,
+    AnyTlsInboundSettings,
+    ShadowsocksInboundSettings,
+    VlessInboundSettings,
+    transport::HysteriaSettings>;
+
+struct BuildRequest {
+    std::string tag;
+    std::string protocol;
+    std::shared_ptr<const PreparedInboundSettings> settings;
 };
 
 struct PreparedVmessUser {

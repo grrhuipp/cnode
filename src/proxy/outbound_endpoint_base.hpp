@@ -9,7 +9,6 @@
 #include "transport/datagram_socket.hpp"
 #include "transport/link.hpp"
 
-#include <chrono>
 #include <span>
 
 namespace proxy {

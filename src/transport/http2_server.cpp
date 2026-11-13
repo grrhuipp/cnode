@@ -1322,7 +1322,7 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
     uint64_t conn_id) {
     std::array<uint8_t, kHttp2ClientPreface.size()> preface{};
     if (!co_await ReadFullFromStream(*stream, preface) ||
-        std::string_view(common::ptr_cast<const char>(preface.data()), preface.size()) !=
+        std::string_view(reinterpret_cast<const char*>(preface.data()), preface.size()) !=
             kHttp2ClientPreface) {
         LOG_CONN_DEBUG(conn_id, "gRPC server received invalid HTTP/2 client preface");
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);

@@ -923,9 +923,13 @@ RunVlessEncryptionClientHandshake(
         ticket_cache->Clear();
     }
 
-    auto pfs = BuildVlessEncryptionClientPfsHello(*nfs_aead);
-    if (!pfs) {
-        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
+    std::unique_ptr<VlessEncryptionClientPfsHello> pfs;
+    {
+        auto built_pfs = BuildVlessEncryptionClientPfsHello(*nfs_aead);
+        if (!built_pfs) {
+            co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
+        }
+        pfs = std::make_unique<VlessEncryptionClientPfsHello>(std::move(*built_pfs));
     }
     auto padding = BuildVlessEncryptionPadding(config, *nfs_aead);
     if (!padding) {
@@ -1056,26 +1060,33 @@ net::awaitable<VlessEncryptionHandshakeResult> CompleteServerPfs(
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
-    auto response = BuildVlessEncryptionServerPfsResponse(
-        config,
-        nfs.iv,
-        nfs.nfs_key,
-        *client_public,
-        cipher);
-    if (!response) {
+    std::unique_ptr<VlessEncryptionServerPfsResponse> response;
+    VlessEncryptionHandshakeResult runtime =
+        tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
+    {
+        auto built_response = BuildVlessEncryptionServerPfsResponse(
+            config,
+            nfs.iv,
+            nfs.nfs_key,
+            *client_public,
+            cipher);
+        if (!built_response) {
+            OPENSSL_cleanse(client_public->data(), client_public->size());
+            co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
+        }
+        runtime = BuildServerRuntime(
+            config,
+            *client_public,
+            *built_response,
+            cipher,
+            nfs.iv);
         OPENSSL_cleanse(client_public->data(), client_public->size());
-        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
-    }
-    auto runtime = BuildServerRuntime(
-        config,
-        *client_public,
-        *response,
-        cipher,
-        nfs.iv);
-    OPENSSL_cleanse(client_public->data(), client_public->size());
-    client_public.reset();
-    if (!runtime) {
-        co_return tl::unexpected(runtime.error());
+        client_public.reset();
+        if (!runtime) {
+            co_return tl::unexpected(runtime.error());
+        }
+        response = std::make_unique<VlessEncryptionServerPfsResponse>(
+            std::move(*built_response));
     }
     auto padding = BuildVlessEncryptionPadding(
         config,

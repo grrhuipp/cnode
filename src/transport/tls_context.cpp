@@ -4,7 +4,6 @@
 #include "transport/transport_security.hpp"
 #include "common/domain_name.hpp"
 #include "common/ip_address.hpp"
-#include "common/unsafe.hpp"
 #include "infra/log.hpp"
 #include <openssl/asn1.h>
 #include <openssl/bio.h>
@@ -55,7 +54,7 @@ namespace {
     for (unsigned int offset = 0; offset < size;) {
         const unsigned int length = wire[offset++];
         if (size - offset < length) return false;
-        if (std::string_view(common::ptr_cast<const char>(wire + offset), length) == protocol) {
+        if (std::string_view(reinterpret_cast<const char*>(wire + offset), length) == protocol) {
             return true;
         }
         offset += length;

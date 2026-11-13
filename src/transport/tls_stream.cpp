@@ -721,6 +721,41 @@ bool TlsStream::SetServerIdentity(std::string_view identity) {
     return !is_server_ && ConfigureTlsServerIdentity(NativeSsl(), identity);
 }
 
+namespace {
+
+template <typename Impl>
+net::awaitable<void> SendRealityCamouflageRequest(
+    Impl& impl, const SSL* ssl, std::string spider_x) {
+    const char* sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    const std::string_view host = (sni && *sni != '\0')
+        ? std::string_view(sni)
+        : std::string_view("localhost");
+    static constexpr std::string_view kReqPrefix = "GET ";
+    static constexpr std::string_view kReqMid = " HTTP/1.1\r\nHost: ";
+    static constexpr std::string_view kReqSuffix =
+        "\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"
+        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+        "Connection: close\r\n\r\n";
+    const std::array<net::const_buffer, 5> request_buffers{
+        net::buffer(kReqPrefix.data(), kReqPrefix.size()),
+        net::buffer(spider_x.data(), spider_x.size()),
+        net::buffer(kReqMid.data(), kReqMid.size()),
+        net::buffer(host.data(), host.size()),
+        net::buffer(kReqSuffix.data(), kReqSuffix.size()),
+    };
+    try {
+        co_await impl.Write(request_buffers);
+        std::string{}.swap(spider_x);
+        (void)co_await impl.ReadMultiBuffer();
+    } catch (const std::exception&) {
+        // The camouflage exchange is best-effort; authentication still
+        // fails regardless of the origin's response or close behavior.
+    }
+}
+
+}  // namespace
+
 net::awaitable<bool> TlsStream::Handshake() {
     if (handshake_done_) {
         co_return true;
@@ -761,33 +796,7 @@ net::awaitable<bool> TlsStream::Handshake() {
         std::string spider_x = std::move(reality_client_state_->spider_x);
         ClearRealityClientState(NativeSsl(), reality_client_state_);
         if (!spider_x.empty()) {
-            const char* sni = SSL_get_servername(
-                NativeSsl(), TLSEXT_NAMETYPE_host_name);
-            const std::string_view host = (sni && *sni != '\0')
-                ? std::string_view(sni)
-                : std::string_view("localhost");
-            static constexpr std::string_view kReqPrefix = "GET ";
-            static constexpr std::string_view kReqMid = " HTTP/1.1\r\nHost: ";
-            static constexpr std::string_view kReqSuffix =
-                "\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"
-                "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
-                "Connection: close\r\n\r\n";
-            const std::array<net::const_buffer, 5> request_buffers{
-                net::buffer(kReqPrefix.data(), kReqPrefix.size()),
-                net::buffer(spider_x.data(), spider_x.size()),
-                net::buffer(kReqMid.data(), kReqMid.size()),
-                net::buffer(host.data(), host.size()),
-                net::buffer(kReqSuffix.data(), kReqSuffix.size()),
-            };
-            try {
-                co_await impl_->Write(request_buffers);
-                std::string{}.swap(spider_x);
-                (void)co_await impl_->ReadMultiBuffer();
-            } catch (const std::exception&) {
-                // The camouflage exchange is best-effort; authentication still
-                // fails regardless of the origin's response or close behavior.
-            }
+            co_await SendRealityCamouflageRequest(*impl_, NativeSsl(), std::move(spider_x));
         }
         impl_->Abort();
         co_return false;

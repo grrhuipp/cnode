@@ -24,7 +24,6 @@
 #include <span>
 #include <utility>
 #include <cstdint>
-#include <vector>
 
 namespace proxy {
 namespace {
@@ -173,15 +172,14 @@ constexpr uint64_t kBytesPerSecondPerMbps = 125000;
     return static_cast<uint64_t>(mbps) * kBytesPerSecondPerMbps;
 }
 
-std::optional<std::shared_ptr<const app::ProtocolSettings>>
+std::optional<std::shared_ptr<const app::PreparedInboundSettings>>
 PrepareSettings(transport::HysteriaVersion version, const infra::InboundProtocolSettings& config) {
-    auto settings = std::make_shared<transport::HysteriaSettings>();
-    settings->version = version;
-    settings->upload_bytes_per_second =
-        MbpsToBytesPerSecond(config.hysteria_up_mbps);
-    settings->download_bytes_per_second =
-        MbpsToBytesPerSecond(config.hysteria_down_mbps);
-    return settings;
+    return std::make_shared<const app::PreparedInboundSettings>(
+        transport::HysteriaSettings{
+            .version = version,
+            .upload_bytes_per_second = MbpsToBytesPerSecond(config.hysteria_up_mbps),
+            .download_bytes_per_second = MbpsToBytesPerSecond(config.hysteria_down_mbps),
+        });
 }
 
 std::unique_ptr<::proxy::Inbound> CreateInbound(
@@ -221,14 +219,14 @@ app::ProxyRegistration Registration() {
 const bool kHysteriaRegistered = [] {
     auto v1 = Registration();
     v1.prepare_settings = [](std::string_view, const infra::InboundProtocolSettings& config)
-        -> std::optional<std::shared_ptr<const app::ProtocolSettings>> {
+        -> std::optional<std::shared_ptr<const app::PreparedInboundSettings>> {
         return PrepareSettings(transport::HysteriaVersion::V1, config);
     };
     app::RegisterProxy(common::kHysteria, std::move(v1));
 
     auto v2 = Registration();
     v2.prepare_settings = [](std::string_view, const infra::InboundProtocolSettings& config)
-        -> std::optional<std::shared_ptr<const app::ProtocolSettings>> {
+        -> std::optional<std::shared_ptr<const app::PreparedInboundSettings>> {
         return PrepareSettings(transport::HysteriaVersion::V2, config);
     };
     app::RegisterProxy(common::kHysteria2, std::move(v2));

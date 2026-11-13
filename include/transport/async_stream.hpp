@@ -245,6 +245,7 @@ public:
 
     [[nodiscard]] std::optional<tcp::endpoint> LocalEndpoint() const;
     [[nodiscard]] std::optional<tcp::endpoint> RemoteEndpoint() const;
+    [[nodiscard]] TcpStream* AsDirectTcpStream() noexcept;
 
 protected:
     // Override for a logical stream, including split transports. Its Cancel()

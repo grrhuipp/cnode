@@ -16,6 +16,7 @@
 #include "infra/log.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/session.hpp"
+#include "common/scoped_cleanse.hpp"
 
 #include <cstring>
 #include <memory>
@@ -32,17 +33,20 @@ common::Network RequestNetwork(::proxy::VmessCommand command) noexcept {
         ? common::Network::MUX : common::Network::TCP;
 }
 
-net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>>
-ParseHandshake(transport::AsyncStream& stream,
-               ::proxy::ServerSession& vmess_session,
-               const app::AdmissionEnvironment& environment,
-               proxy::InboundAuthentication authentication,
-               common::Context& ctx) {
-    std::array<uint8_t, ::proxy::kMaxRequestHeaderWireSize> header_buf{};
-    size_t total_read = 0;
+struct DecodedVMessHeader {
     std::optional<::proxy::VMessRequest> request;
     size_t consumed = 0;
-    while (!request) {
+};
+
+net::awaitable<tl::expected<DecodedVMessHeader, common::ErrorCode>>
+ReadVMessHandshakeHeader(transport::AsyncStream& stream,
+                         ::proxy::ServerSession& vmess_session,
+                         uint64_t conn_id) {
+    std::array<uint8_t, ::proxy::kMaxRequestHeaderWireSize> header_buf{};
+    common::ScopedCleanse cleanse_header{header_buf};
+    size_t total_read = 0;
+    DecodedVMessHeader out;
+    while (!out.request) {
         const size_t required = vmess_session.RequiredHeaderBytes();
         if (required > header_buf.size()) {
             co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -54,21 +58,38 @@ ParseHandshake(transport::AsyncStream& stream,
         if (!read) co_return tl::unexpected(read.error());
         total_read = required;
         auto decoded = vmess_session.DecodeRequestHeader(
-            header_buf.data(), total_read, ctx.conn_id);
-        request = std::move(decoded.first);
-        consumed = decoded.second;
-        if (!request && vmess_session.RequiredHeaderBytes() == 0) {
-            const auto reason = vmess_session.HeaderFailureReason();
-            const auto* authenticated = vmess_session.AuthenticatedRejectedHeader();
-            if (!authenticated) {
-                co_return tl::unexpected(co_await authentication.RejectCredential(reason));
-            }
-            auto bound = std::move(authentication).Bind(authenticated->user->profile,
-                proxy::InboundRequestTarget{RequestNetwork(authenticated->command), authenticated->target});
-            co_return tl::unexpected(std::move(bound).Reject(reason, common::ErrorCode::PROTOCOL_DECODE_FAILED));
+            header_buf.data(), total_read, conn_id);
+        out.request = std::move(decoded.first);
+        out.consumed = decoded.second;
+        if (!out.request && vmess_session.RequiredHeaderBytes() == 0) {
+            break;
         }
     }
+    co_return out;
+}
 
+net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>>
+ParseHandshake(transport::AsyncStream& stream,
+               ::proxy::ServerSession& vmess_session,
+               const app::AdmissionEnvironment& environment,
+               proxy::InboundAuthentication authentication,
+               common::Context& ctx) {
+    auto header = co_await ReadVMessHandshakeHeader(stream, vmess_session, ctx.conn_id);
+    if (!header) {
+        co_return tl::unexpected(header.error());
+    }
+    if (!header->request) {
+        const auto reason = vmess_session.HeaderFailureReason();
+        const auto* authenticated = vmess_session.AuthenticatedRejectedHeader();
+        if (!authenticated) {
+            co_return tl::unexpected(co_await authentication.RejectCredential(reason));
+        }
+        auto bound = std::move(authentication).Bind(authenticated->user->profile,
+            proxy::InboundRequestTarget{RequestNetwork(authenticated->command), authenticated->target});
+        co_return tl::unexpected(std::move(bound).Reject(reason, common::ErrorCode::PROTOCOL_DECODE_FAILED));
+    }
+    auto& request = header->request;
+    const size_t consumed = header->consumed;
     if (!request->user) {
         co_return tl::unexpected(co_await authentication.RejectCredential("no authenticated user"));
     }

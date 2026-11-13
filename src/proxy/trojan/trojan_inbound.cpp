@@ -38,14 +38,12 @@ struct TrojanHandshakeResult {
     std::optional<common::ForwardedMetadata> forwarded;
 };
 
-net::awaitable<tl::expected<TrojanHandshakeResult, common::ErrorCode>>
-ParseTrojanRequest(transport::AsyncStream& stream,
-                   common::Context& ctx,
-                   InboundAuthentication& authentication) {
+net::awaitable<tl::expected<TrojanRequest, common::ErrorCode>>
+ReadRawTrojanRequest(transport::AsyncStream& stream, common::Context& ctx) {
     std::array<uint8_t, kMaxTrojanHandshakeBytes> handshake_buf{};
+    common::ScopedCleanse cleanse_handshake{handshake_buf};
     size_t total_read = 0;
     size_t required = kRequestPrefixSize;
-    TrojanRequestDecodeResult decoded;
     while (true) {
         if (required > kMaxTrojanHandshakeBytes) {
             co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -60,10 +58,10 @@ ParseTrojanRequest(transport::AsyncStream& stream,
             if (!read) co_return tl::unexpected(read.error());
             total_read = required;
         }
-        decoded = DecodeTrojanRequest(
+        auto decoded = DecodeTrojanRequest(
             std::span<const uint8_t>(handshake_buf.data(), total_read));
         if (decoded.status == TrojanRequestDecodeStatus::Complete) {
-            break;
+            co_return std::move(decoded.request);
         }
         if (decoded.status == TrojanRequestDecodeStatus::InvalidAddress) {
             LOG_ACCESS(common::FormatAccessLog(ctx, common::AccessStatus::Rejected, "invalid target address"));
@@ -75,9 +73,18 @@ ParseTrojanRequest(transport::AsyncStream& stream,
         }
         required = decoded.required;
     }
+}
 
-    auto& request = decoded.request;
-    OPENSSL_cleanse(handshake_buf.data(), handshake_buf.size());
+net::awaitable<tl::expected<TrojanHandshakeResult, common::ErrorCode>>
+ParseTrojanRequest(transport::AsyncStream& stream,
+                   common::Context& ctx,
+                   InboundAuthentication& authentication) {
+    auto parsed_request = co_await ReadRawTrojanRequest(stream, ctx);
+    if (!parsed_request) {
+        co_return tl::unexpected(parsed_request.error());
+    }
+    auto& request = *parsed_request;
+    common::ScopedCleanse cleanse_hash{request.password_hash};
     const auto credential = co_await authentication.VerifyCredential({
         proxy::KeyedInboundProtocol::Trojan,
         {reinterpret_cast<const uint8_t*>(request.password_hash.data()), request.password_hash.size()}});

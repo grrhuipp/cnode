@@ -34,7 +34,6 @@
 #include <span>
 #include <string>
 #include <utility>
-#include <vector>
 
 #include <chrono>
 #include <cstdint>

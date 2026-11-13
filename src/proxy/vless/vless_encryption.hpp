@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/unsafe.hpp"
 #include "common/asio_types.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/error.hpp"
@@ -103,10 +102,10 @@ struct VlessMlKem768Encapsulation {
 
 // EVP_PKEY owns the expanded ML-KEM key and seed; EVP_PKEY_free wipes both.
 // Configuration keys share ownership, while each PFS hello owns its own key.
-[[nodiscard]] std::shared_ptr<EVP_PKEY>
+[[nodiscard]] SharedEvpPkey
 CreateVlessMlKem768PrivateKeyFromSeed(std::span<const uint8_t> seed) noexcept;
 
-[[nodiscard]] std::shared_ptr<EVP_PKEY>
+[[nodiscard]] SharedEvpPkey
 CreateVlessMlKem768PublicKey(std::span<const uint8_t> public_key) noexcept;
 
 [[nodiscard]] bssl::UniquePtr<EVP_PKEY> GenerateVlessMlKem768PrivateKey() noexcept;

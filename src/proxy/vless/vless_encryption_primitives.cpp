@@ -11,25 +11,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <memory>
-#include <new>
 #include <utility>
 namespace proxy {
-namespace {
-
-[[nodiscard]] std::shared_ptr<EVP_PKEY> ShareKey(
-    bssl::UniquePtr<EVP_PKEY> key) noexcept {
-    if (!key) {
-        return nullptr;
-    }
-    try {
-        return std::shared_ptr<EVP_PKEY>(key.release(), EVP_PKEY_free);
-    } catch (const std::bad_alloc&) {
-        return nullptr;
-    }
-}
-
-}  // namespace
 
 VlessX25519KeyPair GenerateVlessX25519KeyPair() noexcept {
     VlessX25519KeyPair pair;
@@ -57,7 +40,7 @@ bool ComputeVlessX25519SharedKey(
                   peer_public_key.data()) == 1;
 }
 
-std::shared_ptr<EVP_PKEY>
+SharedEvpPkey
 CreateVlessMlKem768PrivateKeyFromSeed(
     std::span<const uint8_t> seed) noexcept {
     if (seed.size() != kVlessMlKem768SeedSize) {
@@ -70,10 +53,10 @@ CreateVlessMlKem768PrivateKeyFromSeed(
         ERR_clear_error();
         return nullptr;
     }
-    return ShareKey(std::move(key));
+    return SharedEvpPkey{std::move(key)};
 }
 
-std::shared_ptr<EVP_PKEY>
+SharedEvpPkey
 CreateVlessMlKem768PublicKey(
     std::span<const uint8_t> public_key) noexcept {
     if (public_key.size() != kVlessMlKem768PublicKeySize) {
@@ -87,7 +70,7 @@ CreateVlessMlKem768PublicKey(
         ERR_clear_error();
         return nullptr;
     }
-    return ShareKey(std::move(key));
+    return SharedEvpPkey{std::move(key)};
 }
 
 bssl::UniquePtr<EVP_PKEY> GenerateVlessMlKem768PrivateKey() noexcept {

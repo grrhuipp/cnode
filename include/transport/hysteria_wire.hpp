@@ -23,6 +23,12 @@ enum class HysteriaVersion : uint8_t {
     V2,
 };
 
+struct HysteriaSettings {
+    HysteriaVersion version = HysteriaVersion::V2;
+    uint64_t upload_bytes_per_second = 0;
+    uint64_t download_bytes_per_second = 0;
+};
+
 enum class ProtocolError : uint8_t {
     Incomplete,
     Invalid,

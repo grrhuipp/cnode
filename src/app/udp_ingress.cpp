@@ -718,7 +718,7 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         auto record = handoff_directory_.Claim(
             identity, prepared->settings, *decoded->association_policy);
         if (!record) return;
-        record->socket_pin = sockets_.at(&socket);
+        record->socket_pin = socket.shared_from_this();
         auto release_claim = MakeScopeExit([record]() noexcept {
             record->association->claimed = false;
         });
@@ -811,7 +811,7 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
         const auto local_endpoint = socket.local_endpoint;
 
         const uint32_t worker_id = datagram.worker_id;
-        auto socket_pin = sockets_.at(&socket);
+        auto socket_pin = socket.shared_from_this();
         ReplyRoute reply{
             .socket = socket_pin,
             .response = std::move(*response),
@@ -1158,7 +1158,7 @@ void UdpIngress::CloseMatchingJobs(Pred&& match) noexcept {
 
 std::shared_ptr<UdpHandoffRecord> UdpHandoffDirectory::Claim(
     const UdpHandoffIdentity& key,
-    std::shared_ptr<const ProtocolSettings> configuration,
+    std::shared_ptr<const PreparedInboundSettings> configuration,
     const proxy::InboundDatagramAssociationPolicy& policy) {
     using Clock = proxy::InboundDatagramAssociation::Clock;
     if (auto found = records_.find(key); found != records_.end()) {

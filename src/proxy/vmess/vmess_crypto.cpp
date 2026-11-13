@@ -2,7 +2,6 @@
 #include "common/byte_reader.hpp"
 #include "proxy/aead.hpp"
 #include "common/binary_text_codec.hpp"
-#include "common/unsafe.hpp"
 
 #include <openssl/aead.h>
 #include <openssl/evp.h>
@@ -111,7 +110,7 @@ void VmessKdfRecursive(
             std::memcpy(k_padded, key.data(), key.size());
         }
     } else {
-        VmessKdfRecursive(common::ptr_cast<const uint8_t>(key.data()),
+        VmessKdfRecursive(reinterpret_cast<const uint8_t*>(key.data()),
                           key.size(), path, depth - 1, k_padded);
     }
 
@@ -150,7 +149,7 @@ void VmessKdfRecursive(
 }
 
 std::string_view AsText(std::span<const uint8_t> bytes) noexcept {
-    return {common::ptr_cast<const char>(bytes.data()), bytes.size()};
+    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
 
 HeaderAeadKey DeriveHeaderKey(std::span<const uint8_t> key_material,

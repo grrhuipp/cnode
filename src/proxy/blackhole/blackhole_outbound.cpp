@@ -6,11 +6,9 @@
 #include "infra/log.hpp"
 #include "proxy/outbound.hpp"
 
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <span>
-#include <string>
 #include <string_view>
 namespace proxy {
 

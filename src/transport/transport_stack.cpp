@@ -6,7 +6,6 @@
 #include "transport/xhttp_session.hpp"
 #include "app/relay.hpp"
 #include "common/session.hpp"
-#include "common/unsafe.hpp"
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"
 #include "transport/http_headers.hpp"
@@ -27,7 +26,7 @@ namespace transport {
 net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
     AsyncStream& raw,
     std::chrono::seconds timeout) {
-    auto* tcp = dynamic_cast<TcpStream*>(&raw);
+    auto* tcp = raw.AsDirectTcpStream();
     if (!tcp) {
         ProxyProtocolReadResult result;
         result.status = ProxyProtocolReadStatus::Invalid;
@@ -48,7 +47,7 @@ namespace {
 }
 
 std::unique_ptr<TcpStream> TakeOwnedTcpStream(std::unique_ptr<AsyncStream>& stream) {
-    auto* tcp_raw = stream ? dynamic_cast<TcpStream*>(stream.get()) : nullptr;
+    auto* tcp_raw = stream ? stream->AsDirectTcpStream() : nullptr;
     if (!tcp_raw) {
         return nullptr;
     }
@@ -315,12 +314,12 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
         }
         total += n;
         if (!kHttp2ClientPreface.starts_with(std::string_view(
-                common::ptr_cast<const char>(first.data()), total))) {
+                reinterpret_cast<const char*>(first.data()), total))) {
             break;
         }
     }
 
-    if (std::string_view(common::ptr_cast<const char>(first.data()), total) ==
+    if (std::string_view(reinterpret_cast<const char*>(first.data()), total) ==
         kHttp2ClientPreface) {
         co_return co_await RunHttp2ServerSession(coordinator, 
             std::move(stream),

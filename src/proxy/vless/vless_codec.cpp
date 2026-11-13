@@ -17,7 +17,8 @@
 #include <openssl/mem.h>
 #include <openssl/rand.h>
 #include <cstdint>
-#include <list>
+#include <memory>
+#include <vector>
 
 namespace proxy {
 
@@ -287,19 +288,20 @@ public:
             return ptr;
         }
         if (overflow_.empty() || overflow_used_ + len > kBlockSize) {
-            overflow_.emplace_back();
+            overflow_.push_back(std::make_unique<Block>());
             overflow_used_ = 0;
         }
-        uint8_t* ptr = overflow_.back().data() + overflow_used_;
+        uint8_t* ptr = overflow_.back()->data() + overflow_used_;
         overflow_used_ += len;
         return ptr;
     }
 
 private:
-    static constexpr size_t kBlockSize = 128;
-    std::array<uint8_t, kBlockSize> inline_{};
+    static constexpr size_t kBlockSize = 256;
+    using Block = std::array<uint8_t, kBlockSize>;
+    Block inline_{};
     size_t inline_used_ = 0;
-    std::list<std::array<uint8_t, kBlockSize>> overflow_;
+    std::vector<std::unique_ptr<Block>> overflow_;
     size_t overflow_used_ = 0;
 };
 

@@ -356,6 +356,32 @@ net::awaitable<BaseWsStream::WriteGate::Lease> BaseWsStream::AcquireWrite(
     co_return lease;
 }
 
+namespace {
+
+constexpr size_t kInlineWsClientFrameCapacity = 512;
+
+net::awaitable<void> WriteInlineMaskedWsFrame(
+    AsyncStream& inner,
+    std::span<const uint8_t> header_bytes,
+    std::span<const net::const_buffer> buffers,
+    const uint8_t (&mask)[4]) {
+    std::array<uint8_t, kInlineWsClientFrameCapacity> inline_frame{};
+    std::memcpy(inline_frame.data(), header_bytes.data(), header_bytes.size());
+    size_t write_pos = header_bytes.size();
+    size_t offset = 0;
+    for (const auto& buffer : buffers) {
+        if (buffer.size() == 0) continue;
+        std::memcpy(inline_frame.data() + write_pos, buffer.data(), buffer.size());
+        MaskData(inline_frame.data() + write_pos, buffer.size(), mask, offset);
+        write_pos += buffer.size();
+        offset += buffer.size();
+    }
+    const net::const_buffer output(inline_frame.data(), write_pos);
+    co_await inner.WriteBuffers({&output, 1});
+}
+
+}  // namespace
+
 net::awaitable<void> BaseWsStream::WriteDataFrame(
     std::span<const net::const_buffer> buffers, size_t size) {
     if (size == 0) co_return;
@@ -376,21 +402,12 @@ net::awaitable<void> BaseWsStream::WriteDataFrame(
             output.AppendBuffers(buffers);
             co_await inner_->WriteBuffers(output.Span());
         } else {
-            static constexpr size_t kInlineFrameCapacity = 512;
-            if (header.size + size <= kInlineFrameCapacity) {
-                std::array<uint8_t, kInlineFrameCapacity> inline_frame{};
-                std::memcpy(inline_frame.data(), header.bytes.data(), header.size);
-                size_t write_pos = header.size;
-                size_t offset = 0;
-                for (const auto& buffer : buffers) {
-                    if (buffer.size() == 0) continue;
-                    std::memcpy(inline_frame.data() + write_pos, buffer.data(), buffer.size());
-                    MaskData(inline_frame.data() + write_pos, buffer.size(), mask, offset);
-                    write_pos += buffer.size();
-                    offset += buffer.size();
-                }
-                const net::const_buffer output(inline_frame.data(), write_pos);
-                co_await inner_->WriteBuffers({&output, 1});
+            if (header.size + size <= kInlineWsClientFrameCapacity) {
+                co_await WriteInlineMaskedWsFrame(
+                    *inner_,
+                    std::span<const uint8_t>(header.bytes.data(), header.size),
+                    buffers,
+                    mask);
             } else {
                 common::BufferGuard scratch{common::Buffer::New()};
                 if (!scratch) throw std::bad_alloc();

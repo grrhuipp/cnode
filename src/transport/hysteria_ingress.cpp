@@ -829,9 +829,11 @@ void HysteriaConnection::Flush() {
                 vectors[i] = {http_vectors[i].base, http_vectors[i].len};
             http_data = stream_id >= 0;
         }
+        auto stream_it = core_->streams.end();
         if (!http_data && core_->next_output_stream >= 0) {
             stream_id = core_->next_output_stream;
-            auto& stream = core_->streams.find(stream_id)->second;
+            stream_it = core_->streams.find(stream_id);
+            auto& stream = stream_it->second;
             const bool has_unsent = stream.output_index < stream.output.size();
             if (!stream.state->Open() || stream.flow_blocked ||
                 (!has_unsent && !stream.fin_pending)) {
@@ -908,14 +910,13 @@ void HysteriaConnection::Flush() {
                     nghttp3_conn_block_stream(core_->http, stream_id);
                 else
                     nghttp3_conn_shutdown_stream_write(core_->http, stream_id);
-            } else if (auto it = core_->streams.find(stream_id);
-                       it != core_->streams.end()) {
+            } else if (stream_it != core_->streams.end()) {
                 if (written == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
-                    it->second.flow_blocked = true;
-                    UnscheduleStreamOutput(stream_id, it->second);
+                    stream_it->second.flow_blocked = true;
+                    UnscheduleStreamOutput(stream_id, stream_it->second);
                 } else {
-                    auto state = it->second.state;
-                    UnscheduleStreamOutput(stream_id, it->second);
+                    auto state = stream_it->second.state;
+                    UnscheduleStreamOutput(stream_id, stream_it->second);
                     state->RemoteReset();
                 }
             }
@@ -935,9 +936,8 @@ void HysteriaConnection::Flush() {
                     Close();
                     return;
                 }
-            } else if (auto it = core_->streams.find(stream_id);
-                       it != core_->streams.end()) {
-                auto& stream = it->second;
+            } else if (stream_it != core_->streams.end()) {
+                auto& stream = stream_it->second;
                 size_t remaining = static_cast<size_t>(accepted);
                 while (remaining != 0) {
                     const size_t available =

@@ -24,7 +24,6 @@ namespace app {
 class ConnectionLimiter;
 struct ConnectionFamily;
 struct ReceiverSettings;
-class ProtocolSettings;
 
 }  // namespace app
 namespace transport {
@@ -128,7 +127,7 @@ struct InboundDatagramAssociationPolicy {
 struct InboundDatagramAssociationKey {
     InboundDatagramOwner owner;
     uint64_t session_id;
-    const app::ProtocolSettings* configuration;
+    const void* configuration = nullptr;
     [[nodiscard]] bool operator==(const InboundDatagramAssociationKey& other) const noexcept {
         return session_id == other.session_id && configuration == other.configuration &&
             owner.Same(other.owner);
@@ -155,7 +154,7 @@ struct InboundDatagramRequest {
     std::string_view tag;
     std::span<const uint8_t> payload;
     const InboundDatagramAssociationIndex* associations = nullptr;
-    const app::ProtocolSettings* configuration = nullptr;
+    const void* configuration = nullptr;
     uint32_t worker_id = 0;
     udp::endpoint client_endpoint;
 };

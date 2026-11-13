@@ -3,7 +3,6 @@
 #include "common/domain_name.hpp"
 #include "common/ip_address.hpp"
 #include "common/target_address.hpp"
-#include "common/unsafe.hpp"
 #include "common/constants.hpp"
 #include "transport/http_headers.hpp"
 #include "transport/tls_server_name.hpp"
@@ -535,7 +534,7 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
 SniffResult SniffHttp(std::span<const uint8_t> data) {
     SniffResult result;
     const std::string_view request(
-        common::ptr_cast<const char>(data.data()), data.size());
+        reinterpret_cast<const char*>(data.data()), data.size());
     size_t line_end = request.find("\r\n");
     if (line_end == std::string_view::npos) {
         if (CheckHttpRequestLine(request, true)) {

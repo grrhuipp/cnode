@@ -494,15 +494,9 @@ proxy::VlessInboundHandler::Process(
 
 
 namespace {
-class VlessSettings final
-    : public ::app::ProtocolSettings {
-public:
-    std::shared_ptr<const ::proxy::VlessEncryptionConfig> decryption;
-};
-
-[[nodiscard]] const VlessSettings* GetVlessSettings(
+[[nodiscard]] const ::app::VlessInboundSettings* GetVlessSettings(
     const ::app::BuildRequest& req) noexcept {
-    return dynamic_cast<const VlessSettings*>(req.settings.get());
+    return req.settings ? std::get_if<::app::VlessInboundSettings>(req.settings.get()) : nullptr;
 }
 
 [[nodiscard]] std::optional<::app::PreparedVlessUser>
@@ -539,21 +533,23 @@ const bool kVlessInboundRegistered = [] {
     reg.prepare_settings =
         [](std::string_view tag, const ::infra::InboundProtocolSettings& config)
             -> std::optional<std::shared_ptr<
-                const ::app::ProtocolSettings>> {
-            auto settings = std::make_shared<VlessSettings>();
-                auto parsed = ::proxy::ParseVlessServerDecryption(
-                    config.vless_decryption);
-                if (!parsed) {
-                    LOG_WARN("VLESS inbound '{}': invalid decryption: {}",
-                             tag,
-                             ::proxy::VlessEncryptionParseErrorMessage(
-                                 parsed.error()));
-                    return std::nullopt;
-                }
-                if (*parsed) settings->decryption =
-                    std::make_shared<::proxy::VlessEncryptionConfig>(
+                const ::app::PreparedInboundSettings>> {
+            ::app::VlessInboundSettings settings;
+            auto parsed = ::proxy::ParseVlessServerDecryption(
+                config.vless_decryption);
+            if (!parsed) {
+                LOG_WARN("VLESS inbound '{}': invalid decryption: {}",
+                         tag,
+                         ::proxy::VlessEncryptionParseErrorMessage(
+                             parsed.error()));
+                return std::nullopt;
+            }
+            if (*parsed) {
+                settings.decryption =
+                    std::make_shared<const ::proxy::VlessEncryptionConfig>(
                         std::move(**parsed));
-            return settings;
+            }
+            return std::make_shared<const ::app::PreparedInboundSettings>(std::move(settings));
         };
 
     // Decryption settings are validated once by prepare_settings; inbound

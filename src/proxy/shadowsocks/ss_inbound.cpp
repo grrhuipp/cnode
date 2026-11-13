@@ -680,18 +680,9 @@ proxy::SsInboundHandler::CreateDatagramResponse(
 // 自注册（静态初始化）
 // ============================================================================
 namespace {
-class ShadowsocksSettings final
-    : public ::app::ProtocolSettings {
-public:
-    ::proxy::SsCipherInfo cipher;
-    // SS2022-AES identity header key; empty when EIH is disabled.
-    ::app::PreparedKeyBytes identity_key;
-    ::infra::Ss2022UserKey user_key = ::infra::Ss2022UserKey::Base64Psk;
-};
-
-[[nodiscard]] const ShadowsocksSettings* GetSettings(
+[[nodiscard]] const ::app::ShadowsocksInboundSettings* GetSettings(
     const ::app::BuildRequest& req) noexcept {
-    return dynamic_cast<const ShadowsocksSettings*>(req.settings.get());
+    return req.settings ? std::get_if<::app::ShadowsocksInboundSettings>(req.settings.get()) : nullptr;
 }
 
 const bool kSsInboundRegistered = [] {
@@ -718,32 +709,33 @@ const bool kSsInboundRegistered = [] {
     reg.prepare_settings =
         [](std::string_view tag, const ::infra::InboundProtocolSettings& config)
             -> std::optional<std::shared_ptr<
-                const ::app::ProtocolSettings>> {
-            const std::string method = config.method.empty()
-                ? std::string(::common::kAes256Gcm)
-                : config.method;
+                const ::app::PreparedInboundSettings>> {
+            const std::string_view method = config.method.empty()
+                ? ::common::kAes256Gcm
+                : std::string_view(config.method);
             auto cipher = ::proxy::ParseCipherMethod(method);
             if (!cipher) {
                 LOG_WARN("Inbound '{}': unknown SS cipher '{}'", tag, method);
                 return std::nullopt;
             }
-            auto settings = std::make_shared<ShadowsocksSettings>();
-            settings->cipher = *cipher;
-            settings->user_key = config.ss2022_user_key;
+            ::app::ShadowsocksInboundSettings settings;
+            settings.cipher = *cipher;
+            settings.uuid_derived_user_key =
+                config.ss2022_user_key == ::infra::Ss2022UserKey::UuidDerived;
             if (::proxy::Is2022AesCipher(cipher->type)) {
                 if (!config.identity_password.empty()) {
-                    settings->identity_key =
+                    settings.identity_key =
                         ::proxy::BuildMasterKey(config.identity_password, *cipher);
-                    if (settings->identity_key.empty()) {
+                    if (settings.identity_key.empty()) {
                         LOG_WARN("Inbound '{}': invalid SS2022 identity password", tag);
                         return std::nullopt;
                     }
-                } else if (config.ss2022_user_key == ::infra::Ss2022UserKey::UuidDerived) {
+                } else if (settings.uuid_derived_user_key) {
                     LOG_WARN("Inbound '{}': SS2022 UUID users require server identity key", tag);
                     return std::nullopt;
                 }
             }
-            return settings;
+            return std::make_shared<const ::app::PreparedInboundSettings>(std::move(settings));
         };
 
     reg.build_users =
@@ -758,7 +750,7 @@ const bool kSsInboundRegistered = [] {
             const auto& cipher_info = settings->cipher;
             const bool uuid_derived =
                 ::proxy::Is2022Cipher(cipher_info.type) &&
-                settings->user_key == ::infra::Ss2022UserKey::UuidDerived;
+                settings->uuid_derived_user_key;
 
             std::vector<::app::PreparedShadowsocksUser> users;
             users.reserve(specs.size());

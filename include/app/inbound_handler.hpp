@@ -159,9 +159,9 @@ struct ProxyRegistration {
         uint32_t worker_id, uint32_t worker_count, net::io_context& io,
         app::DatagramSessionEnvironment environment) = nullptr;
 
-    // Parse protocol-specific source fields on the cold path. The returned
-    // immutable type remains private to the protocol implementation.
-    std::optional<std::shared_ptr<const ProtocolSettings>>
+    // Parse protocol-specific source fields on the cold path into the closed
+    // immutable settings variant.
+    std::optional<std::shared_ptr<const PreparedInboundSettings>>
     (*prepare_settings)(
         std::string_view tag,
         const ::infra::InboundProtocolSettings& settings) = nullptr;

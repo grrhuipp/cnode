@@ -4,7 +4,6 @@
 #include "common/const_buffer_span.hpp"
 #include "infra/log.hpp"
 #include "transport/http_headers.hpp"
-#include "common/unsafe.hpp"
 #include "transport/tcp_stream.hpp"
 #include "transport/ws_stream.hpp"
 #include <openssl/base64.h>
@@ -655,7 +654,7 @@ net::awaitable<tl::expected<void, common::ErrorCode>> ReadHttp1MessageHead(
         head.extended_storage.erase(0, head.header_end);
         head.size = head.extended_storage.size();
         head.header_end = 0;
-        head.bytes = common::ptr_cast<const uint8_t>(head.extended_storage.data());
+        head.bytes = reinterpret_cast<const uint8_t*>(head.extended_storage.data());
         if (head.extended_storage.empty()) std::string{}.swap(head.extended_storage);
     }
     if (head.storage) {
@@ -729,10 +728,10 @@ net::awaitable<tl::expected<void, common::ErrorCode>> ReadHttp1MessageHead(
             std::memcpy(data + head.size, initial.data(), initial.size());
         } else {
             if (head.extended_storage.empty())
-                head.extended_storage.assign(common::ptr_cast<const char>(data), head.size);
+                head.extended_storage.assign(reinterpret_cast<const char*>(data), head.size);
             head.extended_storage.append(
-                common::ptr_cast<const char>(initial.data()), initial.size());
-            head.bytes = common::ptr_cast<const uint8_t>(head.extended_storage.data());
+                reinterpret_cast<const char*>(initial.data()), initial.size());
+            head.bytes = reinterpret_cast<const uint8_t*>(head.extended_storage.data());
         }
         head.size += initial.size();
     }
@@ -742,7 +741,7 @@ net::awaitable<tl::expected<void, common::ErrorCode>> ReadHttp1MessageHead(
     size_t line_start = 0;
     size_t line_scanned = 0;
     for (;;) {
-        const std::string_view received(common::ptr_cast<const char>(head.bytes), head.size);
+        const std::string_view received(reinterpret_cast<const char*>(head.bytes), head.size);
         const size_t from = scanned < kTerminator.size() - 1
             ? 0 : scanned - (kTerminator.size() - 1);
         const size_t end = received.find(kTerminator, from);
@@ -782,13 +781,13 @@ net::awaitable<tl::expected<void, common::ErrorCode>> ReadHttp1MessageHead(
             head.size += n;
         } else {
             if (head.extended_storage.empty())
-                head.extended_storage.assign(common::ptr_cast<const char>(data), head.size);
+                head.extended_storage.assign(reinterpret_cast<const char*>(data), head.size);
             const size_t want = std::min(capacity, head_limit - head.size);
             const size_t n = co_await stream.AsyncRead(net::buffer(data, want));
             if (n == 0) co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
-            head.extended_storage.append(common::ptr_cast<const char>(data), n);
+            head.extended_storage.append(reinterpret_cast<const char*>(data), n);
             head.size += n;
-            head.bytes = common::ptr_cast<const uint8_t>(head.extended_storage.data());
+            head.bytes = reinterpret_cast<const uint8_t*>(head.extended_storage.data());
         }
     }
 }

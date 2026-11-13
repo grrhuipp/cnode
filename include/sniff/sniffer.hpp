@@ -4,6 +4,7 @@
 #include "common/constants.hpp"
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -59,7 +60,10 @@ class Sniffer {
 public:
     [[nodiscard]] SniffResult Sniff(std::span<const uint8_t> data, common::Network network) {
         if (network == common::Network::UDP) {
-            return quic_.Sniff(data);
+            if (!quic_) {
+                quic_ = std::make_unique<QuicSniffer>();
+            }
+            return quic_->Sniff(data);
         }
         if (auto result = SniffTls(data); result.success || result.need_more) {
             return result;
@@ -71,7 +75,7 @@ public:
     }
 
 private:
-    QuicSniffer quic_;
+    std::unique_ptr<QuicSniffer> quic_;
 };
 
 }  // namespace sniff

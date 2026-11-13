@@ -120,7 +120,6 @@ private:
     FixtureState& state_;
 };
 
-struct Settings final : ::app::ProtocolSettings {};
 
 class NativeDecoder final : public ::proxy::Inbound {
 public:
@@ -364,7 +363,7 @@ void SendLateDnsReply(::udp::socket& socket, DnsPacket& query) {
 
     ::app::BuildRequest request{
         .tag = std::string(kTag), .protocol = std::string(kProtocol),
-        .settings = std::make_shared<Settings>()};
+        .settings = std::make_shared<const ::app::PreparedInboundSettings>()};
     ::app::ReceiverSettings receiver{
         .inbound_tag = std::string(kTag), .inbound_tags = {}, .protocol = std::string(kProtocol),
         .stream_settings = {},
@@ -417,7 +416,7 @@ template <typename Predicate>
 
 ::app::BuildRequest BuildFixtureRequest(std::string tag) {
     return {.tag = std::move(tag), .protocol = std::string(kProtocol),
-            .settings = std::make_shared<Settings>()};
+            .settings = std::make_shared<const ::app::PreparedInboundSettings>()};
 }
 
 ::app::ReceiverSettings BuildFixtureReceiver(

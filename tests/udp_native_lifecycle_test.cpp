@@ -385,8 +385,8 @@ TEST_F(UdpNativeLifecycleTest, ClosedSessionReleasesAllocationButRetainsReplayAu
     UdpSocketFixtures sockets(io);
     UdpHandoffDirectory directory;
     const auto& policy = ::proxy::Ss2022UdpAssociation::Policy();
-    auto configuration = std::make_shared<const ::app::ProtocolSettings>();
-    std::weak_ptr<const ::app::ProtocolSettings> configuration_lifetime = configuration;
+    auto configuration = std::make_shared<const ::app::PreparedInboundSettings>();
+    std::weak_ptr<const ::app::PreparedInboundSettings> configuration_lifetime = configuration;
     ::proxy::InboundDatagramOwner owner;
     constexpr std::array<uint8_t, 32> credential{0x71};
     EXPECT_TRUE(owner.Assign(credential)) << "failed to prepare tombstone credential";
@@ -450,7 +450,7 @@ TEST_F(UdpNativeLifecycleTest, DirectoryCapacityProtectsUnexpiredAndClaimedTombs
     using namespace ::app;
     UdpHandoffDirectory directory;
     const auto& policy = ::proxy::Ss2022UdpAssociation::Policy();
-    auto configuration = std::make_shared<const ::app::ProtocolSettings>();
+    auto configuration = std::make_shared<const ::app::PreparedInboundSettings>();
     ::proxy::InboundDatagramOwner owner;
     constexpr std::array<uint8_t, 32> credential{0x63};
     EXPECT_TRUE(owner.Assign(credential)) << "failed to prepare capacity credential";
@@ -492,8 +492,8 @@ TEST(UdpHandoffDirectory, ClaimsAreExclusiveAndRetainCommittedReplay) {
     using namespace ::app;
     UdpHandoffDirectory directory;
     const auto& policy = ::proxy::Ss2022UdpAssociation::Policy();
-    auto configuration = std::make_shared<const ::app::ProtocolSettings>();
-    auto other_configuration = std::make_shared<const ::app::ProtocolSettings>();
+    auto configuration = std::make_shared<const ::app::PreparedInboundSettings>();
+    auto other_configuration = std::make_shared<const ::app::PreparedInboundSettings>();
     UdpSocketState listener_state, other_listener_state;
     ::proxy::InboundDatagramOwner owner;
     std::array<uint8_t, 32> credential{};
@@ -523,8 +523,8 @@ TEST_P(UdpHandoffNamespaceTest, DistinctAuthenticatedNamespacesKeepIndependentRe
     using namespace ::app;
     UdpHandoffDirectory directory;
     const auto& policy = ::proxy::Ss2022UdpAssociation::Policy();
-    auto configuration = std::make_shared<const ::app::ProtocolSettings>();
-    auto other_configuration = std::make_shared<const ::app::ProtocolSettings>();
+    auto configuration = std::make_shared<const ::app::PreparedInboundSettings>();
+    auto other_configuration = std::make_shared<const ::app::PreparedInboundSettings>();
     UdpSocketState listener_state, other_listener_state;
     ::proxy::InboundDatagramOwner owner;
     std::array<uint8_t, 32> credential{};
@@ -584,7 +584,7 @@ protected:
     ::app::StatsShard stats{};
     const ::app::AdmissionEnvironment admission{
         *coordinator.Get(), *limiter, tracker, stats};
-    ::app::ProtocolSettings configuration{}, other_configuration{};
+    const int configuration = 1, other_configuration = 2;
     const ::udp::endpoint first{::net::ip::address_v4::loopback(), 48234};
     const ::udp::endpoint second{::net::ip::address_v4::loopback(), 48235};
     const ::common::TargetAddress target{"127.0.0.1", 53};

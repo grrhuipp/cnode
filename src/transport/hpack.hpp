@@ -61,6 +61,8 @@ public:
         };
         size_t offset = 0;
         bool allow_dynamic_resize = true;
+        std::string name_scratch;
+        std::string value_scratch;
         while (offset < block.size()) {
             const uint8_t first = block[offset];
             if ((first & 0x80) != 0) {
@@ -97,8 +99,8 @@ public:
                 return false;
             }
             if (*name_index == 0) {
-                std::string name_scratch;
-                std::string value_scratch;
+                name_scratch.clear();
+                value_scratch.clear();
                 auto name = ReadStringViewOrDecode(block, offset, name_scratch);
                 auto value = name ? ReadStringViewOrDecode(block, offset, value_scratch) : std::nullopt;
                 if (!value || !emit_field(*name, *value)) {
@@ -109,7 +111,7 @@ public:
                 if (!indexed) {
                     return false;
                 }
-                std::string value_scratch;
+                value_scratch.clear();
                 auto value = ReadStringViewOrDecode(block, offset, value_scratch);
                 if (!value || !emit_field(indexed->name, *value)) {
                     return false;
