@@ -57,12 +57,15 @@ struct H2InboundPayload final {
     template <class Source>
     net::awaitable<common::MultiBuffer> ReadMultiBuffer(Source& source) {
         if (!Ready(source) && !co_await Ensure(source)) co_return common::MultiBuffer{};
+        if (codec == H2PayloadCodec::RawData) {
+            co_return source.ConsumeRawMultiBuffer();
+        }
         common::BufferGuard buffer{common::Buffer::New()};
         if (!buffer) throw std::bad_alloc();
         const size_t size = Consume(source,
             net::buffer(buffer->Tail().data(), buffer->Available()));
         if (size == 0) co_return common::MultiBuffer{};
-        buffer->Produce(static_cast<uint32_t>(size));
+        buffer->Produce(size);
         co_return common::MultiBuffer{std::move(buffer)};
     }
 };

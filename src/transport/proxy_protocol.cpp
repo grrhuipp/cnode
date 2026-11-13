@@ -4,7 +4,6 @@
 #include "common/ip_address.hpp"
 
 #include <algorithm>
-#include <array>
 #include <charconv>
 #include <cstring>
 #include <optional>

@@ -135,7 +135,6 @@
       ]
     },
     "streamSettings": {
-      "network": "tcp",
       "security": "tls",
       "tlsSettings": {
         "serverName": "example.com",

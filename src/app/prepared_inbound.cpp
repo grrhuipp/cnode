@@ -49,7 +49,13 @@ PreparedInbound PrepareInbound(const infra::InboundSpec& spec) {
     transport::TransportSecurity::Prepare(stream_settings, transport::StreamEndpointRole::Inbound);
     // XHTTP 会话命名空间按入站 tag 隔离，配置准备期一次推导，Worker 只读。
     if (stream_settings.IsXHttp()) {
-        stream_settings.xhttp.session_namespace.insert(0, spec.tag + std::string(1, '\0'));
+        auto& ns = stream_settings.xhttp.session_namespace;
+        std::string prefixed;
+        prefixed.reserve(spec.tag.size() + 1 + ns.size());
+        prefixed.append(spec.tag);
+        prefixed.push_back('\0');
+        prefixed.append(ns);
+        ns = std::move(prefixed);
     }
 
     return PreparedInbound{

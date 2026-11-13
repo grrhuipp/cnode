@@ -184,16 +184,12 @@ public:
     }
 
 private:
-    net::awaitable<void> WriteFirstEncodedChunks(
-        transport::AsyncStream& stream,
-        common::MultiBuffer chunks,
-        std::span<const uint8_t> first_header,
-        bool& header_sent);
-    // By value: an owned MultiBuffer stays in this frame until encoding consumes it.
-    template <typename Payload>
+    // By value when owned: an owned MultiBuffer stays in this frame until encoding consumes it.
     net::awaitable<void> WriteEncoded(
         transport::AsyncStream& stream,
-        Payload payload,
+        std::span<const net::const_buffer> borrowed,
+        common::MultiBuffer owned,
+        bool is_multi_buffer,
         const char* cancel_what,
         std::span<const uint8_t> first_header,
         bool* header_sent,

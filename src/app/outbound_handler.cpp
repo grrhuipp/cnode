@@ -1,5 +1,4 @@
 #include "app/outbound_handler.hpp"
-#include "app/relay.hpp"
 
 #include "app/dns.hpp"
 #include "common/allocator.hpp"

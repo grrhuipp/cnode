@@ -623,7 +623,7 @@ ParseJsonString(const object& source, std::string_view key) {
     if (!raw->is_string()) {
         return tl::unexpected(std::format("{} must be a string", key));
     }
-    return std::optional<std::string>{std::string(raw->as_string())};
+    return std::optional<std::string>{raw->as_string()};
 }
 
 tl::expected<std::optional<std::vector<std::string>>, std::string>

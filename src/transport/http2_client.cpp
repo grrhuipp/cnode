@@ -62,16 +62,9 @@ public:
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
         if (payload_codec_ == H2PayloadCodec::RawData) {
-            co_await SendData(buffers);
-            co_return;
+            return SendData(buffers);
         }
-        for (const auto& buffer : buffers) {
-            if (buffer.size() == 0) {
-                continue;
-            }
-            const auto* data = static_cast<const uint8_t*>(buffer.data());
-            co_await SendGrpcHunkMessage(std::span<const uint8_t>(data, buffer.size()));
-        }
+        return WriteGrpcBuffers(buffers);
     }
 
     void ShutdownRead() override {
@@ -153,45 +146,57 @@ protected:
 
 private:
     friend struct H2InboundPayload;
-    // DATA payload taken off the wire; [offset, end) is body, and the whole
-    // payload (padding included) is the flow-controlled length (6.1).
+    // DATA payload taken off the wire; payload->Bytes() is body, and flow_bytes
+    // (padding included) is the flow-controlled length (6.1).
     struct QueuedDataFrame {
-        std::vector<uint8_t> payload;
-        size_t offset = 0;
-        size_t end = 0;
+        common::BufferGuard payload;
         uint32_t flow_bytes = 0;
     };
 
+    net::awaitable<void> WriteGrpcBuffers(
+        std::span<const net::const_buffer> buffers) {
+        for (const auto& buffer : buffers) {
+            if (buffer.size() == 0) {
+                continue;
+            }
+            const auto* data = static_cast<const uint8_t*>(buffer.data());
+            co_await SendGrpcHunkMessage(std::span<const uint8_t>(data, buffer.size()));
+        }
+    }
+
     void ReleaseDataFrame() noexcept {
-        std::vector<uint8_t>{}.swap(data_frame_);
-        data_offset_ = 0;
-        data_end_ = 0;
+        data_frame_.reset();
     }
 
     [[nodiscard]] size_t ConsumeRaw(net::mutable_buffer buffer) noexcept {
-        const size_t size = std::min(buffer.size(), data_end_ - data_offset_);
-        std::memcpy(buffer.data(), data_frame_.data() + data_offset_, size);
-        data_offset_ += size;
-        if (data_offset_ >= data_end_) ReleaseDataFrame();
+        const size_t size = std::min(buffer.size(), data_frame_->Len());
+        std::memcpy(buffer.data(), data_frame_->Bytes().data(), size);
+        data_frame_->Advance(size);
+        if (data_frame_->IsEmpty()) ReleaseDataFrame();
         return size;
     }
 
+    [[nodiscard]] common::MultiBuffer ConsumeRawMultiBuffer() noexcept {
+        return common::MultiBuffer{std::move(data_frame_)};
+    }
+
     net::awaitable<bool> WaitForDataFrame() {
-        while (data_offset_ >= data_end_) {
+        while (!data_frame_ || data_frame_->IsEmpty()) {
             ReleaseDataFrame();
             if (!co_await TakeReceivedData()) co_return false;
         }
         co_return true;
     }
 
-    [[nodiscard]] bool RawReady() const noexcept { return data_offset_ < data_end_; }
+    [[nodiscard]] bool RawReady() const noexcept {
+        return data_frame_ && !data_frame_->IsEmpty();
+    }
     [[nodiscard]] std::span<const uint8_t> HunkInput() const noexcept {
-        return std::span<const uint8_t>(data_frame_).subspan(
-            data_offset_, data_end_ - data_offset_);
+        return data_frame_->Bytes();
     }
     void ConsumeHunkInput(size_t, size_t consumed) noexcept {
-        data_offset_ += consumed;
-        if (data_offset_ >= data_end_) ReleaseDataFrame();
+        data_frame_->Advance(consumed);
+        if (data_frame_->IsEmpty()) ReleaseDataFrame();
     }
     void HunkFailure() noexcept { CloseAbortive(); }
     void ReleaseHunkStorage() noexcept { inbound_.decoder.Clear(); }
@@ -278,8 +283,6 @@ private:
         auto& front = received_.front();
         const uint32_t credit = front.flow_bytes;
         data_frame_ = std::move(front.payload);
-        data_offset_ = front.offset;
-        data_end_ = front.end;
         received_.pop_front();
 
         if (credit != 0) {
@@ -593,19 +596,28 @@ private:
             }
             co_return;
         }
-        if (!frame.heap_payload.empty()) {
-            const size_t offset = static_cast<size_t>(data.data() - frame.heap_payload.data());
+        if (frame.buffer_payload) {
+            const size_t offset = static_cast<size_t>(
+                data.data() - frame.buffer_payload->data);
+            frame.buffer_payload->start = offset;
+            frame.buffer_payload->end = offset + data.size();
             received_.push_back(QueuedDataFrame{
-                .payload = std::move(frame.heap_payload),
-                .offset = offset,
-                .end = offset + data.size(),
+                .payload = std::move(frame.buffer_payload),
                 .flow_bytes = static_cast<uint32_t>(flow_len),
             });
+        } else if (!received_.empty() &&
+                   data.size() <= received_.back().payload->Available()) {
+            auto& tail = received_.back();
+            std::memcpy(tail.payload->Tail().data(), data.data(), data.size());
+            tail.payload->Produce(data.size());
+            tail.flow_bytes += static_cast<uint32_t>(flow_len);
         } else {
+            common::BufferGuard buf{common::Buffer::New()};
+            if (!buf) throw std::bad_alloc();
+            std::memcpy(buf->data, data.data(), data.size());
+            buf->Produce(data.size());
             received_.push_back(QueuedDataFrame{
-                .payload = std::vector<uint8_t>(data.begin(), data.end()),
-                .offset = 0,
-                .end = data.size(),
+                .payload = std::move(buf),
                 .flow_bytes = static_cast<uint32_t>(flow_len),
             });
         }
@@ -712,10 +724,8 @@ private:
     HpackDecoder response_decoder_;
     // Received DATA the reader has not taken yet.
     common::RingDeque<QueuedDataFrame> received_;
-    // Current DATA frame payload; [data_offset_, data_end_) is unread body.
-    std::vector<uint8_t> data_frame_;
-    size_t data_offset_ = 0;
-    size_t data_end_ = 0;
+    // Current DATA frame payload; data_frame_->Bytes() is unread body.
+    common::BufferGuard data_frame_;
     H2SendWindow conn_send_window_;
     H2SendWindow stream_send_window_;
     uint32_t peer_initial_window_ = H2SendWindow::kDefault;

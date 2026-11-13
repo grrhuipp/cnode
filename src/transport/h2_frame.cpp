@@ -48,21 +48,32 @@ net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream) {
                 }
                 frame.inline_size = static_cast<uint8_t>(length);
             } else {
+                frame.buffer_payload.reset(common::Buffer::New());
+                if (!frame.buffer_payload) {
+                    throw std::bad_alloc();
+                }
                 size_t filled = 0;
                 while (filled < length) {
-                    if (filled == frame.heap_payload.size()) {
-                        const size_t next_size = std::min<size_t>(
-                            length,
-                            std::max<size_t>(1024, frame.heap_payload.size() * 2));
-                        frame.heap_payload.resize(next_size);
+                    if (filled == frame.buffer_payload->capacity) {
+                        const size_t next_cap = std::min<size_t>(
+                            length, frame.buffer_payload->capacity * 2);
+                        common::BufferGuard grown{common::Buffer::New(next_cap)};
+                        if (!grown) {
+                            throw std::bad_alloc();
+                        }
+                        std::memcpy(grown->data, frame.buffer_payload->data, filled);
+                        grown->Produce(filled);
+                        frame.buffer_payload = std::move(grown);
                     }
+                    const size_t want = std::min<size_t>(
+                        length - filled, frame.buffer_payload->Available());
                     const size_t n = co_await stream.AsyncRead(
-                        net::buffer(frame.heap_payload.data() + filled,
-                                    frame.heap_payload.size() - filled));
+                        net::buffer(frame.buffer_payload->Tail().data(), want));
                     if (n == 0) {
                         throw IoSystemError(
                             io_error::connection_reset, "truncated HTTP/2 frame payload");
                     }
+                    frame.buffer_payload->Produce(n);
                     filled += n;
                 }
             }

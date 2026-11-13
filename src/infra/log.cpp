@@ -270,7 +270,7 @@ std::string FormatConsoleRecord(int64_t timestamp_us,
                                 std::string_view message,
                                 const PanelLogContext* panel = nullptr) {
     std::string line;
-    line.reserve(64 + message.size() + (panel ? 64 : 0));
+    line.reserve(65 + message.size() + (panel ? 64 : 0));
     line.append("time=\"");
     AppendConsoleTimestamp(line, timestamp_us);
     line.append("\" level=");
@@ -985,7 +985,7 @@ public:
     }
 
 private:
-    std::vector<DailyLogSpec> DailySpecs() const {
+    std::array<DailyLogSpec, 2> DailySpecs() const {
         return {
             MakeDailySpec(
                 log_dir_, error_target_.configured_path, error_target_.fallback_prefix),
@@ -1479,6 +1479,9 @@ void Log::WriteConnection(LogLevel level,
                           uint64_t conn_id,
                           std::string message,
                           std::source_location location) {
+    if (!ShouldLog(level) || !initialized_.load(std::memory_order_acquire)) {
+        return;
+    }
     ConnectionLogContext log_context;
     log_context.conn_id = conn_id;
     WriteConnection(level, std::move(log_context), std::move(message), location);
@@ -1488,6 +1491,9 @@ void Log::WriteConnection(LogLevel level,
                           const common::Context& ctx,
                           std::string message,
                           std::source_location location) {
+    if (!ShouldLog(level) || !initialized_.load(std::memory_order_acquire)) {
+        return;
+    }
     ConnectionLogContext log_context;
     log_context.conn_id = ctx.conn_id;
     log_context.inbound_tag = std::string(ctx.inbound.tag);

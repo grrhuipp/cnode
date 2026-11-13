@@ -239,31 +239,15 @@ size_t BodyEncoder::EncodeEndTo(std::span<uint8_t, 128> out) {
     }
 }
 
-net::awaitable<void> BodyEncoder::WriteFirstEncodedChunks(
-    transport::AsyncStream& stream,
-    common::MultiBuffer chunks,
-    std::span<const uint8_t> first_header,
-    bool& header_sent) {
-    header_sent = true;
-    std::array<net::const_buffer, 2> framed;
-    size_t count = 0;
-    if (!first_header.empty()) framed[count++] = net::buffer(first_header.data(), first_header.size());
-    if (const auto bytes = chunks.FrontSpan(); !bytes.empty()) {
-        framed[count++] = net::buffer(bytes.data(), bytes.size());
-    }
-    co_await stream.WriteBuffers({framed.data(), count});
-    chunks.clear();
-}
-
-template <typename Payload>
 net::awaitable<void> BodyEncoder::WriteEncoded(
     transport::AsyncStream& stream,
-    Payload payload,
+    std::span<const net::const_buffer> borrowed,
+    common::MultiBuffer owned,
+    bool is_multi_buffer,
     const char* cancel_what,
     std::span<const uint8_t> first_header,
     bool* header_sent,
-    [[maybe_unused]] const common::TargetAddress* udp_target) {
-    constexpr bool kOwnsPayload = std::is_same_v<Payload, common::MultiBuffer>;
+    const common::TargetAddress* udp_target) {
     CheckWritable();
     if ((co_await net::this_coro::cancellation_state).cancelled() !=
         net::cancellation_type::none) {
@@ -271,21 +255,30 @@ net::awaitable<void> BodyEncoder::WriteEncoded(
     }
     bool frame_generated = false;
     try {
-        if constexpr (kOwnsPayload) {
-            if (udp_target && PacketMode()) {
-                ValidateFixedUdpDatagram(payload, *udp_target);
-            }
-        }
         common::MultiBuffer chunks;
-        Encode(payload, chunks);
-        if constexpr (kOwnsPayload) {
-            payload.clear();
+        if (is_multi_buffer) {
+            if (udp_target && PacketMode()) {
+                ValidateFixedUdpDatagram(owned, *udp_target);
+            }
+            Encode(owned, chunks);
+            owned.clear();
+        } else {
+            Encode(borrowed, chunks);
         }
         frame_generated = chunks.byte_size() != 0;
         if (frame_generated) {
             if (header_sent && !*header_sent) {
-                co_await WriteFirstEncodedChunks(
-                    stream, std::move(chunks), first_header, *header_sent);
+                *header_sent = true;
+                std::array<net::const_buffer, 2> framed;
+                size_t count = 0;
+                if (!first_header.empty()) {
+                    framed[count++] = net::buffer(first_header.data(), first_header.size());
+                }
+                if (const auto bytes = chunks.FrontSpan(); !bytes.empty()) {
+                    framed[count++] = net::buffer(bytes.data(), bytes.size());
+                }
+                co_await stream.WriteBuffers({framed.data(), count});
+                chunks.clear();
             } else {
                 co_await stream.WriteMultiBuffer(std::move(chunks));
             }
@@ -309,8 +302,8 @@ net::awaitable<void> BodyEncoder::WriteMultiBuffer(
     std::span<const uint8_t> first_header,
     bool* header_sent,
     const common::TargetAddress* udp_target) {
-    return WriteEncoded(stream, std::move(mb), cancel_what, first_header, header_sent,
-                        udp_target);
+    return WriteEncoded(
+        stream, {}, std::move(mb), true, cancel_what, first_header, header_sent, udp_target);
 }
 
 net::awaitable<void> BodyEncoder::WriteBuffers(
@@ -319,7 +312,8 @@ net::awaitable<void> BodyEncoder::WriteBuffers(
     const char* cancel_what,
     std::span<const uint8_t> first_header,
     bool* header_sent) {
-    return WriteEncoded(stream, buffers, cancel_what, first_header, header_sent, nullptr);
+    return WriteEncoded(
+        stream, buffers, {}, false, cancel_what, first_header, header_sent, nullptr);
 }
 net::awaitable<void> BodyEncoder::WriteEOF(
     transport::AsyncStream& stream,

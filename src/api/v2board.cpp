@@ -16,6 +16,7 @@
 #include <asio/cancel_after.hpp>
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstdint>
 #include <format>
 #include <stdexcept>
@@ -152,7 +153,7 @@ public:
         co_return common::MultiBuffer{std::move(buffer)};
     }
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        co_return co_await stream.async_write_some(buffer, net::use_awaitable);
+        return stream.async_write_some(buffer, net::use_awaitable);
     }
     void ShutdownRead() override {
         IoErrorCode ec;
@@ -418,7 +419,7 @@ APIClient::HttpExchange(HttpMethod method,
     request += config_.Key;
     request += " HTTP/1.1\r\nHost: ";
     request += host_header_;
-    request += "\r\nUser-Agent: acppnode/1.0\r\nAuthorization: Bearer ";
+    request += "\r\nUser-Agent: cnode/1.0\r\nAuthorization: Bearer ";
     request += config_.Key;
     request += "\r\nX-API-Key: ";
     request += config_.Key;
@@ -430,7 +431,10 @@ APIClient::HttpExchange(HttpMethod method,
     }
     if (method == HttpMethod::Post) {
         request += "Content-Type: application/json\r\nContent-Length: ";
-        request += std::to_string(body_text.size());
+        char len_buf[24];
+        auto [ptr, ec] = std::to_chars(len_buf, len_buf + sizeof(len_buf), body_text.size());
+        (void)ec;
+        request.append(len_buf, ptr);
         request += "\r\n";
     }
     request += "\r\n";
@@ -630,33 +634,68 @@ APIClient::ReportUserTraffic(const std::vector<UserTraffic>& data) {
     const int node_id = config_.NodeID;
 
     // V2Board UniProxy push 格式: {user_id: [upload, download], ...}
-    infra::object body;
+    struct AggregatedTraffic {
+        int64_t uid = 0;
+        int64_t up = 0;
+        int64_t down = 0;
+    };
+    std::vector<AggregatedTraffic> items;
+    items.reserve(data.size());
     for (const auto& t : data) {
         if (t.UID <= 0 || (t.Upload <= 0 && t.Download <= 0)) {
             continue;
         }
-        const int64_t up = std::max<int64_t>(0, t.Upload);
-        const int64_t down = std::max<int64_t>(0, t.Download);
-        auto& entry = body[std::to_string(t.UID)];
-        if (!entry.is_array()) {
-            entry = infra::array{up, down};
-            continue;
-        }
-        auto& pair = entry.as_array();
-        const int64_t prev_up = pair[0].as_int64();
-        const int64_t prev_down = pair[1].as_int64();
-        pair[0] = (up > INT64_MAX - prev_up) ? INT64_MAX : (prev_up + up);
-        pair[1] = (down > INT64_MAX - prev_down) ? INT64_MAX : (prev_down + down);
+        items.push_back(AggregatedTraffic{
+            .uid = t.UID,
+            .up = std::max<int64_t>(0, t.Upload),
+            .down = std::max<int64_t>(0, t.Download),
+        });
     }
-    const size_t reported_users = body.size();
+    std::sort(items.begin(), items.end(),
+              [](const AggregatedTraffic& a, const AggregatedTraffic& b) {
+                  return a.uid < b.uid;
+              });
+    size_t unique_count = 0;
+    for (const auto& item : items) {
+        if (unique_count > 0 && items[unique_count - 1].uid == item.uid) {
+            auto& prev = items[unique_count - 1];
+            prev.up = (item.up > INT64_MAX - prev.up) ? INT64_MAX : (prev.up + item.up);
+            prev.down = (item.down > INT64_MAX - prev.down) ? INT64_MAX : (prev.down + item.down);
+        } else {
+            items[unique_count++] = item;
+        }
+    }
+    items.resize(unique_count);
+    const size_t reported_users = items.size();
+
+    std::string body_json;
+    body_json.reserve(2 + items.size() * 32);
+    body_json.push_back('{');
+    char num_buf[24];
+    auto append_int = [&](int64_t val) {
+        auto [ptr, ec] = std::to_chars(num_buf, num_buf + sizeof(num_buf), val);
+        (void)ec;
+        body_json.append(num_buf, ptr);
+    };
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i != 0) body_json.push_back(',');
+        body_json.push_back('"');
+        append_int(items[i].uid);
+        body_json.append("\":[");
+        append_int(items[i].up);
+        body_json.push_back(',');
+        append_int(items[i].down);
+        body_json.push_back(']');
+    }
+    body_json.push_back('}');
+    std::vector<AggregatedTraffic>{}.swap(items);
 
     // 路径包含 node_id 和 node_type
     std::string path = std::format("/api/v1/server/UniProxy/push?node_id={}&node_type={}",
                                    node_id, ApiNodeType());
 
     auto resp = co_await HttpRequest(
-        HttpMethod::Post, std::move(path), infra::serialize(infra::value(std::move(body))), {});
-
+        HttpMethod::Post, std::move(path), std::move(body_json), {});
     if (resp.status != 200) {
         LOG_PANEL_WARN(log_context_, "Traffic API acceptance unknown: {}", FormatReportFailure(resp, config_.Key));
         co_return false;

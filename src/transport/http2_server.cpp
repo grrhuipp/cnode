@@ -69,30 +69,27 @@ bool Http2ServerSubStreamState::EnqueueData(
     // per tiny frame and exhausts storage before the advertised byte window.
     size_t coalesced = 0;
     if (!data_frames_.empty()) {
-        auto& tail = data_frames_.back();
-        if (size <= tail.payload.capacity() - tail.end) {
-            tail.payload.resize(tail.end + size);
-            std::memcpy(tail.payload.data() + tail.end, data.data(), size);
+        auto& tail = *data_frames_.back().payload;
+        if (size <= tail.capacity - tail.end) {
+            std::memcpy(tail.data + tail.end, data.data(), size);
             tail.end += size;
             queued_bytes_ += size;
             WakeInputReader();
             return true;
         }
-        coalesced = tail.payload.capacity() - tail.end;
+        coalesced = tail.capacity - tail.end;
     }
-    std::vector<uint8_t> frame_payload;
+    common::BufferGuard frame_payload;
     size_t offset = 0;
-    if (!frame.heap_payload.empty()) {
-        offset = static_cast<size_t>(data.data() - frame.heap_payload.data());
-        frame_payload = std::move(frame.heap_payload);
-        if (frame_payload.capacity() < common::Buffer::kSize) {
-            frame_payload.reserve(common::Buffer::kSize);
-        }
+    size_t storage = 0;
+    if (frame.buffer_payload) {
+        offset = static_cast<size_t>(data.data() - frame.buffer_payload->data);
+        storage = frame.buffer_payload->capacity;
     } else {
-        frame_payload.reserve(common::Buffer::kSize);
-        frame_payload.assign(data.begin(), data.end());
+        frame_payload.reset(common::Buffer::New());
+        if (!frame_payload) throw std::bad_alloc();
+        storage = frame_payload->capacity;
     }
-    const size_t storage = frame_payload.capacity();
     if (storage > kHttp2MaxQueuedStreamStorage - queued_storage_ ||
         !session.ReserveReceiveMemory(storage)) return false;
     const auto upload_budget = upload_budget_.lock();
@@ -100,12 +97,17 @@ bool Http2ServerSubStreamState::EnqueueData(
         session.ReleaseReceiveMemory(storage);
         return false;
     }
+    if (frame.buffer_payload) {
+        frame_payload = std::move(frame.buffer_payload);
+        frame_payload->start = offset;
+        frame_payload->end = offset + size;
+    } else {
+        std::memcpy(frame_payload->data, data.data(), size);
+        frame_payload->start = 0;
+        frame_payload->end = size;
+    }
     try {
-        data_frames_.push_back(QueuedDataFrame{
-            .payload = std::move(frame_payload),
-            .offset = offset,
-            .end = offset + size,
-        });
+        data_frames_.push_back(QueuedDataFrame{std::move(frame_payload)});
     } catch (...) {
         session.ReleaseReceiveMemory(storage);
         if (upload_budget) upload_budget->Release(storage);
@@ -114,17 +116,13 @@ bool Http2ServerSubStreamState::EnqueueData(
     if (coalesced != 0) {
         // Do not modify the old tail until the new allocation and deque entry
         // are committed: rejection must leave every input byte unqueued.
-        auto& tail = data_frames_[data_frames_.size() - 2];
-        auto& added = data_frames_.back();
-        tail.payload.resize(tail.end + coalesced);
-        std::memcpy(tail.payload.data() + tail.end,
-                    added.payload.data() + offset, coalesced);
+        auto& tail = *data_frames_[data_frames_.size() - 2].payload;
+        auto& added = *data_frames_.back().payload;
+        std::memcpy(tail.data + tail.end, added.data + added.start, coalesced);
         tail.end += coalesced;
         const size_t remaining = size - coalesced;
-        std::memmove(added.payload.data(),
-                     added.payload.data() + offset + coalesced, remaining);
-        added.payload.resize(remaining);
-        added.offset = 0;
+        std::memmove(added.data, added.data + added.start + coalesced, remaining);
+        added.start = 0;
         added.end = remaining;
     }
     if (upload_budget) upload_reserved_ += storage;
@@ -314,7 +312,7 @@ net::awaitable<void> Http2ServerSubStreamState::AsyncShutdownWrite() {
 
 void Http2ServerSubStreamState::PopFrontDataFrame(Http2ServerSession* session) noexcept {
     const auto& front = data_frames_.front();
-    const size_t storage = front.payload.capacity();
+    const size_t storage = front.payload->capacity;
     queued_storage_ -= storage;
     if (session) session->ReleaseReceiveMemory(storage);
     if (upload_reserved_ != 0) {
@@ -324,7 +322,6 @@ void Http2ServerSubStreamState::PopFrontDataFrame(Http2ServerSession* session) n
         upload_reserved_ -= std::min(upload_reserved_, storage);
     }
     data_frames_.pop_front();
-    read_offset_ = 0;
 }
 
 void Http2ServerSubStreamState::DropQueuedData() noexcept {
@@ -337,7 +334,6 @@ void Http2ServerSubStreamState::DropQueuedData() noexcept {
     }
     upload_budget_.reset();
     data_frames_.clear();
-    read_offset_ = 0;
     const auto session = LockSession();
     ReleaseDecoderStorage(session.get());
     if (session) {
@@ -357,11 +353,7 @@ void Http2ServerSubStreamState::ReleaseDecoderStorage(Http2ServerSession* sessio
 
 bool Http2ServerSubStreamState::FrontDataReady() noexcept {
     while (!data_frames_.empty()) {
-        const auto& front = data_frames_.front();
-        if (read_offset_ < front.offset) {
-            read_offset_ = front.offset;
-        }
-        if (read_offset_ < front.end) {
+        if (!data_frames_.front().payload->IsEmpty()) {
             return true;
         }
         PopFrontDataFrame(LockSession().get());
@@ -392,8 +384,7 @@ net::awaitable<bool> Http2ServerSubStreamState::WaitForDataFrame() {
 
 std::span<const uint8_t> Http2ServerSubStreamState::HunkInput() {
     const auto& front = data_frames_.front();
-    auto bytes = std::span<const uint8_t>(front.payload).subspan(
-        read_offset_, front.end - read_offset_);
+    auto bytes = front.payload->Bytes();
     bytes = bytes.first(std::min(bytes.size(), inbound_.decoder.NextFeedLimit()));
     // 解码器增长与帧队列使用同一连接预算；在实际 Feed 分配前计入保守上界。
     const size_t reserve = 2 * bytes.size() + (decoder_reserved_ == 0 ? 256 : 0);
@@ -413,8 +404,8 @@ void Http2ServerSubStreamState::ConsumeHunkInput(
     const size_t unused = 2 * (offered - consumed);
     session->ReleaseReceiveMemory(unused);
     decoder_reserved_ -= unused;
-    read_offset_ += consumed;
-    if (read_offset_ == data_frames_.front().end) PopFrontDataFrame(session.get());
+    data_frames_.front().payload->Advance(consumed);
+    if (data_frames_.front().payload->IsEmpty()) PopFrontDataFrame(session.get());
     if (inbound_.decoder.Payload().empty() && inbound_.decoder.AtMessageBoundary())
         ReleaseDecoderStorage(session.get());
     ConsumeData(session.get(), consumed);
@@ -431,13 +422,32 @@ void Http2ServerSubStreamState::ReleaseHunkStorage() noexcept {
 
 size_t Http2ServerSubStreamState::ConsumeRaw(net::mutable_buffer buffer) noexcept {
     const auto session = LockSession();
-    const auto& front = data_frames_.front();
-    const size_t size = std::min(buffer.size(), front.end - read_offset_);
-    std::memcpy(buffer.data(), front.payload.data() + read_offset_, size);
-    read_offset_ += size;
-    if (read_offset_ == front.end) PopFrontDataFrame(session.get());
+    auto& front = *data_frames_.front().payload;
+    const size_t size = std::min(buffer.size(), front.Len());
+    std::memcpy(buffer.data(), front.Bytes().data(), size);
+    front.Advance(size);
+    if (front.IsEmpty()) PopFrontDataFrame(session.get());
     ConsumeData(session.get(), size);
     return size;
+}
+
+common::MultiBuffer Http2ServerSubStreamState::ConsumeRawMultiBuffer() noexcept {
+    const auto session = LockSession();
+    auto& front = data_frames_.front();
+    const size_t size = front.payload->Len();
+    const size_t storage = front.payload->capacity;
+    common::BufferGuard buffer = std::move(front.payload);
+    queued_storage_ -= storage;
+    if (session) session->ReleaseReceiveMemory(storage);
+    if (upload_reserved_ != 0) {
+        if (auto budget = upload_budget_.lock()) {
+            budget->Release(storage);
+        }
+        upload_reserved_ -= std::min(upload_reserved_, storage);
+    }
+    data_frames_.pop_front();
+    ConsumeData(session.get(), size);
+    return common::MultiBuffer{std::move(buffer)};
 }
 
 int Http2ServerSubStream::NativeHandle() const {

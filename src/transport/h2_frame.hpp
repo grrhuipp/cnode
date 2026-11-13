@@ -72,12 +72,12 @@ struct H2Frame {
     uint8_t inline_size = 0;
     uint32_t stream_id = 0;
     std::array<uint8_t, kInlinePayloadCapacity> inline_payload{};
-    std::vector<uint8_t> heap_payload;
+    common::BufferGuard buffer_payload;
 
     [[nodiscard]] std::span<const uint8_t> Payload() const noexcept {
-        return heap_payload.empty()
-            ? std::span<const uint8_t>(inline_payload.data(), inline_size)
-            : std::span<const uint8_t>(heap_payload);
+        return buffer_payload
+            ? buffer_payload->Bytes()
+            : std::span<const uint8_t>(inline_payload.data(), inline_size);
     }
 };
 

@@ -389,13 +389,10 @@ public:
     }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
-        if (!downlink_) {
-            co_return 0;
+        if (downlink_ && !ReaderMustSendDeferredUpload()) {
+            return downlink_->AsyncRead(buffer);
         }
-        if (ReaderMustSendDeferredUpload()) {
-            co_await FlushDeferredUploadForRead();
-        }
-        co_return co_await downlink_->AsyncRead(buffer);
+        return AsyncReadSlow(buffer);
     }
 
     net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
@@ -424,13 +421,10 @@ public:
     }
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
-        if (!downlink_) {
-            co_return common::MultiBuffer{};
+        if (downlink_ && !ReaderMustSendDeferredUpload()) {
+            return downlink_->ReadMultiBuffer();
         }
-        if (ReaderMustSendDeferredUpload()) {
-            co_await FlushDeferredUploadForRead();
-        }
-        co_return co_await downlink_->ReadMultiBuffer();
+        return ReadMultiBufferSlow();
     }
 
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
@@ -560,6 +554,26 @@ protected:
     }
 
 private:
+    net::awaitable<size_t> AsyncReadSlow(net::mutable_buffer buffer) {
+        if (!downlink_) {
+            co_return 0;
+        }
+        if (ReaderMustSendDeferredUpload()) {
+            co_await FlushDeferredUploadForRead();
+        }
+        co_return co_await downlink_->AsyncRead(buffer);
+    }
+
+    net::awaitable<common::MultiBuffer> ReadMultiBufferSlow() {
+        if (!downlink_) {
+            co_return common::MultiBuffer{};
+        }
+        if (ReaderMustSendDeferredUpload()) {
+            co_await FlushDeferredUploadForRead();
+        }
+        co_return co_await downlink_->ReadMultiBuffer();
+    }
+
     void CheckUploadWritableBeforeAcquire() const {
         // upload_failed_ is provisionally set while an open is in flight;
         // only a finished failed open poisons the stream.
@@ -711,10 +725,7 @@ public:
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
         CheckWritable();
-        if (!HasNonEmptyBuffer(buffers)) {
-            co_return;
-        }
-        co_await SendPacket(buffers);
+        return SendPacket(buffers);
     }
 
     void ShutdownWrite() override {
@@ -734,6 +745,9 @@ private:
     }
 
     net::awaitable<void> SendPacket(std::span<const net::const_buffer> payloads) {
+        if (!HasNonEmptyBuffer(payloads)) {
+            co_return;
+        }
         auto lease = upload_gate_.TryAcquire();
         if (!lease) lease = co_await upload_gate_.Acquire();
         if (!lease) {

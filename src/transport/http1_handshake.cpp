@@ -93,44 +93,10 @@ public:
     }
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
-        if (closed_ || read_closed_) {
-            co_return common::MultiBuffer{};
-        }
         if (content_remaining_) {
-            co_return co_await ReadContentLengthMultiBuffer();
+            return ReadContentLengthMultiBuffer();
         }
-        if (!read_chunked_) {
-            if (pending_.byte_size() != 0) {
-                ChargeBodyRead(pending_.byte_size());
-                co_return std::move(pending_);
-            }
-            auto payload = co_await inner_->ReadMultiBuffer();
-            ChargeBodyRead(payload.byte_size());
-            co_return payload;
-        }
-        if (chunk_remaining_ == 0 && !co_await EnsureChunkPayload()) {
-            co_return common::MultiBuffer{};
-        }
-        if (pending_.byte_size() == 0) {
-            pending_ = co_await inner_->ReadMultiBuffer();
-        }
-        if (pending_.byte_size() == 0) {
-            if (closed_ || read_closed_) co_return common::MultiBuffer{};
-            FailBodyRead("truncated HTTP/1 chunk payload");
-        }
-        if (pending_.byte_size() <= chunk_remaining_) {
-            ChargeBodyRead(pending_.byte_size());
-            chunk_remaining_ -= pending_.byte_size();
-            if (chunk_remaining_ == 0) chunk_terminator_pending_ = true;
-            co_return std::move(pending_);
-        }
-        const size_t n = std::min(pending_.byte_size(), chunk_remaining_);
-        common::MultiBuffer payload;
-        if (!pending_.MovePrefixTo(payload, n)) throw std::bad_alloc();
-        ChargeBodyRead(n);
-        chunk_remaining_ -= n;
-        if (chunk_remaining_ == 0) chunk_terminator_pending_ = true;
-        co_return payload;
+        return ReadFramedOrUntilCloseMultiBuffer();
     }
 
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
@@ -262,6 +228,44 @@ protected:
     }
 
 private:
+    net::awaitable<common::MultiBuffer> ReadFramedOrUntilCloseMultiBuffer() {
+        if (closed_ || read_closed_) {
+            co_return common::MultiBuffer{};
+        }
+        if (!read_chunked_) {
+            if (pending_.byte_size() != 0) {
+                ChargeBodyRead(pending_.byte_size());
+                co_return std::move(pending_);
+            }
+            auto payload = co_await inner_->ReadMultiBuffer();
+            ChargeBodyRead(payload.byte_size());
+            co_return payload;
+        }
+        if (chunk_remaining_ == 0 && !co_await EnsureChunkPayload()) {
+            co_return common::MultiBuffer{};
+        }
+        if (pending_.byte_size() == 0) {
+            pending_ = co_await inner_->ReadMultiBuffer();
+        }
+        if (pending_.byte_size() == 0) {
+            if (closed_ || read_closed_) co_return common::MultiBuffer{};
+            FailBodyRead("truncated HTTP/1 chunk payload");
+        }
+        if (pending_.byte_size() <= chunk_remaining_) {
+            ChargeBodyRead(pending_.byte_size());
+            chunk_remaining_ -= pending_.byte_size();
+            if (chunk_remaining_ == 0) chunk_terminator_pending_ = true;
+            co_return std::move(pending_);
+        }
+        const size_t n = std::min(pending_.byte_size(), chunk_remaining_);
+        common::MultiBuffer payload;
+        if (!pending_.MovePrefixTo(payload, n)) throw std::bad_alloc();
+        ChargeBodyRead(n);
+        chunk_remaining_ -= n;
+        if (chunk_remaining_ == 0) chunk_terminator_pending_ = true;
+        co_return payload;
+    }
+
     void ChargeTrailerLine(size_t bytes) {
         if (bytes > max_trailer_bytes_ - trailer_bytes_)
             FailBodyRead("HTTP/1 chunk trailers exceed limit");

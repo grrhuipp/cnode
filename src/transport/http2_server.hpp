@@ -87,9 +87,7 @@ public:
 private:
     friend struct H2InboundPayload;
     struct QueuedDataFrame {
-        std::vector<uint8_t> payload;
-        size_t offset = 0;
-        size_t end = 0;
+        common::BufferGuard payload;
     };
 
     void WakeInputReader() noexcept {
@@ -100,6 +98,7 @@ private:
     net::awaitable<bool> WaitForDataFrame();
     [[nodiscard]] bool RawReady() noexcept { return !cancelled_ && FrontDataReady(); }
     [[nodiscard]] size_t ConsumeRaw(net::mutable_buffer) noexcept;
+    [[nodiscard]] common::MultiBuffer ConsumeRawMultiBuffer() noexcept;
     [[nodiscard]] std::span<const uint8_t> HunkInput();
     void ConsumeHunkInput(size_t offered, size_t consumed) noexcept;
     void HunkFailure() noexcept;
@@ -132,8 +131,6 @@ private:
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
     H2InboundPayload inbound_;
     common::RingDeque<QueuedDataFrame> data_frames_;
-    // Read position inside data_frames_.front().
-    size_t read_offset_ = 0;
     size_t queued_bytes_ = 0;
     size_t queued_storage_ = 0;
     size_t decoder_reserved_ = 0;
