@@ -589,27 +589,6 @@ constexpr std::string_view kSwitchingProtocolsResponse =
 constexpr std::string_view kSwitchingProtocolsFields =
     kSwitchingProtocolsResponse.substr(0, kSwitchingProtocolsResponse.size() - 2);
 
-// Reads the response head of a client handshake and requires `status_code`.
-// Read-ahead belongs to the established byte stream.
-net::awaitable<tl::expected<void, common::ErrorCode>> ReadClientResponse(
-    AsyncStream& stream,
-    std::string_view scope,
-    uint64_t conn_id,
-    std::string_view status_code) {
-    Http1MessageHead head;
-    if (auto read = co_await ReadHttp1MessageHead(stream, head); !read) {
-        LogHeadReadFailure(scope, conn_id, read.error());
-        co_return tl::unexpected(read.error());
-    }
-    const std::string_view status_line = ExtractStartLine(head.Text());
-    if (!HasStatusCode(status_line, status_code)) {
-        LOG_CONN_DEBUG(conn_id, "{} client request rejected", scope);
-        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-    MoveReadAhead(stream, head);
-    co_return tl::expected<void, common::ErrorCode>{};
-}
-
 }  // namespace
 
 net::awaitable<tl::expected<Http1ResponseHead, common::ErrorCode>>
@@ -1083,64 +1062,6 @@ std::string SanitizeHttpRequestLineForLog(const Http1RequestLine& line) {
     return out;
 }
 
-net::awaitable<bool> SendHttp1UpgradeRequest(
-    AsyncStream& stream,
-    std::string_view req_path,
-    std::string_view host,
-    const HttpHeaders* headers,
-    std::string_view ws_key) {
-    size_t reserve_size =
-        (ws_key.empty() ? 96 : 160) + req_path.size() + host.size() + ws_key.size();
-    if (headers) {
-        for (const auto& [key, value] : *headers) {
-            if (!key.empty() && !IsReservedUpgradeHeader(key)) {
-                reserve_size += key.size() + value.size() + 4;
-            }
-        }
-    }
-    Http1HeaderBuffer request;
-    request.reserve(reserve_size);
-    AppendRequestStart(request, "GET", req_path, host);
-    request.append("Upgrade: websocket\r\n");
-    request.append("Connection: Upgrade\r\n");
-    if (!ws_key.empty()) {
-        AppendHeaderLine(request, "Sec-WebSocket-Key", ws_key);
-        request.append("Sec-WebSocket-Version: 13\r\n");
-    }
-    if (headers) {
-        for (const auto& [key, value] : *headers) {
-            if (!key.empty() && !IsReservedUpgradeHeader(key)) {
-                AppendHeaderLine(request, key, value);
-            }
-        }
-    }
-    request.append("\r\n");
-    co_return co_await WriteFullToStream(stream, request.View());
-}
-
-net::awaitable<bool> SendHttp1ClientRequest(
-    AsyncStream& stream,
-    std::string_view method,
-    std::string_view req_path,
-    std::string_view host,
-    const HttpHeaders& headers) {
-    size_t reserve_size = 64 + method.size() + req_path.size() + host.size();
-    for (const auto& [key, value] : headers) {
-        if (!key.empty() && !common::EqualsAsciiCI(key, "Host")) {
-            reserve_size += key.size() + value.size() + 4;
-        }
-    }
-    Http1HeaderBuffer request;
-    request.reserve(reserve_size);
-    AppendRequestStart(request, method, req_path, host);
-    for (const auto& [key, value] : headers) {
-        if (!key.empty() && !common::EqualsAsciiCI(key, "Host")) {
-            AppendHeaderLine(request, key, value);
-        }
-    }
-    request.append("\r\n");
-    co_return co_await WriteFullToStream(stream, request.View());
-}
 
 net::awaitable<tl::expected<Http1Request, common::ErrorCode>> ReadHttp1Request(
     AsyncStream& stream,
@@ -1198,11 +1119,42 @@ ExecuteHttp1UpgradeClientHandshake(
     const HttpHeaders* headers,
     std::string_view ws_key) {
     const std::string_view req_path = EffectiveHttpPath(path);
-    if (!co_await SendHttp1UpgradeRequest(stream, req_path, host, headers, ws_key)) {
-        LOG_CONN_DEBUG(conn_id, "{} client failed to send upgrade request", scope);
-        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
+    {
+        size_t reserve_size =
+            (ws_key.empty() ? 96 : 160) + req_path.size() + host.size() + ws_key.size();
+        if (headers) {
+            for (const auto& [key, value] : *headers) {
+                if (!key.empty() && !IsReservedUpgradeHeader(key)) {
+                    reserve_size += key.size() + value.size() + 4;
+                }
+            }
+        }
+        Http1HeaderBuffer request;
+        request.reserve(reserve_size);
+        AppendRequestStart(request, "GET", req_path, host);
+        request.append("Upgrade: websocket\r\n");
+        request.append("Connection: Upgrade\r\n");
+        if (!ws_key.empty()) {
+            AppendHeaderLine(request, "Sec-WebSocket-Key", ws_key);
+            request.append("Sec-WebSocket-Version: 13\r\n");
+        }
+        if (headers) {
+            for (const auto& [key, value] : *headers) {
+                if (!key.empty() && !IsReservedUpgradeHeader(key)) {
+                    AppendHeaderLine(request, key, value);
+                }
+            }
+        }
+        request.append("\r\n");
+        const auto view = request.View();
+        const net::const_buffer buffer(view.data(), view.size());
+        try {
+            co_await stream.WriteBuffers(std::span<const net::const_buffer>{&buffer, 1});
+        } catch (...) {
+            LOG_CONN_DEBUG(conn_id, "{} client failed to send upgrade request", scope);
+            co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
+        }
     }
-
     Http1MessageHead head;
     if (auto read = co_await ReadHttp1MessageHead(stream, head); !read) {
         LogHeadReadFailure(scope, conn_id, read.error());
@@ -1341,13 +1293,43 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
     const std::string_view req_path = EffectiveHttpPath(cfg.path);
     const std::string_view method = cfg.method.empty()
         ? std::string_view("PUT") : std::string_view(cfg.method);
-    if (!co_await SendHttp1ClientRequest(*stream, method, req_path, host, cfg.headers)) {
-        LOG_CONN_DEBUG(conn_id, "HTTP client failed to send request");
-        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
+    {
+        size_t reserve_size = 64 + method.size() + req_path.size() + host.size();
+        for (const auto& [key, value] : cfg.headers) {
+            if (!key.empty() && !common::EqualsAsciiCI(key, "Host")) {
+                reserve_size += key.size() + value.size() + 4;
+            }
+        }
+        Http1HeaderBuffer request;
+        request.reserve(reserve_size);
+        AppendRequestStart(request, method, req_path, host);
+        for (const auto& [key, value] : cfg.headers) {
+            if (!key.empty() && !common::EqualsAsciiCI(key, "Host")) {
+                AppendHeaderLine(request, key, value);
+            }
+        }
+        request.append("\r\n");
+        const auto view = request.View();
+        const net::const_buffer buffer(view.data(), view.size());
+        try {
+            co_await stream->WriteBuffers(std::span<const net::const_buffer>{&buffer, 1});
+        } catch (...) {
+            LOG_CONN_DEBUG(conn_id, "HTTP client failed to send request");
+            co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
+        }
     }
-    if (auto response = co_await ReadClientResponse(*stream, "HTTP", conn_id, "200");
-        !response) {
-        co_return tl::unexpected(response.error());
+    {
+        Http1MessageHead head;
+        if (auto read = co_await ReadHttp1MessageHead(*stream, head); !read) {
+            LogHeadReadFailure("HTTP", conn_id, read.error());
+            co_return tl::unexpected(read.error());
+        }
+        const std::string_view status_line = ExtractStartLine(head.Text());
+        if (!HasStatusCode(status_line, "200")) {
+            LOG_CONN_DEBUG(conn_id, "HTTP client request rejected");
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+        MoveReadAhead(*stream, head);
     }
     LOG_CONN_DEBUG(conn_id, "HTTP client handshake completed (host={} path={})",
                    PublicHttpTargetForLog(host), PublicHttpTargetForLog(req_path));

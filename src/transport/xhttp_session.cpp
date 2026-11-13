@@ -430,7 +430,14 @@ net::awaitable<bool> SendXHttpResponseHeaders(
         AppendHeaderLine(response, "content-type", "text/event-stream");
     }
     response.append("\r\n");
-    co_return co_await WriteFullToStream(stream, response.View());
+    const auto view = response.View();
+    const net::const_buffer buffer(view.data(), view.size());
+    try {
+        co_await stream.WriteBuffers(std::span<const net::const_buffer>{&buffer, 1});
+    } catch (...) {
+        co_return false;
+    }
+    co_return true;
 }
 
 net::awaitable<bool> SendEmptyHttp1Response(AsyncStream& stream,
@@ -445,7 +452,14 @@ net::awaitable<bool> SendEmptyHttp1Response(AsyncStream& stream,
         response.append("Connection: close\r\n");
     }
     response.append("\r\n");
-    co_return co_await WriteFullToStream(stream, response.View());
+    const auto view = response.View();
+    const net::const_buffer buffer(view.data(), view.size());
+    try {
+        co_await stream.WriteBuffers(std::span<const net::const_buffer>{&buffer, 1});
+    } catch (...) {
+        co_return false;
+    }
+    co_return true;
 }
 
 // Consumes a Content-Length body nobody will use, keeping the connection in

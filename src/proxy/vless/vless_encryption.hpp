@@ -453,13 +453,6 @@ AcceptVlessEncryptionClientZeroRtt(
 // Runtime Handshake, Record I/O & 0-RTT Ticket Store
 // ============================================================================
 
-inline net::awaitable<void> WriteVlessBytes(
-    transport::MultiBufferWriter& writer,
-    std::span<const uint8_t> data) {
-    net::const_buffer buffer{data.data(), data.size()};
-    co_await writer.WriteBuffers(std::span<const net::const_buffer>{&buffer, 1});
-}
-
 // 记录层只报告首个认证响应前的拒绝，不借用握手凭据。
 // 宿主必须地址稳定，并比延迟读端活得更久；取消本身不构成拒绝。
 struct VlessEncryptionTicketRejection {

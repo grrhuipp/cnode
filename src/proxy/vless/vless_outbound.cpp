@@ -350,8 +350,9 @@ public:
         if (session_started_ && !end_sent_) {
             std::array<uint8_t, 6> write_frame{};
             const size_t header_len = common::EncodeEndTo(write_frame, session_id_);
-            co_await WriteVlessBytes(
-                writer_, std::span<const uint8_t>(write_frame.data(), header_len));
+            const net::const_buffer end_buf(write_frame.data(), header_len);
+            co_await writer_.WriteBuffers(
+                std::span<const net::const_buffer>{&end_buf, 1});
             end_sent_ = true;
         }
         co_await writer_.AsyncShutdownWrite();
@@ -475,8 +476,9 @@ DialAndSendPlainVlessHandshake(
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     try {
-        co_await WriteVlessBytes(
-            *stream, std::span<const uint8_t>(header_buf.data(), header_len));
+        const net::const_buffer header_buffer(header_buf.data(), header_len);
+        co_await stream->WriteBuffers(
+            std::span<const net::const_buffer>{&header_buffer, 1});
     } catch (...) {
         OPENSSL_cleanse(header_buf.data(), header_len);
         const common::ErrorCode classified = proxy::ClassifyOutboundHandshakeException(
@@ -565,8 +567,9 @@ SendVlessHandshake(
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     try {
-        co_await WriteVlessBytes(
-            *active_writer, std::span<const uint8_t>(header_buf.data(), header_len));
+        const net::const_buffer header_buffer(header_buf.data(), header_len);
+        co_await active_writer->WriteBuffers(
+            std::span<const net::const_buffer>{&header_buffer, 1});
     } catch (...) {
         OPENSSL_cleanse(header_buf.data(), header_len);
         const common::ErrorCode classified = proxy::ClassifyOutboundHandshakeException(

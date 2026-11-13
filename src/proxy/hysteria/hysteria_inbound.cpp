@@ -29,11 +29,7 @@ namespace {
 
 constexpr size_t kMaxRequestHeaderBytes = 8192;
 
-struct TcpRequest {
-    common::TargetAddress target;
-    // Request-stream bytes that followed the header in the same read.
-    common::MultiBuffer early_data;
-};
+
 
 [[nodiscard]] tl::expected<common::TargetAddress, transport::ProtocolError>
 ParseTcpRequest(transport::HysteriaVersion version, std::span<const uint8_t> header,
@@ -51,9 +47,13 @@ ParseTcpRequest(transport::HysteriaVersion version, std::span<const uint8_t> hea
     return std::move(request->target);
 }
 
-net::awaitable<tl::expected<TcpRequest, common::ErrorCode>>
-ReadTcpRequest(transport::AsyncStream& stream, transport::HysteriaVersion version, common::Context& ctx) {
+net::awaitable<tl::expected<common::InitialPayload, common::ErrorCode>>
+CompleteHysteriaTcpHandshake(
+    transport::AsyncStream& stream,
+    transport::HysteriaVersion version,
+    common::Context& ctx) {
     common::MultiBuffer received;
+    common::TargetAddress decoded_target;
     for (;;) {
         common::MultiBuffer chunk;
         try {
@@ -72,17 +72,14 @@ ReadTcpRequest(transport::AsyncStream& stream, transport::HysteriaVersion versio
         chunk.MoveTo(received, true);
 
         size_t header_bytes = 0;
-        tl::expected<common::TargetAddress, transport::ProtocolError> target =
-            tl::unexpected(transport::ProtocolError::Incomplete);
-        {
-            const size_t inspect_bytes =
-                std::min(received.byte_size(), kMaxRequestHeaderBytes);
-            target = ParseTcpRequest(
-                version, received.PrefixSpan(inspect_bytes), header_bytes);
-        }
+        const size_t inspect_bytes =
+            std::min(received.byte_size(), kMaxRequestHeaderBytes);
+        auto target = ParseTcpRequest(
+            version, received.PrefixSpan(inspect_bytes), header_bytes);
         if (target) {
             (void)received.DropPrefixBytes(header_bytes);
-            co_return TcpRequest{std::move(*target), std::move(received)};
+            decoded_target = std::move(*target);
+            break;
         }
         if (target.error() == transport::ProtocolError::Incomplete &&
             received.byte_size() < kMaxRequestHeaderBytes) {
@@ -93,6 +90,26 @@ ReadTcpRequest(transport::AsyncStream& stream, transport::HysteriaVersion versio
         LogInboundRequestRejected(ctx, reason);
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
+
+    static constexpr std::array<uint8_t, 7> kV1OkResponse{1, 0, 0, 0, 0, 0, 0};
+    static constexpr std::array<uint8_t, 3> kV2OkResponse{0, 0, 0};
+    const auto response = version == transport::HysteriaVersion::V1
+        ? std::span<const uint8_t>(kV1OkResponse)
+        : std::span<const uint8_t>(kV2OkResponse);
+    try {
+        const net::const_buffer response_buf(response.data(), response.size());
+        co_await stream.WriteBuffers({&response_buf, 1});
+    } catch (const transport::LinkError& error) {
+        co_return tl::unexpected(
+            ConsumeStreamWriteTimeout(stream) ? common::ErrorCode::TIMEOUT : error.code());
+    } catch (const IoSystemError& error) {
+        co_return tl::unexpected(ClassifyHandshakeWriteException(stream, error));
+    }
+
+    BindInboundRequestTarget(
+        ctx, InboundRequestTarget{common::Network::TCP, std::move(decoded_target)});
+    stream.ClearPhaseDeadline();
+    co_return common::InitialPayload(std::move(received));
 }
 
 }  // namespace
@@ -115,40 +132,31 @@ public:
         uint32_t /*pressure_idle_timeout*/) override {
         if (ctx.content.network == common::Network::UDP) {
             const transport::Link client{stream.get(), stream.get()};
-            co_return co_await dispatcher.Dispatch(
+            return dispatcher.Dispatch(
                 io_context, receiver.dispatch_policy, std::move(stream),
                 client, common::InitialPayload{},
                 ctx, stats_, timeouts);
         }
+        return ProcessTcp(
+            std::move(stream), dispatcher, receiver, io_context, ctx, timeouts);
+    }
 
+private:
+    net::awaitable<app::RelayResult> ProcessTcp(
+        std::unique_ptr<transport::AsyncStream> stream,
+        routing::Dispatcher& dispatcher,
+        const app::ReceiverSettings& receiver,
+        net::io_context& io_context,
+        common::Context& ctx,
+        const infra::TimeoutsConfig& timeouts) {
         common::InitialPayload initial_payload;
         {
-            auto request = co_await ReadTcpRequest(*stream, version_, ctx);
-            if (!request) {
-                co_return RejectInbound(stats_, stream.get(), request.error());
+            auto handshake = co_await CompleteHysteriaTcpHandshake(*stream, version_, ctx);
+            if (!handshake) {
+                co_return RejectInbound(stats_, stream.get(), handshake.error());
             }
-            static constexpr std::array<uint8_t, 7> kV1OkResponse{1, 0, 0, 0, 0, 0, 0};
-            static constexpr std::array<uint8_t, 3> kV2OkResponse{0, 0, 0};
-            const auto response = version_ == transport::HysteriaVersion::V1
-                ? std::span<const uint8_t>(kV1OkResponse)
-                : std::span<const uint8_t>(kV2OkResponse);
-            try {
-                co_await stream->AsyncWrite(net::buffer(response));
-            } catch (const transport::LinkError& error) {
-                co_return RejectInbound(
-                    stats_, stream.get(),
-                    (ConsumeStreamWriteTimeout(*stream) ? common::ErrorCode::TIMEOUT : error.code()));
-            } catch (const IoSystemError& error) {
-                co_return RejectInbound(
-                    stats_, stream.get(),
-                    ClassifyHandshakeWriteException(*stream, error));
-            }
-            BindInboundRequestTarget(
-                ctx, InboundRequestTarget{common::Network::TCP, std::move(request->target)});
-            initial_payload = common::InitialPayload(std::move(request->early_data));
+            initial_payload = std::move(*handshake);
         }
-        stream->ClearPhaseDeadline();
-
         auto* tcp_stream = stream.get();
         co_return co_await dispatcher.Dispatch(
             io_context, receiver.dispatch_policy, std::move(stream),
@@ -157,7 +165,6 @@ public:
             ctx, stats_, timeouts);
     }
 
-private:
     app::StatsShard& stats_;
     transport::HysteriaVersion version_;
 };

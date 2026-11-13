@@ -101,6 +101,7 @@ template <typename Key>
         blake3_hasher_update(&hasher, data.data(), data.size());
     }
     blake3_hasher_finalize(&hasher, out.data(), out.size());
+    OPENSSL_cleanse(&hasher, sizeof(hasher));
     return out;
 }
 
@@ -723,11 +724,21 @@ net::awaitable<tl::expected<void, VlessEncryptionHandshakeFailure>> ReadAndOpenP
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
-    std::vector<uint8_t> padding(*encrypted_body_length);
-    if (!co_await reader.ReadExact(padding.data(), padding.size())) {
-        co_return tl::unexpected(VlessEncryptionHandshakeFailure::Truncated);
+    const size_t total_len = *encrypted_body_length;
+    std::vector<uint8_t> padding;
+    padding.reserve(std::min<size_t>(total_len, common::Buffer::kSize));
+    size_t filled = 0;
+    while (filled < total_len) {
+        if (filled == padding.capacity()) {
+            padding.reserve(std::min(total_len, padding.capacity() * 2));
+        }
+        const size_t target = std::min(total_len, padding.capacity());
+        padding.resize(target);
+        if (!co_await reader.ReadExact(padding.data(), target, &filled)) {
+            co_return tl::unexpected(VlessEncryptionHandshakeFailure::Truncated);
+        }
     }
-    const size_t plain_size = padding.size() - kVlessEncryptionTagSize;
+    const size_t plain_size = total_len - kVlessEncryptionTagSize;
     const auto opened = aead.Open(
         padding, {}, std::span<uint8_t>(padding).first(plain_size));
     if (!opened || *opened != plain_size) {
@@ -1045,7 +1056,10 @@ net::awaitable<VlessEncryptionHandshakeResult> ResumeServerTicket(
             co_return tl::unexpected(runtime.error());
         }
         runtime->resumed_identity = identity;
-        co_await WriteVlessBytes(raw_writer, accept->server_random);
+        const net::const_buffer random_buf(
+            accept->server_random.data(), accept->server_random.size());
+        co_await raw_writer.WriteBuffers(
+            std::span<const net::const_buffer>{&random_buf, 1});
         co_return runtime;
 }
 
