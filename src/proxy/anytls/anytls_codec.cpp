@@ -2,6 +2,7 @@
 #include "proxy/handshake_errors.hpp"
 #include "proxy/anytls_padding.hpp"
 #include "common/byte_reader.hpp"
+#include "common/binary_text_codec.hpp"
 #include "common/const_buffer_span.hpp"
 #include "transport/async_stream.hpp"
 
@@ -329,7 +330,7 @@ WriteSlicesWithPadding(transport::AsyncStream& stream,
         co_return co_await write_span(buffers);
     }
 
-    static constexpr std::array<uint8_t, 4096> kZeroWaste{};
+    static constexpr std::array<uint8_t, 16384> kZeroWaste{};
     size_t buf_idx = 0;
     size_t buf_off = 0;
     auto append_data = [&](auto& out, size_t count) {
@@ -370,7 +371,7 @@ WriteSlicesWithPadding(transport::AsyncStream& stream,
         }
         // Compiled records are positive and every possible Waste fits uint16.
         const size_t size = static_cast<size_t>(sampled_size);
-        common::ConstBufferSpanBuilder<24> out;
+        common::ConstBufferSpanBuilder<8> out;
         std::array<uint8_t, kFrameHeaderSize> waste_header{};
         if (remaining >= size) {
             append_data(out, size);
@@ -598,12 +599,8 @@ std::optional<AnyTlsPaddingScheme> ParseAnyTlsPaddingScheme(std::string_view raw
     unsigned int size = 0;
     if (EVP_Digest(raw.data(), raw.size(), digest.data(), &size, EVP_md5(), nullptr) != 1)
         return std::nullopt;
-    static constexpr char kHex[] = "0123456789abcdef";
-    scheme.md5_.reserve(size * 2);
-    for (unsigned int index = 0; index < size; ++index) {
-        scheme.md5_.push_back(kHex[digest[index] >> 4]);
-        scheme.md5_.push_back(kHex[digest[index] & 0xf]);
-    }
+    scheme.md5_ = common::EncodeHexLower(
+        std::span<const uint8_t>(digest.data(), size));
     std::sort(scheme.records_.begin(), scheme.records_.end(),
         [](const AnyTlsPaddingScheme::PacketPadding& lhs, const AnyTlsPaddingScheme::PacketPadding& rhs) {
             return lhs.index < rhs.index;

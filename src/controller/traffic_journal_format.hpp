@@ -1,6 +1,7 @@
 #pragma once
 
 #include "infra/json.hpp"
+#include "common/binary_text_codec.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -36,14 +37,7 @@ struct ScopedFd {
 [[nodiscard]] inline std::string Sha256Hex(std::string_view raw) {
     std::array<unsigned char, SHA256_DIGEST_LENGTH> digest{};
     SHA256(reinterpret_cast<const unsigned char*>(raw.data()), raw.size(), digest.data());
-    constexpr char kHex[] = "0123456789abcdef";
-    std::string result;
-    result.reserve(digest.size() * 2);
-    for (const unsigned char byte : digest) {
-        result.push_back(kHex[byte >> 4]);
-        result.push_back(kHex[byte & 0x0f]);
-    }
-    return result;
+    return common::EncodeHexLower(digest);
 }
 
 // 单条记录与目录内全部 ready/unknown 记录的字节上限，以及记录条数上限。

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 
 // RFC 4648 §8 / RFC 5234 HEXDIG digit value, accepting both letter cases;
@@ -94,6 +95,22 @@ ParseUuid(std::string_view text) noexcept {
     if (nibble_index != 32) {
         return std::nullopt;
     }
+    return out;
+}
+
+// Encodes bytes into lowercase RFC 4648 §8 Base16; dst must hold at least
+// src.size() * 2 chars.
+constexpr void EncodeHexLowerTo(std::span<const uint8_t> src, std::span<char> dst) noexcept {
+    constexpr char kHex[] = "0123456789abcdef";
+    for (size_t i = 0; i < src.size(); ++i) {
+        dst[2 * i] = kHex[src[i] >> 4];
+        dst[2 * i + 1] = kHex[src[i] & 0x0f];
+    }
+}
+
+[[nodiscard]] inline std::string EncodeHexLower(std::span<const uint8_t> src) {
+    std::string out(src.size() * 2, '\0');
+    EncodeHexLowerTo(src, out);
     return out;
 }
 

@@ -115,6 +115,11 @@ struct UdpTargetText {
 [[nodiscard]] tl::expected<size_t, ProtocolError>
 UdpTargetHeaderSize(HysteriaVersion version, const UdpTargetText& text);
 
+// 将单片头部编码进 |out|（长度须 >= UdpTargetHeaderSize），返回写入头长。
+[[nodiscard]] tl::expected<size_t, ProtocolError> EncodeUdpFragmentHeader(
+    HysteriaVersion version, const HysteriaUdpMessage& message, const UdpTargetText& text,
+    std::span<uint8_t> out) noexcept;
+
 // 以预格式化目标编码一片；|message.target| 不读，分片号与载荷上限由调用方
 // 按 |header_size|（UdpTargetHeaderSize 的结果）预先约束。
 [[nodiscard]] tl::expected<std::vector<uint8_t>, ProtocolError> EncodeUdpFragment(

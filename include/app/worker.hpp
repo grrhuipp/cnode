@@ -5,12 +5,10 @@
 #include "app/outbound_handler.hpp"
 #include "infra/config_types.hpp"
 #include "common/asio_types.hpp"
-#include "transport/timeout_scheduler.hpp"
 #include <cstdint>
 #include <atomic>
 #include <exception>
 #include <memory>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -19,7 +17,6 @@
 namespace geo {
 class GeoDatabase;
 }
-#include "app/stats.hpp"
 namespace common {
 
 struct OnlineDevice;

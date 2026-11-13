@@ -1475,6 +1475,56 @@ void HysteriaConnection::DeliverUdpPacket(
         [payload](common::MultiBuffer& packet) { return packet.AppendSpan(payload); });
 }
 
+bool HysteriaConnection::TrySendImmediateDatagram(
+    std::span<const uint8_t> header, std::span<const uint8_t> payload) {
+    if (!core_ || closed_ || in_ngtcp2_callback_) return false;
+    in_ngtcp2_callback_ = true;
+    struct RefreshExpiry {
+        HysteriaConnection& connection;
+        ~RefreshExpiry() {
+            if (connection.core_ && connection.core_->quic) {
+                ngtcp2_conn_update_pkt_tx_time(connection.core_->quic, Timestamp());
+            }
+            connection.in_ngtcp2_callback_ = false;
+            connection.PublishExpiry();
+        }
+    } refresh{*this};
+    auto local = MakeAddress(core_->local);
+    auto remote = MakeAddress(core_->remote);
+    ngtcp2_path_storage write_path{};
+    ngtcp2_path_storage_init(
+        &write_path, local.addr, local.addrlen, remote.addr, remote.addrlen,
+        &core_->path_binding);
+    ngtcp2_pkt_info packet_info{};
+    std::array<uint8_t, NGTCP2_MAX_UDP_PAYLOAD_SIZE> packet;
+    std::array<ngtcp2_vec, 2> vectors{{
+        {const_cast<uint8_t*>(header.data()), header.size()},
+        {const_cast<uint8_t*>(payload.data()), payload.size()},
+    }};
+    const size_t vec_count = payload.empty() ? 1 : 2;
+    int accepted_datagram = 0;
+    const auto written = ngtcp2_conn_writev_datagram(
+        core_->quic, &write_path.path, &packet_info, packet.data(), packet.size(),
+        &accepted_datagram, NGTCP2_WRITE_DATAGRAM_FLAG_NONE, 0,
+        vectors.data(), vec_count, Timestamp());
+    if (written < 0) {
+        if (written != NGTCP2_ERR_INVALID_STATE) Close();
+        return written != NGTCP2_ERR_INVALID_STATE;
+    }
+    if (written > 0) {
+        auto* output_socket = OutputSocket(write_path.path);
+        auto output_remote = EndpointFromAddress(write_path.path.remote);
+        if (!output_socket || !output_remote ||
+            !listener_->Queue(*output_socket,
+                std::span<const uint8_t>(packet.data(), static_cast<size_t>(written)),
+                *output_remote, *this)) {
+            Close();
+            return true;
+        }
+    }
+    return accepted_datagram != 0;
+}
+
 bool HysteriaConnection::SendUdpMessage(
     uint32_t session_id, const common::TargetAddress& target,
     std::span<const uint8_t> payload) {
@@ -1512,6 +1562,32 @@ bool HysteriaConnection::SendUdpMessage(
     };
     // The first fragment always carries the target.
     if (text->host.empty()) return false;
+    if (fragments == 1 && core_->datagrams.empty()) {
+        message.fragment_id = 0;
+        message.payload = payload;
+        std::array<uint8_t, kMaxUdpMessageSize> header_buf{};
+        const auto hdr_len = EncodeUdpFragmentHeader(
+            version, message, *text,
+            std::span<uint8_t>(header_buf.data(), *header_size));
+        if (!hdr_len) return false;
+        const std::span<const uint8_t> header_span(header_buf.data(), *hdr_len);
+        if (TrySendImmediateDatagram(header_span, payload)) {
+            if (!closed_ &&
+                (core_->http || core_->next_output_stream >= 0 || !core_->datagrams.empty())) {
+                Flush();
+            }
+            return true;
+        }
+        if (closed_) return true;
+        std::vector<uint8_t> queued(*hdr_len + payload.size());
+        std::memcpy(queued.data(), header_span.data(), header_span.size());
+        if (!payload.empty()) {
+            std::memcpy(queued.data() + *hdr_len, payload.data(), payload.size());
+        }
+        core_->datagrams.push_back(std::move(queued));
+        Flush();
+        return true;
+    }
     try {
         for (size_t index = 0; index < fragments; ++index) {
             const size_t offset = index * fragment_payload;

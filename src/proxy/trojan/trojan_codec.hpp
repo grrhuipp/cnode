@@ -8,6 +8,7 @@
 
 #include "proxy/outbound_endpoint_base.hpp"
 #include "common/address_codec.hpp"
+#include "common/binary_text_codec.hpp"
 #include "common/asio_types.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/target_address.hpp"
@@ -30,12 +31,8 @@ using TrojanPasswordHash = std::array<char, 56>;
     std::array<unsigned char, SHA224_DIGEST_LENGTH> digest{};
     SHA224(reinterpret_cast<const unsigned char*>(password.data()),
            password.size(), digest.data());
-    constexpr std::string_view hex = "0123456789abcdef";
     TrojanPasswordHash result{};
-    for (size_t i = 0; i < digest.size(); ++i) {
-        result[2 * i] = hex[digest[i] >> 4];
-        result[2 * i + 1] = hex[digest[i] & 0x0f];
-    }
+    common::EncodeHexLowerTo(digest, result);
     return result;
 }
 

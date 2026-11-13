@@ -170,7 +170,6 @@ public:
 
     [[nodiscard]] net::io_context& IoContext() const noexcept { return io_context_; }
 
-    [[nodiscard]] bool Passthrough() const noexcept { return sender_.passthrough; }
     [[nodiscard]] common::ForwardedMetadataView ForwardedMetadata(
         const common::Context& ctx) const noexcept;
     common::ForwardedMetadataView ForwardedMetadata(

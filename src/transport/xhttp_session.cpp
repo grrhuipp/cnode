@@ -500,26 +500,6 @@ net::awaitable<std::optional<common::MultiBuffer>> ReadXHttpPacketBody(
     co_return payload;
 }
 
-[[nodiscard]] std::string BuildXHttpReferer(std::string_view host,
-                                                          std::string_view path,
-                                                          bool tls) {
-    const std::string_view scheme = tls ? "https://" : "http://";
-    const std::string_view host_part = host.empty() ? "example.com" : host;
-    const std::string_view req_path = EffectiveHttpPath(path);
-    constexpr std::string_view kPaddingKey = "x_padding=";
-
-    std::string referer;
-    referer.reserve(scheme.size() + host_part.size() + req_path.size() + 1 +
-                    kPaddingKey.size() + kXHttpRefererPadding.size());
-    referer.append(scheme);
-    referer.append(host_part);
-    referer.append(req_path);
-    referer.push_back(req_path.find('?') == std::string_view::npos ? '?' : '&');
-    referer.append(kPaddingKey);
-    referer.append(kXHttpRefererPadding);
-    return referer;
-}
-
 // RFC 9112 9.3: an HTTP/1.1 request leaves its connection open unless it
 // carries the "close" option in any Connection field line (9.6); earlier
 // versions are not kept alive.
@@ -557,15 +537,19 @@ net::awaitable<std::optional<common::MultiBuffer>> ReadXHttpPacketBody(
 }
 
 [[nodiscard]] std::string BuildXHttp1ClientRequest(
-    const HttpConfig& cfg,
+    const HttpClientRequestView& req,
     std::string_view host,
     std::string_view content_length,
     bool chunked_upload) {
-    const std::string_view req_path = EffectiveHttpPath(cfg.path);
-    const std::string_view method = cfg.method.empty()
-        ? std::string_view("PUT") : std::string_view(cfg.method);
+    const std::string_view req_path = EffectiveHttpPath(req.path);
+    const std::string_view method = req.method.empty()
+        ? std::string_view("PUT") : req.method;
+    const size_t header_count =
+        (req.headers ? req.headers->size() : 0) +
+        (!req.default_content_type.empty() ? 1 : 0) +
+        (!req.default_referer.empty() ? 1 : 0);
     const size_t reserve_size = 224 + method.size() + req_path.size() + host.size() +
-                                content_length.size() + cfg.headers.size() * 32;
+                                content_length.size() + header_count * 32;
 
     std::string request;
     request.reserve(reserve_size);
@@ -578,12 +562,20 @@ net::awaitable<std::optional<common::MultiBuffer>> ReadXHttpPacketBody(
     } else if (!content_length.empty()) {
         AppendHeaderLine(request, "Content-Length", content_length);
     }
-    for (const auto& [key, value] : cfg.headers) {
-        if (key.empty() || IsBodyFramingOrHostHeader(key) ||
-            (chunked_upload && common::EqualsAsciiCI(key, "Connection"))) {
-            continue;
+    if (req.headers) {
+        for (const auto& [key, value] : *req.headers) {
+            if (key.empty() || IsBodyFramingOrHostHeader(key) ||
+                (chunked_upload && common::EqualsAsciiCI(key, "Connection"))) {
+                continue;
+            }
+            AppendHeaderLine(request, key, value);
         }
-        AppendHeaderLine(request, key, value);
+    }
+    if (!req.default_content_type.empty()) {
+        AppendHeaderLine(request, "content-type", req.default_content_type);
+    }
+    if (!req.default_referer.empty()) {
+        AppendHeaderLine(request, "referer", req.default_referer);
     }
     request.append("\r\n");
     return request;
@@ -1489,11 +1481,7 @@ std::unique_ptr<AsyncStream> MakeXHttpSplitStream(
         std::move(session), std::move(downlink));
 }
 
-HttpConfig XHttpStreamOneHttpConfig(const XHttpConfig& cfg, bool outbound) {
-    if (outbound) {
-        return XHttpClientHttpConfig(
-            cfg, cfg.normalized_path, "POST", true, XHttpClientRequestKind::StreamUp);
-    }
+HttpConfig XHttpStreamOneServerHttpConfig(const XHttpConfig& cfg) {
     HttpConfig http;
     http.path = cfg.normalized_path;
     http.host = cfg.host;
@@ -1505,27 +1493,63 @@ HttpConfig XHttpStreamOneHttpConfig(const XHttpConfig& cfg, bool outbound) {
     return http;
 }
 
-HttpConfig XHttpClientHttpConfig(const XHttpConfig& cfg,
-                                 std::string_view path,
-                                 std::string_view method,
-                                 bool tls,
-                                 XHttpClientRequestKind kind) {
-    HttpConfig http;
-    http.path.assign(path.data(), path.size());
-    http.host = cfg.host;
-    http.method.assign(method.data(), method.size());
-    http.headers = cfg.headers;
-    http.force_http2 = true;
+std::string_view XHttpRefererScratch::Format(
+    std::string_view host,
+    std::string_view path,
+    bool tls) {
+    const std::string_view scheme = tls ? "https://" : "http://";
+    const std::string_view host_part = host.empty() ? "example.com" : host;
+    const std::string_view req_path = EffectiveHttpPath(path);
+    constexpr std::string_view kPaddingKey = "x_padding=";
+    const char sep = req_path.find('?') == std::string_view::npos ? '?' : '&';
+    const size_t total = scheme.size() + host_part.size() + req_path.size() + 1 +
+                         kPaddingKey.size() + kXHttpRefererPadding.size();
+    char* dst = nullptr;
+    if (total <= inline_buf.size()) {
+        dst = inline_buf.data();
+    } else {
+        overflow.resize(total);
+        dst = overflow.data();
+    }
+    char* out = dst;
+    auto put = [&out](std::string_view s) noexcept {
+        std::memcpy(out, s.data(), s.size());
+        out += s.size();
+    };
+    put(scheme);
+    put(host_part);
+    put(req_path);
+    *out++ = sep;
+    put(kPaddingKey);
+    put(kXHttpRefererPadding);
+    return std::string_view(dst, total);
+}
+
+HttpClientRequestView MakeXHttpClientRequestView(
+    const XHttpConfig& cfg,
+    std::string_view path,
+    std::string_view method,
+    bool tls,
+    XHttpClientRequestKind kind,
+    XHttpRefererScratch& referer_scratch) {
+    HttpClientRequestView req{
+        .path = path,
+        .method = method,
+        .host = cfg.host,
+        .headers = &cfg.headers,
+        .initial_window_size = std::nullopt,
+        .default_content_type = {},
+        .default_referer = {},
+    };
     if (kind == XHttpClientRequestKind::StreamUp &&
         !cfg.no_grpc_header &&
-        !FindHttpHeader(http.headers, "Content-Type")) {
-        http.headers.emplace("content-type", "application/grpc");
+        !FindHttpHeader(cfg.headers, "Content-Type")) {
+        req.default_content_type = "application/grpc";
     }
-    if (!FindHttpHeader(http.headers, "Referer")) {
-        http.headers.emplace(
-            "referer", std::string(BuildXHttpReferer(http.host, http.path, tls)));
+    if (!FindHttpHeader(cfg.headers, "Referer")) {
+        req.default_referer = referer_scratch.Format(cfg.host, path, tls);
     }
-    return http;
+    return req;
 }
 
 namespace {
@@ -1948,7 +1972,7 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
 
 net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
     std::unique_ptr<AsyncStream> stream,
-    const HttpConfig& cfg,
+    HttpClientRequestView cfg,
     std::string_view host,
     XHttpClientRequestKind kind,
     std::span<const net::const_buffer> packet_payload,

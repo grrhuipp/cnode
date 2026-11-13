@@ -1,4 +1,5 @@
 #include "config_panel_common.hpp"
+#include "udp_wire.hpp"
 
 #include <openssl/evp.h>
 
@@ -71,9 +72,9 @@ TEST_P(Ss2022TcpReplay, RejectsCapturedRequestAndAcceptsFreshSaltWithoutBanningC
     TempDir root;
     const auto server_dir = root.Path() / "server";
     const auto client_dir = root.Path() / "client";
-    auto server_reservation = Socket::ReserveTcp();
+    udp::PortReservation server_reservation(true);
     auto client_reservation = Socket::ReserveTcp();
-    const auto server_port = server_reservation.Port();
+    const auto server_port = server_reservation.port;
     const auto client_port = client_reservation.Port();
     auto splitter = Socket::Listen();
     const std::string payload = "real-ss2022-tcp-replay-protection";
@@ -103,6 +104,7 @@ TEST_P(Ss2022TcpReplay, RejectsCapturedRequestAndAcceptsFreshSaltWithoutBanningC
     config["limits"]["ipBan"] = {
         {"enabled", true}, {"failureLimit", 1}, {"windowSeconds", 60}, {"banSeconds", 180}};
     WriteJson(server_dir, "config.json", config);
+    server_reservation.ReleaseUdp();
     auto server = Start(server_dir);
     server->WaitForLog("server started");
 

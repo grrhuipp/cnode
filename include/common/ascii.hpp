@@ -50,4 +50,11 @@ inline void LowerAsciiInPlace(std::string& value) noexcept {
     return value;
 }
 
+[[nodiscard]] constexpr bool ContainsControlCharacter(std::string_view value) noexcept {
+    for (const unsigned char ch : value) {
+        if (ch < 0x20 || ch == 0x7f) return true;
+    }
+    return false;
+}
+
 }  // namespace common

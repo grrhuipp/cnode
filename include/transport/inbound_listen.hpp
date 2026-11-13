@@ -3,7 +3,7 @@
 #include "common/asio_types.hpp"
 #include "common/ip_address.hpp"
 #include "common/constants.hpp"
-#include "transport/http_headers.hpp"
+#include "common/ascii.hpp"
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -20,7 +20,6 @@ public:
         candidates_[1] = net::ip::address_v6::any();
     }
 
-    [[nodiscard]] bool IsAuto() const noexcept { return candidate_count_ == 2; }
     [[nodiscard]] std::span<const net::ip::address> Candidates() const noexcept {
         return {candidates_.data(), candidate_count_};
     }

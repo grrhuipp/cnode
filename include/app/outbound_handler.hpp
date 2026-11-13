@@ -25,9 +25,9 @@ namespace app {
 
 class DNS;
 
-class OutboundProtocolSettings {
-public:
-    virtual ~OutboundProtocolSettings() noexcept = default;
+struct OutboundProtocolSettings {
+protected:
+    ~OutboundProtocolSettings() noexcept = default;
 };
 
 template <typename T>

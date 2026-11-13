@@ -348,13 +348,13 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
 
 net::awaitable<TransportBuildResult> DoXHttp2PacketUpClientRequest(
     std::unique_ptr<AsyncStream> stream,
-    const HttpConfig& cfg,
+    HttpClientRequestView req,
     std::string_view host,
     bool tls,
     std::span<const net::const_buffer> packet_payload,
     uint64_t conn_id) {
     auto upload = co_await DoHttp2ClientHandshake(
-        std::move(stream), cfg, host, tls, conn_id);
+        std::move(stream), req, host, tls, conn_id);
     if (!upload) {
         co_return tl::unexpected(upload.error());
     }
@@ -387,7 +387,7 @@ net::awaitable<TransportBuildResult> BuildInboundXHttpTransport(
     uint64_t conn_id,
     InboundTransportMetadata* metadata) {
     // Outlives the HTTP/2 session, which borrows it until the call returns.
-    const HttpConfig http = XHttpStreamOneHttpConfig(xhttp, false);
+    const HttpConfig http = XHttpStreamOneServerHttpConfig(xhttp);
     co_return co_await DoHttpServerHandshake(
         coordinator,
         std::move(stream),
@@ -409,11 +409,18 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpStreamOne(
                   XHttpModeName(mode));
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
     }
-    const HttpConfig http = XHttpStreamOneHttpConfig(s.xhttp, true);
+    XHttpRefererScratch referer_scratch;
+    const HttpClientRequestView req = MakeXHttpClientRequestView(
+        s.xhttp,
+        s.xhttp.normalized_path,
+        "POST",
+        true,
+        XHttpClientRequestKind::StreamUp,
+        referer_scratch);
     co_return co_await DoHttp2ClientHandshake(
         std::move(stream),
-        http,
-        ResolveConfiguredHttpHost(http.host, &http.headers, authority_fallback),
+        req,
+        ResolveConfiguredHttpHost(req.host, req.headers, authority_fallback),
         s.IsTlsLike(),
         conn_id);
 }
@@ -580,7 +587,7 @@ net::awaitable<TransportBuildResult> BuildOutboundTransport(
             s.http.host, &s.http.headers, authority_fallback);
         auto http_result = ShouldUseHttp2ForHttp(s)
             ? co_await DoHttp2ClientHandshake(
-                  std::move(stream), s.http, host, s.IsTlsLike(), conn_id)
+                  std::move(stream), HttpClientRequestView::FromConfig(s.http), host, s.IsTlsLike(), conn_id)
             : co_await DoHttp1ClientHandshake(
                   std::move(stream), s.http, host, conn_id);
         if (!http_result) {
@@ -658,12 +665,14 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
         stream = std::move(*secured);
     }
 
-    const HttpConfig http = XHttpClientHttpConfig(
+    XHttpRefererScratch referer_scratch;
+    const HttpClientRequestView http = MakeXHttpClientRequestView(
         s.xhttp,
         path,
         kind == XHttpClientRequestKind::Downlink ? "GET" : "POST",
         s.IsTlsLike(),
-        kind);
+        kind,
+        referer_scratch);
 
     std::string_view dial_host = host;
     if (dial_host.empty()) {
@@ -672,7 +681,7 @@ net::awaitable<TransportBuildResult> BuildOutboundXHttpClientRequest(
             : sni;
     }
     const std::string_view authority = ResolveConfiguredHttpHost(
-        http.host, &http.headers, dial_host.empty() ? kDefaultHttpAuthority : dial_host);
+        http.host, http.headers, dial_host.empty() ? kDefaultHttpAuthority : dial_host);
 
     if (!ShouldUseHttp2ForXHttp(s)) {
         co_return co_await DoXHttp1ClientRequest(

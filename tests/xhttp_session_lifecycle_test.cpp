@@ -194,7 +194,7 @@ TEST(XhttpSessionLifecycle, UploadResponseDrainPreservesWritesAndJoinsReaderOnCl
     const std::string initial = "first";
     const std::array<net::const_buffer, 1> payload{net::buffer(initial)};
     net::co_spawn(io, DoXHttp1ClientRequest(std::make_unique<::transport::TcpStream>(std::move(client)),
-        config, "localhost", ::transport::XHttpClientRequestKind::StreamUp, payload, 0),
+        ::transport::HttpClientRequestView::FromConfig(config), "localhost", ::transport::XHttpClientRequestKind::StreamUp, payload, 0),
         [&](std::exception_ptr error, ::transport::TransportBuildResult result) {
             failure = error;
             if (!error && result) upload = std::move(*result);

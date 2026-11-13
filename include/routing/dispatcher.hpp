@@ -3,7 +3,6 @@
 #include "common/asio_types.hpp"
 #include "app/relay.hpp"
 #include "common/domain_name.hpp"
-#include "common/error.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/constants.hpp"
 #include "transport/link.hpp"

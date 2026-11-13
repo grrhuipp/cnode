@@ -661,7 +661,7 @@ RunVlessEncryptionServerHandshake(
     app::GroupCoordinator& coordinator,
     proxy::BufferedStreamReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
-    std::shared_ptr<const VlessEncryptionConfig> config,
+    const std::shared_ptr<const VlessEncryptionConfig>& config,
     std::string_view inbound_tag);
 
 // Directory entries carry only routing/lifetime metadata. PFS secrets and the

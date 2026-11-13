@@ -22,15 +22,6 @@ namespace api {
     return value.is_array() && value.as_array().empty();
 }
 
-[[nodiscard]] inline bool ContainsControlCharacter(std::string_view value) noexcept {
-    for (const unsigned char ch : value) {
-        if (ch < 0x20 || ch == 0x7f) {
-            return true;
-        }
-    }
-    return false;
-}
-
 [[nodiscard]] inline std::optional<uint64_t> PanelUnsignedInteger(
     const infra::value& value) noexcept {
     if (const auto parsed = infra::JsonUnsignedInteger(value)) {

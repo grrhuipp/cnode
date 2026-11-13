@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/asio_types.hpp"
 #include "common/binary_text_codec.hpp"
 #include "common/byte_reader.hpp"
 #include "common/domain_name.hpp"

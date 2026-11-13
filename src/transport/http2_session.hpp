@@ -74,9 +74,32 @@ inline constexpr std::string_view kHttp2ClientPreface =
     bool tls,
     uint64_t conn_id);
 
+struct HttpClientRequestView {
+    std::string_view path;
+    std::string_view method;
+    std::string_view host;
+    const HttpHeaders* headers = nullptr;
+    std::optional<uint32_t> initial_window_size;
+    std::string_view default_content_type;
+    std::string_view default_referer;
+
+    [[nodiscard]] static HttpClientRequestView FromConfig(const HttpConfig& cfg) noexcept {
+        return HttpClientRequestView{
+            .path = cfg.path,
+            .method = cfg.method,
+            .host = cfg.host,
+            .headers = &cfg.headers,
+            .initial_window_size = cfg.initial_window_size,
+            .default_content_type = {},
+            .default_referer = {},
+        };
+    }
+    static HttpClientRequestView FromConfig(const HttpConfig&&) = delete;
+};
+
 [[nodiscard]] net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
     std::unique_ptr<AsyncStream> stream,
-    const HttpConfig& cfg,
+    HttpClientRequestView req,
     std::string_view authority,
     bool tls,
     uint64_t conn_id);

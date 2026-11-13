@@ -318,7 +318,9 @@ tl::expected<std::optional<uint32_t>, H2Error> PeerInitialWindowSetting(
 tl::expected<uint32_t, H2Error> WindowUpdateIncrement(const H2Frame&);
 void EncodeWindowUpdateFrame(uint8_t* out, uint32_t stream_id, uint32_t increment) noexcept;
 net::awaitable<void> SendWindowUpdates(AsyncStream&, uint32_t, uint32_t, uint32_t);
-std::vector<uint8_t> EncodeHttpRequestHeaders(std::string_view, bool, const HttpConfig&);
+struct HttpClientRequestView;
+std::vector<uint8_t> EncodeHttpRequestHeaders(
+    std::string_view, bool, const HttpClientRequestView&);
 std::vector<uint8_t> EncodeHttpResponseHeaders(const HttpHeaders&);
 net::awaitable<tl::expected<std::optional<H2RequestHeaders>, H2Error>> ParseH2RequestHeaders(
     AsyncStream&, HpackDecoder&, H2Frame, std::string_view, bool);

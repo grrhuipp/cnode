@@ -1115,7 +1115,7 @@ RunVlessEncryptionServerHandshake(
     app::GroupCoordinator& coordinator,
     proxy::BufferedStreamReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
-    std::shared_ptr<const VlessEncryptionConfig> namespace_config,
+    const std::shared_ptr<const VlessEncryptionConfig>& namespace_config,
     std::string_view inbound_tag) {
     if (!namespace_config) co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     const auto& config = *namespace_config;

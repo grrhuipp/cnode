@@ -1047,7 +1047,7 @@ tl::expected<std::string, std::string> ParseOptionalString(
         return tl::unexpected(std::format(
             "users[{}].{} must be a string or null", user_index, field));
     }
-    if (ContainsControlCharacter(value->as_string())) {
+    if (common::ContainsControlCharacter(value->as_string())) {
         return tl::unexpected(std::format(
             "users[{}].{} contains control characters", user_index, field));
     }
@@ -1382,7 +1382,7 @@ tl::expected<std::vector<common::DetectRule>, std::string> ExtractBlockDetectRul
                 return tl::unexpected(
                     "block route match entries must not be empty");
             }
-            if (ContainsControlCharacter(entry)) {
+            if (common::ContainsControlCharacter(entry)) {
                 return tl::unexpected(
                     "block route match entries must not contain control characters");
             }
@@ -1442,7 +1442,7 @@ ParseUserList(const infra::object& source) {
             return tl::unexpected(std::format(
                 "users[{}].uuid must be a non-empty string", i));
         }
-        if (ContainsControlCharacter(uuid->as_string())) {
+        if (common::ContainsControlCharacter(uuid->as_string())) {
             return tl::unexpected(std::format(
                 "users[{}].uuid contains control characters", i));
         }

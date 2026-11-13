@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 #include "transport/inbound_listen.hpp"
-#include <chrono>
 #include <string_view>
 
 namespace {
@@ -8,7 +7,6 @@ class AutomaticListen : public testing::TestWithParam<const char*> {};
 TEST_P(AutomaticListen, ExposesBothWildcardFamilies) {
     const auto listen = ::transport::InboundListen::Parse(GetParam());
     ASSERT_TRUE(listen);
-    EXPECT_TRUE(listen->IsAuto());
     ASSERT_EQ(listen->Candidates().size(), 2u);
     EXPECT_TRUE(listen->Candidates()[0].is_v4());
     EXPECT_TRUE(listen->Candidates()[0].is_unspecified());
@@ -22,7 +20,6 @@ class LiteralListen : public testing::TestWithParam<LiteralCase> {};
 TEST_P(LiteralListen, NormalizesLoopbackFamily) {
     const auto listen = ::transport::InboundListen::Parse(GetParam().text);
     ASSERT_TRUE(listen);
-    EXPECT_FALSE(listen->IsAuto());
     ASSERT_EQ(listen->Candidates().size(), 1u);
     EXPECT_EQ(listen->Candidates()[0].is_v4(), GetParam().ipv4);
     EXPECT_TRUE(listen->Candidates()[0].is_loopback());

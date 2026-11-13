@@ -1,6 +1,7 @@
 #include "transport/xhttp_client.hpp"
 
 #include "common/multi_buffer.hpp"
+#include "common/binary_text_codec.hpp"
 #include "common/const_buffer_span.hpp"
 #include "common/ip_address.hpp"
 #include "infra/log.hpp"
@@ -811,12 +812,8 @@ XHttpSessionId GenerateXHttpSessionId() noexcept {
         // 随机源不可用时任何会话 ID 都可预测，不降级继续拨号。
         std::abort();
     }
-    constexpr std::string_view kHexDigits = "0123456789abcdef";
     XHttpSessionId id{};
-    for (size_t i = 0; i < random.size(); ++i) {
-        id[2 * i] = kHexDigits[random[i] >> 4];
-        id[2 * i + 1] = kHexDigits[random[i] & 0x0f];
-    }
+    common::EncodeHexLowerTo(random, id);
     return id;
 }
 

@@ -213,11 +213,9 @@ transport::StreamSettings ParseStreamSettingsFields(const object& source, transp
         throw std::invalid_argument(
             "routing domain regexp must not be empty");
     }
-    for (const unsigned char byte : value) {
-        if (byte < 0x20 || byte == 0x7f) {
-            throw std::invalid_argument(
-                "routing domain regexp contains control characters");
-        }
+    if (common::ContainsControlCharacter(value)) {
+        throw std::invalid_argument(
+            "routing domain regexp contains control characters");
     }
     try {
         (void)std::regex(

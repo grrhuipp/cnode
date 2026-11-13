@@ -113,6 +113,8 @@ private:
     void OnTimeout() override;
     void InitializeBaseContext(const udp::endpoint& remote);
     void Flush();
+    bool TrySendImmediateDatagram(
+        std::span<const uint8_t> header, std::span<const uint8_t> payload);
     void Refuse() noexcept;
     void SpawnOwned(net::awaitable<void> task);
     void OnStreamData(uint32_t flags, int64_t stream_id, std::span<const uint8_t> data);

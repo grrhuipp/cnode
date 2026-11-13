@@ -824,21 +824,21 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
 
 net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
     std::unique_ptr<AsyncStream> stream,
-    const HttpConfig& cfg,
+    HttpClientRequestView req,
     std::string_view authority,
     bool tls,
     uint64_t conn_id) {
-    const auto headers = EncodeHttpRequestHeaders(authority, tls, cfg);
-    const bool end_stream = common::EqualsAsciiCI(cfg.method, "GET");
+    const auto headers = EncodeHttpRequestHeaders(authority, tls, req);
+    const bool end_stream = common::EqualsAsciiCI(req.method, "GET");
     co_return co_await OpenHttp2ClientStream(
         std::move(stream),
-        cfg.initial_window_size,
+        req.initial_window_size,
         headers,
         H2PayloadCodec::RawData,
         end_stream,
         "HTTP/2",
         authority,
-        EffectiveHttpPath(cfg.path),
+        EffectiveHttpPath(req.path),
         conn_id);
 }
 

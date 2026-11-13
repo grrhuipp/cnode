@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <charconv>
 #include <limits>
+#include <cstring>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -32,17 +33,6 @@ void AppendU64(std::vector<uint8_t>& output, uint64_t value) {
     std::array<uint8_t, 8> bytes{};
     common::StoreU64BE(bytes.data(), value);
     output.insert(output.end(), bytes.begin(), bytes.end());
-}
-
-bool AppendVarint(std::vector<uint8_t>& output, uint64_t value) {
-    const size_t width = common::QuicVarintSize(value);
-    if (width == 0) return false;
-    const uint8_t prefix = static_cast<uint8_t>(
-        (width == 1 ? 0 : width == 2 ? 1 : width == 4 ? 2 : 3) << 6);
-    output.push_back(static_cast<uint8_t>((value >> ((width - 1) * 8)) | prefix));
-    for (size_t i = 1; i < width; ++i)
-        output.push_back(static_cast<uint8_t>(value >> ((width - 1 - i) * 8)));
-    return true;
 }
 
 [[nodiscard]] std::string_view TargetHost(
@@ -108,36 +98,67 @@ tl::expected<size_t, ProtocolError> UdpTargetHeaderSize(
     return 8 + width + text.authority_size;
 }
 
+tl::expected<size_t, ProtocolError> EncodeUdpFragmentHeader(
+    HysteriaVersion version, const HysteriaUdpMessage& message, const UdpTargetText& text,
+    std::span<uint8_t> out) noexcept {
+    size_t pos = 0;
+    auto write_bytes = [&](const void* src, size_t len) noexcept {
+        if (len != 0) std::memcpy(out.data() + pos, src, len);
+        pos += len;
+    };
+    if (out.size() < 8) return tl::unexpected(ProtocolError::TooLarge);
+    common::StoreU32BE(out.data() + pos, message.session_id);
+    pos += 4;
+    if (version == HysteriaVersion::V1) {
+        if (out.size() < 14 + text.host.size())
+            return tl::unexpected(ProtocolError::TooLarge);
+        common::StoreU16BE(out.data() + pos, static_cast<uint16_t>(text.host.size()));
+        pos += 2;
+        write_bytes(text.host.data(), text.host.size());
+        common::StoreU16BE(out.data() + pos, text.port);
+        pos += 2;
+        common::StoreU16BE(out.data() + pos, message.packet_id);
+        pos += 2;
+        out[pos++] = message.fragment_id;
+        out[pos++] = message.fragment_count;
+        common::StoreU16BE(out.data() + pos, static_cast<uint16_t>(message.payload.size()));
+        pos += 2;
+        return pos;
+    }
+    common::StoreU16BE(out.data() + pos, message.packet_id);
+    pos += 2;
+    out[pos++] = message.fragment_id;
+    out[pos++] = message.fragment_count;
+    const size_t width = common::QuicVarintSize(text.authority_size);
+    const size_t needed = 8 + width + (text.host.empty() ? 0 : text.authority_size);
+    if (width == 0 || out.size() < needed)
+        return tl::unexpected(ProtocolError::TooLarge);
+    const uint8_t prefix = static_cast<uint8_t>(
+        (width == 1 ? 0 : width == 2 ? 1 : width == 4 ? 2 : 3) << 6);
+    out[pos++] = static_cast<uint8_t>((text.authority_size >> ((width - 1) * 8)) | prefix);
+    for (size_t i = 1; i < width; ++i)
+        out[pos++] = static_cast<uint8_t>(text.authority_size >> ((width - 1 - i) * 8));
+    if (!text.host.empty()) {
+        if (text.bracket_v6) out[pos++] = '[';
+        write_bytes(text.host.data(), text.host.size());
+        if (text.bracket_v6) out[pos++] = ']';
+        out[pos++] = ':';
+        write_bytes(text.port_text.data(), text.port_text_size);
+    }
+    return pos;
+}
+
 tl::expected<std::vector<uint8_t>, ProtocolError> EncodeUdpFragment(
     HysteriaVersion version, const HysteriaUdpMessage& message, const UdpTargetText& text,
     size_t header_size) {
-    std::vector<uint8_t> output;
-    output.reserve(header_size + message.payload.size());
-    AppendU32(output, message.session_id);
-    if (version == HysteriaVersion::V1) {
-        AppendU16(output, static_cast<uint16_t>(text.host.size()));
-        output.insert(output.end(), text.host.begin(), text.host.end());
-        AppendU16(output, text.port);
-        AppendU16(output, message.packet_id);
-        output.push_back(message.fragment_id);
-        output.push_back(message.fragment_count);
-        AppendU16(output, static_cast<uint16_t>(message.payload.size()));
-    } else {
-        AppendU16(output, message.packet_id);
-        output.push_back(message.fragment_id);
-        output.push_back(message.fragment_count);
-        if (!AppendVarint(output, text.authority_size))
-            return tl::unexpected(ProtocolError::TooLarge);
-        if (!text.host.empty()) {
-            if (text.bracket_v6) output.push_back('[');
-            output.insert(output.end(), text.host.begin(), text.host.end());
-            if (text.bracket_v6) output.push_back(']');
-            output.push_back(':');
-            output.insert(output.end(), text.port_text.data(),
-                          text.port_text.data() + text.port_text_size);
-        }
+    std::vector<uint8_t> output(header_size + message.payload.size());
+    const auto written = EncodeUdpFragmentHeader(
+        version, message, text, std::span<uint8_t>(output.data(), header_size));
+    if (!written) return tl::unexpected(written.error());
+    output.resize(*written + message.payload.size());
+    if (!message.payload.empty()) {
+        std::memcpy(output.data() + *written, message.payload.data(), message.payload.size());
     }
-    output.insert(output.end(), message.payload.begin(), message.payload.end());
     return output;
 }
 

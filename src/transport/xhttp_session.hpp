@@ -15,6 +15,7 @@
 #include <map>
 #include <string>
 
+#include "transport/http2_session.hpp"
 namespace transport {
 
 struct XHttpPacketSessionKeyRef {
@@ -441,13 +442,22 @@ enum class XHttpSessionAccess : uint8_t {
     std::shared_ptr<XHttpPacketUpSession> session,
     std::unique_ptr<AsyncStream> downlink);
 
-[[nodiscard]] HttpConfig XHttpStreamOneHttpConfig(const XHttpConfig& cfg, bool outbound);
-[[nodiscard]] HttpConfig XHttpClientHttpConfig(const XHttpConfig& cfg,
-                                               std::string_view path,
-                                               std::string_view method,
-                                               bool tls,
-                                               XHttpClientRequestKind kind);
+struct XHttpRefererScratch {
+    std::array<char, 512> inline_buf{};
+    std::string overflow;
 
+    [[nodiscard]] std::string_view Format(
+        std::string_view host, std::string_view path, bool tls);
+};
+
+[[nodiscard]] HttpConfig XHttpStreamOneServerHttpConfig(const XHttpConfig& cfg);
+[[nodiscard]] HttpClientRequestView MakeXHttpClientRequestView(
+    const XHttpConfig& cfg,
+    std::string_view path,
+    std::string_view method,
+    bool tls,
+    XHttpClientRequestKind kind,
+    XHttpRefererScratch& referer_scratch);
 [[nodiscard]] net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     app::GroupCoordinator& coordinator,
     net::io_context& io_context,
@@ -461,7 +471,7 @@ enum class XHttpSessionAccess : uint8_t {
 
 [[nodiscard]] net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
     std::unique_ptr<AsyncStream> stream,
-    const HttpConfig& cfg,
+    HttpClientRequestView req,
     std::string_view host,
     XHttpClientRequestKind kind,
     std::span<const net::const_buffer> packet_payload,

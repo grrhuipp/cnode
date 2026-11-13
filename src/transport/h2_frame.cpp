@@ -1,4 +1,5 @@
 #include "transport/h2_frame.hpp"
+#include "transport/http2_session.hpp"
 
 namespace transport {
 // Returns nullopt only on a clean EOF at a frame boundary.
@@ -122,13 +123,17 @@ net::awaitable<void> WriteH2Frame(
 [[nodiscard]] std::vector<uint8_t> EncodeHttpRequestHeaders(
     std::string_view authority,
     bool tls,
-    const HttpConfig& cfg) {
-    const std::string_view method = cfg.method.empty()
-        ? std::string_view("PUT") : std::string_view(cfg.method);
-    const std::string_view req_path = EffectiveHttpPath(cfg.path);
+    const HttpClientRequestView& req) {
+    const std::string_view method = req.method.empty()
+        ? std::string_view("PUT") : req.method;
+    const std::string_view req_path = EffectiveHttpPath(req.path);
+    const size_t header_count =
+        (req.headers ? req.headers->size() : 0) +
+        (!req.default_content_type.empty() ? 1 : 0) +
+        (!req.default_referer.empty() ? 1 : 0);
     std::vector<uint8_t> h;
     h.reserve(128 + authority.size() + req_path.size() + method.size() +
-              cfg.headers.size() * 32);
+              header_count * 32);
 
     if (method == "GET") {
         AppendHpackIndexed(h, kHpackStaticMethodGet);
@@ -146,11 +151,19 @@ net::awaitable<void> WriteH2Frame(
     if (!authority.empty()) {
         AppendHpackLiteralIndexedName(h, kHpackStaticAuthority, authority);
     }
-    for (const auto& [key, value] : cfg.headers) {
-        if (key.empty() || IsConnectionSpecificHttp2Header(key)) {
-            continue;
+    if (req.headers) {
+        for (const auto& [key, value] : *req.headers) {
+            if (key.empty() || IsConnectionSpecificHttp2Header(key)) {
+                continue;
+            }
+            AppendHpackLiteralNewName(h, key, value);
         }
-        AppendHpackLiteralNewName(h, key, value);
+    }
+    if (!req.default_content_type.empty()) {
+        AppendHpackLiteralNewName(h, "content-type", req.default_content_type);
+    }
+    if (!req.default_referer.empty()) {
+        AppendHpackLiteralNewName(h, "referer", req.default_referer);
     }
     return h;
 }

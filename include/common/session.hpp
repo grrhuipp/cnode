@@ -3,7 +3,6 @@
 #include "common/asio_types.hpp"
 #include "common/target_address.hpp"
 
-#include <array>
 #include <cstdint>
 #include <optional>
 #include <memory>

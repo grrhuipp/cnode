@@ -182,9 +182,7 @@ static constexpr std::array<std::string_view, 9> kHttpMethods{
         allow_partial = false;
     }
     if (line.empty()) return false;
-    for (const unsigned char character : line) {
-        if (character < 0x20 || character == 0x7f) return false;
-    }
+    if (common::ContainsControlCharacter(line)) return false;
 
     const size_t first_space = line.find(' ');
     if (first_space == std::string_view::npos) {
