@@ -6,6 +6,7 @@
 #include <charconv>
 #include <cmath>
 #include <format>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -516,7 +517,9 @@ void SerializeString(const std::string& s, std::string& out) {
             case '\t': out += "\\t"; break;
             default:
                 if (c < 0x20) {
-                    out += std::format("\\u{:04x}", c);
+                    constexpr char kHex[] = "0123456789abcdef";
+                    const char escaped[6] = {'\\', 'u', '0', '0', kHex[c >> 4], kHex[c & 0x0f]};
+                    out.append(escaped, sizeof(escaped));
                 } else {
                     out.push_back(static_cast<char>(c));
                 }
@@ -534,13 +537,21 @@ void SerializeValue(const value& v, std::string& out) {
     v.visit(Overloaded{
         [&](std::nullptr_t) { out += "null"; },
         [&](bool b) { out += b ? "true" : "false"; },
-        [&](int64_t n) { out += std::to_string(n); },
-        [&](uint64_t n) { out += std::to_string(n); },
+        [&](int64_t n) {
+            char buf[24];
+            const auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), n);
+            if (ec == std::errc{}) out.append(buf, ptr);
+        },
+        [&](uint64_t n) {
+            char buf[24];
+            const auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), n);
+            if (ec == std::errc{}) out.append(buf, ptr);
+        },
         [&](double d) {
             if (!std::isfinite(d)) {
                 throw std::invalid_argument("json number must be finite");
             }
-            out += std::format("{}", d);
+            std::format_to(std::back_inserter(out), "{}", d);
         },
         [&](const std::string& s) { SerializeString(s, out); },
         [&](const array& items) {

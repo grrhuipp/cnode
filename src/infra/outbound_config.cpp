@@ -9,28 +9,10 @@
 #include <limits>
 #include <stdexcept>
 
-namespace proxy {
-std::optional<DomainStrategy> ParseDomainStrategy(std::string_view value) {
-    if (common::EqualsAsciiCI(value, "asis")) return DomainStrategy::AsIs;
-    if (common::EqualsAsciiCI(value, "useip")) return DomainStrategy::UseIP;
-    if (common::EqualsAsciiCI(value, "useipv6v4")) return DomainStrategy::UseIPv6v4;
-    if (common::EqualsAsciiCI(value, "useipv4")) return DomainStrategy::UseIPv4;
-    if (common::EqualsAsciiCI(value, "useipv4v6")) return DomainStrategy::UseIPv4v6;
-    if (common::EqualsAsciiCI(value, "useipv6")) return DomainStrategy::UseIPv6;
-    if (common::EqualsAsciiCI(value, "forceip")) return DomainStrategy::ForceIP;
-    if (common::EqualsAsciiCI(value, "forceipv6v4")) return DomainStrategy::ForceIPv6v4;
-    if (common::EqualsAsciiCI(value, "forceipv6")) return DomainStrategy::ForceIPv6;
-    if (common::EqualsAsciiCI(value, "forceipv4v6")) return DomainStrategy::ForceIPv4v6;
-    if (common::EqualsAsciiCI(value, "forceipv4")) return DomainStrategy::ForceIPv4;
-    return std::nullopt;
-}
-}  // namespace proxy
-
 namespace infra {
 namespace {
 
-const object& SingleObject(const object& source, std::string_view key) {
-    const auto* value = source.if_contains(key);
+const object& SingleObject(const value* value, std::string_view key) {
     if (!value || !value->is_array() || value->as_array().size() != 1 ||
         !value->as_array()[0].is_object()) {
         throw std::invalid_argument(std::string(key) + " must contain exactly one object");
@@ -161,9 +143,9 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const object& 
     if (protocol == common::kShadowsocks || protocol == common::kTrojan) {
         const bool shadowsocks = protocol == common::kShadowsocks;
         const object* server = &source;
-        if (source.contains("servers")) {
+        if (const auto* servers = source.if_contains("servers")) {
             RequireJsonKeys(source, {"servers"}, "outbound.settings");
-            server = &SingleObject(source, "servers");
+            server = &SingleObject(servers, "servers");
         }
         RequireJsonKeys(*server, shadowsocks ? kSsFields : kTrojanFields, "outbound.settings.server");
         if (shadowsocks) {
@@ -190,11 +172,11 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const object& 
         const object* server = &source;
         const object* user = &source;
         const auto fields = vless_protocol ? kVlessFields : kVmessFields;
-        if (source.contains("vnext")) {
+        if (const auto* vnext = source.if_contains("vnext")) {
             RequireJsonKeys(source, {"vnext"}, "outbound.settings");
-            server = &SingleObject(source, "vnext");
+            server = &SingleObject(vnext, "vnext");
             RequireJsonKeys(*server, {"address", "port", "users"}, "outbound.settings.vnext[0]");
-            user = &SingleObject(*server, "users");
+            user = &SingleObject(server->if_contains("users"), "users");
             RequireJsonKeys(*user, fields, "outbound.settings.vnext[0].users[0]");
         } else {
             RequireJsonKeys(source, fields, "outbound.settings", {"address", "port"});
@@ -215,10 +197,10 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const object& 
             auto encryption = proxy::ParseVlessClientEncryption(JsonStringOr(*user, "encryption", ""));
             if (!encryption) throw std::invalid_argument(std::string(proxy::VlessEncryptionParseErrorMessage(encryption.error())));
             if (*encryption) result.encryption = std::make_shared<const proxy::VlessEncryptionConfig>(std::move(**encryption));
-            const auto packet = common::LowerAscii(JsonStringOr(*user, "packetEncoding", "xudp"));
-            if (packet == "none") result.packet_encoding = PacketEncoding::None;
-            else if (packet == "packetaddr") result.packet_encoding = PacketEncoding::PacketAddr;
-            else if (packet == "xudp" || packet.empty()) result.packet_encoding = PacketEncoding::Xudp;
+            const auto packet = JsonStringOr(*user, "packetEncoding", "xudp");
+            if (common::EqualsAsciiCI(packet, "none")) result.packet_encoding = PacketEncoding::None;
+            else if (common::EqualsAsciiCI(packet, "packetaddr")) result.packet_encoding = PacketEncoding::PacketAddr;
+            else if (packet.empty() || common::EqualsAsciiCI(packet, "xudp")) result.packet_encoding = PacketEncoding::Xudp;
             else throw std::invalid_argument("packetEncoding must be none, packetaddr, or xudp");
             return result;
         }

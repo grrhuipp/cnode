@@ -12,6 +12,7 @@
 #include "proxy/inbound.hpp"
 #include "proxy/outbound.hpp"
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
+#include "proxy/shadowsocks/ss_stream.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/outbound_target_builder.hpp"
 #include "transport/link.hpp"
@@ -172,4 +173,28 @@ struct SsPreparedSettings {
     SsOutboundConfig config;
     SsCredentials credentials;
 };
+
+struct WriteTCPRequestResult {
+    SsStreamWriter request_writer;
+    KeyBytes request_salt;
+};
+
+[[nodiscard]] net::awaitable<tl::expected<WriteTCPRequestResult, common::ErrorCode>>
+WriteTCPRequest(const common::TargetAddress& target,
+                const SsCipherInfo& cipher_info,
+                const KeyBytes& master_key,
+                std::span<const KeyBytes> psk_chain,
+                transport::AsyncStream& stream,
+                common::ForwardedMetadataView forwarded = {});
+
+struct ReadTCPResponseResult {
+    BodyReader reader;
+    common::MultiBuffer initial_payload;
+};
+
+[[nodiscard]] net::awaitable<tl::expected<ReadTCPResponseResult, common::ErrorCode>>
+ReadTCPResponse(const SsCipherInfo& cipher_info,
+                const KeyBytes& master_key,
+                const KeyBytes& request_salt,
+                transport::AsyncStream& stream);
 }  // namespace proxy

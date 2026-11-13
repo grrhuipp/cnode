@@ -1,6 +1,5 @@
 #include "infra/json.hpp"
 #include "controller/traffic_journal_format.hpp"
-#include <openssl/sha.h>
 
 #include <algorithm>
 #include <array>
@@ -34,12 +33,9 @@ constexpr size_t MaxAuditBytes = 1024 * 1024;
 class File {
 public:
     explicit File(int fd) : fd_(fd) { if (fd < 0) FailSystem("open"); }
-    ~File() { ::close(fd_); }
-    File(const File&) = delete;
-    File& operator=(const File&) = delete;
-    int Get() const noexcept { return fd_; }
+    int Get() const noexcept { return fd_.fd; }
 private:
-    int fd_;
+    ::controller::ScopedFd fd_;
 };
 
 void Sync(int fd) {
@@ -76,18 +72,6 @@ std::string Quote(std::string_view text) {
     return ::infra::serialize(::infra::value(text));
 }
 
-std::string Digest(std::string_view raw) {
-    std::array<unsigned char, SHA256_DIGEST_LENGTH> digest {};
-    SHA256(reinterpret_cast<const unsigned char*>(raw.data()), raw.size(), digest.data());
-    constexpr char Hex[] = "0123456789abcdef";
-    std::string result;
-    result.reserve(2 * digest.size());
-    for (unsigned char byte : digest) {
-        result.push_back(Hex[byte >> 4]);
-        result.push_back(Hex[byte & 15]);
-    }
-    return result;
-}
 
 bool ValidEvidence(std::string_view text) {
     size_t characters = 0;
@@ -167,7 +151,7 @@ void Resolve(int directory, const std::string& record, std::string_view decision
     if (std::strftime(timestamp.data(), timestamp.size(), "%Y-%m-%dT%H:%M:%SZ", &utc) == 0)
         throw std::runtime_error("cannot format audit time");
     const ::infra::object entry {
-        {"event", "reconciliation-intent"}, {"record", record}, {"sha256", Digest(raw)},
+        {"event", "reconciliation-intent"}, {"record", record}, {"sha256", ::controller::Sha256Hex(raw)},
         {"decision", decision}, {"evidence", evidence}, {"time", timestamp.data()}
     };
     const auto audit_line = ::infra::serialize(entry) + '\n';

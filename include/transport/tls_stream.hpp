@@ -8,7 +8,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 
 
 namespace transport {
@@ -137,8 +136,6 @@ public:
 
     [[nodiscard]] std::optional<DetachedTlsState> DetachForHandoff(
         common::MultiBuffer plaintext_prefix = {});
-    [[nodiscard]] std::optional<DetachedTlsState> DetachForHandoff(
-        std::span<const uint8_t> plaintext_prefix);
     [[nodiscard]] static std::unique_ptr<TlsStream> RestoreFromHandoff(
         net::io_context& io_context, DetachedTlsState state);
 protected:

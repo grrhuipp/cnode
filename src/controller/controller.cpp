@@ -13,7 +13,6 @@
 #include "common/constants.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config.hpp"
-#include "infra/json.hpp"
 #include "infra/log.hpp"
 #include "transport/http_headers.hpp"
 #include <asio/bind_cancellation_slot.hpp>

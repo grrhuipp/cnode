@@ -2,10 +2,8 @@
 
 #include "common/target_address.hpp"
 #include "common/constants.hpp"
-#include <algorithm>
 #include <array>
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <string>
 #include <string_view>

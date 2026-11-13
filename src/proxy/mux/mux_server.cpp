@@ -1133,7 +1133,8 @@ private:
                     const bool is_udp = hdr.network == common::NetworkType::UDP;
                     // A reused ID or a sub-session beyond the budget is refused
                     // with an error END; the refused frame's payload is dropped.
-                    if (sub_sessions.contains(hdr.session_id) ||
+                    const bool duplicate_sid = sub_sessions.contains(hdr.session_id);
+                    if (duplicate_sid ||
                         sub_sessions.size() >= kMaxConcurrentSubSessions) {
                         common::Context rejected_ctx;
                         rejected_ctx.InitSubstreamFrom(parent_ctx);
@@ -1147,8 +1148,7 @@ private:
                             "refused NEW sid={} active={}",
                             hdr.session_id, sub_sessions.size());
                         LOG_ACCESS(common::FormatAccessLog(rejected_ctx, common::AccessStatus::Rejected,
-                            sub_sessions.contains(hdr.session_id)
-                                ? "duplicate stream ID" : "concurrent stream limit"));
+                            duplicate_sid ? "duplicate stream ID" : "concurrent stream limit"));
                         std::array<uint8_t, 6> write_frame{};
                         const size_t header_len =
                             common::EncodeEndTo(write_frame, hdr.session_id, true);

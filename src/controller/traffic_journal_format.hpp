@@ -4,9 +4,11 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <openssl/sha.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -19,6 +21,30 @@
 // 流量 journal 的磁盘格式：cnode 写入与 cnode_traffic_journal 对账共用这一份
 // 文法、上限与解码，任何一侧都不另行解释记录。
 namespace controller {
+
+struct ScopedFd {
+    int fd = -1;
+    ScopedFd() noexcept = default;
+    explicit ScopedFd(int value) noexcept : fd(value) {}
+    ~ScopedFd() {
+        if (fd >= 0) ::close(fd);
+    }
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+};
+
+[[nodiscard]] inline std::string Sha256Hex(std::string_view raw) {
+    std::array<unsigned char, SHA256_DIGEST_LENGTH> digest{};
+    SHA256(reinterpret_cast<const unsigned char*>(raw.data()), raw.size(), digest.data());
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(digest.size() * 2);
+    for (const unsigned char byte : digest) {
+        result.push_back(kHex[byte >> 4]);
+        result.push_back(kHex[byte & 0x0f]);
+    }
+    return result;
+}
 
 // 单条记录与目录内全部 ready/unknown 记录的字节上限，以及记录条数上限。
 inline constexpr size_t kMaxBytes = 64 * 1024 * 1024;
@@ -105,10 +131,7 @@ void VisitRecordRows(std::string_view text, Visit&& visit) {
     };
     const int fd = ::openat(directory_fd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) fail("open traffic journal record");
-    struct Closer {
-        int fd;
-        ~Closer() { ::close(fd); }
-    } closer{fd};
+    ScopedFd closer(fd);
     struct stat info{};
     if (::fstat(fd, &info) != 0) fail("stat traffic journal record");
     if (!S_ISREG(info.st_mode) || info.st_size < 0 ||

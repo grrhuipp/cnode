@@ -12,7 +12,7 @@ cnode 本地日志分为三个独立语义通道，文本格式与字段示例�
 
 ## 2. error 语义
 
-`component` 使用包路径，例如 `app/dispatcher`、`proxy/freedom`、`transport/internet/tcp`。连接关联使用完整 64 位 `conn_id`。日志入队前复制身份字段，后台 writer 不借用 session 或 Worker 内的字符串。未认证连接不输出候选用户身份；认证通过后发生语法、flow、准入或重放拒绝，仍保留已验证身份及已解析目标，不倒退为“未知用户认证失败”。
+`component` 使用包路径，例如 `app/default_dispatcher`、`proxy/freedom`、`transport/tcp_stream`。连接关联使用完整 64 位 `conn_id`。日志入队前复制身份字段，后台 writer 不借用 session 或 Worker 内的字符串。未认证连接不输出候选用户身份；认证通过后发生语法、flow、准入或重放拒绝，仍保留已验证身份及已解析目标，不倒退为“未知用户认证失败”。
 
 级别口径：
 
@@ -21,7 +21,7 @@ cnode 本地日志分为三个独立语义通道，文本格式与字段示例�
 - `Warning`：单请求失败、拒绝、降级或可恢复异常。
 - `Error`：影响进程能力、控制面或全局资源的故障。
 
-`LOG_TRACE` 至 `LOG_ERROR` 写普通 error 日志；`LOG_CONN_*` 写带 context ID 的 error 日志；尚未建立 session 的网络诊断使用 `LOG_NET_*`，同样进入 error logger。
+`LOG_DEBUG` 至 `LOG_ERROR` 写普通 error 日志；`LOG_CONN_TRACE` 至 `LOG_CONN_ERROR` 写带 context ID 的 error 日志；尚未建立 session 的网络诊断使用 `LOG_NET_*`，同样进入 error logger。
 
 Freedom 的 TCP / UDP 拨号失败细节使用 `Debug`；Dispatcher 统一输出请求最终失败的 `Warning`，避免同一次失败在两个层级重复告警。
 

@@ -3,15 +3,12 @@
 #include "infra/json.hpp"
 
 #include <fcntl.h>
-#include <openssl/sha.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <array>
 #include <cerrno>
 #include <cstdint>
-#include <cstdlib>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -23,10 +20,6 @@ namespace {
 [[noreturn]] void SystemFailure(const char* operation) {
     throw std::system_error(errno, std::generic_category(), operation);
 }
-struct File {
-    int fd;
-    ~File() { if (fd >= 0) ::close(fd); }
-};
 std::string Identity(const infra::PanelConfig& config) {
     if (config.TrafficJournalDir.empty()) {
         throw std::invalid_argument("traffic journal directory is required");
@@ -36,13 +29,7 @@ std::string Identity(const infra::PanelConfig& config) {
     }
     const auto identity = infra::serialize(infra::array{
         config.Name, config.APIHost, config.NodeType, config.NodeIDs.Front()});
-    std::array<unsigned char, SHA256_DIGEST_LENGTH> digest{};
-    SHA256(reinterpret_cast<const unsigned char*>(identity.data()), identity.size(), digest.data());
-    constexpr char hex[] = "0123456789abcdef";
-    std::string result;
-    result.reserve(digest.size() * 2);
-    for (auto byte : digest) { result += hex[byte >> 4]; result += hex[byte & 15]; }
-    return result;
+    return Sha256Hex(identity);
 }
 std::optional<RecordState> EntryRecordState(const std::filesystem::directory_entry& entry) {
     return ParseRecordName(entry.path().filename().native());
@@ -57,7 +44,7 @@ TrafficJournal::TrafficJournal(const infra::PanelConfig& config)
     if (directory_fd_ < 0) SystemFailure("open traffic journal directory");
     try {
         const auto parent_path = directory_.parent_path();
-        File parent{::open(parent_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
+        ScopedFd parent(::open(parent_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
         if (parent.fd < 0) SystemFailure("open traffic journal parent");
         if (::fchmod(parent.fd, 0700) != 0) SystemFailure("protect traffic journal parent");
         if (::fchmod(directory_fd_, 0700) != 0) SystemFailure("protect traffic journal directory");
@@ -76,7 +63,7 @@ TrafficJournal::TrafficJournal(const infra::PanelConfig& config)
         if (::fsync(parent.fd) != 0) SystemFailure("sync traffic journal parent");
         auto ancestor_path = parent_path.parent_path();
         if (ancestor_path.empty()) ancestor_path = ".";
-        File ancestor{::open(ancestor_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+        ScopedFd ancestor(::open(ancestor_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
         if (ancestor.fd < 0 || ::fsync(ancestor.fd) != 0) SystemFailure("sync traffic journal root");
     } catch (...) {
         if (lock_fd_ >= 0) ::close(lock_fd_);
@@ -113,12 +100,16 @@ void TrafficJournal::Append(const app::UserTrafficCounters& traffic) {
     const auto text = infra::serialize(infra::value(std::move(rows)));
     size_t bytes = 0, records = 0;
     for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
-        if (!EntryRecordState(entry)) continue;
-        const auto status = entry.symlink_status();
-        if (!std::filesystem::is_regular_file(status)) {
+        const auto filename = entry.path().filename().native();
+        if (!ParseRecordName(filename)) continue;
+        struct stat st{};
+        if (::fstatat(directory_fd_, filename.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            SystemFailure("stat traffic journal record");
+        }
+        if (!S_ISREG(st.st_mode) || st.st_size < 0) {
             throw std::runtime_error("invalid traffic journal record type");
         }
-        const auto size = entry.file_size();
+        const auto size = static_cast<size_t>(st.st_size);
         if (size > kMaxBytes || bytes > kMaxBytes - size) {
             throw std::runtime_error("traffic journal byte limit reached; reconcile unknown records");
         }
@@ -132,8 +123,8 @@ void TrafficJournal::Append(const app::UserTrafficCounters& traffic) {
     name.append(kRecordIdSize, 'X');
     name += kTemporarySuffix;
     auto temporary = (directory_ / name).string();
-    File file{::mkostemps(temporary.data(), static_cast<int>(kTemporarySuffix.size()),
-                          O_CLOEXEC)};
+    ScopedFd file(::mkostemps(temporary.data(), static_cast<int>(kTemporarySuffix.size()),
+                              O_CLOEXEC));
     if (file.fd < 0) SystemFailure("create traffic journal record");
     bool published = false;
     try {

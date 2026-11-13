@@ -138,14 +138,9 @@ bool FrameBatch::Append(uint8_t cmd, uint32_t sid, std::span<const uint8_t> byte
 
 tl::expected<void, common::ErrorCode> FrameBatch::Encode(
     uint8_t cmd, uint32_t sid, const common::MultiBuffer& payload) {
-    Begin(payload.size());
-    for (const auto* buffer : payload) {
-        if (!buffer || buffer->IsEmpty()) continue;
-        if (!Append(cmd, sid, buffer->Bytes())) {
-            return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
-        }
-    }
-    return {};
+    const auto bytes = payload.FrontSpan();
+    const net::const_buffer single(bytes.data(), bytes.size());
+    return Encode(cmd, sid, {&single, bytes.empty() ? size_t{0} : size_t{1}});
 }
 
 tl::expected<void, common::ErrorCode> FrameBatch::Encode(
@@ -375,16 +370,18 @@ WritePaddedMultiBufferFrames(transport::AsyncStream& stream,
                              uint8_t cmd,
                              uint32_t sid,
                              common::MultiBuffer mb) {
+    std::span<const uint8_t> remaining = mb.FrontSpan();
+    const size_t frames = remaining.empty()
+        ? 0 : 1 + (remaining.size() - 1) / kMaxFramePayload;
     std::vector<uint8_t> packet;
-    packet.reserve(mb.byte_size() + (mb.size() * kFrameHeaderSize));
-    for (auto* buffer : mb) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        auto ok = AppendFrameBytesTo(packet, cmd, sid, buffer->Bytes());
+    packet.reserve(remaining.size() + frames * kFrameHeaderSize);
+    while (!remaining.empty()) {
+        const size_t chunk = std::min(remaining.size(), kMaxFramePayload);
+        auto ok = AppendFrameBytesTo(packet, cmd, sid, remaining.first(chunk));
         if (!ok) {
             co_return tl::unexpected(ok.error());
         }
+        remaining = remaining.subspan(chunk);
     }
     mb.clear();
     co_return co_await WriteAnyTlsPacketWithPadding(stream, records, std::move(packet));

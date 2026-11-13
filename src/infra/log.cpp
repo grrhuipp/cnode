@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <array>
+#include <charconv>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -98,18 +99,20 @@ std::string_view LevelName(LogLevel level) noexcept {
     return "?";
 }
 
-std::string FormatConsoleTimestamp(int64_t timestamp_us) {
+void AppendConsoleTimestamp(std::string& out, int64_t timestamp_us) {
     const auto tm = common::LocalTime(static_cast<std::time_t>(timestamp_us / 1'000'000));
     char buffer[48]{};
     const auto written = std::strftime(
         buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S%z", &tm);
-    if (written == 0) return {};
-    std::string result(buffer, written);
-    if (result.size() >= 5 &&
-        (result[result.size() - 5] == '+' || result[result.size() - 5] == '-')) {
-        result.insert(result.size() - 2, 1, ':');
+    if (written == 0) return;
+    if (written >= 5 &&
+        (buffer[written - 5] == '+' || buffer[written - 5] == '-')) {
+        out.append(buffer, written - 2);
+        out.push_back(':');
+        out.append(buffer + written - 2, 2);
+    } else {
+        out.append(buffer, written);
     }
-    return result;
 }
 
 std::string_view ConsoleLevelName(LogLevel level) noexcept {
@@ -155,40 +158,6 @@ std::string_view AfterMarker(std::string_view file, std::string_view name) {
     return rest;
 }
 
-std::string_view TransportInternetComponent(std::string_view relative) {
-    constexpr std::string_view kPrefix = "transport/internet/";
-    if (!relative.starts_with(kPrefix)) {
-        return {};
-    }
-    const auto leaf = relative.substr(kPrefix.size());
-    if (leaf.starts_with("tcp")) {
-        return "transport/internet/tcp";
-    }
-    if (leaf.starts_with("udp")) {
-        return "transport/internet/udp";
-    }
-    if (leaf.starts_with("tls") || leaf.starts_with("ssl")) {
-        return "transport/internet/tls";
-    }
-    if (leaf.starts_with("reality")) {
-        return "transport/internet/reality";
-    }
-    if (leaf.starts_with("ws") || leaf.find("websocket") != std::string_view::npos) {
-        return "transport/internet/websocket";
-    }
-    if (leaf.starts_with("grpc")) {
-        return "transport/internet/grpc";
-    }
-    if (leaf.starts_with("xhttp")) {
-        return "transport/internet/xhttp";
-    }
-    if (leaf.find("httpupgrade") != std::string_view::npos ||
-        leaf.find("http_upgrade") != std::string_view::npos) {
-        return "transport/internet/httpupgrade";
-    }
-    return "transport/internet";
-}
-
 std::string ComponentName(std::string_view file) {
     auto relative = AfterMarker(file, "src");
     if (relative.empty()) {
@@ -210,11 +179,6 @@ std::string ComponentName(std::string_view file) {
     }
     if (normalized.empty()) {
         return "cnode";
-    }
-
-    if (const auto transport = TransportInternetComponent(normalized);
-        !transport.empty()) {
-        return std::string(transport);
     }
 
     size_t parts = 1;
@@ -256,47 +220,82 @@ void AppendEscapedLogText(std::string& result, std::string_view text, bool quote
     if (quoted) result.push_back('"');
 }
 
-std::string EscapeLogText(std::string_view text, bool quoted = false) {
-    std::string result;
-    result.reserve(text.size() + (quoted ? 2 : 0));
-    AppendEscapedLogText(result, text, quoted);
-    return result;
-}
-
-std::string ConsoleField(std::string_view value) {
+void AppendConsoleField(std::string& out, std::string_view value) {
     const bool quote = value.empty() || value.find_first_not_of(
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-") !=
         std::string_view::npos;
-    return EscapeLogText(value, quote);
+    AppendEscapedLogText(out, value, quote);
 }
 
-std::string PanelOrigin(std::string_view host) {
+void AppendPanelOrigin(std::string& out, std::string_view host) {
     const auto scheme_end = host.find("://");
-    if (scheme_end == std::string_view::npos) return "<invalid host>";
+    if (scheme_end == std::string_view::npos) {
+        out.append("\"<invalid host>\"");
+        return;
+    }
     const auto scheme = host.substr(0, scheme_end);
-    if (scheme != "https" && scheme != "http") return "<invalid host>";
+    if (scheme != "https" && scheme != "http") {
+        out.append("\"<invalid host>\"");
+        return;
+    }
     auto authority = host.substr(scheme_end + 3);
     authority = authority.substr(0, authority.find_first_of("/?#"));
     if (const auto credentials = authority.rfind('@'); credentials != std::string_view::npos) {
         authority.remove_prefix(credentials + 1);
     }
-    if (authority.empty() || authority.find_first_of("\r\n\t\\ ") != std::string_view::npos)
-        return "<invalid host>";
-    return std::format("{}://{}", scheme, authority);
+    if (authority.empty() || authority.find_first_of("\r\n\t\\ ") != std::string_view::npos) {
+        out.append("\"<invalid host>\"");
+        return;
+    }
+    constexpr char kHex[] = "0123456789abcdef";
+    out.push_back('"');
+    out.append(scheme);
+    out.append("://");
+    for (const unsigned char ch : authority) {
+        if (ch == '"') {
+            out.append("\\\"");
+        } else if (ch < 0x20 || ch == 0x7f) {
+            out.append("\\x");
+            out.push_back(kHex[ch >> 4]);
+            out.push_back(kHex[ch & 0x0f]);
+        } else {
+            out.push_back(static_cast<char>(ch));
+        }
+    }
+    out.push_back('"');
 }
 
 std::string FormatConsoleRecord(int64_t timestamp_us,
                                 LogLevel level,
                                 std::string_view message,
                                 const PanelLogContext* panel = nullptr) {
-    auto line = std::format("time=\"{}\" level={} msg={}",
-        FormatConsoleTimestamp(timestamp_us), ConsoleLevelName(level),
-        EscapeLogText(message, true));
+    std::string line;
+    line.reserve(64 + message.size() + (panel ? 64 : 0));
+    line.append("time=\"");
+    AppendConsoleTimestamp(line, timestamp_us);
+    line.append("\" level=");
+    line.append(ConsoleLevelName(level));
+    line.append(" msg=");
+    AppendEscapedLogText(line, message, true);
     if (panel) {
-        if (!panel->host.empty()) line.append(" Host=").append(ConsoleField(PanelOrigin(panel->host)));
-        if (panel->node_id > 0) line.append(std::format(" ID={}", panel->node_id));
-        if (!panel->name.empty()) line.append(" Name=").append(ConsoleField(panel->name));
-        if (!panel->type.empty()) line.append(" Type=").append(ConsoleField(panel->type));
+        if (!panel->host.empty()) {
+            line.append(" Host=");
+            AppendPanelOrigin(line, panel->host);
+        }
+        if (panel->node_id > 0) {
+            line.append(" ID=");
+            char id_buf[24];
+            auto [ptr, ec] = std::to_chars(id_buf, id_buf + sizeof(id_buf), panel->node_id);
+            if (ec == std::errc{}) line.append(id_buf, ptr);
+        }
+        if (!panel->name.empty()) {
+            line.append(" Name=");
+            AppendConsoleField(line, panel->name);
+        }
+        if (!panel->type.empty()) {
+            line.append(" Type=");
+            AppendConsoleField(line, panel->type);
+        }
     }
     return line;
 }
@@ -1550,10 +1549,12 @@ void Log::WritePanel(LogLevel level,
             ? std::format("[{}/{}] {}", context.name, context.node_id, message)
             : std::format("[{}] {}", context.name, message);
         if (!context.host.empty()) {
-            diagnostic.append(" Host=").append(ConsoleField(PanelOrigin(context.host)));
+            diagnostic.append(" Host=");
+            AppendPanelOrigin(diagnostic, context.host);
         }
         if (!context.type.empty()) {
-            diagnostic.append(" Type=").append(ConsoleField(context.type));
+            diagnostic.append(" Type=");
+            AppendConsoleField(diagnostic, context.type);
         }
         g_async_log_backend.Enqueue(LogRecord{
             .channel = LogChannel::Error,

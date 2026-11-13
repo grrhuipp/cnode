@@ -99,8 +99,7 @@ bool AttachQuicReuseportBpf(int fd, uint32_t worker_count) noexcept {
 namespace {
 
 
-// The C libraries need realloc semantics; use mimalloc's native API rather than
-// sized PMR deallocation, allocation headers or a per-connection resource.
+// The C libraries need realloc semantics; use mimalloc's native API directly.
 void* AllocateQuicMemory(size_t size, void*) {
     return mi_malloc(size);
 }
@@ -723,9 +722,10 @@ int HysteriaConnection::OpenStream(ngtcp2_conn*, int64_t stream_id, void* user_d
 int HysteriaConnection::CloseStream(ngtcp2_conn* conn, uint32_t flags, int64_t stream_id,
     uint64_t app_error_code, void* user_data, void*) {
     auto& self = *static_cast<HysteriaConnection*>(user_data);
+    auto h3_it = self.core_->h3_requests.find(stream_id);
     if (self.core_->http &&
         (!ngtcp2_is_bidi_stream(stream_id) ||
-         self.core_->h3_requests.contains(stream_id))) {
+         h3_it != self.core_->h3_requests.end())) {
         const int result = nghttp3_conn_close_stream(
             self.core_->http, stream_id, app_error_code);
         if (result != 0 && result != NGHTTP3_ERR_STREAM_NOT_FOUND)
@@ -739,8 +739,10 @@ int HysteriaConnection::CloseStream(ngtcp2_conn* conn, uint32_t flags, int64_t s
         self.core_->streams.erase(it);
         common::MaybeShrinkHashContainer(self.core_->streams, 8);
     }
-    self.core_->h3_requests.erase(stream_id);
-    common::MaybeShrinkHashContainer(self.core_->h3_requests, 8);
+    if (h3_it != self.core_->h3_requests.end()) {
+        self.core_->h3_requests.erase(h3_it);
+        common::MaybeShrinkHashContainer(self.core_->h3_requests, 8);
+    }
     if (state) {
         if (conn != nullptr &&
             (flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET) == 0) {

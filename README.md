@@ -353,7 +353,7 @@ time="2026-11-05T12:30:00+08:00" level=info msg="Panel status: state=ready inbou
 **错误文件**：受 `loglevel` 控制的诊断，时间精确到微秒。连接记录带完整 64 位连接 ID、组件、已有路由与已确认 UID。
 
 ```text
-2026/11/05 12:30:02.123456 [Warning] [4294967303] proxy/vless/inbound: [vless-in] authentication failed from 192.0.2.10:52001 > no matching user
+2026/11/05 12:30:02.123456 [Warning] [4294967303] proxy/vless: [vless-in] authentication failed from 192.0.2.10:52001 > no matching user
 ```
 
 控制台普通诊断同样遵守 `loglevel`，连接认证失败不刷控制台；面板警告与错误同时进入控制台和错误文件。常规控制台 Error 使用 stderr，其余级别使用 stdout；日志后端自身的故障与恢复诊断走 stderr。`none` 不隐藏访问事实或致命启动失败。正常 EOF、取消和停机不输出 Warning/Error。

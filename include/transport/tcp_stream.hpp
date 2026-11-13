@@ -66,8 +66,6 @@ public:
     void PrependReadMultiBuffer(common::MultiBuffer&& mb) override;
     [[nodiscard]] std::optional<DetachedTcpState> DetachForHandoff(
         common::MultiBuffer prefix = {});
-    [[nodiscard]] std::optional<DetachedTcpState> DetachForHandoff(
-        std::span<const uint8_t> prefix);
     [[nodiscard]] static std::unique_ptr<TcpStream> RestoreFromHandoff(
         net::io_context& io_context, DetachedTcpState state);
 

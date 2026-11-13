@@ -1,6 +1,5 @@
 #pragma once
 #include "common/allocator.hpp"
-#include "common/unsafe.hpp"
 #include "transport/http_headers.hpp"
 #include <array>
 #include <limits>
@@ -98,8 +97,10 @@ public:
                 return false;
             }
             if (*name_index == 0) {
-                auto name = ReadString(block, offset);
-                auto value = name ? ReadString(block, offset) : std::nullopt;
+                std::string name_scratch;
+                std::string value_scratch;
+                auto name = ReadStringViewOrDecode(block, offset, name_scratch);
+                auto value = name ? ReadStringViewOrDecode(block, offset, value_scratch) : std::nullopt;
                 if (!value || !emit_field(*name, *value)) {
                     return false;
                 }
@@ -108,7 +109,8 @@ public:
                 if (!indexed) {
                     return false;
                 }
-                auto value = ReadString(block, offset);
+                std::string value_scratch;
+                auto value = ReadStringViewOrDecode(block, offset, value_scratch);
                 if (!value || !emit_field(indexed->name, *value)) {
                     return false;
                 }
@@ -348,9 +350,10 @@ private:
         return out;
     }
 
-    static std::optional<std::string> ReadString(
+    static std::optional<std::string_view> ReadStringViewOrDecode(
         std::span<const uint8_t> block,
-        size_t& offset) {
+        size_t& offset,
+        std::string& scratch) {
         if (offset >= block.size()) {
             return std::nullopt;
         }
@@ -362,11 +365,24 @@ private:
         std::span<const uint8_t> encoded(block.data() + offset, *len);
         offset += *len;
         if (huffman) {
-            return DecodeHuffman(encoded);
+            auto decoded = DecodeHuffman(encoded);
+            if (!decoded) return std::nullopt;
+            scratch = std::move(*decoded);
+            return scratch;
         }
-        return std::string(
-            common::ptr_cast<const char>(encoded.data()),
+        return std::string_view(
+            reinterpret_cast<const char*>(encoded.data()),
             encoded.size());
+    }
+
+    static std::optional<std::string> ReadString(
+        std::span<const uint8_t> block,
+        size_t& offset) {
+        std::string scratch;
+        auto view = ReadStringViewOrDecode(block, offset, scratch);
+        if (!view) return std::nullopt;
+        if (!scratch.empty() || view->empty()) return scratch;
+        return std::string(*view);
     }
 
     // Static entries first, then the dynamic table newest-first (RFC 7541 2.3.3).

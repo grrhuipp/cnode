@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/ascii.hpp"
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -20,6 +21,20 @@ enum class DomainStrategy : uint8_t {
     ForceIPv4,
 };
 
-[[nodiscard]] std::optional<DomainStrategy> ParseDomainStrategy(std::string_view value);
+[[nodiscard]] inline std::optional<DomainStrategy> ParseDomainStrategy(
+    std::string_view value) noexcept {
+    if (common::EqualsAsciiCI(value, "asis")) return DomainStrategy::AsIs;
+    if (common::EqualsAsciiCI(value, "useip")) return DomainStrategy::UseIP;
+    if (common::EqualsAsciiCI(value, "useipv6v4")) return DomainStrategy::UseIPv6v4;
+    if (common::EqualsAsciiCI(value, "useipv4")) return DomainStrategy::UseIPv4;
+    if (common::EqualsAsciiCI(value, "useipv4v6")) return DomainStrategy::UseIPv4v6;
+    if (common::EqualsAsciiCI(value, "useipv6")) return DomainStrategy::UseIPv6;
+    if (common::EqualsAsciiCI(value, "forceip")) return DomainStrategy::ForceIP;
+    if (common::EqualsAsciiCI(value, "forceipv6v4")) return DomainStrategy::ForceIPv6v4;
+    if (common::EqualsAsciiCI(value, "forceipv6")) return DomainStrategy::ForceIPv6;
+    if (common::EqualsAsciiCI(value, "forceipv4v6")) return DomainStrategy::ForceIPv4v6;
+    if (common::EqualsAsciiCI(value, "forceipv4")) return DomainStrategy::ForceIPv4;
+    return std::nullopt;
+}
 
 }  // namespace proxy

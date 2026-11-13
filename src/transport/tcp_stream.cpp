@@ -696,15 +696,6 @@ std::optional<DetachedTcpState> TcpStream::DetachForHandoff(
     return state;
 }
 
-std::optional<DetachedTcpState> TcpStream::DetachForHandoff(
-    std::span<const uint8_t> prefix) {
-    common::MultiBuffer mb;
-    if (!prefix.empty() && !mb.AppendSpan(prefix)) {
-        throw std::bad_alloc();
-    }
-    return DetachForHandoff(std::move(mb));
-}
-
 std::unique_ptr<TcpStream> TcpStream::RestoreFromHandoff(
     net::io_context& io_context, DetachedTcpState state) {
     if (state.fd < 0) return nullptr;

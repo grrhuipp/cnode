@@ -1,6 +1,7 @@
 #pragma once
 
 #include "proxy/shadowsocks/ss_udp.hpp"
+#include "proxy/shadowsocks/ss_stream.hpp"
 #include "proxy/inbound.hpp"
 
 namespace app { struct AdmissionEnvironment; }
@@ -40,4 +41,25 @@ private:
     size_t last_matched_index_ = 0;
 };
 
+
+struct ReadTCPSessionResult {
+    std::shared_ptr<const app::UserStore::ShadowsocksCredential> user;
+    common::TargetAddress target;
+    std::optional<common::ForwardedMetadata> forwarded;
+    common::InitialPayload initial_payload;
+    std::optional<BodyReader> body_reader;
+    KeyBytes request_salt;
+};
+
+[[nodiscard]] net::awaitable<tl::expected<ReadTCPSessionResult, common::ErrorCode>>
+ReadTCPSession(transport::AsyncStream& stream,
+               const SsCipherInfo& cipher_info,
+               std::string_view tag,
+               size_t& last_matched_index);
+
+[[nodiscard]] tl::expected<SsStreamWriter, common::ErrorCode>
+WriteTCPResponse(const app::UserStore::ShadowsocksCredential& user,
+                 const SsCipherInfo& cipher_info,
+                 const KeyBytes& request_salt,
+                 transport::AsyncStream& stream);
 }  // namespace proxy

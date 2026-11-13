@@ -1,6 +1,4 @@
 #include "transport/h2_frame.hpp"
-#include <string>
-#include <vector>
 
 namespace transport {
 // Returns nullopt only on a clean EOF at a frame boundary.

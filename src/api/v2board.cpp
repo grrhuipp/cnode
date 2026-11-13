@@ -120,7 +120,7 @@ std::string FormatReportFailure(const PanelHttpResponse& response, std::string_v
     return summary;
 }
 
-std::string MethodName(HttpMethod method) {
+std::string_view MethodName(HttpMethod method) noexcept {
     switch (method) {
         case HttpMethod::Get: return "GET";
         case HttpMethod::Post: return "POST";
@@ -403,19 +403,20 @@ APIClient::HttpExchange(HttpMethod method,
         }
     }
 
-    // 构建完整路径（所有请求都在 URL 参数中传 token）
-    std::string full_path = url_parts_.path_prefix + path;
-    if (full_path.find('?') != std::string::npos) {
-        full_path += "&token=" + config_.Key;
-    } else {
-        full_path += "?token=" + config_.Key;
-    }
-
+    const bool has_query = url_parts_.path_prefix.find('?') != std::string::npos ||
+                           path.find('?') != std::string::npos;
     std::string request;
-    request.reserve(512 + body_text.size());
+    request.reserve(512 + url_parts_.path_prefix.size() + path.size() + body_text.size());
     request += MethodName(method);
     request += ' ';
-    request += full_path.empty() ? "/" : full_path;
+    if (url_parts_.path_prefix.empty() && path.empty()) {
+        request += '/';
+    } else {
+        request += url_parts_.path_prefix;
+        request += path;
+    }
+    request += has_query ? "&token=" : "?token=";
+    request += config_.Key;
     request += " HTTP/1.1\r\nHost: ";
     request += host_header_;
     request += "\r\nUser-Agent: acppnode/1.0\r\nAuthorization: Bearer ";
@@ -1107,7 +1108,7 @@ tl::expected<NodeInfo, std::string> ParseNodeInfo(
     }
 
     NodeInfo config;
-    config.NodeType = common::LowerAscii(std::string(node_type));
+    config.NodeType = common::LowerAscii(node_type);
     config.Port = *port;
 
     if (auto ok = AssignOptionalNodeString(
@@ -1138,7 +1139,7 @@ tl::expected<NodeInfo, std::string> ParseNodeInfo(
             }
             std::optional<std::string> host;
             for (const auto& [name, raw_value] : headers->as_object()) {
-                if (common::LowerAscii(name) != "host") {
+                if (!common::EqualsAsciiCI(name, "host")) {
                     continue;
                 }
                 if (!raw_value.is_string()) {
@@ -1217,9 +1218,9 @@ tl::expected<NodeInfo, std::string> ParseNodeInfo(
             source, "server_key", config.ShadowsocksServerKey); !ok) {
         return tl::unexpected(std::move(ok.error()));
     }
-    std::string ignored_host;
-    if (auto ok = AssignOptionalNodeString(source, "host", ignored_host); !ok) {
-        return tl::unexpected(std::move(ok.error()));
+    if (const auto* host = source.if_contains("host");
+        host && !host->is_null() && !host->is_string()) {
+        return tl::unexpected("host must be a string");
     }
 
     if (config.NodeType == common::kShadowsocks) {

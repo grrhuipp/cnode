@@ -1,5 +1,4 @@
 #include "proxy/shadowsocks/ss_inbound.hpp"
-#include "proxy/shadowsocks/ss_stream.hpp"
 #include "proxy/shadowsocks/ss_salt_pool.hpp"
 #include "proxy/handshake_errors.hpp"
 #include "common/scoped_cleanse.hpp"

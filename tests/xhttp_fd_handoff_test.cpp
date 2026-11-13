@@ -34,7 +34,9 @@ TEST(XhttpFdHandoff, TcpStaticBoundaryDetachAndRestorePreservesPrefixAndStream) 
     const size_t n = read_fut.get();
     ASSERT_EQ(n, head_buf.size());
 
-    auto detached = server_stream->DetachForHandoff({head_buf.data(), n});
+    common::MultiBuffer head_mb;
+    ASSERT_TRUE(head_mb.AppendSpan({head_buf.data(), n}));
+    auto detached = server_stream->DetachForHandoff(std::move(head_mb));
     ASSERT_TRUE(detached.has_value());
     server_stream.reset();
 
@@ -115,7 +117,9 @@ TEST(XhttpFdHandoff, TlsStaticBoundaryDetachAndRestorePreservesSessionAndPlainte
     server_fut.get();
     ASSERT_EQ(prefix_n, prefix.size());
 
-    auto detached = server_tls->DetachForHandoff({prefix.data(), prefix_n});
+    common::MultiBuffer prefix_mb;
+    ASSERT_TRUE(prefix_mb.AppendSpan({prefix.data(), prefix_n}));
+    auto detached = server_tls->DetachForHandoff(std::move(prefix_mb));
     ASSERT_TRUE(detached.has_value());
     server_tls.reset();
 

@@ -170,15 +170,8 @@ bool TrojanUdpFramer::Next(TrojanFramedUdpPacket& out) {
     if (state_ == State::Finished) return false;
     if (!target_) {
         // SOCKS5 address without metadata, length and CRLF only.
-        std::array<uint8_t, kMaxUdpPacketHeaderSize> scratch;
-        const size_t copied = std::min(pending_.byte_size(), scratch.size());
-        std::span<const uint8_t> header = pending_.FrontSpan();
-        if (header.size() >= copied) {
-            header = header.first(copied);
-        } else {
-            (void)pending_.CopyPrefixTo(std::span<uint8_t>(scratch.data(), copied));
-            header = std::span<const uint8_t>(scratch.data(), copied);
-        }
+        const size_t copied = std::min(pending_.byte_size(), kMaxUdpPacketHeaderSize);
+        const std::span<const uint8_t> header = pending_.FrontSpan().first(copied);
         auto address = common::DecodeAddress(
             header,
             common::AddressWireFormat::Socks5,

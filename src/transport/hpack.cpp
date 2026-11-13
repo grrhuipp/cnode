@@ -1,6 +1,4 @@
 #include "transport/hpack.hpp"
-#include <string>
-#include <vector>
 
 namespace transport {
 void AppendHpackInt(std::vector<uint8_t>& out,

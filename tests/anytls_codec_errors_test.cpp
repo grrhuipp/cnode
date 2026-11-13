@@ -267,3 +267,78 @@ TEST(AnytlsCodecErrors, HandshakeEofDistinguishesCloseFromTruncation) {
                                      : common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 }
+
+TEST(AnytlsCodecErrors, LargeMultiBufferSplitsIntoMaxPayloadFrames) {
+    class RecordingStream final : public transport::AsyncStream {
+    public:
+        std::vector<uint8_t> written;
+        net::awaitable<size_t> AsyncRead(net::mutable_buffer) override { co_return 0; }
+        net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
+            const auto* data = static_cast<const uint8_t*>(buffer.data());
+            written.insert(written.end(), data, data + buffer.size());
+            co_return buffer.size();
+        }
+        net::awaitable<common::MultiBuffer> ReadMultiBuffer() override { co_return common::MultiBuffer{}; }
+        void ShutdownWrite() override {}
+        void Cancel() noexcept override { NotifyCancellation(); }
+        void Close() override {}
+        int NativeHandle() const override { return -1; }
+        bool IsOpen() const override { return true; }
+    };
+
+    constexpr size_t kTotalBytes = proxy::kMaxFramePayload + 4465;
+    std::vector<uint8_t> expected(kTotalBytes);
+    for (size_t i = 0; i < expected.size(); ++i) {
+        expected[i] = static_cast<uint8_t>((i * 131u + 17u) & 0xffu);
+    }
+
+    const proxy::AnyTlsPaddingScheme no_padding;
+    for (const bool padded_path : {false, true}) {
+        common::MultiBuffer payload;
+        ASSERT_TRUE(payload.AppendSpan(expected));
+        ASSERT_GT(payload.FrontSpan().size(), proxy::kMaxFramePayload);
+
+        net::io_context io;
+        RecordingStream stream;
+        tl::expected<void, common::ErrorCode> outcome = tl::unexpected(common::ErrorCode::INTERNAL);
+        net::co_spawn(
+            io,
+            padded_path
+                ? proxy::WriteAnyTlsMultiBufferAsFramesWithPadding(
+                      stream, no_padding, 0, uint8_t{2}, 0x01020304u, std::move(payload))
+                : proxy::WriteMultiBufferAsFrameBatch(
+                      stream, uint8_t{2}, 0x01020304u, std::move(payload)),
+            [&](std::exception_ptr error, tl::expected<void, common::ErrorCode> res) {
+                ASSERT_FALSE(error);
+                outcome = res;
+            });
+        io.run();
+        ASSERT_TRUE(outcome.has_value());
+        ASSERT_EQ(stream.written.size(), 2 * proxy::kFrameHeaderSize + kTotalBytes);
+
+        std::vector<uint8_t> decoded;
+        size_t offset = 0;
+        std::vector<uint16_t> lengths;
+        while (offset < stream.written.size()) {
+            ASSERT_LE(offset + proxy::kFrameHeaderSize, stream.written.size());
+            EXPECT_EQ(stream.written[offset], uint8_t{2});
+            const uint32_t sid = (uint32_t(stream.written[offset + 1]) << 24) |
+                                 (uint32_t(stream.written[offset + 2]) << 16) |
+                                 (uint32_t(stream.written[offset + 3]) << 8) |
+                                 uint32_t(stream.written[offset + 4]);
+            EXPECT_EQ(sid, 0x01020304u);
+            const uint16_t len = (uint16_t(stream.written[offset + 5]) << 8) |
+                                 uint16_t(stream.written[offset + 6]);
+            lengths.push_back(len);
+            offset += proxy::kFrameHeaderSize;
+            ASSERT_LE(offset + len, stream.written.size());
+            decoded.insert(decoded.end(),
+                           stream.written.begin() + static_cast<ptrdiff_t>(offset),
+                           stream.written.begin() + static_cast<ptrdiff_t>(offset + len));
+            offset += len;
+        }
+        EXPECT_EQ(lengths, (std::vector<uint16_t>{65535, 4465}));
+        EXPECT_EQ(decoded, expected);
+        EXPECT_EQ(common::test_buffers_live, 0);
+    }
+}

@@ -2,7 +2,6 @@
 #include "common/scoped_cleanse.hpp"
 #include "transport/http1_handshake.hpp"
 #include "common/binary_text_codec.hpp"
-#include "common/unsafe.hpp"
 #include "common/const_buffer_span.hpp"
 #include "infra/log.hpp"
 
@@ -377,35 +376,52 @@ net::awaitable<void> BaseWsStream::WriteDataFrame(
             output.AppendBuffers(buffers);
             co_await inner_->WriteBuffers(output.Span());
         } else {
-            common::BufferGuard scratch{common::Buffer::New()};
-            if (!scratch) throw std::bad_alloc();
-            std::memcpy(scratch->Tail().data(), header.bytes.data(), header.size);
-            scratch->Produce(static_cast<uint32_t>(header.size));
-            size_t offset = 0;
-            for (const auto& buffer : buffers) {
-                const auto* data = static_cast<const uint8_t*>(buffer.data());
-                size_t remaining = buffer.size();
-                while (remaining != 0) {
-                    if (scratch->Available() == 0) {
-                        const auto bytes = scratch->Bytes();
-                        const net::const_buffer output(bytes.data(), bytes.size());
-                        co_await inner_->WriteBuffers({&output, 1});
-                        scratch->Reset();
-                    }
-                    const size_t chunk = std::min(remaining, static_cast<size_t>(scratch->Available()));
-                    uint8_t* dst = scratch->Tail().data();
-                    std::memcpy(dst, data, chunk);
-                    MaskData(dst, chunk, mask, offset);
-                    scratch->Produce(static_cast<uint32_t>(chunk));
-                    data += chunk;
-                    remaining -= chunk;
-                    offset += chunk;
+            static constexpr size_t kInlineFrameCapacity = 512;
+            if (header.size + size <= kInlineFrameCapacity) {
+                std::array<uint8_t, kInlineFrameCapacity> inline_frame{};
+                std::memcpy(inline_frame.data(), header.bytes.data(), header.size);
+                size_t write_pos = header.size;
+                size_t offset = 0;
+                for (const auto& buffer : buffers) {
+                    if (buffer.size() == 0) continue;
+                    std::memcpy(inline_frame.data() + write_pos, buffer.data(), buffer.size());
+                    MaskData(inline_frame.data() + write_pos, buffer.size(), mask, offset);
+                    write_pos += buffer.size();
+                    offset += buffer.size();
                 }
-            }
-            if (!scratch->IsEmpty()) {
-                const auto bytes = scratch->Bytes();
-                const net::const_buffer output(bytes.data(), bytes.size());
+                const net::const_buffer output(inline_frame.data(), write_pos);
                 co_await inner_->WriteBuffers({&output, 1});
+            } else {
+                common::BufferGuard scratch{common::Buffer::New()};
+                if (!scratch) throw std::bad_alloc();
+                std::memcpy(scratch->Tail().data(), header.bytes.data(), header.size);
+                scratch->Produce(header.size);
+                size_t offset = 0;
+                for (const auto& buffer : buffers) {
+                    const auto* data = static_cast<const uint8_t*>(buffer.data());
+                    size_t remaining = buffer.size();
+                    while (remaining != 0) {
+                        if (scratch->Available() == 0) {
+                            const auto bytes = scratch->Bytes();
+                            const net::const_buffer output(bytes.data(), bytes.size());
+                            co_await inner_->WriteBuffers({&output, 1});
+                            scratch->Reset();
+                        }
+                        const size_t chunk = std::min(remaining, scratch->Available());
+                        uint8_t* dst = scratch->Tail().data();
+                        std::memcpy(dst, data, chunk);
+                        MaskData(dst, chunk, mask, offset);
+                        scratch->Produce(chunk);
+                        data += chunk;
+                        remaining -= chunk;
+                        offset += chunk;
+                    }
+                }
+                if (!scratch->IsEmpty()) {
+                    const auto bytes = scratch->Bytes();
+                    const net::const_buffer output(bytes.data(), bytes.size());
+                    co_await inner_->WriteBuffers({&output, 1});
+                }
             }
         }
     } catch (...) {
@@ -438,11 +454,9 @@ net::awaitable<void> BaseWsStream::WriteMultiBuffer(common::MultiBuffer buffers)
         ~ClearOnExit() { mb.clear(); }
     } clear_guard{buffers};
     CheckWritable();
-    size_t size = 0;
-    for (const auto* buffer : buffers) {
-        if (!buffer || buffer->IsEmpty()) continue;
-        AddPayloadSize(size, buffer->Len());
-    }
+    const size_t size = buffers.byte_size();
+    if (size > kMaxFrameSize)
+        throw IoSystemError(io_error::message_size, "WebSocket frame exceeds payload budget");
     if (size == 0) co_return;
     const auto state = co_await net::this_coro::cancellation_state;
     if (closed_ || state.cancelled() != net::cancellation_type::none)

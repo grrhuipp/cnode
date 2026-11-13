@@ -5,7 +5,6 @@
 #include "transport/async_write_gate.hpp"
 #include "transport/stream_settings.hpp"
 #include "infra/log.hpp"
-#include "common/unsafe.hpp"
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -686,15 +685,6 @@ std::optional<DetachedTlsState> TlsStream::DetachForHandoff(
     return state;
 }
 
-std::optional<DetachedTlsState> TlsStream::DetachForHandoff(
-    std::span<const uint8_t> plaintext_prefix) {
-    common::MultiBuffer mb;
-    if (!plaintext_prefix.empty() && !mb.AppendSpan(plaintext_prefix)) {
-        throw std::bad_alloc();
-    }
-    return DetachForHandoff(std::move(mb));
-}
-
 std::unique_ptr<TlsStream> TlsStream::RestoreFromHandoff(
     net::io_context& io_context, DetachedTlsState state) {
     if (!state.ssl || state.tcp.fd < 0) return nullptr;
@@ -816,7 +806,7 @@ std::string_view TlsStream::NegotiatedAlpn() const {
     SSL_get0_alpn_selected(ssl, &data, &len);
 
     if (data && len > 0) {
-        return std::string_view(common::ptr_cast<const char>(data), len);
+        return std::string_view(reinterpret_cast<const char*>(data), len);
     }
     return {};
 }

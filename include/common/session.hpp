@@ -135,7 +135,6 @@ struct Inbound {
     }
     ForwardedMetadataView MakeForwardedMetadata() const&& = delete;
 };
-using ClientIpSource = Inbound::ClientIpSource;
 
 
 // xray-core common/session.Outbound 对应的出站目标/路由元数据。

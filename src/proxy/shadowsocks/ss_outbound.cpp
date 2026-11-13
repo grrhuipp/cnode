@@ -1,5 +1,4 @@
 #include "proxy/shadowsocks/ss_outbound.hpp"
-#include "proxy/shadowsocks/ss_stream.hpp"
 namespace proxy {
 class SsOutboundHandler final : public ::proxy::Outbound {
 public:

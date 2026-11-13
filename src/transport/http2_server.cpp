@@ -1,6 +1,4 @@
 #include "transport/http2_server.hpp"
-#include "common/allocator.hpp"
-#include <vector>
 
 namespace transport {
 // The release signal lives in this frame and is published only while it
@@ -722,8 +720,14 @@ net::awaitable<void> Http2ServerSession::FlushReceiveCredit() {
             if (conn_increment != 0) {
                 connection_receive_window_ += conn_increment;
             }
-            uint32_t target_stream_id = 0;
-            uint32_t stream_increment = 0;
+            static constexpr size_t kMaxBatchedStreamUpdates = 16;
+            std::array<uint8_t, 13 * (1 + kMaxBatchedStreamUpdates)> frames{};
+            size_t encoded_bytes = 0;
+            if (conn_increment != 0) {
+                EncodeWindowUpdateFrame(frames.data(), 0, conn_increment);
+                encoded_bytes += 13;
+            }
+            size_t batched_streams = 0;
             bool more_streams = false;
             // Do not retain an unordered_map iterator over an await.
             for (auto& [stream_id, sub] : streams_) {
@@ -732,17 +736,24 @@ net::awaitable<void> Http2ServerSession::FlushReceiveCredit() {
                     continue;
                 }
                 if (sub->ConsumedCredit() == 0) continue;
-                if (stream_increment == 0) {
-                    target_stream_id = stream_id;
-                    stream_increment = std::exchange(sub->ConsumedCredit(), 0);
-                    sub->ReceiveWindow() += stream_increment;
+                if (batched_streams < kMaxBatchedStreamUpdates) {
+                    const uint32_t inc = std::exchange(sub->ConsumedCredit(), 0);
+                    sub->ReceiveWindow() += inc;
+                    EncodeWindowUpdateFrame(frames.data() + encoded_bytes, stream_id, inc);
+                    encoded_bytes += 13;
+                    ++batched_streams;
                 } else {
                     more_streams = true;
                 }
             }
-            if (conn_increment == 0 && stream_increment == 0) break;
-            co_await SendWindowUpdates(
-                *stream_, conn_increment, target_stream_id, stream_increment);
+            if (encoded_bytes == 0) break;
+            const net::const_buffer buf = net::buffer(frames.data(), encoded_bytes);
+            try {
+                co_await stream_->WriteBuffers(std::span<const net::const_buffer>(&buf, 1));
+            } catch (...) {
+                stream_->CloseAbortive();
+                throw;
+            }
             if (!more_streams && consumed_connection_credit_ == 0) break;
         }
     } catch (...) {

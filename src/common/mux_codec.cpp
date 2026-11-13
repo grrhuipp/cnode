@@ -5,15 +5,8 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
-#include <cstring>
-#include <exception>
 #include <limits>
-#include <memory>
-#include <new>
-#include <unordered_map>
 #include <utility>
-#include <vector>
 namespace common {
 
 namespace {
@@ -135,32 +128,15 @@ constexpr size_t kMaxFrameMetadataBytes = 4 + 1 + kMaxEncodedAddressSize + 8;
 }  // namespace
 
 std::optional<FrameHeader> DecodeFrame(const MultiBuffer& data) {
-    const size_t total_len = data.byte_size();
-    if (total_len < 2) {
+    const auto front = data.FrontSpan();
+    if (front.size() < 2) {
         return std::nullopt;
     }
-    const auto front = data.FrontSpan();
-    uint16_t meta_len = 0;
-    if (front.size() >= 2) {
-        meta_len = LoadU16BE(front.data());
-    } else {
-        std::array<uint8_t, 2> len_bytes{};
-        if (data.CopyPrefixTo(len_bytes) < 2) {
-            return std::nullopt;
-        }
-        meta_len = LoadU16BE(len_bytes.data());
-    }
+    const uint16_t meta_len = LoadU16BE(front.data());
     if (meta_len < 4 || meta_len > kMaxFrameMetadataBytes) {
         return FrameHeader{};
     }
-    const size_t needed_prefix = std::min(total_len, size_t{2} + meta_len + 2);
-    if (front.size() >= needed_prefix) {
-        return DecodeFramePrefix(front, total_len);
-    }
-    std::array<uint8_t, kMaxFrameHeaderBytes> prefix{};
-    const size_t copied = data.CopyPrefixTo(
-        std::span<uint8_t>(prefix.data(), needed_prefix));
-    return DecodeFramePrefix(std::span<const uint8_t>(prefix.data(), copied), total_len);
+    return DecodeFramePrefix(front, front.size());
 }
 
 // ============================================================================

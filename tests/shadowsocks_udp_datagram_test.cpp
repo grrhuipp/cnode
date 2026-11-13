@@ -2,7 +2,8 @@
 #include <gtest/gtest.h>
 
 #include "proxy/shadowsocks/ss_udp.hpp"
-#include "proxy/shadowsocks/ss_stream.hpp"
+#include "proxy/shadowsocks/ss_inbound.hpp"
+#include "proxy/shadowsocks/ss_outbound.hpp"
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>

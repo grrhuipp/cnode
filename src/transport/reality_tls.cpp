@@ -151,20 +151,22 @@ ParseRealityMldsa65PublicKey(std::string_view value) noexcept {
 
 std::optional<std::string>
 NormalizeRealityFingerprint(std::string_view value) {
-    const std::string normalized = common::LowerAscii(std::string(value));
-    if (normalized.empty() ||
-        normalized == "chrome" ||
-        normalized == "firefox" ||
-        normalized == "safari" ||
-        normalized == "ios" ||
-        normalized == "android" ||
-        normalized == "edge" ||
-        normalized == "360" ||
-        normalized == "qq" ||
-        normalized == "random" ||
-        normalized == "randomized" ||
-        normalized == "auto") {
-        return normalized;
+    for (const std::string_view allowed : {
+             std::string_view{},
+             std::string_view{"chrome"},
+             std::string_view{"firefox"},
+             std::string_view{"safari"},
+             std::string_view{"ios"},
+             std::string_view{"android"},
+             std::string_view{"edge"},
+             std::string_view{"360"},
+             std::string_view{"qq"},
+             std::string_view{"random"},
+             std::string_view{"randomized"},
+             std::string_view{"auto"}}) {
+        if (common::EqualsAsciiCI(value, allowed)) {
+            return common::LowerAscii(value);
+        }
     }
     return std::nullopt;
 }

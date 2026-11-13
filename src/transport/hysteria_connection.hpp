@@ -7,6 +7,7 @@
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <openssl/ssl.h>
+#include <bitset>
 #include <string>
 #include <unordered_map>
 #include <vector>

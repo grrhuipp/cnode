@@ -79,14 +79,8 @@ ReadTcpRequest(transport::AsyncStream& stream, transport::HysteriaVersion versio
         {
             const size_t inspect_bytes =
                 std::min(received.byte_size(), kMaxRequestHeaderBytes);
-            if (const auto contiguous = received.PrefixSpan(inspect_bytes);
-                !contiguous.empty()) {
-                target = ParseTcpRequest(version, contiguous, header_bytes);
-            } else {
-                std::vector<uint8_t> header(inspect_bytes);
-                (void)received.CopyPrefixTo(header);
-                target = ParseTcpRequest(version, header, header_bytes);
-            }
+            target = ParseTcpRequest(
+                version, received.PrefixSpan(inspect_bytes), header_bytes);
         }
         if (target) {
             (void)received.DropPrefixBytes(header_bytes);
