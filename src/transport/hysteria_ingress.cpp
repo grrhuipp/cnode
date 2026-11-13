@@ -1142,14 +1142,7 @@ void HysteriaConnection::StartRawStream(int64_t stream_id, StreamRecord& stream)
         if (front[0] != 0) {
             const size_t inspect_bytes =
                 std::min(input.byte_size(), kMaxStreamHeaderBytes);
-            auto prefix = input.PrefixSpan(inspect_bytes);
-            std::vector<uint8_t> header;
-            if (prefix.empty()) {
-                header.resize(inspect_bytes);
-                (void)input.CopyPrefixTo(header);
-                prefix = header;
-            }
-            auto request = ParseV1Request(prefix);
+            auto request = ParseV1Request(input.PrefixSpan(inspect_bytes));
             if (!request) {
                 if (request.error() != ProtocolError::Incomplete ||
                     input.byte_size() >= kMaxStreamHeaderBytes)
@@ -1173,9 +1166,10 @@ void HysteriaConnection::OpenV1UdpSession(
     }
     stream.delivered = true;
     stream.state->DiscardInput(header_bytes);
-    const auto response = EncodeV1Response(true, session_id, "");
-    stream.output.push_back(CopyPacket(response));
-    stream.queued_bytes += response.size();
+    std::array<uint8_t, 7> response;
+    const size_t response_size = EncodeV1ResponseTo(response, true, session_id, "");
+    stream.output.push_back(CopyPacket({response.data(), response_size}));
+    stream.queued_bytes += response_size;
     ScheduleStreamOutput(stream_id, stream);
     Flush();
 }
@@ -1192,31 +1186,34 @@ net::awaitable<void> HysteriaConnection::RunV1Control(int64_t stream_id) {
     if (it == core_->streams.end()) co_return;
     auto state = it->second.state;
     constexpr size_t kMaxHelloBytes = kMaxAuthLength + 32;
-    std::vector<uint8_t> hello_bytes;
+    common::MultiBuffer hello_bytes;
     tl::expected<V1ClientHello, ProtocolError> hello =
         tl::unexpected(ProtocolError::Incomplete);
     while (!hello) {
         auto chunk = co_await state->ReadMultiBuffer();
         const size_t bytes = chunk.byte_size();
-        if (bytes == 0 || bytes > kMaxHelloBytes - hello_bytes.size()) co_return;
-        const size_t offset = hello_bytes.size();
-        hello_bytes.resize(offset + bytes);
-        (void)chunk.CopyPrefixTo(std::span<uint8_t>(hello_bytes.data() + offset, bytes));
-        chunk.clear();
-        hello = ParseV1ClientHello(hello_bytes);
+        if (bytes == 0 || bytes > kMaxHelloBytes - hello_bytes.byte_size()) co_return;
+        chunk.MoveTo(hello_bytes, true);
+        hello = ParseV1ClientHello(hello_bytes.FrontSpan());
         if (!hello && hello.error() != ProtocolError::Incomplete) co_return;
     }
     const auto result = co_await AdmitConnection(hello->auth);
+    hello_bytes.clear();
     if (result == AdmitResult::AuthFailed) {
-        auto response = EncodeV1ServerHello(false, 0, 0, "authentication failed");
-        co_await state->WriteMultiBuffer(CopyPacket(response));
+        std::array<uint8_t, 64> response;
+        const size_t size = EncodeV1ServerHelloTo(
+            response, false, 0, 0, "authentication failed");
+        co_await state->WriteMultiBuffer(CopyPacket({response.data(), size}));
         co_return;
     }
     if (result != AdmitResult::Admitted) co_return;
-    auto response = EncodeV1ServerHello(
-        true, listener_->download_bytes_per_second,
-        listener_->upload_bytes_per_second, "");
-    co_await state->WriteMultiBuffer(CopyPacket(response));
+    {
+        std::array<uint8_t, 32> response;
+        const size_t size = EncodeV1ServerHelloTo(
+            response, true, listener_->download_bytes_per_second,
+            listener_->upload_bytes_per_second, "");
+        co_await state->WriteMultiBuffer(CopyPacket({response.data(), size}));
+    }
     if (closed_) co_return;
     std::vector<int64_t> waiting;
     for (const auto& [id, candidate] : core_->streams) {
@@ -1562,7 +1559,7 @@ bool HysteriaConnection::SendUdpMessage(
     if (fragments == 1 && core_->datagrams.empty()) {
         message.fragment_id = 0;
         message.payload = payload;
-        std::array<uint8_t, kMaxUdpMessageSize> header_buf{};
+        std::array<uint8_t, kMaxUdpMessageSize> header_buf;
         const auto hdr_len = EncodeUdpFragmentHeader(
             version, message, *text,
             std::span<uint8_t>(header_buf.data(), *header_size));

@@ -17,24 +17,6 @@ namespace transport {
 
 namespace {
 
-void AppendU16(std::vector<uint8_t>& output, uint16_t value) {
-    std::array<uint8_t, 2> bytes{};
-    common::StoreU16BE(bytes.data(), value);
-    output.insert(output.end(), bytes.begin(), bytes.end());
-}
-
-void AppendU32(std::vector<uint8_t>& output, uint32_t value) {
-    std::array<uint8_t, 4> bytes{};
-    common::StoreU32BE(bytes.data(), value);
-    output.insert(output.end(), bytes.begin(), bytes.end());
-}
-
-void AppendU64(std::vector<uint8_t>& output, uint64_t value) {
-    std::array<uint8_t, 8> bytes{};
-    common::StoreU64BE(bytes.data(), value);
-    output.insert(output.end(), bytes.begin(), bytes.end());
-}
-
 [[nodiscard]] std::string_view TargetHost(
     const common::TargetAddress& target, std::optional<common::AddressText>& storage) {
     if (target.IsDomain()) return {target.host.data(), target.host.size()};
@@ -184,16 +166,27 @@ ParseV1ClientHello(std::span<const uint8_t> input) {
     return hello;
 }
 
+size_t EncodeV1ServerHelloTo(
+    std::span<uint8_t> out, bool accepted, uint64_t send_bps,
+    uint64_t receive_bps, std::string_view message) noexcept {
+    message = message.substr(0, std::min(message.size(), kMaxMessageLength));
+    const size_t needed = 19 + message.size();
+    if (out.size() < needed) return 0;
+    out[0] = accepted ? 1 : 0;
+    common::StoreU64BE(out.data() + 1, send_bps);
+    common::StoreU64BE(out.data() + 9, receive_bps);
+    common::StoreU16BE(out.data() + 17, static_cast<uint16_t>(message.size()));
+    if (!message.empty()) {
+        std::memcpy(out.data() + 19, message.data(), message.size());
+    }
+    return needed;
+}
+
 std::vector<uint8_t> EncodeV1ServerHello(
     bool accepted, uint64_t send_bps, uint64_t receive_bps, std::string_view message) {
     message = message.substr(0, std::min(message.size(), kMaxMessageLength));
-    std::vector<uint8_t> output;
-    output.reserve(19 + message.size());
-    output.push_back(accepted ? 1 : 0);
-    AppendU64(output, send_bps);
-    AppendU64(output, receive_bps);
-    AppendU16(output, static_cast<uint16_t>(message.size()));
-    output.insert(output.end(), message.begin(), message.end());
+    std::vector<uint8_t> output(19 + message.size());
+    (void)EncodeV1ServerHelloTo(output, accepted, send_bps, receive_bps, message);
     return output;
 }
 
@@ -218,15 +211,26 @@ ParseV1Request(std::span<const uint8_t> input) {
     return V1Request{udp != 0, std::move(*target), reader.Position()};
 }
 
+size_t EncodeV1ResponseTo(
+    std::span<uint8_t> out, bool accepted, uint32_t udp_session_id,
+    std::string_view message) noexcept {
+    message = message.substr(0, std::min(message.size(), kMaxMessageLength));
+    const size_t needed = 7 + message.size();
+    if (out.size() < needed) return 0;
+    out[0] = accepted ? 1 : 0;
+    common::StoreU32BE(out.data() + 1, udp_session_id);
+    common::StoreU16BE(out.data() + 5, static_cast<uint16_t>(message.size()));
+    if (!message.empty()) {
+        std::memcpy(out.data() + 7, message.data(), message.size());
+    }
+    return needed;
+}
+
 std::vector<uint8_t> EncodeV1Response(
     bool accepted, uint32_t udp_session_id, std::string_view message) {
     message = message.substr(0, std::min(message.size(), kMaxMessageLength));
-    std::vector<uint8_t> output;
-    output.reserve(7 + message.size());
-    output.push_back(accepted ? 1 : 0);
-    AppendU32(output, udp_session_id);
-    AppendU16(output, static_cast<uint16_t>(message.size()));
-    output.insert(output.end(), message.begin(), message.end());
+    std::vector<uint8_t> output(7 + message.size());
+    (void)EncodeV1ResponseTo(output, accepted, udp_session_id, message);
     return output;
 }
 

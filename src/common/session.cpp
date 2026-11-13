@@ -84,7 +84,7 @@ std::string FormatAccessLog(const Context& ctx,
                    reason.size());
     if (accepted || src_host != "unknown") {
         access.append("from ");
-        access.append(FormatEndpointForLog(src_host, ctx.inbound.source_port));
+        AppendEndpointForLog(access, src_host, ctx.inbound.source_port);
         access.push_back(' ');
     }
     access.append(accepted ? "accepted" : "rejected");
@@ -92,7 +92,7 @@ std::string FormatAccessLog(const Context& ctx,
         access.push_back(' ');
         access.append(net_str);
         access.push_back(':');
-        access.append(FormatEndpointForLog(target_host, t.port));
+        AppendEndpointForLog(access, target_host, t.port);
     }
     if (!accepted && !reason.empty()) {
         access.push_back(' ');

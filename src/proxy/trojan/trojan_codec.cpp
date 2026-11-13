@@ -264,8 +264,9 @@ net::awaitable<void> WriteTrojanUdpDatagram(
     std::array<uint8_t, kMaxUdpPacketHeaderSize> header;
     const size_t header_size =
         EncodeRequiredUdpPacketHeader(*datagram->target, datagram->payload_size, header);
-    co_await proxy::WriteFramedDatagram(
-        writer, std::span<const uint8_t>(header.data(), header_size), payload);
+    const auto framed = proxy::BuildFramedDatagram(
+        std::span<const uint8_t>(header.data(), header_size), payload);
+    co_await writer.WriteBuffers(framed.Span());
 }
 
 net::awaitable<void> WriteTrojanUdpDatagram(
@@ -275,8 +276,9 @@ net::awaitable<void> WriteTrojanUdpDatagram(
     const size_t payload_size = proxy::RequireUdpPayloadSize(payload);
     std::array<uint8_t, kMaxUdpPacketHeaderSize> header;
     const size_t header_size = EncodeRequiredUdpPacketHeader(target, payload_size, header);
-    co_await proxy::WriteFramedDatagram(
-        writer, std::span<const uint8_t>(header.data(), header_size), payload);
+    const auto framed = proxy::BuildFramedDatagram(
+        std::span<const uint8_t>(header.data(), header_size), payload);
+    co_await writer.WriteBuffers(framed.Span());
 }
 
 }  // namespace proxy

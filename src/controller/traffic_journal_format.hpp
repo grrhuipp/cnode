@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 // 流量 journal 的磁盘格式：cnode 写入与 cnode_traffic_journal 对账共用这一份
 // 文法、上限与解码，任何一侧都不另行解释记录。
@@ -32,7 +33,29 @@ struct ScopedFd {
     }
     ScopedFd(const ScopedFd&) = delete;
     ScopedFd& operator=(const ScopedFd&) = delete;
+    ScopedFd(ScopedFd&& other) noexcept : fd(std::exchange(other.fd, -1)) {}
+    ScopedFd& operator=(ScopedFd&& other) noexcept {
+        if (this != &other) {
+            if (fd >= 0) ::close(fd);
+            fd = std::exchange(other.fd, -1);
+        }
+        return *this;
+    }
 };
+
+[[nodiscard]] inline bool WriteAllFd(int fd, std::string_view data) noexcept {
+    size_t offset = 0;
+    while (offset != data.size()) {
+        const auto count = ::write(fd, data.data() + offset, data.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            if (count == 0) errno = EIO;
+            return false;
+        }
+        offset += static_cast<size_t>(count);
+    }
+    return true;
+}
 
 [[nodiscard]] inline std::string Sha256Hex(std::string_view raw) {
     std::array<unsigned char, SHA256_DIGEST_LENGTH> digest{};

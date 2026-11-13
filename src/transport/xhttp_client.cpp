@@ -131,7 +131,7 @@ protected:
         , stream_settings_(target.stream_settings)
         , security_context_(target.security_context)
         , tls_server_name_(target.tls_server_name)
-        , ws_host_(target.ws_host)
+        , ws_host_(target.HttpHost())
         , candidate_(candidate)
         , upload_path_(std::move(upload_path))
         , base_upload_path_size_(upload_path_.size())
@@ -781,7 +781,7 @@ net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
         *target.stream_settings,
         target.security_context,
         target.tls_server_name,
-        target.ws_host,
+        target.HttpHost(),
         path,
         kind,
         packet_payload,

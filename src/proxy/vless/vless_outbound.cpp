@@ -1,13 +1,10 @@
-#include "common/domain_name.hpp"
 #include "proxy/outbound_endpoint_base.hpp"
-#include "common/ip_address.hpp"
 #include <openssl/mem.h>
 #include "proxy/outbound.hpp"
 #include "proxy/vless/vless_codec.hpp"
 #include "proxy/vless/vless_encryption.hpp"
 #include "proxy/handshake_errors.hpp"
 #include "proxy/outbound_stream_endpoint.hpp"
-#include "app/dns.hpp"
 #include "app/outbound_handler.hpp"
 #include "app/relay.hpp"
 #include "common/asio_types.hpp"
@@ -24,8 +21,6 @@
 #include "transport/outbound_target_builder.hpp"
 #include "transport/link.hpp"
 
-#include <asio/bind_cancellation_slot.hpp>
-#include <asio/co_spawn.hpp>
 #include <array>
 #include <limits>
 #include <memory>
@@ -312,14 +307,26 @@ public:
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
         const auto datagram = proxy::RequireUdpDatagram(mb, &udp_target_);
         if (!datagram) co_return;
-        const auto bytes = mb.FrontSpan();
-        const net::const_buffer payload(bytes.data(), bytes.size());
-        co_await WriteDatagram(*datagram->target,
-                               {&payload, bytes.empty() ? size_t{0} : size_t{1}});
+        std::array<uint8_t, common::kMaxFrameHeaderBytes> write_frame{};
+        const size_t header_len = EncodeDatagramHeader(
+            *datagram->target, datagram->payload_size, write_frame);
+        const auto framed = proxy::BuildFramedDatagram(
+            std::span(write_frame).first(header_len), mb);
+        co_await writer_.WriteBuffers(framed.Span());
+        session_started_ = true;
+        forwarded_ = {};
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-        return WriteDatagram(udp_target_, buffers);
+        const auto payload_size = proxy::RequireUdpPayloadSize(buffers);
+        std::array<uint8_t, common::kMaxFrameHeaderBytes> write_frame{};
+        const size_t header_len = EncodeDatagramHeader(
+            udp_target_, payload_size, write_frame);
+        const auto framed = proxy::BuildFramedDatagram(
+            std::span(write_frame).first(header_len), buffers);
+        co_await writer_.WriteBuffers(framed.Span());
+        session_started_ = true;
+        forwarded_ = {};
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
@@ -338,12 +345,10 @@ public:
     }
 
 private:
-    net::awaitable<void> WriteDatagram(
+    size_t EncodeDatagramHeader(
         const common::TargetAddress& target,
-        std::span<const net::const_buffer> payload) {
-        const auto payload_size = proxy::RequireUdpPayloadSize(payload);
-
-        std::array<uint8_t, common::kMaxFrameHeaderBytes> write_frame{};
+        size_t payload_size,
+        std::array<uint8_t, common::kMaxFrameHeaderBytes>& write_frame) const {
         const size_t header_len = !session_started_
             ? common::EncodeNewHeaderTo(
                   write_frame, session_id_, common::NetworkType::UDP,
@@ -355,11 +360,7 @@ private:
                 io_error::connection_reset,
                 "VLESS mux request encode failed");
         }
-
-        co_await proxy::WriteFramedDatagram(
-            writer_, std::span(write_frame).first(header_len), payload);
-        session_started_ = true;
-        forwarded_ = {};
+        return header_len;
     }
 
     proxy::BufferedStreamReader& reader_;

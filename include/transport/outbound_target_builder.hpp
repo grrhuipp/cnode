@@ -72,13 +72,20 @@ struct OutboundTransportTarget {
     std::optional<OutboundDialCandidate> single_candidate; // 单个已解析候选，避免每连接 vector 分配
     std::vector<OutboundDialCandidate> candidates; // 已解析候选地址（按优先级排序）
     std::string_view tls_server_name;               // TLS SNI（冷路径配置视图，可空）
-    std::string ws_host;              // HTTP Host/authority（WS、HTTPUpgrade、gRPC、XHTTP，已按端口格式化）
+    std::string ws_host;              // 未配置显式 HTTP Host 时动态格式化的 fallback authority
     const StreamSettings* stream_settings = nullptr; // 必填：冷路径准备好的传输层组合配置
     SslContext* security_context = nullptr;          // TLS/REALITY 时必填：出站 handler 的 Worker 私有上下文
     std::chrono::seconds timeout{common::kDialTimeout};
 
     // XHTTP packet-up / stream-up 可用独立下行入口；仅保存已解析候选和不可变配置视图。
     std::unique_ptr<const OutboundTransportTarget> xhttp_download_target;
+
+    [[nodiscard]] std::string_view HttpHost() const noexcept {
+        if (stream_settings && !stream_settings->configured_http_host.empty()) {
+            return stream_settings->configured_http_host;
+        }
+        return ws_host;
+    }
 
     [[nodiscard]] std::span<const OutboundDialCandidate> Candidates() const noexcept {
         return single_candidate

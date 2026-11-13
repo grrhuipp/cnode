@@ -27,7 +27,7 @@ public:
     static constexpr size_t kMaxSalts = size_t{1} << 18;
     static constexpr auto kRetention = std::chrono::seconds(65);
 
-    explicit Ss2022SaltPool(size_t capacity = kMaxSalts) : entries_(capacity), capacity_(capacity) {}
+    explicit Ss2022SaltPool(size_t capacity = kMaxSalts) : entries_(capacity) {}
     Ss2022SaltPool(const Ss2022SaltPool&) = delete;
     Ss2022SaltPool& operator=(const Ss2022SaltPool&) = delete;
 
@@ -40,7 +40,6 @@ public:
 
 private:
     proxy::ExpiringKeyedMap<33, std::monostate, Clock::time_point> entries_;
-    size_t capacity_;
 };
 
 // One bounded control round trip. Mailbox/allocation exhaustion returns Limited;

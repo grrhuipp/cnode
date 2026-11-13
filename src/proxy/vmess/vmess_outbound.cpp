@@ -1,6 +1,4 @@
-#include "common/domain_name.hpp"
 #include "proxy/outbound_endpoint_base.hpp"
-#include "common/ip_address.hpp"
 #include <openssl/mem.h>
 #include "proxy/outbound.hpp"
 #include "proxy/vmess/body.hpp"
@@ -8,7 +6,6 @@
 #include "proxy/handshake_errors.hpp"
 #include "proxy/outbound_stream_endpoint.hpp"
 #include "app/relay.hpp"
-#include "app/dns.hpp"
 #include "app/outbound_handler.hpp"
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"
@@ -18,12 +15,7 @@
 #include "transport/link.hpp"
 #include "transport/outbound_target_builder.hpp"
 #include <chrono>
-#include <algorithm>
-#include <cctype>
-#include <cstring>
 #include <new>
-#include <openssl/rand.h>
-#include "common/length_prefixed_packet_buffer.hpp"
 #include <openssl/aes.h>
 #include <memory>
 

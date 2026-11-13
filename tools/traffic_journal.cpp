@@ -30,13 +30,10 @@ constexpr size_t MaxAuditBytes = 1024 * 1024;
     throw std::runtime_error(std::string(operation) + ": " + std::strerror(errno));
 }
 
-class File {
-public:
-    explicit File(int fd) : fd_(fd) { if (fd < 0) FailSystem("open"); }
-    int Get() const noexcept { return fd_.fd; }
-private:
-    ::controller::ScopedFd fd_;
-};
+[[nodiscard]] ::controller::ScopedFd OpenFd(int fd) {
+    if (fd < 0) FailSystem("open");
+    return ::controller::ScopedFd(fd);
+}
 
 void Sync(int fd) {
     if (::fsync(fd) != 0) FailSystem("fsync");
@@ -155,23 +152,17 @@ void Resolve(int directory, const std::string& record, std::string_view decision
         {"decision", decision}, {"evidence", evidence}, {"time", timestamp.data()}
     };
     const auto audit_line = ::infra::serialize(entry) + '\n';
-    File audit(::openat(directory, ".reconciliation.jsonl", O_CREAT | O_WRONLY | O_APPEND |
-                       O_CLOEXEC | O_NOFOLLOW, 0600));
+    const auto audit = OpenFd(::openat(directory, ".reconciliation.jsonl",
+        O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600));
     struct stat info {};
-    if (::fstat(audit.Get(), &info) != 0) FailSystem("fstat audit");
+    if (::fstat(audit.fd, &info) != 0) FailSystem("fstat audit");
     if (!S_ISREG(info.st_mode) || info.st_size < 0 ||
         static_cast<uint64_t>(info.st_size) > MaxAuditBytes ||
         audit_line.size() > MaxAuditBytes - static_cast<size_t>(info.st_size))
         throw std::runtime_error("audit limit reached; archive .reconciliation.jsonl while stopped first");
     // Durable intent is not a claim of completed reconciliation; the record suffix remains authoritative.
-    size_t written = 0;
-    while (written < audit_line.size()) {
-        const auto count = ::write(audit.Get(), audit_line.data() + written, audit_line.size() - written);
-        if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) FailSystem("write audit");
-        written += static_cast<size_t>(count);
-    }
-    Sync(audit.Get());
+    if (!::controller::WriteAllFd(audit.fd, audit_line)) FailSystem("write audit");
+    Sync(audit.fd);
     Sync(directory);
     if (decision == "confirmed-applied") {
         if (::unlinkat(directory, record.c_str(), 0) != 0) FailSystem("unlink record");
@@ -202,11 +193,11 @@ int main(int argc, char** argv) {
                 else throw std::runtime_error("invalid or repeated option");
             }
         }
-        File directory(::open(argv[1], O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
-        File lock(::openat(directory.Get(), ".lock", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600));
-        if (::flock(lock.Get(), LOCK_EX | LOCK_NB) != 0) FailSystem("lock journal (stop cnode first)");
-        if (command == "list") List(directory.Get());
-        else Resolve(directory.Get(), argv[3], decision, evidence);
+        const auto directory = OpenFd(::open(argv[1], O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+        const auto lock = OpenFd(::openat(directory.fd, ".lock", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600));
+        if (::flock(lock.fd, LOCK_EX | LOCK_NB) != 0) FailSystem("lock journal (stop cnode first)");
+        if (command == "list") List(directory.fd);
+        else Resolve(directory.fd, argv[3], decision, evidence);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "traffic journal: " << error.what() << '\n';

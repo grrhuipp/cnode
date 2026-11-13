@@ -18,10 +18,11 @@ public:
     static constexpr int64_t kCleanupIntervalSeconds = 30;
     static constexpr size_t kMaxEntries = 65536;
 
-    explicit VmessSessionHistory(size_t capacity = kMaxEntries) : entries_(capacity), capacity_(capacity) {}
+    explicit VmessSessionHistory(size_t capacity = kMaxEntries) : entries_(capacity) {}
 
     [[nodiscard]] bool AddIfNew(const SessionKey& key, int64_t now) {
-        if (now - last_cleanup_ >= kCleanupIntervalSeconds || entries_.size() >= capacity_) {
+        if (now - last_cleanup_ >= kCleanupIntervalSeconds ||
+            entries_.size() >= entries_.capacity()) {
             last_cleanup_ = now;
             entries_.Prune(now);
         }
@@ -32,13 +33,12 @@ public:
             entries_.Rearm(key, *entry, expires_at);
             return true;
         }
-        if (entries_.size() >= capacity_) return false;
+        if (entries_.size() >= entries_.capacity()) return false;
         return entries_.Insert(key, expires_at, std::monostate{}) != nullptr;
     }
 
 private:
     proxy::ExpiringKeyedMap<32, std::monostate, int64_t> entries_;
-    size_t capacity_;
     int64_t last_cleanup_ = 0;
 };
 

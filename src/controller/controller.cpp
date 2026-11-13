@@ -5,7 +5,6 @@
 #include "controller/traffic_journal.hpp"
 #include "api/api.hpp"
 #include "app/prepared_inbound.hpp"
-#include "app/inbound_handler.hpp"
 #include "app/user_store.hpp"
 #include "app/outbound_handler.hpp"
 #include "app/worker.hpp"
@@ -14,7 +13,6 @@
 #include "routing/dispatcher.hpp"
 #include "infra/config.hpp"
 #include "infra/log.hpp"
-#include "transport/http_headers.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/this_coro.hpp>

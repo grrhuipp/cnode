@@ -441,7 +441,7 @@ TEST_F(UdpRequestTest, QueuedDeadlineCallbacksDoNotBorrowDestroyedRequests) {
     Run([&]() -> net::awaitable<void> {
         {
             UdpRequest old(io, dns, net::ip::address_v4::loopback());
-            old.RelayControl().StartPhaseDeadline(1s);
+            EXPECT_TRUE(static_cast<bool>(old.RelayControl().StartPhaseDeadline(1s)));
             std::this_thread::sleep_for(1050ms);
         }
         co_await RoundTrip(io, Request(), 32);
@@ -451,7 +451,7 @@ TEST_F(UdpRequestTest, QueuedDeadlineCallbacksDoNotBorrowDestroyedRequests) {
 TEST_F(UdpRequestTest, MaximumDurationDeadlineDoesNotOverflow) {
     Run([&]() -> net::awaitable<void> {
         auto& current = Request();
-        current.RelayControl().StartPhaseDeadline(std::chrono::seconds::max());
+        EXPECT_TRUE(static_cast<bool>(current.RelayControl().StartPhaseDeadline(std::chrono::seconds::max())));
         co_await Pause(io, 20ms);
         EXPECT_FALSE(current.RelayControl().ConsumePhaseDeadline());
         co_await RoundTrip(io, current, 32);
@@ -536,7 +536,7 @@ TEST_P(UdpRelayAbortTest, CancellationJoinsRateLimitedRelayWithoutCountingUnsent
         app::StatsShard stats;
         net::steady_timer cancellation(io);
         const bool deadline = GetParam() == RelayAbort::Deadline;
-        if (deadline) target.RelayControl().StartPhaseDeadline(1s);
+        if (deadline) EXPECT_TRUE(static_cast<bool>(target.RelayControl().StartPhaseDeadline(1s)));
         else {
             cancellation.expires_after(50ms);
             cancellation.async_wait([&](const IoErrorCode& error) {

@@ -8,7 +8,6 @@
 #include "proxy/outbound_endpoint_base.hpp"
 #include "common/target_address.hpp"
 #include "infra/config_types.hpp"
-#include "infra/log.hpp"
 #include "transport/link.hpp"
 #include "transport/datagram_socket.hpp"
 #include "transport/outbound_target_builder.hpp"

@@ -70,6 +70,7 @@ public:
 
     [[nodiscard]] SecretKeyedHash hash_function() const noexcept { return entries_.hash_function(); }
     [[nodiscard]] size_t size() const noexcept { return entries_.size(); }
+    [[nodiscard]] size_t capacity() const noexcept { return capacity_; }
     [[nodiscard]] bool empty() const noexcept { return entries_.empty(); }
     [[nodiscard]] Entry* Find(const Key& key) noexcept {
         const auto it = entries_.find(key);

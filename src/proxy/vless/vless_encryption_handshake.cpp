@@ -906,9 +906,12 @@ RunVlessEncryptionClientHandshake(
             cipher);
         if (zero) {
             try {
-                co_await WriteVlessBytes(raw_writer, nfs->bytes);
+                const std::array<net::const_buffer, 2> flight{
+                    net::buffer(nfs->bytes.data(), nfs->bytes.size()),
+                    net::buffer(zero->bytes.data(), zero->bytes.size()),
+                };
+                co_await raw_writer.WriteBuffers(flight);
                 std::vector<uint8_t>{}.swap(nfs->bytes);
-                co_await WriteVlessBytes(raw_writer, zero->bytes);
             } catch (...) {
                 ticket_cache->Clear();
                 throw;
@@ -936,10 +939,15 @@ RunVlessEncryptionClientHandshake(
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
-    co_await WriteVlessBytes(raw_writer, nfs->bytes);
+    {
+        const std::array<net::const_buffer, 3> flight{
+            net::buffer(nfs->bytes.data(), nfs->bytes.size()),
+            net::buffer(pfs->encrypted.data(), pfs->encrypted.size()),
+            net::buffer(padding->data(), padding->size()),
+        };
+        co_await raw_writer.WriteBuffers(flight);
+    }
     std::vector<uint8_t>{}.swap(nfs->bytes);
-    co_await WriteVlessBytes(raw_writer, pfs->encrypted);
-    co_await WriteVlessBytes(raw_writer, *padding);
     padding.reset();
 
     auto encrypted_server_public = std::make_unique_for_overwrite<
@@ -1095,10 +1103,17 @@ net::awaitable<VlessEncryptionHandshakeResult> CompleteServerPfs(
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
-    co_await WriteVlessBytes(raw_writer, response->encrypted_public_key);
-    co_await WriteVlessBytes(raw_writer, response->encrypted_ticket);
+    {
+        const std::array<net::const_buffer, 3> flight{
+            net::buffer(response->encrypted_public_key.data(),
+                        response->encrypted_public_key.size()),
+            net::buffer(response->encrypted_ticket.data(),
+                        response->encrypted_ticket.size()),
+            net::buffer(padding->data(), padding->size()),
+        };
+        co_await raw_writer.WriteBuffers(flight);
+    }
     response.reset();
-    co_await WriteVlessBytes(raw_writer, *padding);
     padding.reset();
 
     if (auto padding_result = co_await ReadAndOpenPadding(raw_reader, nfs_aead);
@@ -1124,18 +1139,28 @@ RunVlessEncryptionServerHandshake(
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }
 
-    std::vector<uint8_t> iv_and_relays(
-        kVlessEncryptionIvSize + *relays_len);
-    size_t progress = 0;
-    if (!co_await raw_reader.ReadExact(
-            iv_and_relays.data(),
-            iv_and_relays.size(), &progress)) {
-        co_return tl::unexpected(progress == 0
-            ? VlessEncryptionHandshakeFailure::Closed
-            : VlessEncryptionHandshakeFailure::Truncated);
+    std::optional<VlessEncryptionServerNfsOpenResult> nfs;
+    {
+        const size_t hello_size = kVlessEncryptionIvSize + *relays_len;
+        std::array<uint8_t, 256> inline_hello{};
+        std::vector<uint8_t> heap_hello;
+        std::span<uint8_t> iv_and_relays;
+        if (hello_size <= inline_hello.size()) {
+            iv_and_relays = {inline_hello.data(), hello_size};
+        } else {
+            heap_hello.resize(hello_size);
+            iv_and_relays = heap_hello;
+        }
+        size_t progress = 0;
+        if (!co_await raw_reader.ReadExact(
+                iv_and_relays.data(),
+                iv_and_relays.size(), &progress)) {
+            co_return tl::unexpected(progress == 0
+                ? VlessEncryptionHandshakeFailure::Closed
+                : VlessEncryptionHandshakeFailure::Truncated);
+        }
+        nfs = OpenVlessEncryptionClientNfsHello(config, iv_and_relays);
     }
-    auto nfs = OpenVlessEncryptionClientNfsHello(config, iv_and_relays);
-    std::vector<uint8_t>{}.swap(iv_and_relays);
     if (!nfs) {
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }

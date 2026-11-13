@@ -220,7 +220,8 @@ inline void FormatHttpHostHeaderInto(
     }
 }
 
-inline std::string FormatEndpointForLog(
+inline void AppendEndpointForLog(
+    std::string& out,
     std::string_view host,
     uint16_t port) {
     const bool bracket_ipv6 = NeedsIpv6Brackets(host);
@@ -228,9 +229,6 @@ inline std::string FormatEndpointForLog(
     auto [ptr, ec] = std::to_chars(port_buf, port_buf + sizeof(port_buf), port);
     (void)ec;
 
-    std::string out;
-    out.reserve(host.size() + (bracket_ipv6 ? 2 : 0) + 1 +
-                static_cast<size_t>(ptr - port_buf));
     if (bracket_ipv6) {
         out.push_back('[');
     }
@@ -240,6 +238,14 @@ inline std::string FormatEndpointForLog(
     }
     out.push_back(':');
     out.append(port_buf, ptr);
+}
+
+inline std::string FormatEndpointForLog(
+    std::string_view host,
+    uint16_t port) {
+    std::string out;
+    out.reserve(host.size() + 8);
+    AppendEndpointForLog(out, host, port);
     return out;
 }
 

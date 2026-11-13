@@ -256,8 +256,9 @@ net::awaitable<void> UotPacketWriter::WriteMultiBuffer(common::MultiBuffer mb) {
     const size_t header_size = EncodePacketHeader(
         is_connect_, is_connect_ ? destination_ : *datagram->target,
         static_cast<uint16_t>(datagram->payload_size), header_);
-    co_await WriteFramedDatagram(
-        writer_, std::span<const uint8_t>(header_.data(), header_size), mb);
+    const auto framed = BuildFramedDatagram(
+        std::span<const uint8_t>(header_.data(), header_size), mb);
+    co_await writer_.WriteBuffers(framed.Span());
 }
 
 net::awaitable<void> UotPacketWriter::WriteBuffers(
@@ -268,8 +269,9 @@ net::awaitable<void> UotPacketWriter::WriteBuffers(
     const size_t payload_size = RequireUdpPayloadSize(buffers);
     const size_t header_size = EncodePacketHeader(
         is_connect_, destination_, static_cast<uint16_t>(payload_size), header_);
-    co_await WriteFramedDatagram(
-        writer_, std::span<const uint8_t>(header_.data(), header_size), buffers);
+    const auto framed = BuildFramedDatagram(
+        std::span<const uint8_t>(header_.data(), header_size), buffers);
+    co_await writer_.WriteBuffers(framed.Span());
 }
 
 net::awaitable<void> UotPacketWriter::AsyncShutdownWrite() {

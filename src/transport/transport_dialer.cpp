@@ -53,7 +53,7 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
         *target.stream_settings,
         target.security_context,
         target.tls_server_name,
-        target.ws_host,
+        target.HttpHost(),
         ctx.conn_id);
     if (!build_result) {
         co_return DialResult::Fail(build_result.error());
@@ -199,7 +199,7 @@ void AppendPreferredFamilyCandidates(OutboundTransportTarget& target,
         return std::string{};
     }
     if (!settings.configured_http_host.empty()) {
-        return std::string(settings.configured_http_host);
+        return std::string{};
     }
     if (settings.IsGrpc() && settings.IsReality()) {
         return std::string{};

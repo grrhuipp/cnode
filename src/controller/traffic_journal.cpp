@@ -128,13 +128,7 @@ void TrafficJournal::Append(const app::UserTrafficCounters& traffic) {
     if (file.fd < 0) SystemFailure("create traffic journal record");
     bool published = false;
     try {
-        size_t offset = 0;
-        while (offset != text.size()) {
-            const auto count = ::write(file.fd, text.data() + offset, text.size() - offset);
-            if (count < 0 && errno == EINTR) continue;
-            if (count <= 0) SystemFailure("write traffic journal record");
-            offset += static_cast<size_t>(count);
-        }
+        if (!WriteAllFd(file.fd, text)) SystemFailure("write traffic journal record");
         if (::fsync(file.fd) != 0) SystemFailure("sync traffic journal record");
         const auto temporary_name = std::filesystem::path(temporary).filename().native();
         const auto ready = directory_ /

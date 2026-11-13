@@ -1,6 +1,5 @@
 #include "app/group_coordinator.hpp"
 #include "common/error.hpp"
-#include "infra/log.hpp"
 
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
@@ -9,10 +8,7 @@
 #include <unistd.h>
 #include <cerrno>
 #include <atomic>
-#include <algorithm>
-#include <stdexcept>
 #include <system_error>
-#include <vector>
 
 
 struct app::GroupCoordinator::ReservedState {

@@ -17,7 +17,7 @@ Ss2022SaltAdmission Ss2022SaltPool::Admit(
     std::copy(salt.begin(), salt.end(), key.begin() + 1);
     entries_.Prune(now);
     if (entries_.Find(key)) return Ss2022SaltAdmission::Replayed;
-    if (entries_.size() >= capacity_) return Ss2022SaltAdmission::Limited;
+    if (entries_.size() >= entries_.capacity()) return Ss2022SaltAdmission::Limited;
     try {
         return entries_.Insert(key, now + kRetention, std::monostate{})
             ? Ss2022SaltAdmission::Accepted : Ss2022SaltAdmission::Limited;

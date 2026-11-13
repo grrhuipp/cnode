@@ -636,7 +636,8 @@ net::awaitable<void> WriteVlessUdpDatagram(
     std::array<uint8_t, kMaxUdpHeaderSize> header{};
     const auto size = EncodeRequiredUdpHeaderTo(
         *datagram->target, packet_addr, datagram->payload_size, header);
-    co_await proxy::WriteFramedDatagram(writer, std::span(header).first(size), payload);
+    const auto framed = proxy::BuildFramedDatagram(std::span(header).first(size), payload);
+    co_await writer.WriteBuffers(framed.Span());
 }
 
 net::awaitable<void> WriteVlessUdpDatagram(
@@ -645,7 +646,8 @@ net::awaitable<void> WriteVlessUdpDatagram(
     const auto payload_size = proxy::RequireUdpPayloadSize(payload);
     std::array<uint8_t, kMaxUdpHeaderSize> header{};
     const auto size = EncodeRequiredUdpHeaderTo(target, packet_addr, payload_size, header);
-    co_await proxy::WriteFramedDatagram(writer, std::span(header).first(size), payload);
+    const auto framed = proxy::BuildFramedDatagram(std::span(header).first(size), payload);
+    co_await writer.WriteBuffers(framed.Span());
 }
 
 bool IsVisionFlow(std::string_view flow) noexcept {

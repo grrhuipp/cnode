@@ -60,28 +60,38 @@ struct RequiredUdpDatagram {
     return *size;
 }
 
-// 报头与负载作为一次物理写出，保持帧边界完整。header 由调用方帧持有。
-inline net::awaitable<void> WriteFramedDatagram(
-    transport::MultiBufferWriter& writer,
-    std::span<const uint8_t> header,
-    const common::MultiBuffer& payload) {
-    std::array<net::const_buffer, 2> framed;
+// 报头与负载作为一次物理写出，保持帧边界完整；纯值构帧避免每包额外分配子协程帧。
+struct FramedDatagramPair {
+    std::array<net::const_buffer, 2> buffers{};
     size_t count = 0;
-    if (!header.empty()) framed[count++] = net::buffer(header.data(), header.size());
-    if (const auto bytes = payload.FrontSpan(); !bytes.empty()) {
-        framed[count++] = net::buffer(bytes.data(), bytes.size());
+
+    [[nodiscard]] std::span<const net::const_buffer> Span() const noexcept {
+        return {buffers.data(), count};
     }
-    co_await writer.WriteBuffers({framed.data(), count});
+};
+
+[[nodiscard]] inline FramedDatagramPair BuildFramedDatagram(
+    std::span<const uint8_t> header,
+    const common::MultiBuffer& payload) noexcept {
+    FramedDatagramPair out;
+    if (!header.empty()) {
+        out.buffers[out.count++] = net::buffer(header.data(), header.size());
+    }
+    if (const auto bytes = payload.FrontSpan(); !bytes.empty()) {
+        out.buffers[out.count++] = net::buffer(bytes.data(), bytes.size());
+    }
+    return out;
 }
 
-inline net::awaitable<void> WriteFramedDatagram(
-    transport::MultiBufferWriter& writer,
+[[nodiscard]] inline common::ConstBufferSpanBuilder<8> BuildFramedDatagram(
     std::span<const uint8_t> header,
     std::span<const net::const_buffer> payload) {
     common::ConstBufferSpanBuilder<8> framed;
-    framed.Append(net::buffer(header.data(), header.size()));
+    if (!header.empty()) {
+        framed.Append(net::buffer(header.data(), header.size()));
+    }
     framed.AppendBuffers(payload);
-    co_await writer.WriteBuffers(framed.Span());
+    return framed;
 }
 
 }  // namespace proxy
