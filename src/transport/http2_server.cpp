@@ -1349,7 +1349,26 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     uint64_t conn_id,
     const HttpConfig* http_config,
     const XHttpConfig* xhttp_config,
-    const GrpcConfig* grpc_config) {
+    const GrpcConfig* grpc_config,
+    bool read_client_preface) {
+    if (read_client_preface) {
+        std::array<uint8_t, kHttp2ClientPreface.size()> preface{};
+        size_t done = 0;
+        while (done < preface.size()) {
+            const size_t n = co_await stream->AsyncRead(
+                net::buffer(preface.data() + done, preface.size() - done));
+            if (n == 0) {
+                LOG_CONN_DEBUG(conn_id, "gRPC server received invalid HTTP/2 client preface");
+                co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
+            }
+            done += n;
+        }
+        if (std::string_view(reinterpret_cast<const char*>(preface.data()), preface.size()) !=
+            kHttp2ClientPreface) {
+            LOG_CONN_DEBUG(conn_id, "gRPC server received invalid HTTP/2 client preface");
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+    }
     // SETTINGS is a receiver-selected limit, not a promise to allocate an
     // arbitrarily large configured window.
     initial_window = std::min<uint32_t>(initial_window, kHttp2MaxQueuedStreamBytes);
@@ -1362,6 +1381,7 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     co_await session->Run();
     co_return std::unique_ptr<AsyncStream>{};
 }
+
 net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
     app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
@@ -1369,15 +1389,7 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
     net::io_context& io_context,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
     uint64_t conn_id) {
-    std::array<uint8_t, kHttp2ClientPreface.size()> preface{};
-    if (!co_await ReadFullFromStream(*stream, preface) ||
-        std::string_view(reinterpret_cast<const char*>(preface.data()), preface.size()) !=
-            kHttp2ClientPreface) {
-        LOG_CONN_DEBUG(conn_id, "gRPC server received invalid HTTP/2 client preface");
-        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-
-    co_return co_await StartHttp2ServerSession(coordinator,
+    return StartHttp2ServerSession(coordinator,
         std::move(stream),
         cfg.initial_window_size.value_or(kDefaultInitialWindow),
         H2PayloadCodec::GrpcHunk,
@@ -1386,7 +1398,8 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
         conn_id,
         nullptr,
         nullptr,
-        &cfg);
+        &cfg,
+        true);
 }
 
 net::awaitable<TransportBuildResult> RunHttp2ServerSession(
@@ -1408,7 +1421,8 @@ net::awaitable<TransportBuildResult> RunHttp2ServerSession(
         conn_id,
         cfg,
         xhttp_cfg,
-        nullptr);
+        nullptr,
+        false);
 }
 
 }  // namespace transport

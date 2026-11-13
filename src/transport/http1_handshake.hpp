@@ -252,9 +252,6 @@ ExecuteHttp1UpgradeClientHandshake(
 // SOCKET_WRITE_FAILED.
 [[nodiscard]] net::awaitable<bool> WriteFullToStream(AsyncStream& stream,
                                                      std::string_view bytes);
-// Fills `out` completely. False when the peer closes first; I/O errors throw.
-[[nodiscard]] net::awaitable<bool> ReadFullFromStream(AsyncStream& stream,
-                                                      std::span<uint8_t> out);
 
 // How a received HTTP/1 message body ends (RFC 9112 6.3).
 struct Http1BodyUntilClose {};

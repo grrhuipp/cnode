@@ -1185,18 +1185,6 @@ net::awaitable<bool> WriteFullToStream(AsyncStream& stream, std::string_view byt
     co_return true;
 }
 
-net::awaitable<bool> ReadFullFromStream(AsyncStream& stream, std::span<uint8_t> out) {
-    size_t done = 0;
-    while (done < out.size()) {
-        const size_t n = co_await stream.AsyncRead(
-            net::buffer(out.data() + done, out.size() - done));
-        if (n == 0) {
-            co_return false;
-        }
-        done += n;
-    }
-    co_return true;
-}
 
 std::unique_ptr<AsyncStream> MakeHttp1BodyStream(
     std::unique_ptr<AsyncStream> inner,
