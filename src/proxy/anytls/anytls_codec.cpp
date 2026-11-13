@@ -479,8 +479,22 @@ WriteAnyTlsBuffersAsFramesWithPadding(transport::AsyncStream& stream,
 net::awaitable<tl::expected<AnyTlsFrameHeader, common::ErrorCode>>
 ReadAnyTlsFrameHeader(transport::AsyncStream& stream) {
     std::array<uint8_t, kFrameHeaderSize> header{};
-    if (auto ok = co_await proxy::ReadHandshakeExact(stream, header, proxy::HandshakeProgress::NotStarted); !ok) {
-        co_return tl::unexpected(ok.error());
+    size_t filled = 0;
+    while (filled < header.size()) {
+        size_t n = 0;
+        try {
+            n = co_await stream.AsyncRead(
+                net::buffer(header.data() + filled, header.size() - filled));
+        } catch (const IoSystemError& error) {
+            co_return tl::unexpected(
+                proxy::ClassifyExactReadException(stream, error, filled != 0));
+        } catch (const std::bad_alloc&) {
+            co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
+        }
+        if (n == 0) {
+            co_return tl::unexpected(proxy::ClassifyExactReadEof(stream, filled != 0));
+        }
+        filled += n;
     }
 
     AnyTlsFrameHeader out;
@@ -493,28 +507,45 @@ ReadAnyTlsFrameHeader(transport::AsyncStream& stream) {
 net::awaitable<tl::expected<std::string, common::ErrorCode>>
 ReadFrameText(transport::AsyncStream& stream, uint16_t length) {
     std::string text(length, '\0');
-    if (auto ok = co_await proxy::ReadHandshakeExact(
-            stream,
-            std::span<uint8_t>(reinterpret_cast<uint8_t*>(text.data()), length),
-            proxy::HandshakeProgress::Started);
-        !ok) {
-        co_return tl::unexpected(ok.error());
+    size_t filled = 0;
+    while (filled < length) {
+        size_t n = 0;
+        try {
+            n = co_await stream.AsyncRead(
+                net::buffer(text.data() + filled, length - filled));
+        } catch (const IoSystemError& error) {
+            co_return tl::unexpected(
+                proxy::ClassifyExactReadException(stream, error, true));
+        } catch (const std::bad_alloc&) {
+            co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
+        }
+        if (n == 0) {
+            co_return tl::unexpected(proxy::ClassifyExactReadEof(stream, true));
+        }
+        filled += n;
     }
     co_return text;
 }
 
 net::awaitable<tl::expected<void, common::ErrorCode>>
 DiscardFramePayload(transport::AsyncStream& stream, uint16_t length) {
-    std::array<uint8_t, 256> scratch{};
+    std::array<uint8_t, 512> scratch{};
     size_t remaining = length;
     while (remaining > 0) {
         const size_t want = std::min(remaining, scratch.size());
-        if (auto ok = co_await proxy::ReadHandshakeExact(
-                stream, std::span<uint8_t>(scratch.data(), want), proxy::HandshakeProgress::Started);
-            !ok) {
-            co_return tl::unexpected(ok.error());
+        size_t n = 0;
+        try {
+            n = co_await stream.AsyncRead(net::buffer(scratch.data(), want));
+        } catch (const IoSystemError& error) {
+            co_return tl::unexpected(
+                proxy::ClassifyExactReadException(stream, error, true));
+        } catch (const std::bad_alloc&) {
+            co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
         }
-        remaining -= want;
+        if (n == 0) {
+            co_return tl::unexpected(proxy::ClassifyExactReadEof(stream, true));
+        }
+        remaining -= n;
     }
     co_return tl::expected<void, common::ErrorCode>{};
 }
@@ -529,10 +560,22 @@ ReadFramePayload(transport::AsyncStream& stream, uint16_t length) {
             co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
         }
         const size_t want = std::min<size_t>(remaining, buffer->Available());
-        if (auto ok = co_await proxy::ReadHandshakeExact(
-                stream, std::span<uint8_t>(buffer->Tail().data(), want), proxy::HandshakeProgress::Started);
-            !ok) {
-            co_return tl::unexpected(ok.error());
+        uint8_t* dst = buffer->Tail().data();
+        size_t filled = 0;
+        while (filled < want) {
+            size_t n = 0;
+            try {
+                n = co_await stream.AsyncRead(net::buffer(dst + filled, want - filled));
+            } catch (const IoSystemError& error) {
+                co_return tl::unexpected(
+                    proxy::ClassifyExactReadException(stream, error, true));
+            } catch (const std::bad_alloc&) {
+                co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
+            }
+            if (n == 0) {
+                co_return tl::unexpected(proxy::ClassifyExactReadEof(stream, true));
+            }
+            filled += n;
         }
         buffer->Produce(static_cast<uint32_t>(want));
         remaining -= want;

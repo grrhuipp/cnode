@@ -64,6 +64,25 @@ enum class HandshakeProgress : uint8_t {
     Started,
 };
 
+[[nodiscard]] inline common::ErrorCode ClassifyExactReadEof(
+    transport::AsyncStream& stream,
+    bool started) noexcept {
+    return ResolveHandshakeReadFailure(
+        stream,
+        started ? common::ErrorCode::PROTOCOL_DECODE_FAILED
+                : common::ErrorCode::SOCKET_EOF);
+}
+
+[[nodiscard]] inline common::ErrorCode ClassifyExactReadException(
+    transport::AsyncStream& stream,
+    const IoSystemError& error,
+    bool started) noexcept {
+    if (error.code() == io_error::eof) {
+        return ClassifyExactReadEof(stream, started);
+    }
+    return ClassifyHandshakeReadException(stream, error);
+}
+
 // 唯一的握手精确读：填满 `out` 才返回成功。
 // 握手首字节前 EOF 是对端正常关闭 → SOCKET_EOF；收到任何握手字节后 EOF 是
 // 异常截断 → PROTOCOL_DECODE_FAILED；已触发的读、空闲或阶段超时优先归为 TIMEOUT。
@@ -77,18 +96,12 @@ enum class HandshakeProgress : uint8_t {
         try {
             n = co_await stream.AsyncRead(net::buffer(out.data(), out.size()));
         } catch (const IoSystemError& error) {
-            if (error.code() == io_error::eof) {
-                co_return tl::unexpected(ResolveHandshakeReadFailure(stream, started
-                    ? common::ErrorCode::PROTOCOL_DECODE_FAILED : common::ErrorCode::SOCKET_EOF));
-            }
-            co_return tl::unexpected(ClassifyHandshakeReadException(stream, error));
+            co_return tl::unexpected(ClassifyExactReadException(stream, error, started));
         } catch (const std::bad_alloc&) {
             co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
         }
         if (n == 0) {
-            co_return tl::unexpected(ResolveHandshakeReadFailure(
-                stream,
-                started ? common::ErrorCode::PROTOCOL_DECODE_FAILED : common::ErrorCode::SOCKET_EOF));
+            co_return tl::unexpected(ClassifyExactReadEof(stream, started));
         }
         started = true;
         out = out.subspan(n);

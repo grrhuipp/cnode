@@ -8,6 +8,7 @@
 
 #include "common/asio_types.hpp"
 #include "common/length_prefixed_packet_buffer.hpp"
+#include <asio/this_coro.hpp>
 #include <array>
 #include <memory>
 #include <new>
@@ -43,28 +44,48 @@ size_t EncodePacketHeader(bool is_connect,
 net::awaitable<tl::expected<PreparedRequest, common::ErrorCode>> ReadV2Request(
     transport::MultiBufferReader& reader,
     common::MultiBuffer pending) {
-    if (!co_await BufferedStreamReader::EnsureBufferedFrom(reader, pending, 1, common::kPacketStreamPendingLimit)) {
+    if (pending.byte_size() < 1 &&
+        !co_await BufferedStreamReader::EnsureBufferedFrom(
+            reader, pending, 1, common::kPacketStreamPendingLimit)) {
         co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
     }
-    std::array<uint8_t, 1> first{};
-    if (pending.CopyPrefixTo(first) != first.size() || first[0] > 1) {
+    const auto initial = pending.FrontSpan();
+    if (initial.empty() || initial[0] > 1) {
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
+    const bool is_connect = initial[0] != 0;
 
-    auto address = co_await ::common::ReadAddress(
-        reader, pending, common::AddressWireFormat::Socks5, 1,
-        {.require_non_empty_domain = true, .allow_metadata = true});
-    if (!address || !address->target.IsValid()) {
-        co_return tl::unexpected(address
-            ? common::ErrorCode::PROTOCOL_INVALID_ADDRESS
-            : address.error());
+    common::DecodedAddress decoded_addr;
+    if (auto fast = common::DecodeAddress(
+            initial.subspan(1),
+            common::AddressWireFormat::Socks5,
+            {.require_non_empty_domain = true, .allow_metadata = true});
+        fast.status == common::AddressDecodeStatus::Complete) {
+        decoded_addr = {
+            .target = std::move(fast.target),
+            .consumed = fast.consumed,
+            .forwarded = std::move(fast.forwarded),
+        };
+    } else if (fast.status == common::AddressDecodeStatus::Invalid) {
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
+    } else {
+        auto slow = co_await ::common::ReadAddress(
+            reader, pending, common::AddressWireFormat::Socks5, 1,
+            {.require_non_empty_domain = true, .allow_metadata = true});
+        if (!slow) {
+            co_return tl::unexpected(slow.error());
+        }
+        decoded_addr = std::move(*slow);
+    }
+    if (!decoded_addr.target.IsValid()) {
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
 
     PreparedRequest out;
-    out.is_connect = first[0] != 0;
-    out.destination = std::move(address->target);
-    out.forwarded = std::move(address->forwarded);
-    pending.DropPrefixBytes(1 + address->consumed);
+    out.is_connect = is_connect;
+    out.destination = std::move(decoded_addr.target);
+    out.forwarded = std::move(decoded_addr.forwarded);
+    pending.DropPrefixBytes(1 + decoded_addr.consumed);
     pending.ReleaseIfIdle();
     out.pending = std::move(pending);
     co_return out;
@@ -229,45 +250,101 @@ common::MultiBuffer UotPacketReader::TakePending() noexcept {
     pending_.ReleaseIfIdle();
     return out;
 }
-net::awaitable<common::MultiBuffer> UotPacketReader::ReadMultiBuffer() {
-    if (pending_.byte_size() < 1 &&
-        !co_await BufferedStreamReader::EnsureBufferedFrom(reader_, pending_, 1, common::kPacketStreamPendingLimit))
-        co_return common::MultiBuffer{};
-    common::TargetAddress packet_target;
-    if (!is_connect_) {
-        auto address = co_await ::common::ReadAddress(
-            reader_, pending_, common::AddressWireFormat::Uot, 0,
-            {.require_non_empty_domain = true, .allow_metadata = false});
-        if (!address || !address->target.IsValid()) {
-            ThrowDecodeFailure();
-        }
-        packet_target = std::move(address->target);
-        (void)pending_.DropPrefixBytes(address->consumed);
-    }
-    if (pending_.byte_size() < 2 &&
-        !co_await BufferedStreamReader::EnsureBufferedFrom(reader_, pending_, 2, common::kPacketStreamPendingLimit)) {
-        ThrowDecodeFailure();
-    }
+void UotPacketReader::Fail() {
+    failed_ = true;
+    header_decoded_ = false;
+    payload_size_ = 0;
+    packet_target_.reset();
+    pending_.clear();
+    ThrowDecodeFailure();
+}
 
-    std::array<uint8_t, 2> len_bytes{};
-    if (pending_.CopyPrefixTo(len_bytes) != len_bytes.size()) {
-        ThrowDecodeFailure();
+bool UotPacketReader::TryPopDatagram(common::MultiBuffer& out) {
+    if (!header_decoded_) {
+        const auto view = pending_.FrontSpan();
+        if (is_connect_) {
+            if (view.size() < 2) return false;
+            payload_size_ = common::LoadU16BE(view.data());
+            (void)pending_.DropPrefixBytes(2);
+            header_decoded_ = true;
+        } else {
+            if (view.empty()) return false;
+            auto address = common::DecodeAddress(
+                view,
+                common::AddressWireFormat::Uot,
+                {.require_non_empty_domain = true, .allow_metadata = false});
+            if (address.status == common::AddressDecodeStatus::Incomplete) {
+                if (address.required > common::kMaxBaseEncodedAddressSize ||
+                    view.size() >= common::kMaxBaseEncodedAddressSize) {
+                    Fail();
+                }
+                return false;
+            }
+            if (address.status == common::AddressDecodeStatus::Invalid ||
+                !address.target.IsValid()) {
+                Fail();
+            }
+            if (view.size() < address.consumed + 2) {
+                return false;
+            }
+            payload_size_ = common::LoadU16BE(view.data() + address.consumed);
+            packet_target_.emplace(std::move(address.target));
+            (void)pending_.DropPrefixBytes(address.consumed + 2);
+            header_decoded_ = true;
+        }
     }
-    const size_t payload_size = common::LoadU16BE(len_bytes.data());
-    (void)pending_.DropPrefixBytes(len_bytes.size());
-    if (pending_.byte_size() < payload_size &&
-        !co_await BufferedStreamReader::EnsureBufferedFrom(reader_, pending_, payload_size, common::kPacketStreamPendingLimit)) {
-        ThrowDecodeFailure();
+    if (pending_.byte_size() < payload_size_) {
+        return false;
     }
-    common::MultiBuffer packet;
-    if (!pending_.MovePrefixTo(packet, payload_size)) {
-        ThrowDecodeFailure();
+    if (!pending_.MovePrefixTo(out, payload_size_)) {
+        Fail();
     }
     pending_.ReleaseIfIdle();
-    if (!common::SetUdpTarget(packet, is_connect_ ? destination_ : packet_target)) {
+    const common::TargetAddress& target = is_connect_ ? destination_ : *packet_target_;
+    if (!common::SetUdpTarget(out, target)) {
+        packet_target_.reset();
+        header_decoded_ = false;
+        payload_size_ = 0;
         throw std::bad_alloc();
     }
-    co_return packet;
+    packet_target_.reset();
+    header_decoded_ = false;
+    payload_size_ = 0;
+    return true;
+}
+
+net::awaitable<common::MultiBuffer> UotPacketReader::ReadMultiBuffer() {
+    if (failed_) {
+        ThrowDecodeFailure();
+    }
+    for (;;) {
+        common::MultiBuffer packet;
+        if (TryPopDatagram(packet)) {
+            co_return packet;
+        }
+        pending_.ReleaseIfIdle();
+        auto incoming = co_await reader_.ReadMultiBuffer();
+        const bool received = incoming.byte_size() != 0;
+        if (received) {
+            if (pending_.byte_size() > common::kPacketStreamPendingLimit ||
+                incoming.byte_size() > common::kPacketStreamPendingLimit - pending_.byte_size()) {
+                failed_ = true;
+                pending_.clear();
+                throw IoSystemError(io_error::message_size, "stream pending buffer exceeded");
+            }
+            incoming.MoveTo(pending_, true);
+        }
+        if ((co_await net::this_coro::cancellation_state).cancelled() !=
+            net::cancellation_type::none) {
+            throw IoSystemError(io_error::operation_aborted);
+        }
+        if (!received) {
+            if (header_decoded_ || pending_.byte_size() != 0) {
+                Fail();
+            }
+            co_return common::MultiBuffer{};
+        }
+    }
 }
 
 UotPacketWriter::UotPacketWriter(transport::MultiBufferWriter& writer,

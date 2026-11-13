@@ -7,7 +7,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
+#include <charconv>
 #include <cstdint>
 #include <string>
 #include <system_error>
@@ -88,16 +90,39 @@ void TrafficJournal::Append(const app::UserTrafficCounters& traffic) {
     if (traffic.empty()) return;
     CheckHealthy();
     constexpr uint64_t max_value = static_cast<uint64_t>(INT64_MAX);
-    infra::array rows;
+    size_t non_zero_rows = 0;
     for (const auto& [uid, value] : traffic.users) {
         if (uid <= 0 || value.upload > max_value || value.download > max_value) {
             throw std::runtime_error("traffic exceeds UniProxy signed integer range");
         }
-        if (value.upload == 0 && value.download == 0) continue;
-        rows.push_back(infra::array{uid, value.upload, value.download});
+        if (value.upload != 0 || value.download != 0) {
+            ++non_zero_rows;
+        }
     }
-    if (rows.empty()) return;
-    const auto text = infra::serialize(infra::value(std::move(rows)));
+    if (non_zero_rows == 0) return;
+    std::string text;
+    text.reserve(2 + non_zero_rows * 32);
+    text.push_back('[');
+    bool first_row = true;
+    const auto append_uint = [&text](uint64_t v) {
+        std::array<char, 20> digits{};
+        const auto [end, ec] = std::to_chars(digits.data(), digits.data() + digits.size(), v);
+        (void)ec;
+        text.append(digits.data(), static_cast<size_t>(end - digits.data()));
+    };
+    for (const auto& [uid, value] : traffic.users) {
+        if (value.upload == 0 && value.download == 0) continue;
+        if (!first_row) text.push_back(',');
+        first_row = false;
+        text.push_back('[');
+        append_uint(static_cast<uint64_t>(uid));
+        text.push_back(',');
+        append_uint(value.upload);
+        text.push_back(',');
+        append_uint(value.download);
+        text.push_back(']');
+    }
+    text.push_back(']');
     size_t bytes = 0, records = 0;
     for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
         const auto filename = entry.path().filename().native();

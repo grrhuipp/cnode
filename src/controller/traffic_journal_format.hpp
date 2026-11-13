@@ -1,6 +1,6 @@
 #pragma once
 
-#include "infra/json.hpp"
+#include <charconv>
 #include "common/binary_text_codec.hpp"
 
 #include <fcntl.h>
@@ -112,31 +112,88 @@ struct RecordRow {
     int64_t download = 0;
 };
 
-[[nodiscard]] inline std::optional<int64_t> DecodeCounter(const infra::value& value) noexcept {
-    const auto number = infra::JsonUnsignedInteger(value);
-    if (!number || *number > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-        return std::nullopt;
-    }
-    return static_cast<int64_t>(*number);
-}
-
-// 单遍校验并逐行交给 `visit`；任何一行非法都使整条记录无效（抛 runtime_error）。
+// 单遍零分配校验并逐行交给 `visit`；任何一行或尾随字节非法都使整条记录无效（抛 runtime_error）。
 template <typename Visit>
 void VisitRecordRows(std::string_view text, Visit&& visit) {
-    const auto parsed = infra::parse(text);
-    if (!parsed.is_array()) throw std::runtime_error("invalid traffic journal record");
-    for (const auto& item : parsed.as_array()) {
-        if (!item.is_array() || item.as_array().size() != 3) {
-            throw std::runtime_error("invalid traffic journal row");
+    size_t pos = 0;
+    const auto skip_ws = [&]() noexcept {
+        while (pos < text.size()) {
+            const char c = text[pos];
+            if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
+            ++pos;
         }
-        const auto& fields = item.as_array();
-        const auto uid = DecodeCounter(fields[0]);
-        const auto upload = DecodeCounter(fields[1]);
-        const auto download = DecodeCounter(fields[2]);
-        if (!uid || !upload || !download || *uid == 0 || (*upload == 0 && *download == 0)) {
-            throw std::runtime_error("invalid traffic journal counters");
+    };
+    const auto consume_char = [&](char expected) noexcept {
+        skip_ws();
+        if (pos < text.size() && text[pos] == expected) {
+            ++pos;
+            return true;
         }
-        visit(RecordRow{.uid = *uid, .upload = *upload, .download = *download});
+        return false;
+    };
+    const auto read_counter = [&](const char* invalid_what) -> int64_t {
+        skip_ws();
+        if (pos >= text.size()) {
+            throw std::runtime_error(invalid_what);
+        }
+        const char first = text[pos];
+        if (first < '0' || first > '9') {
+            throw std::runtime_error(invalid_what);
+        }
+        const size_t start = pos++;
+        if (first == '0') {
+            if (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
+                throw std::runtime_error(invalid_what);
+            }
+        } else {
+            while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
+                ++pos;
+            }
+        }
+        int64_t value = 0;
+        const auto [end, ec] = std::from_chars(text.data() + start, text.data() + pos, value);
+        if (ec != std::errc{} || end != text.data() + pos) {
+            throw std::runtime_error(invalid_what);
+        }
+        return value;
+    };
+
+    if (!consume_char('[')) {
+        throw std::runtime_error("invalid traffic journal record");
+    }
+    if (!consume_char(']')) {
+        for (;;) {
+            if (!consume_char('[')) {
+                throw std::runtime_error("invalid traffic journal row");
+            }
+            const int64_t uid = read_counter("invalid traffic journal counters");
+            if (!consume_char(',')) {
+                throw std::runtime_error("invalid traffic journal row");
+            }
+            const int64_t upload = read_counter("invalid traffic journal counters");
+            if (!consume_char(',')) {
+                throw std::runtime_error("invalid traffic journal row");
+            }
+            const int64_t download = read_counter("invalid traffic journal counters");
+            if (!consume_char(']')) {
+                throw std::runtime_error("invalid traffic journal row");
+            }
+            if (uid <= 0 || (upload == 0 && download == 0)) {
+                throw std::runtime_error("invalid traffic journal counters");
+            }
+            visit(RecordRow{.uid = uid, .upload = upload, .download = download});
+            if (consume_char(',')) {
+                continue;
+            }
+            if (!consume_char(']')) {
+                throw std::runtime_error("invalid traffic journal record");
+            }
+            break;
+        }
+    }
+    skip_ws();
+    if (pos != text.size()) {
+        throw std::runtime_error("invalid traffic journal record");
     }
 }
 

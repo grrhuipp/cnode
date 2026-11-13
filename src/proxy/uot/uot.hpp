@@ -98,10 +98,17 @@ public:
 
     [[nodiscard]] common::MultiBuffer TakePending() noexcept;
 private:
+    [[nodiscard]] bool TryPopDatagram(common::MultiBuffer& out);
+    [[noreturn]] void Fail();
+
     transport::MultiBufferReader& reader_;
     bool is_connect_ = false;
+    bool header_decoded_ = false;
+    bool failed_ = false;
+    uint16_t payload_size_ = 0;
     // 非 connect 仅使用帧内地址，请求目标已由会话上下文拥有。
     common::TargetAddress destination_;
+    std::optional<common::TargetAddress> packet_target_;
     common::MultiBuffer pending_;
 };
 
