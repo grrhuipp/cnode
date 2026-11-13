@@ -111,7 +111,9 @@ public:
         std::source_location location = std::source_location::current());
 
     [[nodiscard]] static bool ShouldLog(LogLevel level) noexcept;
-
+    [[nodiscard]] static bool IsInitialized() noexcept {
+        return initialized_.load(std::memory_order_acquire);
+    }
 private:
     static std::atomic<LogLevel> min_level_;
     static std::atomic_bool initialized_;
@@ -152,6 +154,7 @@ private:
 
 #define LOG_ACCESS(message) \
     do { \
-        ::infra::Log::WriteAccess((message)); \
+        if (::infra::Log::IsInitialized()) \
+            ::infra::Log::WriteAccess((message)); \
     } while (0)
 

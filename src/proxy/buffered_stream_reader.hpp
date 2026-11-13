@@ -26,6 +26,18 @@ public:
     [[nodiscard]] bool ReadBuffered(uint8_t* data, size_t len, size_t& done) noexcept {
         return ReadBufferedFrom(pending_, data, len, done);
     }
+    [[nodiscard]] size_t PendingBytes() const noexcept { return pending_.byte_size(); }
+    [[nodiscard]] common::BufferGuard TakeFrontIfLen(size_t len) noexcept {
+        return pending_.TakeFrontIfLen(len);
+    }
+    [[nodiscard]] std::span<uint8_t> MutablePrefixSpan(size_t len) noexcept {
+        return len <= pending_.byte_size()
+            ? pending_.MutableFrontSpan().first(len)
+            : std::span<uint8_t>{};
+    }
+    void DropBufferedPrefix(size_t len) noexcept {
+        (void)pending_.DropPrefixBytes(len);
+    }
     [[nodiscard]] static bool ReadBufferedFrom(
         common::MultiBuffer& pending, uint8_t* data, size_t len, size_t& done) noexcept {
         if (done < len)

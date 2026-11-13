@@ -495,7 +495,9 @@ private:
     net::awaitable<common::MultiBuffer> ReadRawBytes();
     net::awaitable<common::MultiBuffer> ReadEncryptedMultiBuffer();
     void DecodeLoadedRecordHeader();
-    size_t OpenRecord(VlessEncryptionAead& aead, std::span<uint8_t> encrypted);
+    size_t OpenRecord(VlessEncryptionAead& aead,
+                      std::span<const uint8_t> encrypted,
+                      std::span<uint8_t> plain_out);
 
     [[nodiscard]] VlessEncryptionAead& KeyDeferredRead(
         const VlessEncryptionDeferredRead& deferred);
