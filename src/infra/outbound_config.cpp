@@ -2,8 +2,7 @@
 #include "infra/json.hpp"
 #include "common/scoped_cleanse.hpp"
 #include "proxy/anytls_padding.hpp"
-#include "proxy/vless/vless_codec.hpp"
-#include "proxy/vless/vless_encryption_config.hpp"
+#include "proxy/vless_config.hpp"
 #include <limits>
 #include <stdexcept>
 

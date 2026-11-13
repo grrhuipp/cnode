@@ -738,29 +738,17 @@ net::awaitable<tl::expected<void, common::ErrorCode>> ReadHttp1MessageHead(
     if (!head.storage) {
         if (initial.empty()) {
             common::MultiBuffer mb = co_await stream.ReadMultiBuffer();
-            common::BufferGuard first;
-            while (!mb.empty()) {
-                first = mb.pop_front();
-                if (first && !first->IsEmpty()) break;
-                first.reset();
-            }
-            if (!first) {
+            common::BufferGuard first = mb.pop_front();
+            if (!first || first->IsEmpty()) {
                 co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
             }
             first->CompactToFront();
             const size_t first_len = first->Len();
             first->Reset();
             head.storage = std::move(first);
-            uint8_t* data = head.storage->Tail().data();
-            const size_t capacity = head.storage->Available();
-            head.bytes = data;
+            head.bytes = head.storage->Tail().data();
             head.header_end = 0;
             head.size = first_len;
-            if (!mb.empty()) {
-                head.size += mb.ConsumePrefixTo(
-                    std::span<uint8_t>(data + head.size, capacity - head.size));
-                stream.PrependReadMultiBuffer(std::move(mb));
-            }
         } else {
             head.storage = common::BufferGuard{common::Buffer::New()};
             if (!head.storage) {

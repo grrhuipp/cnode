@@ -160,7 +160,6 @@ private:
     [[nodiscard]] bool HasPendingBytes() noexcept;
     [[nodiscard]] bool TryFillHeaderFromPending() noexcept;
     net::awaitable<bool> EnsurePendingData();
-    net::awaitable<size_t> ReadSome(uint8_t* data, size_t size);
     net::awaitable<bool> PrepareNextDataFrame();
     void ConsumePayloadBytes(std::span<uint8_t> bytes);
     void FinishDataFrame();

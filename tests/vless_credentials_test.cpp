@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
-#include "proxy/vless/vless_codec.hpp"
-#include "proxy/vless/vless_encryption_config.hpp"
+#include "proxy/vless_config.hpp"
 #include <string>
 #include <string_view>
 

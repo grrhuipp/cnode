@@ -7,7 +7,7 @@
 #include "proxy/buffered_stream_reader.hpp"
 #include "proxy/aead.hpp"
 #include "proxy/expiring_keyed_map.hpp"
-#include "proxy/vless/vless_encryption_config.hpp"
+#include "proxy/vless_config.hpp"
 #include <tl/expected.hpp>
 
 #include <openssl/aead.h>

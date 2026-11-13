@@ -124,13 +124,6 @@ net::awaitable<bool> BaseWsStream::EnsurePendingData() {
     co_return HasPendingBytes();
 }
 
-net::awaitable<size_t> BaseWsStream::ReadSome(uint8_t* data, size_t size) {
-    if (!HasPendingBytes() && !co_await EnsurePendingData()) co_return 0;
-    const size_t n = pending_data_.ConsumePrefixTo(std::span<uint8_t>(data, size));
-    pending_data_.ReleaseIfIdle();
-    co_return n;
-}
-
 void BaseWsStream::ConsumePayloadBytes(std::span<uint8_t> bytes) {
     if (frame_masked_)
         MaskData(bytes.data(), bytes.size(), frame_mask_key_.data(), frame_mask_offset_);
@@ -253,9 +246,11 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
                 break;
             case ReadStage::Control: {
                 while (frame_payload_remaining_ != 0) {
-                    const size_t n = co_await ReadSome(
-                        control_payload_.data() + control_used_,
-                        static_cast<size_t>(frame_payload_remaining_));
+                    if (!HasPendingBytes() && !co_await EnsurePendingData()) co_return false;
+                    const size_t n = pending_data_.ConsumePrefixTo(
+                        std::span<uint8_t>(control_payload_.data() + control_used_,
+                                           static_cast<size_t>(frame_payload_remaining_)));
+                    pending_data_.ReleaseIfIdle();
                     if (n == 0) co_return false;
                     if (frame_masked_)
                         MaskData(control_payload_.data() + control_used_, n,
