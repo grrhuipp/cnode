@@ -148,8 +148,9 @@ public:
         if (metadata.udp_session_target) {
             ctx.content.network = common::Network::UDP;
             ctx.outbound.target = std::move(*metadata.udp_session_target);
+            metadata.udp_session_target.reset();
         }
-
+        std::string{}.swap(metadata.real_ip);
         InboundHandler& handler = *handler_;
         const app::ReceiverSettings& listener = handler.receiver_;
         proxy::InboundSubstreamAdmission admission(stats_);
@@ -202,7 +203,14 @@ std::shared_ptr<transport::InboundTransportStreamHandler> InboundHandler::NewAut
         session_ctx, true, std::move(family));
 }
 
-net::awaitable<void> InboundHandler::ProcessAcceptedTCP(
+struct InboundHandler::AcceptedTcpTransport {
+    std::unique_ptr<transport::AsyncStream> stream;
+    app::ConnectionLimiter::Reservation connection_limit;
+    app::ConnectionLimiter::Reservation ip_limit;
+};
+
+net::awaitable<std::optional<InboundHandler::AcceptedTcpTransport>>
+InboundHandler::PrepareAcceptedTCP(
     net::io_context& io_context,
     routing::Dispatcher& dispatcher,
     app::StatsShard& stats,
@@ -212,15 +220,13 @@ net::awaitable<void> InboundHandler::ProcessAcceptedTCP(
     common::Context& ctx,
     app::DNS* dns_service) {
     const app::ReceiverSettings& listener = receiver_;
-    app::ConnectionStatsScope connection_stats(stats);
 
     ctx.inbound.accounting_key.assign(listener.accounting_key);
 
     if (!raw_conn) {
         stats.OnError();
-        co_return;
+        co_return std::nullopt;
     }
-
     if (listener.proxy_protocol != transport::ProxyProtocolMode::Off) {
         auto proxy_read = co_await transport::ReadInboundProxyProtocol(
             *raw_conn,
@@ -256,7 +262,7 @@ net::awaitable<void> InboundHandler::ProcessAcceptedTCP(
             }
             stats.OnError();
             raw_conn->CloseAbortive();
-            co_return;
+            co_return std::nullopt;
         }
 
         if (listener.proxy_protocol == transport::ProxyProtocolMode::On &&
@@ -267,7 +273,7 @@ net::awaitable<void> InboundHandler::ProcessAcceptedTCP(
                 ctx.inbound.source_ip);
             stats.OnError();
             raw_conn->CloseAbortive();
-            co_return;
+            co_return std::nullopt;
         }
 
         ApplyProxyProtocolResult(ctx, proxy_read.result);
@@ -280,7 +286,7 @@ net::awaitable<void> InboundHandler::ProcessAcceptedTCP(
     auto reject = physical_admission.reason;
     if (reject != app::ConnectionLimiter::RejectReason::NONE) {
         proxy::RejectInboundAdmission(ctx, stats, reject);
-        co_return;
+        co_return std::nullopt;
     }
     auto connection_limit = std::move(physical_admission.reservation);
     ctx.inbound.connection_family = connection_limit.FamilyLease();
@@ -327,14 +333,14 @@ net::awaitable<void> InboundHandler::ProcessAcceptedTCP(
                        transport::SecurityModeName(listener.stream_settings.security_mode),
                        listener.stream_settings.NetworkName());
         stats.OnError();
-        co_return;
+        co_return std::nullopt;
     }
     auto stream = std::move(*build_result);
     if (!stream) {
         LOG_CONN_DEBUG(ctx, "transport consumed connection security={} network={}",
                        transport::SecurityModeName(listener.stream_settings.security_mode),
                        listener.stream_settings.NetworkName());
-        co_return;
+        co_return std::nullopt;
     }
 
     ApplyHttpRealIp(ctx, local_metadata.real_ip);
@@ -346,18 +352,41 @@ net::awaitable<void> InboundHandler::ProcessAcceptedTCP(
     reject = ip_admission.reason;
     if (reject != app::ConnectionLimiter::RejectReason::NONE) {
         proxy::RejectInboundAdmission(ctx, stats, reject);
-        co_return;
+        co_return std::nullopt;
     }
     auto ip_limit = std::move(ip_admission.reservation);
 
     LOG_CONN_DEBUG(ctx, "transport ready security={} network={}",
                    transport::SecurityModeName(listener.stream_settings.security_mode),
                    listener.stream_settings.NetworkName());
+    co_return AcceptedTcpTransport{
+        .stream = std::move(stream),
+        .connection_limit = std::move(connection_limit),
+        .ip_limit = std::move(ip_limit),
+    };
+}
+
+net::awaitable<void> InboundHandler::ProcessAcceptedTCP(
+    net::io_context& io_context,
+    routing::Dispatcher& dispatcher,
+    app::StatsShard& stats,
+    app::RequestLoadState& request_load,
+    const infra::TimeoutsConfig& timeouts,
+    std::unique_ptr<transport::AsyncStream> raw_conn,
+    common::Context& ctx,
+    app::DNS* dns_service) {
+    app::ConnectionStatsScope connection_stats(stats);
+    auto prepared = co_await PrepareAcceptedTCP(
+        io_context, dispatcher, stats, request_load, timeouts,
+        std::move(raw_conn), ctx, dns_service);
+    if (!prepared) {
+        co_return;
+    }
 
     proxy::Inbound& proxy = *proxy_;
     try {
         (void)co_await proxy.Process(
-            std::move(stream), dispatcher, listener, io_context, ctx, timeouts,
+            std::move(prepared->stream), dispatcher, receiver_, io_context, ctx, timeouts,
             request_load.PressureIdleTimeout());
     } catch (...) {
         CountEscapedInboundFailure(ctx, stats);

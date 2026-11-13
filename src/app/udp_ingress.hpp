@@ -437,7 +437,6 @@ private:
     void RetireNativeJob(ClientSession& session) noexcept;
     static net::awaitable<void> RunNativeDispatch(ClientSessionPtr session);
     void ProcessDecoded(const UdpDatagramContext& datagram,
-        const net::ip::address& client_address,
         proxy::InboundDatagramResult decoded,
         std::chrono::steady_clock::time_point now,
         std::shared_ptr<UdpHandoffRecord> record = {});

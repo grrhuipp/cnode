@@ -6,7 +6,6 @@
 #include "infra/log.hpp"
 #include "proxy/outbound.hpp"
 
-#include <cstdint>
 #include <memory>
 #include <span>
 #include <string_view>

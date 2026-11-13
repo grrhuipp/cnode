@@ -926,59 +926,37 @@ private:
                 }
                 co_return false;
     }
-    net::awaitable<bool> WritePayloadFrameToClient(MuxReply& reply) {
-                const size_t payload_size = reply.PayloadSize();
-                size_t header_len = 0;
-                if (reply.is_udp) {
-                    // 入队前已校验整份 datagram 带同一合法目标；队列不改写 Buffer 标签。
-                    const auto datagram = common::InspectUdpDatagram(reply.payload);
-                    header_len = datagram.target == nullptr ? 0 : common::EncodeKeepUDPHeaderTo(
-                        write_frame_,
-                        reply.session_id,
-                        *datagram.target,
-                        payload_size);
-                    if (header_len == 0) {
-                        LOG_CONN_DEBUG(parent_ctx,
-                            "UDP reply header encode failed sid={} src={} payload={}B",
-                            reply.session_id,
-                            datagram.target ? *datagram.target : common::TargetAddress{},
-                            payload_size);
-                        reply.payload.clear();
-                        co_return true;
-                    }
-                } else {
-                    header_len = common::EncodeKeepDataHeaderTo(
-                        write_frame_,
-                        reply.session_id,
-                        payload_size);
-                    if (header_len == 0) {
-                        reply.payload.clear();
-                        result.error = common::ErrorCode::PROTOCOL_ENCODE_FAILED;
-                        co_return false;
-                    }
-                }
-                const size_t frame_size = header_len + payload_size;
-                if (frame_size == 0) {
-                    co_return true;
-                }
-
-                std::array<net::const_buffer, 2> framed;
-                size_t count = 0;
-                if (header_len != 0) framed[count++] = net::const_buffer(write_frame_.data(), header_len);
-                if (const auto bytes = reply.payload.FrontSpan(); !bytes.empty()) {
-                    framed[count++] = net::const_buffer(bytes.data(), bytes.size());
-                }
-                try {
-                    co_await client_link.writer->WriteBuffers({framed.data(), count});
-                    reply.payload.clear();
-                    parent_ctx.traffic.bytes_down += frame_size;
-                    result.bytes_down += frame_size;
-                    co_return true;
-                } catch (...) {
-                    RecordClientWriteFailure(std::current_exception());
-                }
+    [[nodiscard]] std::optional<size_t> EncodePayloadFrameHeader(MuxReply& reply) {
+        const size_t payload_size = reply.PayloadSize();
+        if (reply.is_udp) {
+            // 入队前已校验整份 datagram 带同一合法目标；队列不改写 Buffer 标签。
+            const auto datagram = common::InspectUdpDatagram(reply.payload);
+            const size_t header_len = datagram.target == nullptr ? 0 : common::EncodeKeepUDPHeaderTo(
+                write_frame_,
+                reply.session_id,
+                *datagram.target,
+                payload_size);
+            if (header_len == 0) {
+                LOG_CONN_DEBUG(parent_ctx,
+                    "UDP reply header encode failed sid={} src={} payload={}B",
+                    reply.session_id,
+                    datagram.target ? *datagram.target : common::TargetAddress{},
+                    payload_size);
                 reply.payload.clear();
-                co_return false;
+                return size_t{0};
+            }
+            return header_len;
+        }
+        const size_t header_len = common::EncodeKeepDataHeaderTo(
+            write_frame_,
+            reply.session_id,
+            payload_size);
+        if (header_len == 0) {
+            reply.payload.clear();
+            result.error = common::ErrorCode::PROTOCOL_ENCODE_FAILED;
+            return std::nullopt;
+        }
+        return header_len;
     }
     net::awaitable<void> ProcessFrames(common::AwaitableTaskGroup& tasks) {
         try {
@@ -1007,7 +985,30 @@ private:
                     }
                     continue;
                 }
-                if (!co_await WritePayloadFrameToClient(reply)) {
+                const size_t payload_size = reply.PayloadSize();
+                const auto header_len = EncodePayloadFrameHeader(reply);
+                if (!header_len) {
+                    running = false;
+                    break;
+                }
+                if (*header_len == 0) {
+                    continue;
+                }
+                const size_t frame_size = *header_len + payload_size;
+                std::array<net::const_buffer, 2> framed;
+                size_t count = 0;
+                framed[count++] = net::const_buffer(write_frame_.data(), *header_len);
+                if (const auto bytes = reply.payload.FrontSpan(); !bytes.empty()) {
+                    framed[count++] = net::const_buffer(bytes.data(), bytes.size());
+                }
+                try {
+                    co_await client_link.writer->WriteBuffers({framed.data(), count});
+                    reply.payload.clear();
+                    parent_ctx.traffic.bytes_down += frame_size;
+                    result.bytes_down += frame_size;
+                } catch (...) {
+                    RecordClientWriteFailure(std::current_exception());
+                    reply.payload.clear();
                     running = false;
                     break;
                 }
@@ -1117,10 +1118,10 @@ private:
 
                 // ----------------------------------------------------------------
                 case common::SessionStatus::KEEPALIVE: {
-                    std::array<uint8_t, 6> write_frame{};
-                    const size_t header_len = common::EncodeKeepAliveTo(write_frame);
+                    const size_t header_len = common::EncodeKeepAliveTo(
+                        std::span<uint8_t>(write_frame_).first<6>());
                     if (!co_await WriteFrameToClient(
-                            std::span<const uint8_t>(write_frame.data(), header_len))) {
+                            std::span<const uint8_t>(write_frame_.data(), header_len))) {
                         running = false;
                     }
                     break;
@@ -1147,11 +1148,10 @@ private:
                             hdr.session_id, sub_sessions.size());
                         LOG_ACCESS(common::FormatAccessLog(rejected_ctx, common::AccessStatus::Rejected,
                             duplicate_sid ? "duplicate stream ID" : "concurrent stream limit"));
-                        std::array<uint8_t, 6> write_frame{};
-                        const size_t header_len =
-                            common::EncodeEndTo(write_frame, hdr.session_id, true);
+                        const size_t header_len = common::EncodeEndTo(
+                            std::span<uint8_t>(write_frame_).first<6>(), hdr.session_id, true);
                         if (!co_await WriteFrameToClient(
-                                std::span<const uint8_t>(write_frame.data(), header_len))) {
+                                std::span<const uint8_t>(write_frame_.data(), header_len))) {
                             running = false;
                         }
                         break;

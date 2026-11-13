@@ -191,11 +191,9 @@ public:
                      std::weak_ptr<HysteriaConnection> owner);
     ~UdpSessionStream() noexcept override;
 
+    [[nodiscard]] bool CanAcceptBytes(size_t total_bytes) const noexcept;
     [[nodiscard]] bool Push(const common::TargetAddress& target, std::span<const uint8_t> payload);
-    template <typename AppendFn>
-    [[nodiscard]] bool PushWith(
-        const common::TargetAddress& target, size_t total_bytes, AppendFn&& append);
-    // The owning connection closed; pending reads end and writes fail.
+    [[nodiscard]] bool PushMultiBuffer(const common::TargetAddress& target, common::MultiBuffer packet);
     void Detach() noexcept;
 
     transport::EofAction ReadEofAction() const noexcept override {

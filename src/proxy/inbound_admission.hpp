@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/error.hpp"
+#include "proxy/handshake_errors.hpp"
 #include "app/relay.hpp"
 #include "app/inbound_handler.hpp"
 #include "app/user_store.hpp"
@@ -83,17 +84,9 @@ inline void RejectInboundAdmission(const common::Context& ctx, app::StatsShard& 
     } catch (const std::bad_alloc&) {
         return common::ErrorCode::RESOURCE_EXHAUSTED;
     } catch (const IoSystemError& error) {
-        if (stream) {
-            if (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout() ||
-                stream->ConsumeReadTimeout() || error.code() == io_error::timed_out) {
-                return common::ErrorCode::TIMEOUT;
-            }
-            if (error.code() == io_error::operation_aborted) {
-                return common::ErrorCode::CANCELLED;
-            }
-            return common::ErrorCode::SOCKET_READ_FAILED;
-        }
-        return common::MapAsioError(error.code());
+        return stream
+            ? ClassifyHandshakeReadException(*stream, error)
+            : common::MapAsioError(error.code());
     } catch (...) {
         return transport::ClassifyFailure(failure, fallback);
     }

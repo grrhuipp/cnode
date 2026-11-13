@@ -396,43 +396,56 @@ private:
     // Runs one header phase under the substream's absolute handshake budget.
     // The phase and its timer are joined before this returns; an expired
     // budget yields TIMEOUT even when the phase itself completed.
-    template<class Phase>
-    net::awaitable<common::ErrorCode> RunHandshakePhase(
-        AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at, Phase& phase) {
-        const auto deadline_tp = opened_at + timeouts_.HandshakeTimeout();
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline_tp) {
-            sub.Cancel();
-            co_return common::ErrorCode::TIMEOUT;
+    struct ScopedHandshakeDeadline final : private transport::TimeoutEvent {
+        ScopedHandshakeDeadline(AnyTLSSubStream& sub_ref,
+                                std::chrono::steady_clock::time_point deadline) noexcept
+            : sub(sub_ref), deadline_tp(deadline) {}
+
+        [[nodiscard]] common::ErrorCode Arm(net::io_context& io) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline_tp) {
+                timed_out = true;
+                sub.Cancel();
+                return common::ErrorCode::TIMEOUT;
+            }
+            const auto remaining =
+                std::chrono::ceil<std::chrono::milliseconds>(deadline_tp - now);
+            if (!transport::TimeoutScheduler::ForIoContext(io).ScheduleAfter(
+                    remaining, *this)) {
+                throw IoSystemError(io_error::operation_aborted);
+            }
+            return common::ErrorCode::OK;
         }
-        const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline_tp - now);
-        bool timed_out = false;
-        struct HandshakeDeadline final : transport::TimeoutEvent {
-            HandshakeDeadline(bool& timed_out, AnyTLSSubStream& sub) noexcept
-                : timed_out(timed_out), sub(sub) {}
-            void OnTimeout() override {
+
+        [[nodiscard]] common::ErrorCode Finish(common::ErrorCode phase_error) noexcept {
+            this->Cancel();
+            // Ready continuations can run before an already-due timer callback.
+            // Do not dispatch a header that completed beyond its absolute budget.
+            if (!timed_out && std::chrono::steady_clock::now() >= deadline_tp) {
                 timed_out = true;
                 sub.Cancel();
             }
-            bool& timed_out;
-            AnyTLSSubStream& sub;
-        } deadline(timed_out, sub);
-        if (!transport::TimeoutScheduler::ForIoContext(io_context_).ScheduleAfter(remaining, deadline))
-            throw IoSystemError(io_error::operation_aborted);
-        common::ErrorCode phase_error = common::ErrorCode::INTERNAL;
-        try {
-            phase_error = co_await phase();
-        } catch (const IoSystemError&) {
-            if (!timed_out) throw;
+            return timed_out ? common::ErrorCode::TIMEOUT : phase_error;
         }
-        // Ready continuations can run before an already-due timer callback.
-        // Do not dispatch a header that completed beyond its absolute budget.
-        if (!timed_out && std::chrono::steady_clock::now() >= deadline_tp) {
+
+        void OnTimeout() override {
             timed_out = true;
             sub.Cancel();
         }
-        co_return timed_out ? common::ErrorCode::TIMEOUT : phase_error;
-    }
+
+        AnyTLSSubStream& sub;
+        std::chrono::steady_clock::time_point deadline_tp;
+        bool timed_out = false;
+    };
+
+    struct PreparedSubstream {
+        common::ErrorCode error = common::ErrorCode::OK;
+        std::optional<UotVersion> uot_version;
+        common::MultiBuffer pending;
+    };
+
+    net::awaitable<PreparedSubstream> PrepareStream(
+        AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at);
 
     net::awaitable<common::ErrorCode> ProcessUdpSubstream(
         AnyTLSSubStream& sub,
@@ -493,16 +506,27 @@ net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
     common::MultiBuffer pending,
     std::chrono::steady_clock::time_point opened_at) {
     std::optional<PreparedRequest> prepared;
-    auto read_header = [&]() -> net::awaitable<common::ErrorCode> {
-        auto uot_header = co_await ReadUotRequestHeader(
-            uot_version, sub, std::move(pending));
-        if (!uot_header) co_return uot_header.error();
-        prepared.emplace(std::move(*uot_header));
-        co_return common::ErrorCode::OK;
-    };
-    if (const auto error = co_await RunHandshakePhase(sub, opened_at, read_header);
-        error != common::ErrorCode::OK) {
-        co_return error;
+    {
+        ScopedHandshakeDeadline guard(sub, opened_at + timeouts_.HandshakeTimeout());
+        if (const auto arm_err = guard.Arm(io_context_); arm_err != common::ErrorCode::OK) {
+            co_return arm_err;
+        }
+        common::ErrorCode phase_error = common::ErrorCode::OK;
+        try {
+            auto uot_header = co_await ReadUotRequestHeader(
+                uot_version, sub, std::move(pending));
+            if (!uot_header) {
+                phase_error = uot_header.error();
+            } else {
+                prepared.emplace(std::move(*uot_header));
+            }
+        } catch (const IoSystemError&) {
+            if (!guard.timed_out) throw;
+        }
+        if (const auto finished = guard.Finish(phase_error);
+            finished != common::ErrorCode::OK) {
+            co_return finished;
+        }
     }
     if (sub.IsClosed()) co_return common::ErrorCode::CONNECTION_CLOSED;
 
@@ -510,6 +534,50 @@ net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
         std::move(*prepared), nullptr, sub, sub,
         dispatcher_, policy_, io_context_, sub.ctx, environment_.stats, timeouts_);
     co_return common::ErrorCode::OK;
+}
+
+net::awaitable<AnyTLSDemuxSession::PreparedSubstream> AnyTLSDemuxSession::PrepareStream(
+    AnyTLSSubStream& sub, std::chrono::steady_clock::time_point opened_at) {
+    PreparedSubstream out;
+    ScopedHandshakeDeadline guard(sub, opened_at + timeouts_.HandshakeTimeout());
+    if (const auto arm_err = guard.Arm(io_context_); arm_err != common::ErrorCode::OK) {
+        out.error = arm_err;
+        co_return out;
+    }
+    common::ErrorCode phase_error = common::ErrorCode::OK;
+    try {
+        auto parsed = co_await common::ReadAddress(
+            sub, out.pending, common::AddressWireFormat::Socks5, 0,
+            {.require_non_empty_domain = true, .allow_metadata = true});
+        if (!parsed) {
+            phase_error = parsed.error();
+        } else {
+            out.pending.DropPrefixBytes(parsed->consumed);
+            out.uot_version = VersionFromMagicAddress(parsed->target);
+            if (!parsed->target.IsValid() && !out.uot_version) {
+                phase_error = common::ErrorCode::PROTOCOL_INVALID_ADDRESS;
+            } else {
+                proxy::BindInboundRequestTarget(
+                    sub.ctx,
+                    proxy::InboundRequestTarget{
+                        out.uot_version ? common::Network::UDP : common::Network::TCP,
+                        out.uot_version ? common::TargetAddress{} : std::move(parsed->target),
+                        std::move(parsed->forwarded)});
+                if (session_version_ == SessionVersion::V2) {
+                    if (auto ok = co_await WriteFrameSerialized(kCmdSYNACK, sub.Sid(), {}, &sub); !ok) {
+                        phase_error = ok.error();
+                    }
+                }
+            }
+        }
+    } catch (const IoSystemError&) {
+        if (!guard.timed_out) throw;
+    }
+    out.error = guard.Finish(phase_error);
+    if (out.error != common::ErrorCode::OK) {
+        out.pending.clear();
+    }
+    co_return out;
 }
 
 net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessStream(
@@ -525,44 +593,21 @@ net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessStream(
         }
         co_return common::ErrorCode::BLOCKED;
     }
-    common::MultiBuffer pending;
-    std::optional<UotVersion> uot_version;
-    auto prepare = [&]() -> net::awaitable<common::ErrorCode> {
-        auto parsed = co_await common::ReadAddress(sub, pending, common::AddressWireFormat::Socks5,
-                                           0,
-                                           {.require_non_empty_domain = true,
-                                            .allow_metadata = true});
-        if (!parsed) co_return parsed.error();
-        pending.DropPrefixBytes(parsed->consumed);
-        uot_version = VersionFromMagicAddress(parsed->target);
-        if (!parsed->target.IsValid() && !uot_version) {
-            co_return common::ErrorCode::PROTOCOL_INVALID_ADDRESS;
+    common::InitialPayload initial_payload;
+    {
+        auto prepared = co_await PrepareStream(sub, opened_at);
+        if (prepared.error != common::ErrorCode::OK) {
+            co_return prepared.error;
         }
-        proxy::BindInboundRequestTarget(
-            ctx,
-            proxy::InboundRequestTarget{
-                uot_version ? common::Network::UDP : common::Network::TCP,
-                uot_version ? common::TargetAddress{} : std::move(parsed->target),
-                std::move(parsed->forwarded)});
-        if (session_version_ == SessionVersion::V2) {
-            if (auto ok = co_await WriteFrameSerialized(kCmdSYNACK, sub.Sid(), {}, &sub); !ok)
-                co_return ok.error();
+        if (sub.IsClosed()) co_return common::ErrorCode::CONNECTION_CLOSED;
+        if (prepared.uot_version) {
+            co_return co_await ProcessUdpSubstream(
+                sub, *prepared.uot_version, std::move(prepared.pending), opened_at);
         }
-        co_return common::ErrorCode::OK;
-    };
-
-    if (const auto error = co_await RunHandshakePhase(sub, opened_at, prepare);
-        error != common::ErrorCode::OK) {
-        co_return error;
-    }
-    if (sub.IsClosed()) co_return common::ErrorCode::CONNECTION_CLOSED;
-    // Header preparation is joined and its timer removed before Dispatcher.
-    if (uot_version) {
-        co_return co_await ProcessUdpSubstream(
-            sub, *uot_version, std::move(pending), opened_at);
+        initial_payload = common::InitialPayload{std::move(prepared.pending)};
     }
     (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
-        transport::Link{&sub, &sub}, common::InitialPayload{std::move(pending)},
+        transport::Link{&sub, &sub}, std::move(initial_payload),
         ctx, environment_.stats, timeouts_);
     co_return common::ErrorCode::OK;
 }

@@ -6,6 +6,8 @@
 #include "common/constants.hpp"
 #include "transport/http_headers.hpp"
 #include "transport/tls_server_name.hpp"
+#include <openssl/aead.h>
+#include <openssl/aes.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 
@@ -346,16 +348,15 @@ bool HkdfExpandLabel(std::span<const uint8_t> secret,
     return true;
 }
 
-bool AesEcbEncrypt(EVP_CIPHER_CTX* ctx,
-                   std::span<const uint8_t, 16> key,
+bool AesEcbEncrypt(std::span<const uint8_t, 16> key,
                    std::span<const uint8_t, 16> in,
                    std::span<uint8_t, 16> out) noexcept {
-    EVP_CIPHER_CTX_reset(ctx);
-    int out_len = 0;
-    return EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, key.data(), nullptr) == 1 &&
-           EVP_CIPHER_CTX_set_padding(ctx, 0) == 1 &&
-           EVP_EncryptUpdate(ctx, out.data(), &out_len, in.data(), 16) == 1 &&
-           out_len == 16;
+    AES_KEY aes_key{};
+    if (AES_set_encrypt_key(key.data(), 128, &aes_key) != 0) {
+        return false;
+    }
+    AES_encrypt(in.data(), out.data(), &aes_key);
+    return true;
 }
 
 constexpr size_t kMaxCrypto = 64 * 1024;
@@ -369,7 +370,8 @@ void Grow(std::vector<uint8_t>& bytes, size_t size) {
     bytes.resize(size);
 }
 
-bool AesGcmDecrypt(EVP_CIPHER_CTX* ctx,
+bool AesGcmDecrypt(bssl::ScopedEVP_AEAD_CTX& aead_ctx,
+                   bool& aead_ready,
                    std::span<const uint8_t, 16> key,
                    std::span<const uint8_t, 12> nonce,
                    uint8_t unmasked_first_byte,
@@ -380,40 +382,50 @@ bool AesGcmDecrypt(EVP_CIPHER_CTX* ctx,
                    std::vector<uint8_t>& heap_buf,
                    std::span<const uint8_t>& plaintext) {
     if (ciphertext.size() <= 16) return false; // A QUIC packet must contain a frame.
-    const auto tag = ciphertext.subspan(ciphertext.size() - 16, 16);
-    const auto body = ciphertext.first(ciphertext.size() - 16);
+    const size_t max_plain_size = ciphertext.size() - 16;
     uint8_t* out_ptr = nullptr;
     if (ciphertext.size() <= stack_buf.size()) {
         out_ptr = stack_buf.data();
     } else {
-        heap_buf.resize(body.size());
+        heap_buf.resize(max_plain_size);
         out_ptr = heap_buf.data();
     }
 
-    EVP_CIPHER_CTX_reset(ctx);
-    int aad_len = 0;
-    int out_len = 0;
-    int final_len = 0;
-    const bool ok =
-        EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr) == 1 &&
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) == 1 &&
-        EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce.data()) == 1 &&
-        EVP_DecryptUpdate(ctx, nullptr, &aad_len, &unmasked_first_byte, 1) == 1 &&
-        EVP_DecryptUpdate(ctx, nullptr, &aad_len, aad_middle.data(),
-                          static_cast<int>(aad_middle.size())) == 1 &&
-        EVP_DecryptUpdate(ctx, nullptr, &aad_len, unmasked_pn.data(),
-                          static_cast<int>(unmasked_pn.size())) == 1 &&
-        EVP_DecryptUpdate(ctx, out_ptr, &out_len, body.data(),
-                          static_cast<int>(body.size())) == 1 &&
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16,
-                            const_cast<uint8_t*>(tag.data())) == 1 &&
-        EVP_DecryptFinal_ex(ctx, out_ptr + out_len, &final_len) == 1;
-    if (!ok) {
+    if (!aead_ready) {
+        if (EVP_AEAD_CTX_init(
+                aead_ctx.get(), EVP_aead_aes_128_gcm(),
+                key.data(), key.size(), 16, nullptr) != 1) {
+            heap_buf.clear();
+            plaintext = {};
+            return false;
+        }
+        aead_ready = true;
+    }
+
+    const size_t aad_size = 1 + aad_middle.size() + unmasked_pn.size();
+    std::array<uint8_t, 128> stack_aad{};
+    std::vector<uint8_t> heap_aad;
+    uint8_t* aad_ptr = stack_aad.data();
+    if (aad_size > stack_aad.size()) {
+        heap_aad.resize(aad_size);
+        aad_ptr = heap_aad.data();
+    }
+    aad_ptr[0] = unmasked_first_byte;
+    if (!aad_middle.empty()) {
+        std::memcpy(aad_ptr + 1, aad_middle.data(), aad_middle.size());
+    }
+    std::memcpy(aad_ptr + 1 + aad_middle.size(), unmasked_pn.data(), unmasked_pn.size());
+
+    size_t plain_size = 0;
+    if (EVP_AEAD_CTX_open(
+            aead_ctx.get(), out_ptr, &plain_size, max_plain_size,
+            nonce.data(), nonce.size(),
+            ciphertext.data(), ciphertext.size(),
+            aad_ptr, aad_size) != 1) {
         heap_buf.clear();
         plaintext = {};
         return false;
     }
-    const auto plain_size = static_cast<size_t>(out_len + final_len);
     if (out_ptr != stack_buf.data()) {
         heap_buf.resize(plain_size);
     }
@@ -609,7 +621,8 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
 
     // Released on return: no plaintext is held while waiting for the next datagram.
     std::array<uint8_t, 1536> stack_decrypted;
-    bssl::UniquePtr<EVP_CIPHER_CTX> cipher_ctx;
+    bssl::ScopedEVP_AEAD_CTX aead_ctx;
+    bool aead_ready = false;
     std::vector<uint8_t> heap_decrypted;
     std::span<const uint8_t> decrypted;
     size_t offset = 0;
@@ -681,13 +694,9 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
                 !HkdfExpandLabel(client_secret, spec->iv_label, iv_)) return fail();
         }
 
-        if (!cipher_ctx) {
-            cipher_ctx.reset(EVP_CIPHER_CTX_new());
-            if (!cipher_ctx) return fail();
-        }
         std::array<uint8_t, 16> mask{};
         const std::span<const uint8_t, 16> sample(remaining.data() + hdr_len + 4, 16);
-        if (!AesEcbEncrypt(cipher_ctx.get(), hp_key_, sample, mask)) return fail();
+        if (!AesEcbEncrypt(hp_key_, sample, mask)) return fail();
         const uint8_t first = static_cast<uint8_t>(remaining[0] ^ (mask[0] & 0x0f));
         if ((first & 0x0c) != 0) return fail();
         const size_t pn_len = (first & 3) + 1;
@@ -712,7 +721,8 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
         auto nonce = iv_;
         for (size_t i = 0; i < 8; ++i)
             nonce[nonce.size() - 1 - i] ^= static_cast<uint8_t>(packet_number >> (8 * i));
-        if (!AesGcmDecrypt(cipher_ctx.get(), key_, nonce, first, remaining.subspan(1, hdr_len - 1),
+        if (!AesGcmDecrypt(aead_ctx, aead_ready, key_, nonce, first,
+                remaining.subspan(1, hdr_len - 1),
                 std::span<const uint8_t>(pn_bytes.data(), pn_len),
                 remaining.subspan(hdr_len + pn_len,
                                   static_cast<size_t>(packet_len) - pn_len),

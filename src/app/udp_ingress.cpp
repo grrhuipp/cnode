@@ -663,8 +663,6 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
     auto& socket = *datagram.socket;
     const auto now = std::chrono::steady_clock::now();
 
-    const auto normalized_client_addr =
-        common::NormalizeAddress(datagram.client_endpoint.address());
     auto decoded = proxy_->Process(proxy::InboundDatagramRequest{
         .tag = tag_,
         .payload = datagram.payload,
@@ -678,13 +676,14 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         if (decoded.error() == common::ErrorCode::PROTOCOL_AUTH_FAILED) {
             // Datagram sources are socket peers, never PROXY protocol clients,
             // so a credential failure is logged without feeding the ban table.
+            const auto normalized_client_addr =
+                common::NormalizeAddress(datagram.client_endpoint.address());
             common::Context rejected;
             rejected.worker_id = datagram.worker_id;
             rejected.inbound.tag = tag_;
             rejected.inbound.source_addr = normalized_client_addr;
             rejected.inbound.source_ip = common::AddressText(normalized_client_addr).View();
             rejected.inbound.source_port = datagram.client_endpoint.port();
-            rejected.content.network = common::Network::UDP;
             ::proxy::LogInboundAuthFailure(
                 rejected, "datagram authentication or validation failed");
         }
@@ -739,21 +738,22 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
                 datagram.client_endpoint, proxy::InboundDatagramCheck::Commit)) {
             return;
         }
-        ProcessDecoded(datagram, normalized_client_addr, std::move(*decoded), now, std::move(record));
+        ProcessDecoded(datagram, std::move(*decoded), now, std::move(record));
         return;
     }
-    ProcessDecoded(datagram, normalized_client_addr, std::move(*decoded), now);
+    ProcessDecoded(datagram, std::move(*decoded), now);
 }
 
 void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
-    const net::ip::address& client_address,
     proxy::InboundDatagramResult result, std::chrono::steady_clock::time_point now,
     std::shared_ptr<UdpHandoffRecord> record) {
     auto* decoded = &result;
     auto& socket = *datagram.socket;
 
     auto client_key_log = [&]() {
-        return common::TargetAddress(client_address, datagram.client_endpoint.port());
+        return common::TargetAddress(
+            common::NormalizeAddress(datagram.client_endpoint.address()),
+            datagram.client_endpoint.port());
     };
     const ClientSessionKey client_session_key{
         decoded->session_owner, decoded->session_id, datagram.client_endpoint,
@@ -851,6 +851,8 @@ void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
             for (const auto& route_tag : *route_tags)
                 ctx.inbound.tags.emplace_back(route_tag);
         }
+        const auto client_address =
+            common::NormalizeAddress(datagram.client_endpoint.address());
         const common::AddressText client_ip(client_address);
         ctx.inbound.source_ip.assign(client_ip.View());
         ctx.inbound.source_addr = client_address;

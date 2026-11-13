@@ -88,11 +88,16 @@ private:
         common::RingDeque<std::vector<uint8_t>> datagrams;
         std::unordered_map<uint32_t, UdpSessionStream*> udp_sessions;
     };
+    struct StagedFragment {
+        uint8_t id = 0;
+        std::vector<uint8_t> payload;
+    };
     struct PendingFragments {
         common::TargetAddress target;
-        std::vector<std::vector<uint8_t>> payloads;
-        std::array<uint8_t, 256> payload_slots{};
+        common::MultiBuffer in_order;
+        std::vector<StagedFragment> out_of_order;
         std::bitset<256> received_fragments;
+        uint16_t next_in_order = 0;
         uint8_t count = 0;
         uint8_t received = 0;
         size_t bytes = 0;
@@ -130,9 +135,8 @@ private:
     void OnHttpHeader(int64_t stream_id, int32_t token, nghttp3_rcbuf* name, nghttp3_rcbuf* value);
     void ProcessUdpMessage(const HysteriaUdpMessage& message);
     void ExpireUdpFragments(ngtcp2_tstamp now) noexcept;
-    template <typename AppendFn>
-    void DeliverUdpPayload(uint32_t session_id, const common::TargetAddress& target,
-                           size_t total_bytes, AppendFn&& append);
+    void DeliverUdpMultiBuffer(uint32_t session_id, const common::TargetAddress& target,
+                               common::MultiBuffer packet);
     void DeliverUdpPacket(uint32_t session_id, const common::TargetAddress& target,
                           std::span<const uint8_t> payload);
     static int ReceiveStreamData(ngtcp2_conn*, uint32_t flags, int64_t stream_id,

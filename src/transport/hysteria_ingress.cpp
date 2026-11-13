@@ -1354,41 +1354,44 @@ void HysteriaConnection::ExpireUdpFragments(ngtcp2_tstamp now) noexcept {
         }
     }
     if (fragments_.empty()) {
-        fragments_ = {};
+        std::unordered_map<uint64_t, PendingFragments>{}.swap(fragments_);
     }
 }
 
-template <typename AppendFn>
-bool UdpSessionStream::PushWith(
-    const common::TargetAddress& target, size_t total_bytes, AppendFn&& append) {
+bool UdpSessionStream::CanAcceptBytes(size_t total_bytes) const noexcept {
     if (closed_ || cancelled_) return false;
     // Datagrams cannot share a block. Count rounded capacity before allocating,
     // without subtracting an externally sized payload from the byte budget.
     const size_t buffer_count = total_bytes == 0
         ? 1 : 1 + (total_bytes - 1) / common::Buffer::kSize;
-    if (buffer_count > kMaxQueuedBytes / common::Buffer::kSize - queued_buffer_count_)
-        return false;
-    common::MultiBuffer packet;
-    if (!append(packet) || !common::SetUdpTarget(packet, target)) return false;
+    return buffer_count <= kMaxQueuedBytes / common::Buffer::kSize - queued_buffer_count_;
+}
+
+bool UdpSessionStream::PushMultiBuffer(
+    const common::TargetAddress& target, common::MultiBuffer packet) {
+    const size_t total_bytes = packet.byte_size();
+    if (!CanAcceptBytes(total_bytes)) return false;
+    if (!common::SetUdpTarget(packet, target)) return false;
+    const size_t buffer_count = total_bytes == 0
+        ? 1 : 1 + (total_bytes - 1) / common::Buffer::kSize;
     input_.push_back(std::move(packet));
     queued_buffer_count_ += buffer_count;
     WakeReader();
     return true;
 }
 
-template <typename AppendFn>
-void HysteriaConnection::DeliverUdpPayload(
+void HysteriaConnection::DeliverUdpMultiBuffer(
     uint32_t session_id, const common::TargetAddress& target,
-    size_t total_bytes, AppendFn&& append) {
+    common::MultiBuffer packet) {
     if (auto it = core_->udp_sessions.find(session_id);
         it != core_->udp_sessions.end()) {
-        (void)it->second->PushWith(target, total_bytes, std::forward<AppendFn>(append));
+        (void)it->second->PushMultiBuffer(target, std::move(packet));
         return;
     }
     if (core_->udp_sessions.size() >= kMaxUdpSessions) return;
     auto session = std::make_unique<UdpSessionStream>(
         Reactor(), session_id, weak_from_this());
-    if (!session->PushWith(target, total_bytes, std::forward<AppendFn>(append))) return;
+    if (!session->PushMultiBuffer(target, std::move(packet))) return;
     core_->udp_sessions.emplace(session_id, session.get());
     SpawnOwned(DeliverStream(std::move(session),
         InboundTransportMetadata{.real_ip = {}, .udp_session_target = target}));
@@ -1428,15 +1431,38 @@ void HysteriaConnection::ProcessUdpMessage(const HysteriaUdpMessage& message) {
         return;
     }
     if (message.fragment_id == 0) pending.target = message.target;
-    // Header-only fragments still satisfy an index; do not allocate a payload
-    // slot for them or confuse their empty data with a missing fragment.
-    if (!message.payload.empty()) {
-        pending.payloads.emplace_back(message.payload.begin(), message.payload.end());
-        // At most count distinct indices can arrive, and count fits uint8_t.
-        pending.payload_slots[message.fragment_id] =
-            static_cast<uint8_t>(pending.payloads.size());
-    }
     pending.received_fragments.set(message.fragment_id);
+    if (message.fragment_id == pending.next_in_order) {
+        if (!message.payload.empty() &&
+            !pending.in_order.AppendSpan(message.payload)) {
+            fragments_.erase(it);
+            ExpireUdpFragments(now);
+            return;
+        }
+        ++pending.next_in_order;
+        while (pending.next_in_order < pending.count &&
+               pending.received_fragments.test(pending.next_in_order)) {
+            const uint8_t want = static_cast<uint8_t>(pending.next_in_order);
+            auto staged = std::find_if(
+                pending.out_of_order.begin(), pending.out_of_order.end(),
+                [want](const StagedFragment& entry) { return entry.id == want; });
+            if (staged != pending.out_of_order.end()) {
+                if (!pending.in_order.AppendSpan(staged->payload)) {
+                    fragments_.erase(it);
+                    ExpireUdpFragments(now);
+                    return;
+                }
+                *staged = std::move(pending.out_of_order.back());
+                pending.out_of_order.pop_back();
+            }
+            ++pending.next_in_order;
+        }
+    } else if (!message.payload.empty()) {
+        pending.out_of_order.push_back(StagedFragment{
+            .id = message.fragment_id,
+            .payload = {message.payload.begin(), message.payload.end()},
+        });
+    }
     pending.bytes += message.payload.size();
     ++pending.received;
     pending.expires_at = std::min(pending.deadline,
@@ -1447,26 +1473,28 @@ void HysteriaConnection::ProcessUdpMessage(const HysteriaUdpMessage& message) {
         ExpireUdpFragments(now);
         return;
     }
-    const size_t total_bytes = pending.bytes;
-    const common::TargetAddress target = std::move(pending.target);
-    DeliverUdpPayload(message.session_id, target, total_bytes,
-        [&pending](common::MultiBuffer& packet) {
-            for (size_t id = 0; id < pending.count; ++id) {
-                const auto slot = pending.payload_slots[id];
-                if (slot == 0) continue;
-                if (!packet.AppendSpan(pending.payloads[slot - 1])) return false;
-            }
-            return true;
-        });
+    common::TargetAddress target = std::move(pending.target);
+    common::MultiBuffer assembled = std::move(pending.in_order);
     fragments_.erase(it);
     ExpireUdpFragments(now);
+    DeliverUdpMultiBuffer(message.session_id, target, std::move(assembled));
 }
 
 void HysteriaConnection::DeliverUdpPacket(
     uint32_t session_id, const common::TargetAddress& target,
     std::span<const uint8_t> payload) {
-    DeliverUdpPayload(session_id, target, payload.size(),
-        [payload](common::MultiBuffer& packet) { return packet.AppendSpan(payload); });
+    if (auto it = core_->udp_sessions.find(session_id);
+        it != core_->udp_sessions.end()) {
+        (void)it->second->Push(target, payload);
+        return;
+    }
+    if (core_->udp_sessions.size() >= kMaxUdpSessions) return;
+    auto session = std::make_unique<UdpSessionStream>(
+        Reactor(), session_id, weak_from_this());
+    if (!session->Push(target, payload)) return;
+    core_->udp_sessions.emplace(session_id, session.get());
+    SpawnOwned(DeliverStream(std::move(session),
+        InboundTransportMetadata{.real_ip = {}, .udp_session_target = target}));
 }
 
 bool HysteriaConnection::TrySendImmediateDatagram(
@@ -2095,8 +2123,10 @@ UdpSessionStream::~UdpSessionStream() noexcept {
 
 bool UdpSessionStream::Push(
     const common::TargetAddress& target, std::span<const uint8_t> payload) {
-    return PushWith(target, payload.size(),
-        [payload](common::MultiBuffer& packet) { return packet.AppendSpan(payload); });
+    if (!CanAcceptBytes(payload.size())) return false;
+    common::MultiBuffer packet;
+    if (!packet.AppendSpan(payload)) return false;
+    return PushMultiBuffer(target, std::move(packet));
 }
 
 void UdpSessionStream::Detach() noexcept {

@@ -252,7 +252,17 @@ public:
 
 private:
     class LogicalTransportStreamSink;
+    struct AcceptedTcpTransport;
 
+    net::awaitable<std::optional<AcceptedTcpTransport>> PrepareAcceptedTCP(
+        net::io_context& io_context,
+        routing::Dispatcher& dispatcher,
+        app::StatsShard& stats,
+        app::RequestLoadState& request_load,
+        const infra::TimeoutsConfig& timeouts,
+        std::unique_ptr<transport::AsyncStream> raw_conn,
+        common::Context& ctx,
+        app::DNS* dns_service);
 
     const app::ReceiverSettings receiver_;
     transport::TransportSecurity security_;

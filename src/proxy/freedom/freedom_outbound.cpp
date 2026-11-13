@@ -113,6 +113,7 @@ net::awaitable<OutboundProcessResult> FreedomOutbound::Process(
 }
 
 
+namespace {
 [[nodiscard]] app::PreparedOutboundCreator
 MakeFreedomPreparedOutboundCreator(infra::FreedomSettings settings) {
     return app::MakePreparedOutboundCreator<
@@ -122,6 +123,7 @@ MakeFreedomPreparedOutboundCreator(infra::FreedomSettings settings) {
             return std::make_unique<FreedomOutbound>(*config);
         }>(std::move(settings));
 }
+}  // namespace
 }  // namespace proxy
 
 // ============================================================================

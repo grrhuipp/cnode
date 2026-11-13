@@ -84,15 +84,6 @@ bool VlessEncryptionServerTicketStore::BindIdentity(
     return true;
 }
 
-void VlessEncryptionServerTicketStore::Erase(
-    std::span<const uint8_t, kVlessEncryptionTicketSize> ticket) noexcept {
-    TicketArray key{};
-    std::copy(ticket.begin(), ticket.end(), key.begin());
-    sessions_.Erase(key, [this](auto& entry) noexcept {
-        seen_nfs_keys_ -= entry.value.seen_nfs_keys.size();
-    });
-}
-
 void VlessEncryptionServerTicketStore::Store(
     std::span<const uint8_t, kVlessEncryptionTicketSize> ticket,
     const VlessEncryptionPfsKey& pfs_key, uint16_t seconds,
@@ -191,9 +182,11 @@ net::awaitable<bool> AuthenticateVlessTicket(
     app::GroupCoordinator& coordinator,
     std::shared_ptr<const VlessEncryptionConfig> config, std::string_view tag,
     VlessEncryptionIssuedTicket ticket, std::array<uint8_t, 16> identity) {
-    if (!config) co_return false;
+    if (!config) {
+        return []() -> net::awaitable<bool> { co_return false; }();
+    }
     std::string owned_tag(tag);
-    co_return co_await coordinator.PostCall(
+    return coordinator.PostCall(
         [&coordinator, config = std::move(config), tag = std::move(owned_tag),
          ticket = std::move(ticket), identity]() mutable -> bool {
             const auto now = Clock::now();
@@ -210,9 +203,11 @@ net::awaitable<std::optional<Resumed>> LookupVlessTicket(
     app::GroupCoordinator& coordinator,
     std::shared_ptr<const VlessEncryptionConfig> config, std::string_view tag,
     Ticket ticket, VlessEncryptionNfsKey nfs) {
-    if (!config) co_return std::nullopt;
+    if (!config) {
+        return []() -> net::awaitable<std::optional<Resumed>> { co_return std::nullopt; }();
+    }
     std::string owned_tag(tag);
-    co_return co_await coordinator.PostCall(
+    return coordinator.PostCall(
         [&coordinator, config = std::move(config), tag = std::move(owned_tag),
          ticket, nfs = std::move(nfs)]() -> std::optional<Resumed> {
             auto* store = net::use_service<TicketDirectoryService>(
