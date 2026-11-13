@@ -106,20 +106,18 @@ private:
     void Finish();
     void Retire();
 
-    // By value: the range must stay in this frame until the write completes.
-    template <typename BufferRange>
-    net::awaitable<void> WriteEncrypted(BufferRange buffers);
+    // By value when owned: the payload must stay alive until encrypted.
+    net::awaitable<void> WriteEncrypted(
+        std::span<const net::const_buffer> buffers,
+        common::MultiBuffer owned = {});
 
     net::awaitable<void> FlushPendingAndWrite(transport::AsyncStream& stream, common::MultiBuffer out_mb);
 
     bool InitResponseCipher();
 
-    template <typename BufferRange>
-    bool InitResponseCipher2022(const BufferRange& buffers);
+    bool InitResponseCipher2022(std::span<const net::const_buffer> buffers);
 
-    template <typename BufferRange>
-    bool AppendFirstResponsePayload(const BufferRange& buffers, size_t want);
-
+    bool AppendFirstResponsePayload(std::span<const net::const_buffer> buffers, size_t want);
     SsCipherType cipher_type_;
     uint8_t key_size_ = 0;
     std::optional<PendingHandshake> pending_handshake_;

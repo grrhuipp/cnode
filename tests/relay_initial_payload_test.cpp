@@ -62,7 +62,6 @@ struct Endpoint : transport::TimeoutEvent {
     uint64_t written = 0;
     std::vector<uint8_t> output;
     std::vector<size_t> packet_sizes;
-    std::vector<size_t> packet_fragments;
     std::vector<uint16_t> packet_ports;
     size_t read_calls = 0;
     size_t fail_after_writes = 0;
@@ -115,13 +114,10 @@ struct Endpoint : transport::TimeoutEvent {
             throw transport::LinkError(later_write_error);
         RecordWrite(payload.byte_size());
         packet_sizes.push_back(payload.byte_size());
-        packet_fragments.push_back(payload.size());
-        const auto* first = payload.empty() ? nullptr : *payload.begin();
+        const auto* first = payload.FrontBuffer();
         packet_ports.push_back(first && first->HasUDP() ? first->UDP().port : 0);
-        for (const auto* buffer : payload) {
-            const auto bytes = buffer->Bytes();
-            output.insert(output.end(), bytes.begin(), bytes.end());
-        }
+        const auto bytes = payload.FrontSpan();
+        output.insert(output.end(), bytes.begin(), bytes.end());
         co_return;
     }
     transport::EofAction ReadEofAction() const noexcept { return eof_action; }
@@ -475,18 +471,15 @@ net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int
     const auto result = co_await app::DoRelayLink(io, link, link, controlled ? &link : nullptr,
                                            target, context, stats, config, std::move(batch));
     std::vector<size_t> sizes{3};
-    std::vector<size_t> fragments{1};
     std::vector<uint16_t> ports{1001};
     std::vector<uint8_t> bytes(3, 0x11);
     if (mode < 2) {
         sizes.insert(sizes.end(), {0, common::Buffer::kSize + 7, 0, 5});
-        fragments.insert(fragments.end(), {1, 1, 1, 1});
         ports.insert(ports.end(), {1005, 1002, 1006, 1003});
         bytes.insert(bytes.end(), common::Buffer::kSize + 7, 0x22);
         bytes.insert(bytes.end(), 5, 0x33);
         if (mode == 0) {
             sizes.push_back(9);
-            fragments.push_back(1);
             ports.push_back(1004);
             bytes.insert(bytes.end(), 9, 0x44);
         }
@@ -494,7 +487,7 @@ net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int
     const auto expected = mode == 0 ? common::ErrorCode::OK : mode == 1 ? common::ErrorCode::SOCKET_READ_FAILED :
         mode == 2 ? common::ErrorCode::RESOURCE_EXHAUSTED : common::ErrorCode::CANCELLED;
     const bool passed = queued_ok && batch.empty() && batch.byte_size() == 0 &&
-        target.packet_sizes == sizes && target.packet_fragments == fragments &&
+        target.packet_sizes == sizes &&
         target.packet_ports == ports && target.output == bytes &&
         result.error == expected && result.bytes_up == bytes.size() &&
         context.traffic.bytes_up == bytes.size() && stats.Snapshot().bytes_out == bytes.size() &&

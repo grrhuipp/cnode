@@ -111,13 +111,26 @@ private:
     bool spilled_ = false;
 };
 
-[[nodiscard]] std::string ClientSettings(const AnyTlsPaddingScheme& scheme);
-[[nodiscard]] tl::expected<void, common::ErrorCode> AppendFrameBytesTo(
-    std::vector<uint8_t>& out,
-    uint8_t cmd,
-    uint32_t sid,
-    std::span<const uint8_t> payload);
+class OpenPacketBuffer {
+public:
+    static constexpr size_t kInlineCapacity = 256;
 
+    [[nodiscard]] tl::expected<void, common::ErrorCode> AppendFrame(
+        uint8_t cmd,
+        uint32_t sid,
+        std::span<const uint8_t> payload);
+
+    [[nodiscard]] std::span<const uint8_t> Span() const noexcept {
+        return spilled_ ? std::span<const uint8_t>(heap_)
+                        : std::span<const uint8_t>(inline_.data(), inline_size_);
+    }
+
+private:
+    std::array<uint8_t, kInlineCapacity> inline_{};
+    std::vector<uint8_t> heap_;
+    size_t inline_size_ = 0;
+    bool spilled_ = false;
+};
 // Protocol validation and actual I/O errors are values. Non-I/O exceptions
 // retain their types for the owning request/session boundary to classify.
 net::awaitable<tl::expected<void, common::ErrorCode>>
@@ -129,7 +142,7 @@ WriteFrame(transport::AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<
 net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteAnyTlsPacketWithPadding(transport::AsyncStream& stream,
                        std::span<const PaddingRecord> record_rules,
-                       std::vector<uint8_t> packet);
+                       std::span<const uint8_t> packet);
 
 net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteMultiBufferAsFrameBatch(transport::AsyncStream& stream, uint8_t cmd, uint32_t sid, common::MultiBuffer mb);

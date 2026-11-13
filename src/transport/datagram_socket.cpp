@@ -359,13 +359,6 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
     const auto maximum = MaxUdpPayload(ipv6);
     if (payload.byte_size() > maximum)
         throw LinkError(common::ErrorCode::INVALID_ARGUMENT);
-    std::size_t total = 0;
-    for (const auto* buffer : payload) {
-        if (!buffer || buffer->Bytes().size() > maximum - total)
-            throw LinkError(common::ErrorCode::INVALID_ARGUMENT);
-        total += buffer->Bytes().size();
-    }
-    if (total != payload.byte_size()) throw LinkError(common::ErrorCode::INVALID_ARGUMENT);
 
     const auto cancellation_state = co_await net::this_coro::cancellation_state;
     if (operation.Cancelled()) ThrowCancelled(operation.CancellationReason());
@@ -386,7 +379,7 @@ net::awaitable<void> DatagramSocket::Impl::SendMultiBuffer(
             destination, 0, send_ec);
     }
     if (!send_ec) {
-        if (sent != total) throw LinkError(common::ErrorCode::INTERNAL);
+        if (sent != payload.byte_size()) throw LinkError(common::ErrorCode::INTERNAL);
         timeouts.TouchActivity();
         co_return;
     }

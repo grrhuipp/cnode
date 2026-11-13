@@ -118,16 +118,12 @@ TEST(ShadowsocksStreamCrypto, SubkeyMatchesIndependentHmacSha1Vectors) {
 }
 
 std::vector<uint8_t> Flatten(const common::MultiBuffer& mb) {
-    std::vector<uint8_t> out;
-    out.reserve(mb.byte_size());
-    for (const common::Buffer* buffer : mb) {
-        EXPECT_TRUE((buffer != nullptr)) << "decoded MultiBuffer contains a null slot";
-        if (!buffer) throw std::runtime_error("missing decoded buffer");
-        EXPECT_TRUE((buffer->start <= buffer->end && buffer->end <= buffer->capacity)) << "decoded Buffer cursor escaped the payload capacity";
-        const auto bytes = buffer->Bytes();
-        out.insert(out.end(), bytes.begin(), bytes.end());
-    }
-    return out;
+    const auto* buffer = mb.FrontBuffer();
+    if (!buffer) return {};
+    EXPECT_TRUE((buffer->start <= buffer->end && buffer->end <= buffer->capacity))
+        << "decoded Buffer cursor escaped the payload capacity";
+    const auto bytes = buffer->Bytes();
+    return std::vector<uint8_t>(bytes.begin(), bytes.end());
 }
 
 void TestLargeRecord(size_t payload_size, proxy::SsCipherType cipher_type) {

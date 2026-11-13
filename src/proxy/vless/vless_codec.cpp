@@ -396,14 +396,20 @@ void AppendVisionFramed(
     }
 }
 
-template <typename BufferRange>
 net::awaitable<void> WriteVisionFramed(
     transport::MultiBufferWriter& dst,
     std::span<uint8_t, 16> user_uuid,
     bool& send_uuid,
     bool& write_process,
     VisionTrafficState& traffic,
-    const BufferRange& buffers) {
+    std::span<const net::const_buffer> buffers,
+    common::MultiBuffer owned = {}) {
+    net::const_buffer single_owned;
+    if (!owned.empty()) {
+        const auto span = owned.FrontSpan();
+        single_owned = net::buffer(span.data(), span.size());
+        buffers = {&single_owned, span.empty() ? size_t{0} : size_t{1}};
+    }
     CompleteRecords records;
     const bool filter = traffic.packets_to_filter > 0;
     size_t remaining_bytes = 0;
@@ -435,6 +441,7 @@ net::awaitable<void> WriteVisionFramed(
     if (!out.empty()) {
         co_await dst.WriteBuffers(out.Span());
     }
+    owned.clear();
 }
 }  // namespace
 
@@ -733,9 +740,7 @@ net::awaitable<common::MultiBuffer> VisionReader::ReadFramedMultiBuffer() {
         Decode(out);
         if (out.byte_size() != 0) {
             if (traffic_.packets_to_filter > 0) {
-                for (const auto* buffer : out) {
-                    traffic_.FilterTLS(buffer->Bytes());
-                }
+                traffic_.FilterTLS(out.FrontSpan());
             }
             co_return out;
         }
@@ -797,24 +802,15 @@ net::awaitable<void> VisionWriter::WriteMultiBuffer(common::MultiBuffer mb) {
     if (!write_process_) {
         return dst_.WriteMultiBuffer(std::move(mb));
     }
-    return WriteFramedMultiBuffer(std::move(mb));
-}
-
-net::awaitable<void> VisionWriter::WriteFramedMultiBuffer(common::MultiBuffer mb) {
-    co_await WriteVisionFramed(
-        dst_, user_uuid_, send_uuid_, write_process_, traffic_, mb);
-    mb.clear();
+    return WriteVisionFramed(
+        dst_, user_uuid_, send_uuid_, write_process_, traffic_, {}, std::move(mb));
 }
 
 net::awaitable<void> VisionWriter::WriteBuffers(std::span<const net::const_buffer> buffers) {
     if (!write_process_) {
         return dst_.WriteBuffers(buffers);
     }
-    return WriteFramedBuffers(buffers);
-}
-
-net::awaitable<void> VisionWriter::WriteFramedBuffers(std::span<const net::const_buffer> buffers) {
-    co_await WriteVisionFramed(
+    return WriteVisionFramed(
         dst_, user_uuid_, send_uuid_, write_process_, traffic_, buffers);
 }
 

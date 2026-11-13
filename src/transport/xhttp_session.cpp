@@ -396,19 +396,20 @@ private:
 
 // `close_connection` announces that the server ends the connection after this
 // response (RFC 9112 9.6); otherwise an HTTP/1.1 connection persists.
-[[nodiscard]] std::string BuildXHttpResponseHeaders(
+net::awaitable<bool> SendXHttpResponseHeaders(
+    AsyncStream& stream,
     const XHttpConfig& xhttp_cfg,
     bool chunked_body,
     bool close_connection) {
     const bool add_sse = !xhttp_cfg.no_sse_header &&
                          !FindHttpHeader(xhttp_cfg.headers, "Content-Type");
-    std::string response;
+    Http1HeaderBuffer response;
     response.reserve(192 + (xhttp_cfg.headers.size() + (add_sse ? 1 : 0)) * 32);
-    response.append("HTTP/1.1 200 OK\r\n");
-    response.append("X-Accel-Buffering: no\r\n");
-    response.append("Cache-Control: no-store\r\n");
-    response.append("Access-Control-Allow-Origin: *\r\n");
-    response.append("Access-Control-Allow-Methods: GET, POST\r\n");
+    response.append("HTTP/1.1 200 OK\r\n"
+                    "X-Accel-Buffering: no\r\n"
+                    "Cache-Control: no-store\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Access-Control-Allow-Methods: GET, POST\r\n");
     if (chunked_body) {
         response.append("Transfer-Encoding: chunked\r\n");
     } else {
@@ -430,12 +431,13 @@ private:
         AppendHeaderLine(response, "content-type", "text/event-stream");
     }
     response.append("\r\n");
-    return response;
+    co_return co_await WriteFullToStream(stream, response.View());
 }
 
-[[nodiscard]] std::string BuildEmptyHttp1Response(std::string_view status,
-                                                                bool close_connection) {
-    std::string response;
+net::awaitable<bool> SendEmptyHttp1Response(AsyncStream& stream,
+                                            std::string_view status,
+                                            bool close_connection) {
+    Http1HeaderBuffer response;
     response.reserve(64 + status.size());
     response.append("HTTP/1.1 ");
     response.append(status);
@@ -444,7 +446,7 @@ private:
         response.append("Connection: close\r\n");
     }
     response.append("\r\n");
-    return response;
+    co_return co_await WriteFullToStream(stream, response.View());
 }
 
 // Consumes a Content-Length body nobody will use, keeping the connection in
@@ -541,7 +543,8 @@ net::awaitable<std::optional<common::MultiBuffer>> ReadXHttpPacketBody(
            common::EqualsAsciiCI(key, "Transfer-Encoding");
 }
 
-[[nodiscard]] std::string BuildXHttp1ClientRequest(
+void BuildXHttp1ClientRequest(
+    Http1HeaderBuffer& request,
     const HttpClientRequestView& req,
     std::string_view host,
     std::string_view content_length,
@@ -556,7 +559,6 @@ net::awaitable<std::optional<common::MultiBuffer>> ReadXHttpPacketBody(
     const size_t reserve_size = 224 + method.size() + req_path.size() + host.size() +
                                 content_length.size() + header_count * 32;
 
-    std::string request;
     request.reserve(reserve_size);
     AppendRequestStart(request, method, req_path, host);
     if (chunked_upload) {
@@ -583,7 +585,38 @@ net::awaitable<std::optional<common::MultiBuffer>> ReadXHttpPacketBody(
         AppendHeaderLine(request, "referer", req.default_referer);
     }
     request.append("\r\n");
-    return request;
+}
+
+net::awaitable<common::ErrorCode> SendXHttp1ClientRequest(
+    AsyncStream& stream,
+    const HttpClientRequestView& cfg,
+    std::string_view host,
+    std::string_view content_length,
+    XHttpClientRequestKind kind,
+    std::span<const net::const_buffer> packet_payload,
+    size_t payload_len) {
+    const bool chunked_upload = kind == XHttpClientRequestKind::StreamUp;
+    Http1HeaderBuffer request;
+    BuildXHttp1ClientRequest(
+        request, cfg, host, content_length, chunked_upload);
+    const std::string_view head_view = request.View();
+    common::ConstBufferSpanBuilder<20> out;
+    out.Append(net::buffer(head_view.data(), head_view.size()));
+    Http1ChunkPrefixBuffer prefix{};
+    if (chunked_upload) {
+        if (payload_len > 0 &&
+            !AppendHttp1Chunk(out, prefix, packet_payload, payload_len)) {
+            co_return common::ErrorCode::PROTOCOL_ENCODE_FAILED;
+        }
+    } else if (kind == XHttpClientRequestKind::PacketUp && payload_len > 0) {
+        out.AppendBuffers(packet_payload);
+    }
+    try {
+        co_await stream.WriteBuffers(out.Span());
+    } catch (...) {
+        co_return common::ErrorCode::SOCKET_WRITE_FAILED;
+    }
+    co_return common::ErrorCode::OK;
 }
 
 // Coordinator-owned metadata only. Each admitted record reserves its own
@@ -966,7 +999,7 @@ XHttpPacketUpSession::Upload::~Upload() noexcept {
 
 net::awaitable<size_t> XHttpPacketUpSession::Upload::Read(
     common::MultiBuffer& payload, size_t limit) {
-    if (payload.empty() || payload.back()->Available() == 0) {
+    if (payload.empty() || payload.FrontBuffer()->Available() == 0) {
         if (!session_.Reserve(common::Buffer::kSize)) {
             uint8_t excess;
             if (co_await stream_.AsyncRead(net::buffer(&excess, 1)) == 0) co_return 0;
@@ -977,24 +1010,17 @@ net::awaitable<size_t> XHttpPacketUpSession::Upload::Read(
     if (limit == 0) {
         co_return 0;
     }
-    if (!payload.empty() && payload.back()->Available() != 0) {
-        auto* tail = payload.back();
+    if (auto* tail = payload.FrontBuffer(); tail && tail->Available() != 0) {
         const size_t n = co_await stream_.AsyncRead(net::buffer(
             tail->Tail().data(), std::min(limit, size_t{tail->Available()})));
         tail->Produce(static_cast<uint32_t>(n));
         co_return n;
     }
     common::MultiBuffer chunk = co_await stream_.ReadMultiBuffer();
-    common::BufferGuard first;
-    while (!chunk.empty()) {
-        first = chunk.pop_front();
-        if (first && !first->IsEmpty()) break;
-        first.reset();
-    }
-    if (!first) {
+    common::BufferGuard first = chunk.pop_front();
+    if (!first || first->IsEmpty()) {
         co_return 0;
     }
-    stream_.PrependReadMultiBuffer(std::move(chunk));
     const size_t n = std::min<size_t>(limit, first->Len());
     if (n < first->Len()) {
         stream_.PrependReadBytes(first->Bytes().subspan(n));
@@ -1607,8 +1633,7 @@ net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest
             if (!session->DownlinkAttached() && !co_await session->AwaitDownlink(*body)) {
                 co_return tl::unexpected(common::ErrorCode::TIMEOUT);
             }
-            if (!co_await WriteFullToStream(
-                    *body, BuildXHttpResponseHeaders(xhttp_cfg, false, true))) {
+            if (!co_await SendXHttpResponseHeaders(*body, xhttp_cfg, false, true)) {
                 co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
             }
             LOG_CONN_TRACE(conn_id, "XHTTP server packet-up payload accepted seq={}",
@@ -1669,10 +1694,10 @@ net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest
             co_return tl::unexpected(common::ErrorCode::TIMEOUT);
         }
         session.reset();
-        const auto response = rejection.empty()
-            ? BuildXHttpResponseHeaders(xhttp_cfg, false, !keep_alive)
-            : BuildEmptyHttp1Response(rejection, !keep_alive);
-        if (!co_await WriteFullToStream(*stream, response)) {
+        const bool wrote_response = rejection.empty()
+            ? co_await SendXHttpResponseHeaders(*stream, xhttp_cfg, false, !keep_alive)
+            : co_await SendEmptyHttp1Response(*stream, rejection, !keep_alive);
+        if (!wrote_response) {
             co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
         }
         LOG_CONN_TRACE(conn_id, "XHTTP server packet-up response seq={} status={}",
@@ -1794,8 +1819,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
             }
             XHttpDownlinkClaim claim(*session);
             if (!claim) co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-            if (!co_await WriteFullToStream(
-                    *stream, BuildXHttpResponseHeaders(xhttp_cfg, true, false))) {
+            if (!co_await SendXHttpResponseHeaders(*stream, xhttp_cfg, true, false)) {
                 co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
             }
             // This physical GET becomes the dedicated downlink of a logical
@@ -1884,7 +1908,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
             !co_await WriteFullToStream(*stream, kContinueResponse)) {
             co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
         }
-        if (!co_await WriteFullToStream(*stream, BuildXHttpResponseHeaders(xhttp_cfg, true, false))) {
+        if (!co_await SendXHttpResponseHeaders(*stream, xhttp_cfg, true, false)) {
             co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
         }
         auto body = MakeHttp1BodyStream(
@@ -1985,24 +2009,12 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
             static_cast<size_t>(ptr - content_length_buf.data()));
     }
 
-    const bool chunked_upload = kind == XHttpClientRequestKind::StreamUp;
-    std::string request = BuildXHttp1ClientRequest(
-        cfg, host, content_length, chunked_upload);
-    if (chunked_upload) {
-        // Send the head and initial chunk together; an owned reader drains
-        // this upload connection's response while the downlink joins.
-        common::ConstBufferSpanBuilder<20> out;
-        out.Append(net::buffer(request.data(), request.size()));
-        Http1ChunkPrefixBuffer prefix{};
-        if (payload_len > 0 &&
-            !AppendHttp1Chunk(out, prefix, packet_payload, payload_len)) {
-            co_return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
-        }
-        try {
-            co_await stream->WriteBuffers(out.Span());
-        } catch (...) {
-            co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
-        }
+    if (const auto send_err = co_await SendXHttp1ClientRequest(
+            *stream, cfg, host, content_length, kind, packet_payload, payload_len);
+        send_err != common::ErrorCode::OK) {
+        co_return tl::unexpected(send_err);
+    }
+    if (kind == XHttpClientRequestKind::StreamUp) {
         LOG_CONN_DEBUG(conn_id, "XHTTP client H1 stream-up ready path={} initial={}B",
                       PublicHttpTargetForLog(EffectiveHttpPath(cfg.path)),
                       payload_len);
@@ -2011,18 +2023,6 @@ net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
         auto body = MakeHttp1BodyStream(std::move(stream), Http1BodyUntilClose{}, true);
         co_return std::make_unique<XHttpUploadClientStream>(
             executor, services, std::move(body));
-    }
-    const bool wrote_head = co_await WriteFullToStream(*stream, request);
-    std::string{}.swap(request);
-    if (!wrote_head) {
-        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
-    }
-    if (kind == XHttpClientRequestKind::PacketUp && payload_len > 0) {
-        try {
-            co_await stream->WriteBuffers(packet_payload);
-        } catch (...) {
-            co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
-        }
     }
 
     Http1MessageHead head;

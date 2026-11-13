@@ -728,9 +728,8 @@ public:
         host = ctx.outbound.target.host;
         auto data = std::move(first).MoveToMultiBuffer();
         while (bytes.size() < 60000) {
-            for (const auto* buffer : data) {
-                if (buffer) bytes.insert(bytes.end(), buffer->Bytes().begin(), buffer->Bytes().end());
-            }
+            const auto span = data.FrontSpan();
+            bytes.insert(bytes.end(), span.begin(), span.end());
             if (bytes.size() >= 60000) break;
             data = co_await link.reader->ReadMultiBuffer();
             if (data.byte_size() == 0) break;
@@ -863,10 +862,8 @@ public:
             auto data = std::move(first).MoveToMultiBuffer();
             try {
                 while (true) {
-                    for (const auto* buffer : data) {
-                        if (!buffer) continue;
-                        received.insert(received.end(), buffer->Bytes().begin(), buffer->Bytes().end());
-                    }
+                    const auto span = data.FrontSpan();
+                    received.insert(received.end(), span.begin(), span.end());
                     data.clear();
                     data = co_await link.reader->ReadMultiBuffer();
                     if (data.byte_size() == 0) break;
@@ -1044,10 +1041,8 @@ public:
                 EXPECT_TRUE(datagram.Valid());
                 if (!datagram.Valid()) co_return app::RelayResult{};
                 Packet observation{*datagram.target, {}};
-                for (const auto* buffer : packet) {
-                    const auto bytes = buffer->Bytes();
-                    observation.bytes.insert(observation.bytes.end(), bytes.begin(), bytes.end());
-                }
+                const auto bytes = packet.FrontSpan();
+                observation.bytes.assign(bytes.begin(), bytes.end());
                 received.push_back(std::move(observation));
                 co_await link.writer->WriteMultiBuffer(std::move(packet));
             }

@@ -522,28 +522,14 @@ namespace {
 
 udp::endpoint ParseDnsServer(std::string_view text) {
     // Endpoint syntax and default ports belong to configuration normalization.
-    std::string_view host = text;
-    std::string_view port_text;
-    bool explicit_port = false;
-    if (text.starts_with('[')) {
-        host = {};
-        const auto end = text.find(']');
-        if (end != std::string_view::npos && text.substr(end + 1).starts_with(':')) {
-            host = text.substr(1, end - 1);
-            port_text = text.substr(end + 2);
-            explicit_port = true;
-        }
-    } else if (const auto colon = text.find(':'); colon != std::string_view::npos &&
-               text.find(':', colon + 1) == std::string_view::npos) {
-        host = text.substr(0, colon);
-        port_text = text.substr(colon + 1);
-        explicit_port = true;
-    }
     uint16_t port = 53;
-    const bool valid_port = !explicit_port || common::TargetAddress::ParsePort(port_text, port);
-    if (const auto address = common::ParseLiteral(host);
-        valid_port && address && (!text.starts_with('[') || address->is_v6())) {
-        return {*address, port};
+    if (const auto split = common::SplitHostPort(text);
+        split && (!split->bracketed || split->has_port) &&
+        (!split->has_port || common::TargetAddress::ParsePort(split->port, port))) {
+        if (const auto address = common::ParseLiteral(split->host);
+            address && (!split->bracketed || address->is_v6())) {
+            return {*address, port};
+        }
     }
     throw std::invalid_argument(std::format(
         "dns server '{}' must be an IP, IPv4:port or [IPv6]:port with port 1..65535", text));
@@ -2155,53 +2141,26 @@ std::optional<PanelApiUrlParts> ParsePanelApiUrl(std::string_view url) {
         }
     }
 
-    std::string_view host;
-    std::string_view explicit_port;
-    bool has_explicit_port = false;
-    if (authority.front() == '[') {
-        const size_t close_bracket = authority.find(']');
-        if (close_bracket == std::string_view::npos) {
-            return std::nullopt;
-        }
-        host = authority.substr(1, close_bracket - 1);
-        if (close_bracket + 1 < authority.size()) {
-            if (authority[close_bracket + 1] != ':') {
-                return std::nullopt;
-            }
-            has_explicit_port = true;
-            explicit_port = authority.substr(close_bracket + 2);
-        }
-    } else {
-        const size_t first_colon = authority.find(':');
-        const size_t last_colon = authority.rfind(':');
-        if (first_colon != std::string_view::npos && first_colon == last_colon) {
-            host = authority.substr(0, first_colon);
-            has_explicit_port = true;
-            explicit_port = authority.substr(last_colon + 1);
-        } else {
-            host = authority;
-        }
-    }
-
-    if (host.empty()) {
+    const auto split = common::SplitHostPort(authority);
+    if (!split) {
         return std::nullopt;
     }
     uint16_t port = use_ssl ? 443 : 80;
-    if (has_explicit_port && !common::TargetAddress::ParsePort(explicit_port, port)) {
+    if (split->has_port && !common::TargetAddress::ParsePort(split->port, port)) {
         return std::nullopt;
     }
 
-    const auto literal_address = common::ParseLiteral(host);
-    if (authority.front() == '[') {
+    const auto literal_address = common::ParseLiteral(split->host);
+    if (split->bracketed) {
         if (!literal_address || !literal_address->is_v6()) {
             return std::nullopt;
         }
-    } else if (host.find(':') != std::string_view::npos ||
+    } else if (split->host.find(':') != std::string_view::npos ||
                (!literal_address &&
-                !common::IsValidDnsHostname(host, common::TrailingDotPolicy::Allow))) {
+                !common::IsValidDnsHostname(split->host, common::TrailingDotPolicy::Allow))) {
         return std::nullopt;
     }
-    std::string normalized_host(host);
+    std::string normalized_host(split->host);
     if (!literal_address) {
         common::NormalizeDnsHostnameInPlace(normalized_host);
         if (common::ParseLiteral(normalized_host).has_value()) {

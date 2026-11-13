@@ -36,7 +36,7 @@ common::MultiBuffer Packet(const common::TargetAddress& target, size_t size) {
     for (size_t i = 0; i < size; ++i) bytes[i] = static_cast<uint8_t>(i * 37);
     common::MultiBuffer payload;
     EXPECT_TRUE(payload.AppendSpan(bytes));
-    for (auto* buffer : payload) buffer->SetUDP(target);
+    EXPECT_TRUE(common::SetUdpTarget(payload, target));
     return payload;
 }
 
@@ -200,10 +200,8 @@ net::awaitable<void> RoundTrip(net::io_context& io, UdpRequest& channel, size_t 
     EXPECT_NE(datagram.target, nullptr);
     if (datagram.target) EXPECT_EQ(datagram.target->port, peer.local_endpoint().port());
     size_t offset = 0;
-    for (auto* buffer : reply) {
-        for (auto byte : buffer->Bytes()) {
-            EXPECT_EQ(byte, static_cast<uint8_t>(offset++ * 37));
-        }
+    for (auto byte : reply.FrontSpan()) {
+        EXPECT_EQ(byte, static_cast<uint8_t>(offset++ * 37));
     }
 }
 

@@ -24,16 +24,8 @@ namespace {
 
 
 std::vector<uint8_t> Flatten(const common::MultiBuffer& payload) {
-    std::vector<uint8_t> out;
-    out.reserve(payload.byte_size());
-    for (const common::Buffer* buffer : payload) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        const auto bytes = buffer->Bytes();
-        out.insert(out.end(), bytes.begin(), bytes.end());
-    }
-    return out;
+    const auto bytes = payload.FrontSpan();
+    return std::vector<uint8_t>(bytes.begin(), bytes.end());
 }
 
 class CaptureWriter final : public transport::MultiBufferWriter {
@@ -53,13 +45,8 @@ public:
     }
 
     void Append(const common::MultiBuffer& payload) {
-        for (const common::Buffer* buffer : payload) {
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            const auto data = buffer->Bytes();
-            bytes.insert(bytes.end(), data.begin(), data.end());
-        }
+        const auto data = payload.FrontSpan();
+        bytes.insert(bytes.end(), data.begin(), data.end());
     }
 
     std::vector<uint8_t> bytes;
@@ -237,11 +224,7 @@ TEST(TrojanUdpFraming, LargeDatagramAndScatterWritePreserveMessageBoundary) {
     const std::vector<uint8_t> source(common::Buffer::kSize + 257, 0x6d);
     common::MultiBuffer payload;
     EXPECT_TRUE((payload.AppendSpan(source))) << "failed to allocate Trojan UDP test payload";
-    for (common::Buffer* buffer : payload) {
-        if (buffer && !buffer->IsEmpty()) {
-            buffer->SetUDP(target);
-        }
-    }
+    ASSERT_TRUE(common::SetUdpTarget(payload, target));
 
     CaptureWriter capture;
     ::Run([&]() -> net::awaitable<void> {

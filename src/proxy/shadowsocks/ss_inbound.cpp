@@ -30,7 +30,6 @@ namespace proxy {
 
 namespace {
 
-using common::ChunkBytes;
 net::awaitable<tl::expected<void, common::ErrorCode>> ReadStreamPayload(
     transport::AsyncStream& stream,
     SsAeadCipher& cipher,

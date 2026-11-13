@@ -44,15 +44,9 @@ void Verify(const proxy::SsUdpDecodeResult& result,
     const auto datagram = common::InspectUdpDatagram(result.payload);
     Require(datagram.Valid() && datagram.target->SameEndpoint(target) &&
             datagram.payload_size == payload.size());
-    size_t offset = 0;
-    for (const auto* buffer : result.payload) {
-        Require(buffer != nullptr);
-        const auto bytes = buffer->Bytes();
-        Require(bytes.size() <= payload.size() - offset);
-        Require(std::equal(bytes.begin(), bytes.end(), payload.begin() + offset));
-        offset += bytes.size();
-    }
-    Require(offset == payload.size());
+    const auto bytes = result.payload.FrontSpan();
+    Require(bytes.size() == payload.size());
+    Require(std::equal(bytes.begin(), bytes.end(), payload.begin()));
 }
 
 void RunCase(const char* cipher_name, const proxy::SsCipherInfo& cipher,

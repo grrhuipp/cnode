@@ -101,9 +101,8 @@ TEST_P(DatagramSocketPayload, PreservesPayloadAndSourceWithIndependentBindings) 
     sending.get();
     const auto packet = receiving.get();
     EXPECT_EQ(packet.source, sender.LocalEndpoint());
-    std::vector<uint8_t> received;
-    for (const auto* buffer : packet.payload)
-        received.insert(received.end(), buffer->Bytes().begin(), buffer->Bytes().end());
+    const auto received_span = packet.payload.FrontSpan();
+    std::vector<uint8_t> received(received_span.begin(), received_span.end());
     EXPECT_EQ(received, bytes);
 }
 INSTANTIATE_TEST_SUITE_P(SendShapes, DatagramSocketPayload,

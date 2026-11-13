@@ -440,9 +440,8 @@ public:
             if (queue_scenario->mode == 10 || queue_scenario->mode == 11) {
                 queue_scenario->datagram_sizes.push_back(bytes.byte_size());
             }
-            for (const auto* block : bytes) {
-                queue_scenario->received.insert(queue_scenario->received.end(), block->Bytes().begin(), block->Bytes().end());
-            }
+            const auto block = bytes.FrontSpan();
+            queue_scenario->received.insert(queue_scenario->received.end(), block.begin(), block.end());
             if (queue_scenario->mode == 9 && queue_scenario->received.size() == 65535) {
                 auto& wire = *dialed[0];
                 wire.Frame(proxy::kCmdPSH, 1, std::string_view(

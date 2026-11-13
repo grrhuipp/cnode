@@ -846,19 +846,15 @@ void HysteriaConnection::Flush() {
             size_t skip = stream.output_offset;
             for (size_t output_index = stream.output_index;
                  output_index < stream.output.size(); ++output_index) {
-                const auto& multi = stream.output[output_index];
-                for (const auto* buffer : multi) {
-                    auto bytes = buffer->Bytes();
-                    if (skip >= bytes.size()) {
-                        skip -= bytes.size();
-                        continue;
-                    }
-                    bytes = bytes.subspan(skip);
-                    skip = 0;
-                    vectors[vector_count++] = ngtcp2_vec{
-                        const_cast<uint8_t*>(bytes.data()), bytes.size()};
-                    if (vector_count == vectors.size()) break;
+                auto bytes = stream.output[output_index].FrontSpan();
+                if (skip >= bytes.size()) {
+                    skip -= bytes.size();
+                    continue;
                 }
+                bytes = bytes.subspan(skip);
+                skip = 0;
+                vectors[vector_count++] = ngtcp2_vec{
+                    const_cast<uint8_t*>(bytes.data()), bytes.size()};
                 if (vector_count == vectors.size()) break;
             }
         }

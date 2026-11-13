@@ -125,12 +125,10 @@ public:
         sessions[dispatches++] = static_cast<Ingress::ClientSession*>(link.reader);
         auto payload = co_await link.reader->ReadMultiBuffer();
         EXPECT_EQ(payload.byte_size(), 1u);
-        for (const auto* buffer : payload) {
-            EXPECT_NE(buffer, nullptr);
-            if (!buffer) continue;
-            EXPECT_EQ(buffer->Len(), 1u);
-            if (buffer->Len() != 1) continue;
-            EXPECT_TRUE(buffer->Bytes()[0] == 0x62 || buffer->Bytes()[0] == 0x63);
+        const auto bytes = payload.FrontSpan();
+        EXPECT_EQ(bytes.size(), 1u);
+        if (bytes.size() == 1) {
+            EXPECT_TRUE(bytes[0] == 0x62 || bytes[0] == 0x63);
         }
         ++packets_read;
         RequestCancellation cancellation(*this);

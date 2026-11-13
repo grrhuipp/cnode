@@ -79,14 +79,8 @@ void ExpectPayload(std::span<const uint8_t> wire, size_t consumed) {
 }
 
 std::vector<uint8_t> Flatten(const common::MultiBuffer& payload) {
-    std::vector<uint8_t> bytes;
-    for (const common::Buffer* buffer : payload) {
-        if (buffer && !buffer->IsEmpty()) {
-            const auto part = buffer->Bytes();
-            bytes.insert(bytes.end(), part.begin(), part.end());
-        }
-    }
-    return bytes;
+    const auto part = payload.FrontSpan();
+    return std::vector<uint8_t>(part.begin(), part.end());
 }
 
 class ProtocolDomainTest : public testing::TestWithParam<DomainCase> {};

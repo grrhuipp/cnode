@@ -197,12 +197,8 @@ public:
     }
     [[nodiscard]] PayloadReservation ReservePayload(const common::MultiBuffer& payload) noexcept {
         size_t capacity = 0;
-        for (const auto* buffer : payload) {
-            if (!buffer) continue;
-            const size_t block_capacity = std::max<size_t>(buffer->capacity, common::Buffer::kSize);
-            if (capacity > std::numeric_limits<size_t>::max() - block_capacity)
-                return {};
-            capacity += block_capacity;
+        if (const auto* buffer = payload.FrontBuffer()) {
+            capacity = std::max<size_t>(buffer->capacity, common::Buffer::kSize);
         }
         if (!Acquire(datagrams_, 1, limits_.datagrams)) return {};
         if (!Acquire(payload_capacity_, capacity, limits_.payload_capacity)) {

@@ -260,17 +260,27 @@ void FreeRealityServerConnState(void* /*parent*/,
         common::LoadU24BE(hello.client_hello + 1) == hello.client_hello_len - 4;
 }
 
-[[nodiscard]] std::vector<uint8_t> FramedClientHello(const SSL_CLIENT_HELLO& hello) {
-    std::vector<uint8_t> framed;
+[[nodiscard]] size_t FramedClientHelloSize(const SSL_CLIENT_HELLO& hello) noexcept {
+    return HasHandshakeHeader(hello)
+        ? hello.client_hello_len
+        : 4 + hello.client_hello_len;
+}
+
+void WriteFramedClientHello(const SSL_CLIENT_HELLO& hello,
+                            std::span<uint8_t> out) noexcept {
     if (HasHandshakeHeader(hello)) {
-        framed.assign(hello.client_hello,
-                      hello.client_hello + hello.client_hello_len);
-        return framed;
+        std::copy_n(hello.client_hello, hello.client_hello_len, out.data());
+        return;
     }
-    framed.resize(4 + hello.client_hello_len);
-    framed[0] = SSL3_MT_CLIENT_HELLO;
-    common::StoreU24BE(framed.data() + 1, static_cast<uint32_t>(hello.client_hello_len));
-    std::copy_n(hello.client_hello, hello.client_hello_len, framed.data() + 4);
+    out[0] = SSL3_MT_CLIENT_HELLO;
+    common::StoreU24BE(
+        out.data() + 1, static_cast<uint32_t>(hello.client_hello_len));
+    std::copy_n(hello.client_hello, hello.client_hello_len, out.data() + 4);
+}
+
+[[nodiscard]] std::vector<uint8_t> FramedClientHello(const SSL_CLIENT_HELLO& hello) {
+    std::vector<uint8_t> framed(FramedClientHelloSize(hello));
+    WriteFramedClientHello(hello, framed);
     return framed;
 }
 
@@ -921,45 +931,45 @@ struct RealityClientHelloExtensions {
     return parsed;
 }
 
-[[nodiscard]] std::unique_ptr<RealityServerConnState>
-VerifyRealityClientHelloHandshake(
-    std::vector<uint8_t> handshake,
-    const RealityServerState& state) {
+[[nodiscard]] std::optional<std::array<uint8_t, 32>>
+VerifyRealityClientHelloAuthKey(
+    std::span<uint8_t> handshake,
+    const RealityServerState& state) noexcept {
     // This is the reassembled handshake, including its four-byte header.
     common::ByteReader reader(handshake);
     const uint8_t msg_type = reader.ReadU8();
     const uint32_t hello_len = reader.ReadU24BE();
     if (!reader.Ok() || msg_type != SSL3_MT_CLIENT_HELLO ||
         hello_len != reader.Remaining()) {
-        return nullptr;
+        return std::nullopt;
     }
     (void)reader.ReadU16BE();
     const auto random = reader.ReadBytes(kRealityRandomSize);
     if (reader.ReadU8() != kRealitySessionIdSize ||
         !reader.Skip(kRealitySessionIdSize)) {
-        return nullptr;
+        return std::nullopt;
     }
     const uint16_t cipher_suites_len = reader.ReadU16BE();
     if (cipher_suites_len == 0 || (cipher_suites_len & 1u) != 0 ||
         !reader.Skip(cipher_suites_len)) {
-        return nullptr;
+        return std::nullopt;
     }
     const uint8_t comp_methods_len = reader.ReadU8();
     if (comp_methods_len == 0 || !reader.Skip(comp_methods_len)) {
-        return nullptr;
+        return std::nullopt;
     }
     const auto extensions_bytes = reader.ReadBytes(reader.ReadU16BE());
     if (!reader.Ok() || !reader.Empty()) {
-        return nullptr;
+        return std::nullopt;
     }
 
     const auto extensions = ParseRealityClientHelloExtensions(extensions_bytes);
     if (!extensions) {
-        return nullptr;
+        return std::nullopt;
     }
     if (!IsRealityServerNameAllowed(
             state.server_names, extensions->server_name.value_or(std::string_view{}))) {
-        return nullptr;
+        return std::nullopt;
     }
 
     auto auth_key = ComputeRealityAuthKey(
@@ -967,7 +977,7 @@ VerifyRealityClientHelloHandshake(
         extensions->peer_public,
         std::span<const uint8_t, 20>(random.data(), 20));
     if (!auth_key) {
-        return nullptr;
+        return std::nullopt;
     }
     const common::ScopedCleanse wipe_auth{*auth_key};
 
@@ -980,14 +990,33 @@ VerifyRealityClientHelloHandshake(
             random.data() + 20, kRealityAesGcmNonceSize),
         session_id,
         handshake);
-    if (!plain) return nullptr;
+    if (!plain) return std::nullopt;
     const common::ScopedCleanse wipe_plain{*plain};
-    if (!IsRealityClientAuthAllowed(state, *plain)) return nullptr;
+    if (!IsRealityClientAuthAllowed(state, *plain)) return std::nullopt;
+    return *auth_key;
+}
+
+[[nodiscard]] std::unique_ptr<RealityServerConnState>
+VerifyRealityClientHelloHandshake(
+    std::vector<uint8_t> handshake,
+    const RealityServerState& state) {
+    std::array<uint8_t, kRealitySessionIdSize> session_id{};
+    if (state.mldsa65_key &&
+        handshake.size() >= 4 + 35 + kRealitySessionIdSize) {
+        std::copy_n(
+            handshake.data() + 4 + 35, kRealitySessionIdSize, session_id.data());
+    }
+    auto auth_key = VerifyRealityClientHelloAuthKey(handshake, state);
+    if (!auth_key) {
+        return nullptr;
+    }
+    const common::ScopedCleanse wipe_auth{*auth_key};
 
     auto conn_state = std::make_unique<RealityServerConnState>();
     conn_state->auth_key = *auth_key;
     if (state.mldsa65_key) {
-        std::copy(session_id.begin(), session_id.end(), handshake.data() + 4 + 35);
+        std::copy(
+            session_id.begin(), session_id.end(), handshake.data() + 4 + 35);
         conn_state->client_hello_raw = std::move(handshake);
     }
     return conn_state;
@@ -1016,28 +1045,46 @@ VerifyRealityClientHelloHandshake(
 
     auto* conn_state = static_cast<RealityServerConnState*>(
         SSL_get_ex_data(hello->ssl, RealityConnStateExIndex()));
-    std::unique_ptr<RealityServerConnState> verified;
-    if (!conn_state) {
-        verified = VerifyRealityClientHelloHandshake(
+    std::array<uint8_t, 32> stack_auth_key{};
+    const common::ScopedCleanse wipe_stack_auth{stack_auth_key};
+    const uint8_t* auth_key_ptr = nullptr;
+    if (conn_state) {
+        auth_key_ptr = conn_state->auth_key.data();
+    } else if (state->mldsa65_key) {
+        auto verified = VerifyRealityClientHelloHandshake(
             FramedClientHello(*hello), *state);
         if (!verified) {
             return fail("client hello verification failed");
         }
-        conn_state = verified.get();
-        if (state->mldsa65_key) {
-            if (SSL_set_ex_data(
-                    hello->ssl, RealityConnStateExIndex(), verified.get()) != 1) {
-                return fail("failed to store REALITY connection state");
-            }
-            (void)verified.release();
+        if (SSL_set_ex_data(
+                hello->ssl, RealityConnStateExIndex(), verified.get()) != 1) {
+            return fail("failed to store REALITY connection state");
         }
+        auth_key_ptr = verified.release()->auth_key.data();
+    } else {
+        std::array<uint8_t, 2048> stack_hello{};
+        std::vector<uint8_t> heap_hello;
+        const size_t framed_size = FramedClientHelloSize(*hello);
+        std::span<uint8_t> framed_span;
+        if (framed_size <= stack_hello.size()) {
+            framed_span = {stack_hello.data(), framed_size};
+        } else {
+            heap_hello.resize(framed_size);
+            framed_span = heap_hello;
+        }
+        WriteFramedClientHello(*hello, framed_span);
+        auto verified_key = VerifyRealityClientHelloAuthKey(framed_span, *state);
+        if (!verified_key) {
+            return fail("client hello verification failed");
+        }
+        stack_auth_key = *verified_key;
+        OPENSSL_cleanse(verified_key->data(), verified_key->size());
+        auth_key_ptr = stack_auth_key.data();
     }
 
     auto cert = BuildRealityCertificate(
         *state,
-        std::span<const uint8_t, 32>(
-            conn_state->auth_key.data(),
-            conn_state->auth_key.size()));
+        std::span<const uint8_t, 32>(auth_key_ptr, 32));
     if (!cert) {
         return fail("ephemeral Ed25519 certificate build failed");
     }

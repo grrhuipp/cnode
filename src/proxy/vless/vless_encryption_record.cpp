@@ -108,10 +108,9 @@ net::awaitable<common::MultiBuffer> VlessEncryptionReader::ReadRawBytes() {
         co_await common::ThrowIfCancelledOnEof("VLESS Encryption read cancelled");
     }
     if (header_xor_) {
-        for (auto* buffer : out) {
-            if (!header_xor_->XorInboundInPlace(buffer->Bytes())) {
-                ThrowVlessEncryptionIoError("VLESS Encryption direct header xor failed");
-            }
+        if (const auto bytes = out.MutableFrontSpan();
+            !bytes.empty() && !header_xor_->XorInboundInPlace(bytes)) {
+            ThrowVlessEncryptionIoError("VLESS Encryption direct header xor failed");
         }
     }
     co_return out;

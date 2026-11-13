@@ -1,23 +1,17 @@
-#include "common/domain_name.hpp"
 #include "common/scoped_cleanse.hpp"
-#include "common/ip_address.hpp"
-#include <openssl/mem.h>
 #include "proxy/outbound.hpp"
 #include "proxy/trojan/trojan_codec.hpp"
 #include "proxy/handshake_errors.hpp"
 #include "proxy/outbound_stream_endpoint.hpp"
 #include "app/relay.hpp"
 #include "app/outbound_handler.hpp"
-#include "app/dns.hpp"
 #include "infra/config_types.hpp"
 #include "transport/link.hpp"
 #include "transport/outbound_target_builder.hpp"
-#include <algorithm>
 #include <openssl/crypto.h>
 #include <array>
 #include <cstring>
 #include <new>
-#include <span>
 #include <utility>
 
 #include <chrono>

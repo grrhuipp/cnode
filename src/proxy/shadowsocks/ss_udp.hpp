@@ -165,8 +165,14 @@ private:
         KeyBytes reply_key;
         SsCipherInfo cipher_info{};
     };
-    [[nodiscard]] size_t EncodePacketTo(const common::TargetAddress& target,
-        std::span<const uint8_t> payload, uint8_t* out, size_t out_capacity);
+    [[nodiscard]] size_t EncodedPacketSize(
+        size_t addr_size, size_t payload_len) const noexcept;
+    [[nodiscard]] size_t EncodePacketWithAddrSize(
+        const common::TargetAddress& target,
+        size_t addr_size,
+        std::span<const uint8_t> payload,
+        uint8_t* out,
+        size_t out_capacity);
     std::variant<ClassicState, Ss2022UdpTxState> state_;
 };
 

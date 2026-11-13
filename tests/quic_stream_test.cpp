@@ -54,9 +54,9 @@ TEST_P(QuicUdpCancellation, ReturnsUnreadBuffersBeforeNotifyingSubscribers) {
             if (!admitted) co_return;
         }
         auto delivered = co_await stream->ReadMultiBuffer();
-        EXPECT_EQ(delivered.size(), 1u);
+        EXPECT_FALSE(delivered.empty());
         EXPECT_EQ(delivered.byte_size(), input[0].size());
-        if (delivered.size() != 1 || delivered.byte_size() != input[0].size()) co_return;
+        if (delivered.empty() || delivered.byte_size() != input[0].size()) co_return;
         EXPECT_EQ(common::test_buffers_live, baseline + input.size());
         struct Observer final : transport::CancellationSubscription {
             std::unique_ptr<UdpSessionStream>& host;
@@ -81,13 +81,13 @@ TEST_P(QuicUdpCancellation, ReturnsUnreadBuffersBeforeNotifyingSubscribers) {
         EXPECT_EQ(common::rejected_process_allocations, rejected);
         EXPECT_TRUE(observer.notified);
         EXPECT_EQ(observer.reason, common::ErrorCode::CANCELLED);
-        EXPECT_EQ(observer.buffers_at_notification, baseline + delivered.size())
+        EXPECT_EQ(observer.buffers_at_notification, baseline + 1u)
             << "unread input was still owned during cancellation delivery";
-        EXPECT_EQ(common::test_buffers_live, baseline + delivered.size())
+        EXPECT_EQ(common::test_buffers_live, baseline + 1u)
             << "cancelled UDP host retained unreachable input";
         if (stream) stream->Cancel();
         {
-            const auto* buffer = *delivered.begin();
+            const auto* buffer = delivered.FrontBuffer();
             const auto bytes = buffer->Bytes();
             EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()), input[0]);
             EXPECT_TRUE(buffer->UDP().SameEndpoint(target));
@@ -122,10 +122,10 @@ TEST(QuicUdpQueue, BoundsBufferCapacityAndReturnsAdmissionOnRead) {
             << "full UDP queue attempted allocation before rejecting input";
 
         auto first = co_await stream.ReadMultiBuffer();
-        EXPECT_EQ(first.size(), 1u);
+        EXPECT_FALSE(first.empty());
         EXPECT_EQ(first.byte_size(), 1u);
-        if (first.size() != 1 || first.byte_size() != 1) co_return;
-        EXPECT_EQ((*first.begin())->Bytes().front(), 0);
+        if (first.empty() || first.byte_size() != 1) co_return;
+        EXPECT_EQ(first.FrontSpan().front(), 0);
         std::vector<uint8_t> two_blocks(common::Buffer::kSize + 1, 0x6c);
         two_blocks.front() = 0x12;
         two_blocks.back() = 0x91;
@@ -137,36 +137,32 @@ TEST(QuicUdpQueue, BoundsBufferCapacityAndReturnsAdmissionOnRead) {
         EXPECT_EQ(common::rejected_process_allocations, rejected_with_one_slot)
             << "two-block input allocated with only one queued block available";
         auto second = co_await stream.ReadMultiBuffer();
-        EXPECT_EQ(second.size(), 1u);
+        EXPECT_FALSE(second.empty());
         EXPECT_EQ(second.byte_size(), 1u);
-        if (second.size() != 1 || second.byte_size() != 1) co_return;
-        EXPECT_EQ((*second.begin())->Bytes().front(), 1);
+        if (second.empty() || second.byte_size() != 1) co_return;
+        EXPECT_EQ(second.FrontSpan().front(), 1);
         const bool admitted = stream.Push(target, two_blocks);
         EXPECT_TRUE(admitted);
         if (!admitted) co_return;
-        EXPECT_TRUE((*first.begin())->UDP().SameEndpoint(target));
+        EXPECT_TRUE(first.FrontBuffer()->UDP().SameEndpoint(target));
         first.clear();
         second.clear();
         for (size_t index = 2; index < accepted; ++index) {
             auto packet = co_await stream.ReadMultiBuffer();
-            EXPECT_EQ(packet.size(), 1u);
+            EXPECT_FALSE(packet.empty());
             EXPECT_EQ(packet.byte_size(), 1u);
-            if (packet.size() != 1 || packet.byte_size() != 1) co_return;
-            EXPECT_EQ((*packet.begin())->Bytes().front(), static_cast<uint8_t>(index % 251));
-            EXPECT_TRUE((*packet.begin())->UDP().SameEndpoint(target));
+            if (packet.empty() || packet.byte_size() != 1) co_return;
+            EXPECT_EQ(packet.FrontSpan().front(), static_cast<uint8_t>(index % 251));
+            EXPECT_TRUE(packet.FrontBuffer()->UDP().SameEndpoint(target));
         }
         auto tail = co_await stream.ReadMultiBuffer();
         EXPECT_EQ(tail.byte_size(), two_blocks.size());
         if (tail.byte_size() != two_blocks.size()) co_return;
-        size_t offset = 0;
-        for (const auto* buffer : tail) {
-            const auto bytes = buffer->Bytes();
-            EXPECT_LE(offset + bytes.size(), two_blocks.size());
-            if (offset + bytes.size() > two_blocks.size()) co_return;
-            EXPECT_TRUE(std::equal(bytes.begin(), bytes.end(), two_blocks.begin() + offset));
-            EXPECT_TRUE(buffer->UDP().SameEndpoint(target));
-            offset += bytes.size();
-        }
+        const auto bytes = tail.FrontSpan();
+        EXPECT_EQ(bytes.size(), two_blocks.size());
+        if (bytes.size() != two_blocks.size()) co_return;
+        EXPECT_TRUE(std::equal(bytes.begin(), bytes.end(), two_blocks.begin()));
+        EXPECT_TRUE(tail.FrontBuffer()->UDP().SameEndpoint(target));
         tail.clear();
         EXPECT_EQ(common::test_buffers_live, baseline);
 
@@ -463,11 +459,8 @@ TEST_P(QuicStreamWriteWaitEnd, SettlesPendingAndSubsequentWaits) {
         if (!cancelled) {
             EXPECT_TRUE(state->Open());
             auto input = co_await state->ReadMultiBuffer();
-            std::vector<uint8_t> received;
-            for (const auto* buffer : input) {
-                const auto bytes = buffer->Bytes();
-                received.insert(received.end(), bytes.begin(), bytes.end());
-            }
+            const auto bytes = input.FrontSpan();
+            std::vector<uint8_t> received(bytes.begin(), bytes.end());
             EXPECT_EQ(received, std::vector<uint8_t>(tail.begin(), tail.end()));
             if (ending == WriteWaitEnd::ShutdownWrite) {
                 const bool admitted = state->PushInput({}, true);

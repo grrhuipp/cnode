@@ -45,12 +45,10 @@ net::awaitable<Measurement> Transfer(
             auto received = co_await stream.ReadMultiBuffer();
             if (received.empty() || received.byte_size() > payload.size() - offset)
                 throw std::runtime_error("TCP benchmark changed burst boundaries");
-            for (const auto* buffer : received) {
-                const auto bytes = buffer->Bytes();
-                if (!std::equal(bytes.begin(), bytes.end(), payload.begin() + offset))
-                    throw std::runtime_error("TCP benchmark corrupted payload");
-                offset += bytes.size();
-            }
+            const auto bytes = received.FrontSpan();
+            if (!std::equal(bytes.begin(), bytes.end(), payload.begin() + offset))
+                throw std::runtime_error("TCP benchmark corrupted payload");
+            offset += bytes.size();
             ++reads;
         }
     }

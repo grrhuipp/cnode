@@ -110,18 +110,13 @@ common::MultiBuffer MakePayload(
     const common::TargetAddress& target, const std::vector<uint8_t>& bytes) {
     common::MultiBuffer payload;
     EXPECT_TRUE(payload.AppendSpan(bytes));
-    for (auto* buffer : payload) buffer->SetUDP(target);
+    EXPECT_TRUE(common::SetUdpTarget(payload, target));
     return payload;
 }
 
 std::vector<uint8_t> Flatten(const common::MultiBuffer& payload) {
-    std::vector<uint8_t> bytes;
-    bytes.reserve(payload.byte_size());
-    for (const auto* buffer : payload) {
-        const auto part = buffer->Bytes();
-        bytes.insert(bytes.end(), part.begin(), part.end());
-    }
-    return bytes;
+    const auto part = payload.FrontSpan();
+    return std::vector<uint8_t>(part.begin(), part.end());
 }
 
 std::vector<uint8_t> EncodeClassic(

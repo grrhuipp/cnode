@@ -85,12 +85,8 @@ void Prepend(::transport::AsyncStream& stream, std::string_view value) {
     stream.PrependReadBytes(Bytes(value));
 }
 std::string Flatten(const ::common::MultiBuffer& data) {
-    std::string result;
-    for (const auto* buffer : data) {
-        const auto bytes = buffer->Bytes();
-        result.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-    }
-    return result;
+    const auto bytes = data.FrontSpan();
+    return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 
 // The peer is a real TCP/Asio TLS endpoint, independent of cnode's transport.

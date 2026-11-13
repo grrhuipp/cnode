@@ -16,7 +16,8 @@ class Capture final : public transport::MultiBufferWriter {
 public:
     std::vector<uint8_t> bytes;
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
-        for (auto* b : mb) bytes.insert(bytes.end(), b->Bytes().begin(), b->Bytes().end());
+        const auto span = mb.FrontSpan();
+        bytes.insert(bytes.end(), span.begin(), span.end());
         co_return;
     }
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
@@ -144,7 +145,8 @@ net::awaitable<void> RecoversFragmentedContent(size_t size) {
             for (;;) {
                 auto mb = co_await reader.ReadMultiBuffer();
                 if (mb.empty()) break;
-                for (auto* b : mb) decoded.insert(decoded.end(), b->Bytes().begin(), b->Bytes().end());
+                const auto span = mb.FrontSpan();
+                decoded.insert(decoded.end(), span.begin(), span.end());
             }
             EXPECT_EQ(decoded, body) << "one-byte frame fragmentation corrupted content";
         }
@@ -175,7 +177,8 @@ net::awaitable<void> SwitchesToRawAfterPadding(size_t chunk) {
         for (;;) {
             auto mb = co_await reader.ReadMultiBuffer();
             if (mb.empty()) break;
-            for (auto* b : mb) decoded.insert(decoded.end(), b->Bytes().begin(), b->Bytes().end());
+            const auto span = mb.FrontSpan();
+            decoded.insert(decoded.end(), span.begin(), span.end());
         }
         EXPECT_EQ(decoded, std::vector<uint8_t>({10, 11, 12, 13, 14})) << "direct prefetch ordering";
         EXPECT_GE(source.switched_at, 26) << "raw read switched before padding boundary";

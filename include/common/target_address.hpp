@@ -170,47 +170,69 @@ private:
     }
 };
 
-inline std::optional<TargetAddress> TargetAddress::Parse(std::string_view addr) {
-    if (addr.empty()) {
-        return std::nullopt;
-    }
-
+struct HostPortSplit {
     std::string_view host;
-    uint16_t port = 0;
+    std::string_view port;
+    bool has_port = false;
+    bool bracketed = false;
+};
 
-    if (addr.front() == '[') {
-        const auto close = addr.find(']');
-        if (close == std::string::npos ||
-            close + 1 >= addr.size() ||
-            addr[close + 1] != ':') {
-            return std::nullopt;
-        }
-        host = addr.substr(1, close - 1);
-        if (!ParsePort(addr.substr(close + 2), port)) {
-            return std::nullopt;
-        }
-    } else {
-        const auto colon = addr.rfind(':');
-        if (colon == std::string::npos ||
-            addr.find(':') != colon) {
-            return std::nullopt;
-        }
-        host = addr.substr(0, colon);
-        if (!ParsePort(addr.substr(colon + 1), port)) {
-            return std::nullopt;
-        }
+[[nodiscard]] inline std::optional<HostPortSplit> SplitHostPort(
+    std::string_view text) noexcept {
+    if (text.empty()) {
+        return std::nullopt;
     }
+    if (text.front() == '[') {
+        const size_t close = text.find(']');
+        if (close == std::string_view::npos || close == 1) {
+            return std::nullopt;
+        }
+        const std::string_view host = text.substr(1, close - 1);
+        if (host.find('[') != std::string_view::npos) {
+            return std::nullopt;
+        }
+        if (close + 1 == text.size()) {
+            return HostPortSplit{host, {}, false, true};
+        }
+        if (text[close + 1] != ':') {
+            return std::nullopt;
+        }
+        return HostPortSplit{host, text.substr(close + 2), true, true};
+    }
+    if (text.find('[') != std::string_view::npos ||
+        text.find(']') != std::string_view::npos) {
+        return std::nullopt;
+    }
+    const size_t first_colon = text.find(':');
+    if (first_colon == std::string_view::npos) {
+        return HostPortSplit{text, {}, false, false};
+    }
+    if (text.find(':', first_colon + 1) == std::string_view::npos) {
+        if (first_colon == 0) {
+            return std::nullopt;
+        }
+        return HostPortSplit{
+            text.substr(0, first_colon),
+            text.substr(first_colon + 1),
+            true,
+            false};
+    }
+    return HostPortSplit{text, {}, false, false};
+}
 
-    if (host.empty() || port == 0) {
+inline std::optional<TargetAddress> TargetAddress::Parse(std::string_view addr) {
+    const auto split = SplitHostPort(addr);
+    uint16_t port = 0;
+    if (!split || !split->has_port || !ParsePort(split->port, port) || port == 0) {
         return std::nullopt;
     }
 
-    TargetAddress target(host, port);
+    TargetAddress target(split->host, port);
     // Brackets must enclose exactly an IPv6 literal. ParseLiteral takes the
     // IPv6 path iff the text contains ':', and v4-mapped literals normalize to
     // IPv4, so the bracket check uses the source text rather than the type.
-    if (addr.front() == '[' &&
-        (!target.IsIP() || host.find(':') == std::string_view::npos)) {
+    if (split->bracketed &&
+        (!target.IsIP() || split->host.find(':') == std::string_view::npos)) {
         return std::nullopt;
     }
     if (!target.IsValid()) {

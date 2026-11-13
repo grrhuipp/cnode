@@ -28,16 +28,8 @@ namespace {
 
 
 std::vector<uint8_t> Flatten(const common::MultiBuffer& mb) {
-    std::vector<uint8_t> out;
-    out.reserve(mb.byte_size());
-    for (const common::Buffer* buffer : mb) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        const auto bytes = buffer->Bytes();
-        out.insert(out.end(), bytes.begin(), bytes.end());
-    }
-    return out;
+    const auto bytes = mb.FrontSpan();
+    return std::vector<uint8_t>(bytes.begin(), bytes.end());
 }
 
 common::MultiBuffer MakePacket(std::string_view payload, const common::TargetAddress& target) {
@@ -54,13 +46,8 @@ common::MultiBuffer MakePacket(std::string_view payload, const common::TargetAdd
 class CaptureWriter final : public transport::MultiBufferWriter {
 public:
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
-        for (const common::Buffer* buffer : mb) {
-            if (!buffer || buffer->IsEmpty()) {
-                continue;
-            }
-            const auto span = buffer->Bytes();
-            bytes.insert(bytes.end(), span.begin(), span.end());
-        }
+        const auto span = mb.FrontSpan();
+        bytes.insert(bytes.end(), span.begin(), span.end());
         co_return;
     }
 

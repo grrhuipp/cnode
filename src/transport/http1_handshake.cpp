@@ -1041,26 +1041,63 @@ std::string SanitizeHttpRequestLineForLog(const Http1RequestLine& line) {
     return out;
 }
 
-void AppendRequestStart(std::string& request,
-                        std::string_view method,
-                        std::string_view path,
-                        std::string_view host) {
-    request.append(method);
-    request.push_back(' ');
-    request.append(path);
-    request.append(" HTTP/1.1\r\n");
-    request.append("Host: ");
-    request.append(host);
+net::awaitable<bool> SendHttp1UpgradeRequest(
+    AsyncStream& stream,
+    std::string_view req_path,
+    std::string_view host,
+    const HttpHeaders* headers,
+    std::string_view ws_key) {
+    size_t reserve_size =
+        (ws_key.empty() ? 96 : 160) + req_path.size() + host.size() + ws_key.size();
+    if (headers) {
+        for (const auto& [key, value] : *headers) {
+            if (!key.empty() && !IsReservedUpgradeHeader(key)) {
+                reserve_size += key.size() + value.size() + 4;
+            }
+        }
+    }
+    Http1HeaderBuffer request;
+    request.reserve(reserve_size);
+    AppendRequestStart(request, "GET", req_path, host);
+    request.append("Upgrade: websocket\r\n");
+    request.append("Connection: Upgrade\r\n");
+    if (!ws_key.empty()) {
+        AppendHeaderLine(request, "Sec-WebSocket-Key", ws_key);
+        request.append("Sec-WebSocket-Version: 13\r\n");
+    }
+    if (headers) {
+        for (const auto& [key, value] : *headers) {
+            if (!key.empty() && !IsReservedUpgradeHeader(key)) {
+                AppendHeaderLine(request, key, value);
+            }
+        }
+    }
     request.append("\r\n");
+    co_return co_await WriteFullToStream(stream, request.View());
 }
 
-void AppendHeaderLine(std::string& out,
-                      std::string_view name,
-                      std::string_view value) {
-    out.append(name);
-    out.append(": ");
-    out.append(value);
-    out.append("\r\n");
+net::awaitable<bool> SendHttp1ClientRequest(
+    AsyncStream& stream,
+    std::string_view method,
+    std::string_view req_path,
+    std::string_view host,
+    const HttpHeaders& headers) {
+    size_t reserve_size = 64 + method.size() + req_path.size() + host.size();
+    for (const auto& [key, value] : headers) {
+        if (!key.empty() && !common::EqualsAsciiCI(key, "Host")) {
+            reserve_size += key.size() + value.size() + 4;
+        }
+    }
+    Http1HeaderBuffer request;
+    request.reserve(reserve_size);
+    AppendRequestStart(request, method, req_path, host);
+    for (const auto& [key, value] : headers) {
+        if (!key.empty() && !common::EqualsAsciiCI(key, "Host")) {
+            AppendHeaderLine(request, key, value);
+        }
+    }
+    request.append("\r\n");
+    co_return co_await WriteFullToStream(stream, request.View());
 }
 
 net::awaitable<tl::expected<Http1Request, common::ErrorCode>> ReadHttp1Request(
@@ -1119,37 +1156,7 @@ ExecuteHttp1UpgradeClientHandshake(
     const HttpHeaders* headers,
     std::string_view ws_key) {
     const std::string_view req_path = EffectiveHttpPath(path);
-    size_t reserve_size =
-        (ws_key.empty() ? 192 : 256) + req_path.size() + host.size() + ws_key.size();
-    if (headers) {
-        for (const auto& [key, value] : *headers) {
-            if (!key.empty() && !IsReservedUpgradeHeader(key)) {
-                reserve_size += key.size() + value.size() + 4;
-            }
-        }
-    }
-
-    std::string request;
-    request.reserve(reserve_size);
-    AppendRequestStart(request, "GET", req_path, host);
-    request.append("Upgrade: websocket\r\n");
-    request.append("Connection: Upgrade\r\n");
-    if (!ws_key.empty()) {
-        AppendHeaderLine(request, "Sec-WebSocket-Key", ws_key);
-        request.append("Sec-WebSocket-Version: 13\r\n");
-    }
-    if (headers) {
-        for (const auto& [key, value] : *headers) {
-            if (!key.empty() && !IsReservedUpgradeHeader(key)) {
-                AppendHeaderLine(request, key, value);
-            }
-        }
-    }
-    request.append("\r\n");
-
-    const bool write_ok = co_await WriteFullToStream(stream, request);
-    std::string{}.swap(request);
-    if (!write_ok) {
+    if (!co_await SendHttp1UpgradeRequest(stream, req_path, host, headers, ws_key)) {
         LOG_CONN_DEBUG(conn_id, "{} client failed to send upgrade request", scope);
         co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
@@ -1262,7 +1269,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     if (cfg.headers.empty()) {
         wrote = co_await WriteFullToStream(*stream, kDefaultOkResponse);
     } else {
-        std::string response;
+        Http1HeaderBuffer response;
         response.reserve(96 + cfg.headers.size() * 32);
         response.append("HTTP/1.1 200 OK\r\nCache-Control: no-store\r\n");
         for (const auto& [key, value] : cfg.headers) {
@@ -1271,7 +1278,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
             }
         }
         response.append("\r\n");
-        wrote = co_await WriteFullToStream(*stream, response);
+        wrote = co_await WriteFullToStream(*stream, response.View());
     }
     if (!wrote) {
         LOG_CONN_DEBUG(conn_id, "HTTP server failed to send 200 response");
@@ -1292,28 +1299,10 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
     const std::string_view req_path = EffectiveHttpPath(cfg.path);
     const std::string_view method = cfg.method.empty()
         ? std::string_view("PUT") : std::string_view(cfg.method);
-    size_t reserve_size = 192 + method.size() + req_path.size() + host.size();
-    for (const auto& [key, value] : cfg.headers) {
-        if (!key.empty() && !common::EqualsAsciiCI(key, "Host")) {
-            reserve_size += key.size() + value.size() + 4;
-        }
-    }
-
-    std::string request;
-    request.reserve(reserve_size);
-    AppendRequestStart(request, method, req_path, host);
-    for (const auto& [key, value] : cfg.headers) {
-        if (!key.empty() && !common::EqualsAsciiCI(key, "Host")) {
-            AppendHeaderLine(request, key, value);
-        }
-    }
-    request.append("\r\n");
-
-    if (!co_await WriteFullToStream(*stream, request)) {
+    if (!co_await SendHttp1ClientRequest(*stream, method, req_path, host, cfg.headers)) {
         LOG_CONN_DEBUG(conn_id, "HTTP client failed to send request");
         co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
-    std::string{}.swap(request);
     if (auto response = co_await ReadClientResponse(*stream, "HTTP", conn_id, "200");
         !response) {
         co_return tl::unexpected(response.error());

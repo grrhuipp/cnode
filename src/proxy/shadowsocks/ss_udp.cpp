@@ -46,11 +46,11 @@ struct Parsed2022Body {
 
 
 [[nodiscard]] bool WriteClassicUdpPlaintext(const common::TargetAddress& target,
+                                            size_t addr_size,
                                             const uint8_t* payload,
                                             size_t payload_len,
                                             std::span<uint8_t> plaintext,
                                             common::ForwardedMetadataView forwarded = {}) noexcept {
-    const size_t addr_size = common::AddressEncodedSize(target, forwarded);
     if (addr_size == 0 || plaintext.size() != addr_size + payload_len) {
         return false;
     }
@@ -62,11 +62,11 @@ struct Parsed2022Body {
 }
 
 [[nodiscard]] bool Write2022ClientBodyPlaintext(const common::TargetAddress& target,
+                                                size_t addr_size,
                                                 const uint8_t* payload,
                                                 size_t payload_len,
                                                 std::span<uint8_t> plaintext,
                                                 common::ForwardedMetadataView forwarded = {}) noexcept {
-    const size_t addr_size = common::AddressEncodedSize(target, forwarded);
     constexpr size_t kHeaderSize = 1 + 8 + 2;
     if (addr_size == 0 || plaintext.size() != kHeaderSize + addr_size + payload_len) {
         return false;
@@ -85,11 +85,11 @@ struct Parsed2022Body {
 }
 
 [[nodiscard]] bool Write2022ServerBodyPlaintext(const common::TargetAddress& target,
+                                                size_t addr_size,
                                                 const uint8_t* payload,
                                                 size_t payload_len,
                                                 std::span<const uint8_t, 8> client_session_id,
                                                 std::span<uint8_t> plaintext) noexcept {
-    const size_t addr_size = common::AddressEncodedSize(target);
     constexpr size_t kHeaderSize = 1 + 8 + 8 + 2;
     if (addr_size == 0 || plaintext.size() != kHeaderSize + addr_size + payload_len) {
         return false;
@@ -461,8 +461,9 @@ struct PlaintextScratch {
     return std::nullopt;
 }
 
-[[nodiscard]] size_t EncodeClassicUdpPacketTo(
+[[nodiscard]] size_t EncodeClassicUdpPacketWithAddrSize(
     const common::TargetAddress& target,
+    size_t addr_size,
     const uint8_t* payload,
     size_t payload_len,
     std::span<const uint8_t> master_key,
@@ -473,13 +474,8 @@ struct PlaintextScratch {
     size_t output_size,
     common::ForwardedMetadataView forwarded) {
 
-    if (key_size > 64 || salt_size > 64 || master_key.size() < key_size ||
-        (payload_len > 0 && !payload)) {
-        return 0;
-    }
-
-    const size_t addr_size = common::AddressEncodedSize(target, forwarded);
-    if (addr_size == 0) {
+    if (addr_size == 0 || key_size > 64 || salt_size > 64 ||
+        master_key.size() < key_size || (payload_len > 0 && !payload)) {
         return 0;
     }
     const size_t plain_size = addr_size + payload_len;
@@ -490,7 +486,7 @@ struct PlaintextScratch {
 
     uint8_t* salt = output;
     uint8_t* ciphertext = output + salt_size;
-    if (!WriteClassicUdpPlaintext(target, payload, payload_len,
+    if (!WriteClassicUdpPlaintext(target, addr_size, payload, payload_len,
                                   std::span<uint8_t>(ciphertext, plain_size), forwarded)) {
         return 0;
     }
@@ -520,8 +516,9 @@ struct PlaintextScratch {
     return total_size;
 }
 
-[[nodiscard]] size_t Encode2022UdpAesPacketTo(
+[[nodiscard]] size_t Encode2022UdpAesPacketWithAddrSize(
     const common::TargetAddress& target,
+    size_t addr_size,
     const uint8_t* payload,
     size_t payload_len,
     Ss2022UdpTxState& state,
@@ -535,12 +532,7 @@ struct PlaintextScratch {
     if (!response && !psk_chain.empty()) {
         body_key = &psk_chain.back();
     }
-    if (body_key->empty() || (payload_len > 0 && !payload)) {
-        return 0;
-    }
-
-    const size_t addr_size = common::AddressEncodedSize(target, response ? common::ForwardedMetadataView{} : forwarded);
-    if (addr_size == 0) {
+    if (addr_size == 0 || body_key->empty() || (payload_len > 0 && !payload)) {
         return 0;
     }
     const size_t body_header_size = response ? (1 + 8 + 8 + 2) : (1 + 8 + 2);
@@ -560,10 +552,10 @@ struct PlaintextScratch {
     uint8_t* body_out = output + header_bytes;
     const bool wrote_body = response
         ? Write2022ServerBodyPlaintext(
-              target, payload, payload_len, state.client_session_id,
+              target, addr_size, payload, payload_len, state.client_session_id,
               std::span<uint8_t>(body_out, body_plain_size))
         : Write2022ClientBodyPlaintext(
-              target, payload, payload_len,
+              target, addr_size, payload, payload_len,
               std::span<uint8_t>(body_out, body_plain_size), forwarded);
     if (!wrote_body) {
         return 0;
@@ -635,8 +627,9 @@ struct PlaintextScratch {
     return total_size;
 }
 
-[[nodiscard]] size_t Encode2022UdpChachaPacketTo(
+[[nodiscard]] size_t Encode2022UdpChachaPacketWithAddrSize(
     const common::TargetAddress& target,
+    size_t addr_size,
     const uint8_t* payload,
     size_t payload_len,
     Ss2022UdpTxState& state,
@@ -645,12 +638,7 @@ struct PlaintextScratch {
     size_t output_size,
     common::ForwardedMetadataView forwarded = {}) {
 
-    if (state.key.size != 32 || (payload_len > 0 && !payload)) {
-        return 0;
-    }
-
-    const size_t addr_size = common::AddressEncodedSize(target, response ? common::ForwardedMetadataView{} : forwarded);
-    if (addr_size == 0) {
+    if (addr_size == 0 || state.key.size != 32 || (payload_len > 0 && !payload)) {
         return 0;
     }
     const size_t body_header_size = response ? (1 + 8 + 8 + 2) : (1 + 8 + 2);
@@ -668,10 +656,10 @@ struct PlaintextScratch {
         cipher_out + kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize;
     const bool wrote_body = response
         ? Write2022ServerBodyPlaintext(
-              target, payload, payload_len, state.client_session_id,
+              target, addr_size, payload, payload_len, state.client_session_id,
               std::span<uint8_t>(body_out, body_plain_size))
         : Write2022ClientBodyPlaintext(
-              target, payload, payload_len,
+              target, addr_size, payload, payload_len,
               std::span<uint8_t>(body_out, body_plain_size), forwarded);
     if (!wrote_body) {
         return 0;
@@ -951,8 +939,9 @@ size_t EncodeUdpPacketTo(
     if (Is2022Cipher(cipher_type)) {
         return 0;
     }
-    return EncodeClassicUdpPacketTo(
+    return EncodeClassicUdpPacketWithAddrSize(
         target,
+        common::AddressEncodedSize(target, forwarded),
         payload,
         payload_len,
         master_key,
@@ -1056,14 +1045,15 @@ size_t Encode2022UdpRequestPacketTo(
     size_t output_size,
     common::ForwardedMetadataView forwarded) {
 
+    const size_t addr_size = common::AddressEncodedSize(target, forwarded);
     if (Is2022AesCipher(state.cipher_info.type)) {
-        return Encode2022UdpAesPacketTo(
-            target, payload, payload_len, state, psk_chain,
+        return Encode2022UdpAesPacketWithAddrSize(
+            target, addr_size, payload, payload_len, state, psk_chain,
             false, output, output_size, forwarded);
     }
     if (state.cipher_info.type == SsCipherType::CHACHA20_POLY1305_2022) {
-        return Encode2022UdpChachaPacketTo(
-            target, payload, payload_len, state, false, output, output_size, forwarded);
+        return Encode2022UdpChachaPacketWithAddrSize(
+            target, addr_size, payload, payload_len, state, false, output, output_size, forwarded);
     }
     return 0;
 }
@@ -1076,14 +1066,15 @@ size_t Encode2022UdpResponsePacketTo(
     uint8_t* output,
     size_t output_size) {
 
+    const size_t addr_size = common::AddressEncodedSize(target);
     if (Is2022AesCipher(state.cipher_info.type)) {
-        return Encode2022UdpAesPacketTo(
-            target, payload, payload_len, state, {},
+        return Encode2022UdpAesPacketWithAddrSize(
+            target, addr_size, payload, payload_len, state, {},
             true, output, output_size);
     }
     if (state.cipher_info.type == SsCipherType::CHACHA20_POLY1305_2022) {
-        return Encode2022UdpChachaPacketTo(
-            target, payload, payload_len, state, true, output, output_size);
+        return Encode2022UdpChachaPacketWithAddrSize(
+            target, addr_size, payload, payload_len, state, true, output, output_size);
     }
     return 0;
 }
@@ -1194,23 +1185,62 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     return result;
 }
 
-size_t proxy::UdpResponse::EncodePacketTo(
+size_t proxy::UdpResponse::EncodedPacketSize(
+    size_t addr_size, size_t payload_len) const noexcept {
+    if (addr_size == 0) {
+        return 0;
+    }
+    if (const auto* ss2022 = std::get_if<proxy::Ss2022UdpTxState>(&state_)) {
+        constexpr size_t kBodyHeaderSize = 1 + 8 + 8 + 2;
+        if (Is2022AesCipher(ss2022->cipher_info.type)) {
+            if (ss2022->key.empty()) return 0;
+            return kSs2022UdpSeparateHeaderSize + kBodyHeaderSize +
+                   addr_size + payload_len + SsAeadCipher::kTagSize;
+        }
+        if (ss2022->cipher_info.type == SsCipherType::CHACHA20_POLY1305_2022) {
+            if (ss2022->key.size != 32) return 0;
+            return kSs2022UdpNonceSize + kSs2022UdpSessionIdSize +
+                   kSs2022UdpPacketIdSize + kBodyHeaderSize +
+                   addr_size + payload_len + SsAeadCipher::kTagSize;
+        }
+        return 0;
+    }
+    const auto& classic = std::get<ClassicState>(state_);
+    if (Is2022Cipher(classic.cipher_info.type) ||
+        classic.cipher_info.key_size > 64 ||
+        classic.cipher_info.salt_size > 64 ||
+        classic.reply_key.size < classic.cipher_info.key_size) {
+        return 0;
+    }
+    return classic.cipher_info.salt_size + addr_size + payload_len + SsAeadCipher::kTagSize;
+}
+
+size_t proxy::UdpResponse::EncodePacketWithAddrSize(
     const common::TargetAddress& target,
+    size_t addr_size,
     std::span<const uint8_t> payload,
     uint8_t* out,
     size_t out_capacity) {
     if (auto* ss2022 = std::get_if<proxy::Ss2022UdpTxState>(&state_)) {
-        return proxy::Encode2022UdpResponsePacketTo(
-            target,
-            payload.data(),
-            payload.size(),
-            *ss2022,
-            out,
-            out_capacity);
+        if (Is2022AesCipher(ss2022->cipher_info.type)) {
+            return Encode2022UdpAesPacketWithAddrSize(
+                target, addr_size, payload.data(), payload.size(),
+                *ss2022, {}, true, out, out_capacity);
+        }
+        if (ss2022->cipher_info.type == SsCipherType::CHACHA20_POLY1305_2022) {
+            return Encode2022UdpChachaPacketWithAddrSize(
+                target, addr_size, payload.data(), payload.size(),
+                *ss2022, true, out, out_capacity);
+        }
+        return 0;
     }
     const auto& classic = std::get<ClassicState>(state_);
-    return proxy::EncodeUdpPacketTo(
+    if (Is2022Cipher(classic.cipher_info.type)) {
+        return 0;
+    }
+    return EncodeClassicUdpPacketWithAddrSize(
         target,
+        addr_size,
         payload.data(),
         payload.size(),
         classic.reply_key.span(),
@@ -1218,12 +1248,13 @@ size_t proxy::UdpResponse::EncodePacketTo(
         classic.cipher_info.key_size,
         classic.cipher_info.salt_size,
         out,
-        out_capacity);
+        out_capacity,
+        {});
 }
 
 common::MultiBuffer proxy::UdpResponse::Encode(UDPPacketView packet) {
-    const size_t encoded_len = EncodePacketTo(
-        packet.target, packet.data, nullptr, 0);
+    const size_t addr_size = common::AddressEncodedSize(packet.target);
+    const size_t encoded_len = EncodedPacketSize(addr_size, packet.data.size());
     if (encoded_len == 0) {
         return {};
     }
@@ -1233,8 +1264,9 @@ common::MultiBuffer proxy::UdpResponse::Encode(UDPPacketView packet) {
     if (!dst) {
         return {};
     }
-    const size_t written = EncodePacketTo(
+    const size_t written = EncodePacketWithAddrSize(
         packet.target,
+        addr_size,
         packet.data,
         dst,
         encoded_len);

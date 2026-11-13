@@ -319,7 +319,7 @@ net::awaitable<common::MultiBuffer> BaseWsStream::ReadMultiBuffer() {
         co_return common::MultiBuffer{};
     }
     if (!HasPendingBytes() && !co_await EnsurePendingData()) co_return common::MultiBuffer{};
-    if (common::Buffer* front = *pending_data_.begin();
+    if (const auto* front = pending_data_.FrontBuffer();
         front && front->Len() <= frame_payload_remaining_) {
         common::BufferGuard output = pending_data_.pop_front();
         pending_data_.ReleaseIfIdle();
@@ -493,8 +493,7 @@ net::awaitable<void> BaseWsStream::WriteMultiBuffer(common::MultiBuffer buffers)
         std::array<net::const_buffer, 2> output;
         size_t count = 0;
         output[count++] = net::buffer(header.bytes.data(), header.size);
-        if (auto* buffer = buffers.back(); buffer && !buffer->IsEmpty()) {
-            auto bytes = buffer->Bytes();
+        if (const auto bytes = buffers.MutableFrontSpan(); !bytes.empty()) {
             if (is_client_) {
                 MaskData(bytes.data(), bytes.size(), mask, 0);
             }

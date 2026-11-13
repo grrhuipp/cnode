@@ -264,8 +264,8 @@ protected:
             [result](std::exception_ptr error, ::common::MultiBuffer payload) {
                 result->completed = true;
                 if (error || payload.byte_size() != 1) return;
-                for (const auto* buffer : payload)
-                    if (buffer && buffer->Len() == 1) result->marker = buffer->Bytes()[0];
+                const auto bytes = payload.FrontSpan();
+                if (bytes.size() == 1) result->marker = bytes[0];
             });
         io_context.poll();
         io_context.restart();
@@ -1108,11 +1108,7 @@ TEST_P(UdpReplyEndpointTest, MultibufferReplyUsesCurrentEndpointWithoutSplitting
     ::common::MultiBuffer callback_large_buffers;
     EXPECT_TRUE(callback_large_buffers.AppendSpan(
                 callback_large_payload)) << "failed to allocate large UDP callback payload";
-    for (::common::Buffer* buffer : callback_large_buffers) {
-        if (buffer && !buffer->IsEmpty()) {
-            buffer->SetUDP(callback_source);
-        }
-    }
+    ASSERT_TRUE(::common::SetUdpTarget(callback_large_buffers, callback_source));
 
     auto response_context = std::make_shared<CountingUdpResponseContext>();
     ::app::UdpIngress::ClientSession large_reply_session(io_context,

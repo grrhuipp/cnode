@@ -31,11 +31,9 @@ std::vector<uint8_t> Flatten(const common::MultiBuffer& payload) {
 }
 
 bool Consistent(const common::MultiBuffer& payload) {
-    size_t bytes = 0;
-    for (const auto* buffer : payload) {
-        if (buffer) bytes += buffer->Len();
-    }
-    return payload.byte_size() == bytes && payload.empty() == (payload.size() == 0);
+    const auto* buffer = payload.FrontBuffer();
+    const size_t bytes = buffer ? buffer->Len() : 0;
+    return payload.byte_size() == bytes && payload.empty() == (buffer == nullptr);
 }
 
 std::vector<uint8_t> Pattern(size_t bytes) {
@@ -86,10 +84,10 @@ TEST(BufferOwnership, SpanAppendRollsBackEveryAllocationFailureAndCanRetry) {
         const auto before = Pattern(33);
         const auto added = Pattern(90000);
         auto payload = Packet(before);
-        auto* original = *payload.begin();
+        auto* original = payload.FrontBuffer();
         complete = Inject(budget, [&] { return payload.AppendSpan(added); });
         const bool unchanged = complete || (failures != 0 && Flatten(payload) == before &&
-            Consistent(payload) && payload.size() == 1 && *payload.begin() == original);
+            Consistent(payload) && !payload.empty() && payload.FrontBuffer() == original);
         if (!complete && !payload.AppendSpan(added)) return false;
         auto expected = before;
         expected.insert(expected.end(), added.begin(), added.end());
@@ -120,7 +118,7 @@ TEST_P(BufferTransferFailure, PreservesBothContainersAndUdpMetadataOnFailure) {
                 const auto target_bytes = Pattern(common::Buffer::kSize * 2);
                 auto source = Packet(source_bytes);
                 auto target = Packet(target_bytes);
-                auto* original = *source.begin();
+                auto* original = source.FrontBuffer();
                 const common::TargetAddress endpoint{"127.0.0.1", 1234};
                 original->SetUDP(endpoint);
                 const size_t bytes = prefix ? common::Buffer::kSize + 17 : source_bytes.size();
@@ -132,7 +130,7 @@ TEST_P(BufferTransferFailure, PreservesBothContainersAndUdpMetadataOnFailure) {
                 complete = Inject(budget, operation);
                 const bool unchanged = complete || (failures != 0 &&
                     Flatten(source) == source_bytes && Flatten(target) == target_bytes &&
-                    Consistent(source) && Consistent(target) && *source.begin() == original &&
+                    Consistent(source) && Consistent(target) && source.FrontBuffer() == original &&
                     original->HasUDP() && original->UDP().SameEndpoint(endpoint));
                 if (!complete && !operation()) return false;
                 auto expected = target_bytes;
@@ -153,7 +151,7 @@ TEST(BufferOwnership, UdpPrefixAllocationFailureRollsBackBothContainersAndCanRet
             const common::TargetAddress long_target{
                 "split-copy-target-host-name-longer-than-sso.example.com", 14321};
             auto source = Packet(source_bytes);
-            auto* original = *source.begin();
+            auto* original = source.FrontBuffer();
             original->SetUDP(long_target);
             common::MultiBuffer destination;
 
@@ -161,17 +159,17 @@ TEST(BufferOwnership, UdpPrefixAllocationFailureRollsBackBothContainersAndCanRet
                 return source.MovePrefixTo(destination, prefix_bytes);
             });
             const bool rolled_back = complete || (failures != 0 &&
-                source.size() == 1 && *source.begin() == original &&
+                !source.empty() && source.FrontBuffer() == original &&
                 Flatten(source) == source_bytes && source.byte_size() == source_bytes.size() &&
                 original->HasUDP() && original->UDP().SameEndpoint(long_target) &&
                 destination.empty() && destination.byte_size() == 0 &&
                 Consistent(source) && Consistent(destination));
             const bool retried = complete || source.MovePrefixTo(destination, prefix_bytes);
-            const bool metadata = retried && source.size() == 1 && original->HasUDP() &&
-                original->UDP().SameEndpoint(long_target) && destination.size() == 1 &&
-                destination.back()->HasUDP() &&
-                destination.back()->UDP().SameEndpoint(long_target) &&
-                destination.back()->Len() == prefix_bytes;
+            const bool metadata = retried && !source.empty() && original->HasUDP() &&
+                original->UDP().SameEndpoint(long_target) && !destination.empty() &&
+                destination.FrontBuffer()->HasUDP() &&
+                destination.FrontBuffer()->UDP().SameEndpoint(long_target) &&
+                destination.FrontBuffer()->Len() == prefix_bytes;
             const bool bytes = source.byte_size() == source_bytes.size() - prefix_bytes &&
                 destination.byte_size() == prefix_bytes &&
                 Consistent(source) && Consistent(destination);
@@ -182,13 +180,13 @@ TEST(BufferOwnership, UdpPrefixAllocationFailureRollsBackBothContainersAndCanRet
 TEST(BufferOwnership, InitialPayloadTransfersOwnedBlocksWhenAllocationIsUnavailable) {
     auto owned_bytes = Pattern(9000);
     auto owned = Packet(owned_bytes);
-    const auto* original_buffer = *owned.begin();
+    const auto* original_buffer = owned.FrontBuffer();
     common::MultiBuffer transferred;
     EXPECT_TRUE(Inject(0, [&] {
         common::InitialPayload from_stream{std::move(owned)};
         transferred = std::move(from_stream).MoveToMultiBuffer();
         return from_stream.empty();
-    }) && owned.empty() && *transferred.begin() == original_buffer &&
+    }) && owned.empty() && transferred.FrontBuffer() == original_buffer &&
           Flatten(transferred) == owned_bytes);
 }
 
@@ -265,7 +263,7 @@ TEST(BufferOwnership, EmptyUdpMessageSurvivesTransfersAndChecksEveryTarget) {
     const common::TargetAddress second_target{"127.0.0.1", 4321};
     common::MultiBuffer packet;
     ASSERT_TRUE(common::SetUdpTarget(packet, first_target));
-    const auto* original = *packet.begin();
+    const auto* original = packet.FrontBuffer();
     common::InitialPayload initial(std::move(packet));
     EXPECT_FALSE(initial.empty());
     auto moved = std::move(initial).MoveToMultiBuffer();
@@ -279,8 +277,8 @@ TEST(BufferOwnership, EmptyUdpMessageSurvivesTransfersAndChecksEveryTarget) {
     }
     common::MultiBuffer destination;
     moved.MoveTo(destination);
-    ASSERT_EQ(destination.size(), 1u);
-    EXPECT_EQ(*destination.begin(), original);
+    ASSERT_FALSE(destination.empty());
+    EXPECT_EQ(destination.FrontBuffer(), original);
     EXPECT_TRUE(moved.empty());
 
     common::MultiBuffer later;

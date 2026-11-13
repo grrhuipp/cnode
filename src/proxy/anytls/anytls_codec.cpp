@@ -241,18 +241,7 @@ tl::expected<PeerSettings, common::ErrorCode> ParsePeerSettings(std::string_view
     return result;
 }
 
-std::string ClientSettings(const AnyTlsPaddingScheme& scheme) {
-    std::string settings;
-    const auto& digest = scheme.Digest();
-    settings.reserve(28 + digest.size());
-    settings.append("v=2\nclient=cnode\npadding-md5=");
-    settings.append(digest);
-    return settings;
-}
-
-
-tl::expected<void, common::ErrorCode> AppendFrameBytesTo(
-    std::vector<uint8_t>& out,
+tl::expected<void, common::ErrorCode> OpenPacketBuffer::AppendFrame(
     uint8_t cmd,
     uint32_t sid,
     std::span<const uint8_t> payload) {
@@ -260,11 +249,28 @@ tl::expected<void, common::ErrorCode> AppendFrameBytesTo(
         return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     const auto header = BuildFrameHeaderBytes(cmd, sid, payload.size());
-    const size_t offset = out.size();
-    out.resize(offset + header.size() + payload.size());
-    std::memcpy(out.data() + offset, header.data(), header.size());
+    const size_t total_frame = header.size() + payload.size();
+    if (!spilled_ && total_frame <= kInlineCapacity - inline_size_) {
+        std::memcpy(inline_.data() + inline_size_, header.data(), header.size());
+        if (!payload.empty()) {
+            std::memcpy(
+                inline_.data() + inline_size_ + header.size(),
+                payload.data(),
+                payload.size());
+        }
+        inline_size_ += total_frame;
+        return tl::expected<void, common::ErrorCode>{};
+    }
+    if (!spilled_) {
+        heap_.reserve(std::max(inline_size_ + total_frame, kInlineCapacity * 2));
+        heap_.assign(inline_.data(), inline_.data() + inline_size_);
+        spilled_ = true;
+    }
+    const size_t offset = heap_.size();
+    heap_.resize(offset + total_frame);
+    std::memcpy(heap_.data() + offset, header.data(), header.size());
     if (!payload.empty()) {
-        std::memcpy(out.data() + offset + kFrameHeaderSize, payload.data(), payload.size());
+        std::memcpy(heap_.data() + offset + header.size(), payload.data(), payload.size());
     }
     return tl::expected<void, common::ErrorCode>{};
 }
@@ -401,7 +407,7 @@ WriteSlicesWithPadding(transport::AsyncStream& stream,
 net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteAnyTlsPacketWithPadding(transport::AsyncStream& stream,
                              std::span<const PaddingRecord> record_rules,
-                             std::vector<uint8_t> packet) {
+                             std::span<const uint8_t> packet) {
     const net::const_buffer single(packet.data(), packet.size());
     co_return co_await WriteSlicesWithPadding(
         stream, record_rules, {&single, packet.empty() ? size_t{0} : size_t{1}});
@@ -601,6 +607,9 @@ std::optional<AnyTlsPaddingScheme> ParseAnyTlsPaddingScheme(std::string_view raw
         return std::nullopt;
     scheme.md5_ = common::EncodeHexLower(
         std::span<const uint8_t>(digest.data(), size));
+    scheme.client_settings_.reserve(28 + scheme.md5_.size());
+    scheme.client_settings_.append("v=2\nclient=cnode\npadding-md5=");
+    scheme.client_settings_.append(scheme.md5_);
     std::sort(scheme.records_.begin(), scheme.records_.end(),
         [](const AnyTlsPaddingScheme::PacketPadding& lhs, const AnyTlsPaddingScheme::PacketPadding& rhs) {
             return lhs.index < rhs.index;

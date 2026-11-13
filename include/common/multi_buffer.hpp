@@ -75,10 +75,6 @@ struct Buffer {
         mixed_udp_ = false;
         udp_untagged_ = false;
     }
-    void SetUDP(TargetAddress&& dest) {
-        udp_ = std::move(dest);
-        udp_untagged_ = false;
-    }
     void ClearUDP() noexcept {
         udp_.reset();
         mixed_udp_ = false;
@@ -149,14 +145,12 @@ public:
     }
 
     [[nodiscard]] bool empty() const noexcept { return buf_ == nullptr; }
-    [[nodiscard]] size_t size() const noexcept { return buf_ ? 1 : 0; }
     [[nodiscard]] size_t byte_size() const noexcept { return buf_ ? buf_->Len() : 0; }
     [[nodiscard]] bool HasUDP() const noexcept {
         return buf_ && (buf_->HasUDP() || buf_->mixed_udp_);
     }
-    [[nodiscard]] Buffer* back() noexcept { return buf_; }
-    [[nodiscard]] const Buffer* back() const noexcept { return buf_; }
-
+    [[nodiscard]] Buffer* FrontBuffer() noexcept { return buf_; }
+    [[nodiscard]] const Buffer* FrontBuffer() const noexcept { return buf_; }
     void push_back(BufferGuard buffer) {
         if (!buffer) {
             return;
@@ -252,6 +246,13 @@ public:
     }
     std::span<const uint8_t> FrontSpan() const&& = delete;
 
+    [[nodiscard]] std::span<uint8_t> MutableFrontSpan() & noexcept {
+        if (!buf_ || buf_->IsEmpty()) {
+            return {};
+        }
+        return buf_->Bytes();
+    }
+    std::span<uint8_t> MutableFrontSpan() && = delete;
     size_t CopyPrefixTo(std::span<uint8_t> dst) const noexcept {
         if (!buf_ || dst.empty()) return 0;
         const auto bytes = buf_->Bytes();
@@ -333,11 +334,6 @@ public:
             return false;
         }
     }
-
-    Buffer** begin() noexcept { return &buf_; }
-    Buffer** end() noexcept { return buf_ ? &buf_ + 1 : &buf_; }
-    Buffer* const* begin() const noexcept { return &buf_; }
-    Buffer* const* end() const noexcept { return buf_ ? &buf_ + 1 : &buf_; }
 
 private:
     void AppendBufferContents(const Buffer& src) {
@@ -421,19 +417,15 @@ private:
 };
 
 [[nodiscard]] inline bool SetUdpTarget(MultiBuffer& packet, const TargetAddress& target) {
-    try {
-        if (packet.empty()) {
-            BufferGuard buffer{Buffer::New()};
-            if (!buffer) return false;
-            buffer->SetUDP(target);
-            packet.push_back(std::move(buffer));
-            return true;
-        }
-        packet.back()->SetUDP(target);
+    if (packet.empty()) {
+        BufferGuard buffer{Buffer::New()};
+        if (!buffer) return false;
+        buffer->SetUDP(target);
+        packet.push_back(std::move(buffer));
         return true;
-    } catch (const std::bad_alloc&) {
-        return false;
     }
+    packet.FrontBuffer()->SetUDP(target);
+    return true;
 }
 
 enum class UdpDatagramStatus : uint8_t {
@@ -457,7 +449,7 @@ struct UdpDatagramInfo {
 [[nodiscard]] inline UdpDatagramInfo InspectUdpDatagram(
     const MultiBuffer& mb) noexcept {
     UdpDatagramInfo info;
-    const Buffer* buffer = mb.back();
+    const Buffer* buffer = mb.FrontBuffer();
     if (!buffer || (buffer->IsEmpty() && !buffer->HasUDP() && !buffer->mixed_udp_)) {
         return info;
     }
@@ -685,10 +677,6 @@ private:
     size_t bytes_ = 0;
     bool occupied_ = false;
 };
-
-[[nodiscard]] inline std::span<const uint8_t> ChunkBytes(const Buffer* buffer) noexcept {
-    return buffer ? buffer->Bytes() : std::span<const uint8_t>{};
-}
 
 [[nodiscard]] inline std::span<const uint8_t> ChunkBytes(const net::const_buffer& buffer) noexcept {
     if (!buffer.data() || buffer.size() == 0) {

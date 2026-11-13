@@ -99,7 +99,7 @@ net::awaitable<common::ErrorCode> Invoke(Stream& stream, int operation) {
         case 5: co_return Result(co_await proxy::WriteFrame(stream, 2, 1, bytes));
         case 6: {
             auto body = Payload(1);
-            co_return Result(co_await proxy::WriteFrame(stream, 2, 1, (*body.begin())->Bytes()));
+            co_return Result(co_await proxy::WriteFrame(stream, 2, 1, body.FrontSpan()));
         }
         case 7: co_return Result(co_await proxy::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1)));
         case 8: co_return Result(co_await proxy::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(9)));
@@ -107,17 +107,15 @@ net::awaitable<common::ErrorCode> Invoke(Stream& stream, int operation) {
         case 10: co_return Result(co_await proxy::WriteAnyTlsBuffersAsFramesWithPadding(stream, no_padding, 0, 2, 1, std::span(buffers).first(1)));
         case 11: co_return Result(co_await proxy::WriteAnyTlsBuffersAsFramesWithPadding(stream, no_padding, 0, 2, 1, buffers));
         case 12: co_return Result(co_await proxy::WriteAnyTlsBuffersAsFramesWithPadding(stream, padding, 1, 2, 1, buffers));
-        case 13: co_return Result(co_await proxy::WriteAnyTlsPacketWithPadding(stream, padding.RecordFor(1), std::vector<uint8_t>(bytes.begin(), bytes.end())));
-        case 14: co_return Result(co_await proxy::WriteAnyTlsPacketWithPadding(stream, no_padding.RecordFor(0), std::vector<uint8_t>(bytes.begin(), bytes.end())));
+        case 13: co_return Result(co_await proxy::WriteAnyTlsPacketWithPadding(stream, padding.RecordFor(1), bytes));
+        case 14: co_return Result(co_await proxy::WriteAnyTlsPacketWithPadding(stream, no_padding.RecordFor(0), bytes));
         case 16: {
             const auto large = *proxy::ParseAnyTlsPaddingScheme("stop=2\n1=65535-65535,65535-65535\n");
-            co_return Result(co_await proxy::WriteAnyTlsPacketWithPadding(stream, large.RecordFor(1),
-                std::vector<uint8_t>(bytes.begin(), bytes.end())));
+            co_return Result(co_await proxy::WriteAnyTlsPacketWithPadding(stream, large.RecordFor(1), bytes));
         }
         case 17: {
             const auto split = *proxy::ParseAnyTlsPaddingScheme("stop=2\n1=1-1,7-7,8-8\n");
-            co_return Result(co_await proxy::WriteAnyTlsPacketWithPadding(stream, split.RecordFor(1),
-                std::vector<uint8_t>(bytes.begin(), bytes.end())));
+            co_return Result(co_await proxy::WriteAnyTlsPacketWithPadding(stream, split.RecordFor(1), bytes));
         }
         default: co_return Result(co_await proxy::WriteAnyTlsMultiBufferAsFramesWithPadding(stream, no_padding, 0, 2, 1, Payload(9)));
     }

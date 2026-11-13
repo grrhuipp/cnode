@@ -40,10 +40,8 @@ public:
         co_return common::MultiBuffer{};
     }
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer input) override {
-        for (const auto* buffer : input) {
-            const auto data = buffer->Bytes();
-            bytes.insert(bytes.end(), data.begin(), data.end());
-        }
+        const auto data = input.FrontSpan();
+        bytes.insert(bytes.end(), data.begin(), data.end());
         co_return;
     }
     void ShutdownWrite() override {}

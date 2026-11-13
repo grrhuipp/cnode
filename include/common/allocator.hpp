@@ -159,21 +159,27 @@ public:
     void push_back(const T& value) { (void)emplace_back(value); }
     void push_back(T&& value) { (void)emplace_back(std::move(value)); }
 
-    template <typename... Args>
-    T& emplace_front(Args&&... args) {
+    void push_front(const T& value) {
         if (size_ == capacity_) {
-            return GrowEmplace(false, std::forward<Args>(args)...);
+            (void)GrowEmplace(false, value);
+            return;
         }
         const std::size_t next_head = (head_ + capacity_ - 1) & (capacity_ - 1);
-        T* ptr = data_ + next_head;
-        std::construct_at(ptr, std::forward<Args>(args)...);
+        std::construct_at(data_ + next_head, value);
         head_ = next_head;
         ++size_;
-        return *ptr;
     }
 
-    void push_front(const T& value) { (void)emplace_front(value); }
-    void push_front(T&& value) { (void)emplace_front(std::move(value)); }
+    void push_front(T&& value) {
+        if (size_ == capacity_) {
+            (void)GrowEmplace(false, std::move(value));
+            return;
+        }
+        const std::size_t next_head = (head_ + capacity_ - 1) & (capacity_ - 1);
+        std::construct_at(data_ + next_head, std::move(value));
+        head_ = next_head;
+        ++size_;
+    }
 
     void pop_front() noexcept {
         std::destroy_at(data_ + head_);

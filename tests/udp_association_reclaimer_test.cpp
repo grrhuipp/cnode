@@ -138,10 +138,8 @@ private:
 };
 
 bool IsDecodedPayload(const ::common::MultiBuffer& payload) {
-    if (payload.size() != 1) return false;
-    for (const auto* buffer : payload)
-        if (!buffer || buffer->Len() != 1 || buffer->Bytes()[0] != 0x42) return false;
-    return true;
+    const auto bytes = payload.FrontSpan();
+    return bytes.size() == 1 && bytes[0] == 0x42;
 }
 
 // The reader of a dispatched native request is the association's session.

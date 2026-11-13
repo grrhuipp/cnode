@@ -161,11 +161,7 @@ void BodyEncoder::Encode(const common::MultiBuffer& payload, common::MultiBuffer
     if (payload.byte_size() == 0) {
         return;
     }
-    for (const common::Buffer* buffer : payload) {
-        if (buffer) {
-            EncodeStream(buffer->Bytes(), out);
-        }
-    }
+    EncodeStream(payload.FrontSpan(), out);
 }
 
 void BodyEncoder::Encode(std::span<const net::const_buffer> payload, common::MultiBuffer& out) {

@@ -290,8 +290,6 @@ public:
     }
 
 private:
-    net::awaitable<void> WriteFramedMultiBuffer(common::MultiBuffer mb);
-    net::awaitable<void> WriteFramedBuffers(std::span<const net::const_buffer> buffers);
     transport::MultiBufferWriter& dst_;
     std::array<uint8_t, 16> user_uuid_{};
     bool write_process_ = true;

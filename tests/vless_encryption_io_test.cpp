@@ -28,26 +28,15 @@
 namespace {
 
 std::vector<uint8_t> Flatten(const common::MultiBuffer& payload) {
-    std::vector<uint8_t> out;
-    out.reserve(payload.byte_size());
-    for (const common::Buffer* buffer : payload) {
-        if (buffer && !buffer->IsEmpty()) {
-            const auto bytes = buffer->Bytes();
-            out.insert(out.end(), bytes.begin(), bytes.end());
-        }
-    }
-    return out;
+    const auto bytes = payload.FrontSpan();
+    return std::vector<uint8_t>(bytes.begin(), bytes.end());
 }
 
 class CaptureWriter final : public transport::MultiBufferWriter {
 public:
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer payload) override {
-        for (const common::Buffer* buffer : payload) {
-            if (buffer && !buffer->IsEmpty()) {
-                const auto data = buffer->Bytes();
-                bytes.insert(bytes.end(), data.begin(), data.end());
-            }
-        }
+        const auto data = payload.FrontSpan();
+        bytes.insert(bytes.end(), data.begin(), data.end());
         co_return;
     }
 

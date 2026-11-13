@@ -56,11 +56,8 @@ protected:
         ASSERT_EQ(decoded.session_owner.size, user.derived_key.size);
         EXPECT_TRUE(std::equal(user.derived_key.span().begin(), user.derived_key.span().end(),
                                decoded.session_owner.span().begin()));
-        std::vector<uint8_t> actual;
-        for (const auto* buffer : decoded.payload) {
-            const auto bytes = buffer->Bytes();
-            actual.insert(actual.end(), bytes.begin(), bytes.end());
-        }
+        const auto bytes = decoded.payload.FrontSpan();
+        std::vector<uint8_t> actual(bytes.begin(), bytes.end());
         EXPECT_EQ(actual, std::vector<uint8_t>(payload.begin(), payload.end()));
         const auto datagram = common::InspectUdpDatagram(decoded.payload);
         ASSERT_TRUE(datagram.Valid());

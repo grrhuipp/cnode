@@ -446,8 +446,6 @@ template <typename Reader>
 [[nodiscard]] net::awaitable<tl::expected<DecodedAddress, ErrorCode>> ReadAddress(
     Reader& reader, MultiBuffer& pending, AddressWireFormat format,
     size_t offset = 0, AddressDecodeOptions options = {}) {
-    std::array<uint8_t, kMaxEncodedAddressSize> bytes{};
-    size_t copied = 0;
     size_t needed = 1;
     for (;;) {
         const auto front = pending.FrontSpan();
@@ -459,48 +457,11 @@ template <typename Reader>
                     decoded.consumed,
                     std::move(decoded.forwarded)};
             }
-            if (decoded.status == AddressDecodeStatus::Invalid) {
+            if (decoded.status == AddressDecodeStatus::Invalid ||
+                decoded.required <= front.size() - offset) {
                 co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
             }
-            needed = std::min(decoded.required, bytes.size());
-        }
-        const size_t total = pending.byte_size();
-        const size_t available = total > offset
-            ? std::min(total - offset, bytes.size()) : 0;
-        while (available >= needed) {
-            const size_t target_copy = std::min(available, needed);
-            if (copied < target_copy) {
-                size_t skip = offset + copied;
-                for (const auto* buffer : pending) {
-                    if (!buffer || buffer->IsEmpty()) continue;
-                    const auto source = buffer->Bytes();
-                    if (skip >= source.size()) {
-                        skip -= source.size();
-                        continue;
-                    }
-                    const size_t count = std::min(source.size() - skip, target_copy - copied);
-                    if (count != 0)
-                        std::memcpy(bytes.data() + copied, source.data() + skip, count);
-                    copied += count;
-                    skip = 0;
-                    if (copied == target_copy) break;
-                }
-            }
-            auto decoded = DecodeAddress(
-                std::span<const uint8_t>(bytes.data(), copied), format, options);
-            if (decoded.status == AddressDecodeStatus::Complete) {
-                co_return DecodedAddress{
-                    std::move(decoded.target),
-                    decoded.consumed,
-                    std::move(decoded.forwarded)};
-            }
-            if (decoded.status == AddressDecodeStatus::Invalid) {
-                co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-            }
-            needed = std::min(decoded.required, bytes.size());
-            if (needed <= copied) {
-                co_return tl::unexpected(ErrorCode::PROTOCOL_INVALID_ADDRESS);
-            }
+            needed = std::min(decoded.required, kMaxEncodedAddressSize);
         }
         auto next = co_await reader.ReadMultiBuffer();
         if (next.byte_size() == 0) {

@@ -35,10 +35,10 @@ TEST(XhttpPacketQueue, OrdersPacketsAndIgnoresDuplicateSequences) {
     ASSERT_TRUE(queue.Push(0, MakePayload(0x11)));
     auto first = queue.Pop();
     auto second = queue.Pop();
-    ASSERT_EQ(first.size(), 1u);
-    ASSERT_EQ(second.size(), 1u);
-    EXPECT_EQ((*first.begin())->Bytes()[0], 0x11);
-    EXPECT_EQ((*second.begin())->Bytes()[0], 0x22);
+    ASSERT_EQ(first.byte_size(), 1u);
+    ASSERT_EQ(second.byte_size(), 1u);
+    EXPECT_EQ(first.FrontSpan()[0], 0x11);
+    EXPECT_EQ(second.FrontSpan()[0], 0x22);
     EXPECT_EQ(queue.QueuedPackets(), 0u);
     EXPECT_EQ(queue.QueuedBytes(), 0u);
 }

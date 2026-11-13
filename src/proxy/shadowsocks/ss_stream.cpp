@@ -3,13 +3,12 @@
 
 #include <openssl/rand.h>
 #include <asio/this_coro.hpp>
-#include <type_traits>
 
 namespace proxy {
 using common::ChunkBytes;
 
 net::awaitable<void> SsStreamWriter::WriteMultiBuffer(common::MultiBuffer mb) {
-    return WriteEncrypted(std::move(mb));
+    return WriteEncrypted({}, std::move(mb));
 }
 
 net::awaitable<void> SsStreamWriter::WriteBuffers(
@@ -69,14 +68,21 @@ void SsStreamWriter::Retire() {
     if (stream) stream->CloseAbortive();
 }
 
-template <typename BufferRange>
-net::awaitable<void> SsStreamWriter::WriteEncrypted(BufferRange buffers) {
+net::awaitable<void> SsStreamWriter::WriteEncrypted(
+    std::span<const net::const_buffer> buffers,
+    common::MultiBuffer owned) {
     if (!stream_) {
         throw IoSystemError(io_error::not_connected, "Shadowsocks response writer has no stream");
     }
     if (write_finished_) throw transport::WriteClosed();
     transport::AsyncStream& stream = *stream_;
 
+    net::const_buffer single_owned;
+    if (!owned.empty()) {
+        const auto span = owned.FrontSpan();
+        single_owned = net::buffer(span.data(), span.size());
+        buffers = {&single_owned, span.empty() ? size_t{0} : size_t{1}};
+    }
     bool has_data = false;
     for (const auto& buffer : buffers) {
         if (!ChunkBytes(buffer).empty()) {
@@ -113,9 +119,7 @@ net::awaitable<void> SsStreamWriter::WriteEncrypted(BufferRange buffers) {
                 out_mb,
                 &skip_first_bytes_);
         }
-        if constexpr (std::is_same_v<BufferRange, common::MultiBuffer>) {
-            buffers.clear();
-        }
+        owned.clear();
 
         write_started = true;
         co_await FlushPendingAndWrite(stream, std::move(out_mb));
@@ -184,8 +188,8 @@ bool SsStreamWriter::InitResponseCipher() {
     return true;
 }
 
-template <typename BufferRange>
-bool SsStreamWriter::AppendFirstResponsePayload(const BufferRange& buffers, size_t want) {
+bool SsStreamWriter::AppendFirstResponsePayload(
+    std::span<const net::const_buffer> buffers, size_t want) {
     if (want == 0) return true;
     common::BufferGuard payload_cipher{common::Buffer::New()};
     if (!payload_cipher ||
@@ -217,9 +221,8 @@ bool SsStreamWriter::AppendFirstResponsePayload(const BufferRange& buffers, size
     return true;
 }
 
-template <typename BufferRange>
 bool SsStreamWriter::InitResponseCipher2022(
-    const BufferRange& buffers) {
+    std::span<const net::const_buffer> buffers) {
     size_t want = 0;
     for (const auto& buffer : buffers) {
         want += ChunkBytes(buffer).size();

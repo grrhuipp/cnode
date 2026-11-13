@@ -85,10 +85,8 @@ net::awaitable<std::vector<uint8_t>> ReadToEof(transport::TcpStream& stream) {
         if (batch.empty()) break;
         if (batch.byte_size() > common::Buffer::kSize)
             throw std::runtime_error("TCP read exceeded one payload buffer");
-        for (const auto* buffer : batch) {
-            const auto bytes = buffer->Bytes();
-            result.insert(result.end(), bytes.begin(), bytes.end());
-        }
+        const auto bytes = batch.FrontSpan();
+        result.insert(result.end(), bytes.begin(), bytes.end());
     }
     co_return result;
 }

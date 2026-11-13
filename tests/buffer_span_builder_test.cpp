@@ -202,7 +202,7 @@ TEST(BufferSpanBuilder, ContiguousMultiBufferAlwaysBorrowsZeroCopy) {
     {
         const ContiguousView view(std::as_const(source));
         EXPECT_EQ(view.Bytes().data(), source.FrontSpan().data());
-        (*source.begin())->Bytes()[1] = expected[1] = 0x99;
+        source.MutableFrontSpan()[1] = expected[1] = 0x99;
         ASSERT_EQ(view.Bytes().size(), expected.size());
         EXPECT_TRUE(std::equal(view.Bytes().begin(), view.Bytes().end(), expected.begin()));
     }

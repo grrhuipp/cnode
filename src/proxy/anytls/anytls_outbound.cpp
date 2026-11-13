@@ -27,7 +27,6 @@
 #include <chrono>
 #include <exception>
 #include <limits>
-#include <format>
 #include <stdexcept>
 #include <memory>
 #include <optional>
@@ -35,7 +34,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <unordered_map>
 
 namespace {
 
@@ -296,7 +294,7 @@ struct AnyTlsOutboundHandler::ClientSession {
     }
 
     net::awaitable<tl::expected<void, common::ErrorCode>>
-    WriteOpenPacket(std::vector<uint8_t> packet) {
+    WriteOpenPacket(std::span<const uint8_t> packet) {
         auto write_lease = write_gate.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
@@ -307,7 +305,7 @@ struct AnyTlsOutboundHandler::ClientSession {
             auto scheme_snapshot = opening_scheme_ ? opening_scheme_ : scheme_;
             const uint32_t this_packet = NextPacketIndex();
             auto ok = co_await WriteAnyTlsPacketWithPadding(
-                *stream, scheme_snapshot->RecordFor(this_packet), std::move(packet));
+                *stream, scheme_snapshot->RecordFor(this_packet), packet);
             if (!ok) {
                 CloseAll(ok.error());
                 co_return tl::unexpected(ok.error());
@@ -891,7 +889,8 @@ DialPhysicalSession(
     co_return std::move(new_stream);
 }
 
-tl::expected<std::vector<uint8_t>, common::ErrorCode> BuildOpenPacket(
+tl::expected<void, common::ErrorCode> BuildOpenPacket(
+    OpenPacketBuffer& packet,
     uint32_t sid,
     bool is_udp,
     const common::TargetAddress& original_target,
@@ -910,12 +909,9 @@ tl::expected<std::vector<uint8_t>, common::ErrorCode> BuildOpenPacket(
         return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
     }
 
-    std::vector<uint8_t> packet;
-    packet.reserve((kFrameHeaderSize * 4) + 64 + target_size + 128);
     if (opening_scheme) {
-        const auto settings = ClientSettings(*opening_scheme);
-        auto settings_frame = AppendFrameBytesTo(
-            packet,
+        const std::string_view settings = opening_scheme->ClientSettings();
+        auto settings_frame = packet.AppendFrame(
             kCmdSettings,
             0,
             std::span<const uint8_t>(
@@ -924,9 +920,8 @@ tl::expected<std::vector<uint8_t>, common::ErrorCode> BuildOpenPacket(
             return tl::unexpected(settings_frame.error());
         }
     }
-    auto syn_frame = AppendFrameBytesTo(packet, kCmdSYN, sid, {});
-    auto target_frame = AppendFrameBytesTo(
-        packet,
+    auto syn_frame = packet.AppendFrame(kCmdSYN, sid, {});
+    auto target_frame = packet.AppendFrame(
         kCmdPSH,
         sid,
         std::span<const uint8_t>(target.data(), target_size));
@@ -938,8 +933,7 @@ tl::expected<std::vector<uint8_t>, common::ErrorCode> BuildOpenPacket(
         if (!request) {
             return tl::unexpected(request.error());
         }
-        auto request_frame = AppendFrameBytesTo(
-            packet,
+        auto request_frame = packet.AppendFrame(
             kCmdPSH,
             sid,
             request->span());
@@ -947,7 +941,7 @@ tl::expected<std::vector<uint8_t>, common::ErrorCode> BuildOpenPacket(
             return tl::unexpected(request_frame.error());
         }
     }
-    return packet;
+    return tl::expected<void, common::ErrorCode>{};
 }
 
 }  // namespace
@@ -1054,21 +1048,24 @@ net::awaitable<OutboundProcessResult> AnyTlsOutboundHandler::ProcessSession(
     auto open_logical_stream = [&]() -> net::awaitable<tl::expected<void, common::ErrorCode>> {
         stream.SetIdleTimeout(timeouts.HandshakeTimeout());
         auto deadline = stream.StartPhaseDeadline(timeouts.HandshakeTimeout());
-        auto open_packet = BuildOpenPacket(
-            sid, is_udp, original_target, dialer.ForwardedMetadata(ctx),
-            session->opening_scheme_.get());
-        if (!open_packet) {
-            stream.ClearPhaseDeadline();
-            session->CloseAll(open_packet.error());
-            co_return tl::unexpected(open_packet.error());
-        }
-        if (auto ok = co_await session->WriteOpenPacket(std::move(*open_packet)); !ok) {
-            const bool timed_out =
-                proxy::ConsumeOutboundHandshakeTimeout(stream, deadline);
-            const common::ErrorCode error = timed_out ? common::ErrorCode::TIMEOUT : ok.error();
-            stream.Cancel();
-            logical->Close(error);
-            co_return tl::unexpected(error);
+        {
+            OpenPacketBuffer open_packet;
+            auto built = BuildOpenPacket(
+                open_packet, sid, is_udp, original_target, dialer.ForwardedMetadata(ctx),
+                session->opening_scheme_.get());
+            if (!built) {
+                stream.ClearPhaseDeadline();
+                session->CloseAll(built.error());
+                co_return tl::unexpected(built.error());
+            }
+            if (auto ok = co_await session->WriteOpenPacket(open_packet.Span()); !ok) {
+                const bool timed_out =
+                    proxy::ConsumeOutboundHandshakeTimeout(stream, deadline);
+                const common::ErrorCode error = timed_out ? common::ErrorCode::TIMEOUT : ok.error();
+                stream.Cancel();
+                logical->Close(error);
+                co_return tl::unexpected(error);
+            }
         }
         if (sid >= 2 && session->session_version == SessionVersion::V2) {
             if (auto ok = co_await logical->WaitOpenResult(kSynAckTimeout, dialer.IoContext()); !ok) {

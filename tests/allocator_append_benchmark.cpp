@@ -128,7 +128,7 @@ TEST(MultiBufferBenchmark, TrackedTransfers) {
         common::CollectThreadHeap();
         {
             auto probe = TransferBuffers(blocks);
-            ASSERT_EQ(probe.size(), 1u);
+            ASSERT_FALSE(probe.empty());
             ASSERT_EQ(probe.byte_size(), blocks);
             auto buffer = probe.pop_front();
             ASSERT_TRUE(buffer);

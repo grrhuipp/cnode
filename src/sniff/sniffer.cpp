@@ -234,40 +234,22 @@ static constexpr std::array<std::string_view, 9> kHttpMethods{
         return std::nullopt;
     }
 
-    HostPortView parsed;
-    if (value.front() == '[') {
-        const size_t close = value.find(']');
-        if (close == std::string_view::npos || close == 1 ||
-            value.substr(1, close - 1).find(':') == std::string_view::npos) {
-            return std::nullopt;
-        }
-        parsed.host = value.substr(1, close - 1);
-        const auto address = common::ParseLiteral(parsed.host);
-        if (!address || !address->is_v6()) return std::nullopt;
-        const std::string_view suffix = value.substr(close + 1);
-        if (!suffix.empty() &&
-            (suffix.front() != ':' ||
-             !common::TargetAddress::ParsePort(suffix.substr(1), parsed.port))) {
-            return std::nullopt;
-        }
-        return parsed;
-    }
-
-    if (value.find('[') != std::string_view::npos ||
-        value.find(']') != std::string_view::npos) {
+    const auto split = common::SplitHostPort(value);
+    if (!split) {
         return std::nullopt;
     }
-    const size_t colon = value.find(':');
-    if (colon == std::string_view::npos) {
-        parsed.host = value;
-    } else {
-        if (value.rfind(':') != colon || colon == 0 ||
-            !common::TargetAddress::ParsePort(value.substr(colon + 1), parsed.port)) {
-            return std::nullopt;
-        }
-        parsed.host = value.substr(0, colon);
+    HostPortView parsed{.host = split->host};
+    if (split->has_port &&
+        !common::TargetAddress::ParsePort(split->port, parsed.port)) {
+        return std::nullopt;
     }
-    if (!common::IsValidDnsHostname(
+    if (split->bracketed) {
+        const auto address = common::ParseLiteral(parsed.host);
+        if (!address || !address->is_v6()) return std::nullopt;
+        return parsed;
+    }
+    if (parsed.host.find(':') != std::string_view::npos ||
+        !common::IsValidDnsHostname(
             parsed.host, common::TrailingDotPolicy::Allow)) {
         return std::nullopt;
     }

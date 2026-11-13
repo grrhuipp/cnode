@@ -26,16 +26,8 @@ namespace {
 
 
 std::vector<uint8_t> Flatten(const common::MultiBuffer& payload) {
-    std::vector<uint8_t> out;
-    out.reserve(payload.byte_size());
-    for (const common::Buffer* buffer : payload) {
-        if (!buffer || buffer->IsEmpty()) {
-            continue;
-        }
-        const auto bytes = buffer->Bytes();
-        out.insert(out.end(), bytes.begin(), bytes.end());
-    }
-    return out;
+    const auto bytes = payload.FrontSpan();
+    return std::vector<uint8_t>(bytes.begin(), bytes.end());
 }
 
 common::MultiBuffer MakePayload(const std::vector<uint8_t>& source,

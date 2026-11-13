@@ -29,6 +29,11 @@ public:
 
     [[nodiscard]] std::string_view Raw() const noexcept { return raw_; }
     [[nodiscard]] std::string_view Digest() const noexcept { return md5_; }
+    [[nodiscard]] std::string_view ClientSettings() const noexcept {
+        return client_settings_.empty()
+            ? std::string_view("v=2\nclient=cnode\npadding-md5=")
+            : std::string_view(client_settings_);
+    }
     [[nodiscard]] std::span<const PaddingRecord> RecordFor(uint32_t index) const noexcept;
     [[nodiscard]] uint16_t SampleAuthPaddingSize() const;
 
@@ -44,6 +49,7 @@ private:
 
     std::string raw_;
     std::string md5_;
+    std::string client_settings_;
     uint32_t stop_ = 0;
     AuthPadding auth_padding_;
     std::vector<PacketPadding> records_;
