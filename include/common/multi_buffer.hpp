@@ -335,6 +335,63 @@ public:
         }
     }
 
+    // Reserves at least `bytes` of writable tail space in the owned Buffer
+    // (compacting or growing geometrically when needed) without advancing end.
+    // Pair with CommitAppend(actual_bytes) once the caller has written payload.
+    [[nodiscard]] uint8_t* PrepareAppend(size_t bytes) {
+        const size_t current_len = byte_size();
+        if (bytes > std::numeric_limits<size_t>::max() - current_len) {
+            throw std::length_error("MultiBuffer byte size overflow");
+        }
+        if (!buf_) {
+            BufferGuard next{Buffer::New(std::max<size_t>(bytes, 1))};
+            if (!next) throw std::bad_alloc();
+            buf_ = next.release();
+            return buf_->Tail().data();
+        }
+        if (buf_->IsEmpty() && !buf_->HasUDP() && !buf_->mixed_udp_) {
+            buf_->Reset();
+        }
+        if (buf_->Available() >= bytes) {
+            return buf_->Tail().data();
+        }
+        if (buf_->start > 0 && current_len + bytes <= buf_->capacity) {
+            if (current_len > 0) {
+                std::memmove(buf_->data, buf_->Bytes().data(), current_len);
+            }
+            buf_->start = 0;
+            buf_->end = current_len;
+            return buf_->Tail().data();
+        }
+        const size_t min_needed = current_len + bytes;
+        const size_t doubled = buf_->capacity <= std::numeric_limits<size_t>::max() / 2
+            ? buf_->capacity * 2
+            : std::numeric_limits<size_t>::max();
+        BufferGuard grown{Buffer::New(std::max(min_needed, doubled))};
+        if (!grown) throw std::bad_alloc();
+        if (current_len > 0) {
+            std::memcpy(grown->data, buf_->Bytes().data(), current_len);
+            grown->Produce(current_len);
+        }
+        grown->udp_ = std::move(buf_->udp_);
+        grown->mixed_udp_ = buf_->mixed_udp_;
+        grown->udp_untagged_ = buf_->udp_untagged_;
+        Buffer::Free(buf_);
+        buf_ = grown.release();
+        return buf_->Tail().data();
+    }
+
+    void CommitAppend(size_t bytes) noexcept {
+        if (bytes == 0 || !buf_) return;
+        if (buf_->HasUDP() && !buf_->IsEmpty()) {
+            buf_->mixed_udp_ = true;
+        }
+        if (!buf_->HasUDP()) {
+            buf_->udp_untagged_ = true;
+        }
+        buf_->Produce(bytes);
+    }
+
 private:
     void AppendBufferContents(const Buffer& src) {
         AppendRawWithUdp(src.Bytes(), src.udp_, src.mixed_udp_, !src.HasUDP() && !src.IsEmpty());

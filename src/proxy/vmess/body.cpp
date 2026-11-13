@@ -176,16 +176,57 @@ void BodyEncoder::Encode(std::span<const net::const_buffer> payload, common::Mul
         EncodeChunk(packet.Bytes(), out);
         return;
     }
-    const bool has_data = std::any_of(payload.begin(), payload.end(),
-        [](const net::const_buffer& buffer) { return buffer.data() && buffer.size() > 0; });
-    if (!has_data) {
-        return;
-    }
+    size_t non_empty_buffers = 0;
+    size_t total_plain = 0;
+    std::span<const uint8_t> single_span;
     for (const net::const_buffer& buffer : payload) {
         if (buffer.data() && buffer.size() > 0) {
-            EncodeStream(std::span<const uint8_t>(
-                static_cast<const uint8_t*>(buffer.data()), buffer.size()), out);
+            ++non_empty_buffers;
+            if (buffer.size() > std::numeric_limits<size_t>::max() - total_plain) {
+                Abort();
+                throw std::length_error("VMess encoded stream overflow");
+            }
+            total_plain += buffer.size();
+            single_span = std::span<const uint8_t>(
+                static_cast<const uint8_t*>(buffer.data()), buffer.size());
         }
+    }
+    if (non_empty_buffers == 0) {
+        return;
+    }
+    if (non_empty_buffers == 1) {
+        EncodeStream(single_span, out);
+        return;
+    }
+    try {
+        size_t chunks = 0;
+        for (const net::const_buffer& buffer : payload) {
+            if (buffer.data() && buffer.size() > 0) {
+                chunks += 1 + (buffer.size() - 1) / stream_chunk_size_;
+            }
+        }
+        const size_t length_size = cipher_.LengthSize();
+        const size_t max_chunk_overhead = length_size + cipher_.Overhead() + kMaxPaddingSize;
+        if (chunks > (std::numeric_limits<size_t>::max() - total_plain) / max_chunk_overhead) {
+            throw std::length_error("VMess encoded stream overflow");
+        }
+        uint8_t* dst = out.PrepareAppend(total_plain + chunks * max_chunk_overhead);
+        size_t written = 0;
+        for (const net::const_buffer& buffer : payload) {
+            if (!buffer.data() || buffer.size() == 0) continue;
+            std::span<const uint8_t> bytes(
+                static_cast<const uint8_t*>(buffer.data()), buffer.size());
+            while (!bytes.empty()) {
+                const size_t chunk_size = std::min(bytes.size(), stream_chunk_size_);
+                written += SealChunkTo(
+                    bytes.first(chunk_size), length_size, cipher_.NextPaddingSize(), dst + written);
+                bytes = bytes.subspan(chunk_size);
+            }
+        }
+        out.CommitAppend(written);
+    } catch (...) {
+        Abort();
+        throw;
     }
 }
 
@@ -494,21 +535,69 @@ net::awaitable<common::MultiBuffer> BodyDecoder::Read(transport::MultiBufferRead
 
             const size_t data_len = chunk_len - padding_len_;
             if (body_read_ == 0 && read_buffer_.Empty()) {
-                if (auto sealed = pending_read_.TakeFrontIfLen(chunk_len)) {
+                if (pending_output_.empty()) {
+                    if (auto sealed = pending_read_.TakeFrontIfLen(chunk_len)) {
+                        const ssize_t opened = cipher_.Payload().Decrypt(
+                            sealed->Bytes().data(), data_len, sealed->Bytes().data());
+                        if (opened < 0) {
+                            Fail("VMess body authentication failed");
+                        }
+                        sealed->end = sealed->start + static_cast<uint32_t>(opened);
+                        FinishRecord();
+                        if (packet_mode) {
+                            co_return common::MultiBuffer{std::move(sealed)};
+                        }
+                        if (sealed->IsEmpty()) {
+                            break;
+                        }
+                        pending_output_.push_back(std::move(sealed));
+                        ++pending_output_chunks_;
+                        continue;
+                    }
+                }
+                if (pending_read_.byte_size() >= chunk_len) {
+                    const size_t max_plain = data_len - overhead;
+                    const auto cipher_slice = pending_read_.PrefixSpan(chunk_len);
+                    if (max_plain == 0) {
+                        uint8_t empty_plain = 0;
+                        if (cipher_.Payload().Decrypt(
+                                cipher_slice.data(), data_len, &empty_plain) < 0) {
+                            Fail("VMess body authentication failed");
+                        }
+                        pending_read_.DropPrefixBytes(chunk_len);
+                        FinishRecord();
+                        if (packet_mode) {
+                            co_return common::MultiBuffer{};
+                        }
+                        break;
+                    }
+                    if (packet_mode) {
+                        common::BufferGuard out_buf{common::Buffer::New(max_plain)};
+                        if (!out_buf) {
+                            throw std::bad_alloc();
+                        }
+                        const ssize_t opened = cipher_.Payload().Decrypt(
+                            cipher_slice.data(), data_len, out_buf->Tail().data());
+                        if (opened < 0) {
+                            Fail("VMess body authentication failed");
+                        }
+                        out_buf->Produce(static_cast<size_t>(opened));
+                        pending_read_.DropPrefixBytes(chunk_len);
+                        FinishRecord();
+                        co_return common::MultiBuffer{std::move(out_buf)};
+                    }
+                    uint8_t* dst = pending_output_.PrepareAppend(max_plain);
                     const ssize_t opened = cipher_.Payload().Decrypt(
-                        sealed->Bytes().data(), data_len, sealed->Bytes().data());
+                        cipher_slice.data(), data_len, dst);
                     if (opened < 0) {
                         Fail("VMess body authentication failed");
                     }
-                    sealed->end = sealed->start + static_cast<uint32_t>(opened);
+                    pending_read_.DropPrefixBytes(chunk_len);
                     FinishRecord();
-                    if (packet_mode) {
-                        co_return common::MultiBuffer{std::move(sealed)};
-                    }
-                    if (sealed->IsEmpty()) {
+                    if (opened == 0) {
                         break;
                     }
-                    pending_output_.push_back(std::move(sealed));
+                    pending_output_.CommitAppend(static_cast<size_t>(opened));
                     ++pending_output_chunks_;
                     continue;
                 }

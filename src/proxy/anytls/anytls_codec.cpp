@@ -570,36 +570,42 @@ DiscardFramePayload(transport::AsyncStream& stream, uint16_t length) {
 
 net::awaitable<tl::expected<common::MultiBuffer, common::ErrorCode>>
 ReadFramePayload(transport::AsyncStream& stream, uint16_t length) {
-    common::MultiBuffer mb;
-    size_t remaining = length;
-    while (remaining > 0) {
-        common::BufferGuard buffer{common::Buffer::New()};
-        if (!buffer) {
-            co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
-        }
-        const size_t want = std::min<size_t>(remaining, buffer->Available());
-        uint8_t* dst = buffer->Tail().data();
-        size_t filled = 0;
-        while (filled < want) {
-            size_t n = 0;
-            try {
-                n = co_await stream.AsyncRead(net::buffer(dst + filled, want - filled));
-            } catch (const IoSystemError& error) {
-                co_return tl::unexpected(
-                    proxy::ClassifyExactReadException(stream, error, true));
-            } catch (const std::bad_alloc&) {
+    if (length == 0) {
+        co_return common::MultiBuffer{};
+    }
+    common::BufferGuard buffer{common::Buffer::New()};
+    if (!buffer) {
+        co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
+    }
+    size_t filled = 0;
+    while (filled < length) {
+        if (filled == buffer->capacity) {
+            const size_t next_cap = std::min<size_t>(length, buffer->capacity * 2);
+            common::BufferGuard grown{common::Buffer::New(next_cap)};
+            if (!grown) {
                 co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
             }
-            if (n == 0) {
-                co_return tl::unexpected(proxy::ClassifyExactReadEof(stream, true));
-            }
-            filled += n;
+            std::memcpy(grown->data, buffer->data, filled);
+            grown->Produce(filled);
+            buffer = std::move(grown);
         }
-        buffer->Produce(static_cast<uint32_t>(want));
-        remaining -= want;
-        mb.push_back(std::move(buffer));
+        const size_t want = std::min<size_t>(length - filled, buffer->Available());
+        size_t n = 0;
+        try {
+            n = co_await stream.AsyncRead(net::buffer(buffer->Tail().data(), want));
+        } catch (const IoSystemError& error) {
+            co_return tl::unexpected(
+                proxy::ClassifyExactReadException(stream, error, true));
+        } catch (const std::bad_alloc&) {
+            co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
+        }
+        if (n == 0) {
+            co_return tl::unexpected(proxy::ClassifyExactReadEof(stream, true));
+        }
+        buffer->Produce(n);
+        filled += n;
     }
-    co_return mb;
+    co_return common::MultiBuffer{std::move(buffer)};
 }
 
 
