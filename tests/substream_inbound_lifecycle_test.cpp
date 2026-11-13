@@ -6,6 +6,7 @@
 #include "app/user_store.hpp"
 #include "app/stats.hpp"
 #include "app/group_coordinator.hpp"
+#include "common/user_online_tracker.hpp"
 #include "common/allocator.hpp"
 #include "common/mux_codec.hpp"
 #include "proxy/mux/mux_server.hpp"

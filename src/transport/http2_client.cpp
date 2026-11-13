@@ -401,12 +401,12 @@ private:
                 co_await FailConnection(H2Error::Protocol);
                 throw IoSystemError(io_error::connection_reset, "HTTP/2 PING on non-zero stream");
             }
-            if (frame.payload.size() != 8) {
+            if (frame.Payload().size() != 8) {
                 co_await FailConnection(H2Error::FrameSize);
                 throw IoSystemError(io_error::connection_reset, "invalid HTTP/2 PING frame size");
             }
             if ((frame.flags & kFlagAck) == 0) {
-                co_await WriteControlFrame(H2FrameType::PING, kFlagAck, 0, frame.payload);
+                co_await WriteControlFrame(H2FrameType::PING, kFlagAck, 0, frame.Payload());
             }
             break;
         case H2FrameType::WINDOW_UPDATE:
@@ -436,7 +436,7 @@ private:
                 co_await FailConnection(H2Error::Protocol);
                 throw IoSystemError(io_error::connection_reset, "HTTP/2 PRIORITY on stream 0");
             }
-            if (frame.payload.size() != 5) {
+            if (frame.Payload().size() != 5) {
                 co_await FailConnection(H2Error::FrameSize);
                 throw IoSystemError(io_error::connection_reset, "invalid HTTP/2 PRIORITY frame size");
             }
@@ -446,7 +446,7 @@ private:
                 co_await FailConnection(H2Error::Protocol);
                 throw IoSystemError(io_error::connection_reset, "HTTP/2 RST_STREAM on stream 0");
             }
-            if (frame.payload.size() != 4) {
+            if (frame.Payload().size() != 4) {
                 co_await FailConnection(H2Error::FrameSize);
                 throw IoSystemError(io_error::connection_reset, "invalid HTTP/2 RST_STREAM frame size");
             }
@@ -475,7 +475,8 @@ private:
             co_await FailConnection(H2Error::Protocol);
             throw IoSystemError(io_error::connection_reset, "invalid HTTP/2 SETTINGS frame");
         }
-        if (frame.payload.size() % 6 != 0 || (ack && !frame.payload.empty())) {
+        const auto payload = frame.Payload();
+        if (payload.size() % 6 != 0 || (ack && !payload.empty())) {
             co_await FailConnection(H2Error::FrameSize);
             throw IoSystemError(io_error::connection_reset, "invalid HTTP/2 SETTINGS frame");
         }
@@ -489,7 +490,7 @@ private:
             }
             co_return;
         }
-        const auto initial_window = PeerInitialWindowSetting(frame.payload);
+        const auto initial_window = PeerInitialWindowSetting(payload);
         if (!initial_window) {
             co_await FailConnection(H2Error::FlowControl);
             throw IoSystemError(io_error::connection_reset, "HTTP/2 initial window exceeds 2^31-1");
@@ -541,7 +542,8 @@ private:
             co_await FailConnection(H2Error::Protocol);
             throw IoSystemError(io_error::connection_reset, "HTTP/2 DATA on unexpected stream");
         }
-        const auto flow_len = static_cast<int64_t>(frame.payload.size());
+        const auto raw_payload = frame.Payload();
+        const auto flow_len = static_cast<int64_t>(raw_payload.size());
         if (flow_len > conn_recv_window_ || flow_len > stream_recv_window_) {
             co_await FailConnection(H2Error::FlowControl);
             throw IoSystemError(io_error::connection_reset, "HTTP/2 DATA exceeded the advertised receive window");
@@ -549,8 +551,7 @@ private:
         conn_recv_window_ -= flow_len;
         stream_recv_window_ -= flow_len;
         if ((frame.flags & kFlagPadded) != 0 &&
-            (frame.payload.empty() || frame.payload.front() >= frame.payload.size())) {
-            co_await FailConnection(H2Error::Protocol);
+            (raw_payload.empty() || raw_payload.front() >= raw_payload.size())) {
             throw IoSystemError(io_error::connection_reset, "invalid HTTP/2 DATA padding");
         }
         if (!response_headers_received_) {
@@ -571,7 +572,7 @@ private:
             }
             co_return;
         }
-        if (frame.payload.empty()) {
+        if (raw_payload.empty()) {
             co_return;
         }
         const auto data = H2DataPayload(frame);
@@ -592,13 +593,22 @@ private:
             }
             co_return;
         }
-        const size_t offset = static_cast<size_t>(data.data() - frame.payload.data());
-        received_.push_back(QueuedDataFrame{
-            .payload = std::move(frame.payload),
-            .offset = offset,
-            .end = offset + data.size(),
-            .flow_bytes = static_cast<uint32_t>(flow_len),
-        });
+        if (!frame.heap_payload.empty()) {
+            const size_t offset = static_cast<size_t>(data.data() - frame.heap_payload.data());
+            received_.push_back(QueuedDataFrame{
+                .payload = std::move(frame.heap_payload),
+                .offset = offset,
+                .end = offset + data.size(),
+                .flow_bytes = static_cast<uint32_t>(flow_len),
+            });
+        } else {
+            received_.push_back(QueuedDataFrame{
+                .payload = std::vector<uint8_t>(data.begin(), data.end()),
+                .offset = 0,
+                .end = data.size(),
+                .flow_bytes = static_cast<uint32_t>(flow_len),
+            });
+        }
     }
 
     // Reports a connection error to the peer (5.4.1); the caller then fails
@@ -837,7 +847,7 @@ net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
     co_return co_await OpenHttp2ClientStream(
         std::move(stream),
         cfg.initial_window_size,
-        headers,
+        headers.Span(),
         H2PayloadCodec::GrpcHunk,
         false,
         "gRPC",
@@ -857,7 +867,7 @@ net::awaitable<TransportBuildResult> DoHttp2ClientHandshake(
     co_return co_await OpenHttp2ClientStream(
         std::move(stream),
         req.initial_window_size,
-        headers,
+        headers.Span(),
         H2PayloadCodec::RawData,
         end_stream,
         "HTTP/2",

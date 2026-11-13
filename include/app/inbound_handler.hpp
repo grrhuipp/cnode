@@ -1,17 +1,12 @@
 #pragma once
 
-#include "common/user_online_tracker.hpp"
 #include "common/hash.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/user_store.hpp"
-#include "app/request_load.hpp"
-#include "app/stats.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
-#include "transport/async_stream.hpp"
 #include "transport/proxy_protocol.hpp"
-#include "transport/quic_listener.hpp"
 #include "transport/stream_settings.hpp"
 #include "transport/transport_security.hpp"
 #include <algorithm>
@@ -34,15 +29,20 @@ struct InboundUserSpec;
 namespace common {
 
 struct OnlineDevice;
+class UserOnlineTracker;
 
 }  // namespace common
 namespace transport {
 
 class InboundTransportStreamHandler;
+class AsyncStream;
+class QuicListener;
 
 }  // namespace transport
 
 namespace app {
+class RequestLoadState;
+struct StatsShard;
 
 class DNS;
 

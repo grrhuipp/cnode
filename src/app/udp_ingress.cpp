@@ -1,6 +1,7 @@
 #include "app/udp_ingress.hpp"
 #include "app/relay.hpp"
 #include "app/inbound_handler.hpp"
+#include "app/request_load.hpp"
 #include "common/awaitable_task_group.hpp"
 #include "proxy/inbound_admission.hpp"
 

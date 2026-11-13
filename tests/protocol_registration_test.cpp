@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include "app/inbound_handler.hpp"
+#include "common/user_online_tracker.hpp"
+#include "transport/quic_listener.hpp"
 #include "app/relay.hpp"
 #include "app/stats.hpp"
 #include "app/user_store.hpp"

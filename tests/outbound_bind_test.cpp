@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "transport/outbound_bind.hpp"
 #include "infra/config.hpp"
+#include "infra/json.hpp"
 #include <asio/ip/network_v4.hpp>
 #include <asio/ip/network_v6.hpp>
 #include <array>

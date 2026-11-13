@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "infra/config.hpp"
+#include "infra/json.hpp"
 #include "common/constants.hpp"
 #include <vector>
 

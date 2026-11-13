@@ -2,6 +2,8 @@
 #include "common/allocator.hpp"
 #include "transport/http_headers.hpp"
 #include <array>
+#include <algorithm>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <span>
@@ -12,11 +14,97 @@
 #include <vector>
 
 namespace transport {
-void AppendHpackInt(std::vector<uint8_t>&, uint8_t, uint8_t, uint32_t);
-void AppendHpackString(std::vector<uint8_t>&, std::string_view);
-void AppendHpackIndexed(std::vector<uint8_t>&, uint32_t);
-void AppendHpackLiteralIndexedName(std::vector<uint8_t>&, uint32_t, std::string_view);
-void AppendHpackLiteralNewName(std::vector<uint8_t>&, std::string_view, std::string_view);
+class HpackBuffer final {
+public:
+    static constexpr size_t kInlineCapacity = 512;
+
+    void reserve(size_t n) {
+        if (n > kInlineCapacity) spill(n);
+    }
+
+    void push_back(uint8_t byte) {
+        if (!spilled_ && inline_size_ < kInlineCapacity) {
+            inline_[inline_size_++] = byte;
+            return;
+        }
+        if (!spilled_) spill(kInlineCapacity * 2);
+        heap_.push_back(byte);
+    }
+
+    void append(std::string_view value) {
+        if (value.empty()) return;
+        if (!spilled_ && value.size() <= kInlineCapacity - inline_size_) {
+            std::memcpy(inline_.data() + inline_size_, value.data(), value.size());
+            inline_size_ += value.size();
+            return;
+        }
+        if (!spilled_) spill(std::max(kInlineCapacity * 2, inline_size_ + value.size()));
+        const auto* bytes = reinterpret_cast<const uint8_t*>(value.data());
+        heap_.insert(heap_.end(), bytes, bytes + value.size());
+    }
+
+    [[nodiscard]] std::span<const uint8_t> Span() const noexcept {
+        return spilled_ ? std::span<const uint8_t>(heap_)
+                        : std::span<const uint8_t>(inline_.data(), inline_size_);
+    }
+
+private:
+    void spill(size_t cap) {
+        heap_.reserve(cap);
+        heap_.assign(inline_.data(), inline_.data() + inline_size_);
+        spilled_ = true;
+    }
+
+    std::array<uint8_t, kInlineCapacity> inline_{};
+    size_t inline_size_ = 0;
+    std::vector<uint8_t> heap_;
+    bool spilled_ = false;
+};
+
+template <typename Out>
+inline void AppendHpackInt(Out& out, uint8_t prefix_bits, uint8_t first_mask, uint32_t value) {
+    const uint8_t max_prefix = static_cast<uint8_t>((1u << prefix_bits) - 1u);
+    if (value < max_prefix) {
+        out.push_back(static_cast<uint8_t>(first_mask | value));
+        return;
+    }
+    out.push_back(static_cast<uint8_t>(first_mask | max_prefix));
+    value -= max_prefix;
+    while (value >= 128) {
+        out.push_back(static_cast<uint8_t>((value & 0x7f) | 0x80));
+        value >>= 7;
+    }
+    out.push_back(static_cast<uint8_t>(value));
+}
+
+template <typename Out>
+inline void AppendHpackString(Out& out, std::string_view value) {
+    AppendHpackInt(out, 7, 0, static_cast<uint32_t>(value.size()));
+    if constexpr (requires { out.append(value); }) {
+        out.append(value);
+    } else {
+        out.insert(out.end(), value.begin(), value.end());
+    }
+}
+
+template <typename Out>
+inline void AppendHpackIndexed(Out& out, uint32_t index) {
+    AppendHpackInt(out, 7, 0x80, index);
+}
+
+template <typename Out>
+inline void AppendHpackLiteralIndexedName(Out& out, uint32_t name_index, std::string_view value) {
+    AppendHpackInt(out, 4, 0, name_index);
+    AppendHpackString(out, value);
+}
+
+template <typename Out>
+inline void AppendHpackLiteralNewName(Out& out, std::string_view name, std::string_view value) {
+    out.push_back(0);
+    AppendHpackInt(out, 7, 0, static_cast<uint32_t>(name.size()));
+    for (const unsigned char ch : name) out.push_back(common::ToLowerAscii(ch));
+    AppendHpackString(out, value);
+}
 inline constexpr uint32_t kHpackStaticAuthority = 1;
 inline constexpr uint32_t kHpackStaticMethodGet = 2;
 inline constexpr uint32_t kHpackStaticMethodPost = 3;

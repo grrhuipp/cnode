@@ -35,22 +35,36 @@ net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream) {
     }
     if (length > 0) {
         try {
-            size_t filled = 0;
-            while (filled < length) {
-                if (filled == frame.payload.size()) {
-                    const size_t next_size = std::min<size_t>(
-                        length,
-                        std::max<size_t>(1024, frame.payload.size() * 2));
-                    frame.payload.resize(next_size);
+            if (length <= H2Frame::kInlinePayloadCapacity) {
+                size_t filled = 0;
+                while (filled < length) {
+                    const size_t n = co_await stream.AsyncRead(
+                        net::buffer(frame.inline_payload.data() + filled, length - filled));
+                    if (n == 0) {
+                        throw IoSystemError(
+                            io_error::connection_reset, "truncated HTTP/2 frame payload");
+                    }
+                    filled += n;
                 }
-                const size_t n = co_await stream.AsyncRead(
-                    net::buffer(frame.payload.data() + filled,
-                                frame.payload.size() - filled));
-                if (n == 0) {
-                    throw IoSystemError(
-                        io_error::connection_reset, "truncated HTTP/2 frame payload");
+                frame.inline_size = static_cast<uint8_t>(length);
+            } else {
+                size_t filled = 0;
+                while (filled < length) {
+                    if (filled == frame.heap_payload.size()) {
+                        const size_t next_size = std::min<size_t>(
+                            length,
+                            std::max<size_t>(1024, frame.heap_payload.size() * 2));
+                        frame.heap_payload.resize(next_size);
+                    }
+                    const size_t n = co_await stream.AsyncRead(
+                        net::buffer(frame.heap_payload.data() + filled,
+                                    frame.heap_payload.size() - filled));
+                    if (n == 0) {
+                        throw IoSystemError(
+                            io_error::connection_reset, "truncated HTTP/2 frame payload");
+                    }
+                    filled += n;
                 }
-                filled += n;
             }
         } catch (const IoSystemError& error) {
             if (error.code() == io_error::operation_aborted) {
@@ -117,7 +131,7 @@ net::awaitable<void> WriteH2Frame(
             ? std::span<const net::const_buffer>{}
             : std::span<const net::const_buffer>(&buffer, 1));
 }
-[[nodiscard]] std::vector<uint8_t> EncodeHttpRequestHeaders(
+[[nodiscard]] HpackBuffer EncodeHttpRequestHeaders(
     std::string_view authority,
     bool tls,
     const HttpClientRequestView& req) {
@@ -128,7 +142,7 @@ net::awaitable<void> WriteH2Frame(
         (req.headers ? req.headers->size() : 0) +
         (!req.default_content_type.empty() ? 1 : 0) +
         (!req.default_referer.empty() ? 1 : 0);
-    std::vector<uint8_t> h;
+    HpackBuffer h;
     h.reserve(128 + authority.size() + req_path.size() + method.size() +
               header_count * 32);
 
@@ -201,8 +215,9 @@ net::awaitable<void> WriteH2Frame(
 // WINDOW_UPDATE increment (6.9): FRAME_SIZE_ERROR unless the payload is four
 // octets; a zero increment is a PROTOCOL_ERROR.
 [[nodiscard]] tl::expected<uint32_t, H2Error> WindowUpdateIncrement(const H2Frame& frame) {
-    if (frame.payload.size() != 4) return tl::unexpected(H2Error::FrameSize);
-    const uint32_t increment = common::LoadU32BE(frame.payload.data()) & 0x7fff'ffffu;
+    const auto payload = frame.Payload();
+    if (payload.size() != 4) return tl::unexpected(H2Error::FrameSize);
+    const uint32_t increment = common::LoadU32BE(payload.data()) & 0x7fff'ffffu;
     if (increment == 0) return tl::unexpected(H2Error::Protocol);
     return increment;
 }
@@ -244,31 +259,33 @@ net::awaitable<void> SendWindowUpdates(AsyncStream& stream,
 
 // DATA payload without padding; empty when the padding length is invalid.
 [[nodiscard]] std::span<const uint8_t> H2DataPayload(const H2Frame& frame) {
-    if (frame.payload.empty()) {
+    const auto payload = frame.Payload();
+    if (payload.empty()) {
         return {};
     }
     size_t start = 0;
-    size_t end = frame.payload.size();
+    size_t end = payload.size();
     if ((frame.flags & kFlagPadded) != 0) {
-        const size_t pad_len = frame.payload[0];
+        const size_t pad_len = payload[0];
         start = 1;
         if (pad_len > end - start) {
             return {};
         }
         end -= pad_len;
     }
-    return std::span<const uint8_t>(frame.payload.data() + start, end - start);
+    return std::span<const uint8_t>(payload.data() + start, end - start);
 }
 
 [[nodiscard]] std::optional<std::span<const uint8_t>> H2HeaderBlockFragment(
     const H2Frame& frame) {
+    const auto payload = frame.Payload();
     size_t start = 0;
-    size_t end = frame.payload.size();
+    size_t end = payload.size();
     if ((frame.flags & kFlagPadded) != 0) {
-        if (frame.payload.empty()) {
+        if (payload.empty()) {
             return std::nullopt;
         }
-        const size_t pad_len = frame.payload[0];
+        const size_t pad_len = payload[0];
         start = 1;
         if (pad_len > end - start) {
             return std::nullopt;
@@ -281,7 +298,7 @@ net::awaitable<void> SendWindowUpdates(AsyncStream& stream,
         }
         start += 5;
     }
-    return std::span<const uint8_t>(frame.payload.data() + start, end - start);
+    return std::span<const uint8_t>(payload.data() + start, end - start);
 }
 [[nodiscard]] net::awaitable<tl::expected<std::optional<H2RequestHeaders>, H2Error>>
 ParseH2RequestHeaders(

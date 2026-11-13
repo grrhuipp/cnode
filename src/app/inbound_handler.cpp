@@ -1,5 +1,7 @@
 #include "app/inbound_handler.hpp"
 #include "app/rate_limiter.hpp"
+#include "app/request_load.hpp"
+#include "transport/quic_listener.hpp"
 #include "app/stats.hpp"
 #include "common/allocator.hpp"
 #include "common/ip_address.hpp"

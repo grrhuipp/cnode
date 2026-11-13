@@ -65,10 +65,20 @@ enum class H2PayloadCodec : uint8_t {
 };
 
 struct H2Frame {
+    static constexpr size_t kInlinePayloadCapacity = 64;
+
     H2FrameType type = H2FrameType::DATA;
     uint8_t flags = 0;
+    uint8_t inline_size = 0;
     uint32_t stream_id = 0;
-    std::vector<uint8_t> payload;
+    std::array<uint8_t, kInlinePayloadCapacity> inline_payload{};
+    std::vector<uint8_t> heap_payload;
+
+    [[nodiscard]] std::span<const uint8_t> Payload() const noexcept {
+        return heap_payload.empty()
+            ? std::span<const uint8_t>(inline_payload.data(), inline_size)
+            : std::span<const uint8_t>(heap_payload);
+    }
 };
 
 net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream);
@@ -181,12 +191,12 @@ public:
 private:
     int64_t size_ = kDefault;
 };
-[[nodiscard]] inline std::vector<uint8_t> EncodeGrpcRequestHeaders(
+[[nodiscard]] inline HpackBuffer EncodeGrpcRequestHeaders(
     std::string_view authority,
     std::string_view path,
     bool tls,
     std::string_view user_agent) {
-    std::vector<uint8_t> h;
+    HpackBuffer h;
     h.reserve(128 + authority.size() + path.size() + user_agent.size());
     AppendHpackIndexed(h, kHpackStaticMethodPost);
     AppendHpackIndexed(h, tls ? kHpackStaticSchemeHttps : kHpackStaticSchemeHttp);
@@ -267,10 +277,11 @@ net::awaitable<tl::expected<void, H2Error>> ReadH2HeaderFields(
             continuation->stream_id != stream_id) {
             co_return tl::unexpected(H2Error::Protocol);
         }
-        if (continuation->payload.size() > kHttp2MaxHeaderBlockSize - block.size()) {
+        const auto cont_payload = continuation->Payload();
+        if (cont_payload.size() > kHttp2MaxHeaderBlockSize - block.size()) {
             co_return tl::unexpected(H2Error::ExcessiveLoad);
         }
-        block.insert(block.end(), continuation->payload.begin(), continuation->payload.end());
+        block.insert(block.end(), cont_payload.begin(), cont_payload.end());
         if ((continuation->flags & kFlagEndHeaders) != 0) {
             break;
         }
@@ -329,7 +340,7 @@ inline void EncodeH2FrameHeader(uint8_t* out,
 void EncodeWindowUpdateFrame(uint8_t* out, uint32_t stream_id, uint32_t increment) noexcept;
 net::awaitable<void> SendWindowUpdates(AsyncStream&, uint32_t, uint32_t, uint32_t);
 struct HttpClientRequestView;
-std::vector<uint8_t> EncodeHttpRequestHeaders(
+HpackBuffer EncodeHttpRequestHeaders(
     std::string_view, bool, const HttpClientRequestView&);
 std::vector<uint8_t> EncodeHttpResponseHeaders(
     const HttpHeaders& headers, std::string_view default_content_type = {});

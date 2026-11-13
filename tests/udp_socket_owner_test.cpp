@@ -7,6 +7,7 @@
 #include "worker_coordinator_fixture.hpp"
 #include "app/relay.hpp"
 #include "app/inbound_handler.hpp"
+#include "app/request_load.hpp"
 #include "app/stats.hpp"
 #include "common/user_online_tracker.hpp"
 #include "routing/dispatcher.hpp"

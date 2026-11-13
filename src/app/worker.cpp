@@ -2,6 +2,8 @@
 #include "app/group_coordinator.hpp"
 #include "app/prepared_inbound.hpp"
 #include "app/rate_limiter.hpp"
+#include "app/request_load.hpp"
+#include "transport/quic_listener.hpp"
 #include "common/awaitable_task_group.hpp"
 #include "app/stats.hpp"
 #include "common/allocator.hpp"

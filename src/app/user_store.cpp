@@ -325,7 +325,11 @@ UserStore::PublishedSnapshot UserStore::PrepareUsers(
             if (next_revision == std::numeric_limits<uint64_t>::max()) {
                 throw std::overflow_error("credential revision exhausted");
             }
-            revisions.insert_or_assign(std::string(tag), next_revision++);
+            if (auto it = revisions.find(tag); it != revisions.end()) {
+                it->second = next_revision++;
+            } else {
+                revisions.emplace(std::string(tag), next_revision++);
+            }
         }
     }
     return next;

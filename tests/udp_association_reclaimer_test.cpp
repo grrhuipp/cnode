@@ -7,6 +7,7 @@
 #include "app/relay.hpp"
 
 #include "app/inbound_handler.hpp"
+#include "app/request_load.hpp"
 #include "app/stats.hpp"
 #include "common/user_online_tracker.hpp"
 #include "common/session.hpp"

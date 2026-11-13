@@ -360,24 +360,22 @@ namespace {
 
 constexpr size_t kInlineWsClientFrameCapacity = 512;
 
-net::awaitable<void> WriteInlineMaskedWsFrame(
-    AsyncStream& inner,
+size_t EncodeInlineMaskedWsFrame(
+    uint8_t* dst,
     std::span<const uint8_t> header_bytes,
     std::span<const net::const_buffer> buffers,
-    const uint8_t (&mask)[4]) {
-    std::array<uint8_t, kInlineWsClientFrameCapacity> inline_frame{};
-    std::memcpy(inline_frame.data(), header_bytes.data(), header_bytes.size());
+    const uint8_t (&mask)[4]) noexcept {
+    std::memcpy(dst, header_bytes.data(), header_bytes.size());
     size_t write_pos = header_bytes.size();
     size_t offset = 0;
     for (const auto& buffer : buffers) {
         if (buffer.size() == 0) continue;
-        std::memcpy(inline_frame.data() + write_pos, buffer.data(), buffer.size());
-        MaskData(inline_frame.data() + write_pos, buffer.size(), mask, offset);
+        std::memcpy(dst + write_pos, buffer.data(), buffer.size());
+        MaskData(dst + write_pos, buffer.size(), mask, offset);
         write_pos += buffer.size();
         offset += buffer.size();
     }
-    const net::const_buffer output(inline_frame.data(), write_pos);
-    co_await inner.WriteBuffers({&output, 1});
+    return write_pos;
 }
 
 }  // namespace
@@ -403,11 +401,17 @@ net::awaitable<void> BaseWsStream::WriteDataFrame(
             co_await inner_->WriteBuffers(output.Span());
         } else {
             if (header.size + size <= kInlineWsClientFrameCapacity) {
-                co_await WriteInlineMaskedWsFrame(
-                    *inner_,
+                if (!client_inline_frame_) {
+                    client_inline_frame_ =
+                        std::make_unique_for_overwrite<std::array<uint8_t, kInlineWsClientFrameCapacity>>();
+                }
+                const size_t frame_len = EncodeInlineMaskedWsFrame(
+                    client_inline_frame_->data(),
                     std::span<const uint8_t>(header.bytes.data(), header.size),
                     buffers,
                     mask);
+                const net::const_buffer output(client_inline_frame_->data(), frame_len);
+                co_await inner_->WriteBuffers({&output, 1});
             } else {
                 common::BufferGuard scratch{common::Buffer::New()};
                 if (!scratch) throw std::bad_alloc();

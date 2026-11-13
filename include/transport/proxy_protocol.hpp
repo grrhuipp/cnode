@@ -62,9 +62,6 @@ struct ProxyProtocolReadResult {
         return status == ProxyProtocolReadStatus::Ok;
     }
 
-    [[nodiscard]] bool timed_out() const noexcept {
-        return status == ProxyProtocolReadStatus::TimedOut;
-    }
 };
 
 // Auto-detects v1 (text) and v2 (binary). Bytes that cannot start a PROXY

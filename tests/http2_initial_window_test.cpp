@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "infra/config.hpp"
+#include "infra/json.hpp"
 #include "transport/http2_session.hpp"
 #include <string>
 #include <string_view>

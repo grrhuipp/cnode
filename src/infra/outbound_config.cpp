@@ -1,4 +1,5 @@
 #include "infra/config.hpp"
+#include "infra/json.hpp"
 #include "common/scoped_cleanse.hpp"
 #include "proxy/anytls/anytls_codec.hpp"
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"

@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "app/inbound_handler.hpp"
+#include "app/request_load.hpp"
 TEST(WorkerRequestLoad, NestedDispatchesReleasePressureWhenTheyComplete) {
     ::app::RequestLoadState load(3, 7);
     {

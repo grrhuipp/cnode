@@ -42,18 +42,19 @@ public:
     }
 };
 
-TEST(VmessCipher, DigestAllocationFailureRejectsMaskAndCipherConstruction) {
-    bool mask_failed = false, key_failed = false;
+TEST(VmessCipher, DigestAllocationFailureRejectsMaskConstruction) {
+    bool mask_failed = false;
     {
         CryptoFaultReset reset;
         fail_digest_allocation = true;
         try { ShakeMask mask(iv.data()); }
         catch (const std::bad_alloc&) { mask_failed = true; }
-        try { VMessCipher cipher(VmessSecurity::CHACHA20_POLY1305, key.data(), iv.data()); }
-        catch (const std::bad_alloc&) { key_failed = true; }
+        // MD5Hash uses stack-only one-shot BoringSSL MD5 without EVP_MD_CTX allocation.
+        const auto digest = MD5Hash(key.data(), key.size());
+        EXPECT_EQ(digest[0], 0x4au);
+        EXPECT_NO_THROW((void)VMessCipher(VmessSecurity::CHACHA20_POLY1305, key.data(), iv.data()));
     }
     EXPECT_TRUE(mask_failed);
-    EXPECT_TRUE(key_failed);
 }
 
 TEST(VmessCipher, AeadAllocationFailureRejectsConstruction) {

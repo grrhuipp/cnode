@@ -5,7 +5,6 @@
 #include "common/constants.hpp"
 #include "routing/dispatcher.hpp"
 #include "routing/router.hpp"
-#include "infra/json.hpp"
 #include "infra/log.hpp"
 #include "infra/outbound_types.hpp"
 #include "transport/inbound_listen.hpp"
@@ -24,6 +23,8 @@
 // 资源限制配置
 // ============================================================================
 namespace infra {
+
+class object;
 
 struct AuthFailureLimitConfig {
     bool enabled = false;

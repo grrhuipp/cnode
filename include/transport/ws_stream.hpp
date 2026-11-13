@@ -195,6 +195,7 @@ private:
     bool write_closed_ = false;
     bool closed_ = false;
     WriteGate write_gate_;
+    std::unique_ptr<std::array<uint8_t, 512>> client_inline_frame_;
 };
 
 }  // namespace transport

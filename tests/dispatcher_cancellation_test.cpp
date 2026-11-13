@@ -4,6 +4,7 @@
 #include "app/dns.hpp"
 #include "app/relay.hpp"
 #include "app/inbound_handler.hpp"
+#include "app/request_load.hpp"
 #include "common/allocator.hpp"
 #include "common/rule.hpp"
 #include "app/outbound_handler.hpp"

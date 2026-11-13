@@ -9,6 +9,7 @@
 #include "app/user_store.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/group_coordinator.hpp"
+#include "app/request_load.hpp"
 #include "app/stats.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/byte_reader.hpp"

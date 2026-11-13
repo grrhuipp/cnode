@@ -41,8 +41,8 @@ public:
     // Queues a received DATA payload. False asks the session to reset the
     // stream: the per-stream or XHTTP session budget is exhausted. `session`
     // is the demultiplexer delivering the frame.
-    bool EnqueueData(Http2ServerSession& session, std::vector<uint8_t> frame_payload,
-                     size_t offset, size_t size);
+    bool EnqueueData(Http2ServerSession& session, H2Frame& frame,
+                     std::span<const uint8_t> data);
     void CloseInput();
     void CancelFromSession(IoErrorCode error = io_error::operation_aborted) noexcept;
     [[nodiscard]] bool InputEnded() const noexcept { return input_done_ && !cancelled_; }

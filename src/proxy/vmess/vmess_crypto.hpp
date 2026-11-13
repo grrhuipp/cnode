@@ -92,8 +92,8 @@ struct VmessUserAccount {
 // 哈希函数
 // ============================================================================
 
-std::array<uint8_t, 16> MD5Hash(const uint8_t* data, size_t len);
-std::array<uint8_t, 32> SHA256Hash(const uint8_t* data, size_t len);
+std::array<uint8_t, 16> MD5Hash(const uint8_t* data, size_t len) noexcept;
+std::array<uint8_t, 32> SHA256Hash(const uint8_t* data, size_t len) noexcept;
 
 // ============================================================================
 // VMess AEAD KDF（嵌套 HMAC-SHA256）

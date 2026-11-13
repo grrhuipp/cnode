@@ -100,7 +100,11 @@ void SessionTrackingState::CommitTraffic(
         throw std::logic_error("traffic snapshot account disappeared before commit");
     }
     auto& bucket = entry->second;
-    std::vector<decltype(bucket.traffic.begin())> matched;
+    struct MatchedCommit {
+        decltype(bucket.traffic.begin()) it;
+        std::decay_t<decltype(snapshot.users.begin()->second)> value;
+    };
+    std::vector<MatchedCommit> matched;
     matched.reserve(snapshot.users.size());
     for (const auto& [uid, value] : snapshot) {
         const auto it = bucket.traffic.find(uid);
@@ -111,12 +115,9 @@ void SessionTrackingState::CommitTraffic(
             it->second.snapshotted.download < value.download) {
             throw std::logic_error("traffic snapshot exceeds in-flight counters");
         }
-        matched.push_back(it);
+        matched.push_back(MatchedCommit{it, value});
     }
-    size_t idx = 0;
-    for (const auto& [uid, value] : snapshot) {
-        (void)uid;
-        auto it = matched[idx++];
+    for (const auto& [it, value] : matched) {
         it->second.completed.upload -= value.upload;
         it->second.completed.download -= value.download;
         it->second.snapshotted.upload -= value.upload;
@@ -142,7 +143,11 @@ void SessionTrackingState::RollbackTraffic(
         throw std::logic_error("traffic snapshot account disappeared before rollback");
     }
     auto& bucket = entry->second;
-    std::vector<Account*> matched;
+    struct MatchedRollback {
+        Account* account;
+        std::decay_t<decltype(snapshot.users.begin()->second)> value;
+    };
+    std::vector<MatchedRollback> matched;
     matched.reserve(snapshot.users.size());
     for (const auto& [uid, value] : snapshot) {
         const auto it = bucket.traffic.find(uid);
@@ -151,14 +156,11 @@ void SessionTrackingState::RollbackTraffic(
             it->second.snapshotted.download < value.download) {
             throw std::logic_error("traffic rollback exceeds in-flight counters");
         }
-        matched.push_back(&it->second);
+        matched.push_back(MatchedRollback{&it->second, value});
     }
-    size_t idx = 0;
-    for (const auto& [uid, value] : snapshot) {
-        (void)uid;
-        auto& account = *matched[idx++];
-        account.snapshotted.upload -= value.upload;
-        account.snapshotted.download -= value.download;
+    for (const auto& [account, value] : matched) {
+        account->snapshotted.upload -= value.upload;
+        account->snapshotted.download -= value.download;
     }
 }
 

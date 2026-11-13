@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "infra/config.hpp"
+#include "infra/json.hpp"
 #include "proxy/uot/uot.hpp"
 #include <string_view>
 

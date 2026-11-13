@@ -59,11 +59,10 @@ net::awaitable<void> Http2ServerSubStreamState::WaitSendCredit() {
 
 bool Http2ServerSubStreamState::EnqueueData(
     Http2ServerSession& session,
-    std::vector<uint8_t> frame_payload,
-    size_t offset,
-    size_t size) {
+    H2Frame& frame,
+    std::span<const uint8_t> data) {
     if (!AcceptsData()) return false;
-    if (offset > frame_payload.size() || size > frame_payload.size() - offset) return false;
+    const size_t size = data.size();
     if (size > kHttp2MaxQueuedStreamBytes - queued_bytes_) return false;
     // Pack small/split DATA frames into the tail, including a prefix of a
     // larger successor. Otherwise legal fragmentation leaves an 8 KiB hole
@@ -73,7 +72,7 @@ bool Http2ServerSubStreamState::EnqueueData(
         auto& tail = data_frames_.back();
         if (size <= tail.payload.capacity() - tail.end) {
             tail.payload.resize(tail.end + size);
-            std::memcpy(tail.payload.data() + tail.end, frame_payload.data() + offset, size);
+            std::memcpy(tail.payload.data() + tail.end, data.data(), size);
             tail.end += size;
             queued_bytes_ += size;
             WakeInputReader();
@@ -81,7 +80,18 @@ bool Http2ServerSubStreamState::EnqueueData(
         }
         coalesced = tail.payload.capacity() - tail.end;
     }
-    if (frame_payload.capacity() < common::Buffer::kSize) frame_payload.reserve(common::Buffer::kSize);
+    std::vector<uint8_t> frame_payload;
+    size_t offset = 0;
+    if (!frame.heap_payload.empty()) {
+        offset = static_cast<size_t>(data.data() - frame.heap_payload.data());
+        frame_payload = std::move(frame.heap_payload);
+        if (frame_payload.capacity() < common::Buffer::kSize) {
+            frame_payload.reserve(common::Buffer::kSize);
+        }
+    } else {
+        frame_payload.reserve(common::Buffer::kSize);
+        frame_payload.assign(data.begin(), data.end());
+    }
     const size_t storage = frame_payload.capacity();
     if (storage > kHttp2MaxQueuedStreamStorage - queued_storage_ ||
         !session.ReserveReceiveMemory(storage)) return false;
@@ -907,14 +917,15 @@ net::awaitable<bool> Http2ServerSession::FailConnection(H2Error error) {
 
 net::awaitable<bool> Http2ServerSession::DispatchFrame(H2Frame frame) {
     switch (frame.type) {
-    case H2FrameType::SETTINGS:
+    case H2FrameType::SETTINGS: {
         if (frame.stream_id != 0) co_return co_await FailConnection(H2Error::Protocol);
-        if (frame.payload.size() % 6 != 0 ||
-            ((frame.flags & kFlagAck) && !frame.payload.empty())) {
+        const auto settings_payload = frame.Payload();
+        if (settings_payload.size() % 6 != 0 ||
+            ((frame.flags & kFlagAck) && !settings_payload.empty())) {
             co_return co_await FailConnection(H2Error::FrameSize);
         }
         if (!(frame.flags & kFlagAck)) {
-            if (const auto error = ApplyPeerSettings(frame.payload)) {
+            if (const auto error = ApplyPeerSettings(settings_payload)) {
                 co_return co_await FailConnection(*error);
             }
             co_return co_await WriteFrameSerialized(H2FrameType::SETTINGS, kFlagAck, 0);
@@ -930,12 +941,13 @@ net::awaitable<bool> Http2ServerSession::DispatchFrame(H2Frame frame) {
             }
         }
         break;
+    }
     case H2FrameType::PING:
         if (frame.stream_id != 0) co_return co_await FailConnection(H2Error::Protocol);
-        if (frame.payload.size() != 8) co_return co_await FailConnection(H2Error::FrameSize);
+        if (frame.Payload().size() != 8) co_return co_await FailConnection(H2Error::FrameSize);
         if (!(frame.flags & kFlagAck)) {
             co_return co_await WriteFrameSerialized(
-                H2FrameType::PING, kFlagAck, 0, frame.payload);
+                H2FrameType::PING, kFlagAck, 0, frame.Payload());
         }
         break;
     case H2FrameType::WINDOW_UPDATE:
@@ -954,10 +966,10 @@ net::awaitable<bool> Http2ServerSession::DispatchFrame(H2Frame frame) {
     }
     case H2FrameType::PRIORITY:
         if (frame.stream_id == 0) co_return co_await FailConnection(H2Error::Protocol);
-        if (frame.payload.size() != 5) co_return co_await FailConnection(H2Error::FrameSize);
+        if (frame.Payload().size() != 5) co_return co_await FailConnection(H2Error::FrameSize);
         break;
     case H2FrameType::RST_STREAM:
-        if (frame.payload.size() != 4) co_return co_await FailConnection(H2Error::FrameSize);
+        if (frame.Payload().size() != 4) co_return co_await FailConnection(H2Error::FrameSize);
         if (!IsKnownClientStream(frame.stream_id)) {
             co_return co_await FailConnection(H2Error::Protocol);
         }
@@ -1262,7 +1274,8 @@ std::optional<Http2ServerSession::DataFault> Http2ServerSession::ReceiveData(H2F
     // The complete DATA payload consumes credit, including Pad Length and
     // padding (RFC 9113 6.1). Closed/reset streams still consume connection
     // credit, and discarding those bytes returns it exactly once.
-    const size_t flow_size = frame.payload.size();
+    const auto raw_payload = frame.Payload();
+    const size_t flow_size = raw_payload.size();
     if (static_cast<int64_t>(flow_size) > connection_receive_window_) {
         return DataFault{H2Error::FlowControl, true};
     }
@@ -1285,7 +1298,7 @@ std::optional<Http2ServerSession::DataFault> Http2ServerSession::ReceiveData(H2F
         return DataFault{H2Error::StreamClosed, false};
     }
     if ((frame.flags & kFlagPadded) != 0 &&
-        (frame.payload.empty() || frame.payload.front() >= frame.payload.size())) {
+        (raw_payload.empty() || raw_payload.front() >= raw_payload.size())) {
         return DataFault{H2Error::Protocol, true};
     }
     if (!sub.AcceptsData()) {
@@ -1295,12 +1308,10 @@ std::optional<Http2ServerSession::DataFault> Http2ServerSession::ReceiveData(H2F
     }
     const auto data = H2DataPayload(frame);
     const size_t data_size = data.size();
-    const size_t offset = data_size == 0 ? 0 :
-        static_cast<size_t>(data.data() - frame.payload.data());
     bool queued = data_size == 0;
     try {
         if (data_size != 0) {
-            queued = sub.EnqueueData(*this, std::move(frame.payload), offset, data_size);
+            queued = sub.EnqueueData(*this, frame, data);
         }
     } catch (const std::bad_alloc&) {
         queued = false;

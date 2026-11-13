@@ -3,7 +3,6 @@
 #include "common/defaults.hpp"
 #include "common/constants.hpp"
 #include "infra/config_types.hpp"
-#include "infra/json.hpp"
 #include "transport/inbound_listen.hpp"
 #include "transport/proxy_protocol.hpp"
 #include "transport/stream_settings.hpp"
@@ -25,6 +24,10 @@ namespace transport {
 struct TlsPemMaterial;
 
 }  // namespace transport
+namespace infra {
+class object;
+class value;
+}  // namespace infra
 
 namespace infra {
 [[nodiscard]] transport::WsConfig ParseWsConfig(const object& source);

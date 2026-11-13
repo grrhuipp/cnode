@@ -2,6 +2,7 @@
 
 #include "app/inbound_handler.hpp"
 #include "app/relay.hpp"
+#include "app/request_load.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/group_coordinator.hpp"
 #include "common/allocator.hpp"

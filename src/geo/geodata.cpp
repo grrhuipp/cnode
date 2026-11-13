@@ -150,10 +150,7 @@ void DomainRuleSet::AddKeyword(std::string_view keyword) {
     if (keyword.empty()) {
         return;
     }
-    auto& lower = keywords_.emplace_back(keyword);
-    std::ranges::transform(lower, lower.begin(), [](char ch) {
-        return common::ToLowerAscii(ch);
-    });
+    common::LowerAsciiInPlace(keywords_.emplace_back(keyword));
 }
 
 void DomainRuleSet::AddRegex(const std::string& pattern) {
@@ -293,14 +290,6 @@ private:
 
 [[nodiscard]] std::string_view AsText(std::span<const uint8_t> bytes) noexcept {
     return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
-}
-
-[[nodiscard]] std::string LowerTag(std::string_view tag) {
-    std::string lower(tag);
-    std::ranges::transform(lower, lower.begin(), [](char ch) {
-        return common::ToLowerAscii(ch);
-    });
-    return lower;
 }
 
 [[nodiscard]] std::vector<uint8_t> ReadWholeFile(const std::filesystem::path& path) {
@@ -476,7 +465,7 @@ void LoadCategories(
     std::vector<std::string> wanted;
     wanted.reserve(tags.size());
     for (const auto& tag : tags) {
-        wanted.push_back(LowerTag(tag));
+        wanted.push_back(common::LowerAscii(tag));
     }
     std::ranges::sort(wanted);
     const auto duplicates = std::ranges::unique(wanted);

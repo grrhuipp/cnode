@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "infra/config.hpp"
+#include "infra/json.hpp"
 #include "proxy/vmess/vmess_crypto.hpp"
 #include <string>
 #include <string_view>
