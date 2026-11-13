@@ -375,17 +375,20 @@ private:
 
     std::string ParseString() {
         Expect('"');
-        std::string out;
-
-        while (true) {
-            const size_t run = pos_;
-            while (pos_ < text_.size()) {
-                const char next = text_[pos_];
-                if (next == '"' || next == '\\' || static_cast<unsigned char>(next) < 0x20) break;
+        const size_t first_run = pos_;
+        while (pos_ < text_.size()) {
+            const char next = text_[pos_];
+            if (next == '"') {
+                const size_t len = pos_ - first_run;
                 ++pos_;
+                return std::string(text_.data() + first_run, len);
             }
-            out.append(text_.substr(run, pos_ - run));
+            if (next == '\\' || static_cast<unsigned char>(next) < 0x20) break;
+            ++pos_;
+        }
 
+        std::string out(text_.data() + first_run, pos_ - first_run);
+        while (true) {
             const char c = Take();
             if (c == '"') return out;
             if (c != '\\') Fail("control character in string");
@@ -402,6 +405,14 @@ private:
                 case 'u': AppendUnicodeEscape(out); break;
                 default: Fail("invalid string escape");
             }
+
+            const size_t run = pos_;
+            while (pos_ < text_.size()) {
+                const char next = text_[pos_];
+                if (next == '"' || next == '\\' || static_cast<unsigned char>(next) < 0x20) break;
+                ++pos_;
+            }
+            out.append(text_.data() + run, pos_ - run);
         }
     }
 

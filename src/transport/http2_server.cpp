@@ -1266,9 +1266,13 @@ net::awaitable<bool> Http2ServerSession::RouteXHttpRequest(
         co_return true;
     }
     case XHttpRequestMeta::Kind::PacketUp: {
-        auto xsession = co_await GetXHttpPacketSession(coordinator_,
-            io_context_, xhttp_config_->session_namespace,
-            meta.session_id, XHttpSessionAccess::Upload);
+        auto xsession = TryGetLocalXHttpPacketSession(
+            io_context_, xhttp_config_->session_namespace, meta.session_id);
+        if (!xsession) {
+            xsession = co_await GetXHttpPacketSession(coordinator_,
+                io_context_, xhttp_config_->session_namespace,
+                meta.session_id, XHttpSessionAccess::Upload);
+        }
         if (!xsession) {
             co_return co_await ResetStream(stream_id, H2Error::Protocol);
         }

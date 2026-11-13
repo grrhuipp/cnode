@@ -1012,7 +1012,7 @@ XHttpPacketUpSession::Upload::~Upload() noexcept {
 
 net::awaitable<size_t> XHttpPacketUpSession::Upload::Read(
     common::MultiBuffer& payload, size_t limit) {
-    if (payload.empty() || payload.FrontBuffer()->Available() == 0) {
+    if (payload.empty() || payload.byte_size() >= reserved_) {
         if (!session_.Reserve(common::Buffer::kSize)) {
             uint8_t excess;
             if (co_await stream_.AsyncRead(net::buffer(&excess, 1)) == 0) co_return 0;
@@ -1023,10 +1023,11 @@ net::awaitable<size_t> XHttpPacketUpSession::Upload::Read(
     if (limit == 0) {
         co_return 0;
     }
-    if (auto* tail = payload.FrontBuffer(); tail && tail->Available() != 0) {
-        const size_t n = co_await stream_.AsyncRead(net::buffer(
-            tail->Tail().data(), std::min(limit, size_t{tail->Available()})));
-        tail->Produce(static_cast<uint32_t>(n));
+    if (!payload.empty()) {
+        const size_t want = std::min(limit, reserved_ - payload.byte_size());
+        uint8_t* dst = payload.PrepareAppend(want);
+        const size_t n = co_await stream_.AsyncRead(net::buffer(dst, want));
+        payload.CommitAppend(n);
         co_return n;
     }
     common::MultiBuffer chunk = co_await stream_.ReadMultiBuffer();
@@ -1508,13 +1509,27 @@ net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
 
 }  // namespace
 
+std::shared_ptr<XHttpPacketUpSession> TryGetLocalXHttpPacketSession(
+    net::io_context& io_context,
+    std::string_view session_namespace,
+    std::string_view session_id) {
+    return net::use_service<XHttpSessionTable>(io_context).Get(
+        io_context, session_namespace, session_id, XHttpSessionAccess::Join);
+}
+
 net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
     app::GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::string_view session_namespace,
     std::string_view session_id,
     XHttpSessionAccess access) {
-    co_return (co_await ResolveXHttpSessionOwner(coordinator, 
+    if (access != XHttpSessionAccess::Open) {
+        if (auto local = TryGetLocalXHttpPacketSession(
+                io_context, session_namespace, session_id)) {
+            co_return local;
+        }
+    }
+    co_return (co_await ResolveXHttpSessionOwner(coordinator,
         io_context, session_namespace, session_id, access, true)).session;
 }
 
@@ -1876,9 +1891,19 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
                 ? XHttpSessionAccess::Open
                 : XHttpSessionAccess::Upload;
             const bool bind_immediately = !timeouts.active;
-            auto resolution = co_await ResolveXHttpSessionOwner(coordinator, 
-                io_context, xhttp_cfg.session_namespace, meta.session_id,
-                access, bind_immediately, &stream->Cancellation());
+            XHttpSessionOwnerResolution resolution;
+            if (access != XHttpSessionAccess::Open) {
+                if (auto local = TryGetLocalXHttpPacketSession(
+                        io_context, xhttp_cfg.session_namespace, meta.session_id)) {
+                    resolution.owner = &io_context;
+                    resolution.session = std::move(local);
+                }
+            }
+            if (!resolution.owner) {
+                resolution = co_await ResolveXHttpSessionOwner(coordinator,
+                    io_context, xhttp_cfg.session_namespace, meta.session_id,
+                    access, bind_immediately, &stream->Cancellation());
+            }
             auto* owner_reactor = resolution.owner;
             if (!owner_reactor)
                 co_return tl::unexpected(OwnerMissError(*stream, meta.kind));

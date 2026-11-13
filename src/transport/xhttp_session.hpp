@@ -433,6 +433,14 @@ enum class XHttpSessionAccess : uint8_t {
     std::string_view session_id,
     XHttpSessionAccess access);
 
+// Owner-thread fast path for Join/Upload when the session already lives on
+// this Worker's local table (steady-state HTTP/2 and persistent HTTP/1.1
+// packet-up uploads), avoiding two lookup coroutine frames per packet.
+[[nodiscard]] std::shared_ptr<XHttpPacketUpSession> TryGetLocalXHttpPacketSession(
+    net::io_context& io_context,
+    std::string_view session_namespace,
+    std::string_view session_id);
+
 // Teardown joins upload-response readers before releasing their Worker's
 // transport hosts. Standalone callers pass their io_context.
 [[nodiscard]] net::awaitable<void> JoinXHttpClientTasks(net::execution_context& services);

@@ -877,8 +877,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
     std::optional<OutboundDialCandidate> selected;
     std::unique_ptr<AsyncStream> downlink;
 
-    auto try_downlink_candidate = [&](const OutboundDialCandidate& candidate)
-        -> net::awaitable<bool> {
+    for (const auto& candidate : downlink_target.Candidates()) {
         auto attempt = co_await DialAndBuildXHttpRequestCandidate(
             io_context,
             ctx,
@@ -889,22 +888,14 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
         if (attempt.Ok()) {
             selected = candidate;
             downlink = std::move(attempt.stream);
-            co_return true;
+            break;
         }
-
         LOG_CONN_DEBUG(ctx,
                        "XHTTP downlink candidate failed endpoint={}:{} > {}",
                        common::AddressText(candidate.endpoint.address()).View(),
                        candidate.endpoint.port(),
                        attempt.error_msg);
         last_result = std::move(attempt);
-        co_return false;
-    };
-
-    for (const auto& candidate : downlink_target.Candidates()) {
-        if (co_await try_downlink_candidate(candidate)) {
-            break;
-        }
     }
 
     if (!downlink || !selected) {
