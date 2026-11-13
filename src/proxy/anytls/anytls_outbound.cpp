@@ -319,65 +319,117 @@ struct AnyTlsOutboundHandler::ClientSession {
         }
     }
 
-    net::awaitable<tl::expected<void, common::ErrorCode>>
-    WritePayloadFrames(uint32_t sid, LogicalStream& logical, common::MultiBuffer mb) {
-        auto write_lease = write_gate.TryAcquire();
-        if (!write_lease) write_lease = co_await write_gate.Acquire();
-        if (!write_lease || closed || !stream) {
-            mb.clear();
-            co_return tl::unexpected(ClosedError());
-        }
-
-        logical.CheckWrite();
-
-        try {
-            const uint32_t this_packet = NextPacketIndex();
-            const auto scheme_guard = SchemeGuardFor(this_packet);
-            auto ok = co_await WriteAnyTlsMultiBufferAsFramesWithPadding(
-                *stream, *scheme_, this_packet, kCmdPSH, sid, std::move(mb));
-            if (!ok) {
-                CloseAll(ok.error());
-                co_return tl::unexpected(ok.error());
+    template <typename Payload>
+    net::awaitable<void>
+    WritePayload(uint32_t sid,
+                 LogicalStream& logical,
+                 const bool& endpoint_cancelled,
+                 size_t& pending_writes,
+                 Payload payload) {
+        constexpr bool is_multi_buffer = std::is_same_v<Payload, common::MultiBuffer>;
+        auto release_payload = [&]() noexcept {
+            if constexpr (is_multi_buffer) {
+                payload.clear();
             }
-            co_return tl::expected<void, common::ErrorCode>{};
+        };
+        if constexpr (is_multi_buffer) {
+            if (payload.byte_size() == 0) {
+                payload.clear();
+                co_return;
+            }
+        }
+        if (endpoint_cancelled) {
+            release_payload();
+            throw transport::LinkError(common::ErrorCode::CANCELLED);
+        }
+        try {
+            logical.CheckWrite();
         } catch (...) {
-            CloseAll(transport::ClassifyFailure(std::current_exception(), common::ErrorCode::RELAY_WRITE_FAILED));
+            release_payload();
             throw;
         }
-    }
-
-    net::awaitable<tl::expected<void, common::ErrorCode>>
-    WritePayloadBuffers(uint32_t sid, LogicalStream& logical, std::span<const net::const_buffer> buffers) {
-        bool has_data = false;
-        for (const net::const_buffer& buffer : buffers) {
-            if (buffer.data() && buffer.size() > 0) {
-                has_data = true;
-                break;
+        if constexpr (!is_multi_buffer) {
+            bool has_data = false;
+            for (const net::const_buffer& buffer : payload) {
+                if (buffer.data() && buffer.size() > 0) {
+                    has_data = true;
+                    break;
+                }
+            }
+            if (!has_data) {
+                co_return;
             }
         }
-        if (!has_data) {
-            co_return tl::expected<void, common::ErrorCode>{};
-        }
+
+        struct PendingWrite {
+            size_t& count;
+            explicit PendingWrite(size_t& c) noexcept : count(c) { ++count; }
+            ~PendingWrite() noexcept { --count; }
+            PendingWrite(const PendingWrite&) = delete;
+            PendingWrite& operator=(const PendingWrite&) = delete;
+        } pending(pending_writes);
 
         auto write_lease = write_gate.TryAcquire();
         if (!write_lease) write_lease = co_await write_gate.Acquire();
         if (!write_lease || closed || !stream) {
-            co_return tl::unexpected(ClosedError());
+            release_payload();
+            const auto err = ClosedError();
+            logical.Close(err);
+            throw transport::LinkError(err);
         }
 
-        logical.CheckWrite();
+        try {
+            logical.CheckWrite();
+        } catch (...) {
+            release_payload();
+            throw;
+        }
 
         try {
             const uint32_t this_packet = NextPacketIndex();
-            const auto scheme_guard = SchemeGuardFor(this_packet);
-            auto ok = co_await WriteAnyTlsBuffersAsFramesWithPadding(
-                *stream, *scheme_, this_packet, kCmdPSH, sid, buffers);
+            const auto records = scheme_->RecordFor(this_packet);
+            if (records.empty()) {
+                FrameBatch batch;
+                auto encoded = batch.Encode(kCmdPSH, sid, payload);
+                if (!encoded) {
+                    release_payload();
+                    CloseAll(encoded.error());
+                    logical.Close(encoded.error());
+                    throw transport::LinkError(encoded.error());
+                }
+                const auto framed = batch.Buffers();
+                if (!framed.empty()) {
+                    try {
+                        co_await stream->WriteBuffers(framed);
+                    } catch (const IoSystemError& e) {
+                        release_payload();
+                        const auto err = common::MapAsioError(e.code());
+                        CloseAll(err);
+                        logical.Close(err);
+                        throw transport::LinkError(err);
+                    }
+                }
+                release_payload();
+                co_return;
+            }
+            const auto scheme_guard = scheme_;
+            tl::expected<void, common::ErrorCode> ok;
+            if constexpr (is_multi_buffer) {
+                ok = co_await WriteAnyTlsMultiBufferAsFramesWithPadding(
+                    *stream, *scheme_, this_packet, kCmdPSH, sid, std::move(payload));
+            } else {
+                ok = co_await WriteAnyTlsBuffersAsFramesWithPadding(
+                    *stream, *scheme_, this_packet, kCmdPSH, sid, payload);
+            }
             if (!ok) {
                 CloseAll(ok.error());
-                co_return tl::unexpected(ok.error());
+                logical.Close(ok.error());
+                throw transport::LinkError(ok.error());
             }
-            co_return tl::expected<void, common::ErrorCode>{};
+        } catch (const transport::LinkError&) {
+            throw;
         } catch (...) {
+            release_payload();
             CloseAll(transport::ClassifyFailure(std::current_exception(), common::ErrorCode::RELAY_WRITE_FAILED));
             throw;
         }
@@ -1144,33 +1196,11 @@ net::awaitable<OutboundProcessResult> AnyTlsOutboundHandler::ProcessSession(
         bool WriteShutdownClosesLink() const noexcept override { return true; }
 
         net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
-            if (mb.byte_size() == 0) {
-                co_return;
-            }
-            if (cancelled) {
-                throw transport::LinkError(common::ErrorCode::CANCELLED);
-            }
-            logical.CheckWrite();
-
-            PendingWrite pending(pending_writes);
-            auto ok = co_await session.WritePayloadFrames(sid, logical, std::move(mb));
-            if (!ok) {
-                logical.Close(ok.error());
-                throw transport::LinkError(ok.error());
-            }
+            return session.WritePayload(sid, logical, cancelled, pending_writes, std::move(mb));
         }
 
         net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
-            if (cancelled) {
-                throw transport::LinkError(common::ErrorCode::CANCELLED);
-            }
-            logical.CheckWrite();
-            PendingWrite pending(pending_writes);
-            auto ok = co_await session.WritePayloadBuffers(sid, logical, buffers);
-            if (!ok) {
-                logical.Close(ok.error());
-                throw transport::LinkError(ok.error());
-            }
+            return session.WritePayload(sid, logical, cancelled, pending_writes, buffers);
         }
 
         net::awaitable<void> AsyncShutdownWrite() override {

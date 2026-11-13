@@ -28,11 +28,9 @@ namespace {
 constexpr size_t kMaxTrojanHandshakeBytes =
     kRequestPrefixSize + common::kMaxEncodedAddressSize + 2;
 
-struct TrojanHandshakeResult {
-    std::shared_ptr<const app::UserStore::TrojanCredential> user;
-    TrojanCommand command = TrojanCommand::CONNECT;
-    common::TargetAddress target;
-    std::optional<common::ForwardedMetadata> forwarded;
+struct AdmittedTrojanRequest {
+    common::UserOnlineSessionGuard user_session;
+    common::Network net = common::Network::TCP;
 };
 
 net::awaitable<tl::expected<TrojanRequest, common::ErrorCode>>
@@ -72,10 +70,15 @@ ReadRawTrojanRequest(transport::AsyncStream& stream, common::Context& ctx) {
     }
 }
 
-net::awaitable<tl::expected<TrojanHandshakeResult, common::ErrorCode>>
-ParseTrojanRequest(transport::AsyncStream& stream,
-                   common::Context& ctx,
-                   InboundAuthentication& authentication) {
+net::awaitable<tl::expected<AdmittedTrojanRequest, common::ErrorCode>>
+AuthenticateTrojanRequest(transport::AsyncStream& stream,
+                          const app::AdmissionEnvironment& environment,
+                          common::Context& ctx) {
+    auto auth_phase = co_await proxy::BeginInboundAuthentication(environment, ctx);
+    if (!auth_phase) {
+        co_return tl::unexpected(auth_phase.error());
+    }
+    auto authentication = std::move(*auth_phase);
     auto parsed_request = co_await ReadRawTrojanRequest(stream, ctx);
     if (!parsed_request) {
         co_return tl::unexpected(parsed_request.error());
@@ -91,15 +94,40 @@ ParseTrojanRequest(transport::AsyncStream& stream,
     if (!user_info) {
         co_return tl::unexpected(co_await authentication.RejectCredential("no matching credential"));
     }
-
-    co_return TrojanHandshakeResult{
-        .user = std::move(user_info),
-        .command = request.command,
-        .target = std::move(request.target),
-        .forwarded = std::move(request.forwarded),
+    const common::Network net = (request.command == TrojanCommand::UDP_ASSOCIATE)
+        ? common::Network::UDP : common::Network::TCP;
+    auto bound = std::move(authentication).Bind(
+        user_info->profile,
+        proxy::InboundRequestTarget{net, std::move(request.target), std::move(request.forwarded)});
+    // Session metadata is owned; release the authentication snapshot before I/O.
+    user_info.reset();
+    auto admitted = co_await std::move(bound).Admit();
+    if (!admitted) co_return tl::unexpected(admitted.error());
+    co_return AdmittedTrojanRequest{
+        .user_session = std::move(*admitted),
+        .net = net,
     };
 }
 
+net::awaitable<app::RelayResult> DispatchTrojanUdp(
+    std::unique_ptr<transport::AsyncStream> stream,
+    routing::Dispatcher& dispatcher,
+    const app::ReceiverSettings& receiver,
+    net::io_context& io_context,
+    common::Context& ctx,
+    const app::AdmissionEnvironment& environment,
+    const infra::TimeoutsConfig& timeouts) {
+    TrojanUdpStreamEndpoint udp_endpoint(*stream);
+    co_return co_await dispatcher.Dispatch(
+        io_context,
+        receiver.dispatch_policy,
+        std::move(stream),
+        transport::Link{&udp_endpoint, &udp_endpoint},
+        common::InitialPayload{},
+        ctx,
+        environment.stats,
+        timeouts);
+}
 }  // namespace
 
 class TrojanInboundHandler final : public ::proxy::Inbound {
@@ -141,40 +169,21 @@ TrojanInboundHandler::Process(
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}",
                    ctx.inbound.source_ip, ctx.inbound.source_port);
 
-    auto authentication = co_await proxy::BeginInboundAuthentication(environment_, ctx);
-    if (!authentication) co_return proxy::RejectInbound(environment_.stats, stream.get(), authentication.error());
-    std::optional<common::UserOnlineSessionGuard> user_session;
+    common::UserOnlineSessionGuard user_session;
     common::Network net = common::Network::TCP;
     {
-        auto handshake = co_await ParseTrojanRequest(*stream, ctx, *authentication);
-        if (!handshake) {
-            co_return proxy::RejectInbound(environment_.stats, stream.get(), handshake.error());
+        auto admitted = co_await AuthenticateTrojanRequest(*stream, environment_, ctx);
+        if (!admitted) {
+            co_return proxy::RejectInbound(environment_.stats, stream.get(), admitted.error());
         }
-        net = (handshake->command == TrojanCommand::UDP_ASSOCIATE)
-              ? common::Network::UDP : common::Network::TCP;
-        auto bound = std::move(*authentication).Bind(
-            handshake->user->profile,
-            proxy::InboundRequestTarget{net, std::move(handshake->target), std::move(handshake->forwarded)});
-        // Session metadata is owned; release the authentication snapshot before I/O.
-        handshake->user.reset();
-        auto admitted = co_await std::move(bound).Admit();
-        if (!admitted) co_return proxy::RejectInbound(environment_.stats, stream.get(), admitted.error());
-        user_session.emplace(std::move(*admitted));
+        user_session = std::move(admitted->user_session);
+        net = admitted->net;
     }
 
     if (net == common::Network::UDP) {
-        TrojanUdpStreamEndpoint udp_endpoint(*stream);
-        co_return co_await dispatcher.Dispatch(
-            io_context,
-            receiver.dispatch_policy,
-            std::move(stream),
-            transport::Link{&udp_endpoint, &udp_endpoint},
-            common::InitialPayload{},
-            ctx,
-            environment_.stats,
-            timeouts);
+        co_return co_await DispatchTrojanUdp(
+            std::move(stream), dispatcher, receiver, io_context, ctx, environment_, timeouts);
     }
-
     auto* tcp_stream = stream.get();
     co_return co_await dispatcher.Dispatch(
         io_context,

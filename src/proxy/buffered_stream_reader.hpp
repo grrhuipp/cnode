@@ -2,7 +2,6 @@
 
 #include "common/asio_types.hpp"
 #include "common/multi_buffer.hpp"
-#include "common/length_prefixed_packet_buffer.hpp"
 #include "transport/link.hpp"
 
 #include <asio/this_coro.hpp>

@@ -9,7 +9,6 @@
 #include "common/asio_types.hpp"
 #include "common/length_prefixed_packet_buffer.hpp"
 #include <array>
-#include <cstring>
 #include <memory>
 #include <new>
 #include <utility>
@@ -142,6 +141,36 @@ net::awaitable<tl::expected<PreparedRequest, common::ErrorCode>> ReadUotRequestH
     }
 }
 
+namespace {
+net::awaitable<app::RelayResult> RunPreparedUotSession(
+    bool is_connect,
+    common::TargetAddress reader_destination,
+    common::MultiBuffer pending,
+    common::InitialPayload initial_payload,
+    std::unique_ptr<transport::AsyncStream> stream,
+    transport::MultiBufferReader& request_reader,
+    transport::MultiBufferWriter& response_writer,
+    routing::Dispatcher& dispatcher,
+    const routing::DispatchPolicy& dispatch_policy,
+    net::io_context& io_context,
+    common::Context& ctx,
+    app::StatsShard& stats,
+    const infra::TimeoutsConfig& timeouts) {
+    UotPacketReader uot_reader(
+        request_reader, is_connect, std::move(reader_destination), std::move(pending));
+    UotPacketWriter uot_writer(response_writer, is_connect, ctx.outbound.target);
+    co_return co_await dispatcher.Dispatch(
+        io_context,
+        dispatch_policy,
+        std::move(stream),
+        transport::Link{&uot_reader, &uot_writer},
+        std::move(initial_payload),
+        ctx,
+        stats,
+        timeouts);
+}
+}  // namespace
+
 net::awaitable<app::RelayResult> DispatchPreparedUotRequest(
     PreparedRequest prepared,
     std::unique_ptr<transport::AsyncStream> stream,
@@ -155,20 +184,25 @@ net::awaitable<app::RelayResult> DispatchPreparedUotRequest(
     const infra::TimeoutsConfig& timeouts) {
     const bool is_connect = prepared.is_connect;
     common::InitialPayload initial_payload{std::move(prepared.initial_decoded)};
+    common::TargetAddress reader_destination =
+        is_connect ? prepared.destination : common::TargetAddress{};
     proxy::BindInboundRequestTarget(
         ctx,
         proxy::InboundRequestTarget{
             common::Network::UDP,
-            prepared.destination,
+            std::move(prepared.destination),
             std::move(prepared.forwarded)});
-    UotPacketReader uot_reader(request_reader, std::move(prepared));
-    UotPacketWriter uot_writer(response_writer, is_connect, ctx.outbound.target);
-    co_return co_await dispatcher.Dispatch(
-        io_context,
-        dispatch_policy,
-        std::move(stream),
-        transport::Link{&uot_reader, &uot_writer},
+    return RunPreparedUotSession(
+        is_connect,
+        std::move(reader_destination),
+        std::move(prepared.pending),
         std::move(initial_payload),
+        std::move(stream),
+        request_reader,
+        response_writer,
+        dispatcher,
+        dispatch_policy,
+        io_context,
         ctx,
         stats,
         timeouts);

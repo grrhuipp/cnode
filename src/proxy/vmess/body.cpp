@@ -9,20 +9,17 @@
 #include "common/asio_types.hpp"
 #include "common/byte_reader.hpp"
 #include "common/error.hpp"
-#include "common/user_online_tracker.hpp"
 #include "common/hash.hpp"
 #include "infra/log.hpp"
 #include "transport/link.hpp"
 
 #include <openssl/mem.h>
 #include <openssl/rand.h>
-#include <openssl/siphash.h>
 #include <asio/this_coro.hpp>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <string_view>
@@ -1289,7 +1286,7 @@ net::awaitable<bool> RegisterSessionIfNew(
     std::memcpy(material.data() + 32, body_iv.data(), 16);
     const SessionKey key = SHA256Hash(material.data(), material.size());
     OPENSSL_cleanse(material.data(), material.size());
-    co_return co_await coordinator.PostCall([&coordinator, key] {
+    return coordinator.PostCall([&coordinator, key] {
         const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         return net::use_service<HistoryService>(

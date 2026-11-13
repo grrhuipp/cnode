@@ -9,7 +9,6 @@
 #include <openssl/sha.h>
 #include <algorithm>
 #include <string_view>
-#include <stdexcept>
 
 
 namespace transport {

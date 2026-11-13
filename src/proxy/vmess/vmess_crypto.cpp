@@ -14,7 +14,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <memory>
 #include <new>
 #include <stdexcept>
 #include <string_view>

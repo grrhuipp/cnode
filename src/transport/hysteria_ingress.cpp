@@ -1587,7 +1587,10 @@ bool HysteriaConnection::SendUdpMessage(
     if (fragments == 1 && core_->datagrams.empty()) {
         message.fragment_id = 0;
         message.payload = payload;
-        std::array<uint8_t, kMaxUdpMessageSize> header_buf;
+        // Valid TargetAddress host <= 254B, so V1 header <= 268B and V2 <= 272B.
+        constexpr size_t kMaxUdpTargetHeaderBufSize = 280;
+        std::array<uint8_t, kMaxUdpTargetHeaderBufSize> header_buf;
+        if (*header_size > header_buf.size()) return false;
         const auto hdr_len = EncodeUdpFragmentHeader(
             version, message, *text,
             std::span<uint8_t>(header_buf.data(), *header_size));

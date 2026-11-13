@@ -23,7 +23,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
 namespace proxy {
 
 // Parses a UUID string, or maps a 1-30 byte VLESS custom id to UUIDv5.

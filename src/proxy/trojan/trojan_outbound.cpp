@@ -24,6 +24,8 @@ struct TrojanOutboundConfig {
     TrojanPasswordHash password_hash{};
 
     TrojanOutboundConfig() = default;
+    TrojanOutboundConfig(transport::OutboundServer srv, TrojanPasswordHash hash) noexcept
+        : server(std::move(srv)), password_hash(hash) {}
     TrojanOutboundConfig(const TrojanOutboundConfig&) = default;
     TrojanOutboundConfig& operator=(const TrojanOutboundConfig&) = default;
     TrojanOutboundConfig(TrojanOutboundConfig&&) noexcept = default;
@@ -37,8 +39,6 @@ class TrojanOutboundHandler final : public ::proxy::Outbound {
 public:
     explicit TrojanOutboundHandler(std::shared_ptr<const ::proxy::TrojanOutboundConfig> config);
 
-    ~TrojanOutboundHandler() override;
-
     ::net::awaitable<::proxy::OutboundProcessResult> Process(
         ::common::Context& ctx,
         ::transport::Link inbound,
@@ -49,22 +49,42 @@ public:
         ::common::MultiBufferBatch first_payload) override;
 
 private:
+    ::net::awaitable<::proxy::OutboundProcessResult> ProcessUdp(
+        ::common::Context& ctx,
+        ::transport::Link inbound,
+        ::transport::OutboundDialer& dialer,
+        const ::infra::TimeoutsConfig& timeouts,
+        ::app::StatsShard& stats,
+        const ::app::RelayConfig& relay_config,
+        ::common::MultiBufferBatch first_payload);
+    ::net::awaitable<::proxy::OutboundProcessResult> ProcessTcp(
+        ::common::Context& ctx,
+        ::transport::Link inbound,
+        ::transport::OutboundDialer& dialer,
+        const ::infra::TimeoutsConfig& timeouts,
+        ::app::StatsShard& stats,
+        const ::app::RelayConfig& relay_config,
+        ::common::MultiBufferBatch first_payload);
+
     std::shared_ptr<const ::proxy::TrojanOutboundConfig> config_;
 };
 namespace {
 
-net::awaitable<tl::expected<void, common::ErrorCode>>
-SendTrojanHandshake(
-    transport::AsyncStream& stream,
-    const TrojanOutboundConfig& config,
-    const common::TargetAddress& target,
-    bool is_udp,
-    std::chrono::seconds handshake_timeout,
+net::awaitable<tl::expected<std::unique_ptr<transport::AsyncStream>, common::ErrorCode>>
+DialAndSendTrojanHandshake(
     common::Context& ctx,
-    const transport::OutboundDialer& dialer) {
-    stream.SetIdleTimeout(handshake_timeout);
+    transport::OutboundDialer& dialer,
+    const TrojanOutboundConfig& config,
+    bool is_udp,
+    std::chrono::seconds handshake_timeout) {
+    auto dialed = co_await dialer.Dial(ctx, config.server);
+    if (!dialed) {
+        co_return tl::unexpected(dialed.error());
+    }
+    auto stream = std::move(*dialed);
+    stream->SetIdleTimeout(handshake_timeout);
     transport::PhaseDeadlineToken outbound_protocol_deadline =
-        stream.StartPhaseDeadline(handshake_timeout);
+        stream->StartPhaseDeadline(handshake_timeout);
 
     std::array<uint8_t, kRequestPrefixSize + common::kMaxEncodedAddressSize + 2> header_buf{};
     common::ScopedCleanse cleanse_header{header_buf};
@@ -72,27 +92,28 @@ SendTrojanHandshake(
         config.password_hash,
         is_udp ? TrojanCommand::UDP_ASSOCIATE
                : TrojanCommand::CONNECT,
-        target,
+        ctx.outbound.target,
         header_buf.data(),
         header_buf.size(),
         dialer.ForwardedMetadata(ctx));
     if (header_len == 0) {
         LOG_CONN_WARN(ctx, "handshake encode failed");
+        stream->CloseAbortive();
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
 
     try {
         const net::const_buffer header_buffer(header_buf.data(), header_len);
-        co_await stream.WriteBuffers({&header_buffer, 1});
+        co_await stream->WriteBuffers({&header_buffer, 1});
         LOG_CONN_DEBUG(ctx, "handshake sent {} bytes", header_len);
-        co_return tl::expected<void, common::ErrorCode>{};
+        co_return std::move(stream);
     } catch (...) {
-        co_return tl::unexpected(
-            proxy::ClassifyOutboundHandshakeException(
-                stream, outbound_protocol_deadline));
+        const auto err = proxy::ClassifyOutboundHandshakeException(
+            *stream, outbound_protocol_deadline);
+        stream->CloseAbortive();
+        co_return tl::unexpected(err);
     }
 }
-
 }  // namespace
 
 // ============================================================================
@@ -103,10 +124,25 @@ TrojanOutboundHandler::TrojanOutboundHandler(
     std::shared_ptr<const TrojanOutboundConfig> config)
     : config_(std::move(config)) {}
 
-TrojanOutboundHandler::~TrojanOutboundHandler() = default;
-
 net::awaitable<OutboundProcessResult>
 TrojanOutboundHandler::Process(
+    common::Context& ctx,
+    transport::Link inbound,
+    transport::OutboundDialer& dialer,
+    const infra::TimeoutsConfig& timeouts,
+    app::StatsShard& stats,
+    const app::RelayConfig& relay_config,
+    common::MultiBufferBatch first_payload) {
+    if (ctx.content.network == common::Network::UDP) {
+        return ProcessUdp(
+            ctx, inbound, dialer, timeouts, stats, relay_config, std::move(first_payload));
+    }
+    return ProcessTcp(
+        ctx, inbound, dialer, timeouts, stats, relay_config, std::move(first_payload));
+}
+
+net::awaitable<OutboundProcessResult>
+TrojanOutboundHandler::ProcessUdp(
     common::Context& ctx,
     transport::Link inbound,
     transport::OutboundDialer& dialer,
@@ -117,32 +153,45 @@ TrojanOutboundHandler::Process(
     if (!inbound.Valid()) {
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-
-    const auto& target = ctx.outbound.target;
-
-    auto dialed = co_await dialer.Dial(ctx, config_->server);
-    if (!dialed) {
-        co_return tl::unexpected(dialed.error());
+    std::unique_ptr<transport::AsyncStream> stream;
+    {
+        auto dialed = co_await DialAndSendTrojanHandshake(
+            ctx, dialer, *config_, true, timeouts.HandshakeTimeout());
+        if (!dialed) {
+            co_return tl::unexpected(dialed.error());
+        }
+        stream = std::move(*dialed);
     }
-    auto stream = std::move(*dialed);
-    const bool is_udp = ctx.content.network == common::Network::UDP;
-    if (auto ok = co_await SendTrojanHandshake(
-            *stream, *config_, target, is_udp, timeouts.HandshakeTimeout(),
-            ctx, dialer); !ok) {
-        stream->CloseAbortive();
-        co_return tl::unexpected(ok.error());
-    }
-
     proxy::ApplyOutboundRelayTimeouts(*stream, relay_config);
+    TrojanUdpStreamEndpoint udp_endpoint(
+        *stream, ctx.outbound.target, transport::EofAction::WaitForPeer);
+    co_return co_await app::DoRelayLink(
+        dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
+        udp_endpoint, ctx, stats, relay_config, std::move(first_payload));
+}
 
-    if (is_udp) {
-        TrojanUdpStreamEndpoint udp_endpoint(
-            *stream, target, transport::EofAction::WaitForPeer);
-        co_return co_await app::DoRelayLink(
-            dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-            udp_endpoint, ctx, stats, relay_config, std::move(first_payload));
+net::awaitable<OutboundProcessResult>
+TrojanOutboundHandler::ProcessTcp(
+    common::Context& ctx,
+    transport::Link inbound,
+    transport::OutboundDialer& dialer,
+    const infra::TimeoutsConfig& timeouts,
+    app::StatsShard& stats,
+    const app::RelayConfig& relay_config,
+    common::MultiBufferBatch first_payload) {
+    if (!inbound.Valid()) {
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-
+    std::unique_ptr<transport::AsyncStream> stream;
+    {
+        auto dialed = co_await DialAndSendTrojanHandshake(
+            ctx, dialer, *config_, false, timeouts.HandshakeTimeout());
+        if (!dialed) {
+            co_return tl::unexpected(dialed.error());
+        }
+        stream = std::move(*dialed);
+    }
+    proxy::ApplyOutboundRelayTimeouts(*stream, relay_config);
     co_return co_await app::DoRelayLink(
         dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
         *stream, ctx, stats, relay_config, std::move(first_payload));
@@ -177,12 +226,9 @@ const bool kTrojanRegistered = (::app::RegisterProxy(
                     ::common::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::proxy::Outbound> {
                     return std::make_unique<::proxy::TrojanOutboundHandler>(
                         std::move(cfg_state));
-                }>([] (::transport::OutboundServer srv, const std::string& pwd) {
-                    ::proxy::TrojanOutboundConfig cfg_val;
-                    cfg_val.server = std::move(srv);
-                    cfg_val.password_hash = ::proxy::HashTrojanPassword(pwd);
-                    return cfg_val;
-                }(std::move(next_hop.server), settings->password)),
+                }>(::proxy::TrojanOutboundConfig(
+                    std::move(next_hop.server),
+                    ::proxy::HashTrojanPassword(settings->password))),
             .sender = std::move(next_hop.sender),
         };
     }), true);

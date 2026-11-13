@@ -15,7 +15,6 @@
 #include "common/session.hpp"
 #include "common/scoped_cleanse.hpp"
 
-#include <cstring>
 #include <memory>
 #include <tl/expected.hpp>
 #include <span>
@@ -65,12 +64,23 @@ ReadVMessHandshakeHeader(transport::AsyncStream& stream,
     co_return out;
 }
 
-net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>>
-ParseHandshake(transport::AsyncStream& stream,
-               ::proxy::ServerSession& vmess_session,
-               const app::AdmissionEnvironment& environment,
-               proxy::InboundAuthentication authentication,
-               common::Context& ctx) {
+struct PreparedVmessInboundSession {
+    common::UserOnlineSessionGuard user_session;
+    ::proxy::RequestBodyReader request_reader;
+    ::proxy::ResponseBodyWriter response_writer;
+};
+
+net::awaitable<tl::expected<PreparedVmessInboundSession, common::ErrorCode>>
+CompleteVmessHandshake(transport::AsyncStream& stream,
+                       std::string_view tag,
+                       const app::AdmissionEnvironment& environment,
+                       common::Context& ctx) {
+    auto auth_phase = co_await proxy::BeginInboundAuthentication(environment, ctx);
+    if (!auth_phase) {
+        co_return tl::unexpected(auth_phase.error());
+    }
+    auto authentication = std::move(*auth_phase);
+    ::proxy::ServerSession vmess_session(tag);
     auto header = co_await ReadVMessHandshakeHeader(stream, vmess_session, ctx.conn_id);
     if (!header) {
         co_return tl::unexpected(header.error());
@@ -119,7 +129,15 @@ ParseHandshake(transport::AsyncStream& stream,
 
     vmess_session.SetRequest(std::move(*request));
 
-    co_return std::move(*user_session);
+    auto reader = vmess_session.DecodeRequestBody(stream);
+    if (!reader) co_return tl::unexpected(reader.error());
+    auto writer = vmess_session.EncodeResponseBodyWithHeader(stream);
+    if (!writer) co_return tl::unexpected(writer.error());
+    co_return PreparedVmessInboundSession{
+        .user_session = std::move(*user_session),
+        .request_reader = std::move(*reader),
+        .response_writer = std::move(*writer),
+    };
 }
 
 }  // namespace
@@ -169,41 +187,24 @@ proxy::VmessInboundHandler::Process(
 
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
-    std::optional<common::UserOnlineSessionGuard> user_session;
-    std::optional<::proxy::RequestBodyReader> request_reader;
-    std::optional<::proxy::ResponseBodyWriter> response_writer;
+    std::optional<PreparedVmessInboundSession> session;
     try {
-        auto authentication = co_await proxy::BeginInboundAuthentication(environment_, ctx);
-        if (!authentication) co_return proxy::RejectInbound(environment_.stats, stream.get(), authentication.error());
-        {
-            ::proxy::ServerSession vmess_session(tag);
-            auto parsed_session = co_await ParseHandshake(
-                *stream, vmess_session, environment_, std::move(*authentication), ctx);
-            if (!parsed_session) {
-                co_return proxy::RejectInbound(environment_.stats, stream.get(), parsed_session.error());
-            }
-            user_session.emplace(std::move(*parsed_session));
-            auto reader = vmess_session.DecodeRequestBody(*stream);
-            if (!reader) co_return proxy::RejectInbound(environment_.stats, stream.get(), reader.error());
-            auto writer = vmess_session.EncodeResponseBodyWithHeader(*stream);
-            if (!writer) co_return proxy::RejectInbound(environment_.stats, stream.get(), writer.error());
-            request_reader.emplace(std::move(*reader));
-            response_writer.emplace(std::move(*writer));
+        auto prepared = co_await CompleteVmessHandshake(*stream, tag, environment_, ctx);
+        if (!prepared) {
+            co_return proxy::RejectInbound(environment_.stats, stream.get(), prepared.error());
         }
+        session.emplace(std::move(*prepared));
     } catch (...) {
         co_return proxy::RejectInbound(
             environment_.stats, stream.get(),
             proxy::ClassifyInboundHandshakeException(std::current_exception()));
-    }
-    if (!request_reader || !response_writer) {
-        co_return proxy::RejectInbound(environment_.stats, stream.get(), common::ErrorCode::RESOURCE_EXHAUSTED);
     }
     const common::Network net = ctx.content.network;
 
     if (net == common::Network::MUX) {
         co_return co_await proxy::ServeMuxInbound(
             io_context,
-            transport::Link{&*request_reader, &*response_writer},
+            transport::Link{&session->request_reader, &session->response_writer},
             *stream,
             dispatcher,
             receiver.dispatch_policy,
@@ -218,7 +219,7 @@ proxy::VmessInboundHandler::Process(
         io_context,
         receiver.dispatch_policy,
         std::move(stream),
-        transport::Link{&*request_reader, &*response_writer},
+        transport::Link{&session->request_reader, &session->response_writer},
         common::InitialPayload{},
         ctx,
         environment_.stats,

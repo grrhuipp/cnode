@@ -26,14 +26,15 @@ namespace transport {
 net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
     AsyncStream& raw,
     std::chrono::seconds timeout) {
-    auto* tcp = raw.AsDirectTcpStream();
-    if (!tcp) {
+    if (auto* tcp = raw.AsDirectTcpStream()) {
+        return tcp->ReadProxyProtocolHeader(timeout);
+    }
+    return []() -> net::awaitable<ProxyProtocolReadResult> {
         ProxyProtocolReadResult result;
         result.status = ProxyProtocolReadStatus::Invalid;
         result.result.status = ProxyProtocolParseStatus::Invalid;
         co_return result;
-    }
-    co_return co_await tcp->ReadProxyProtocolHeader(timeout);
+    }();
 }
 
 namespace {

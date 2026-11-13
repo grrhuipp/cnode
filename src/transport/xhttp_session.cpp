@@ -152,10 +152,10 @@ public:
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        if (!downlink_) {
-            co_return;
+        if (downlink_) {
+            return downlink_->AsyncShutdownWrite();
         }
-        co_await downlink_->AsyncShutdownWrite();
+        return []() -> net::awaitable<void> { co_return; }();
     }
 
     void Cancel() noexcept override {
@@ -1592,6 +1592,7 @@ net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest
     bool keep_alive,
     common::MultiBuffer read_ahead,
     common::BufferGuard head_storage,
+    std::string head_extended_storage,
     std::shared_ptr<XHttpPacketUpSession> session,
     const XHttpUploadTimeouts& timeouts) {
     if (kind == XHttpRequestMeta::Kind::PacketUp) {
@@ -1746,6 +1747,7 @@ net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest
         co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
     }
     head_storage = common::BufferGuard{};
+    std::string{}.swap(head_extended_storage);
     co_await session->JoinAttachedUpload();
     co_return false;
 }
@@ -1767,7 +1769,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
     InboundTransportMetadata* transport_metadata,
     std::span<const uint8_t> initial,
     const std::shared_ptr<InboundTransportStreamHandler>& stream_handler,
-    const XHttpUploadTimeouts& timeouts,
+    XHttpUploadTimeouts timeouts,
     bool start_persistent) {
     // RFC 9112 9.3: a packet-up upload leaves its HTTP/1.1 connection open for
     // the client's next, possibly pipelined, request. Every other request kind
@@ -1837,6 +1839,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
             auto metadata = transport_metadata
                 ? std::move(*transport_metadata) : InboundTransportMetadata{};
             head->storage = common::BufferGuard{};
+            std::string{}.swap(head->extended_storage);
             co_await stream_handler->OnInboundTransportStream(
                 std::move(logical), std::move(metadata));
             co_return std::unique_ptr<AsyncStream>{};
@@ -1869,6 +1872,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
                 std::string session_id(meta.session_id);
                 auto detached = DetachXHttpStream(*stream, head->TakeReadAheadMultiBuffer());
                 head->storage = common::BufferGuard{};
+                std::string{}.swap(head->extended_storage);
                 stream.reset();
                 if (!detached) {
                     co_return tl::unexpected(common::ErrorCode::SOCKET_READ_FAILED);
@@ -1891,6 +1895,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
                 stream, xhttp_cfg, conn_id, meta.kind, meta.session_id, meta.seq,
                 *body_framing, expect_100_continue, keep_alive,
                 std::move(read_ahead), std::move(head->storage),
+                std::move(head->extended_storage),
                 std::move(resolution.session), timeouts);
             if (!upload_result) {
                 co_return tl::unexpected(upload_result.error());
@@ -1920,6 +1925,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
         auto metadata = transport_metadata
             ? std::move(*transport_metadata) : InboundTransportMetadata{};
         head->storage = common::BufferGuard{};
+        std::string{}.swap(head->extended_storage);
         co_await stream_handler->OnInboundTransportStream(std::move(body), std::move(metadata));
         co_return std::unique_ptr<AsyncStream>{};
     }
@@ -1943,7 +1949,7 @@ net::awaitable<tl::expected<void, common::ErrorCode>> HandOffXHttpUpload(
     if (!resolution.owner) co_return tl::unexpected(OwnerMissError(*restored, kind));
     auto first = co_await ExecuteXHttp1UploadRequest(
         restored, xhttp_cfg, conn_id, kind, session_id, seq, framing,
-        expect_100_continue, keep_alive, {}, {}, std::move(resolution.session), timeouts);
+        expect_100_continue, keep_alive, {}, {}, {}, std::move(resolution.session), timeouts);
     if (!first) co_return tl::unexpected(first.error());
     if (!*first) co_return tl::expected<void, common::ErrorCode>{};
     const std::shared_ptr<InboundTransportStreamHandler> no_handler;
@@ -1966,19 +1972,26 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     InboundTransportMetadata* transport_metadata,
     std::span<const uint8_t> initial,
     const std::shared_ptr<InboundTransportStreamHandler>& stream_handler) {
-    const XHttpUploadTimeouts timeouts{
-        .stream_handler = &stream_handler,
-        .handshake_timeout = stream_handler
-            ? stream_handler->TransportHandshakeTimeout()
-            : std::chrono::seconds{0},
-        .idle_timeout = stream_handler
-            ? stream_handler->TransportIdleTimeout()
-            : std::chrono::seconds{0},
-        .active = (stream_handler != nullptr),
-    };
-    co_return co_await RunXHttp1ServerHandshake(coordinator, 
-        io_context, std::move(stream), xhttp_cfg, conn_id,
-        transport_metadata, initial, stream_handler, timeouts, false);
+    return RunXHttp1ServerHandshake(
+        coordinator,
+        io_context,
+        std::move(stream),
+        xhttp_cfg,
+        conn_id,
+        transport_metadata,
+        initial,
+        stream_handler,
+        XHttpUploadTimeouts{
+            .stream_handler = &stream_handler,
+            .handshake_timeout = stream_handler
+                ? stream_handler->TransportHandshakeTimeout()
+                : std::chrono::seconds{0},
+            .idle_timeout = stream_handler
+                ? stream_handler->TransportIdleTimeout()
+                : std::chrono::seconds{0},
+            .active = (stream_handler != nullptr),
+        },
+        false);
 }
 
 net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(

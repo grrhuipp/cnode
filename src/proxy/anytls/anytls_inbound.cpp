@@ -28,8 +28,6 @@
 #include <memory>
 #include <optional>
 #include <span>
-#include <string>
-#include <system_error>
 #include <utility>
 #include <unordered_map>
 
@@ -272,37 +270,66 @@ public:
         }
     }
 
-    net::awaitable<tl::expected<void, common::ErrorCode>>
-    WriteMultiBufferSerialized(uint8_t cmd, uint32_t sid, common::MultiBuffer mb) {
-        co_return co_await WriteSubstreamPayload(
-            sid,
-            [&]() {
-                return WriteMultiBufferAsFrameBatch(
-                    *stream_, cmd, sid, std::move(mb));
-            },
-            [&]() noexcept { mb.clear(); });
-    }
-
-    net::awaitable<tl::expected<void, common::ErrorCode>>
-    WriteBuffersSerialized(uint8_t cmd,
-                           uint32_t sid,
-                           std::span<const net::const_buffer> buffers) {
-        bool has_data = false;
-        for (const net::const_buffer& buffer : buffers) {
-            if (buffer.data() && buffer.size() > 0) {
-                has_data = true;
-                break;
+    template <typename Payload>
+    net::awaitable<void>
+    WriteSubstreamPayload(const AnyTLSSubStream& sub, uint8_t cmd, uint32_t sid, Payload payload) {
+        constexpr bool is_multi_buffer = std::is_same_v<Payload, common::MultiBuffer>;
+        auto release_payload = [&]() noexcept {
+            if constexpr (is_multi_buffer) {
+                payload.clear();
+            }
+        };
+        try {
+            sub.CheckWrite();
+        } catch (...) {
+            release_payload();
+            throw;
+        }
+        if constexpr (!is_multi_buffer) {
+            bool has_data = false;
+            for (const net::const_buffer& buffer : payload) {
+                if (buffer.data() && buffer.size() > 0) {
+                    has_data = true;
+                    break;
+                }
+            }
+            if (!has_data) {
+                co_return;
             }
         }
-        if (!has_data) {
-            co_return tl::expected<void, common::ErrorCode>{};
+        auto write_lease = write_gate_.TryAcquire();
+        if (!write_lease) write_lease = co_await write_gate_.Acquire();
+        if (!write_lease || cancelled_ || !stream_) {
+            release_payload();
+            throw transport::LinkError(common::ErrorCode::CONNECTION_CLOSED);
         }
-        co_return co_await WriteSubstreamPayload(
-            sid,
-            [&]() {
-                return WriteBuffersAsFrameBatch(*stream_, cmd, sid, buffers);
-            },
-            []() noexcept {});
+        try {
+            CheckStreamWrite(sid);
+        } catch (...) {
+            release_payload();
+            throw;
+        }
+        FrameBatch batch;
+        auto encoded = batch.Encode(cmd, sid, payload);
+        if (!encoded) {
+            release_payload();
+            throw transport::LinkError(
+                FinishPhysicalWrite(tl::unexpected(encoded.error())).error());
+        }
+        const auto framed = batch.Buffers();
+        if (!framed.empty()) {
+            try {
+                co_await stream_->WriteBuffers(framed);
+            } catch (const IoSystemError& e) {
+                release_payload();
+                throw transport::LinkError(
+                    FinishPhysicalWrite(tl::unexpected(common::MapAsioError(e.code()))).error());
+            } catch (...) {
+                release_payload();
+                RethrowPhysicalWriteException();
+            }
+        }
+        release_payload();
     }
 
     void RemoveStream(uint32_t sid) {
@@ -319,23 +346,6 @@ public:
     }
 
 private:
-    template <typename WriteOp, typename OnAborted>
-    net::awaitable<tl::expected<void, common::ErrorCode>>
-    WriteSubstreamPayload(uint32_t sid, WriteOp&& op, OnAborted&& on_aborted) {
-        auto write_lease = write_gate_.TryAcquire();
-        if (!write_lease) write_lease = co_await write_gate_.Acquire();
-        if (!write_lease || cancelled_ || !stream_) {
-            on_aborted();
-            co_return tl::unexpected(common::ErrorCode::CONNECTION_CLOSED);
-        }
-        CheckStreamWrite(sid);
-        try {
-            co_return FinishPhysicalWrite(co_await op());
-        } catch (...) {
-            RethrowPhysicalWriteException();
-        }
-    }
-
     tl::expected<void, common::ErrorCode>
     FinishPhysicalWrite(tl::expected<void, common::ErrorCode> result) noexcept {
         if (!result) FailPhysicalWrite(result.error());
@@ -478,15 +488,11 @@ private:
 };
 
 net::awaitable<void> AnyTLSSubStream::WriteMultiBuffer(common::MultiBuffer mb) {
-    CheckWrite();
-    auto ok = co_await session_.WriteMultiBufferSerialized(kCmdPSH, sid_, std::move(mb));
-    if (!ok) throw transport::LinkError(ok.error());
+    return session_.WriteSubstreamPayload(*this, kCmdPSH, sid_, std::move(mb));
 }
 
 net::awaitable<void> AnyTLSSubStream::WriteBuffers(std::span<const net::const_buffer> buffers) {
-    CheckWrite();
-    auto ok = co_await session_.WriteBuffersSerialized(kCmdPSH, sid_, buffers);
-    if (!ok) throw transport::LinkError(ok.error());
+    return session_.WriteSubstreamPayload(*this, kCmdPSH, sid_, buffers);
 }
 
 net::awaitable<void> AnyTLSSubStream::AsyncShutdownWrite() {
@@ -843,10 +849,13 @@ net::awaitable<tl::expected<void, common::ErrorCode>> ReadAuth(
 net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>>
 AuthenticateSession(
     transport::AsyncStream& stream,
-    proxy::InboundAuthentication authentication,
+    const app::AdmissionEnvironment& environment,
     common::Context& ctx,
     const infra::TimeoutsConfig& timeouts,
     std::chrono::seconds control_idle_timeout) {
+    auto auth_phase = co_await proxy::BeginInboundAuthentication(environment, ctx);
+    if (!auth_phase) co_return tl::unexpected(auth_phase.error());
+    auto authentication = std::move(*auth_phase);
     std::array<uint8_t, 32> auth_hash{};
     common::ScopedCleanse cleanse_hash{auth_hash};
     if (auto ok = co_await ReadAuth(stream, auth_hash); !ok) {
@@ -886,9 +895,6 @@ AnyTlsInboundHandler::Process(
     }
 
     try {
-        auto authentication = co_await proxy::BeginInboundAuthentication(environment_, ctx);
-        if (!authentication) co_return proxy::RejectInbound(environment_.stats, stream.get(), authentication.error());
-
         auto control_idle_timeout = timeouts.IdleTimeout();
         if (pressure_idle_timeout > 0) {
             control_idle_timeout = std::min(
@@ -899,7 +905,7 @@ AnyTlsInboundHandler::Process(
         common::UserOnlineSessionGuard user_session;
         {
             auto auth = co_await AuthenticateSession(
-                *stream, std::move(*authentication), ctx, timeouts, control_idle_timeout);
+                *stream, environment_, ctx, timeouts, control_idle_timeout);
             if (!auth) {
                 co_return proxy::RejectInbound(environment_.stats, stream.get(), auth.error());
             }

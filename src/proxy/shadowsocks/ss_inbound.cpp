@@ -19,7 +19,6 @@
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
 #include <algorithm>
-#include <cstring>
 #include <optional>
 #include <span>
 #include <utility>
@@ -411,8 +410,12 @@ PrepareSsTcpSession(
     const proxy::SsCipherInfo& cipher_info,
     size_t& last_matched_index,
     const app::AdmissionEnvironment& environment,
-    proxy::InboundAuthentication authentication,
     common::Context& ctx) {
+    auto auth_phase = co_await proxy::BeginInboundAuthentication(environment, ctx);
+    if (!auth_phase) {
+        co_return tl::unexpected(auth_phase.error());
+    }
+    auto authentication = std::move(*auth_phase);
     const std::string_view tag = ctx.inbound.tag;
     const auto& client_ip = ctx.inbound.source_ip;
     auto session_result = co_await proxy::ReadTCPSession(
@@ -564,14 +567,11 @@ proxy::SsInboundHandler::Process(
 
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
 
-    auto authentication = co_await proxy::BeginInboundAuthentication(environment_, ctx);
-    if (!authentication) co_return proxy::RejectInbound(environment_.stats, stream.get(), authentication.error());
     auto prepared = co_await PrepareSsTcpSession(
         *stream,
         cipher_info_,
         last_matched_index_,
         environment_,
-        std::move(*authentication),
         ctx);
     if (!prepared) {
         co_return proxy::RejectInbound(environment_.stats, stream.get(), prepared.error());

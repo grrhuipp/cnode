@@ -181,18 +181,22 @@ CompleteVlessInboundHandshake(
     const std::shared_ptr<const ::proxy::VlessEncryptionConfig>& decryption,
     proxy::BufferedStreamReader& protocol_reader,
     transport::MultiBufferWriter& protocol_writer,
-    std::optional<::proxy::VlessEncryptedIo>& encrypted_io,
+    std::optional<::proxy::VlessEncryptedIo>* encrypted_io,
     const app::AdmissionEnvironment& environment,
-    proxy::InboundAuthentication authentication,
     const app::ReceiverSettings& receiver,
     common::Context& ctx) {
+    auto auth_phase = co_await proxy::BeginInboundAuthentication(environment, ctx);
+    if (!auth_phase) {
+        co_return tl::unexpected(auth_phase.error());
+    }
+    auto authentication = std::move(*auth_phase);
     const std::string_view tag = ctx.inbound.tag;
     const auto& client_ip = ctx.inbound.source_ip;
     auto* active_reader = &protocol_reader;
     auto* active_writer = &protocol_writer;
     std::optional<::proxy::VlessEncryptionIssuedTicket> issued_ticket;
     std::optional<std::array<uint8_t, 16>> resumed_identity;
-    if (decryption) {
+    if (decryption && encrypted_io) {
         try {
             auto runtime =
                 co_await ::proxy::RunVlessEncryptionServerHandshake(
@@ -223,13 +227,15 @@ CompleteVlessInboundHandshake(
             }
             issued_ticket = std::move(runtime->issued_ticket);
             resumed_identity = runtime->resumed_identity;
-            encrypted_io.emplace(
+            encrypted_io->emplace(
                 protocol_reader, protocol_writer, std::move(*runtime));
-            active_reader = &encrypted_io->plain_reader;
-            active_writer = &encrypted_io->writer;
+            active_reader = &(*encrypted_io)->plain_reader;
+            active_writer = &(*encrypted_io)->writer;
         } catch (...) {
-            const common::ErrorCode classified = proxy::ClassifyInboundHandshakeException(
-                std::current_exception(), &stream, common::ErrorCode::PROTOCOL_DECODE_FAILED);
+            auto classified = proxy::ClassifyInboundHandshakeException(std::current_exception());
+            if (proxy::ConsumeStreamReadTimeout(stream)) {
+                classified = common::ErrorCode::TIMEOUT;
+            }
             if (classified == common::ErrorCode::CANCELLED) {
                 LOG_CONN_DEBUG(ctx, "encryption handshake cancelled from {}:{}",
                                client_ip, ctx.inbound.source_port);
@@ -326,6 +332,142 @@ CompleteVlessInboundHandshake(
         .active = {active_reader, active_writer},
     };
 }
+
+net::awaitable<app::RelayResult> DispatchVlessUdp(
+    std::unique_ptr<transport::AsyncStream> stream,
+    transport::MultiBufferReader& active_reader,
+    transport::MultiBufferWriter& active_writer,
+    bool packet_addr_udp,
+    routing::Dispatcher& dispatcher,
+    const app::ReceiverSettings& receiver,
+    net::io_context& io_context,
+    common::Context& ctx,
+    const app::AdmissionEnvironment& environment,
+    const infra::TimeoutsConfig& timeouts) {
+    ::proxy::VlessUdpStreamEndpoint udp_endpoint(
+        active_reader, active_writer, ctx.outbound.target, packet_addr_udp);
+    common::InitialPayload first_datagram;
+    if (packet_addr_udp) {
+        auto packet = co_await udp_endpoint.ReadMultiBuffer();
+        if (packet.empty()) co_return app::RelayResult{};
+        const auto datagram = common::InspectUdpDatagram(packet);
+        if (!datagram.Valid() || !datagram.target || !datagram.target->IsValid()) {
+            co_return proxy::RejectInbound(
+                environment.stats, stream.get(), common::ErrorCode::PROTOCOL_DECODE_FAILED);
+        }
+        // The magic address selects framing, not a routable destination.
+        proxy::BindInboundRequestTarget(
+            ctx, proxy::InboundRequestTarget{common::Network::UDP, *datagram.target});
+        first_datagram = common::InitialPayload(std::move(packet));
+    }
+    co_return co_await dispatcher.Dispatch(
+        io_context,
+        receiver.dispatch_policy,
+        std::move(stream),
+        transport::Link{&udp_endpoint, &udp_endpoint},
+        std::move(first_datagram),
+        ctx,
+        environment.stats,
+        timeouts);
+}
+
+net::awaitable<app::RelayResult> DispatchVlessVision(
+    std::unique_ptr<transport::AsyncStream> stream,
+    proxy::BufferedStreamReader& active_reader,
+    transport::MultiBufferWriter& active_writer,
+    std::array<uint8_t, 16> request_uuid,
+    routing::Dispatcher& dispatcher,
+    const app::ReceiverSettings& receiver,
+    net::io_context& io_context,
+    common::Context& ctx,
+    const app::AdmissionEnvironment& environment,
+    const infra::TimeoutsConfig& timeouts) {
+    ::proxy::VisionTrafficState traffic;
+    ::proxy::VisionReader vision_reader(active_reader, request_uuid, traffic);
+    ::proxy::VisionWriter vision_writer(active_writer, request_uuid, traffic);
+    OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
+    co_return co_await dispatcher.Dispatch(
+        io_context,
+        receiver.dispatch_policy,
+        std::move(stream),
+        transport::Link{&vision_reader, &vision_writer},
+        common::InitialPayload{},
+        ctx,
+        environment.stats,
+        timeouts);
+}
+
+struct VlessSessionMeta {
+    common::Network net = common::Network::TCP;
+    bool packet_addr_udp = false;
+    bool use_vision = false;
+};
+
+net::awaitable<app::RelayResult> DispatchVlessSession(
+    std::unique_ptr<transport::AsyncStream> stream,
+    proxy::BufferedStreamReader& active_reader,
+    transport::MultiBufferWriter& response_writer,
+    VlessSessionMeta meta,
+    std::array<uint8_t, 16> request_uuid,
+    routing::Dispatcher& dispatcher,
+    const app::ReceiverSettings& receiver,
+    net::io_context& io_context,
+    common::Context& ctx,
+    const app::AdmissionEnvironment& environment,
+    const infra::TimeoutsConfig& timeouts,
+    uint32_t pressure_idle_timeout) {
+    if (meta.net == common::Network::MUX) {
+        OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
+        return proxy::ServeMuxInbound(
+            io_context,
+            transport::Link{&active_reader, &response_writer},
+            *stream,
+            dispatcher,
+            receiver.dispatch_policy,
+            environment,
+            ctx,
+            environment.stats,
+            timeouts,
+            pressure_idle_timeout);
+    }
+    if (meta.net == common::Network::UDP) {
+        OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
+        return DispatchVlessUdp(
+            std::move(stream),
+            active_reader,
+            response_writer,
+            meta.packet_addr_udp,
+            dispatcher,
+            receiver,
+            io_context,
+            ctx,
+            environment,
+            timeouts);
+    }
+    if (meta.use_vision) {
+        return DispatchVlessVision(
+            std::move(stream),
+            active_reader,
+            response_writer,
+            request_uuid,
+            dispatcher,
+            receiver,
+            io_context,
+            ctx,
+            environment,
+            timeouts);
+    }
+    OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
+    return dispatcher.Dispatch(
+        io_context,
+        receiver.dispatch_policy,
+        std::move(stream),
+        transport::Link{&active_reader, &response_writer},
+        common::InitialPayload{},
+        ctx,
+        environment.stats,
+        timeouts);
+}
 }  // namespace
 
 namespace proxy {
@@ -347,6 +489,23 @@ public:
         uint32_t pressure_idle_timeout) override;
 
 private:
+    ::net::awaitable<::app::RelayResult> ProcessPlain(
+        std::unique_ptr<::transport::AsyncStream> stream,
+        ::routing::Dispatcher& dispatcher,
+        const ::app::ReceiverSettings& receiver,
+        ::net::io_context& io_context,
+        ::common::Context& ctx,
+        const ::infra::TimeoutsConfig& timeouts,
+        uint32_t pressure_idle_timeout);
+    ::net::awaitable<::app::RelayResult> ProcessEncrypted(
+        std::unique_ptr<::transport::AsyncStream> stream,
+        ::routing::Dispatcher& dispatcher,
+        const ::app::ReceiverSettings& receiver,
+        ::net::io_context& io_context,
+        ::common::Context& ctx,
+        const ::infra::TimeoutsConfig& timeouts,
+        uint32_t pressure_idle_timeout);
+
     const ::app::AdmissionEnvironment& environment_;
     std::shared_ptr<const ::proxy::VlessEncryptionConfig> decryption_;
 };
@@ -370,15 +529,78 @@ proxy::VlessInboundHandler::Process(
     common::Context& ctx,
     const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
+    if (decryption_) {
+        return ProcessEncrypted(
+            std::move(stream), dispatcher, receiver, io_context, ctx, timeouts, pressure_idle_timeout);
+    }
+    return ProcessPlain(
+        std::move(stream), dispatcher, receiver, io_context, ctx, timeouts, pressure_idle_timeout);
+}
 
+net::awaitable<app::RelayResult>
+proxy::VlessInboundHandler::ProcessPlain(
+    std::unique_ptr<transport::AsyncStream> stream,
+    routing::Dispatcher& dispatcher,
+    const app::ReceiverSettings& receiver,
+    net::io_context& io_context,
+    common::Context& ctx,
+    const infra::TimeoutsConfig& timeouts,
+    uint32_t pressure_idle_timeout) {
+    proxy::BufferedStreamReader protocol_reader(*stream);
+    common::UserOnlineSessionGuard user_session;
+    VlessSessionMeta meta;
+    std::array<uint8_t, 16> request_uuid{};
+    {
+        auto handshake = co_await CompleteVlessInboundHandshake(
+            *stream,
+            decryption_,
+            protocol_reader,
+            *stream,
+            nullptr,
+            environment_,
+            receiver,
+            ctx);
+        if (!handshake) {
+            co_return proxy::RejectInbound(environment_.stats, stream.get(), handshake.error());
+        }
+        user_session = std::move(handshake->user_session);
+        meta = {
+            .net = handshake->net,
+            .packet_addr_udp = handshake->packet_addr_udp,
+            .use_vision = handshake->use_vision,
+        };
+        if (meta.use_vision) {
+            request_uuid = handshake->request_uuid;
+        }
+        OPENSSL_cleanse(handshake->request_uuid.data(), handshake->request_uuid.size());
+    }
+    VlessResponseHeaderWriter response_writer(*stream);
+    const auto uuid = request_uuid;
+    OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
+    co_return co_await DispatchVlessSession(
+        std::move(stream),
+        protocol_reader,
+        response_writer,
+        meta,
+        uuid,
+        dispatcher,
+        receiver,
+        io_context,
+        ctx,
+        environment_,
+        timeouts,
+        pressure_idle_timeout);
+}
 
-    auto fail_abortive = [&](common::ErrorCode error) {
-        return proxy::RejectInbound(environment_.stats, stream.get(), error);
-    };
-
-    auto authentication = co_await proxy::BeginInboundAuthentication(environment_, ctx);
-    if (!authentication) co_return fail_abortive(authentication.error());
-
+net::awaitable<app::RelayResult>
+proxy::VlessInboundHandler::ProcessEncrypted(
+    std::unique_ptr<transport::AsyncStream> stream,
+    routing::Dispatcher& dispatcher,
+    const app::ReceiverSettings& receiver,
+    net::io_context& io_context,
+    common::Context& ctx,
+    const infra::TimeoutsConfig& timeouts,
+    uint32_t pressure_idle_timeout) {
     proxy::BufferedStreamReader protocol_reader(*stream);
     transport::MultiBufferWriter& protocol_writer = *stream;
     proxy::BufferedStreamReader* active_reader = &protocol_reader;
@@ -386,9 +608,7 @@ proxy::VlessInboundHandler::Process(
     std::optional<::proxy::VlessEncryptedIo> encrypted_io;
 
     common::UserOnlineSessionGuard user_session;
-    common::Network net = common::Network::TCP;
-    bool packet_addr_udp = false;
-    bool use_vision = false;
+    VlessSessionMeta meta;
     std::array<uint8_t, 16> request_uuid{};
     {
         auto handshake = co_await CompleteVlessInboundHandshake(
@@ -396,96 +616,42 @@ proxy::VlessInboundHandler::Process(
             decryption_,
             protocol_reader,
             protocol_writer,
-            encrypted_io,
+            &encrypted_io,
             environment_,
-            std::move(*authentication),
             receiver,
             ctx);
         if (!handshake) {
-            co_return fail_abortive(handshake.error());
+            co_return proxy::RejectInbound(environment_.stats, stream.get(), handshake.error());
         }
         active_reader = handshake->active.reader;
         active_writer = handshake->active.writer;
         user_session = std::move(handshake->user_session);
-        net = handshake->net;
-        packet_addr_udp = handshake->packet_addr_udp;
-        use_vision = handshake->use_vision;
-        if (use_vision) {
+        meta = {
+            .net = handshake->net,
+            .packet_addr_udp = handshake->packet_addr_udp,
+            .use_vision = handshake->use_vision,
+        };
+        if (meta.use_vision) {
             request_uuid = handshake->request_uuid;
         }
         OPENSSL_cleanse(handshake->request_uuid.data(), handshake->request_uuid.size());
     }
     VlessResponseHeaderWriter response_writer(*active_writer);
-    active_writer = &response_writer;
-
-    if (net == common::Network::MUX) {
-        co_return co_await proxy::ServeMuxInbound(
-            io_context,
-            transport::Link{active_reader, active_writer},
-            *stream,
-            dispatcher,
-            receiver.dispatch_policy,
-            environment_,
-            ctx,
-            environment_.stats,
-            timeouts,
-            pressure_idle_timeout);
-    }
-
-    if (net == common::Network::UDP) {
-        ::proxy::VlessUdpStreamEndpoint udp_endpoint(
-            *active_reader, *active_writer, ctx.outbound.target, packet_addr_udp);
-        common::InitialPayload first_datagram;
-        if (packet_addr_udp) {
-            auto packet = co_await udp_endpoint.ReadMultiBuffer();
-            if (packet.empty()) co_return app::RelayResult{};
-            const auto datagram = common::InspectUdpDatagram(packet);
-            if (!datagram.Valid() || !datagram.target || !datagram.target->IsValid())
-                co_return fail_abortive(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-            // The magic address selects framing, not a routable destination.
-            proxy::BindInboundRequestTarget(
-                ctx, proxy::InboundRequestTarget{common::Network::UDP, *datagram.target});
-            first_datagram = common::InitialPayload(std::move(packet));
-        }
-        co_return co_await dispatcher.Dispatch(
-            io_context,
-            receiver.dispatch_policy,
-            std::move(stream),
-            transport::Link{&udp_endpoint, &udp_endpoint},
-            std::move(first_datagram),
-            ctx,
-            environment_.stats,
-            timeouts);
-    }
-
-    if (use_vision) {
-        ::proxy::VisionTrafficState traffic;
-        ::proxy::VisionReader vision_reader(
-            *active_reader,
-            request_uuid,
-            traffic);
-        ::proxy::VisionWriter vision_writer(*active_writer, request_uuid, traffic);
-        OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
-        co_return co_await dispatcher.Dispatch(
-            io_context,
-            receiver.dispatch_policy,
-            std::move(stream),
-            transport::Link{&vision_reader, &vision_writer},
-            common::InitialPayload{},
-            ctx,
-            environment_.stats,
-            timeouts);
-    }
-
-    co_return co_await dispatcher.Dispatch(
-        io_context,
-        receiver.dispatch_policy,
+    const auto uuid = request_uuid;
+    OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
+    co_return co_await DispatchVlessSession(
         std::move(stream),
-        transport::Link{active_reader, active_writer},
-        common::InitialPayload{},
+        *active_reader,
+        response_writer,
+        meta,
+        uuid,
+        dispatcher,
+        receiver,
+        io_context,
         ctx,
-        environment_.stats,
-        timeouts);
+        environment_,
+        timeouts,
+        pressure_idle_timeout);
 }
 
 

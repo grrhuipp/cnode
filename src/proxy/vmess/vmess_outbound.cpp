@@ -109,38 +109,45 @@ private:
     const common::TargetAddress& udp_target_;
 };
 
-net::awaitable<tl::expected<void, common::ErrorCode>>
-SendVMessHandshake(
-    transport::AsyncStream& stream,
+net::awaitable<tl::expected<std::unique_ptr<transport::AsyncStream>, common::ErrorCode>>
+DialAndSendVMessHandshake(
+    common::Context& ctx,
+    transport::OutboundDialer& dialer,
+    const VmessPreparedSettings& prepared,
     ::proxy::ClientSession& vmess_session,
-    const ::proxy::VmessUserAccount& user,
-    const AES_KEY& auth_id_key,
-    const common::TargetAddress& target,
     ::proxy::VmessCommand command,
-    common::ForwardedMetadataView forwarded,
-    std::chrono::seconds handshake_timeout,
-    common::Context& ctx) {
-    stream.SetIdleTimeout(handshake_timeout);
+    std::chrono::seconds handshake_timeout) {
+    auto dialed = co_await dialer.Dial(ctx, prepared.config.server);
+    if (!dialed) {
+        co_return tl::unexpected(dialed.error());
+    }
+    auto stream = std::move(*dialed);
+    stream->SetIdleTimeout(handshake_timeout);
     transport::PhaseDeadlineToken outbound_protocol_deadline =
-        stream.StartPhaseDeadline(handshake_timeout);
+        stream->StartPhaseDeadline(handshake_timeout);
 
     auto handshake_result = co_await vmess_session.EncodeRequestHeader(
-        stream, user, auth_id_key, target, command, forwarded);
+        *stream,
+        prepared.user,
+        prepared.auth_id_key,
+        ctx.outbound.target,
+        command,
+        dialer.ForwardedMetadata(ctx));
     if (!handshake_result) {
         const bool timed_out = proxy::ConsumeOutboundHandshakeTimeout(
-            stream, outbound_protocol_deadline);
+            *stream, outbound_protocol_deadline);
         const common::ErrorCode code = timed_out ? common::ErrorCode::TIMEOUT : handshake_result.error();
         if (code != common::ErrorCode::CANCELLED && code != common::ErrorCode::CONNECTION_CLOSED &&
             code != common::ErrorCode::SOCKET_EOF) {
             LOG_CONN_WARN(ctx, "protocol handshake failed > {}", common::ErrorCodeToString(code));
         }
-        stream.Cancel();
+        stream->Cancel();
+        stream->CloseAbortive();
         co_return tl::unexpected(code);
     }
     LOG_CONN_DEBUG(ctx, "protocol handshake succeeded");
-    co_return tl::expected<void, common::ErrorCode>{};
+    co_return std::move(stream);
 }
-
 }  // namespace
 
 // proxy/vmess/outbound.Handler 实现
@@ -161,35 +168,26 @@ VmessOutboundHandler::Process(
     if (!inbound.Valid()) {
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    const auto& target = ctx.outbound.target;
-
-    auto dialed = co_await dialer.Dial(ctx, prepared_->config.server);
-    if (!dialed) {
-        co_return tl::unexpected(dialed.error());
-    }
-    auto stream = std::move(*dialed);
-
     const bool is_udp = ctx.content.network == common::Network::UDP;
     const auto command = is_udp ? ::proxy::VmessCommand::UDP : ::proxy::VmessCommand::TCP;
-    ::proxy::ClientSession vmess_session(
-        prepared_->config.security, command);
-
-    if (auto ok = co_await SendVMessHandshake(
-            *stream, vmess_session, prepared_->user, prepared_->auth_id_key,
-            target, command, dialer.ForwardedMetadata(ctx),
-            timeouts.HandshakeTimeout(), ctx); !ok) {
-        stream->CloseAbortive();
-        co_return tl::unexpected(ok.error());
+    ::proxy::ClientSession vmess_session(prepared_->config.security, command);
+    std::unique_ptr<transport::AsyncStream> stream;
+    {
+        auto dialed = co_await DialAndSendVMessHandshake(
+            ctx, dialer, *prepared_, vmess_session, command, timeouts.HandshakeTimeout());
+        if (!dialed) {
+            co_return tl::unexpected(dialed.error());
+        }
+        stream = std::move(*dialed);
     }
     proxy::ApplyOutboundRelayTimeouts(*stream, relay_config);
 
-    VMessOutboundEndpoint target_endpoint(vmess_session, *stream, is_udp, target);
+    VMessOutboundEndpoint target_endpoint(
+        vmess_session, *stream, is_udp, ctx.outbound.target);
     co_return co_await app::DoRelayLink(
         dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
         target_endpoint, ctx, stats, relay_config, std::move(first_payload));
 }
-
-  // namespace
 
 // ============================================================================
 // 自注册（静态初始化，Xray init() 设计）

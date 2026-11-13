@@ -320,20 +320,13 @@ WriteSlicesWithPadding(transport::AsyncStream& stream,
     if (remaining == 0) {
         co_return tl::expected<void, common::ErrorCode>{};
     }
-    auto write_span = [&stream](std::span<const net::const_buffer> out)
-        -> net::awaitable<tl::expected<void, common::ErrorCode>> {
-        if (out.empty()) {
-            co_return tl::expected<void, common::ErrorCode>{};
-        }
+    if (record_rules.empty()) {
         try {
-            co_await stream.WriteBuffers(out);
+            co_await stream.WriteBuffers(buffers);
         } catch (const IoSystemError& e) {
             co_return tl::unexpected(common::MapAsioError(e.code()));
         }
         co_return tl::expected<void, common::ErrorCode>{};
-    };
-    if (record_rules.empty()) {
-        co_return co_await write_span(buffers);
     }
 
     static constexpr std::array<uint8_t, 16384> kZeroWaste{};
@@ -391,15 +384,26 @@ WriteSlicesWithPadding(transport::AsyncStream& stream,
         } else {
             append_waste(out, waste_header, static_cast<uint16_t>(size));
         }
-        auto ok = co_await write_span(out.Span());
-        if (!ok) {
-            co_return tl::unexpected(ok.error());
+        const auto span = out.Span();
+        if (!span.empty()) {
+            try {
+                co_await stream.WriteBuffers(span);
+            } catch (const IoSystemError& e) {
+                co_return tl::unexpected(common::MapAsioError(e.code()));
+            }
         }
     }
     if (remaining > 0) {
         common::ConstBufferSpanBuilder<8> tail_out;
         append_data(tail_out, remaining);
-        co_return co_await write_span(tail_out.Span());
+        const auto span = tail_out.Span();
+        if (!span.empty()) {
+            try {
+                co_await stream.WriteBuffers(span);
+            } catch (const IoSystemError& e) {
+                co_return tl::unexpected(common::MapAsioError(e.code()));
+            }
+        }
     }
     co_return tl::expected<void, common::ErrorCode>{};
 }
