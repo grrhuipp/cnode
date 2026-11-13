@@ -21,7 +21,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-namespace proxy::vmess {
+namespace proxy {
 
 std::array<uint8_t, 16> MD5Hash(const uint8_t* data, size_t len) {
     const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>
@@ -112,7 +112,7 @@ void VmessKdfRecursive(
             std::memcpy(k_padded, key.data(), key.size());
         }
     } else {
-        VmessKdfRecursive(unsafe::ptr_cast<const uint8_t>(key.data()),
+        VmessKdfRecursive(common::ptr_cast<const uint8_t>(key.data()),
                           key.size(), path, depth - 1, k_padded);
     }
 
@@ -123,7 +123,7 @@ void VmessKdfRecursive(
     }
 
     alignas(16) uint8_t inner_stack[512];
-    std::pmr::vector<uint8_t> inner_heap{memory::process_resource()};
+    std::vector<uint8_t> inner_heap;
     uint8_t* inner_input = inner_stack;
     if (64 + data_len > sizeof(inner_stack)) {
         inner_heap.resize(64 + data_len);
@@ -151,7 +151,7 @@ void VmessKdfRecursive(
 }
 
 std::string_view AsText(std::span<const uint8_t> bytes) noexcept {
-    return {unsafe::ptr_cast<const char>(bytes.data()), bytes.size()};
+    return {common::ptr_cast<const char>(bytes.data()), bytes.size()};
 }
 
 HeaderAeadKey DeriveHeaderKey(std::span<const uint8_t> key_material,
@@ -229,7 +229,7 @@ HeaderAeadKey ResponseHeaderPayloadKey(std::span<const uint8_t, 16> response_key
     return derived;
 }
 
-std::optional<MemoryAccount> MemoryAccount::FromUUID(std::string_view uuid_str) {
+std::optional<VmessUserAccount> VmessUserAccount::FromUUID(std::string_view uuid_str) {
     auto uuid_bytes = ::common::ParseUuid(uuid_str);
     if (!uuid_bytes) {
         return std::nullopt;
@@ -237,8 +237,8 @@ std::optional<MemoryAccount> MemoryAccount::FromUUID(std::string_view uuid_str) 
     return FromUuidBytes(*uuid_bytes);
 }
 
-MemoryAccount MemoryAccount::FromUuidBytes(const std::array<uint8_t, 16>& uuid) {
-    MemoryAccount account;
+VmessUserAccount VmessUserAccount::FromUuidBytes(const std::array<uint8_t, 16>& uuid) {
+    VmessUserAccount account;
     account.uuid_bytes = uuid;
 
     std::array<uint8_t, 16 + kVmessMagic.size()> key_material{};
@@ -259,20 +259,20 @@ MemoryAccount MemoryAccount::FromUuidBytes(const std::array<uint8_t, 16>& uuid) 
 // VMessCipher 实现
 // ============================================================================
 
-VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* iv)
+VMessCipher::VMessCipher(VmessSecurity security, const uint8_t* key, const uint8_t* iv)
     : security_(security) {
     std::memcpy(iv_.data(), iv, iv_.size());
-    if (security == Security::NONE || security == Security::ZERO) {
+    if (security == VmessSecurity::NONE || security == VmessSecurity::ZERO) {
         return;
     }
-    if (security != Security::AES_128_GCM && security != Security::CHACHA20_POLY1305) {
+    if (security != VmessSecurity::AES_128_GCM && security != VmessSecurity::CHACHA20_POLY1305) {
         throw std::invalid_argument("unsupported VMess body security");
     }
     // ChaCha20-Poly1305 needs 32 bytes: MD5(key16) || MD5(MD5(key16)).
     std::array<uint8_t, 32> expanded{};
     std::span<const uint8_t> actual_key(key, 16);
     const EVP_AEAD* algorithm = EVP_aead_aes_128_gcm();
-    if (security == Security::CHACHA20_POLY1305) {
+    if (security == VmessSecurity::CHACHA20_POLY1305) {
         auto first = MD5Hash(key, 16);
         auto second = MD5Hash(first.data(), first.size());
         std::memcpy(expanded.data(), first.data(), first.size());
@@ -290,7 +290,7 @@ VMessCipher::VMessCipher(Security security, const uint8_t* key, const uint8_t* i
 }
 
 ssize_t VMessCipher::Encrypt(const uint8_t* plaintext, size_t len, uint8_t* ciphertext) {
-    if (security_ == Security::NONE || security_ == Security::ZERO) {
+    if (security_ == VmessSecurity::NONE || security_ == VmessSecurity::ZERO) {
         if (len > 0 && plaintext != ciphertext) std::memcpy(ciphertext, plaintext, len);
         return static_cast<ssize_t>(len);
     }
@@ -302,7 +302,7 @@ ssize_t VMessCipher::Encrypt(const uint8_t* plaintext, size_t len, uint8_t* ciph
 }
 
 ssize_t VMessCipher::Decrypt(const uint8_t* ciphertext, size_t len, uint8_t* plaintext) {
-    if (security_ == Security::NONE || security_ == Security::ZERO) {
+    if (security_ == VmessSecurity::NONE || security_ == VmessSecurity::ZERO) {
         if (len > 0 && plaintext != ciphertext) std::memcpy(plaintext, ciphertext, len);
         return static_cast<ssize_t>(len);
     }
@@ -316,8 +316,8 @@ ssize_t VMessCipher::Decrypt(const uint8_t* ciphertext, size_t len, uint8_t* pla
 
 size_t VMessCipher::Overhead() const {
     switch (security_) {
-        case Security::AES_128_GCM:
-        case Security::CHACHA20_POLY1305:
+        case VmessSecurity::AES_128_GCM:
+        case VmessSecurity::CHACHA20_POLY1305:
             return GCM_TAG_SIZE;
         default:
             return 0;
@@ -388,4 +388,4 @@ uint16_t ShakeMask::NextMask() {
     offset_ += 2;
     return result;
 }
-}  // namespace proxy::vmess
+}  // namespace proxy

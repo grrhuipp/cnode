@@ -60,7 +60,7 @@ public:
         } else transferred += buffer.size();
         co_return buffer.size();
     }
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override { co_return buf::MultiBuffer{}; }
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override { co_return common::MultiBuffer{}; }
     void ShutdownWrite() override {}
     void Cancel() noexcept override { NotifyCancellation(); }
     void Close() override { closed = true; }
@@ -68,10 +68,10 @@ public:
     bool IsOpen() const override { return !closed; }
 };
 
-buf::MultiBuffer Payload(size_t count) {
-    buf::MultiBuffer result;
+common::MultiBuffer Payload(size_t count) {
+    common::MultiBuffer result;
     for (size_t i = 0; i < count; ++i) {
-        buf::BufferGuard block{buf::Buffer::New()};
+        common::BufferGuard block{common::Buffer::New()};
         if (!block) throw std::bad_alloc();
         block->Tail()[0] = uint8_t(i);
         block->Produce(1);
@@ -85,62 +85,62 @@ template<class T> common::ErrorCode Result(const tl::expected<T, common::ErrorCo
 }
 
 net::awaitable<common::ErrorCode> Invoke(Stream& stream, int operation) {
-    const proxy::anytls::PaddingScheme no_padding;
-    const auto padding = *proxy::anytls::ParsePaddingScheme("stop=2\n1=64-65\n");
+    const proxy::AnyTlsPaddingScheme no_padding;
+    const auto padding = *proxy::ParseAnyTlsPaddingScheme("stop=2\n1=64-65\n");
     const std::array<uint8_t, 9> bytes{1, 2, 3, 4, 5, 6, 7, 8, 9};
     std::array<net::const_buffer, 9> buffers;
     for (size_t i = 0; i < buffers.size(); ++i) buffers[i] = net::buffer(bytes.data() + i, 1);
     switch (operation) {
-        case 0: co_return Result(co_await proxy::anytls::ReadFrameHeader(stream));
-        case 1: co_return Result(co_await proxy::anytls::ReadFrameText(stream, 19));
-        case 2: co_return Result(co_await proxy::anytls::DiscardFramePayload(stream, 9000));
-        case 3: co_return Result(co_await proxy::anytls::ReadFramePayload(stream, 9000));
-        case 4: co_return Result(co_await proxy::anytls::WriteAll(stream, bytes));
-        case 5: co_return Result(co_await proxy::anytls::WriteFrame(stream, 2, 1, bytes));
+        case 0: co_return Result(co_await proxy::ReadAnyTlsFrameHeader(stream));
+        case 1: co_return Result(co_await proxy::ReadFrameText(stream, 19));
+        case 2: co_return Result(co_await proxy::DiscardFramePayload(stream, 9000));
+        case 3: co_return Result(co_await proxy::ReadFramePayload(stream, 9000));
+        case 4: co_return Result(co_await proxy::WriteAll(stream, bytes));
+        case 5: co_return Result(co_await proxy::WriteFrame(stream, 2, 1, bytes));
         case 6: {
             auto body = Payload(1);
-            co_return Result(co_await proxy::anytls::WriteFrame(stream, 2, 1, (*body.begin())->Bytes()));
+            co_return Result(co_await proxy::WriteFrame(stream, 2, 1, (*body.begin())->Bytes()));
         }
-        case 7: co_return Result(co_await proxy::anytls::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1)));
-        case 8: co_return Result(co_await proxy::anytls::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(9)));
-        case 9: co_return Result(co_await proxy::anytls::WriteMultiBufferAsFramesWithPadding(stream, padding, 1, 2, 1, Payload(9)));
-        case 10: co_return Result(co_await proxy::anytls::WriteBuffersAsFramesWithPadding(stream, no_padding, 0, 2, 1, std::span(buffers).first(1)));
-        case 11: co_return Result(co_await proxy::anytls::WriteBuffersAsFramesWithPadding(stream, no_padding, 0, 2, 1, buffers));
-        case 12: co_return Result(co_await proxy::anytls::WriteBuffersAsFramesWithPadding(stream, padding, 1, 2, 1, buffers));
-        case 13: co_return Result(co_await proxy::anytls::WritePacketWithPadding(stream, padding, 1, std::pmr::vector<uint8_t>(bytes.begin(), bytes.end(), memory::process_resource())));
-        case 14: co_return Result(co_await proxy::anytls::WritePacketWithPadding(stream, no_padding, 0, std::pmr::vector<uint8_t>(bytes.begin(), bytes.end(), memory::process_resource())));
+        case 7: co_return Result(co_await proxy::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1)));
+        case 8: co_return Result(co_await proxy::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(9)));
+        case 9: co_return Result(co_await proxy::WriteAnyTlsMultiBufferAsFramesWithPadding(stream, padding, 1, 2, 1, Payload(9)));
+        case 10: co_return Result(co_await proxy::WriteAnyTlsBuffersAsFramesWithPadding(stream, no_padding, 0, 2, 1, std::span(buffers).first(1)));
+        case 11: co_return Result(co_await proxy::WriteAnyTlsBuffersAsFramesWithPadding(stream, no_padding, 0, 2, 1, buffers));
+        case 12: co_return Result(co_await proxy::WriteAnyTlsBuffersAsFramesWithPadding(stream, padding, 1, 2, 1, buffers));
+        case 13: co_return Result(co_await proxy::WriteAnyTlsPacketWithPadding(stream, padding.RecordFor(1), std::vector<uint8_t>(bytes.begin(), bytes.end())));
+        case 14: co_return Result(co_await proxy::WriteAnyTlsPacketWithPadding(stream, no_padding.RecordFor(0), std::vector<uint8_t>(bytes.begin(), bytes.end())));
         case 16: {
-            const auto large = *proxy::anytls::ParsePaddingScheme("stop=2\n1=65535-65535,65535-65535\n");
-            co_return Result(co_await proxy::anytls::WritePacketWithPadding(stream, large, 1,
-                std::pmr::vector<uint8_t>(bytes.begin(), bytes.end(), memory::process_resource())));
+            const auto large = *proxy::ParseAnyTlsPaddingScheme("stop=2\n1=65535-65535,65535-65535\n");
+            co_return Result(co_await proxy::WriteAnyTlsPacketWithPadding(stream, large.RecordFor(1),
+                std::vector<uint8_t>(bytes.begin(), bytes.end())));
         }
         case 17: {
-            const auto split = *proxy::anytls::ParsePaddingScheme("stop=2\n1=1-1,7-7,8-8\n");
-            co_return Result(co_await proxy::anytls::WritePacketWithPadding(stream, split, 1,
-                std::pmr::vector<uint8_t>(bytes.begin(), bytes.end(), memory::process_resource())));
+            const auto split = *proxy::ParseAnyTlsPaddingScheme("stop=2\n1=1-1,7-7,8-8\n");
+            co_return Result(co_await proxy::WriteAnyTlsPacketWithPadding(stream, split.RecordFor(1),
+                std::vector<uint8_t>(bytes.begin(), bytes.end())));
         }
-        default: co_return Result(co_await proxy::anytls::WriteMultiBufferAsFramesWithPadding(stream, no_padding, 0, 2, 1, Payload(9)));
+        default: co_return Result(co_await proxy::WriteAnyTlsMultiBufferAsFramesWithPadding(stream, no_padding, 0, 2, 1, Payload(9)));
     }
 }
 
 TEST(AnytlsCodecErrors, FrameBatchReencodesAfterGrowthAndShrink) {
-    proxy::anytls::FrameBatch batch;
+    proxy::FrameBatch batch;
+    const std::array<uint8_t, 9> raw{0, 1, 2, 3, 4, 5, 6, 7, 8};
+    std::array<net::const_buffer, 9> input;
+    for (size_t i = 0; i < input.size(); ++i) input[i] = net::buffer(raw.data() + i, 1);
     for (size_t count : {size_t(1), size_t(9), size_t(1), size_t(0)}) {
         SCOPED_TRACE(count);
-        auto payload = Payload(count);
-        ASSERT_TRUE(batch.Encode(2, 1, payload));
+        ASSERT_TRUE(batch.Encode(2, 1, std::span(input).first(count)));
         const auto buffers = batch.Buffers();
         ASSERT_EQ(buffers.size(), count * 2);
-        size_t index = 0;
-        for (const auto* block : payload) {
+        for (size_t index = 0; index < count; ++index) {
             const auto& header = buffers[index * 2];
             const auto& body = buffers[index * 2 + 1];
-            ASSERT_EQ(header.size(), 7);
+            ASSERT_EQ(header.size(), 7u);
             const std::array<uint8_t, 7> expected{2, 0, 0, 0, 1, 0, 1};
             EXPECT_EQ(std::memcmp(header.data(), expected.data(), expected.size()), 0);
-            ASSERT_EQ(body.size(), 1);
-            EXPECT_EQ(*static_cast<const uint8_t*>(body.data()), block->Bytes()[0]);
-            ++index;
+            ASSERT_EQ(body.size(), 1u);
+            EXPECT_EQ(*static_cast<const uint8_t*>(body.data()), static_cast<uint8_t>(index));
         }
     }
 }
@@ -148,7 +148,7 @@ TEST(AnytlsCodecErrors, FrameBatchReencodesAfterGrowthAndShrink) {
 TEST(AnytlsCodecErrors, DeferredBatchOwnsPayloadUntilAwaited) {
     net::io_context io;
     Stream stream;
-    auto pending = proxy::anytls::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1));
+    auto pending = proxy::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1));
     EXPECT_EQ(stream.transferred, 0);
     bool returned = false;
     common::ErrorCode code = common::ErrorCode::INTERNAL;
@@ -160,8 +160,8 @@ TEST(AnytlsCodecErrors, DeferredBatchOwnsPayloadUntilAwaited) {
     io.run();
     EXPECT_TRUE(returned);
     EXPECT_EQ(code, common::ErrorCode::OK);
-    EXPECT_EQ(stream.transferred, proxy::anytls::kFrameHeaderSize + 1);
-    EXPECT_EQ(memory::detail::test_buffers_live, 0);
+    EXPECT_EQ(stream.transferred, proxy::kFrameHeaderSize + 1);
+    EXPECT_EQ(common::test_buffers_live, 0);
 }
 
 void ExerciseOperation(int operation, Fault fault, size_t threshold) {
@@ -204,7 +204,7 @@ void ExerciseOperation(int operation, Fault fault, size_t threshold) {
         EXPECT_EQ(stream.failures, 1);
         EXPECT_EQ(stream.transferred, threshold);
     }
-    EXPECT_EQ(memory::detail::test_buffers_live, 0);
+    EXPECT_EQ(common::test_buffers_live, 0);
 }
 }
 
@@ -247,15 +247,15 @@ TEST_P(AnytlsLargePaddingFault, ReleasesPayloadAfterPartialWrite) {
 INSTANTIATE_TEST_SUITE_P(Faults, AnytlsLargePaddingFault, testing::Range(1, 8));
 
 TEST(AnytlsCodecErrors, HandshakeEofDistinguishesCloseFromTruncation) {
-    for (size_t prefix = 0; prefix < proxy::anytls::kFrameHeaderSize; ++prefix) {
+    for (size_t prefix = 0; prefix < proxy::kFrameHeaderSize; ++prefix) {
         net::io_context io;
         Stream stream;
         stream.eof_after = prefix;
         common::ErrorCode result = common::ErrorCode::INTERNAL;
         std::exception_ptr failure;
         bool has_header = true;
-        net::co_spawn(io, proxy::anytls::ReadFrameHeader(stream),
-            [&](std::exception_ptr error, tl::expected<proxy::anytls::FrameHeader, common::ErrorCode> header) {
+        net::co_spawn(io, proxy::ReadAnyTlsFrameHeader(stream),
+            [&](std::exception_ptr error, tl::expected<proxy::AnyTlsFrameHeader, common::ErrorCode> header) {
                 failure = error;
                 has_header = header.has_value();
                 if (!header) result = header.error();

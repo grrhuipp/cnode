@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "api/v2board/panel_data.hpp"
+#include "api/panel_data.hpp"
 #include <vector>
 
 TEST(V2BoardOnlineReport, DeduplicatesDevicesAndExcludesInvalidUsers) {
@@ -7,7 +7,7 @@ TEST(V2BoardOnlineReport, DeduplicatesDevicesAndExcludesInvalidUsers) {
         {.UID = 7, .IP = "203.0.113.2"}, {.UID = 7, .IP = "203.0.113.1"},
         {.UID = 7, .IP = "203.0.113.1"}, {.UID = 8, .IP = "203.0.113.8"},
         {.UID = 0, .IP = "203.0.113.9"}};
-    const auto report = ::api::v2board::BuildOnlineReportPayload(devices, 42);
+    const auto report = ::api::BuildOnlineReportPayload(devices, 42);
     EXPECT_EQ(report.user_count, 2u);
     EXPECT_EQ(report.device_count, 3u);
     ASSERT_EQ(report.alive_body.size(), 2u);
@@ -18,7 +18,7 @@ TEST(V2BoardOnlineReport, DeduplicatesDevicesAndExcludesInvalidUsers) {
 }
 
 TEST(V2BoardOnlineReport, EmptySnapshotClearsReportedDevices) {
-    const auto report = ::api::v2board::BuildOnlineReportPayload({}, 42);
+    const auto report = ::api::BuildOnlineReportPayload({}, 42);
     EXPECT_EQ(report.user_count, 0u);
     EXPECT_EQ(report.device_count, 0u);
     EXPECT_TRUE(report.alive_body.empty());

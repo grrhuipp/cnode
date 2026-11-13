@@ -6,7 +6,7 @@
 #include <stdexcept>
 
 TEST(PanelNodeIds, AcceptsPositiveIdsThroughIntMaximum) {
-    const auto ids = ::infra::PanelNodeIds::Parse(::json::array{
+    const auto ids = ::infra::PanelNodeIds::Parse(::infra::array{
         int64_t{1}, uint64_t{static_cast<uint64_t>(std::numeric_limits<int>::max())}});
     EXPECT_FALSE(ids.Empty());
     EXPECT_EQ(ids.Front(), 1);
@@ -23,15 +23,15 @@ TEST(PanelNodeIds, ConstructsSinglePositiveId) {
 namespace {
 class InvalidPanelNodeIds : public ::testing::TestWithParam<int> {};
 TEST_P(InvalidPanelNodeIds, RejectsInvalidNodeSelection) {
-    ::json::value value;
+    ::infra::value value;
     switch (GetParam()) {
-    case 0: value = ::json::array{}; break;
+    case 0: value = ::infra::array{}; break;
     case 1: value = int64_t{1}; break;
-    case 2: value = ::json::array{int64_t{-1}}; break;
-    case 3: value = ::json::array{int64_t{0}}; break;
-    case 4: value = ::json::array{uint64_t{static_cast<uint64_t>(std::numeric_limits<int>::max()) + 1}}; break;
-    case 5: value = ::json::array{int64_t{1}, "2"}; break;
-    case 6: value = ::json::array{int64_t{1}, int64_t{1}}; break;
+    case 2: value = ::infra::array{int64_t{-1}}; break;
+    case 3: value = ::infra::array{int64_t{0}}; break;
+    case 4: value = ::infra::array{uint64_t{static_cast<uint64_t>(std::numeric_limits<int>::max()) + 1}}; break;
+    case 5: value = ::infra::array{int64_t{1}, "2"}; break;
+    case 6: value = ::infra::array{int64_t{1}, int64_t{1}}; break;
     }
     EXPECT_THROW(static_cast<void>(::infra::PanelNodeIds::Parse(value)), std::invalid_argument);
 }

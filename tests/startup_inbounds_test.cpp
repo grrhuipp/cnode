@@ -1,14 +1,13 @@
 #include <gtest/gtest.h>
 
 #include "app/prepared_inbound.hpp"
-#include "app/proxyman/inbound/handler.hpp"
-#include "app/proxyman/inbound/user_store.hpp"
-#include "core/constants.hpp"
+#include "app/proxyman/inbound_handler.hpp"
+#include "app/proxyman/user_store.hpp"
+#include "common/constants.hpp"
 #include "infra/config_types.hpp"
-#include "features/routing/dispatcher.hpp"
+#include "routing/dispatcher.hpp"
 #include "proxy/inbound.hpp"
-#include "transport/internet/stream_settings.hpp"
-
+#include "transport/stream_settings.hpp"
 #include <algorithm>
 #include <array>
 #include <span>
@@ -16,7 +15,7 @@
 
 
 namespace {
-using namespace ::proxyman::inbound;
+using namespace ::app;
 size_t user_builds = 0;
 
 // Marks a prepared user with the credential text it was built from.
@@ -41,7 +40,7 @@ infra::StaticInboundConfig Source(std::string tag, uint16_t port, std::string us
     source.protocol = "vmess";
     source.tags.push_back(std::move(tag));
     source.port = port;
-    source.listen = *transport::internet::InboundListen::Parse("127.0.0.1");
+    source.listen = *transport::InboundListen::Parse("127.0.0.1");
     source.users.push_back(infra::InboundUserSpec{.user_id = 0, .email = {}, .credential = std::move(user), .flow = {}, .speed_limit = 0, .device_limit = 0});
     return source;
 }
@@ -69,7 +68,7 @@ protected:
 
     void TearDown() override {
         for (const auto tag : {std::string_view("static-owner"),
-                               std::string_view(constants::test::kTestInboundTag)}) {
+                               std::string_view(common::kTestInboundTag)}) {
             auto snapshot = UserStore::PrepareClearUsers(UserProtocol::Vmess, tag);
             UserStore::CommitSnapshot(std::move(snapshot));
         }
@@ -83,8 +82,8 @@ class StartupReservedBinding : public StartupInboundTest,
 
 TEST_P(StartupReservedBinding, RejectsCollisionBeforeBuildingCredentials) {
     auto source = GetParam()
-        ? Source(std::string(constants::test::kTestInboundTag), 12000)
-        : Source("static-owner", constants::test::kTestPort);
+        ? Source(std::string(common::kTestInboundTag), 12000)
+        : Source("static-owner", common::kTestPort);
     EXPECT_THROW((void)app::PrepareStartupInbounds({source}, true), std::invalid_argument);
     EXPECT_EQ(user_builds, 0u);
 }
@@ -98,10 +97,10 @@ TEST_F(StartupInboundTest, PreparationAddsTestInboundWithoutPublishingUsers) {
     const auto old = UserStore::VmessUsers("static-owner").users;
     const auto prepared = app::PrepareStartupInbounds({Source("static-owner", 12000)}, true);
     ASSERT_EQ(prepared.size(), 2u);
-    EXPECT_EQ(prepared[1].binding.tag, constants::test::kTestInboundTag);
-    EXPECT_EQ(prepared[1].binding.port, constants::test::kTestPort);
+    EXPECT_EQ(prepared[1].binding.tag, common::kTestInboundTag);
+    EXPECT_EQ(prepared[1].binding.port, common::kTestPort);
     EXPECT_EQ(UserStore::VmessUsers("static-owner").users, old);
-    EXPECT_TRUE(UserStore::VmessUsers(constants::test::kTestInboundTag).empty());
+    EXPECT_TRUE(UserStore::VmessUsers(common::kTestInboundTag).empty());
 }
 
 TEST_F(StartupInboundTest, InvalidCredentialsLeavePublishedUsersUntouched) {
@@ -119,11 +118,11 @@ class StartupDispatchPolicy : public StartupInboundTest,
 TEST_P(StartupDispatchPolicy, PreservesExplicitRoutingAndOutboundSelection) {
     auto source = Source("configured", 12002);
     source.routing_enabled = GetParam() != StartupPolicy::Forced;
-    source.proxy_protocol = transport::internet::ProxyProtocolMode::On;
+    source.proxy_protocol = transport::ProxyProtocolMode::On;
     if (GetParam() != StartupPolicy::Routed) source.outbound_tag = "custom-out";
     const auto prepared = app::PrepareStartupInbounds({source}, false);
     ASSERT_EQ(prepared.size(), 1u);
-    EXPECT_EQ(prepared[0].receiver.proxy_protocol, transport::internet::ProxyProtocolMode::On);
+    EXPECT_EQ(prepared[0].receiver.proxy_protocol, transport::ProxyProtocolMode::On);
     const auto& policy = prepared[0].receiver.dispatch_policy.outbound;
     if (GetParam() == StartupPolicy::Routed) {
         EXPECT_TRUE(std::holds_alternative<routing::RouteWithFallback>(policy));

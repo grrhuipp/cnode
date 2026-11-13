@@ -1,14 +1,12 @@
 #include "sniff/sniffer.hpp"
-
 #include "common/byte_reader.hpp"
 #include "common/domain_name.hpp"
 #include "common/ip_utils.hpp"
 #include "common/target_address.hpp"
 #include "common/unsafe.hpp"
-#include "core/constants.hpp"
-#include "transport/internet/http_headers.hpp"
-#include "transport/internet/tls_server_name.hpp"
-
+#include "common/constants.hpp"
+#include "transport/http_headers.hpp"
+#include "transport/tls_server_name.hpp"
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 
@@ -82,11 +80,11 @@ constexpr size_t kMaxTlsSniffHandshakeBytes =
         // RFC 8446 §4.2: duplicate extensions of one type are ambiguous.
         if (server_name) return std::nullopt;
         auto parsed =
-            transport::internet::ParseTlsServerNameExtension(extension);
+            transport::ParseTlsServerNameExtension(extension);
         if (!parsed ||
-            !domain::IsValidDnsHostname(
-                *parsed, domain::TrailingDotPolicy::Forbid) ||
-            iputil::ParseLiteral(*parsed)) {
+            !common::IsValidDnsHostname(
+                *parsed, common::TrailingDotPolicy::Forbid) ||
+            common::ParseLiteral(*parsed)) {
             return std::nullopt;
         }
         server_name = *parsed;
@@ -129,10 +127,17 @@ constexpr size_t kMaxTlsSniffHandshakeBytes =
     if (auto server_name =
             ParseClientHelloServerName(handshake.first(hello_size))) {
         result.success = true;
-        result.protocol = constants::protocol::kTls;
+        result.protocol = common::kTls;
         result.domain.assign(*server_name);
     }
     return true;
+}
+
+void MarkTlsNeedMore(bool version_supports_need_more, SniffResult& result) noexcept {
+    if (version_supports_need_more) {
+        result.need_more = true;
+        result.protocol = common::kTls;
+    }
 }
 
 [[nodiscard]] bool ReadRecordHeader(
@@ -143,10 +148,7 @@ constexpr size_t kMaxTlsSniffHandshakeBytes =
     if (reader.ReadU8() != kContentTypeHandshake) return false;
     if (reader.Empty() ||
         (reader.Remaining() == 1 && reader.ReadU8() == 0x03)) {
-        if (version_supports_need_more) {
-            result.need_more = true;
-            result.protocol = constants::protocol::kTls;
-        }
+        MarkTlsNeedMore(version_supports_need_more, result);
         return false;
     }
     const uint16_t record_version = reader.ReadU16BE();
@@ -159,10 +161,7 @@ constexpr size_t kMaxTlsSniffHandshakeBytes =
         version_supports_need_more &&
         record_version >= kTls10 && record_version <= kTls13;
     if (reader.Remaining() < 2) {
-        if (version_supports_need_more) {
-            result.need_more = true;
-            result.protocol = constants::protocol::kTls;
-        }
+        MarkTlsNeedMore(version_supports_need_more, result);
         return false;
     }
     record_len = reader.ReadU16BE();
@@ -178,62 +177,42 @@ static constexpr std::array<std::string_view, 9> kHttpMethods{
     "GET", "POST", "PUT", "DELETE", "HEAD",
     "OPTIONS", "PATCH", "CONNECT", "TRACE"};
 
-[[nodiscard]] bool IsSupportedRequestLine(std::string_view line) noexcept {
+[[nodiscard]] bool CheckHttpRequestLine(std::string_view line, bool allow_partial) noexcept {
+    if (allow_partial && line.ends_with('\r')) {
+        line.remove_suffix(1);
+        allow_partial = false;
+    }
+    if (line.empty()) return false;
+    for (const unsigned char character : line) {
+        if (character < 0x20 || character == 0x7f) return false;
+    }
+
     const size_t first_space = line.find(' ');
-    if (first_space == std::string_view::npos || first_space == 0) return false;
+    if (first_space == std::string_view::npos) {
+        return allow_partial && std::ranges::any_of(kHttpMethods, [&](std::string_view method) {
+            return method.starts_with(line);
+        });
+    }
+    if (first_space == 0 ||
+        std::ranges::find(kHttpMethods, line.substr(0, first_space)) == kHttpMethods.end()) {
+        return false;
+    }
+
     const size_t second_space = line.find(' ', first_space + 1);
-    if (second_space == std::string_view::npos ||
-        second_space == first_space + 1 ||
+    if (second_space == std::string_view::npos) {
+        return allow_partial;
+    }
+    if (second_space == first_space + 1 ||
         line.find(' ', second_space + 1) != std::string_view::npos) {
         return false;
     }
 
-    const std::string_view method = line.substr(0, first_space);
-    if (std::ranges::find(kHttpMethods, method) == kHttpMethods.end()) return false;
-
-    const std::string_view target =
-        line.substr(first_space + 1, second_space - first_space - 1);
-    for (const unsigned char character : target) {
-        if (character <= 0x20 || character == 0x7f) return false;
-    }
-
     const std::string_view version = line.substr(second_space + 1);
+    if (allow_partial) {
+        return std::string_view("HTTP/1.0").starts_with(version) ||
+               std::string_view("HTTP/1.1").starts_with(version);
+    }
     return version == "HTTP/1.0" || version == "HTTP/1.1";
-}
-
-[[nodiscard]] bool IsValidRequestLinePrefix(std::string_view prefix) noexcept {
-    if (prefix.empty()) return false;
-    const bool trailing_cr = prefix.back() == '\r';
-    if (trailing_cr) prefix.remove_suffix(1);
-    if (prefix.empty()) return false;
-    for (const unsigned char character : prefix) {
-        if (character < 0x20 || character == 0x7f) return false;
-    }
-    if (trailing_cr) {
-        return IsSupportedRequestLine(prefix);
-    }
-
-    const size_t first_space = prefix.find(' ');
-    if (first_space == std::string_view::npos) {
-        return std::ranges::any_of(kHttpMethods, [&](std::string_view method) {
-            return method.starts_with(prefix);
-        });
-    }
-    if (first_space == 0) return false;
-    const std::string_view method = prefix.substr(0, first_space);
-    if (std::ranges::find(kHttpMethods, method) == kHttpMethods.end()) return false;
-
-    const size_t second_space = prefix.find(' ', first_space + 1);
-    if (second_space == std::string_view::npos) {
-        return true;
-    }
-    if (second_space == first_space + 1 ||
-        prefix.find(' ', second_space + 1) != std::string_view::npos) {
-        return false;
-    }
-    const std::string_view version_prefix = prefix.substr(second_space + 1);
-    return std::string_view("HTTP/1.0").starts_with(version_prefix) ||
-           std::string_view("HTTP/1.1").starts_with(version_prefix);
 }
 
 [[nodiscard]] bool IsValidHeaderLinePrefix(std::string_view prefix) noexcept {
@@ -245,16 +224,16 @@ static constexpr std::array<std::string_view, 9> kHttpMethods{
 
     if (prefix.find(':') == std::string_view::npos) {
         if (trailing_cr) return false;
-        return transport::internet::IsValidHttpHeaderName(prefix);
+        return transport::IsValidHttpHeaderName(prefix);
     }
     std::string_view name;
     std::string_view value;
-    return transport::internet::SplitAndValidateHttpHeaderLine(prefix, name, value);
+    return transport::SplitAndValidateHttpHeaderLine(prefix, name, value);
 }
 
 [[nodiscard]] std::optional<HostPortView> ParseHostValue(
     std::string_view value) {
-    if (value.empty() || !transport::internet::IsValidHttpAuthority(value)) {
+    if (value.empty() || !transport::IsValidHttpAuthority(value)) {
         return std::nullopt;
     }
 
@@ -266,7 +245,7 @@ static constexpr std::array<std::string_view, 9> kHttpMethods{
             return std::nullopt;
         }
         parsed.host = value.substr(1, close - 1);
-        const auto address = iputil::ParseLiteral(parsed.host);
+        const auto address = common::ParseLiteral(parsed.host);
         if (!address || !address->is_v6()) return std::nullopt;
         const std::string_view suffix = value.substr(close + 1);
         if (!suffix.empty() &&
@@ -291,12 +270,12 @@ static constexpr std::array<std::string_view, 9> kHttpMethods{
         }
         parsed.host = value.substr(0, colon);
     }
-    if (!domain::IsValidDnsHostname(
-            parsed.host, domain::TrailingDotPolicy::Allow)) {
+    if (!common::IsValidDnsHostname(
+            parsed.host, common::TrailingDotPolicy::Allow)) {
         return std::nullopt;
     }
     if (parsed.host.ends_with('.') &&
-        iputil::ParseLiteral(domain::WithoutTrailingRootDot(parsed.host)).has_value()) {
+        common::ParseLiteral(common::WithoutTrailingRootDot(parsed.host)).has_value()) {
         return std::nullopt;
     }
     return parsed;
@@ -388,25 +367,11 @@ bool HkdfExpandLabel(std::span<const uint8_t> secret,
     return true;
 }
 
-EVP_CIPHER_CTX* ThreadLocalQuicCipherCtx() noexcept {
-    struct Holder {
-        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-        ~Holder() {
-            if (ctx) EVP_CIPHER_CTX_free(ctx);
-        }
-    };
-    thread_local Holder holder;
-    if (holder.ctx) {
-        EVP_CIPHER_CTX_reset(holder.ctx);
-    }
-    return holder.ctx;
-}
-
-bool AesEcbEncrypt(std::span<const uint8_t, 16> key,
+bool AesEcbEncrypt(EVP_CIPHER_CTX* ctx,
+                   std::span<const uint8_t, 16> key,
                    std::span<const uint8_t, 16> in,
                    std::span<uint8_t, 16> out) noexcept {
-    EVP_CIPHER_CTX* ctx = ThreadLocalQuicCipherCtx();
-    if (!ctx) return false;
+    EVP_CIPHER_CTX_reset(ctx);
     int out_len = 0;
     return EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, key.data(), nullptr) == 1 &&
            EVP_CIPHER_CTX_set_padding(ctx, 0) == 1 &&
@@ -418,21 +383,22 @@ constexpr size_t kMaxCrypto = 64 * 1024;
 constexpr size_t kMaxInputs = 64;
 
 // Explicit reservation prevents vector's geometric growth from exceeding the cap.
-void Grow(std::pmr::vector<uint8_t>& bytes, size_t size) {
+void Grow(std::vector<uint8_t>& bytes, size_t size) {
     if (size > bytes.capacity()) {
         bytes.reserve(std::bit_ceil(std::max(size, size_t{256})));
     }
     bytes.resize(size);
 }
 
-bool AesGcmDecrypt(std::span<const uint8_t, 16> key,
+bool AesGcmDecrypt(EVP_CIPHER_CTX* ctx,
+                   std::span<const uint8_t, 16> key,
                    std::span<const uint8_t, 12> nonce,
                    uint8_t unmasked_first_byte,
                    std::span<const uint8_t> aad_middle,
                    std::span<const uint8_t> unmasked_pn,
                    std::span<const uint8_t> ciphertext,
                    std::array<uint8_t, 1536>& stack_buf,
-                   std::pmr::vector<uint8_t>& heap_buf,
+                   std::vector<uint8_t>& heap_buf,
                    std::span<const uint8_t>& plaintext) {
     if (ciphertext.size() <= 16) return false; // A QUIC packet must contain a frame.
     const auto tag = ciphertext.subspan(ciphertext.size() - 16, 16);
@@ -445,8 +411,7 @@ bool AesGcmDecrypt(std::span<const uint8_t, 16> key,
         out_ptr = heap_buf.data();
     }
 
-    EVP_CIPHER_CTX* ctx = ThreadLocalQuicCipherCtx();
-    if (!ctx) return false;
+    EVP_CIPHER_CTX_reset(ctx);
     int aad_len = 0;
     int out_len = 0;
     int final_len = 0;
@@ -491,13 +456,11 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
     const auto record = reader.ReadBytes(record_len);
     if (!reader.Ok()) {
         const auto partial_first = data.subspan(kTlsRecordHeaderBytes);
-        if (version_supports_need_more &&
-            (partial_first.empty() ||
+        if ((partial_first.empty() ||
              partial_first[0] == kHandshakeClientHello) &&
             FitsTlsSniffWireBudget(
                 kTlsRecordHeaderBytes, record_len, partial_first)) {
-            result.need_more = true;
-            result.protocol = constants::protocol::kTls;
+            MarkTlsNeedMore(version_supports_need_more, result);
         }
         return result;
     }
@@ -508,10 +471,7 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
 
     if (TryFinishClientHelloSniff(record, result)) return result;
     if (reader.Empty()) {
-        if (version_supports_need_more) {
-            result.need_more = true;
-            result.protocol = constants::protocol::kTls;
-        }
+        MarkTlsNeedMore(version_supports_need_more, result);
         return result;
     }
 
@@ -549,10 +509,7 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
                         reassembled.data(), reassembled_size))) {
                 return result;
             }
-            if (version_supports_need_more) {
-                result.need_more = true;
-                result.protocol = constants::protocol::kTls;
-            }
+            MarkTlsNeedMore(version_supports_need_more, result);
             return result;
         }
         const auto next_record = reader.ReadBytes(next_len);
@@ -569,10 +526,7 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
         }
     }
 
-    if (version_supports_need_more) {
-        result.need_more = true;
-        result.protocol = constants::protocol::kTls;
-    }
+    MarkTlsNeedMore(version_supports_need_more, result);
     return result;
 }
 
@@ -581,16 +535,16 @@ SniffResult SniffTls(std::span<const uint8_t> data) {
 SniffResult SniffHttp(std::span<const uint8_t> data) {
     SniffResult result;
     const std::string_view request(
-        unsafe::ptr_cast<const char>(data.data()), data.size());
+        common::ptr_cast<const char>(data.data()), data.size());
     size_t line_end = request.find("\r\n");
     if (line_end == std::string_view::npos) {
-        if (IsValidRequestLinePrefix(request)) {
+        if (CheckHttpRequestLine(request, true)) {
             result.need_more = true;
-            result.protocol = constants::protocol::kHttp;
+            result.protocol = common::kHttp;
         }
         return result;
     }
-    if (!IsSupportedRequestLine(request.substr(0, line_end))) {
+    if (!CheckHttpRequestLine(request.substr(0, line_end), false)) {
         return result;
     }
 
@@ -600,7 +554,7 @@ SniffResult SniffHttp(std::span<const uint8_t> data) {
         if (line_end == std::string_view::npos) {
             if (IsValidHeaderLinePrefix(request.substr(position))) {
                 result.need_more = true;
-                result.protocol = constants::protocol::kHttp;
+                result.protocol = common::kHttp;
             }
             return result;
         }
@@ -609,7 +563,7 @@ SniffResult SniffHttp(std::span<const uint8_t> data) {
         if (line.empty()) {
             if (host) {
                 result.success = true;
-                result.protocol = constants::protocol::kHttp;
+                result.protocol = common::kHttp;
                 result.domain.assign(host->host);
                 result.port = host->port;
             }
@@ -620,7 +574,7 @@ SniffResult SniffHttp(std::span<const uint8_t> data) {
 
         std::string_view name;
         std::string_view value;
-        if (!transport::internet::SplitAndValidateHttpHeaderLine(line, name, value)) {
+        if (!transport::SplitAndValidateHttpHeaderLine(line, name, value)) {
             return result;
         }
         if (!common::EqualsAsciiCI(name, "host")) continue;
@@ -629,6 +583,27 @@ SniffResult SniffHttp(std::span<const uint8_t> data) {
         host = ParseHostValue(value);
         if (!host) return result;
     }
+}
+
+SniffResult SniffBittorrent(std::span<const uint8_t> data) {
+    SniffResult result;
+    static constexpr std::string_view kHandshake = "BitTorrent protocol";
+    if (data.empty() || data[0] != static_cast<uint8_t>(kHandshake.size())) {
+        return result;
+    }
+    const size_t prefix_len = std::min(data.size() - 1, kHandshake.size());
+    if (!std::equal(data.begin() + 1,
+                    data.begin() + 1 + static_cast<std::ptrdiff_t>(prefix_len),
+                    kHandshake.begin())) {
+        return result;
+    }
+    result.protocol = common::kBitTorrent;
+    if (data.size() < kHandshake.size() + 1) {
+        result.need_more = true;
+    } else {
+        result.success = true;
+    }
+    return result;
 }
 
 SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
@@ -655,7 +630,8 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
 
     // Released on return: no plaintext is held while waiting for the next datagram.
     std::array<uint8_t, 1536> stack_decrypted;
-    std::pmr::vector<uint8_t> heap_decrypted{memory::process_resource()};
+    bssl::ScopedEVP_CIPHER_CTX cipher_ctx;
+    std::vector<uint8_t> heap_decrypted;
     std::span<const uint8_t> decrypted;
     size_t offset = 0;
     bool decrypted_initial = false;
@@ -728,7 +704,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
 
         std::array<uint8_t, 16> mask{};
         const std::span<const uint8_t, 16> sample(remaining.data() + hdr_len + 4, 16);
-        if (!AesEcbEncrypt(hp_key_, sample, mask)) return fail();
+        if (!AesEcbEncrypt(cipher_ctx.get(), hp_key_, sample, mask)) return fail();
         const uint8_t first = static_cast<uint8_t>(remaining[0] ^ (mask[0] & 0x0f));
         if ((first & 0x0c) != 0) return fail();
         const size_t pn_len = (first & 3) + 1;
@@ -753,7 +729,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
         auto nonce = iv_;
         for (size_t i = 0; i < 8; ++i)
             nonce[nonce.size() - 1 - i] ^= static_cast<uint8_t>(packet_number >> (8 * i));
-        if (!AesGcmDecrypt(key_, nonce, first, remaining.subspan(1, hdr_len - 1),
+        if (!AesGcmDecrypt(cipher_ctx.get(), key_, nonce, first, remaining.subspan(1, hdr_len - 1),
                 std::span<const uint8_t>(pn_bytes.data(), pn_len),
                 remaining.subspan(hdr_len + pn_len,
                                   static_cast<size_t>(packet_len) - pn_len),
@@ -809,7 +785,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
                         if (!sni) return fail();
                         SniffResult result;
                         result.success = true;
-                        result.protocol = constants::protocol::kQuic;
+                        result.protocol = common::kQuic;
                         result.domain.assign(*sni);
                         release_state();
                         return result;
@@ -856,7 +832,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
                 if (!sni) return fail();
                 SniffResult result;
                 result.success = true;
-                result.protocol = constants::protocol::kQuic;
+                result.protocol = common::kQuic;
                 result.domain.assign(*sni);
                 release_state();
                 return result;
@@ -870,7 +846,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
         return fail();
     SniffResult result;
     result.need_more = true;
-    result.protocol = constants::protocol::kQuic;
+    result.protocol = common::kQuic;
     return result;
 }
 

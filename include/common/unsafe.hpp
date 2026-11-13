@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <type_traits>
 
-namespace unsafe {
+namespace common {
 
 template<typename To, typename From>
 [[nodiscard]] inline To* ptr_cast(From* ptr) noexcept {
@@ -31,5 +31,5 @@ template<typename To, typename From>
 
     return reinterpret_cast<const To*>(ptr);
 }
-}  // namespace unsafe
+}  // namespace common
 

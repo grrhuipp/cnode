@@ -3,11 +3,10 @@
 #include "app/worker_batch.hpp"
 #include "infra/config.hpp"
 #include "app/worker.hpp"
-#include "core/constants.hpp"
+#include "common/constants.hpp"
 #include "infra/config_types.hpp"
-#include "transport/internet/stream_settings.hpp"
-#include "transport/internet/transport_security.hpp"
-
+#include "transport/stream_settings.hpp"
+#include "transport/transport_security.hpp"
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -15,10 +14,10 @@
 
 namespace app {
 
-std::shared_ptr<const proxyman::inbound::UserSet> PrepareInboundUsers(
-    const proxyman::inbound::BuildRequest& request,
+std::shared_ptr<const UserSet> PrepareInboundUsers(
+    const BuildRequest& request,
     std::span<const infra::InboundUserSpec> users) {
-    auto prepared = proxyman::inbound::BuildUsers(request, users);
+    auto prepared = BuildUsers(request, users);
     if (!prepared) {
         throw std::invalid_argument(
             "inbound '" + request.tag + "' has invalid users");
@@ -29,16 +28,16 @@ std::shared_ptr<const proxyman::inbound::UserSet> PrepareInboundUsers(
         throw std::invalid_argument(
             "inbound '" + request.tag + "' has an incomplete user snapshot");
     }
-    return std::make_shared<const proxyman::inbound::UserSet>(std::move(*prepared));
+    return std::make_shared<const UserSet>(std::move(*prepared));
 }
 
 PreparedInbound PrepareInbound(const infra::InboundSpec& spec) {
-    if (!proxyman::inbound::HasProxy(spec.protocol)) {
+    if (!HasProxy(spec.protocol)) {
         throw std::invalid_argument(
             "inbound '" + spec.tag + "' has unsupported protocol '" +
             spec.protocol + "'");
     }
-    auto build_request = proxyman::inbound::PrepareBuildRequest(
+    auto build_request = PrepareBuildRequest(
         spec.protocol, spec.tag, spec.settings);
     if (!build_request) {
         throw std::invalid_argument(
@@ -46,8 +45,8 @@ PreparedInbound PrepareInbound(const infra::InboundSpec& spec) {
     }
     auto users = PrepareInboundUsers(*build_request, spec.users);
 
-    transport::internet::StreamSettings stream_settings = spec.stream_settings;
-    transport::internet::TransportSecurity::Prepare(stream_settings, transport::internet::StreamEndpointRole::Inbound);
+    transport::StreamSettings stream_settings = spec.stream_settings;
+    transport::TransportSecurity::Prepare(stream_settings, transport::StreamEndpointRole::Inbound);
     // XHTTP 会话命名空间按入站 tag 隔离，配置准备期一次推导，Worker 只读。
     if (stream_settings.IsXHttp()) {
         stream_settings.xhttp.session_namespace.insert(0, spec.tag + std::string(1, '\0'));
@@ -60,7 +59,7 @@ PreparedInbound PrepareInbound(const infra::InboundSpec& spec) {
             .tag = spec.tag,
             .listen = spec.listen,
         },
-        .receiver = proxyman::inbound::MakeReceiverSettings(
+        .receiver = MakeReceiverSettings(
             spec.tag,
             spec.all_tags,
             spec.protocol,
@@ -78,14 +77,14 @@ namespace {
 
 infra::StaticInboundConfig MakeTestInboundConfig() {
     infra::StaticInboundConfig source;
-    source.protocol = constants::protocol::kDefaultNodeProtocol;
-    source.tags.emplace_back(constants::test::kTestInboundTag);
-    source.port = constants::test::kTestPort;
+    source.protocol = common::kDefaultNodeProtocol;
+    source.tags.emplace_back(common::kTestInboundTag);
+    source.port = common::kTestPort;
     // The ordinary StreamSettings and SniffConfig defaults are already normalized.
     source.users.push_back(infra::InboundUserSpec{
         .user_id = 0,
         .email = "test@example.com",
-        .credential = std::string(constants::test::kTestVmessUuid),
+        .credential = std::string(common::kTestVmessUuid),
         .flow = {},
         .speed_limit = 0,
         .device_limit = 0,
@@ -97,7 +96,7 @@ infra::StaticInboundConfig MakeTestInboundConfig() {
 // email default. Everything else passes through unchanged.
 infra::InboundSpec StaticInboundSpec(infra::StaticInboundConfig source) {
     std::string tag = source.tags.empty()
-        ? naming::BuildProtocolPortTag(source.protocol, source.port)
+        ? common::BuildProtocolPortTag(source.protocol, source.port)
         : source.tags.front();
     std::vector<std::string> all_tags = source.tags.empty()
         ? std::vector<std::string>{tag}
@@ -106,10 +105,10 @@ infra::InboundSpec StaticInboundSpec(infra::StaticInboundConfig source) {
         ? routing::OutboundSelectionPolicy{routing::ForceOutbound(*source.outbound_tag)}
         : (source.routing_enabled
             ? routing::OutboundSelectionPolicy{routing::RouteWithFallback(
-                std::string(constants::protocol::kDirect))}
+                std::string(common::kDirect))}
             : routing::OutboundSelectionPolicy{routing::ForceOutbound(
-                std::string(constants::protocol::kDirect))});
-    if (proxyman::inbound::RegisteredProtocolTraits(source.protocol).mailbox_email_defaults_to_tag) {
+                std::string(common::kDirect))});
+    if (RegisteredProtocolTraits(source.protocol).mailbox_email_defaults_to_tag) {
         for (auto& user : source.users) {
             if (user.email.empty()) user.email = tag;
         }
@@ -143,7 +142,7 @@ std::vector<PreparedInbound> PrepareStartupInbounds(
     prepared.reserve(sources.size());
     for (auto& source : sources) {
         auto inbound = PrepareInbound(StaticInboundSpec(std::move(source)));
-        if (proxyman::inbound::UserSetEmpty(*inbound.users)) {
+        if (UserSetEmpty(*inbound.users)) {
             throw std::invalid_argument(
                 "static inbound '" + inbound.binding.tag + "' has no valid users");
         }
@@ -155,7 +154,7 @@ std::vector<PreparedInbound> PrepareStartupInbounds(
 
 namespace {
 
-using Store = proxyman::inbound::UserStore;
+using Store = UserStore;
 
 // Leases are copied per Worker so a failed install keeps the source views for
 // a later retry.
@@ -190,8 +189,8 @@ net::awaitable<InboundInstallFailure> InstallInbound(
         co_return InboundInstallFailure::Register;
     }
     const bool quic_only =
-        proxyman::inbound::RegisteredDatagramTransport(inbound.build_request.protocol) ==
-        proxyman::inbound::DatagramTransport::Quic;
+        RegisteredDatagramTransport(inbound.build_request.protocol) ==
+        DatagramTransport::Quic;
     if (!quic_only && !worker.AddListener(inbound.binding)) {
         co_return InboundInstallFailure::TcpListen;
     }

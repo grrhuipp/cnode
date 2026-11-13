@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/hysteria/hysteria_ingress.hpp"
-
+#include "transport/hysteria/hysteria_ingress.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
@@ -16,8 +15,8 @@
 
 namespace {
 using namespace std::chrono_literals;
-using transport::internet::hysteria::UdpSessionStream;
-using transport::internet::hysteria::QuicStreamState;
+using transport::UdpSessionStream;
+using transport::QuicStreamState;
 
 
 template <class Scenario>
@@ -42,10 +41,10 @@ class QuicUdpCancellation : public testing::TestWithParam<bool> {};
 TEST_P(QuicUdpCancellation, ReturnsUnreadBuffersBeforeNotifyingSubscribers) {
     const bool destroy_host = GetParam();
     RunInDomain([destroy_host](net::io_context& io) -> net::awaitable<void> {
-        const auto baseline = memory::detail::test_buffers_live;
+        const auto baseline = common::test_buffers_live;
         const common::TargetAddress target("127.0.0.1", 12345);
         auto stream = std::make_unique<UdpSessionStream>(io, 7,
-            std::weak_ptr<transport::internet::hysteria::Connection>{});
+            std::weak_ptr<transport::HysteriaConnection>{});
         constexpr std::array<std::string_view, 3> input{
             "delivered-first", "discard-second", "discard-third"};
         for (const auto bytes : input) {
@@ -58,7 +57,7 @@ TEST_P(QuicUdpCancellation, ReturnsUnreadBuffersBeforeNotifyingSubscribers) {
         EXPECT_EQ(delivered.size(), 1u);
         EXPECT_EQ(delivered.byte_size(), input[0].size());
         if (delivered.size() != 1 || delivered.byte_size() != input[0].size()) co_return;
-        EXPECT_EQ(memory::detail::test_buffers_live, baseline + input.size());
+        EXPECT_EQ(common::test_buffers_live, baseline + input.size());
         struct Observer final : transport::CancellationSubscription {
             std::unique_ptr<UdpSessionStream>& host;
             bool destroy;
@@ -70,21 +69,21 @@ TEST_P(QuicUdpCancellation, ReturnsUnreadBuffersBeforeNotifyingSubscribers) {
             void OnCancellation(transport::Cancellation cancellation) noexcept override {
                 notified = true;
                 reason = cancellation.reason;
-                buffers_at_notification = memory::detail::test_buffers_live;
+                buffers_at_notification = common::test_buffers_live;
                 if (destroy) host.reset();
             }
         } observer(stream, destroy_host);
         observer.Resubscribe(stream->Cancellation());
-        const auto rejected = memory::rejected_process_allocations;
-        memory::reject_next_process_allocation = true;
+        const auto rejected = common::rejected_process_allocations;
+        common::reject_next_process_allocation = true;
         stream->Cancel();
-        memory::reject_next_process_allocation = false;
-        EXPECT_EQ(memory::rejected_process_allocations, rejected);
+        common::reject_next_process_allocation = false;
+        EXPECT_EQ(common::rejected_process_allocations, rejected);
         EXPECT_TRUE(observer.notified);
         EXPECT_EQ(observer.reason, common::ErrorCode::CANCELLED);
         EXPECT_EQ(observer.buffers_at_notification, baseline + delivered.size())
             << "unread input was still owned during cancellation delivery";
-        EXPECT_EQ(memory::detail::test_buffers_live, baseline + delivered.size())
+        EXPECT_EQ(common::test_buffers_live, baseline + delivered.size())
             << "cancelled UDP host retained unreachable input";
         if (stream) stream->Cancel();
         {
@@ -94,17 +93,17 @@ TEST_P(QuicUdpCancellation, ReturnsUnreadBuffersBeforeNotifyingSubscribers) {
             EXPECT_TRUE(buffer->UDP().SameEndpoint(target));
         }
         delivered.clear();
-        EXPECT_EQ(memory::detail::test_buffers_live, baseline);
+        EXPECT_EQ(common::test_buffers_live, baseline);
         stream.reset();
     });
 }
 
 TEST(QuicUdpQueue, BoundsBufferCapacityAndReturnsAdmissionOnRead) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
-        const auto baseline = memory::detail::test_buffers_live;
+        const auto baseline = common::test_buffers_live;
         const common::TargetAddress target("127.0.0.1", 12345);
         UdpSessionStream stream(io, 9, {});
-        constexpr size_t limit = UdpSessionStream::kMaxQueuedBytes / buf::Buffer::kSize;
+        constexpr size_t limit = UdpSessionStream::kMaxQueuedBytes / common::Buffer::kSize;
         size_t accepted = 0;
         for (size_t index = 0; index < 2 * limit; ++index) {
             const uint8_t byte = static_cast<uint8_t>(index % 251);
@@ -112,14 +111,14 @@ TEST(QuicUdpQueue, BoundsBufferCapacityAndReturnsAdmissionOnRead) {
         }
         EXPECT_EQ(accepted, limit);
         if (accepted != limit) co_return;
-        EXPECT_EQ(memory::detail::test_buffers_live, baseline + limit);
+        EXPECT_EQ(common::test_buffers_live, baseline + limit);
         const uint8_t replacement = 0xee;
-        const auto rejected = memory::rejected_process_allocations;
-        memory::reject_next_process_allocation = true;
+        const auto rejected = common::rejected_process_allocations;
+        common::reject_next_process_allocation = true;
         const bool admitted_when_full = stream.Push(target, {&replacement, 1});
-        memory::reject_next_process_allocation = false;
+        common::reject_next_process_allocation = false;
         EXPECT_FALSE(admitted_when_full);
-        EXPECT_EQ(memory::rejected_process_allocations, rejected)
+        EXPECT_EQ(common::rejected_process_allocations, rejected)
             << "full UDP queue attempted allocation before rejecting input";
 
         auto first = co_await stream.ReadMultiBuffer();
@@ -127,15 +126,15 @@ TEST(QuicUdpQueue, BoundsBufferCapacityAndReturnsAdmissionOnRead) {
         EXPECT_EQ(first.byte_size(), 1u);
         if (first.size() != 1 || first.byte_size() != 1) co_return;
         EXPECT_EQ((*first.begin())->Bytes().front(), 0);
-        std::vector<uint8_t> two_blocks(buf::Buffer::kSize + 1, 0x6c);
+        std::vector<uint8_t> two_blocks(common::Buffer::kSize + 1, 0x6c);
         two_blocks.front() = 0x12;
         two_blocks.back() = 0x91;
-        const auto rejected_with_one_slot = memory::rejected_process_allocations;
-        memory::reject_next_process_allocation = true;
+        const auto rejected_with_one_slot = common::rejected_process_allocations;
+        common::reject_next_process_allocation = true;
         const bool admitted_with_one_slot = stream.Push(target, two_blocks);
-        memory::reject_next_process_allocation = false;
+        common::reject_next_process_allocation = false;
         EXPECT_FALSE(admitted_with_one_slot);
-        EXPECT_EQ(memory::rejected_process_allocations, rejected_with_one_slot)
+        EXPECT_EQ(common::rejected_process_allocations, rejected_with_one_slot)
             << "two-block input allocated with only one queued block available";
         auto second = co_await stream.ReadMultiBuffer();
         EXPECT_EQ(second.size(), 1u);
@@ -169,51 +168,51 @@ TEST(QuicUdpQueue, BoundsBufferCapacityAndReturnsAdmissionOnRead) {
             offset += bytes.size();
         }
         tail.clear();
-        EXPECT_EQ(memory::detail::test_buffers_live, baseline);
+        EXPECT_EQ(common::test_buffers_live, baseline);
 
     });
 }
 
 TEST(QuicUdpQueue, OversizedDatagramIsRejectedBeforeAllocation) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
-        const auto baseline = memory::detail::test_buffers_live;
+        const auto baseline = common::test_buffers_live;
         const common::TargetAddress target("127.0.0.1", 12345);
         UdpSessionStream stream(io, 11, {});
         const std::vector<uint8_t> oversized(UdpSessionStream::kMaxQueuedBytes + 1, 0x7a);
-        const auto rejected_before_oversized = memory::rejected_process_allocations;
-        memory::reject_next_process_allocation = true;
+        const auto rejected_before_oversized = common::rejected_process_allocations;
+        common::reject_next_process_allocation = true;
         const bool oversized_admitted = stream.Push(target, oversized);
-        memory::reject_next_process_allocation = false;
+        common::reject_next_process_allocation = false;
         EXPECT_FALSE(oversized_admitted);
-        EXPECT_EQ(memory::rejected_process_allocations, rejected_before_oversized)
+        EXPECT_EQ(common::rejected_process_allocations, rejected_before_oversized)
             << "oversized UDP input underflowed its budget check";
-        EXPECT_EQ(memory::detail::test_buffers_live, baseline);
+        EXPECT_EQ(common::test_buffers_live, baseline);
         co_return;
     });
 }
 
 TEST(QuicUdpQueue, EmptyMessagesConsumeBufferAdmissionAndRemainReadable) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
-        const auto baseline = memory::detail::test_buffers_live;
+        const auto baseline = common::test_buffers_live;
         const common::TargetAddress target("127.0.0.1", 12345);
         UdpSessionStream stream(io, 10, {});
-        constexpr size_t limit = UdpSessionStream::kMaxQueuedBytes / buf::Buffer::kSize;
+        constexpr size_t limit = UdpSessionStream::kMaxQueuedBytes / common::Buffer::kSize;
         size_t admitted = 0;
         for (size_t index = 0; index <= limit; ++index)
             admitted += stream.Push(target, {});
         EXPECT_EQ(admitted, limit);
         if (admitted != limit) co_return;
-        EXPECT_EQ(memory::detail::test_buffers_live, baseline + limit);
-        const auto rejected = memory::rejected_process_allocations;
-        memory::reject_next_process_allocation = true;
+        EXPECT_EQ(common::test_buffers_live, baseline + limit);
+        const auto rejected = common::rejected_process_allocations;
+        common::reject_next_process_allocation = true;
         const bool overflow = stream.Push(target, {});
-        memory::reject_next_process_allocation = false;
+        common::reject_next_process_allocation = false;
         EXPECT_FALSE(overflow);
-        EXPECT_EQ(memory::rejected_process_allocations, rejected);
+        EXPECT_EQ(common::rejected_process_allocations, rejected);
 
         auto packet = co_await stream.ReadMultiBuffer();
         {
-            const auto datagram = buf::InspectUdpDatagram(packet);
+            const auto datagram = common::InspectUdpDatagram(packet);
             EXPECT_TRUE(datagram.Valid());
             EXPECT_NE(datagram.target, nullptr);
             if (!datagram.Valid() || !datagram.target) co_return;
@@ -223,10 +222,10 @@ TEST(QuicUdpQueue, EmptyMessagesConsumeBufferAdmissionAndRemainReadable) {
         const uint8_t later = 0x7a;
         EXPECT_TRUE(stream.Push(target, {&later, 1}));
         stream.Cancel();
-        EXPECT_EQ(memory::detail::test_buffers_live, baseline + 1);
-        EXPECT_EQ(buf::InspectUdpDatagram(packet).status, buf::UdpDatagramStatus::Valid);
+        EXPECT_EQ(common::test_buffers_live, baseline + 1);
+        EXPECT_EQ(common::InspectUdpDatagram(packet).status, common::UdpDatagramStatus::Valid);
         packet.clear();
-        EXPECT_EQ(memory::detail::test_buffers_live, baseline);
+        EXPECT_EQ(common::test_buffers_live, baseline);
     });
 }
 
@@ -244,11 +243,11 @@ struct StreamCancellation final : transport::CancellationSubscription {
 
 TEST(QuicStreamClose, CompletedDuplexLeavesTransportAliveUntilNativeRetirement) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
-        auto state = std::make_shared<QuicStreamState>(io, 4, std::weak_ptr<transport::internet::hysteria::Connection>{});
+        auto state = std::make_shared<QuicStreamState>(io, 4, std::weak_ptr<transport::HysteriaConnection>{});
         StreamCancellation cancellation;
         cancellation.Resubscribe(state->Cancellation());
         {
-            transport::internet::hysteria::QuicStream stream(state);
+            transport::QuicStream stream(state);
             const std::array<uint8_t, 3> input{0x12, 0x34, 0x56};
             const bool admitted = state->PushInput(input, true);
             EXPECT_TRUE(admitted);
@@ -277,8 +276,8 @@ TEST(QuicStreamClose, CompletedDuplexLeavesTransportAliveUntilNativeRetirement) 
 
 TEST(QuicStreamClose, UnreadFinTailIsDiscardedAndCancelled) {
     RunInDomain([](net::io_context& io) -> net::awaitable<void> {
-        auto state = std::make_shared<QuicStreamState>(io, 8, std::weak_ptr<transport::internet::hysteria::Connection>{});
-        transport::internet::hysteria::QuicStream stream(state);
+        auto state = std::make_shared<QuicStreamState>(io, 8, std::weak_ptr<transport::HysteriaConnection>{});
+        transport::QuicStream stream(state);
         StreamCancellation cancellation;
         cancellation.Resubscribe(stream.Cancellation());
         const std::array<uint8_t, 3> input{0x21, 0x43, 0x65};
@@ -310,8 +309,8 @@ class QuicStreamHalfClose : public testing::TestWithParam<bool> {};
 TEST_P(QuicStreamHalfClose, CloseAbortsIncompleteDuplex) {
     const bool remote_fin = GetParam();
     RunInDomain([remote_fin](net::io_context& io) -> net::awaitable<void> {
-        auto state = std::make_shared<QuicStreamState>(io, 12, std::weak_ptr<transport::internet::hysteria::Connection>{});
-        transport::internet::hysteria::QuicStream stream(state);
+        auto state = std::make_shared<QuicStreamState>(io, 12, std::weak_ptr<transport::HysteriaConnection>{});
+        transport::QuicStream stream(state);
         StreamCancellation cancellation;
         cancellation.Resubscribe(stream.Cancellation());
         if (remote_fin) {
@@ -343,8 +342,8 @@ class QuicStreamAbort : public testing::TestWithParam<bool> {};
 TEST_P(QuicStreamAbort, ExplicitAbortCancelsEvenCompletedDuplex) {
     const bool abortive_close = GetParam();
     RunInDomain([abortive_close](net::io_context& io) -> net::awaitable<void> {
-        auto state = std::make_shared<QuicStreamState>(io, 16, std::weak_ptr<transport::internet::hysteria::Connection>{});
-        transport::internet::hysteria::QuicStream stream(state);
+        auto state = std::make_shared<QuicStreamState>(io, 16, std::weak_ptr<transport::HysteriaConnection>{});
+        transport::QuicStream stream(state);
         StreamCancellation cancellation;
         cancellation.Resubscribe(stream.Cancellation());
         const bool admitted = state->PushInput({}, true);
@@ -414,8 +413,8 @@ class QuicStreamWriteWaitEnd : public testing::TestWithParam<WriteWaitEnd> {};
 TEST_P(QuicStreamWriteWaitEnd, SettlesPendingAndSubsequentWaits) {
     const auto ending = GetParam();
     RunInDomain([ending](net::io_context& io) -> net::awaitable<void> {
-        auto state = std::make_shared<QuicStreamState>(io, 8, std::weak_ptr<transport::internet::hysteria::Connection>{});
-        transport::internet::hysteria::QuicStream stream(state);
+        auto state = std::make_shared<QuicStreamState>(io, 8, std::weak_ptr<transport::HysteriaConnection>{});
+        transport::QuicStream stream(state);
         const std::array<uint8_t, 3> tail{0x21, 0x43, 0x65};
         const bool admitted = state->PushInput(tail, false);
         EXPECT_TRUE(admitted);

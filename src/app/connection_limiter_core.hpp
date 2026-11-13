@@ -24,7 +24,7 @@
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 
-namespace app::auth_limit_detail {
+namespace app {
 // OpenSSL 的低层 SHA256 上下文可在栈上复制；EVP 每次构造上下文会分配内存。
 class Fingerprint {
 public:
@@ -73,11 +73,6 @@ public:
 private:
     SHA256_CTX initial_;
 };
-} // namespace auth_limit_detail
-
-// Sans-I/O bounded model; mutable state belongs exclusively to the coordinator.
-// 两个指纹上下文构造后只读，凭据指纹可由任意 Worker 线程计算。
-namespace app {
 
 class ConnectionLimiterCore {
 public:
@@ -99,10 +94,9 @@ public:
           connections_(cfg.max_conn_per_ip ? AllocateZeroedTable<ConnectionSlots>() : nullptr),
           ip_failures_(cfg.ip_ban.enabled ? AllocateZeroedTable<FailureTable>() : nullptr),
           ip_fingerprint_(cfg.ip_ban.enabled
-              ? std::optional<app::auth_limit_detail::Fingerprint>(std::in_place, false)
+              ? std::optional<Fingerprint>(std::in_place, false)
               : std::nullopt),
-          credential_fingerprint_(true),
-          credential_failures_(AllocateZeroedTable<FailureTable>()) {}
+          credential_fingerprint_(true) {}
 
     [[nodiscard]] bool TracksGlobalConnections() const noexcept {
         return cfg_.max_connections > 0;
@@ -179,15 +173,19 @@ public:
     void OnAuthFailTracked(
         const std::optional<AuthCredentialKey>& ip_ban_key,
         std::optional<AuthCredentialKey> credential = std::nullopt,
-        uint64_t now = NowSeconds()) noexcept {
+        uint64_t now = NowSeconds()) {
         if (ip_ban_key && TracksAuthBan())
             ip_failures_->Record(*ip_ban_key, cfg_.ip_ban, now);
-        if (credential)
+        if (credential) {
+            if (!credential_failures_)
+                credential_failures_ = AllocateZeroedTable<FailureTable>();
             credential_failures_->Record(*credential, kCredentialBan, now);
+        }
     }
 
     [[nodiscard]] RejectReason CheckCredential(
         const AuthCredentialKey& credential, uint64_t now = NowSeconds()) const noexcept {
+        if (!credential_failures_) return RejectReason::NONE;
         return credential_failures_->Check(
             credential, kCredentialBan, now, RejectReason::CREDENTIAL_BANNED);
     }
@@ -320,8 +318,8 @@ private:
     uint32_t total_ = 0;
     ZeroedTable<ConnectionSlots> connections_;
     ZeroedTable<FailureTable> ip_failures_;
-    const std::optional<app::auth_limit_detail::Fingerprint> ip_fingerprint_;
-    const app::auth_limit_detail::Fingerprint credential_fingerprint_;
+    const std::optional<Fingerprint> ip_fingerprint_;
+    const Fingerprint credential_fingerprint_;
     ZeroedTable<FailureTable> credential_failures_;
 };
 

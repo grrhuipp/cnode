@@ -14,7 +14,7 @@ void SessionTrackingState::RegisterActiveSession(
     ActiveSession& node,
     std::string_view accounting_key,
     int64_t user_id,
-    session::Traffic& traffic) {
+    common::Traffic& traffic) {
     if (accounting_key.empty() || user_id <= 0 || node.bucket) return;
     auto entry = accounts_.find(accounting_key);
     const bool inserted = entry == accounts_.end();
@@ -100,6 +100,8 @@ void SessionTrackingState::CommitTraffic(
         throw std::logic_error("traffic snapshot account disappeared before commit");
     }
     auto& bucket = entry->second;
+    std::vector<decltype(bucket.traffic.begin())> matched;
+    matched.reserve(snapshot.users.size());
     for (const auto& [uid, value] : snapshot) {
         const auto it = bucket.traffic.find(uid);
         if (it == bucket.traffic.end() ||
@@ -109,9 +111,12 @@ void SessionTrackingState::CommitTraffic(
             it->second.snapshotted.download < value.download) {
             throw std::logic_error("traffic snapshot exceeds in-flight counters");
         }
+        matched.push_back(it);
     }
+    size_t idx = 0;
     for (const auto& [uid, value] : snapshot) {
-        auto it = bucket.traffic.find(uid);
+        (void)uid;
+        auto it = matched[idx++];
         it->second.completed.upload -= value.upload;
         it->second.completed.download -= value.download;
         it->second.snapshotted.upload -= value.upload;
@@ -137,6 +142,8 @@ void SessionTrackingState::RollbackTraffic(
         throw std::logic_error("traffic snapshot account disappeared before rollback");
     }
     auto& bucket = entry->second;
+    std::vector<Account*> matched;
+    matched.reserve(snapshot.users.size());
     for (const auto& [uid, value] : snapshot) {
         const auto it = bucket.traffic.find(uid);
         if (it == bucket.traffic.end() ||
@@ -144,9 +151,12 @@ void SessionTrackingState::RollbackTraffic(
             it->second.snapshotted.download < value.download) {
             throw std::logic_error("traffic rollback exceeds in-flight counters");
         }
+        matched.push_back(&it->second);
     }
+    size_t idx = 0;
     for (const auto& [uid, value] : snapshot) {
-        auto& account = bucket.traffic.find(uid)->second;
+        (void)uid;
+        auto& account = *matched[idx++];
         account.snapshotted.upload -= value.upload;
         account.snapshotted.download -= value.download;
     }

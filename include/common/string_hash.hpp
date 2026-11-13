@@ -2,7 +2,6 @@
 
 #include <functional>
 #include <string_view>
-#include <utility>
 
 
 namespace common {
@@ -25,14 +24,6 @@ struct TransparentStringEq {
     }
 
 };
-
-template<class Map>
-[[nodiscard]] auto FindOrEmplaceStringKey(Map& map, std::string_view key) {
-    const auto existing = map.find(key);
-    if (existing != map.end()) return std::pair{existing, false};
-    using Key = typename Map::key_type;
-    return map.try_emplace(Key{key});
-}
 
 }  // namespace common
 

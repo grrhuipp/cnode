@@ -1,6 +1,5 @@
 #include "infra/json.hpp"
-#include "service/controller/traffic_journal_format.hpp"
-
+#include "controller/traffic_journal_format.hpp"
 #include <openssl/sha.h>
 
 #include <algorithm>
@@ -26,7 +25,6 @@
 #include <vector>
 
 namespace {
-namespace format = ::controller::traffic_journal;
 constexpr size_t MaxAuditBytes = 1024 * 1024;
 
 [[noreturn]] void FailSystem(const char* operation) {
@@ -56,7 +54,7 @@ struct Summary {
 
 Summary Summarize(std::string_view raw) {
     Summary summary;
-    format::VisitRecordRows(raw, [&summary](const format::RecordRow& row) {
+    ::controller::VisitRecordRows(raw, [&summary](const ::controller::RecordRow& row) {
         summary.upload += static_cast<uint64_t>(row.upload);
         summary.download += static_cast<uint64_t>(row.download);
         ++summary.users;
@@ -75,7 +73,7 @@ std::string Decimal(__uint128_t value) {
 }
 
 std::string Quote(std::string_view text) {
-    return ::json::serialize(::json::value(text));
+    return ::infra::serialize(::infra::value(text));
 }
 
 std::string Digest(std::string_view raw) {
@@ -126,7 +124,7 @@ void List(int directory) {
     if (!raw_directory) { ::close(copy); FailSystem("fdopendir"); }
     const auto close_directory = [](DIR* value) { ::closedir(value); };
     std::unique_ptr<DIR, decltype(close_directory)> entries(raw_directory, close_directory);
-    std::vector<std::pair<std::string, format::RecordState>> records;
+    std::vector<std::pair<std::string, ::controller::RecordState>> records;
     for (;;) {
         errno = 0;
         const auto* entry = ::readdir(entries.get());
@@ -134,28 +132,28 @@ void List(int directory) {
             if (errno != 0) FailSystem("readdir");
             break;
         }
-        if (const auto state = format::ParseRecordName(entry->d_name))
+        if (const auto state = ::controller::ParseRecordName(entry->d_name))
             records.emplace_back(entry->d_name, *state);
     }
     std::sort(records.begin(), records.end());
     for (const auto& [name, state] : records) {
-        const auto summary = Summarize(format::ReadRecord(directory, name.c_str()));
+        const auto summary = Summarize(::controller::ReadRecord(directory, name.c_str()));
         std::cout << "{\"record\":" << Quote(name)
-                  << ",\"state\":" << Quote(format::RecordSuffix(state).substr(1))
+                  << ",\"state\":" << Quote(::controller::RecordSuffix(state).substr(1))
                   << ",\"users\":" << summary.users << ",\"upload\":" << Decimal(summary.upload)
                   << ",\"download\":" << Decimal(summary.download) << "}\n";
     }
 }
 
 void Resolve(int directory, const std::string& record, std::string_view decision, std::string_view evidence) {
-    if (format::ParseRecordName(record) != format::RecordState::Unknown)
+    if (::controller::ParseRecordName(record) != ::controller::RecordState::Unknown)
         throw std::runtime_error("resolve requires one exact unknown record filename");
     if (decision != "confirmed-applied" && decision != "confirmed-not-applied")
         throw std::runtime_error("decision must be confirmed-applied or confirmed-not-applied");
     if (!ValidEvidence(evidence)) throw std::runtime_error("evidence must contain 1..512 UTF-8 characters");
-    const auto raw = format::ReadRecord(directory, record.c_str());
+    const auto raw = ::controller::ReadRecord(directory, record.c_str());
     const auto summary = Summarize(raw);
-    const auto ready = format::RecordNameWithState(record, format::RecordState::Ready);
+    const auto ready = ::controller::RecordNameWithState(record, ::controller::RecordState::Ready);
     if (decision == "confirmed-not-applied") {
         struct stat destination {};
         if (::fstatat(directory, ready.c_str(), &destination, AT_SYMLINK_NOFOLLOW) == 0)
@@ -168,11 +166,11 @@ void Resolve(int directory, const std::string& record, std::string_view decision
     std::array<char, 32> timestamp {};
     if (std::strftime(timestamp.data(), timestamp.size(), "%Y-%m-%dT%H:%M:%SZ", &utc) == 0)
         throw std::runtime_error("cannot format audit time");
-    const ::json::object entry {
+    const ::infra::object entry {
         {"event", "reconciliation-intent"}, {"record", record}, {"sha256", Digest(raw)},
         {"decision", decision}, {"evidence", evidence}, {"time", timestamp.data()}
     };
-    const auto audit_line = ::json::serialize(entry) + '\n';
+    const auto audit_line = ::infra::serialize(entry) + '\n';
     File audit(::openat(directory, ".reconciliation.jsonl", O_CREAT | O_WRONLY | O_APPEND |
                        O_CLOEXEC | O_NOFOLLOW, 0600));
     struct stat info {};

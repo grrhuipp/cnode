@@ -3,7 +3,7 @@
 #include "common/allocator.hpp"
 #include "common/unsafe.hpp"
 #include "common/asio_types.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/error.hpp"
 #include "transport/link.hpp"
 #include "proxy/buffered_stream_reader.hpp"
@@ -40,7 +40,7 @@ class GroupCoordinator;
 
 }  // namespace app
 
-namespace proxy::vless {
+namespace proxy {
 
 
 // ============================================================================
@@ -313,7 +313,7 @@ struct VlessEncryptionClientNfsHello {
     std::array<uint8_t, kVlessEncryptionIvSize> iv{};
     VlessEncryptionNfsKey nfs_key;
     // iv followed by the obfuscated relays.
-    std::pmr::vector<uint8_t> bytes{memory::process_resource()};
+    std::vector<uint8_t> bytes;
 };
 
 struct VlessEncryptionServerNfsOpenResult {
@@ -400,7 +400,7 @@ OpenVlessEncryptionServerPfsResponse(
         encrypted_ticket,
     VlessEncryptionAeadCipher cipher) noexcept;
 
-[[nodiscard]] std::optional<std::pmr::vector<uint8_t>> BuildVlessEncryptionPadding(
+[[nodiscard]] std::optional<std::vector<uint8_t>> BuildVlessEncryptionPadding(
     const VlessEncryptionConfig& config,
     VlessEncryptionAead& aead) noexcept;
 
@@ -463,12 +463,12 @@ public:
                           std::optional<VlessEncryptionHeaderXor>
                               header_xor) noexcept;
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override;
     [[nodiscard]] bool EnableRawRead() noexcept override;
     void RejectDeferredTicket() noexcept;
 
 private:
-    net::awaitable<buf::MultiBuffer> ReadRawBytes();
+    net::awaitable<common::MultiBuffer> ReadRawBytes();
     net::awaitable<bool> ReadRecordHeader();
     size_t OpenRecord(VlessEncryptionAead& aead, std::span<uint8_t> encrypted);
 
@@ -484,7 +484,7 @@ private:
     // `bytes_read_` tracks the server random until the read side is keyed.
     std::array<uint8_t, kVlessEncryptionCtrIvSize> server_random_{};
     std::array<uint8_t, kVlessEncryptionRecordHeaderSize> read_header_{};
-    buf::ContiguousWriteBuffer read_record_;
+    common::ContiguousWriteBuffer read_record_;
     size_t header_read_ = 0;
     size_t bytes_read_ = 0;
     size_t encrypted_size_ = 0;
@@ -504,7 +504,7 @@ public:
     VlessEncryptionWriter(VlessEncryptionWriter&&) = delete;
     VlessEncryptionWriter& operator=(VlessEncryptionWriter&&) = delete;
 
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     net::awaitable<void> AsyncShutdownWrite() override;
     bool WriteShutdownClosesLink() const noexcept override {
@@ -636,8 +636,8 @@ private:
     struct Session {
         VlessEncryptionPfsKey pfs_key;
         std::optional<std::array<uint8_t, 16>> identity;
-        std::pmr::unordered_set<NfsKeyDigest, proxy::SecretKeyedHash, proxy::TimingSafeEqual>
-            seen_nfs_keys{memory::process_resource()};
+        std::unordered_set<NfsKeyDigest, proxy::SecretKeyedHash, proxy::TimingSafeEqual>
+            seen_nfs_keys;
     };
 
     using SessionMap = proxy::ExpiringKeyedMap<kVlessEncryptionTicketSize, Session,
@@ -683,4 +683,4 @@ LookupVlessTicket(
     std::string_view inbound_tag,
     std::array<uint8_t, kVlessEncryptionTicketSize> ticket,
     VlessEncryptionNfsKey nfs_key);
-}  // namespace proxy::vless
+}  // namespace proxy

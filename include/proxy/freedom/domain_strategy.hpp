@@ -4,7 +4,7 @@
 #include <optional>
 #include <string_view>
 
-namespace proxy::freedom::outbound {
+namespace proxy {
 
 enum class DomainStrategy : uint8_t {
     AsIs,
@@ -22,4 +22,4 @@ enum class DomainStrategy : uint8_t {
 
 [[nodiscard]] std::optional<DomainStrategy> ParseDomainStrategy(std::string_view value);
 
-}  // namespace proxy::freedom::outbound
+}  // namespace proxy

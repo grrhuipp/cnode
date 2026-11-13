@@ -1,7 +1,6 @@
 #pragma once
 
 #include "app/worker/udp_ingress.hpp"
-
 #include <map>
 #include <string>
 #include <string_view>
@@ -9,7 +8,7 @@
 // 名称仅用于组织测试场景；生产入口只接收地址稳定的 socket 状态。
 class UdpSocketFixtures final {
 public:
-    using Ingress = app::worker_detail::UdpIngress;
+    using Ingress = app::UdpIngress;
     explicit UdpSocketFixtures(net::io_context& io) : io_(io) {}
 
     Ingress::SocketStatePtr Get(Ingress& ingress, std::string_view name) {

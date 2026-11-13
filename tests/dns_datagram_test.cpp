@@ -16,8 +16,8 @@
 namespace {
 namespace net = ::net;
 using namespace std::chrono_literals;
-using ::app::dns::DNS;
-using ::app::dns::DnsResult;
+using ::app::DNS;
+using ::app::DnsResult;
 
 struct Peer {
     struct Query { std::vector<uint8_t> bytes; ::udp::endpoint sender; };
@@ -108,7 +108,7 @@ struct Peer {
         }
         // The resolver's next process-layer allocation after the full answer
         // set arrives is its cache write.
-        if (fault_cache_write) ::memory::reject_next_process_allocation = true;
+        if (fault_cache_write) ::common::reject_next_process_allocation = true;
     }
     ::udp::socket socket, foreign;
     ::udp::endpoint sender;
@@ -124,8 +124,8 @@ struct Peer {
     int ttl_type = 0;
 };
 
-::app::dns::Config Config(Peer& peer) {
-    ::app::dns::Config c;
+::app::DnsConfig Config(Peer& peer) {
+    ::app::DnsConfig c;
     c.servers = {peer.socket.local_endpoint()}; c.min_ttl = 1; c.timeout_sec = 1;
     return c;
 }
@@ -157,7 +157,7 @@ protected:
     }
     net::io_context io;
     Peer peer{io, GetParam()};
-    ::app::dns::DNSWorker worker{io, Config(peer), 8};
+    ::app::DNSWorker worker{io, Config(peer), 8};
     DNS dns{worker};
 };
 
@@ -219,7 +219,7 @@ TEST_P(DnsDatagramIsolation, OneRequestEndingDoesNotCancelAnotherQuery) {
     net::io_context io;
     Peer peer(io);
     peer.hold = cancel;
-    ::app::dns::DNSWorker worker(io, Config(peer), 8);
+    ::app::DNSWorker worker(io, Config(peer), 8);
     DNS dns(worker);
     net::cancellation_signal signal;
     std::array<DnsResult, 2> answers;
@@ -258,7 +258,7 @@ TEST_P(DnsSameDomainCancellation, CancellingOneWaiterPreservesSharedUdpAnswerFor
     net::io_context io;
     Peer peer(io);
     peer.hold = true;
-    ::app::dns::DNSWorker worker(io, Config(peer), 8);
+    ::app::DNSWorker worker(io, Config(peer), 8);
     std::array<net::cancellation_signal, 2> signals;
     std::array<DnsResult, 2> answers;
     std::array<std::exception_ptr, 2> errors;
@@ -320,7 +320,7 @@ TEST_P(DnsMalformedAnswer, RejectsInvalidAddressLengthWithoutPoisoningCache) {
     first.malformed_type = type;
     auto config = Config(first);
     if (fallback) config.servers.push_back(second.socket.local_endpoint());
-    ::app::dns::DNSWorker worker(io, config, 8);
+    ::app::DNSWorker worker(io, config, 8);
     std::exception_ptr failure;
     bool done = false;
     auto run = [&]() -> net::awaitable<void> {
@@ -364,7 +364,7 @@ TEST(DnsDatagram, RefusedUpstreamFallsBackAfterOutstandingQueriesFinish) {
     first.refuse = true;
     auto config = Config(first);
     config.servers.push_back(second.socket.local_endpoint());
-    ::app::dns::DNSWorker worker(io, config, 8);
+    ::app::DNSWorker worker(io, config, 8);
     DNS dns(worker);
     bool ok = false;
     net::co_spawn(io, dns.Resolve("fallback.example"), [&](std::exception_ptr e, DnsResult result) {
@@ -383,7 +383,7 @@ TEST(DnsDatagram, ExhaustedTransactionIdsRotatePortWithoutReuse) {
     net::io_context io;
     Peer peer(io);
     peer.batch_size = 1;
-    auto transport = std::make_shared<::app::dns::DatagramExchange>(io, peer.socket.local_endpoint());
+    auto transport = std::make_shared<::app::DatagramExchange>(io, peer.socket.local_endpoint());
     std::exception_ptr error;
     bool done = false;
     auto run = [&]() -> net::awaitable<void> {
@@ -408,10 +408,10 @@ TEST(DnsDatagram, ExhaustedTransactionIdsRotatePortWithoutReuse) {
 }
 
 TEST(DnsDatagram, CacheWriteFailurePreservesAnswerAndLaterWriteRecovers) {
-    const auto rejected = ::memory::rejected_process_allocations;
+    const auto rejected = ::common::rejected_process_allocations;
     net::io_context io;
     Peer peer(io);
-    ::app::dns::DNSWorker worker(io, Config(peer), 8);
+    ::app::DNSWorker worker(io, Config(peer), 8);
     DNS dns(worker);
     std::exception_ptr error;
     bool done = false;
@@ -419,13 +419,13 @@ TEST(DnsDatagram, CacheWriteFailurePreservesAnswerAndLaterWriteRecovers) {
         peer.fault_cache_write = true;
         auto result = co_await dns.Resolve("cache-fault.example");
         peer.fault_cache_write = false;
-        const bool fault_consumed = !::memory::reject_next_process_allocation;
-        ::memory::reject_next_process_allocation = false;
+        const bool fault_consumed = !::common::reject_next_process_allocation;
+        ::common::reject_next_process_allocation = false;
         const auto failed_stats = co_await worker.GetCacheStats();
         EXPECT_TRUE(result.Ok());
         EXPECT_EQ(result.addresses.size(), 4u);
         EXPECT_TRUE(fault_consumed);
-        EXPECT_GT(::memory::rejected_process_allocations, rejected);
+        EXPECT_GT(::common::rejected_process_allocations, rejected);
         EXPECT_EQ(failed_stats.entries, 0u);
         result = co_await dns.Resolve("cache-fault.example");
         const auto recovered_stats = co_await worker.GetCacheStats();
@@ -435,7 +435,7 @@ TEST(DnsDatagram, CacheWriteFailurePreservesAnswerAndLaterWriteRecovers) {
     };
     net::co_spawn(io, run(), [&](std::exception_ptr e) { error = e; done = true; peer.Stop(); });
     io.run_for(3s);
-    ::memory::reject_next_process_allocation = false;
+    ::common::reject_next_process_allocation = false;
     const bool completed_before_cleanup = done;
     peer.Stop();
     JoinService(io, worker);
@@ -451,7 +451,7 @@ TEST(DnsDatagram, ServiceStopJoinsQueriesAndRejectsLateRepliesWithoutFallback) {
     auto config = Config(peer);
     config.servers.push_back(fallback.socket.local_endpoint());
     config.timeout_sec = 30;
-    auto worker = std::make_unique<::app::dns::DNSWorker>(io, config, 8);
+    auto worker = std::make_unique<::app::DNSWorker>(io, config, 8);
     std::array<DnsResult, 5> answers;
     std::array<std::exception_ptr, 5> errors;
     size_t completed = 0;
@@ -520,7 +520,7 @@ TEST_P(DnsDatagramStop, JoinsReceiveOwnerAndRejectsNewExchanges) {
     Peer peer(io);
     peer.hold = true;
     peer.batch_size = 1;
-    auto transport = std::make_shared<::app::dns::DatagramExchange>(
+    auto transport = std::make_shared<::app::DatagramExchange>(
         io, peer.socket.local_endpoint());
     std::weak_ptr weak = transport;
     std::array<uint8_t, 19> query{0,0,1,0,0,1,0,0,0,0,0,0,1,'r',0,0,1,0,1};
@@ -529,7 +529,7 @@ TEST_P(DnsDatagramStop, JoinsReceiveOwnerAndRejectsNewExchanges) {
     ::IoErrorCode reply_error;
     if (active) {
         net::co_spawn(io, transport->Exchange(query, 30s),
-            [&](std::exception_ptr error, ::app::dns::DatagramExchange::Reply reply) {
+            [&](std::exception_ptr error, ::app::DatagramExchange::Reply reply) {
                 query_error = error;
                 reply_error = reply.error;
                 query_done = true;
@@ -570,10 +570,10 @@ TEST_P(DnsDatagramStop, JoinsReceiveOwnerAndRejectsNewExchanges) {
 }
 
 TEST(DnsDatagram, AllocationFailureUnwindsBeforeStopAndJoin) {
-    const auto rejected = ::memory::rejected_process_allocations;
+    const auto rejected = ::common::rejected_process_allocations;
     net::io_context io;
     Peer peer(io);
-    auto transport = std::make_shared<::app::dns::DatagramExchange>(
+    auto transport = std::make_shared<::app::DatagramExchange>(
         io, peer.socket.local_endpoint());
     std::weak_ptr weak = transport;
     std::array<uint8_t, 19> query{0,0,1,0,0,1,0,0,0,0,0,0,1,'r',0,0,1,0,1};
@@ -581,13 +581,13 @@ TEST(DnsDatagram, AllocationFailureUnwindsBeforeStopAndJoin) {
     std::exception_ptr failure;
     auto run = [&]() -> net::awaitable<void> {
         // Query registration is the exchange's first process-layer allocation.
-        ::memory::reject_next_process_allocation = true;
+        ::common::reject_next_process_allocation = true;
         try {
             (void)co_await transport->Exchange(query, 30s);
         } catch (const std::bad_alloc&) {
             failed = true;
         }
-        ::memory::reject_next_process_allocation = false;
+        ::common::reject_next_process_allocation = false;
         transport->RequestStop();
         co_await transport->AsyncJoin();
         transport.reset();
@@ -599,11 +599,11 @@ TEST(DnsDatagram, AllocationFailureUnwindsBeforeStopAndJoin) {
         peer.Stop();
     });
     io.run_for(2s);
-    ::memory::reject_next_process_allocation = false;
+    ::common::reject_next_process_allocation = false;
     if (failure) std::rethrow_exception(failure);
     EXPECT_TRUE(joined);
     EXPECT_TRUE(failed);
-    EXPECT_GT(::memory::rejected_process_allocations, rejected);
+    EXPECT_GT(::common::rejected_process_allocations, rejected);
     EXPECT_EQ(peer.packets, 0u);
 }
 }
@@ -639,7 +639,7 @@ TEST_P(DnsTtl, PreservesAddressesButDoesNotCacheZeroTtl) {
     auto config = Config(peer);
     config.min_ttl = 60;
     config.max_ttl = 3600;
-    ::app::dns::DNSWorker worker(io, config, 8);
+    ::app::DNSWorker worker(io, config, 8);
     DNS dns(worker);
     bool done = false;
     std::exception_ptr error;

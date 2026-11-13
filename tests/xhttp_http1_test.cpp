@@ -1,9 +1,8 @@
 #include "transport_coordinator_fixture.hpp"
 #include <gtest/gtest.h>
 
-#include "transport/internet/tcp_stream.hpp"
-#include "transport/internet/transport_stack.hpp"
-
+#include "transport/tcp_stream.hpp"
+#include "transport/transport_stack.hpp"
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -38,12 +37,12 @@ void Settle(net::io_context& io) {
     io.run_for(50ms);
 }
 
-::transport::internet::StreamSettings XHttpSettings(::transport::internet::XHttpMode mode) {
-    ::transport::internet::StreamSettings settings;
-    settings.network_mode = ::transport::internet::NetworkMode::XHttp;
+::transport::StreamSettings XHttpSettings(::transport::XHttpMode mode) {
+    ::transport::StreamSettings settings;
+    settings.network_mode = ::transport::NetworkMode::XHttp;
     settings.xhttp.path = "/fixture";
     settings.xhttp.mode = mode;
-    return ::transport::internet::NormalizeStreamSettings(settings);
+    return ::transport::NormalizeStreamSettings(settings);
 }
 
 size_t Count(std::string_view haystack, std::string_view needle) {
@@ -57,14 +56,14 @@ size_t Count(std::string_view haystack, std::string_view needle) {
 
 // Reads the uplink until `expected` arrives, answers on the downlink, then
 // holds the logical stream until released.
-class EchoSink final : public ::transport::internet::InboundTransportStreamHandler {
+class EchoSink final : public ::transport::InboundTransportStreamHandler {
 public:
     EchoSink(net::io_context& io, std::string expected, std::string reply)
         : release(io, 1), expected(std::move(expected)), reply(std::move(reply)) {}
 
     net::awaitable<void> OnInboundTransportStream(
         std::unique_ptr<::transport::AsyncStream> stream,
-        ::transport::internet::InboundTransportMetadata) override {
+        ::transport::InboundTransportMetadata) override {
         ++started;
         try {
             std::array<char, 256> chunk{};
@@ -93,16 +92,16 @@ public:
 // A client socket plus the server-side transport build running on its peer.
 struct Connection {
     Connection(app::GroupCoordinator& coordinator, net::io_context& io, ::tcp::acceptor& acceptor,
-               const ::transport::internet::StreamSettings& settings,
+               const ::transport::StreamSettings& settings,
                std::shared_ptr<EchoSink> sink)
         : io(io), sink(sink), client(io), accepted(io) {
         client.connect(acceptor.local_endpoint());
         acceptor.accept(accepted);
         client.non_blocking(true);
-        auto raw = std::make_unique<::transport::internet::TcpStream>(std::move(accepted));
+        auto raw = std::make_unique<::transport::TcpStream>(std::move(accepted));
         auto build = [state = state, &io, &coordinator, raw = std::move(raw), settings,
                       sink = std::move(sink)]() mutable -> net::awaitable<void> {
-            auto result = co_await ::transport::internet::BuildInboundTransport(coordinator, io, std::move(raw), settings, nullptr, 0, std::move(sink));
+            auto result = co_await ::transport::BuildInboundTransport(coordinator, io, std::move(raw), settings, nullptr, 0, std::move(sink));
             state->build_ok = result.has_value() && !*result;
         };
         net::co_spawn(io, std::move(build),
@@ -168,7 +167,7 @@ TEST(XhttpHttp1, PacketUpPersistsAndPrecedesDownlink) {
     net::io_context io;
     TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    const auto settings = XHttpSettings(::transport::internet::XHttpMode::PacketUp);
+    const auto settings = XHttpSettings(::transport::XHttpMode::PacketUp);
     auto sink = std::make_shared<EchoSink>(io, "hello world", "pong");
 
     Connection upload(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
@@ -213,7 +212,7 @@ TEST(XhttpHttp1, ConcurrentUploadsPrecedeDownlink) {
     net::io_context io;
     TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    const auto settings = XHttpSettings(::transport::internet::XHttpMode::PacketUp);
+    const auto settings = XHttpSettings(::transport::XHttpMode::PacketUp);
     auto sink = std::make_shared<EchoSink>(io, "abc", "ok");
 
     Connection first(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
@@ -256,7 +255,7 @@ TEST(XhttpHttp1, LaterConnectionCloseFieldEndsConnection) {
     net::io_context io;
     TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    const auto settings = XHttpSettings(::transport::internet::XHttpMode::PacketUp);
+    const auto settings = XHttpSettings(::transport::XHttpMode::PacketUp);
     auto sink = std::make_shared<EchoSink>(io, "a", "ok");
 
     Connection downlink(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
@@ -286,7 +285,7 @@ TEST(XhttpHttp1, StreamOneSupportsChunkedDuplexBody) {
     net::io_context io;
     TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    const auto settings = XHttpSettings(::transport::internet::XHttpMode::StreamOne);
+    const auto settings = XHttpSettings(::transport::XHttpMode::StreamOne);
     auto sink = std::make_shared<EchoSink>(io, "hello", "world");
     Connection connection(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
     connection.Write("POST /fixture/ HTTP/1.1\r\nHost: localhost\r\n"
@@ -310,7 +309,7 @@ TEST(XhttpHttp1, ContentLengthExcludesPipelinedRequestFromStreamOneUplink) {
     net::io_context io;
     TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    const auto settings = XHttpSettings(::transport::internet::XHttpMode::StreamOne);
+    const auto settings = XHttpSettings(::transport::XHttpMode::StreamOne);
     // Asks for more than the body holds: only body EOF ends the read.
     auto sink = std::make_shared<EchoSink>(io, "hello!", "world");
     Connection connection(transport_coordinator.Coordinator(), io, acceptor, settings, sink);
@@ -331,7 +330,7 @@ TEST_P(InvalidStreamOneFraming, RefusesAmbiguousUnsupportedOrMissingFraming) {
     net::io_context io;
     TransportCoordinatorFixture transport_coordinator{io};
     ::tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
-    const auto settings = XHttpSettings(::transport::internet::XHttpMode::StreamOne);
+    const auto settings = XHttpSettings(::transport::XHttpMode::StreamOne);
     const auto framing = GetParam();
         auto rejecting = std::make_shared<EchoSink>(io, "hello", "world");
         Connection rejected(transport_coordinator.Coordinator(), io, acceptor, settings, rejecting);

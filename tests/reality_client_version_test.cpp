@@ -1,11 +1,10 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/stream_settings.hpp"
-
+#include "transport/stream_settings.hpp"
 namespace {
-using ::transport::internet::ParseRealityClientVersion;
-using ::transport::internet::RealityClientVersion;
-using ::transport::internet::RealityClientVersionValue;
+using ::transport::ParseRealityClientVersion;
+using ::transport::RealityClientVersion;
+using ::transport::RealityClientVersionValue;
 
 TEST(RealityClientVersion, EmptyPolicyDisablesVersionRestriction) {
     const auto parsed = ParseRealityClientVersion("");

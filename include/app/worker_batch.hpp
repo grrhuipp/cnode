@@ -18,10 +18,6 @@ inline void ThrowIfStopping(const bool& stopping) {
     if (stopping) throw IoSystemError(net::error::operation_aborted);
 }
 
-}  // namespace app
-
-namespace app::worker_batch_detail {
-
 template <typename Operation>
 struct AwaitableValue;
 
@@ -52,16 +48,12 @@ net::awaitable<void> AwaitUnlessStopping(
     *result = co_await std::move(operation);
 }
 
-}  // namespace worker_batch_detail
-
 // 对每个 Worker 并发投递 `make_operation(worker, index)`，并在全部已启动的子任务
 // 结束后才返回（首个非取消失败优先上报）。非 void 结果按 Worker 下标收集，
 // 结果在 `executor` 上写入，不跨线程共享。
-namespace app {
-
 template <typename WorkerRange, typename OperationFactory,
-          typename T = app::worker_batch_detail::OperationValue<WorkerRange, OperationFactory>>
-[[nodiscard]] net::awaitable<app::worker_batch_detail::BatchResult<T>> PostToEachWorker(
+          typename T = OperationValue<WorkerRange, OperationFactory>>
+[[nodiscard]] net::awaitable<BatchResult<T>> PostToEachWorker(
     net::any_io_executor executor,
     WorkerRange& workers,
     const bool& stopping,
@@ -70,14 +62,14 @@ template <typename WorkerRange, typename OperationFactory,
     if constexpr (std::is_void_v<T>) {
         co_await common::RunWorkerBatch(std::move(executor), workers,
             [&stopping, &make_operation](auto& worker, size_t index) {
-                return app::worker_batch_detail::AwaitUnlessStopping(
+                return AwaitUnlessStopping(
                     &stopping, make_operation(worker, index));
             });
     } else {
         std::vector<T> results(workers.size());
         co_await common::RunWorkerBatch(std::move(executor), workers,
             [&stopping, &make_operation, &results](auto& worker, size_t index) {
-                return app::worker_batch_detail::AwaitUnlessStopping(
+                return AwaitUnlessStopping(
                     &stopping, make_operation(worker, index), &results[index]);
             });
         co_return results;
@@ -88,8 +80,8 @@ template <typename WorkerRange, typename OperationFactory,
 // 操作：监听安装决定 SO_REUSEPORT 组内的 socket 下标，QUIC 的 CBPF 以
 // worker_id 作为该下标投递，因此入站必须按 Worker 顺序安装。
 template <typename WorkerRange, typename OperationFactory,
-          typename T = app::worker_batch_detail::OperationValue<WorkerRange, OperationFactory>>
-[[nodiscard]] net::awaitable<app::worker_batch_detail::BatchResult<T>> PostToEachWorkerInOrder(
+          typename T = OperationValue<WorkerRange, OperationFactory>>
+[[nodiscard]] net::awaitable<BatchResult<T>> PostToEachWorkerInOrder(
     WorkerRange& workers,
     const bool& stopping,
     OperationFactory make_operation) {

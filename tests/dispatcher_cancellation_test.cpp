@@ -3,15 +3,15 @@
 #include "app/dispatcher/default_dispatcher.hpp"
 #include "app/dns/dns.hpp"
 #include "app/relay.hpp"
-#include "app/proxyman/inbound/handler.hpp"
+#include "app/proxyman/inbound_handler.hpp"
 #include "common/allocator.hpp"
 #include "common/rule.hpp"
-#include "app/proxyman/outbound/handler.hpp"
+#include "app/proxyman/outbound_handler.hpp"
 #include "app/stats.hpp"
-#include "features/routing/router.hpp"
+#include "routing/router.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/outbound.hpp"
-#include "transport/internet/tcp_stream.hpp"
+#include "transport/tcp_stream.hpp"
 #include "common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -25,10 +25,10 @@
 namespace {
 using namespace std::chrono_literals;
 
-buf::MultiBuffer Payload(size_t size) {
+common::MultiBuffer Payload(size_t size) {
     std::vector<uint8_t> bytes(size, 0x42);
-    buf::MultiBuffer payload;
-    if (!buf::AppendSpanToMultiBuffer(bytes, payload)) throw std::bad_alloc();
+    common::MultiBuffer payload;
+    if (!common::AppendSpanToMultiBuffer(bytes, payload)) throw std::bad_alloc();
     return payload;
 }
 
@@ -48,7 +48,7 @@ struct State {
     bool closed = false;
     bool cleanup_has_owner = false;
     app::RequestLoadState* load = nullptr;
-    transport::internet::TcpStream* phase_stream = nullptr;
+    transport::TcpStream* phase_stream = nullptr;
 };
 
 net::awaitable<void> Wait(State& state) {
@@ -79,7 +79,7 @@ public:
         state_.written += data.size();
         co_return data.size();
     }
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         ++state_.entered;
         if (state_.allocation_failure) throw std::bad_alloc();
         if (state_.read_error != common::ErrorCode::OK) throw transport::LinkError(state_.read_error);
@@ -92,8 +92,8 @@ public:
     int NativeHandle() const override { return -1; }
     bool IsOpen() const override { return !state_.closed; }
 protected:
-    transport::internet::TcpStream* BaseTcpStream() override { return state_.phase_stream; }
-    const transport::internet::TcpStream* BaseTcpStream() const override { return state_.phase_stream; }
+    transport::TcpStream* BaseTcpStream() override { return state_.phase_stream; }
+    const transport::TcpStream* BaseTcpStream() const override { return state_.phase_stream; }
 private:
     State& state_;
 };
@@ -109,9 +109,9 @@ class TestOutbound final : public proxy::Outbound {
 public:
     explicit TestOutbound(OutboundProbe& probe) : probe_(probe) {}
     net::awaitable<proxy::OutboundProcessResult> Process(
-        session::Context& ctx, transport::Link inbound, transport::internet::OutboundDialer& dialer,
+        common::Context& ctx, transport::Link inbound, transport::OutboundDialer& dialer,
         const infra::TimeoutsConfig&, app::StatsShard& stats, const app::RelayConfig& config,
-        buf::MultiBufferBatch first) override {
+        common::MultiBufferBatch first) override {
         auto& state = probe_.state;
         ++state.entered;
         if (state.block) co_await Wait(state);
@@ -130,12 +130,12 @@ private:
     OutboundProbe& probe_;
 };
 
-proxyman::outbound::PreparedOutboundConfig ProbeConfig(std::string tag, OutboundProbe& probe) {
-    return proxyman::outbound::PreparedOutboundConfig{
+app::PreparedOutboundConfig ProbeConfig(std::string tag, OutboundProbe& probe) {
+    return app::PreparedOutboundConfig{
         .tag = std::move(tag),
         .protocol = "test-probe",
         .sender = {},
-        .create = proxyman::outbound::MakePreparedOutboundCreator<
+        .create = app::MakePreparedOutboundCreator<
             OutboundProbe*,
             +[](std::string_view, std::shared_ptr<OutboundProbe* const> probe,
                 net::io_context&, common::AwaitableTaskGroup&) -> std::unique_ptr<proxy::Outbound> {
@@ -154,26 +154,26 @@ struct OutboundProbes {
 };
 
 struct Outbounds {
-    Outbounds(OutboundProbes& probes, net::io_context& io, app::dns::DNS& dns)
+    Outbounds(OutboundProbes& probes, net::io_context& io, app::DNS& dns)
         : tasks(io.get_executor()),
           registry({ProbeConfig("direct", probes.direct),
                     ProbeConfig("second", probes.second)},
                    io, dns, std::chrono::seconds(1), tasks.Tasks()) {}
     common::ResidentTaskGroup tasks;
-    proxyman::outbound::HandlerRegistry registry;
+    app::OutboundHandlerRegistry registry;
 };
 
 class Router final : public routing::Router {
 public:
     mutable int calls = 0;
     routing::RouteDecision decision;
-    routing::RouteDecision Route(const session::Context&) const override { ++calls; return decision; }
+    routing::RouteDecision Route(const common::Context&) const override { ++calls; return decision; }
     routing::DomainStrategy DomainStrategy() const noexcept override {
         return routing::DomainStrategy::IPOnDemand;
     }
 };
 
-void JoinRuntime(net::io_context& io, app::dns::DNSWorker& dns, Outbounds& outbounds) {
+void JoinRuntime(net::io_context& io, app::DNSWorker& dns, Outbounds& outbounds) {
     dns.RequestStop();
     bool dns_joined = false;
     bool outbounds_joined = false;
@@ -203,7 +203,7 @@ void ExerciseDispatch(Case which, bool controlled, common::ErrorCode reason = co
     IoErrorCode phase_open_error;
     phase_socket.open(tcp::v4(), phase_open_error);
     if (phase_open_error) throw IoSystemError(phase_open_error);
-    transport::internet::TcpStream phase_stream(std::move(phase_socket));
+    transport::TcpStream phase_stream(std::move(phase_socket));
     source_state.load = &load;
     source_state.block = which == Case::Sniff;
     source_state.allocation_failure = which == Case::SniffMemory;
@@ -232,7 +232,7 @@ void ExerciseDispatch(Case which, bool controlled, common::ErrorCode reason = co
         policy.outbound = routing::RouteWithFallback{"direct"};
     }
     policy.sniffing.enabled = which == Case::Sniff || which == Case::SniffMemory || which == Case::SniffLinkError;
-    session::Context ctx;
+    common::Context ctx;
     ctx.conn_id = 1;
     ctx.inbound.tag = "dispatcher-test";
     ctx.inbound.accounting_key = "panel/fixture/1/";
@@ -244,7 +244,7 @@ void ExerciseDispatch(Case which, bool controlled, common::ErrorCode reason = co
     app::StatsShard stats;
     infra::TimeoutsConfig timeouts;
     udp::socket dns_peer(io, udp::endpoint(net::ip::make_address("127.0.0.42"), 0));
-    app::dns::Config dns_config{
+    app::DnsConfig dns_config{
         .servers = {dns_peer.local_endpoint()},
         .timeout_sec = 2,
     };
@@ -253,22 +253,22 @@ void ExerciseDispatch(Case which, bool controlled, common::ErrorCode reason = co
         ctx.outbound.target = common::TargetAddress("dispatcher-cancellation.example", 443);
         ctx.outbound.original_target = ctx.outbound.target;
     }
-    app::dns::DNSWorker dns_worker(io, dns_config, 8);
-    app::dns::DNS dns(dns_worker);
+    app::DNSWorker dns_worker(io, dns_config, 8);
+    app::DNS dns(dns_worker);
     app::SessionTrackingState session_tracking;
-    rule::DetectRulePolicy request_policy;
+    common::DetectRulePolicy request_policy;
     if (which == Case::PolicyBlockedForce || which == Case::PolicyBlockedRoute ||
         which == Case::PolicyAllowed) {
         request_policy.UpdateRule(
             ctx.inbound.tag,
-            std::make_shared<const rule::DetectRulePolicy::RuleList>(
-                rule::DetectRulePolicy::RuleList{{
+            std::make_shared<const common::DetectRulePolicy::RuleList>(
+                common::DetectRulePolicy::RuleList{{
                     .Pattern = std::regex(which == Case::PolicyAllowed
                         ? "198\\.51\\.100\\.1" : "192\\.0\\.2\\.1"),
                 }}));
     }
     Outbounds outbound_handlers(outbounds, io, dns);
-    app::dispatcher::DefaultDispatcher dispatcher(
+    app::DefaultDispatcher dispatcher(
         router, outbound_handlers.registry, request_policy, session_tracking, dns, load);
     if (which == Case::PreStopped) reader->Cancellation().Stop(reason);
     bool done = false;
@@ -396,18 +396,18 @@ void ExerciseSiblingIsolation(bool controlled) {
         probe->state.load = &load;
     }
     Router router;
-    rule::DetectRulePolicy request_policy;
+    common::DetectRulePolicy request_policy;
     app::SessionTrackingState session_tracking;
     udp::socket dns_peer(io, udp::endpoint(net::ip::address_v4::loopback(), 0));
-    app::dns::Config dns_config{.servers = {dns_peer.local_endpoint()}};
-    app::dns::DNSWorker dns_worker(io, dns_config, 8);
-    app::dns::DNS dns(dns_worker);
+    app::DnsConfig dns_config{.servers = {dns_peer.local_endpoint()}};
+    app::DNSWorker dns_worker(io, dns_config, 8);
+    app::DNS dns(dns_worker);
     Outbounds outbound_handlers(outbounds, io, dns);
-    app::dispatcher::DefaultDispatcher dispatcher(
+    app::DefaultDispatcher dispatcher(
         router, outbound_handlers.registry, request_policy, session_tracking, dns, load);
     routing::DispatchPolicy policy_a{routing::SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"direct"}};
     routing::DispatchPolicy policy_b{routing::SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"second"}};
-    session::Context ctx_a, ctx_b;
+    common::Context ctx_a, ctx_b;
     ctx_a.outbound.target = ctx_b.outbound.target = common::TargetAddress("192.0.2.1", 443);
     app::StatsShard stats;
     infra::TimeoutsConfig timeouts;
@@ -474,16 +474,16 @@ void ExpectTraffic(const app::UserTrafficCounters& traffic, int64_t user_id,
 
 TEST(DispatcherAccounting, CompletionPreservesUncommittedTrafficWithoutAllocating) {
     struct Restore {
-        bool previous = memory::reject_next_process_allocation;
-        size_t rejections = memory::rejected_process_allocations;
+        bool previous = common::reject_next_process_allocation;
+        size_t rejections = common::rejected_process_allocations;
         ~Restore() {
-            memory::reject_next_process_allocation = previous;
-            memory::rejected_process_allocations = rejections;
+            common::reject_next_process_allocation = previous;
+            common::rejected_process_allocations = rejections;
         }
     } restore;
     app::SessionTrackingState tracking;
     app::SessionTrackingState::ActiveSession old_port, new_port, static_inbound;
-    session::Traffic old_traffic, new_traffic, static_traffic;
+    common::Traffic old_traffic, new_traffic, static_traffic;
     constexpr std::string_view key = "panel/same-node/9/";
     tracking.RegisterActiveSession(old_port, key, 42, old_traffic);
     tracking.RegisterActiveSession(new_port, key, 42, new_traffic);
@@ -500,14 +500,14 @@ TEST(DispatcherAccounting, CompletionPreservesUncommittedTrafficWithoutAllocatin
     ExpectTraffic(uncommitted, 42, 20, 28);
     old_traffic.bytes_up += 19;
     new_traffic.bytes_down += 23;
-    const auto rejections = memory::rejected_process_allocations;
-    memory::reject_next_process_allocation = true;
+    const auto rejections = common::rejected_process_allocations;
+    common::reject_next_process_allocation = true;
     tracking.UnregisterActiveSession(old_port);
     tracking.UnregisterActiveSession(new_port);
     tracking.UnregisterActiveSession(static_inbound);
-    const bool allocation_still_pending = memory::reject_next_process_allocation;
-    const auto rejections_after_teardown = memory::rejected_process_allocations;
-    memory::reject_next_process_allocation = false;
+    const bool allocation_still_pending = common::reject_next_process_allocation;
+    const auto rejections_after_teardown = common::rejected_process_allocations;
+    common::reject_next_process_allocation = false;
     EXPECT_TRUE(allocation_still_pending);
     EXPECT_EQ(rejections_after_teardown, rejections);
     // Completion during off-thread persistence must survive committing the
@@ -523,7 +523,7 @@ TEST(DispatcherAccounting, CompletionPreservesUncommittedTrafficWithoutAllocatin
 TEST(DispatcherAccounting, ReusedSessionStartsWithFreshTraffic) {
     app::SessionTrackingState tracking;
     app::SessionTrackingState::ActiveSession active;
-    session::Traffic traffic;
+    common::Traffic traffic;
     constexpr std::string_view key = "panel/same-node/9/";
     tracking.RegisterActiveSession(active, key, 42, traffic);
     traffic.bytes_up = 7;
@@ -547,7 +547,7 @@ TEST(DispatcherAccounting, RollbackRestoresTrafficFromRetiredSession) {
     // an earlier snapshot is in flight; rollback restores the full total.
     app::SessionTrackingState aggregate;
     app::SessionTrackingState::ActiveSession retired_session;
-    session::Traffic retired_traffic;
+    common::Traffic retired_traffic;
     aggregate.RegisterActiveSession(retired_session, key, 77, retired_traffic);
     retired_traffic.bytes_up = 29;
     retired_traffic.bytes_down = 31;

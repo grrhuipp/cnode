@@ -1,17 +1,16 @@
 #include <gtest/gtest.h>
 
-#include "api/v2board/panel_data.hpp"
-
+#include "api/panel_data.hpp"
 #include <limits>
 #include <string>
 #include <string_view>
 
 namespace {
 
-using ::api::v2board::ParseNodeInfo;
+using ::api::ParseNodeInfo;
 
 auto ParseResponse(std::string_view body) {
-    const auto parsed = ::json::parse(body);
+    const auto parsed = ::infra::parse(body);
     return ParseNodeInfo(parsed.as_object(), "vmess");
 }
 
@@ -65,7 +64,7 @@ TEST(V2BoardNodeInfoJson, InvalidIntervalsAreRejected) {
 }
 
 TEST(V2BoardNodeInfoJson, UnsignedPortOverflowIsRejected) {
-    ::json::object source{
+    ::infra::object source{
         {"server_port", std::numeric_limits<uint64_t>::max()},
     };
     auto result = ParseNodeInfo(source, "vmess");
@@ -90,7 +89,7 @@ TEST(V2BoardNodeInfoJson, LowercaseHostHeaderIsAccepted) {
 }
 
 TEST(V2BoardNodeInfoJson, RealityNodeResponseIsNormalized) {
-    const auto parsed = ::json::parse(
+    const auto parsed = ::infra::parse(
         R"({"server_port":8443,"network":"grpc","networkSettings":{"serviceName":"gun"},"tls":2,"flow":"xtls-rprx-vision","server_name":"www.apple.com","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","short_id":["0123456789abcdef",""],"dest":"www.apple.com:443","xver":1,"mldsa65_seed":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","min_client_ver":"1.8.0","max_client_ver":"26.1.31","max_time_diff":60000}})");
     auto result = ParseNodeInfo(parsed.as_object(), "vless");
     ASSERT_TRUE(result.has_value());
@@ -108,9 +107,9 @@ TEST(V2BoardNodeInfoJson, RealityNodeResponseIsNormalized) {
     EXPECT_EQ(result->Reality.xver, 1);
     ASSERT_TRUE(result->Reality.mldsa65_seed.has_value());
     ASSERT_TRUE(result->Reality.min_client_version.has_value());
-    EXPECT_EQ(*result->Reality.min_client_version, (::transport::internet::RealityClientVersion{1, 8, 0, 0}));
+    EXPECT_EQ(*result->Reality.min_client_version, (::transport::RealityClientVersion{1, 8, 0, 0}));
     ASSERT_TRUE(result->Reality.max_client_version.has_value());
-    EXPECT_EQ(*result->Reality.max_client_version, (::transport::internet::RealityClientVersion{26, 1, 31, 0}));
+    EXPECT_EQ(*result->Reality.max_client_version, (::transport::RealityClientVersion{26, 1, 31, 0}));
     EXPECT_EQ(result->Reality.max_time_diff, 60000);
 }
 
@@ -123,7 +122,7 @@ TEST(V2BoardNodeInfoJson, InvalidRealitySettingsAreRejected) {
 }
 
 TEST(V2BoardNodeInfoJson, NullOptionalRealitySubfieldsAreAccepted) {
-    auto null_subfields = ::json::parse(
+    auto null_subfields = ::infra::parse(
         R"({"server_port":8443,"network":"ws","networkSettings":{"path":"/ws","headers":null,"serviceName":null},"tls":2,"server_name":"www.apple.com","tls_settings":{"private_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","server_names":null,"short_ids":null,"dest":"www.apple.com:443"}})");
     ASSERT_TRUE(ParseNodeInfo(null_subfields.as_object(), "vless").has_value());
 }
@@ -150,7 +149,7 @@ TEST(V2BoardNodeInfoJson, OptionalCipherNullValues) {
 }
 
 TEST(V2BoardNodeInfoJson, Xv2BoardTypesAreCompatible) {
-    auto parsed = ::json::parse(
+    auto parsed = ::infra::parse(
         R"({"server_port":"8443","network":"WS","networkSettings":{"path":"/Edge","headers":{"Host":"Edge.Example"}},"tls":"1","flow":"XTLS-RPRX-VISION","server_name":"SNI.Example","cipher":"AES-128-GCM","server_key":"Identity","base_config":{"pull_interval":"45","push_interval":"30"}})");
     auto result = ParseNodeInfo(parsed.as_object(), "VMESS");
     ASSERT_TRUE(result.has_value());
@@ -184,7 +183,7 @@ TEST(V2BoardNodeInfoJson, PhpEmptyAssociativeArrayIsAccepted) {
 }
 
 TEST(V2BoardNodeInfoJson, HysteriaVersionTwoMapsProtocolAndBandwidth) {
-    auto hysteria = ::json::parse(
+    auto hysteria = ::infra::parse(
         R"({"version":"2","host":"node.example","server_port":"443","server_name":"Node.Example","up_mbps":"100","down_mbps":200,"ignore_client_bandwidth":false,"obfs":null,"obfs-password":null})");
     auto hy = ParseNodeInfo(hysteria.as_object(), "hysteria");
     ASSERT_TRUE(hy.has_value());
@@ -195,13 +194,13 @@ TEST(V2BoardNodeInfoJson, HysteriaVersionTwoMapsProtocolAndBandwidth) {
 }
 
 TEST(V2BoardNodeInfoJson, UnsupportedShadowsocksObfsIsRejected) {
-    auto obfs = ::json::parse(
+    auto obfs = ::infra::parse(
         R"({"server_port":443,"cipher":"aes-128-gcm","obfs":"http","obfs_settings":{"host":"a"}})");
     EXPECT_FALSE(ParseNodeInfo(obfs.as_object(), "shadowsocks"));
 }
 
 TEST(V2BoardNodeInfoJson, AnyTlsPaddingArrayMapsToLines) {
-    auto anytls = ::json::parse(
+    auto anytls = ::infra::parse(
         R"({"server_port":443,"padding_scheme":["stop=2","1=64-65"]})");
     auto any = ParseNodeInfo(anytls.as_object(), "anytls");
     ASSERT_TRUE(any.has_value());
@@ -212,7 +211,7 @@ auto ParseReality(std::string_view settings) {
     constexpr std::string_view kKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     const auto body = std::string(R"({"server_port":443,"tls":2,"tls_settings":{"private_key":")") +
         std::string(kKey) + "\"," + std::string(settings) + "}}";
-    const auto parsed = ::json::parse(body);
+    const auto parsed = ::infra::parse(body);
     return ParseNodeInfo(parsed.as_object(), "vless");
 }
 
@@ -247,13 +246,13 @@ TEST(V2BoardNodeInfoJson, InvalidServerNameIsRejected) {
 }
 
 TEST(V2BoardNodeInfoJson, InvalidAnyTlsPaddingIsRejected) {
-    const auto parsed = ::json::parse(
+    const auto parsed = ::infra::parse(
         R"({"server_port":443,"padding_scheme":"stop=2\n1=65536-65536"})");
     EXPECT_FALSE(ParseNodeInfo(parsed.as_object(), "anytls").has_value());
 }
 
 TEST(V2BoardNodeInfoJson, NullAnyTlsPaddingIsUnset) {
-    const auto parsed = ::json::parse(R"({"server_port":443,"padding_scheme":null})");
+    const auto parsed = ::infra::parse(R"({"server_port":443,"padding_scheme":null})");
     const auto result = ParseNodeInfo(parsed.as_object(), "anytls");
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(result->PaddingScheme.empty());

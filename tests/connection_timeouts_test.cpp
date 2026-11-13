@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "transport/internet/connection_timeouts.hpp"
+#include "transport/connection_timeouts.hpp"
 #include <chrono>
 #include <memory>
 
@@ -10,7 +10,7 @@ struct Owner {
     ::common::ErrorCode reason = ::common::ErrorCode::OK;
     void OnTimeout(::common::ErrorCode error) noexcept { ++calls; reason = error; }
 };
-using Timeouts = ::transport::internet::detail::ConnectionTimeouts<Owner>;
+using Timeouts = ::transport::ConnectionTimeouts<Owner>;
 
 TEST(ConnectionTimeouts, ActivityArmsIdleTimeoutAfterCompletedWrite) {
     ::net::io_context io;

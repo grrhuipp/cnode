@@ -1,10 +1,9 @@
 #pragma once
 
-#include "app/proxyman/inbound/handler.hpp"
-#include "app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/inbound_handler.hpp"
+#include "app/proxyman/user_store.hpp"
 #include "common/asio_types.hpp"
-#include "transport/internet/inbound_listen.hpp"
-
+#include "transport/inbound_listen.hpp"
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -32,16 +31,16 @@ struct PortBinding {
     uint16_t    port     = 0;
     std::string protocol;           // "vmess" / "trojan"
     std::string tag;                // inbound tag
-    transport::internet::InboundListen listen;
+    transport::InboundListen listen;
 };
 
 // Cold-path result shared by static and panel sources. Every field is
 // immutable after preparation; Workers copy only what they install.
 struct PreparedInbound {
     PortBinding binding;
-    proxyman::inbound::ReceiverSettings receiver;
-    proxyman::inbound::BuildRequest build_request;
-    std::shared_ptr<const proxyman::inbound::UserSet> users;
+    ReceiverSettings receiver;
+    BuildRequest build_request;
+    std::shared_ptr<const UserSet> users;
 };
 
 // The single inbound builder: protocol settings, users, transport security,
@@ -51,8 +50,8 @@ struct PreparedInbound {
 
 // Rebuilds only the users of an already prepared inbound. Every user must be
 // accepted; a partial authentication snapshot is rejected.
-[[nodiscard]] std::shared_ptr<const proxyman::inbound::UserSet> PrepareInboundUsers(
-    const proxyman::inbound::BuildRequest& request,
+[[nodiscard]] std::shared_ptr<const UserSet> PrepareInboundUsers(
+    const BuildRequest& request,
     std::span<const infra::InboundUserSpec> users);
 
 // Map every static source (plus the test inbound) to InboundSpec, validate the
@@ -87,14 +86,14 @@ enum class InboundInstallFailure : uint8_t {
 // Rollback credentials of one publication, allocated before any Worker can
 // install the candidate.
 struct UserPublicationRollback {
-    proxyman::inbound::UserStore::PublishedSnapshot previous;
-    std::vector<proxyman::inbound::UserStore::WorkerView> worker_views;
+    UserStore::PublishedSnapshot previous;
+    std::vector<UserStore::WorkerView> worker_views;
 };
 
 // 一次发布的候选与回滚凭据。全部在任何 Worker 变更与提交之前分配完成。
 struct PreparedUserPublication {
-    proxyman::inbound::UserStore::PublishedSnapshot candidate;
-    std::vector<proxyman::inbound::UserStore::WorkerView> candidate_views;
+    UserStore::PublishedSnapshot candidate;
+    std::vector<UserStore::WorkerView> candidate_views;
     UserPublicationRollback rollback;
     void Commit();
 };
@@ -104,7 +103,7 @@ struct PreparedUserPublication {
 // worker_count = 0 调用并经 Commit 提交候选，之后 Worker 捕获已提交快照；
 // 启动失败时由调用方重新提交 `rollback.previous`。
 [[nodiscard]] PreparedUserPublication PrepareUserPublication(
-    proxyman::inbound::UserStore::PublishedSnapshot candidate, size_t worker_count);
+    UserStore::PublishedSnapshot candidate, size_t worker_count);
 
 // 面板节点：经 PrepareUserPublication 准备后把回滚凭据记入 `rollback`，在每个
 // Worker 安装候选视图（等待全部已启动的安装结束），提交候选并清空 `rollback`。
@@ -113,7 +112,7 @@ struct PreparedUserPublication {
 net::awaitable<void> PublishUsers(
     net::any_io_executor executor,
     std::span<const std::unique_ptr<Worker>> workers,
-    proxyman::inbound::UserStore::PublishedSnapshot candidate,
+    UserStore::PublishedSnapshot candidate,
     std::optional<UserPublicationRollback>& rollback,
     const bool& stopping);
 

@@ -3,8 +3,7 @@
 #include "common/asio_types.hpp"
 #include "common/error.hpp"
 #include "transport/link.hpp"
-#include "transport/internet/timeout_scheduler.hpp"
-
+#include "transport/timeout_scheduler.hpp"
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -56,7 +55,7 @@ private:
 // One logical stream's phase deadline, owned inline by that stream on its
 // Worker scheduler. The stream must outlive this member; no private timer or
 // background task is owned here.
-class StreamPhaseDeadline final : private transport::internet::TimeoutEvent {
+class StreamPhaseDeadline final : private TimeoutEvent {
 public:
     StreamPhaseDeadline(net::io_context& io_context, AsyncStream& owner);
     ~StreamPhaseDeadline() noexcept;
@@ -76,14 +75,7 @@ private:
     uint8_t expired_ = 0;
 };
 
-}  // namespace transport
-
-namespace transport::internet {
-
 class TcpStream;
-
-}  // namespace transport::internet
-
 // ============================================================================
 // AsyncStream - 异步流抽象接口
 //
@@ -95,8 +87,6 @@ class TcpStream;
 // │ 4. TLS 流的 AsyncShutdownWrite() 必须发送 close_notify                  │
 // └─────────────────────────────────────────────────────────────────────────┘
 // ============================================================================
-namespace transport {
-
 class AsyncStream : public transport::MultiBufferReader,
                     public transport::MultiBufferWriter {
 public:
@@ -119,7 +109,7 @@ public:
     virtual net::awaitable<std::size_t> AsyncWrite(net::const_buffer buf) = 0;
 
     // ========================================================================
-    // buf::MultiBuffer 流式接口（对应 Xray buf.Reader / buf.Writer）
+    // common::MultiBuffer 流式接口（对应 Xray buf.Reader / buf.Writer）
     //
     // 读路径由每个具体 stream 实现，以便先等待可读数据，再申请唯一的 8KB
     // payload Buffer（VMessStream 解密直写 pool Buffer，省去一次 memcpy）；
@@ -129,10 +119,10 @@ public:
     // ========================================================================
 
     // 空 MultiBuffer 表示 EOF；网络错误或取消抛 IoSystemError，内存不足抛 std::bad_alloc。
-    virtual net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override = 0;
+    virtual net::awaitable<common::MultiBuffer> ReadMultiBuffer() override = 0;
 
     // 接管 mb，写完后归还 Buffer；失败抛 IoSystemError。
-    virtual net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
+    virtual net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override;
 
     /**
      * 批量写入非 owning buffer 序列。
@@ -229,7 +219,7 @@ public:
      */
     virtual bool IsOpen() const = 0;
     virtual void PrependReadData(std::span<const uint8_t> data);
-    virtual void PrependReadMultiBuffer(buf::MultiBuffer&& mb);
+    virtual void PrependReadMultiBuffer(common::MultiBuffer&& mb);
 
     // ========================================================================
     // Tcp 能力透传
@@ -269,14 +259,14 @@ protected:
     }
     // 仅 transport/internet 包装链和 AsyncStream 自身能力方法使用。
     // 不能作为 app/proxy/relay 公开逃逸到 TcpStream 的入口。
-    static transport::internet::TcpStream* BaseTcpStreamOf(AsyncStream& stream) {
+    static TcpStream* BaseTcpStreamOf(AsyncStream& stream) {
         return stream.BaseTcpStream();
     }
-    static const transport::internet::TcpStream* BaseTcpStreamOf(const AsyncStream& stream) {
+    static const TcpStream* BaseTcpStreamOf(const AsyncStream& stream) {
         return stream.BaseTcpStream();
     }
-    virtual transport::internet::TcpStream* BaseTcpStream() { return nullptr; }
-    virtual const transport::internet::TcpStream* BaseTcpStream() const { return nullptr; }
+    virtual TcpStream* BaseTcpStream() { return nullptr; }
+    virtual const TcpStream* BaseTcpStream() const { return nullptr; }
 
 private:
     transport::CancellationSource cancellation_;

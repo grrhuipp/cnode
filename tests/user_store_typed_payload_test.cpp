@@ -1,11 +1,10 @@
 #include <gtest/gtest.h>
 
-#include "app/proxyman/inbound/user_store.hpp"
-
+#include "app/proxyman/user_store.hpp"
 #include <stdexcept>
 
 namespace {
-using namespace ::proxyman::inbound;
+using namespace ::app;
 
 void Commit(UserStore::PublishedSnapshot snapshot) {
     auto view = UserStore::PrepareWorkerView(snapshot);

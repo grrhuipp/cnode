@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace proxy::anytls {
+namespace proxy {
 
 
 namespace {
@@ -30,7 +30,7 @@ std::array<uint8_t, kFrameHeaderSize> BuildFrameHeaderBytes(
     return header;
 }
 
-void AppendWaste(std::pmr::vector<uint8_t>& out, uint16_t payload_size) {
+void AppendWaste(std::vector<uint8_t>& out, uint16_t payload_size) {
     const auto header = BuildFrameHeaderBytes(kCmdWaste, 0, payload_size);
     const size_t offset = out.size();
     out.resize(offset + header.size() + payload_size, uint8_t{0});
@@ -137,7 +137,7 @@ bool FrameBatch::Append(uint8_t cmd, uint32_t sid, std::span<const uint8_t> byte
 }
 
 tl::expected<void, common::ErrorCode> FrameBatch::Encode(
-    uint8_t cmd, uint32_t sid, const buf::MultiBuffer& payload) {
+    uint8_t cmd, uint32_t sid, const common::MultiBuffer& payload) {
     Begin(payload.size());
     for (const auto* buffer : payload) {
         if (!buffer || buffer->IsEmpty()) continue;
@@ -176,7 +176,7 @@ net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteMultiBufferAsFrameBatch(transport::AsyncStream& stream,
                              uint8_t cmd,
                              uint32_t sid,
-                             buf::MultiBuffer mb) {
+                             common::MultiBuffer mb) {
     FrameBatch batch;
     auto encoded = batch.Encode(cmd, sid, mb);
     if (!encoded) {
@@ -251,8 +251,8 @@ tl::expected<PeerSettings, common::ErrorCode> ParsePeerSettings(std::string_view
     return result;
 }
 
-std::pmr::string ClientSettings(const PaddingScheme& scheme) {
-    std::pmr::string settings{memory::process_resource()};
+std::string ClientSettings(const AnyTlsPaddingScheme& scheme) {
+    std::string settings;
     const auto& digest = scheme.Digest();
     settings.reserve(28 + digest.size());
     settings.append("v=2\nclient=cnode\npadding-md5=");
@@ -262,7 +262,7 @@ std::pmr::string ClientSettings(const PaddingScheme& scheme) {
 
 
 tl::expected<void, common::ErrorCode> AppendFrameBytesTo(
-    std::pmr::vector<uint8_t>& out,
+    std::vector<uint8_t>& out,
     uint8_t cmd,
     uint32_t sid,
     std::span<const uint8_t> payload) {
@@ -314,9 +314,9 @@ WriteFrame(transport::AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<
 }
 
 net::awaitable<tl::expected<void, common::ErrorCode>>
-WritePacketWithPadding(transport::AsyncStream& stream,
+WriteAnyTlsPacketWithPadding(transport::AsyncStream& stream,
                        std::span<const PaddingRecord> record_rules,
-                       std::pmr::vector<uint8_t> packet) {
+                       std::vector<uint8_t> packet) {
     if (packet.empty()) {
         co_return tl::expected<void, common::ErrorCode>{};
     }
@@ -369,21 +369,13 @@ WritePacketWithPadding(transport::AsyncStream& stream,
     co_return tl::expected<void, common::ErrorCode>{};
 }
 
-net::awaitable<tl::expected<void, common::ErrorCode>>
-WritePacketWithPadding(transport::AsyncStream& stream,
-                       const PaddingScheme& scheme,
-                       uint32_t packet_index,
-                       std::pmr::vector<uint8_t> packet) {
-    return WritePacketWithPadding(stream, scheme.RecordFor(packet_index), std::move(packet));
-}
-
 static net::awaitable<tl::expected<void, common::ErrorCode>>
 WritePaddedMultiBufferFrames(transport::AsyncStream& stream,
                              std::span<const PaddingRecord> records,
                              uint8_t cmd,
                              uint32_t sid,
-                             buf::MultiBuffer mb) {
-    std::pmr::vector<uint8_t> packet{memory::process_resource()};
+                             common::MultiBuffer mb) {
+    std::vector<uint8_t> packet;
     packet.reserve(mb.byte_size() + (mb.size() * kFrameHeaderSize));
     for (auto* buffer : mb) {
         if (!buffer || buffer->IsEmpty()) {
@@ -395,16 +387,16 @@ WritePaddedMultiBufferFrames(transport::AsyncStream& stream,
         }
     }
     mb.clear();
-    co_return co_await WritePacketWithPadding(stream, records, std::move(packet));
+    co_return co_await WriteAnyTlsPacketWithPadding(stream, records, std::move(packet));
 }
 
 net::awaitable<tl::expected<void, common::ErrorCode>>
-WriteMultiBufferAsFramesWithPadding(transport::AsyncStream& stream,
-                                    const PaddingScheme& scheme,
+WriteAnyTlsMultiBufferAsFramesWithPadding(transport::AsyncStream& stream,
+                                    const AnyTlsPaddingScheme& scheme,
                                     uint32_t packet_index,
                                     uint8_t cmd,
                                     uint32_t sid,
-                                    buf::MultiBuffer mb) {
+                                    common::MultiBuffer mb) {
     const auto records = scheme.RecordFor(packet_index);
     if (records.empty()) {
         return WriteMultiBufferAsFrameBatch(stream, cmd, sid, std::move(mb));
@@ -427,7 +419,7 @@ WritePaddedBufferFrames(transport::AsyncStream& stream,
         }
     }
 
-    std::pmr::vector<uint8_t> packet{memory::process_resource()};
+    std::vector<uint8_t> packet;
     packet.reserve(payload_bytes + (frame_count * kFrameHeaderSize));
     for (const net::const_buffer& buffer : buffers) {
         const auto* data = static_cast<const uint8_t*>(buffer.data());
@@ -448,12 +440,12 @@ WritePaddedBufferFrames(transport::AsyncStream& stream,
             remaining = remaining.subspan(chunk_size);
         }
     }
-    co_return co_await WritePacketWithPadding(stream, records, std::move(packet));
+    co_return co_await WriteAnyTlsPacketWithPadding(stream, records, std::move(packet));
 }
 
 net::awaitable<tl::expected<void, common::ErrorCode>>
-WriteBuffersAsFramesWithPadding(transport::AsyncStream& stream,
-                                const PaddingScheme& scheme,
+WriteAnyTlsBuffersAsFramesWithPadding(transport::AsyncStream& stream,
+                                const AnyTlsPaddingScheme& scheme,
                                 uint32_t packet_index,
                                 uint8_t cmd,
                                 uint32_t sid,
@@ -465,23 +457,23 @@ WriteBuffersAsFramesWithPadding(transport::AsyncStream& stream,
     return WritePaddedBufferFrames(stream, records, cmd, sid, buffers);
 }
 
-net::awaitable<tl::expected<FrameHeader, common::ErrorCode>>
-ReadFrameHeader(transport::AsyncStream& stream) {
+net::awaitable<tl::expected<AnyTlsFrameHeader, common::ErrorCode>>
+ReadAnyTlsFrameHeader(transport::AsyncStream& stream) {
     std::array<uint8_t, kFrameHeaderSize> header{};
     if (auto ok = co_await proxy::ReadHandshakeExact(stream, header, proxy::HandshakeProgress::NotStarted); !ok) {
         co_return tl::unexpected(ok.error());
     }
 
-    FrameHeader out;
+    AnyTlsFrameHeader out;
     out.cmd = header[0];
     out.sid = common::LoadU32BE(header.data() + 1);
     out.length = common::LoadU16BE(header.data() + 5);
     co_return out;
 }
 
-net::awaitable<tl::expected<std::pmr::string, common::ErrorCode>>
+net::awaitable<tl::expected<std::string, common::ErrorCode>>
 ReadFrameText(transport::AsyncStream& stream, uint16_t length) {
-    std::pmr::string text(length, '\0', memory::process_resource());
+    std::string text(length, '\0');
     if (auto ok = co_await proxy::ReadHandshakeExact(
             stream,
             std::span<uint8_t>(reinterpret_cast<uint8_t*>(text.data()), length),
@@ -508,12 +500,12 @@ DiscardFramePayload(transport::AsyncStream& stream, uint16_t length) {
     co_return tl::expected<void, common::ErrorCode>{};
 }
 
-net::awaitable<tl::expected<buf::MultiBuffer, common::ErrorCode>>
+net::awaitable<tl::expected<common::MultiBuffer, common::ErrorCode>>
 ReadFramePayload(transport::AsyncStream& stream, uint16_t length) {
-    buf::MultiBuffer mb;
+    common::MultiBuffer mb;
     size_t remaining = length;
     while (remaining > 0) {
-        buf::BufferGuard buffer{buf::Buffer::New()};
+        common::BufferGuard buffer{common::Buffer::New()};
         if (!buffer) {
             co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
         }
@@ -537,7 +529,7 @@ int PaddingRecord::SampleSize() const {
     return SampleRange(min_size, max_size_exclusive);
 }
 
-std::span<const PaddingRecord> PaddingScheme::RecordFor(uint32_t index) const noexcept {
+std::span<const PaddingRecord> AnyTlsPaddingScheme::RecordFor(uint32_t index) const noexcept {
     if (index >= stop_) return {};
     const auto found = std::lower_bound(records_.begin(), records_.end(), index,
         [](const PacketPadding& record, uint32_t value) { return record.index < value; });
@@ -545,14 +537,14 @@ std::span<const PaddingRecord> PaddingScheme::RecordFor(uint32_t index) const no
         ? std::span<const PaddingRecord>(found->ranges) : std::span<const PaddingRecord>{};
 }
 
-uint16_t PaddingScheme::SampleAuthPaddingSize() const {
+uint16_t AnyTlsPaddingScheme::SampleAuthPaddingSize() const {
     return static_cast<uint16_t>(SampleRange(auth_padding_.min_size,
         static_cast<int>(auth_padding_.max_size_exclusive)));
 }
 
-std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw) {
+std::optional<AnyTlsPaddingScheme> ParseAnyTlsPaddingScheme(std::string_view raw) {
     if (raw.empty()) return std::nullopt;
-    PaddingScheme scheme;
+    AnyTlsPaddingScheme scheme;
     auto text = raw;
     while (const auto line = NextToken(text, '\n')) {
         const auto separator = line->find('=');
@@ -581,7 +573,7 @@ std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw) {
                 auto existing = std::find_if(
                     scheme.records_.begin(),
                     scheme.records_.end(),
-                    [idx = *index](const PaddingScheme::PacketPadding& entry) {
+                    [idx = *index](const AnyTlsPaddingScheme::PacketPadding& entry) {
                         return entry.index == idx;
                     });
                 if (existing != scheme.records_.end()) {
@@ -605,14 +597,14 @@ std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw) {
         scheme.md5_.push_back(kHex[digest[index] & 0xf]);
     }
     std::sort(scheme.records_.begin(), scheme.records_.end(),
-        [](const PaddingScheme::PacketPadding& lhs, const PaddingScheme::PacketPadding& rhs) {
+        [](const AnyTlsPaddingScheme::PacketPadding& lhs, const AnyTlsPaddingScheme::PacketPadding& rhs) {
             return lhs.index < rhs.index;
         });
     return scheme;
 }
 
-const std::shared_ptr<const PaddingScheme>& DefaultPaddingScheme() {
-    static const auto scheme = std::make_shared<const PaddingScheme>(ParsePaddingScheme(
+const std::shared_ptr<const AnyTlsPaddingScheme>& DefaultAnyTlsPaddingScheme() {
+    static const auto scheme = std::make_shared<const AnyTlsPaddingScheme>(ParseAnyTlsPaddingScheme(
         "stop=8\n"
         "0=30-30\n"
         "1=100-400\n"
@@ -624,4 +616,4 @@ const std::shared_ptr<const PaddingScheme>& DefaultPaddingScheme() {
         "7=500-1000").value());
     return scheme;
 }
-}  // namespace proxy::anytls
+}  // namespace proxy

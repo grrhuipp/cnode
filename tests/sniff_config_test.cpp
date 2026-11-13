@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
-#include "features/routing/dispatcher.hpp"
-
+#include "routing/dispatcher.hpp"
 namespace {
 class ExcludedDomain : public testing::TestWithParam<const char*> {};
 TEST_P(ExcludedDomain, MatchesCaseInsensitivelyAndIgnoresRootDot) {

@@ -1,8 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "infra/config.hpp"
-#include "core/constants.hpp"
-
+#include "common/constants.hpp"
 #include <vector>
 
 namespace {
@@ -26,7 +25,7 @@ namespace {
     ::infra::StaticInboundConfig inbound;
     inbound.tags.push_back(tag);
     inbound.protocol = "vmess";
-    inbound.listen = *::transport::internet::InboundListen::Parse(listen);
+    inbound.listen = *::transport::InboundListen::Parse(listen);
     inbound.port = port;
     return inbound;
 }
@@ -145,14 +144,14 @@ INSTANTIATE_TEST_SUITE_P(
     [](const testing::TestParamInfo<InboundEndpointCase>& test) { return test.param.name; });
 
 TEST(ConfigSemantics, PanelTagsDistinguishPanelAndNodeIdentity) {
-    const auto first = naming::BuildPanelNodeTag("same-panel", 1, "vmess", 12001);
-    EXPECT_NE(first, naming::BuildPanelNodeTag("same-panel", 2, "vmess", 12001));
-    EXPECT_NE(first, naming::BuildPanelNodeTag("other-panel", 1, "vmess", 12001));
+    const auto first = common::BuildPanelNodeTag("same-panel", 1, "vmess", 12001);
+    EXPECT_NE(first, common::BuildPanelNodeTag("same-panel", 2, "vmess", 12001));
+    EXPECT_NE(first, common::BuildPanelNodeTag("other-panel", 1, "vmess", 12001));
 }
 
 TEST(ConfigSemantics, StaticInboundCannotClaimPanelNamespace) {
     auto inbound = Inbound("first", "127.0.0.1", 12001);
-    inbound.tags[0] = naming::BuildPanelNodeTag("same-panel", 1, "vmess", 12001);
+    inbound.tags[0] = common::BuildPanelNodeTag("same-panel", 1, "vmess", 12001);
     const std::vector inbounds{inbound};
     const auto result = infra::ValidateStaticInboundSemantics(inbounds);
     EXPECT_EQ(result.error, infra::StaticInboundSemanticError::ReservedTag);
@@ -161,7 +160,7 @@ TEST(ConfigSemantics, StaticInboundCannotClaimPanelNamespace) {
 
 TEST(ConfigSemantics, StaticOutboundCannotClaimPanelNamespace) {
     auto outbound = Outbound("direct");
-    outbound.tag = naming::BuildPanelNodeTag("same-panel", 1, "vmess", 12001);
+    outbound.tag = common::BuildPanelNodeTag("same-panel", 1, "vmess", 12001);
     const std::vector outbounds{outbound};
     const auto result = infra::ValidateOutboundSelectionSemantics(outbounds, {}, {});
     EXPECT_EQ(result.error, infra::ConfigSemanticError::ReservedOutboundTag);
@@ -197,18 +196,18 @@ TEST(ConfigSemantics, RejectsUnknownForcedOutbound) {
 }
 
 TEST(ConfigSemantics, ConnectionIdleUsesCanonicalKeyAndRejectsMisspelling) {
-    const auto canonical = json::parse(
-        R"({"connIdle":17})", json::KeyComparison::AsciiCaseInsensitive);
+    const auto canonical = infra::parse(
+        R"({"connIdle":17})", infra::KeyComparison::AsciiCaseInsensitive);
     EXPECT_EQ(infra::TimeoutsConfig::FromJson(canonical.as_object()).IdleTimeout(),
               std::chrono::seconds(17));
-    const auto misspelled = json::parse(
-        R"({"idle":17})", json::KeyComparison::AsciiCaseInsensitive);
+    const auto misspelled = infra::parse(
+        R"({"idle":17})", infra::KeyComparison::AsciiCaseInsensitive);
     EXPECT_THROW(infra::TimeoutsConfig::FromJson(misspelled.as_object()), std::invalid_argument);
 }
 
 TEST(ConfigSemantics, UnknownNestedKeysCannotSilentlySelectDefaults) {
     const auto config = [](std::string_view text) {
-        return json::parse(text, json::KeyComparison::AsciiCaseInsensitive).as_object();
+        return infra::parse(text, infra::KeyComparison::AsciiCaseInsensitive).as_object();
     };
     EXPECT_FALSE(infra::ParseConfig(config(R"({"worker":1})")));
     EXPECT_FALSE(infra::ParseConfig(config(R"({"timeouts":{"connIdel":17}})")));
@@ -223,26 +222,26 @@ TEST(ConfigSemantics, UnknownNestedKeysCannotSilentlySelectDefaults) {
 }
 
 TEST(ConfigSemantics, LogSeverityIsNormalizedBeforeRuntimeInitialization) {
-    const auto accepted = json::parse(
-        R"({"loglevel":"WARNING"})", json::KeyComparison::AsciiCaseInsensitive);
+    const auto accepted = infra::parse(
+        R"({"loglevel":"WARNING"})", infra::KeyComparison::AsciiCaseInsensitive);
     EXPECT_EQ(infra::LogConfig::FromJson(accepted.as_object()).level, infra::LogLevel::WARN);
-    const auto alias = json::parse(
-        R"({"loglevel":"warn"})", json::KeyComparison::AsciiCaseInsensitive);
+    const auto alias = infra::parse(
+        R"({"loglevel":"warn"})", infra::KeyComparison::AsciiCaseInsensitive);
     EXPECT_THROW(infra::LogConfig::FromJson(alias.as_object()), std::invalid_argument);
 }
 
 TEST(ConfigSemantics, DownloadEndpointKeysAreNotAcceptedAsOrdinaryStreamSettings) {
-    const auto ordinary = json::parse(
+    const auto ordinary = infra::parse(
         R"({"network":"xhttp","address":"example.com","port":443})",
-        json::KeyComparison::AsciiCaseInsensitive);
-    EXPECT_THROW((void)infra::ParseStreamSettings(ordinary.as_object(), transport::internet::StreamEndpointRole::Outbound),
+        infra::KeyComparison::AsciiCaseInsensitive);
+    EXPECT_THROW((void)infra::ParseStreamSettings(ordinary.as_object(), transport::StreamEndpointRole::Outbound),
                  std::invalid_argument);
-    const auto split = json::parse(
+    const auto split = infra::parse(
         R"({"network":"xhttp","xhttpSettings":{"mode":"stream-up","downloadSettings":{
             "address":"example.com","port":443,"network":"xhttp",
             "xhttpSettings":{"path":"/download","mode":"stream-up"}}}})",
-        json::KeyComparison::AsciiCaseInsensitive);
-    const auto settings = infra::ParseStreamSettings(split.as_object(), transport::internet::StreamEndpointRole::Outbound);
+        infra::KeyComparison::AsciiCaseInsensitive);
+    const auto settings = infra::ParseStreamSettings(split.as_object(), transport::StreamEndpointRole::Outbound);
     ASSERT_TRUE(settings.xhttp.download_settings);
     EXPECT_TRUE(settings.xhttp.download_settings->stream_settings.IsXHttp());
     EXPECT_EQ(settings.xhttp.download_settings->stream_settings.xhttp.normalized_path, "/download/");
@@ -260,7 +259,7 @@ class StaticClientSchema : public testing::TestWithParam<StaticClientFieldCase> 
 
 TEST_P(StaticClientSchema, RejectsIgnoredOrAmbiguousCredentialFields) {
     const auto& test = GetParam();
-    auto source = json::parse(R"({"port":443,"settings":{"clients":[{}]}})");
+    auto source = infra::parse(R"({"port":443,"settings":{"clients":[{}]}})");
     source.as_object()["protocol"] = test.protocol;
     auto& client = source.as_object().at("settings").as_object()
         .at("clients").as_array()[0].as_object();

@@ -2,16 +2,15 @@
 
 #include "common/asio_types.hpp"
 #include "common/defaults.hpp"
-#include "core/constants.hpp"
-#include "features/routing/dispatcher.hpp"
-#include "features/routing/router.hpp"
+#include "common/constants.hpp"
+#include "routing/dispatcher.hpp"
+#include "routing/router.hpp"
 #include "infra/json.hpp"
 #include "infra/log.hpp"
 #include "infra/outbound_types.hpp"
-#include "transport/internet/inbound_listen.hpp"
-#include "transport/internet/proxy_protocol.hpp"
-#include "transport/internet/stream_settings.hpp"
-
+#include "transport/inbound_listen.hpp"
+#include "transport/proxy_protocol.hpp"
+#include "transport/stream_settings.hpp"
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -33,24 +32,24 @@ struct AuthFailureLimitConfig {
     uint32_t ban_seconds = 180;
 };
 struct LimitsConfig {
-    uint32_t max_connections = defaults::kMaxConnections;
-    uint32_t max_connections_per_ip = defaults::kMaxConnectionsPerIP;
+    uint32_t max_connections = common::kMaxConnections;
+    uint32_t max_connections_per_ip = common::kMaxConnectionsPerIP;
     AuthFailureLimitConfig ip_ban;
 
-    static LimitsConfig FromJson(const json::object& j);
+    static LimitsConfig FromJson(const object& j);
 };
 
 // ============================================================================
 // 超时配置
 // ============================================================================
 struct TimeoutsConfig {
-    uint32_t handshake = defaults::kHandshakeTimeout;       // 握手阶段预算（idle + absolute deadline）
-    uint32_t dial = defaults::kDialTimeout;                 // 拨号超时
-    uint32_t read = defaults::kReadTimeout;                 // 连接读方向 deadline
-    uint32_t write = defaults::kWriteTimeout;               // 连接写方向 deadline
-    uint32_t idle = defaults::kIdleTimeout;                 // UDP/会话空闲超时
-    uint32_t uplink_only = defaults::kUplinkOnlyTimeout;    // 下行关闭后上行最多保留多久
-    uint32_t downlink_only = defaults::kDownlinkOnlyTimeout;// 上行关闭后下行最多保留多久
+    uint32_t handshake = common::kHandshakeTimeout;       // 握手阶段预算（idle + absolute deadline）
+    uint32_t dial = common::kDialTimeout;                 // 拨号超时
+    uint32_t read = common::kReadTimeout;                 // 连接读方向 deadline
+    uint32_t write = common::kWriteTimeout;               // 连接写方向 deadline
+    uint32_t idle = common::kIdleTimeout;                 // UDP/会话空闲超时
+    uint32_t uplink_only = common::kUplinkOnlyTimeout;    // 下行关闭后上行最多保留多久
+    uint32_t downlink_only = common::kDownlinkOnlyTimeout;// 上行关闭后下行最多保留多久
 
     [[nodiscard]] std::chrono::seconds HandshakeTimeout() const noexcept {
         return std::chrono::seconds(handshake);
@@ -76,7 +75,7 @@ struct TimeoutsConfig {
         return std::chrono::seconds(downlink_only);
     }
 
-    static TimeoutsConfig FromJson(const json::object& j);
+    static TimeoutsConfig FromJson(const object& j);
 };
 
 // ============================================================================
@@ -129,14 +128,14 @@ struct RouteRuleConfig {
 
     std::string outbound_tag;                // 目标出站
 
-    static RouteRuleConfig FromJson(const json::object& j);
+    static RouteRuleConfig FromJson(const object& j);
 };
 
 struct RoutingConfig {
     routing::DomainStrategy domain_strategy = routing::DomainStrategy::AsIs;
     std::vector<RouteRuleConfig> rules;
 
-    static RoutingConfig FromJson(const json::object& j);
+    static RoutingConfig FromJson(const object& j);
 };
 
 // ============================================================================
@@ -144,14 +143,14 @@ struct RoutingConfig {
 // ============================================================================
 struct LogConfig {
     LogLevel level = LogLevel::INFO;
-    std::filesystem::path log_dir = std::filesystem::path(constants::paths::kDefaultLogDir);
+    std::filesystem::path log_dir = std::filesystem::path(common::kDefaultLogDir);
     std::filesystem::path access_path;
     std::filesystem::path error_path;
-    uint16_t max_days = defaults::kLogRetentionDays;  // 日志保留天数（按天切割）
+    uint16_t max_days = common::kLogRetentionDays;  // 日志保留天数（按天切割）
     bool rotate_daily = true;                         // 按本地日期切割日志
     bool gzip = true;                                 // 历史日志 gzip 压缩
 
-    static LogConfig FromJson(const json::object& j);
+    static LogConfig FromJson(const object& j);
 };
 
 // ============================================================================
@@ -160,12 +159,12 @@ struct LogConfig {
 struct DnsConfig {
     // 空表示未配置：LoadConfig 按 /etc/resolv.conf 采用系统 DNS；显式空数组在解析时拒绝。
     std::vector<udp::endpoint> servers;
-    uint32_t timeout = defaults::kDnsTimeout;
-    uint32_t cache_size = defaults::kDnsCacheSize;
-    uint32_t min_ttl = defaults::kDnsMinTTL;
-    uint32_t max_ttl = defaults::kDnsMaxTTL;
+    uint32_t timeout = common::kDnsTimeout;
+    uint32_t cache_size = common::kDnsCacheSize;
+    uint32_t min_ttl = common::kDnsMinTTL;
+    uint32_t max_ttl = common::kDnsMaxTTL;
 
-    static DnsConfig FromJson(const json::object& j);
+    static DnsConfig FromJson(const object& j);
 };
 
 // ============================================================================
@@ -182,12 +181,12 @@ enum class Ss2022UserKey : uint8_t {
 // Protocol-specific inbound source fields. Every source maps its own field
 // names into this one shape; protocols parse it once on the cold path.
 struct InboundProtocolSettings {
-    std::string method = std::string(constants::protocol::kAes256Gcm);
+    std::string method = std::string(common::kAes256Gcm);
     // SS2022 server identity PSK (EIH). Empty disables the identity header.
     std::string identity_password;
     Ss2022UserKey ss2022_user_key = Ss2022UserKey::Base64Psk;
     std::string padding_scheme;
-    std::string vless_decryption = std::string(constants::protocol::kNone);
+    std::string vless_decryption = std::string(common::kNone);
     uint32_t hysteria_up_mbps = 0;
     uint32_t hysteria_down_mbps = 0;
 };
@@ -211,16 +210,16 @@ struct InboundSpec {
     // Opaque reporting identity; empty disables per-user reporting.
     std::string accounting_key;
     std::string protocol;
-    transport::internet::InboundListen listen;
+    transport::InboundListen listen;
     uint16_t port = 0;
-    transport::internet::ProxyProtocolMode proxy_protocol = transport::internet::ProxyProtocolMode::Auto;
+    transport::ProxyProtocolMode proxy_protocol = transport::ProxyProtocolMode::Auto;
     InboundProtocolSettings settings;
     std::vector<InboundUserSpec> users;
     // Normalized and validated by the source's shared field parsers.
-    transport::internet::StreamSettings stream_settings;
+    transport::StreamSettings stream_settings;
     routing::SniffConfig sniffing;
     routing::OutboundSelectionPolicy outbound_policy{
-        routing::ForceOutbound(std::string(constants::protocol::kDirect))};
+        routing::ForceOutbound(std::string(common::kDirect))};
 };
 
 // Static inbound source as written in inbounds.json. Only tag fallback and
@@ -228,30 +227,26 @@ struct InboundSpec {
 struct StaticInboundConfig {
     std::vector<std::string> tags;
     std::string protocol;
-    transport::internet::InboundListen listen;
+    transport::InboundListen listen;
     uint16_t port = 0;
     InboundProtocolSettings settings;
     std::vector<InboundUserSpec> users;
-    transport::internet::StreamSettings stream_settings;
+    transport::StreamSettings stream_settings;
     routing::SniffConfig sniffing;
-    transport::internet::ProxyProtocolMode proxy_protocol = transport::internet::ProxyProtocolMode::Auto;
+    transport::ProxyProtocolMode proxy_protocol = transport::ProxyProtocolMode::Auto;
     bool routing_enabled = false;
     std::optional<std::string> outbound_tag;
-    static StaticInboundConfig FromJson(const json::object& j);
+    static StaticInboundConfig FromJson(const object& j);
 };
-
-}  // namespace infra
-
-namespace infra {
 
 struct OutboundSourceConfig {
     std::string tag;
     std::string protocol;
     OutboundSettings settings;
-    transport::internet::StreamSettings stream_settings;
-    std::optional<transport::internet::OutboundBind> send_through;
+    transport::StreamSettings stream_settings;
+    std::optional<transport::OutboundBind> send_through;
     bool passthrough = false;
-    static OutboundSourceConfig FromJson(const json::object& j);
+    static OutboundSourceConfig FromJson(const object& j);
 };
 
 }  // namespace infra

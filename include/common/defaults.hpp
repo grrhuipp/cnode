@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace defaults {
+namespace common {
 
 // 运行线程
 constexpr uint32_t kMaxWorkers = 1024;
@@ -45,5 +45,5 @@ constexpr uint32_t kStatsOutputInterval = 10;
 // 日志保留
 constexpr uint16_t kLogRetentionDays = 15;
 
-}  // namespace defaults
+}  // namespace common
 

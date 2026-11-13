@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common/asio_types.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/error.hpp"
 
 #include <asio/cancellation_signal.hpp>
@@ -15,10 +15,6 @@
 namespace transport {
 
 class AsyncStream;
-
-}  // namespace transport
-
-namespace transport {
 
 struct Cancellation {
     common::ErrorCode reason;
@@ -183,7 +179,7 @@ class MultiBufferReader {
 public:
     virtual ~MultiBufferReader() noexcept = default;
 
-    virtual net::awaitable<buf::MultiBuffer> ReadMultiBuffer() = 0;
+    virtual net::awaitable<common::MultiBuffer> ReadMultiBuffer() = 0;
     virtual CancellationSource& Cancellation() noexcept = 0;
     virtual EofAction ReadEofAction() const noexcept { return EofAction::WaitForPeer; }
     // Vision command 2 is a read-direction transition at an idle read boundary.
@@ -195,7 +191,7 @@ class MultiBufferWriter {
 public:
     virtual ~MultiBufferWriter() noexcept = default;
 
-    virtual net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) = 0;
+    virtual net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) = 0;
     virtual net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) = 0;
     virtual net::awaitable<void> AsyncShutdownWrite() { co_return; }
@@ -205,7 +201,7 @@ protected:
     // Copies borrowed spans into Buffers, then writes them as one batch.
     net::awaitable<void> WriteBuffersAsMultiBuffer(
         std::span<const net::const_buffer> buffers) {
-        buf::MultiBuffer payload;
+        common::MultiBuffer payload;
         for (const auto& buffer : buffers) {
             if (buffer.size() == 0) {
                 continue;
@@ -213,7 +209,7 @@ protected:
             const auto bytes = std::span<const uint8_t>(
                 static_cast<const uint8_t*>(buffer.data()),
                 buffer.size());
-            if (!buf::AppendSpanToMultiBuffer(bytes, payload)) {
+            if (!common::AppendSpanToMultiBuffer(bytes, payload)) {
                 throw std::bad_alloc();
             }
         }

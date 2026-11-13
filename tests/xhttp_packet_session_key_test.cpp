@@ -1,17 +1,16 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/xhttp_session.hpp"
-
+#include "transport/xhttp_session.hpp"
 #include <cstdlib>
 #include <unordered_map>
 
 TEST(XhttpPacketSessionKey, IsolatesSessionIdsAndInboundNamespaces) {
-    using Key = ::transport::internet::detail::XHttpPacketSessionKey;
+    using Key = ::transport::XHttpPacketSessionKey;
     using Map = std::unordered_map<
         Key,
         int,
-        ::transport::internet::detail::XHttpPacketSessionKeyHash,
-        ::transport::internet::detail::XHttpPacketSessionKeyEq>;
+        ::transport::XHttpPacketSessionKeyHash,
+        ::transport::XHttpPacketSessionKeyEq>;
     Map sessions;
 
     Key first{.session_id = "shared-session", .session_namespace = "inbound-a"};
@@ -21,11 +20,11 @@ TEST(XhttpPacketSessionKey, IsolatesSessionIdsAndInboundNamespaces) {
     sessions.emplace(std::move(second), 2);
     sessions.emplace(std::move(other_namespace), 3);
 
-    const auto first_it = sessions.find(::transport::internet::detail::XHttpPacketSessionKeyRef{
+    const auto first_it = sessions.find(::transport::XHttpPacketSessionKeyRef{
         "shared-session", "inbound-a"});
-    const auto second_it = sessions.find(::transport::internet::detail::XHttpPacketSessionKeyRef{
+    const auto second_it = sessions.find(::transport::XHttpPacketSessionKeyRef{
         "second-session", "inbound-a"});
-    const auto other_it = sessions.find(::transport::internet::detail::XHttpPacketSessionKeyRef{
+    const auto other_it = sessions.find(::transport::XHttpPacketSessionKeyRef{
         "shared-session", "inbound-b"});
     ASSERT_EQ(sessions.size(), 3u);
     ASSERT_NE(first_it, sessions.end());

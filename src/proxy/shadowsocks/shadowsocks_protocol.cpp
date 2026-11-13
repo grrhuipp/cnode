@@ -1,9 +1,8 @@
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
 #include "common/scoped_cleanse.hpp"
 
-#include "core/constants.hpp"
-#include "transport/internet/http_headers.hpp"
-
+#include "common/constants.hpp"
+#include "transport/http_headers.hpp"
 #include <blake3.h>
 #include <openssl/base64.h>
 #include <openssl/crypto.h>
@@ -18,30 +17,30 @@
 #include <stdexcept>
 #include <utility>
 
-namespace proxy::shadowsocks {
+namespace proxy {
 
 // ============================================================================
 // ParseCipherMethod
 // ============================================================================
 std::optional<SsCipherInfo> ParseCipherMethod(std::string_view method) {
 
-    if (common::EqualsAsciiCI(method, constants::protocol::kAes128Gcm)) {
+    if (common::EqualsAsciiCI(method, common::kAes128Gcm)) {
         return SsCipherInfo{SsCipherType::AES_128_GCM, 16, 16};
     }
-    if (common::EqualsAsciiCI(method, constants::protocol::kAes256Gcm)) {
+    if (common::EqualsAsciiCI(method, common::kAes256Gcm)) {
         return SsCipherInfo{SsCipherType::AES_256_GCM, 32, 32};
     }
-    if (common::EqualsAsciiCI(method, constants::protocol::kChacha20IetfPoly1305) ||
+    if (common::EqualsAsciiCI(method, common::kChacha20IetfPoly1305) ||
         common::EqualsAsciiCI(method, "chacha20-poly1305")) {
         return SsCipherInfo{SsCipherType::CHACHA20_POLY1305, 32, 32};
     }
-    if (common::EqualsAsciiCI(method, constants::protocol::kSs2022Blake3Aes128Gcm)) {
+    if (common::EqualsAsciiCI(method, common::kSs2022Blake3Aes128Gcm)) {
         return SsCipherInfo{SsCipherType::AES_128_GCM_2022, 16, 16};
     }
-    if (common::EqualsAsciiCI(method, constants::protocol::kSs2022Blake3Aes256Gcm)) {
+    if (common::EqualsAsciiCI(method, common::kSs2022Blake3Aes256Gcm)) {
         return SsCipherInfo{SsCipherType::AES_256_GCM_2022, 32, 32};
     }
-    if (common::EqualsAsciiCI(method, constants::protocol::kSs2022Blake3Chacha20Poly1305)) {
+    if (common::EqualsAsciiCI(method, common::kSs2022Blake3Chacha20Poly1305)) {
         return SsCipherInfo{SsCipherType::CHACHA20_POLY1305_2022, 32, 32};
     }
     return std::nullopt;
@@ -280,7 +279,7 @@ bool Hash2022Psk(std::span<const uint8_t> key, std::span<uint8_t, 16> out_hash) 
 // ============================================================================
 // DeriveSubkey — HKDF-SHA1("ss-subkey")
 // ============================================================================
-bool DeriveSubkey(const uint8_t* key, size_t key_size,
+bool DeriveSsSubkey(const uint8_t* key, size_t key_size,
                   const uint8_t* salt, size_t salt_size,
                   uint8_t* out_subkey) {
     static constexpr uint8_t info[] = "ss-subkey";
@@ -341,4 +340,4 @@ bool SsAeadCipher::Decrypt(const uint8_t* nonce, const uint8_t* ciphertext,
                       {output, ciphertext_len - kTagSize}).has_value();
 }
 
-}  // namespace proxy::shadowsocks
+}  // namespace proxy

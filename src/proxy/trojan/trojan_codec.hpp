@@ -9,7 +9,7 @@
 #include "proxy/outbound_endpoint_base.hpp"
 #include "common/address_codec.hpp"
 #include "common/asio_types.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/target_address.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/link.hpp"
@@ -22,16 +22,16 @@
 #include <span>
 #include <string_view>
 #include <utility>
-namespace proxy::trojan {
+namespace proxy {
 
-using PasswordHash = std::array<char, 56>;
+using TrojanPasswordHash = std::array<char, 56>;
 
-[[nodiscard]] inline PasswordHash HashPassword(std::string_view password) noexcept {
+[[nodiscard]] inline TrojanPasswordHash HashTrojanPassword(std::string_view password) noexcept {
     std::array<unsigned char, SHA224_DIGEST_LENGTH> digest{};
     SHA224(reinterpret_cast<const unsigned char*>(password.data()),
            password.size(), digest.data());
     constexpr std::string_view hex = "0123456789abcdef";
-    PasswordHash result{};
+    TrojanPasswordHash result{};
     for (size_t i = 0; i < digest.size(); ++i) {
         result[2 * i] = hex[digest[i] >> 4];
         result[2 * i + 1] = hex[digest[i] & 0x0f];
@@ -51,7 +51,7 @@ enum class TrojanCommand : uint8_t {
 // Trojan 请求
 // ============================================================================
 struct TrojanRequest {
-    PasswordHash         password_hash{};  // SHA224 密码哈希（十六进制，56字节）
+    TrojanPasswordHash   password_hash{};  // SHA224 密码哈希（十六进制，56字节）
     TrojanCommand        command = TrojanCommand::CONNECT;
     common::TargetAddress        target;
     std::optional<common::ForwardedMetadata> forwarded;
@@ -61,7 +61,7 @@ struct TrojanRequest {
     }
 };
 
-inline constexpr size_t kPasswordHashSize = std::tuple_size_v<PasswordHash>;
+inline constexpr size_t kPasswordHashSize = std::tuple_size_v<TrojanPasswordHash>;
 // hash + CRLF + command; the SOCKS5 address and a final CRLF follow.
 inline constexpr size_t kRequestPrefixSize = kPasswordHashSize + 3;
 // UDP 包头：不带元数据的 SOCKS5 地址之后是 2 字节长度与 CRLF。
@@ -69,10 +69,10 @@ inline constexpr size_t kUdpPacketTrailerSize = 2 + 2;
 inline constexpr size_t kMaxUdpPacketHeaderSize =
     common::kMaxBaseEncodedAddressSize + kUdpPacketTrailerSize;
 
-enum class RequestDecodeStatus : uint8_t { Complete, Incomplete, InvalidHeader, InvalidAddress };
+enum class TrojanRequestDecodeStatus : uint8_t { Complete, Incomplete, InvalidHeader, InvalidAddress };
 
-struct RequestDecodeResult {
-    RequestDecodeStatus status = RequestDecodeStatus::Incomplete;
+struct TrojanRequestDecodeResult {
+    TrojanRequestDecodeStatus status = TrojanRequestDecodeStatus::Incomplete;
     TrojanRequest request;
     size_t consumed = 0;
     // Incomplete only: minimum total request bytes for the next stage; never
@@ -82,7 +82,7 @@ struct RequestDecodeResult {
 
 // Single-pass incremental decode of the buffered request prefix: each call
 // reports the next required length until the header is complete.
-[[nodiscard]] RequestDecodeResult DecodeRequest(std::span<const uint8_t> data);
+[[nodiscard]] TrojanRequestDecodeResult DecodeTrojanRequest(std::span<const uint8_t> data);
 
 // 返回写入字节数，0 表示目标非法或缓冲区不足。
 [[nodiscard]] size_t EncodeRequestTo(
@@ -100,19 +100,19 @@ struct RequestDecodeResult {
     uint8_t* output,
     size_t output_size);
 
-struct FramedUdpPacket {
+struct TrojanFramedUdpPacket {
     common::TargetAddress target;
-    buf::MultiBuffer payload;
+    common::MultiBuffer payload;
 };
 
 // Owns stream fragments until one complete tagged datagram, including an empty
 // payload, can be transferred. An empty container is reserved for stream EOF.
 // Malformed/truncated input, budget overflow and use after EOF/failure throw
 // LinkError(PROTOCOL_DECODE_FAILED); source I/O errors are propagated unchanged.
-class UdpFramer {
+class TrojanUdpFramer {
 public:
-    void Feed(buf::MultiBuffer input);
-    [[nodiscard]] bool Next(FramedUdpPacket& out);
+    void Feed(common::MultiBuffer input);
+    [[nodiscard]] bool Next(TrojanFramedUdpPacket& out);
     void Finish();
     [[nodiscard]] bool Finished() const noexcept { return state_ == State::Finished; }
 
@@ -120,46 +120,46 @@ private:
     enum class State : uint8_t { Active, Finished, Failed };
     void Fail() noexcept;
 
-    buf::MultiBuffer pending_;
+    common::MultiBuffer pending_;
     std::optional<common::TargetAddress> target_;
     size_t payload_size_ = 0;
     State state_ = State::Active;
 };
 
-net::awaitable<buf::MultiBuffer> ReadUdpDatagram(
+net::awaitable<common::MultiBuffer> ReadUdpDatagram(
     transport::AsyncStream& stream,
-    UdpFramer& framer);
+    TrojanUdpFramer& framer);
 
-net::awaitable<void> WriteUdpDatagram(
+net::awaitable<void> WriteTrojanUdpDatagram(
     transport::MultiBufferWriter& writer,
-    buf::MultiBuffer payload);
+    common::MultiBuffer payload);
 
-net::awaitable<void> WriteUdpDatagram(
+net::awaitable<void> WriteTrojanUdpDatagram(
     transport::MultiBufferWriter& writer,
     const common::TargetAddress& target,
     std::span<const net::const_buffer> payload);
 
-class UdpStreamEndpoint final : public proxy::OutboundStreamEndpointBase {
+class TrojanUdpStreamEndpoint final : public proxy::OutboundStreamEndpointBase {
 public:
-    explicit UdpStreamEndpoint(
+    explicit TrojanUdpStreamEndpoint(
         transport::AsyncStream& stream,
-        const common::TargetAddress& fallback_target = EmptyTarget(),
+        common::TargetAddress fallback_target = {},
         transport::EofAction read_eof_action = transport::EofAction::ShutdownPeerWrite) noexcept
         : OutboundStreamEndpointBase(stream)
-        , fallback_target_(fallback_target)
+        , fallback_target_(std::move(fallback_target))
         , read_eof_action_(read_eof_action) {}
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         return ReadUdpDatagram(stream_, framer_);
     }
 
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        return WriteUdpDatagram(stream_, std::move(mb));
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
+        return WriteTrojanUdpDatagram(stream_, std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
-        return WriteUdpDatagram(stream_, fallback_target_, buffers);
+        return WriteTrojanUdpDatagram(stream_, fallback_target_, buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
@@ -171,14 +171,9 @@ public:
     }
 
 private:
-    static const common::TargetAddress& EmptyTarget() noexcept {
-        static const common::TargetAddress kEmpty{};
-        return kEmpty;
-    }
-
-    const common::TargetAddress& fallback_target_;
-    UdpFramer framer_;
+    common::TargetAddress fallback_target_{};
+    TrojanUdpFramer framer_;
     transport::EofAction read_eof_action_;
 };
 
-}  // namespace proxy::trojan
+}  // namespace proxy

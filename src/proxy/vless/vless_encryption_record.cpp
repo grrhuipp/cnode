@@ -9,7 +9,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-namespace proxy::vless {
+namespace proxy {
 VlessEncryptedIo::VlessEncryptedIo(proxy::BufferedStreamReader& raw_reader,
                                    transport::MultiBufferWriter& raw_writer,
                                    VlessEncryptionRuntime runtime)
@@ -103,7 +103,7 @@ bool VlessEncryptionReader::EnableRawRead() noexcept {
     return true;
 }
 
-net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadRawBytes() {
+net::awaitable<common::MultiBuffer> VlessEncryptionReader::ReadRawBytes() {
     auto out = co_await src_.ReadMultiBuffer();
     if (out.byte_size() == 0) {
         co_await common::ThrowIfCancelledOnEof("VLESS Encryption read cancelled");
@@ -153,7 +153,7 @@ net::awaitable<bool> VlessEncryptionReader::ReadRecordHeader() {
 
 size_t VlessEncryptionReader::OpenRecord(VlessEncryptionAead& aead, std::span<uint8_t> encrypted_span) {
     const auto& header = read_header_;
-    std::pmr::vector<uint8_t> rekey_context{memory::process_resource()};
+    std::vector<uint8_t> rekey_context;
     if (WillReachVlessEncryptionMaxNonce(aead.Nonce())) {
         rekey_context.resize(header.size() + encrypted_span.size());
         auto next = std::copy(header.begin(), header.end(), rekey_context.begin());
@@ -177,7 +177,7 @@ size_t VlessEncryptionReader::OpenRecord(VlessEncryptionAead& aead, std::span<ui
     return *opened;
 }
 
-net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
+net::awaitable<common::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
     if (raw_read_) co_return co_await ReadRawBytes();
     try {
         auto* aead = std::get_if<VlessEncryptionAead>(&keys_);
@@ -192,7 +192,7 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
         for (;;) {
 
             if (encrypted_size_ == 0 && !co_await ReadRecordHeader())
-                co_return buf::MultiBuffer{};
+                co_return common::MultiBuffer{};
 
             // `encrypted_size_` is bounded by kVlessEncryptionMaxRecordCiphertextSize.
             if (bytes_read_ == 0 && read_record_.Empty()) {
@@ -217,7 +217,7 @@ net::awaitable<buf::MultiBuffer> VlessEncryptionReader::ReadMultiBuffer() {
                 read_record_.Reset();
                 continue;
             }
-            buf::MultiBuffer out;
+            common::MultiBuffer out;
             if (!read_record_.TryAppendTo(opened, out)) {
                 throw IoSystemError(io_error::fault,
                                     "VLESS Encryption buffer allocation failed");
@@ -287,7 +287,7 @@ net::awaitable<void> VlessEncryptionWriter::WriteRecord(
 
 template <typename BufferRange>
 net::awaitable<void> VlessEncryptionWriter::WriteEncrypted(BufferRange source) {
-    constexpr bool kOwnsBuffers = std::is_same_v<BufferRange, buf::MultiBuffer>;
+    constexpr bool kOwnsBuffers = std::is_same_v<BufferRange, common::MultiBuffer>;
     CheckWritable();
     const auto cancellation = co_await net::this_coro::cancellation_state;
     if (cancellation.cancelled() != net::cancellation_type::none) {
@@ -296,7 +296,7 @@ net::awaitable<void> VlessEncryptionWriter::WriteEncrypted(BufferRange source) {
     }
     struct NoBuilder {};
     [[maybe_unused]] std::conditional_t<kOwnsBuffers,
-                       common::ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity>,
+                       common::ConstBufferSpanBuilder<common::MultiBuffer::kInlineCapacity>,
                        NoBuilder> builder;
     std::span<const net::const_buffer> buffers;
     if constexpr (kOwnsBuffers) {
@@ -349,7 +349,7 @@ net::awaitable<void> VlessEncryptionWriter::WriteEncrypted(BufferRange source) {
             }
             const size_t frame_capacity =
                 kVlessEncryptionRecordHeaderSize + planned_len + kVlessEncryptionTagSize;
-            buf::ContiguousWriteBuffer frame_buffer;
+            common::ContiguousWriteBuffer frame_buffer;
             uint8_t* frame_ptr = frame_buffer.TryPrepare(frame_capacity);
             if (!frame_ptr) {
                 ThrowVlessEncryptionIoError("VLESS Encryption buffer allocation failed");
@@ -394,7 +394,7 @@ net::awaitable<void> VlessEncryptionWriter::WriteEncrypted(BufferRange source) {
     }
 }
 
-net::awaitable<void> VlessEncryptionWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
+net::awaitable<void> VlessEncryptionWriter::WriteMultiBuffer(common::MultiBuffer mb) {
     return WriteEncrypted(std::move(mb));
 }
 
@@ -425,4 +425,4 @@ net::awaitable<void> VlessEncryptionWriter::AsyncShutdownWrite() {
     }
 }
 
-}  // namespace proxy::vless
+}  // namespace proxy

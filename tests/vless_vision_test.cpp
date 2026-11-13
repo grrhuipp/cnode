@@ -15,7 +15,7 @@ namespace {
 class Capture final : public transport::MultiBufferWriter {
 public:
     std::vector<uint8_t> bytes;
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
         for (auto* b : mb) bytes.insert(bytes.end(), b->Bytes().begin(), b->Bytes().end());
         co_return;
     }
@@ -47,11 +47,11 @@ public:
     bool EnableRawRead() noexcept override { switched_at = offset_; return true; }
     size_t switched_at = 0;
     transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        buf::MultiBuffer mb;
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
+        common::MultiBuffer mb;
         if (offset_ < bytes_.size()) {
             const auto n = std::min(chunk_, bytes_.size() - offset_);
-            EXPECT_TRUE((buf::AppendSpanToMultiBuffer(std::span(bytes_).subspan(offset_, n), mb))) << "allocation";
+            EXPECT_TRUE((common::AppendSpanToMultiBuffer(std::span(bytes_).subspan(offset_, n), mb))) << "allocation";
             offset_ += n;
         }
         co_return mb;
@@ -68,9 +68,9 @@ const std::array<uint8_t, 9> record{0x17, 0x03, 0x03, 0, 4, 1, 2, 3, 4};
 
 net::awaitable<void> EndsPaddingAfterCompleteRecord() {
     {
-        proxy::vless::VisionTrafficState state;
+        proxy::VisionTrafficState state;
         Capture sink;
-        proxy::vless::VisionWriter writer(sink, uuid, state);
+        proxy::VisionWriter writer(sink, uuid, state);
         std::array<net::const_buffer, 1> buffers{net::buffer(hello)};
         co_await writer.WriteBuffers(buffers);
         auto f = Parse(sink, 0, true);
@@ -97,9 +97,9 @@ net::awaitable<void> EndsPaddingAfterCompleteRecord() {
 }
 net::awaitable<void> FiltersBatchBeforePadding() {
     {
-        proxy::vless::VisionTrafficState state;
+        proxy::VisionTrafficState state;
         Capture sink;
-        proxy::vless::VisionWriter writer(sink, uuid, state);
+        proxy::VisionWriter writer(sink, uuid, state);
         const std::array<uint8_t, 1> plain{0x41};
         std::array<net::const_buffer, 7> batch;
         batch.fill(net::buffer(plain));
@@ -110,7 +110,7 @@ net::awaitable<void> FiltersBatchBeforePadding() {
 }
 TEST(VlessVision, ClassifiesOnlyHelloPrefixesAndPreservesMaximumRecordLength) {
     {
-        proxy::vless::VisionTrafficState state;
+        proxy::VisionTrafficState state;
         std::array<uint8_t, 8> false_hello{0, 0, 0x16, 3, 3, 0, 1, 2};
         state.FilterTLS(false_hello);
         EXPECT_FALSE(state.is_tls) << "embedded handshake prefix misclassified as TLS";
@@ -126,11 +126,11 @@ net::awaitable<void> RecoversFragmentedContent(size_t size) {
     {
         // Boundary-size short padding must stay in [0,255], also for TLS.
         {
-            proxy::vless::VisionTrafficState state;
+            proxy::VisionTrafficState state;
             state.is_tls = state.is_tls12_or_above = true;
             state.packets_to_filter = 0;
             Capture sink;
-            proxy::vless::VisionWriter writer(sink, uuid, state);
+            proxy::VisionWriter writer(sink, uuid, state);
             std::vector<uint8_t> body(size, 0x42);
             std::array<net::const_buffer, 1> buffers{net::buffer(body)};
             co_await writer.WriteBuffers(buffers);
@@ -138,8 +138,8 @@ net::awaitable<void> RecoversFragmentedContent(size_t size) {
             if (size == 899) EXPECT_TRUE((f.padding >= 1 && f.padding <= 500)) << "899-byte long padding";
             else EXPECT_LE(f.padding, 255) << "large-content short padding";
             FragmentReader source(sink.bytes);
-            proxy::vless::VisionTrafficState read_state;
-            proxy::vless::VisionReader reader(source, uuid, read_state);
+            proxy::VisionTrafficState read_state;
+            proxy::VisionReader reader(source, uuid, read_state);
             std::vector<uint8_t> decoded;
             for (;;) {
                 auto mb = co_await reader.ReadMultiBuffer();
@@ -153,10 +153,10 @@ net::awaitable<void> RecoversFragmentedContent(size_t size) {
 net::awaitable<void> UsesOppositeDirectionTlsClassification() {
     {
         // The opposite direction's classification controls writer padding.
-        proxy::vless::VisionTrafficState state;
+        proxy::VisionTrafficState state;
         state.FilterTLS(hello);
         Capture sink;
-        proxy::vless::VisionWriter writer(sink, uuid, state);
+        proxy::VisionWriter writer(sink, uuid, state);
         std::array<net::const_buffer, 1> buffers{net::buffer(record)};
         co_await writer.WriteBuffers(buffers);
         EXPECT_EQ(Parse(sink, 0, true).command, 1) << "shared TLS state not used by writer";
@@ -169,8 +169,8 @@ net::awaitable<void> SwitchesToRawAfterPadding(size_t chunk) {
         std::vector<uint8_t> wire(uuid.begin(), uuid.end());
         wire.insert(wire.end(), {2, 0, 3, 0, 2, 10, 11, 12, 0, 0, 13, 14});
         FragmentReader source(wire, chunk);
-        proxy::vless::VisionTrafficState state;
-        proxy::vless::VisionReader reader(source, uuid, state);
+        proxy::VisionTrafficState state;
+        proxy::VisionReader reader(source, uuid, state);
         std::vector<uint8_t> decoded;
         for (;;) {
             auto mb = co_await reader.ReadMultiBuffer();

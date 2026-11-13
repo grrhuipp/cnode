@@ -1,5 +1,4 @@
 #include "geo/geodata.hpp"
-
 #include "common/allocator.hpp"
 #include "common/byte_reader.hpp"
 #include "common/domain_name.hpp"
@@ -10,6 +9,7 @@
 #include <format>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -17,12 +17,32 @@
 
 namespace geo {
 
+namespace {
+
+template <typename Fn>
+decltype(auto) WithLowerAscii(std::string_view input, Fn&& fn) {
+    if (!std::ranges::any_of(input, [](char ch) { return 'A' <= ch && ch <= 'Z'; })) {
+        return fn(input);
+    }
+    std::array<char, 256> stack_buf;
+    std::optional<std::string> heap_buf;
+    char* lower = stack_buf.data();
+    if (input.size() > stack_buf.size()) {
+        lower = heap_buf.emplace(input.size(), '\0').data();
+    }
+    std::ranges::transform(input, lower, [](char ch) {
+        return common::ToLowerAscii(ch);
+    });
+    return fn(std::string_view(lower, input.size()));
+}
+
+}  // namespace
+
 // ============================================================================
 // CidrSet
 // ============================================================================
 
-CidrSet::CidrSet(std::pmr::memory_resource* resource)
-    : v4_(resource), v6_(resource) {}
+CidrSet::CidrSet() = default;
 
 void CidrSet::Insert(std::span<const uint8_t> network, uint8_t prefix) {
     if ((network.size() != 4 && network.size() != 16) || prefix > network.size() * 8) {
@@ -83,12 +103,11 @@ bool CidrSet::MatchBits(const Trie& trie, std::span<const uint8_t> address) noex
 // DomainRuleSet
 // ============================================================================
 
-DomainRuleSet::DomainRuleSet(std::pmr::memory_resource* resource)
-    : full_(resource), suffix_nodes_(resource), keywords_(resource), regexes_(resource) {}
+DomainRuleSet::DomainRuleSet() = default;
 
 void DomainRuleSet::AddFull(std::string_view domain) {
-    std::pmr::string lower(domain, full_.get_allocator());
-    domain::NormalizeDnsHostnameInPlace(lower);
+    std::string lower(domain);
+    common::NormalizeDnsHostnameInPlace(lower);
     if (lower.empty()) {
         return;
     }
@@ -99,16 +118,13 @@ void DomainRuleSet::AddSuffix(std::string_view suffix) {
     while (!suffix.empty() && suffix.front() == '.') {
         suffix.remove_prefix(1);
     }
-    std::pmr::string lower(suffix, suffix_nodes_.get_allocator());
-    domain::NormalizeDnsHostnameInPlace(lower);
+    std::string lower(suffix);
+    common::NormalizeDnsHostnameInPlace(lower);
     if (lower.empty()) {
         return;
     }
-    // 子节点向量必须与节点表同属一个 memory_resource。
     const auto new_node = [this] {
-        suffix_nodes_.push_back(SuffixNode{
-            .children = std::pmr::vector<SuffixChild>(suffix_nodes_.get_allocator()),
-        });
+        suffix_nodes_.push_back(SuffixNode{});
     };
     if (suffix_nodes_.empty()) {
         new_node();
@@ -147,39 +163,27 @@ void DomainRuleSet::AddRegex(const std::string& pattern) {
 }
 
 bool DomainRuleSet::Match(std::string_view domain) const {
-    domain = domain::WithoutTrailingRootDot(domain);
+    domain = common::WithoutTrailingRootDot(domain);
     if (domain.empty()) {
         return false;
     }
 
-    char stack_buf[256];
-    std::optional<std::pmr::string> heap_buf;
-    std::string_view lower_domain = domain;
-    if (std::ranges::any_of(domain, [](char ch) { return 'A' <= ch && ch <= 'Z'; })) {
-        char* lower = stack_buf;
-        if (domain.size() > sizeof(stack_buf)) {
-            lower = heap_buf.emplace(domain.size(), '\0', memory::process_resource()).data();
-        }
-        std::ranges::transform(domain, lower, [](char ch) {
-            return common::ToLowerAscii(ch);
-        });
-        lower_domain = std::string_view(lower, domain.size());
-    }
-
-    if (full_.contains(lower_domain) || MatchSuffix(lower_domain)) {
-        return true;
-    }
-    for (const auto& keyword : keywords_) {
-        if (lower_domain.find(keyword) != std::string_view::npos) {
+    return WithLowerAscii(domain, [this](std::string_view lower_domain) {
+        if (full_.contains(lower_domain) || MatchSuffix(lower_domain)) {
             return true;
         }
-    }
-    for (const auto& regex : regexes_) {
-        if (std::regex_search(lower_domain.begin(), lower_domain.end(), regex)) {
-            return true;
+        for (const auto& keyword : keywords_) {
+            if (lower_domain.find(keyword) != std::string_view::npos) {
+                return true;
+            }
         }
-    }
-    return false;
+        for (const auto& regex : regexes_) {
+            if (std::regex_search(lower_domain.begin(), lower_domain.end(), regex)) {
+                return true;
+            }
+        }
+        return false;
+    });
 }
 
 bool DomainRuleSet::MatchSuffix(std::string_view lower_domain) const noexcept {
@@ -290,7 +294,7 @@ private:
 };
 
 [[nodiscard]] std::string_view AsText(std::span<const uint8_t> bytes) noexcept {
-    return {unsafe::ptr_cast<const char>(bytes.data()), bytes.size()};
+    return {common::ptr_cast<const char>(bytes.data()), bytes.size()};
 }
 
 [[nodiscard]] std::string LowerTag(std::string_view tag) {
@@ -312,7 +316,7 @@ private:
     }
     std::vector<uint8_t> bytes(static_cast<size_t>(size));
     file.seekg(0);
-    if (!file.read(unsafe::ptr_cast<char>(bytes.data()), static_cast<std::streamsize>(size))) {
+    if (!file.read(common::ptr_cast<char>(bytes.data()), static_cast<std::streamsize>(size))) {
         throw std::runtime_error(std::format("failed to read geodata '{}'", path.string()));
     }
     return bytes;
@@ -509,7 +513,7 @@ void LoadCategories(
             less_ignore_case(parsed_code.code, *wanted_it)) {
             continue;
         }
-        auto [it, inserted] = out.try_emplace(*wanted_it, memory::process_resource());
+        auto [it, inserted] = out.try_emplace(*wanted_it);
         if (!inserted) {
             ThrowCorrupt(path, std::format("duplicate {} tag '{}'", kind, it->first));
         }
@@ -531,17 +535,10 @@ void LoadCategories(
 template <class Map>
 [[nodiscard]] const typename Map::mapped_type* FindCategory(
     const Map& map, std::string_view tag) {
-    if (tag.size() <= 128) {
-        std::array<char, 128> stack_buf{};
-        std::ranges::transform(tag, stack_buf.begin(), [](char ch) {
-            return common::ToLowerAscii(ch);
-        });
-        const auto it = map.find(std::string_view(stack_buf.data(), tag.size()));
+    return WithLowerAscii(tag, [&](std::string_view lower_tag) -> const typename Map::mapped_type* {
+        const auto it = map.find(lower_tag);
         return it == map.end() ? nullptr : &it->second;
-    }
-    const auto lower = LowerTag(tag);
-    const auto it = map.find(std::string_view(lower));
-    return it == map.end() ? nullptr : &it->second;
+    });
 }
 
 }  // namespace

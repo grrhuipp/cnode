@@ -74,19 +74,19 @@ private:
     friend class UserOnlineSessionGuard;
     struct DeviceReservation;
     using DeviceIpMap =
-        std::pmr::unordered_map<std::pmr::string,
-                                        uint32_t,
-                                        TransparentStringHash,
-                                        TransparentStringEq>;
-    using UserDeviceMap = std::pmr::unordered_map<uint64_t, DeviceIpMap>;
+        std::unordered_map<std::string,
+                           uint32_t,
+                           TransparentStringHash,
+                           TransparentStringEq>;
+    using UserDeviceMap = std::unordered_map<uint64_t, DeviceIpMap>;
     using TagDeviceMap =
-        std::pmr::unordered_map<std::pmr::string,
-                                        UserDeviceMap,
-                                        TransparentStringHash,
-                                        TransparentStringEq>;
+        std::unordered_map<std::string,
+                           UserDeviceMap,
+                           TransparentStringHash,
+                           TransparentStringEq>;
 
     app::GroupCoordinator& coordinator_;
-    TagDeviceMap devices_{memory::process_resource()};
+    TagDeviceMap devices_;
 };
 
 class UserOnlineSessionGuard {

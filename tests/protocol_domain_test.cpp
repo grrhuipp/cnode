@@ -1,11 +1,11 @@
 #include <gtest/gtest.h>
 
-#include "app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/user_store.hpp"
 #include "common/address_codec.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "proxy/trojan/trojan_codec.hpp"
 #include "proxy/vless/vless_codec.hpp"
-#include "proxy/vmess/encoding/body.hpp"
+#include "proxy/vmess/body.hpp"
 #include "proxy/vmess/vmess_crypto.hpp"
 #include "transport/link.hpp"
 
@@ -78,9 +78,9 @@ void ExpectPayload(std::span<const uint8_t> wire, size_t consumed) {
               std::vector<uint8_t>(kPayload.begin(), kPayload.end()));
 }
 
-std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
+std::vector<uint8_t> Flatten(const common::MultiBuffer& payload) {
     std::vector<uint8_t> bytes;
-    for (const buf::Buffer* buffer : payload) {
+    for (const common::Buffer* buffer : payload) {
         if (buffer && !buffer->IsEmpty()) {
             const auto part = buffer->Bytes();
             bytes.insert(bytes.end(), part.begin(), part.end());
@@ -95,19 +95,19 @@ TEST_P(ProtocolDomainTest, VlessRequestHeader) {
     const auto& domain = GetParam();
     const auto address = EncodeRawAddress(domain, common::AddressWireFormat::PortFirst);
     std::vector<uint8_t> wire(18, 0); // version、UUID、空addons。
-    wire.push_back(static_cast<uint8_t>(proxy::vless::Command::TCP));
+    wire.push_back(static_cast<uint8_t>(proxy::VlessCommand::TCP));
     wire.insert(wire.end(), address.begin(), address.end());
     const size_t header_size = wire.size();
     wire.insert(wire.end(), kPayload.begin(), kPayload.end());
 
-    const auto decoded = proxy::vless::DecodeRequestHeader(wire);
+    const auto decoded = proxy::DecodeVlessRequestHeader(wire);
     if (!domain.accepted) {
-        EXPECT_EQ(decoded.status, proxy::vless::RequestHeaderDecodeStatus::InvalidAddress);
+        EXPECT_EQ(decoded.status, proxy::VlessRequestDecodeStatus::InvalidAddress);
         return;
     }
-    ASSERT_EQ(decoded.status, proxy::vless::RequestHeaderDecodeStatus::Complete);
+    ASSERT_EQ(decoded.status, proxy::VlessRequestDecodeStatus::Complete);
     ExpectTarget(decoded.header.target, domain);
-    EXPECT_EQ(decoded.header.command, proxy::vless::Command::TCP);
+    EXPECT_EQ(decoded.header.command, proxy::VlessCommand::TCP);
     EXPECT_EQ(decoded.consumed, header_size);
     ExpectPayload(wire, decoded.consumed);
 }
@@ -115,21 +115,21 @@ TEST_P(ProtocolDomainTest, VlessRequestHeader) {
 TEST_P(ProtocolDomainTest, TrojanTcpAndUdpRequestHeaders) {
     const auto& domain = GetParam();
     const auto address = EncodeRawAddress(domain, common::AddressWireFormat::Socks5);
-    for (const auto command : {proxy::trojan::TrojanCommand::CONNECT, proxy::trojan::TrojanCommand::UDP_ASSOCIATE}) {
+    for (const auto command : {proxy::TrojanCommand::CONNECT, proxy::TrojanCommand::UDP_ASSOCIATE}) {
         SCOPED_TRACE(static_cast<int>(command));
-        std::vector<uint8_t> wire(proxy::trojan::kPasswordHashSize, 'a');
+        std::vector<uint8_t> wire(proxy::kPasswordHashSize, 'a');
         wire.insert(wire.end(), {'\r', '\n', static_cast<uint8_t>(command)});
         wire.insert(wire.end(), address.begin(), address.end());
         wire.insert(wire.end(), {'\r', '\n'});
         const size_t header_size = wire.size();
         wire.insert(wire.end(), kPayload.begin(), kPayload.end());
 
-        const auto decoded = proxy::trojan::DecodeRequest(wire);
+        const auto decoded = proxy::DecodeTrojanRequest(wire);
         if (!domain.accepted) {
-            EXPECT_EQ(decoded.status, proxy::trojan::RequestDecodeStatus::InvalidAddress);
+            EXPECT_EQ(decoded.status, proxy::TrojanRequestDecodeStatus::InvalidAddress);
             continue;
         }
-        ASSERT_EQ(decoded.status, proxy::trojan::RequestDecodeStatus::Complete);
+        ASSERT_EQ(decoded.status, proxy::TrojanRequestDecodeStatus::Complete);
         ExpectTarget(decoded.request.target, domain);
         EXPECT_EQ(decoded.request.command, command);
         EXPECT_EQ(decoded.consumed, header_size);
@@ -147,11 +147,11 @@ TEST_P(ProtocolDomainTest, TrojanUdpFrame) {
     constexpr std::array<uint8_t, 12> next_frame{
         1, 127, 0, 0, 1, 0, 53, 0, 1, '\r', '\n', 0x42};
     wire.insert(wire.end(), next_frame.begin(), next_frame.end());
-    proxy::trojan::UdpFramer framer;
-    proxy::trojan::FramedUdpPacket packet;
+    proxy::TrojanUdpFramer framer;
+    proxy::TrojanFramedUdpPacket packet;
     if (!domain.accepted) {
-        buf::MultiBuffer input;
-        ASSERT_TRUE(buf::AppendSpanToMultiBuffer(wire, input));
+        common::MultiBuffer input;
+        ASSERT_TRUE(common::AppendSpanToMultiBuffer(wire, input));
         framer.Feed(std::move(input));
         try {
             (void)framer.Next(packet);
@@ -162,16 +162,16 @@ TEST_P(ProtocolDomainTest, TrojanUdpFrame) {
         return;
     }
 
-    buf::MultiBuffer prefix;
-    ASSERT_TRUE(buf::AppendSpanToMultiBuffer(std::span(wire).first(split), prefix));
+    common::MultiBuffer prefix;
+    ASSERT_TRUE(common::AppendSpanToMultiBuffer(std::span(wire).first(split), prefix));
     framer.Feed(std::move(prefix));
     EXPECT_FALSE(framer.Next(packet));
-    buf::MultiBuffer remainder;
-    ASSERT_TRUE(buf::AppendSpanToMultiBuffer(std::span(wire).subspan(split), remainder));
+    common::MultiBuffer remainder;
+    ASSERT_TRUE(common::AppendSpanToMultiBuffer(std::span(wire).subspan(split), remainder));
     framer.Feed(std::move(remainder));
     ASSERT_TRUE(framer.Next(packet));
     ExpectTarget(packet.target, domain);
-    const auto datagram = buf::InspectUdpDatagram(packet.payload);
+    const auto datagram = common::InspectUdpDatagram(packet.payload);
     ASSERT_TRUE(datagram.Valid());
     ASSERT_NE(datagram.target, nullptr);
     ExpectTarget(*datagram.target, domain);
@@ -189,10 +189,10 @@ TEST_P(ProtocolDomainTest, TrojanUdpFrame) {
 class VmessUsers {
 public:
     static constexpr std::string_view kTag = "protocol-domain-boundary";
-    proxyman::inbound::PreparedVmessUser user;
+    app::PreparedVmessUser user;
 
     VmessUsers() {
-        using namespace proxyman::inbound;
+        using namespace app;
         user.auth_key.fill(0x19);
         user.cmd_key.fill(0x27);
         user.profile.user_id = 73;
@@ -202,7 +202,7 @@ public:
         UserStore::InstallWorkerView(std::move(view));
     }
 
-    ~VmessUsers() { proxyman::inbound::UserStore::ClearWorkerView(); }
+    ~VmessUsers() { app::UserStore::ClearWorkerView(); }
 };
 
 TEST_P(ProtocolDomainTest, VmessAuthenticatedRequestHeader) {
@@ -212,8 +212,8 @@ TEST_P(ProtocolDomainTest, VmessAuthenticatedRequestHeader) {
     std::vector<uint8_t> plain(38, 0);
     plain[0] = 1;
     std::fill(plain.begin() + 1, plain.begin() + 33, 0x35); // body IV/key。
-    plain[35] = static_cast<uint8_t>(proxy::vmess::Security::NONE);
-    plain[37] = static_cast<uint8_t>(proxy::vmess::Command::UDP);
+    plain[35] = static_cast<uint8_t>(proxy::VmessSecurity::NONE);
+    plain[37] = static_cast<uint8_t>(proxy::VmessCommand::UDP);
     plain.insert(plain.end(), address.begin(), address.end());
     ASSERT_EQ(plain[41], domain.wire_size); // 加密前的实际PortFirst域名长度。
     const uint32_t checksum = common::Fnv1a32(std::span<const uint8_t>(plain.data(), plain.size()));
@@ -224,11 +224,11 @@ TEST_P(ProtocolDomainTest, VmessAuthenticatedRequestHeader) {
     std::vector<uint8_t> wire(42 + plain.size() + 16, 0);
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    proxy::vmess::GenerateAuthID(proxy::vmess::ExpandAuthIDEncryptKey(users.user.auth_key), now, wire.data());
+    proxy::GenerateAuthID(proxy::ExpandAuthIDEncryptKey(users.user.auth_key), now, wire.data());
     const std::span<const uint8_t, 16> auth_id(wire.data(), 16);
     const std::span<const uint8_t, 8> nonce(wire.data() + 34, 8);
-    const auto length_key = proxy::vmess::RequestHeaderLengthKey(users.user.cmd_key, auth_id, nonce);
-    const auto payload_key = proxy::vmess::RequestHeaderPayloadKey(users.user.cmd_key, auth_id, nonce);
+    const auto length_key = proxy::RequestHeaderLengthKey(users.user.cmd_key, auth_id, nonce);
+    const auto payload_key = proxy::RequestHeaderPayloadKey(users.user.cmd_key, auth_id, nonce);
     const std::array<uint8_t, 2> length{
         static_cast<uint8_t>(plain.size() >> 8), static_cast<uint8_t>(plain.size())};
     ASSERT_TRUE(proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {length_key.key.data(), 16}, {length_key.nonce.data(), 12}, {length.data(), length.size()}, {auth_id.data(), auth_id.size()}, wire.data() + 16, {wire.data() + 18, 16}));
@@ -236,7 +236,7 @@ TEST_P(ProtocolDomainTest, VmessAuthenticatedRequestHeader) {
     const size_t header_size = wire.size();
     wire.insert(wire.end(), kPayload.begin(), kPayload.end());
 
-    proxy::vmess::encoding::ServerSession session(VmessUsers::kTag);
+    proxy::ServerSession session(VmessUsers::kTag);
     const auto prefix = session.DecodeRequestHeader(wire.data(), 42);
     EXPECT_FALSE(prefix.first);
     EXPECT_EQ(session.RequiredHeaderBytes(), header_size);
@@ -253,7 +253,7 @@ TEST_P(ProtocolDomainTest, VmessAuthenticatedRequestHeader) {
     ASSERT_TRUE(request) << session.HeaderFailureReason();
     ASSERT_TRUE(request->user);
     EXPECT_EQ(request->user->profile.user_id, 73);
-    EXPECT_EQ(request->command, proxy::vmess::Command::UDP);
+    EXPECT_EQ(request->command, proxy::VmessCommand::UDP);
     ExpectTarget(request->target, domain);
     EXPECT_EQ(consumed, header_size);
     ExpectPayload(wire, consumed);

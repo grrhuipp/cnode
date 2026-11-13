@@ -1,35 +1,35 @@
-#include "app/proxyman/outbound/handler.hpp"
+#include "app/proxyman/outbound_handler.hpp"
 #include "app/relay.hpp"
 #include "common/session.hpp"
 #include "common/target_address.hpp"
-#include "core/constants.hpp"
+#include "common/constants.hpp"
 #include "infra/log.hpp"
 #include "proxy/freedom/freedom_udp.hpp"
 #include "infra/outbound_types.hpp"
 #include "proxy/outbound.hpp"
-#include "transport/internet/outbound_target_builder.hpp"
-
+#include "proxy/outbound_stream_endpoint.hpp"
+#include "transport/outbound_target_builder.hpp"
 #include <chrono>
 #include <memory>
 #include <optional>
 #include <string_view>
 #include <tl/expected.hpp>
 
-namespace proxy::freedom::outbound {
+namespace proxy {
 
 
-class Handler final : public Outbound {
+class FreedomOutbound final : public Outbound {
 public:
-    explicit Handler(const infra::FreedomSettings& settings);
+    explicit FreedomOutbound(const infra::FreedomSettings& settings);
 
     net::awaitable<OutboundProcessResult> Process(
-        session::Context& ctx,
+        common::Context& ctx,
         transport::Link inbound,
-        transport::internet::OutboundDialer& dialer,
+        transport::OutboundDialer& dialer,
         const infra::TimeoutsConfig& timeouts,
         app::StatsShard& stats,
         const app::RelayConfig& relay_config,
-        buf::MultiBufferBatch first_payload) override;
+        common::MultiBufferBatch first_payload) override;
 
 private:
     DomainStrategy domain_strategy_;
@@ -38,8 +38,8 @@ private:
 
 namespace {
 
-transport::internet::OutboundDialer::AddressFamilyPolicy FamilyPolicy(DomainStrategy strategy) {
-    using Policy = transport::internet::OutboundDialer::AddressFamilyPolicy;
+transport::OutboundDialer::AddressFamilyPolicy FamilyPolicy(DomainStrategy strategy) {
+    using Policy = transport::OutboundDialer::AddressFamilyPolicy;
     switch (strategy) {
         case DomainStrategy::UseIPv4:
             return Policy{.accepts_v6 = false};
@@ -62,18 +62,18 @@ transport::internet::OutboundDialer::AddressFamilyPolicy FamilyPolicy(DomainStra
 
 }  // namespace
 
-Handler::Handler(const infra::FreedomSettings& settings)
+FreedomOutbound::FreedomOutbound(const infra::FreedomSettings& settings)
     : domain_strategy_(settings.domain_strategy)
     , redirect_target_(settings.redirect) {}
 
-net::awaitable<OutboundProcessResult> Handler::Process(
-    session::Context& ctx,
+net::awaitable<OutboundProcessResult> FreedomOutbound::Process(
+    common::Context& ctx,
     transport::Link inbound,
-    transport::internet::OutboundDialer& dialer,
+    transport::OutboundDialer& dialer,
     const infra::TimeoutsConfig& /*timeouts*/,
     app::StatsShard& stats,
     const app::RelayConfig& relay_config,
-    buf::MultiBufferBatch first_payload) {
+    common::MultiBufferBatch first_payload) {
     if (!inbound.Valid()) {
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
@@ -82,16 +82,15 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     // 不做 redirect（保持 UDP 逐包目标语义）；嗅探首包作为普通上行交给转发。
     if (ctx.content.network == common::Network::UDP) {
         const auto& target = ctx.outbound.target;
-        std::optional<UdpRequest> endpoint;
-        if (auto opened = dialer.OpenDatagram(ctx, transport::internet::OutboundDialer::DatagramRemote{
+        std::optional<FreedomUdpRequest> endpoint;
+        if (auto opened = dialer.OpenDatagram(ctx, transport::OutboundDialer::DatagramRemote{
                 .address = target.IsDomain() ? std::nullopt : target.resolved_addr,
                 .family_hint = target.IsDomain() ? target.resolved_addr : std::nullopt,
                 .family_policy = FamilyPolicy(domain_strategy_),
             }, endpoint); !opened) {
             co_return tl::unexpected(opened.error());
         }
-        endpoint->SetIdleTimeout(relay_config.idle_timeout);
-        endpoint->SetWriteTimeout(relay_config.write_timeout);
+        proxy::ApplyOutboundDatagramTimeouts(*endpoint, relay_config);
         co_return co_await app::DoRelayLink(dialer.IoContext(), *inbound.reader, *inbound.writer,
             inbound.control, *endpoint, ctx, stats, relay_config, std::move(first_payload));
     }
@@ -108,42 +107,40 @@ net::awaitable<OutboundProcessResult> Handler::Process(
         co_return tl::unexpected(dialed.error());
     }
     auto stream = std::move(*dialed);
-    stream->SetIdleTimeout(relay_config.idle_timeout);
-    stream->SetReadTimeout(std::chrono::seconds(0));
-    stream->SetWriteTimeout(relay_config.write_timeout);
+    proxy::ApplyOutboundRelayTimeouts(*stream, relay_config);
     co_return co_await app::DoRelayLink(
         dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
         *stream, ctx, stats, relay_config, std::move(first_payload));
 }
 
 
-[[nodiscard]] proxyman::outbound::PreparedOutboundCreator
-PrepareOutbound(infra::FreedomSettings settings) {
-    return proxyman::outbound::MakePreparedOutboundCreator<
+[[nodiscard]] app::PreparedOutboundCreator
+MakeFreedomPreparedOutboundCreator(infra::FreedomSettings settings) {
+    return app::MakePreparedOutboundCreator<
         infra::FreedomSettings,
         +[](std::string_view, std::shared_ptr<const infra::FreedomSettings> config,
             net::io_context&, common::AwaitableTaskGroup&) -> std::unique_ptr<Outbound> {
-            return std::make_unique<Handler>(*config);
+            return std::make_unique<FreedomOutbound>(*config);
         }>(std::move(settings));
 }
-}  // namespace proxy::freedom::outbound
+}  // namespace proxy
 
 // ============================================================================
 // 自注册（静态初始化，Xray init() 设计）
 // ============================================================================
 namespace {
-const bool kFreedomRegistered = (::proxyman::outbound::RegisterProxy(
-    ::constants::protocol::kFreedom,
+const bool kFreedomRegistered = (::app::RegisterProxy(
+    ::common::kFreedom,
     [](const ::infra::OutboundSourceConfig& cfg)
-        -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
+        -> std::optional<::app::PreparedOutboundProxy> {
         const auto* settings = std::get_if<::infra::FreedomSettings>(&cfg.settings);
         if (!settings) return std::nullopt;
-        ::transport::internet::OutboundSenderSettings sender{
+        ::transport::OutboundSenderSettings sender{
             .stream_settings = {},
-            .send_through = ::transport::internet::OutboundBind::Auto(),
+            .send_through = ::transport::OutboundBind::Auto(),
         };
-        return ::proxyman::outbound::PreparedOutboundProxy{
-            .create = ::proxy::freedom::outbound::PrepareOutbound(*settings),
+        return ::app::PreparedOutboundProxy{
+            .create = ::proxy::MakeFreedomPreparedOutboundCreator(*settings),
             .sender = std::move(sender),
         };
     }), true);

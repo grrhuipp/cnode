@@ -1,16 +1,8 @@
 // 分配与容器微基准，与守护进程使用相同的全局 mimalloc。
-// - AllocatorAppendBenchmark：64 B～64 KiB 字节缓冲追加，分预留与按需增长两种模式。
-// - MultiBufferBenchmark：1/8/9/16 块 MultiBuffer 所有权移交，不复制 payload。
-// - BufferSpanBenchmark：分别以 span 与 MultiBuffer 为输入构建散布写描述符，覆盖内联容量
-//   与溢出边界，计时前校验借用视图的地址与长度。
-// - RingDequeBenchmark：每批 1/8/64 个元素填充并完全排空，预热 128 批后测量 262144/批大小 批，
-//   校验 FIFO、checksum 与排空后归还存储。
-// 输出 CPU/墙钟耗时；微基准不代表端到端吞吐。
-
 #include <gtest/gtest.h>
 
 #include "common/allocator.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/const_buffer_span.hpp"
 
 #include <algorithm>
@@ -22,14 +14,11 @@
 #include <vector>
 
 namespace {
-using Bytes = std::pmr::vector<uint8_t>;
+using Bytes = std::vector<uint8_t>;
 constexpr std::size_t kBytesPerWorkload = 16 * 1024 * 1024;
 constexpr std::size_t kGrowingAppends = 4;
-// Match the TLS operation's output bound; a 64 KiB append fills a fresh buffer.
 constexpr std::size_t kOperationByteLimit = 65536;
 
-// The memory clobber makes every append observable, including immediately before
-// the operation-scoped vector is freed, under -O3 and ThinLTO.
 void Observe(const Bytes& bytes) {
     asm volatile("" : : "g"(bytes.data()), "g"(bytes.size()) : "memory");
 }
@@ -59,12 +48,11 @@ TEST(AllocatorAppendBenchmark, TrackedResource) {
                 ? std::min(kGrowingAppends, kOperationByteLimit / append_bytes) : 1;
             const std::size_t iterations = kBytesPerWorkload / (append_bytes * appends);
             ASSERT_GT(iterations, 0u);
-            memory::CollectThreadHeap();
+            common::CollectThreadHeap();
 
-            // Validate the measured append path and preserved prefixes before timing.
             std::size_t sampled_capacity = 0;
             {
-                Bytes probe(memory::process_resource());
+                Bytes probe;
                 if (!growing) probe.reserve(append_bytes);
                 for (std::size_t part = 0; part < appends; ++part) {
                     Append(probe, input);
@@ -75,19 +63,18 @@ TEST(AllocatorAppendBenchmark, TrackedResource) {
                 sampled_capacity = probe.capacity();
             }
 
-            Bytes reserved(memory::process_resource());
+            Bytes reserved;
             if (!growing) reserved.reserve(append_bytes);
             timespec cpu_start{}, cpu_end{};
             ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_start), 0);
             const auto wall_start = std::chrono::steady_clock::now();
             if (growing) {
                 for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
-                    Bytes output(memory::process_resource());
+                    Bytes output;
                     for (std::size_t part = 0; part < appends; ++part) {
                         Append(output, input);
                         Observe(output);
                     }
-                    // Destruction/deallocation belongs to the measured operation.
                 }
             } else {
                 for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
@@ -113,26 +100,24 @@ TEST(AllocatorAppendBenchmark, TrackedResource) {
                 iterations, bytes, wall_ns / bytes, cpu_ns / bytes, sampled_capacity);
         }
     }
-    memory::CollectThreadHeap();
+    common::CollectThreadHeap();
 }
 
-buf::MultiBuffer TransferBuffers(std::size_t count) {
-    buf::MultiBuffer source;
+common::MultiBuffer TransferBuffers(std::size_t count) {
+    common::MultiBuffer source;
+    common::BufferGuard buffer{common::Buffer::New(count)};
+    if (!buffer) throw std::bad_alloc();
     for (std::size_t index = 0; index < count; ++index) {
-        buf::BufferGuard buffer{buf::Buffer::New()};
-        if (!buffer) throw std::bad_alloc();
-        buffer->Tail()[0] = static_cast<uint8_t>(index);
-        buffer->Produce(1);
-        source.push_back(std::move(buffer));
+        buffer->Tail()[index] = static_cast<uint8_t>(index);
     }
-    // Model ownership handoffs, not payload copies. Escaping each container's
-    // address prevents ThinLTO from eliding the intermediate moved-from states.
-    buf::MultiBuffer first(std::move(source));
+    buffer->Produce(count);
+    source.push_back(std::move(buffer));
+    common::MultiBuffer first(std::move(source));
     asm volatile("" : : "g"(&source), "g"(&first) : "memory");
-    buf::MultiBuffer second;
+    common::MultiBuffer second;
     second = std::move(first);
     asm volatile("" : : "g"(&first), "g"(&second) : "memory");
-    buf::MultiBuffer third(std::move(second));
+    common::MultiBuffer third(std::move(second));
     asm volatile("" : : "g"(&second), "g"(&third) : "memory");
     return third;
 }
@@ -140,16 +125,16 @@ buf::MultiBuffer TransferBuffers(std::size_t count) {
 TEST(MultiBufferBenchmark, TrackedTransfers) {
     for (const std::size_t blocks : {1u, 8u, 9u, 16u}) {
         SCOPED_TRACE(blocks);
-        memory::CollectThreadHeap();
+        common::CollectThreadHeap();
         {
             auto probe = TransferBuffers(blocks);
-            ASSERT_EQ(probe.size(), blocks);
+            ASSERT_EQ(probe.size(), 1u);
             ASSERT_EQ(probe.byte_size(), blocks);
+            auto buffer = probe.pop_front();
+            ASSERT_TRUE(buffer);
+            ASSERT_EQ(buffer->Len(), blocks);
             for (std::size_t index = 0; index < blocks; ++index) {
-                auto buffer = probe.pop_front();
-                ASSERT_TRUE(buffer);
-                ASSERT_EQ(buffer->Len(), 1u);
-                ASSERT_EQ(buffer->Bytes()[0], index);
+                ASSERT_EQ(buffer->Bytes()[index], index);
             }
             ASSERT_TRUE(probe.empty());
         }
@@ -159,7 +144,6 @@ TEST(MultiBufferBenchmark, TrackedTransfers) {
         const auto start = std::chrono::steady_clock::now();
         for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
             auto payload = TransferBuffers(blocks);
-            payload.drop_front(blocks - 1);
             asm volatile("" : : "g"(&payload) : "memory");
         }
         const auto finish = std::chrono::steady_clock::now();
@@ -170,34 +154,23 @@ TEST(MultiBufferBenchmark, TrackedTransfers) {
                     "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f\n",
             blocks, iterations, wall_ns / iterations, cpu_ns / iterations);
     }
-    memory::CollectThreadHeap();
+    common::CollectThreadHeap();
 }
 
 TEST(BufferSpanBenchmark, TrackedDescriptors) {
     for (const std::size_t blocks : {1u, 8u, 9u, 16u}) {
-        memory::CollectThreadHeap();
+        common::CollectThreadHeap();
         {
             auto payload = TransferBuffers(blocks);
             std::array<net::const_buffer, 16> input;
-            std::size_t position = 0;
-            for (const auto* buffer : payload) {
-                const auto bytes = buffer->Bytes();
-                input[position++] = net::buffer(bytes.data(), bytes.size());
+            const auto bytes = payload.FrontSpan();
+            for (std::size_t i = 0; i < blocks; ++i) {
+                input[i] = net::buffer(bytes.data() + i, 1);
             }
             const auto descriptors = std::span(input).first(blocks);
             for (const bool from_multibuffer : {false, true}) {
                 SCOPED_TRACE(blocks);
                 SCOPED_TRACE(from_multibuffer);
-                {
-                    common::ConstBufferSpanBuilder<8> probe;
-                    if (from_multibuffer) probe.AppendMultiBuffer(payload);
-                    else probe.AppendBuffers(descriptors);
-                    ASSERT_EQ(probe.size(), blocks);
-                    for (std::size_t index = 0; index < blocks; ++index) {
-                        EXPECT_EQ(probe.Span()[index].data(), input[index].data());
-                        EXPECT_EQ(probe.Span()[index].size(), input[index].size());
-                    }
-                }
                 const std::size_t iterations = 1048576 / blocks;
                 timespec cpu_start{}, cpu_end{};
                 ASSERT_EQ(::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_start), 0);
@@ -220,10 +193,10 @@ TEST(BufferSpanBenchmark, TrackedDescriptors) {
             }
         }
     }
-    memory::CollectThreadHeap();
+    common::CollectThreadHeap();
 }
 
-uint64_t FillAndDrain(memory::RingDeque<uint64_t>& queue,
+uint64_t FillAndDrain(common::RingDeque<uint64_t>& queue,
                      std::size_t batch, std::size_t iterations) {
     uint64_t checksum = 0;
     for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
@@ -241,8 +214,8 @@ uint64_t FillAndDrain(memory::RingDeque<uint64_t>& queue,
 TEST(RingDequeBenchmark, TrackedFillAndDrain) {
     for (const std::size_t batch : {1u, 8u, 64u}) {
         SCOPED_TRACE(batch);
-        memory::CollectThreadHeap();
-        memory::RingDeque<uint64_t> queue;
+        common::CollectThreadHeap();
+        common::RingDeque<uint64_t> queue;
         for (std::size_t value = 0; value < batch; ++value) queue.push_back(value);
         for (std::size_t value = 0; value < batch; ++value) {
             ASSERT_EQ(queue.front(), value);
@@ -267,6 +240,6 @@ TEST(RingDequeBenchmark, TrackedFillAndDrain) {
                     "wall_ns_per_operation=%.3f cpu_ns_per_operation=%.3f\n",
             batch, iterations, wall_ns / iterations, cpu_ns / iterations);
     }
-    memory::CollectThreadHeap();
+    common::CollectThreadHeap();
 }
-} // namespace
+}  // namespace

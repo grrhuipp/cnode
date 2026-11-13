@@ -1,16 +1,15 @@
 #include <gtest/gtest.h>
 
 #include "proxy/shadowsocks/ss_outbound.hpp"
-
 #include <array>
 #include <cstring>
 #include <string>
 #include <string_view>
 
 namespace {
-using proxy::shadowsocks::outbound::Credentials;
-using proxy::shadowsocks::SsCipherInfo;
-using proxy::shadowsocks::SsCipherType;
+using Credentials = proxy::SsCredentials;
+using proxy::SsCipherInfo;
+using proxy::SsCipherType;
 
 constexpr SsCipherInfo kAes128{SsCipherType::AES_128_GCM, 16, 16};
 constexpr SsCipherInfo kAes256{SsCipherType::AES_256_GCM, 32, 32};

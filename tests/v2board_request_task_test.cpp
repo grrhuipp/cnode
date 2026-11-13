@@ -1,9 +1,8 @@
 #include <gtest/gtest.h>
 
-#include "api/v2board/request_task.hpp"
+#include "api/request_task.hpp"
 #include "api/api.hpp"
 #include "app/dns/dns.hpp"
-
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -19,8 +18,8 @@
 
 namespace {
 namespace net = ::net;
-using ::api::v2board::http::Response;
-using ::api::v2board::http::RunRequest;
+using Response = ::api::PanelHttpResponse;
+using ::api::ExecutePanelHttpRequest;
 using namespace std::chrono_literals;
 
 
@@ -67,7 +66,7 @@ TEST_P(OrdinaryRequest, DrainsDeadlineAndPreservesCompletionCategory) {
     bool completed = false;
     std::exception_ptr failure;
     Response response;
-    net::co_spawn(io, RunRequest(ImmediateExchange(fail), 30s),
+    net::co_spawn(io, ExecutePanelHttpRequest(ImmediateExchange(fail), 30s),
         [&](std::exception_ptr error, Response value) {
             completed = true;
             failure = error;
@@ -96,7 +95,7 @@ TEST_P(RequestTimeout, JoinsExchangeBeforeReturningAndPreservesCompletedResponse
     bool released_before_completion = false;
     std::exception_ptr failure;
     Response response;
-    net::co_spawn(io, RunRequest(WaitingExchange(state, result), 20ms),
+    net::co_spawn(io, ExecutePanelHttpRequest(WaitingExchange(state, result), 20ms),
         [&](std::exception_ptr error, Response value) {
             completed = true;
             released_before_completion = state.released;
@@ -129,7 +128,7 @@ TEST_P(RequestCancellation, JoinsExchangeAndPropagatesCallerCancellation) {
     bool completed = false;
     bool released_before_completion = false;
     std::exception_ptr failure;
-    net::co_spawn(io, RunRequest(WaitingExchange(state, result), 30s),
+    net::co_spawn(io, ExecutePanelHttpRequest(WaitingExchange(state, result), 30s),
         net::bind_cancellation_slot(cancellation.slot(),
             [&](std::exception_ptr error, Response) {
                 completed = true;
@@ -174,10 +173,10 @@ class PanelHttpConsumer : public testing::TestWithParam<std::string_view> {};
 TEST_P(PanelHttpConsumer, PreservesResponseBoundariesAndValidatorIdentity) {
     const auto mode = GetParam();
     net::io_context io;
-    ::app::dns::Config dns_config;
+    ::app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 53}};
-    ::app::dns::DNSWorker resolver(io, dns_config, 16);
-    ::app::dns::DNS dns(resolver);
+    ::app::DNSWorker resolver(io, dns_config, 16);
+    ::app::DNS dns(resolver);
     tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::api::Config config;
     config.Name = "http-consumer";

@@ -7,18 +7,18 @@
 #include <cstdint>
 #include <variant>
 
-namespace proxy::vmess {
+namespace proxy {
 
 // Coordinator-owned, Sans-I/O AEAD request tuple history. A full table rejects
 // new tuples rather than forgetting requests still inside the replay window.
-class SessionHistory {
+class VmessSessionHistory {
 public:
     using SessionKey = std::array<uint8_t, 32>;
     static constexpr int64_t kTtlSeconds = 180;
     static constexpr int64_t kCleanupIntervalSeconds = 30;
     static constexpr size_t kMaxEntries = 65536;
 
-    explicit SessionHistory(size_t capacity = kMaxEntries) : entries_(capacity), capacity_(capacity) {}
+    explicit VmessSessionHistory(size_t capacity = kMaxEntries) : entries_(capacity), capacity_(capacity) {}
 
     [[nodiscard]] bool AddIfNew(const SessionKey& key, int64_t now) {
         if (now - last_cleanup_ >= kCleanupIntervalSeconds || entries_.size() >= capacity_) {
@@ -42,4 +42,4 @@ private:
     int64_t last_cleanup_ = 0;
 };
 
-}  // namespace proxy::vmess
+}  // namespace proxy

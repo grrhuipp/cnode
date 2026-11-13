@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "service/controller/traffic_journal.hpp"
-#include "service/controller/traffic_journal_format.hpp"
+#include "controller/traffic_journal.hpp"
+#include "controller/traffic_journal_format.hpp"
 #include "infra/json.hpp"
 
 #include <sys/wait.h>
@@ -15,7 +15,6 @@
 
 namespace {
 using ::controller::TrafficJournal;
-namespace journal_format = ::controller::traffic_journal;
 
 ::app::UserTrafficCounters Sample() {
     ::app::UserTrafficCounters result;
@@ -33,7 +32,7 @@ protected:
         config.Name = "test";
         config.APIHost = "http://127.0.0.1:12345";
         config.Key = "not-written-to-journal";
-        config.NodeIDs = ::infra::PanelNodeIds::Parse(::json::array{1});
+        config.NodeIDs = ::infra::PanelNodeIds::Parse(::infra::array{1});
         config.TrafficJournalDir = root / "journal";
     }
     void TearDown() override {
@@ -125,7 +124,7 @@ TEST_F(TrafficJournalTest, ByteLimitRejectsDeltaWithoutPublishingReadyRecord) {
     const auto huge = journal.Directory() / "batch-limit0.unknown";
     const int fd = ::open(huge.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
     ASSERT_GE(fd, 0);
-    const int truncated = ::ftruncate(fd, journal_format::kMaxBytes);
+    const int truncated = ::ftruncate(fd, ::controller::kMaxBytes);
     const int closed = ::close(fd);
     ASSERT_EQ(truncated, 0);
     ASSERT_EQ(closed, 0);
@@ -136,13 +135,13 @@ TEST_F(TrafficJournalTest, ByteLimitRejectsDeltaWithoutPublishingReadyRecord) {
 
 TEST_F(TrafficJournalTest, RecordCountLimitRejectsAdditionalDelta) {
     TrafficJournal journal(config);
-    for (size_t i = 0; i < journal_format::kMaxRecords; ++i) {
+    for (size_t i = 0; i < ::controller::kMaxRecords; ++i) {
         std::ofstream file(journal.Directory() / std::format("batch-{:06}.unknown", i));
         ASSERT_TRUE(file);
         file << "[]";
     }
     EXPECT_THROW(journal.Append(Sample()), std::exception);
-    EXPECT_EQ(journal.UnknownCount(), journal_format::kMaxRecords);
+    EXPECT_EQ(journal.UnknownCount(), ::controller::kMaxRecords);
     EXPECT_TRUE(journal.Prepare().traffic.empty());
 }
 

@@ -2,7 +2,6 @@
 
 #include "infra/config.hpp"
 #include "proxy/vmess/vmess_crypto.hpp"
-
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -18,7 +17,7 @@ static_assert(std::is_aggregate_v<infra::VmessSettings>);
 static_assert(std::is_aggregate_v<infra::AnyTlsSettings>);
 
 infra::OutboundSettings Parse(std::string_view protocol, std::string_view body) {
-    const auto source = json::parse(body, json::KeyComparison::AsciiCaseInsensitive);
+    const auto source = infra::parse(body, infra::KeyComparison::AsciiCaseInsensitive);
     return infra::ParseOutboundSettings(protocol, source.as_object());
 }
 
@@ -63,10 +62,10 @@ TEST(OutboundConfig, NestedSchemasDoNotFallbackToTopLevelCredentials) {
 }
 
 TEST(OutboundConfig, VmessUsesItsOwnSecurityNamesAndRetainsImplementedModes) {
-    struct Case { std::string_view spelling; proxy::vmess::Security security; };
+    struct Case { std::string_view spelling; proxy::VmessSecurity security; };
     for (const auto& test : {
-        Case{"chacha20-poly1305", proxy::vmess::Security::CHACHA20_POLY1305},
-        Case{"none", proxy::vmess::Security::NONE}, Case{"zero", proxy::vmess::Security::ZERO}}) {
+        Case{"chacha20-poly1305", proxy::VmessSecurity::CHACHA20_POLY1305},
+        Case{"none", proxy::VmessSecurity::NONE}, Case{"zero", proxy::VmessSecurity::ZERO}}) {
         const auto settings = std::get<infra::VmessSettings>(Parse("vmess",
             std::string(R"({"address":"example.com","id":"b831381d-6324-4d53-ad4f-8cda48b30811","security":")") +
             std::string(test.spelling) + R"("})"));
@@ -117,9 +116,9 @@ TEST(OutboundConfig, TrojanRejectsMalformedTlsNamesBeforeRuntimePreparation) {
 }
 
 TEST(OutboundConfig, FreedomOnlyAcceptsHandlerLevelBinding) {
-    const auto source = json::parse(
+    const auto source = infra::parse(
         R"({"protocol":"freedom","settings":{"sendThrough":"auto"}})",
-        json::KeyComparison::AsciiCaseInsensitive);
+        infra::KeyComparison::AsciiCaseInsensitive);
     EXPECT_THROW(infra::OutboundSourceConfig::FromJson(source.as_object()), std::invalid_argument);
 }
 

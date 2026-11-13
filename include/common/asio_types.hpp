@@ -41,7 +41,7 @@ struct ChannelTraits<R(asio::error_code, Args...), Signatures...> {
 
     template <typename Element>
     struct container {
-        using type = memory::RingDeque<Element>;
+        using type = RingDeque<Element>;
     };
 
     using receive_cancelled_signature = R(asio::error_code, Args...);

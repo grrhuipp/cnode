@@ -3,7 +3,7 @@
 #include "app/dns/dns.hpp"
 #include "app/relay.hpp"
 #include "app/prepared_inbound.hpp"
-#include "app/proxyman/inbound/handler.hpp"
+#include "app/proxyman/inbound_handler.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
@@ -52,8 +52,8 @@ public:
     }
     net::awaitable<app::RelayResult> Process(
         std::unique_ptr<transport::AsyncStream> stream, routing::Dispatcher&,
-        const proxyman::inbound::ReceiverSettings&, net::io_context&,
-        session::Context&, const infra::TimeoutsConfig&, uint32_t) override {
+        const app::ReceiverSettings&, net::io_context&,
+        common::Context&, const infra::TimeoutsConfig&, uint32_t) override {
         const std::array<char, 1> admitted{'A'};
         co_await stream->AsyncWrite(net::buffer(admitted));
         std::array<char, 1> input{};
@@ -65,10 +65,10 @@ private:
 };
 
 void RegisterProtocol() {
-    proxyman::inbound::RegisterProxy(kProtocol, {
+    app::RegisterProxy(kProtocol, {
         .user_protocol = std::nullopt,
-        .create_tcp_handler = [](const proxyman::inbound::AdmissionEnvironment& environment,
-                                 const proxyman::inbound::BuildRequest&) -> std::unique_ptr<proxy::Inbound> {
+        .create_tcp_handler = [](const app::AdmissionEnvironment& environment,
+                                 const app::BuildRequest&) -> std::unique_ptr<proxy::Inbound> {
             auto* limiter = &environment.limiter;
             EXPECT_TRUE(fixture) << "factory did not receive the shared limiter";
             if (!fixture) throw std::runtime_error("missing admission fixture");
@@ -88,13 +88,13 @@ net::awaitable<void> Pause(net::io_context& io) {
 }
 
 void Register(app::Worker& worker, std::string tag) {
-    proxyman::inbound::BuildRequest request{
+    app::BuildRequest request{
         .tag = tag, .protocol = std::string(kProtocol), .settings = {}};
-    proxyman::inbound::ReceiverSettings receiver{
+    app::ReceiverSettings receiver{
         .inbound_tag = tag, .inbound_tags = {}, .protocol = std::string(kProtocol),
         .stream_settings = {},
         .dispatch_policy = {{}, routing::ForceOutbound{"unused"}},
-        .proxy_protocol = transport::internet::ProxyProtocolMode::Off};
+        .proxy_protocol = transport::ProxyProtocolMode::Off};
     const bool registered = worker.RegisterInbound(std::move(request), std::move(receiver));
     EXPECT_TRUE(registered);
     if (!registered) throw std::runtime_error("inbound fixture registration failed");
@@ -105,7 +105,7 @@ net::awaitable<uint16_t> Listen(net::io_context& io, app::Worker& worker, std::s
     tcp::acceptor reservation(io, {net::ip::address_v4::loopback(), 0});
     const auto port = reservation.local_endpoint().port();
     reservation.close();
-    const auto listen = transport::internet::InboundListen::Parse("127.0.0.1");
+    const auto listen = transport::InboundListen::Parse("127.0.0.1");
     EXPECT_TRUE((listen.has_value())) << "loopback listen parsing failed";
     if (!listen) throw std::runtime_error("invalid loopback fixture address");
     const bool listening = worker.AddListener(
@@ -215,7 +215,7 @@ net::awaitable<void> Exercise(net::io_context& io, app::Worker& worker, FixtureS
     EXPECT_TRUE((error == net::error::eof || error == net::error::connection_reset)) << "Worker join left the physical TCP read alive";
 }
 
-void ExerciseWorkers(app::dns::DNSWorker& dns, uint32_t global, uint32_t per_ip,
+void ExerciseWorkers(app::DNSWorker& dns, uint32_t global, uint32_t per_ip,
                      bool limited, bool replace_handler) {
     net::io_context control;
     WorkerCoordinatorFixture control_fixture(control);
@@ -287,8 +287,8 @@ class WorkerConnectionLimitRuntime : public testing::TestWithParam<LimitMode> {
 protected:
     static void SetUpTestSuite() { RegisterProtocol(); }
     net::io_context control;
-    app::dns::Config config{.servers = {{net::ip::address_v4::loopback(), 53}}};
-    app::dns::DNSWorker dns{control, config, 8};
+    app::DnsConfig config{.servers = {{net::ip::address_v4::loopback(), 53}}};
+    app::DNSWorker dns{control, config, 8};
 };
 TEST_P(WorkerConnectionLimitRuntime, SharesBudgetAcrossWorkersAndTagsAndReturnsReleasedSlots) {
     const auto mode = GetParam();

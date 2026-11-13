@@ -1,14 +1,13 @@
 #include <gtest/gtest.h>
 
 #include "allocation_hook.hpp"
-#include "app/proxyman/inbound/user_store.hpp"
-
+#include "app/proxyman/user_store.hpp"
 #include <array>
 #include <new>
 
 namespace {
 thread_local std::ptrdiff_t fail_after = -1;
-using namespace ::proxyman::inbound;
+using namespace ::app;
 
 template <typename Users>
 concept BorrowableUserUpdate = requires(Users&& users) {

@@ -10,11 +10,9 @@
 #include <string>
 #include <unordered_map>
 
-namespace session {
-struct Context;
-}  // namespace session
+namespace common {
 
-namespace rule {
+struct Context;
 
 struct DetectRule {
     std::regex Pattern;
@@ -24,11 +22,11 @@ class DetectRulePolicy final {
 public:
     using RuleList = std::vector<DetectRule>;
     using RuleListPtr = std::shared_ptr<const RuleList>;
-    using InboundRule = std::pmr::unordered_map<
-        std::pmr::string,
+    using InboundRule = std::unordered_map<
+        std::string,
         RuleListPtr,
-        common::TransparentStringHash,
-        common::TransparentStringEq>;
+        TransparentStringHash,
+        TransparentStringEq>;
 
     DetectRulePolicy();
     ~DetectRulePolicy();
@@ -40,9 +38,9 @@ public:
 
     void UpdateRule(std::string_view tag, RuleListPtr new_rule_list);
     [[nodiscard]] bool Blocked(
-        const session::Context& ctx);
+        const Context& ctx);
 private:
-    InboundRule rules_{memory::process_resource()};
+    InboundRule rules_;
 };
 
-}  // namespace rule
+}  // namespace common

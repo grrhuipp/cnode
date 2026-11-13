@@ -1,10 +1,9 @@
 #pragma once
 #include "proxy/handshake_errors.hpp"
 #include "proxy/shadowsocks/cipher.hpp"
-
-#include "app/proxyman/inbound/user_store.hpp"
-#include "common/buf/length_prefixed_packet_buffer.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "app/proxyman/user_store.hpp"
+#include "common/length_prefixed_packet_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/eof_cancellation.hpp"
 #include "common/byte_reader.hpp"
 #include "common/unsafe.hpp"
@@ -29,7 +28,7 @@
 #include <string_view>
 #include <variant>
 #include <tl/expected.hpp>
-namespace proxy::shadowsocks {
+namespace proxy {
 
 // ============================================================================
 // 密码类型
@@ -47,7 +46,7 @@ namespace proxy::shadowsocks {
 // 密钥派生
 // ============================================================================
 
-using KeyBytes = ::proxyman::inbound::PreparedKeyBytes;
+using KeyBytes = ::app::PreparedKeyBytes;
 
 // 从密码派生主密钥（EVP_BytesToKey + MD5，Shadowsocks 标准）
 [[nodiscard]] KeyBytes DeriveKey(std::string_view password, size_t key_size);
@@ -67,7 +66,7 @@ using KeyBytes = ::proxyman::inbound::PreparedKeyBytes;
                                std::span<uint8_t, 16> out_hash);
 
 // 从主密钥 + 随机 salt 派生子密钥（HKDF-SHA1，ss-subkey）
-[[nodiscard]] bool DeriveSubkey(const uint8_t* key, size_t key_size,
+[[nodiscard]] bool DeriveSsSubkey(const uint8_t* key, size_t key_size,
                                 const uint8_t* salt, size_t salt_size,
                                 uint8_t* out_subkey);
 
@@ -160,10 +159,8 @@ inline bool AesBlocksCrypt(std::span<const uint8_t> key,
     return status == 0;
 }
 
-namespace detail {
-
 inline constexpr size_t kStreamChunkPayloadSize =
-    buf::Buffer::kSize - (2 + SsAeadCipher::kTagSize) - SsAeadCipher::kTagSize;
+    common::Buffer::kSize - (2 + SsAeadCipher::kTagSize) - SsAeadCipher::kTagSize;
 
 [[noreturn]] inline void ThrowSsWriteError(const char* what) {
     throw IoSystemError(io_error::connection_reset, what);
@@ -179,7 +176,7 @@ inline std::array<uint8_t, 12> MakeNonce(uint64_t counter) noexcept {
 inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
                                  uint64_t& nonce,
                                  std::span<const uint8_t> bytes,
-                                 buf::MultiBuffer& out_mb,
+                                 common::MultiBuffer& out_mb,
                                  size_t* skip_first_bytes) {
     static constexpr size_t kLenHeaderSize = 2 + SsAeadCipher::kTagSize;
 
@@ -197,7 +194,7 @@ inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
 
     while (remaining > 0) {
         const size_t chunk_size = std::min(remaining, kStreamChunkPayloadSize);
-        buf::BufferGuard out{buf::Buffer::New()};
+        common::BufferGuard out{common::Buffer::New()};
         if (!out) {
             throw std::bad_alloc();
         }
@@ -242,18 +239,19 @@ inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
 // place; fragmented records borrow contiguous storage only for this operation.
 [[nodiscard]] inline bool DecryptStreamPayload(
     SsAeadCipher& cipher, std::span<const uint8_t, 12> nonce,
-    buf::MultiBuffer ciphertext, buf::MultiBuffer& output) {
+    common::MultiBuffer ciphertext, common::MultiBuffer& output) {
     const size_t wire_size = ciphertext.byte_size();
     if (wire_size < SsAeadCipher::kTagSize) return false;
     const size_t payload_len = wire_size - SsAeadCipher::kTagSize;
     if (auto block = ciphertext.TakeFrontIfLen(wire_size)) {
+        if (wire_size > common::Buffer::kSize) common::CheckTestAllocationFault();
         auto bytes = block->Bytes();
         if (!cipher.Decrypt(nonce.data(), bytes.data(), bytes.size(), bytes.data())) return false;
         block->end -= SsAeadCipher::kTagSize;
         if (payload_len != 0) output.push_back(std::move(block));
         return true;
     }
-    buf::ContiguousWriteBuffer plaintext;
+    common::ContiguousWriteBuffer plaintext;
     auto* bytes = plaintext.Prepare(wire_size);
     ciphertext.CopyPrefixTo({bytes, wire_size});
     ciphertext.clear();
@@ -268,11 +266,11 @@ ReadAndDecryptStreamPayload(
     SsAeadCipher& cipher,
     std::span<const uint8_t, 12> nonce,
     size_t payload_len,
-    buf::MultiBuffer& output) {
-    buf::MultiBuffer ciphertext;
+    common::MultiBuffer& output) {
+    common::MultiBuffer ciphertext;
     size_t remaining = payload_len;
     while (remaining > 0) {
-        buf::BufferGuard block{buf::Buffer::New()};
+        common::BufferGuard block{common::Buffer::New()};
         if (!block) co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
         const size_t count = std::min(remaining, size_t(block->Available()));
         if (auto read = co_await proxy::ReadHandshakeExact(stream,
@@ -286,7 +284,7 @@ ReadAndDecryptStreamPayload(
     if (auto read = co_await proxy::ReadHandshakeExact(stream, tag,
             proxy::HandshakeProgress::Started); !read)
         co_return tl::unexpected(read.error());
-    if (!buf::AppendSpanToMultiBuffer(tag, ciphertext))
+    if (!common::AppendSpanToMultiBuffer(tag, ciphertext))
         co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
     if (!DecryptStreamPayload(cipher, nonce, std::move(ciphertext), output))
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -311,7 +309,7 @@ public:
 
     transport::CancellationSource& Cancellation() noexcept override { return stream_->Cancellation(); }
     transport::EofAction ReadEofAction() const noexcept override { return stream_->ReadEofAction(); }
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         if (failure_) std::rethrow_exception(failure_);
         for (;;) {
             try {
@@ -328,9 +326,9 @@ public:
                     try { throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED); }
                     catch (...) { Fail(); }
                 }
-                co_return buf::MultiBuffer{};
+                co_return common::MultiBuffer{};
             }
-            try { buf::AppendCoalescedStreamInput(ciphertext_, std::move(raw)); }
+            try { common::AppendCoalescedStreamInput(ciphertext_, std::move(raw)); }
             catch (...) { Fail(); }
         }
     }
@@ -343,7 +341,7 @@ private:
         throw;
     }
 
-    buf::MultiBuffer DecodePending() {
+    common::MultiBuffer DecodePending() {
         for (;;) {
             if (!length_) {
                 std::array<uint8_t, 2 + SsAeadCipher::kTagSize> header{};
@@ -361,10 +359,10 @@ private:
                 ++nonce_;
             }
             if (ciphertext_.byte_size() < *length_ + SsAeadCipher::kTagSize) return {};
-            buf::MultiBuffer record;
+            common::MultiBuffer record;
             if (!ciphertext_.MovePrefixTo(record, *length_ + SsAeadCipher::kTagSize))
                 throw std::bad_alloc();
-            buf::MultiBuffer decoded;
+            common::MultiBuffer decoded;
             const auto nonce = MakeNonce(nonce_);
             if (!DecryptStreamPayload(cipher_, nonce, std::move(record), decoded))
                 throw transport::LinkError(common::ErrorCode::PROTOCOL_AUTH_FAILED);
@@ -380,11 +378,9 @@ private:
     uint64_t nonce_;
     transport::MultiBufferReader* stream_ = nullptr;
     size_t max_payload_;
-    buf::MultiBuffer ciphertext_;
+    common::MultiBuffer ciphertext_;
     std::optional<size_t> length_;
     std::exception_ptr failure_;
 };
 
-} // namespace detail
-
-}  // namespace proxy::shadowsocks
+}  // namespace proxy

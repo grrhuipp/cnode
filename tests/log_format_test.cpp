@@ -2,6 +2,7 @@
 
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"
+#include "common/session.hpp"
 
 #include <array>
 #include <cerrno>
@@ -112,12 +113,6 @@ bool Contains(const std::vector<std::string>& lines, std::string_view marker) {
     return false;
 }
 
-struct SessionLogContext {
-    struct { std::string_view tag; int64_t user_id = 0; } inbound;
-    struct { std::string_view tag; } outbound;
-    uint64_t conn_id = 0;
-};
-
 class LogFormat : public testing::Test {
 protected:
     const std::filesystem::path directory = std::filesystem::temp_directory_path() /
@@ -157,13 +152,20 @@ TEST_F(LogFormat, EscapesControlCharactersWithoutForgingRecords) {
 
 TEST_F(LogFormat, ConnectionIdentityPreservesWorkerBitsAndAuthenticationPhase) {
     ASSERT_TRUE(::infra::Log::Init(config));
+    common::Context authenticated_ctx;
+    authenticated_ctx.inbound.tag = "vless-in";
+    authenticated_ctx.inbound.user_id = 123;
+    authenticated_ctx.outbound.tag = "direct";
+    authenticated_ctx.conn_id = (1ull << 32) | 7;
     ::infra::Log::WriteConnection(infra::LogLevel::WARN,
-        SessionLogContext{.inbound = {.tag = "vless-in", .user_id = 123},
-                          .outbound = {.tag = "direct"}, .conn_id = (1ull << 32) | 7},
+        authenticated_ctx,
         "authenticated outbound failure");
+    common::Context unauthenticated_ctx;
+    unauthenticated_ctx.inbound.tag = "vless-in";
+    unauthenticated_ctx.inbound.user_id = 0;
+    unauthenticated_ctx.conn_id = (2ull << 32) | 7;
     ::infra::Log::WriteConnection(infra::LogLevel::WARN,
-        SessionLogContext{.inbound = {.tag = "vless-in", .user_id = 0},
-                          .outbound = {}, .conn_id = (2ull << 32) | 7},
+        unauthenticated_ctx,
         "authentication failed from 192.0.2.10:52000 > invalid credential");
     ::infra::Log::WriteConnection(infra::LogLevel::DEBUG, uint64_t{0}, "diagnostic without connection identity");
     ::infra::Log::Shutdown();

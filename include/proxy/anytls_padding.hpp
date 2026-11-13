@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-namespace proxy::anytls {
+namespace proxy {
 
 inline constexpr size_t kMaxFramePayload = 0xffff;
 
@@ -23,9 +23,9 @@ struct PaddingRecord {
 
 // Prepared protocol policy. Storage follows actual entries, never packet indices.
 // Published instances are shared as const; lookup neither allocates nor mutates.
-class PaddingScheme final {
+class AnyTlsPaddingScheme final {
 public:
-    PaddingScheme() = default; // An empty scheme disables padding.
+    AnyTlsPaddingScheme() = default; // An empty scheme disables padding.
 
     [[nodiscard]] std::string_view Raw() const noexcept { return raw_; }
     [[nodiscard]] std::string_view Digest() const noexcept { return md5_; }
@@ -48,10 +48,10 @@ private:
     AuthPadding auth_padding_;
     std::vector<PacketPadding> records_;
 
-    friend std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw);
+    friend std::optional<AnyTlsPaddingScheme> ParseAnyTlsPaddingScheme(std::string_view raw);
 };
 
-[[nodiscard]] std::optional<PaddingScheme> ParsePaddingScheme(std::string_view raw);
-[[nodiscard]] const std::shared_ptr<const PaddingScheme>& DefaultPaddingScheme();
+[[nodiscard]] std::optional<AnyTlsPaddingScheme> ParseAnyTlsPaddingScheme(std::string_view raw);
+[[nodiscard]] const std::shared_ptr<const AnyTlsPaddingScheme>& DefaultAnyTlsPaddingScheme();
 
-} // namespace proxy::anytls
+} // namespace proxy

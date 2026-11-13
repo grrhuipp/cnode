@@ -1,12 +1,11 @@
 #pragma once
 
 #include "app/worker_mailbox.hpp"
-#include "app/proxyman/inbound/user_store.hpp"
-#include "app/proxyman/outbound/handler.hpp"
+#include "app/proxyman/user_store.hpp"
+#include "app/proxyman/outbound_handler.hpp"
 #include "infra/config_types.hpp"
 #include "common/asio_types.hpp"
-#include "transport/internet/timeout_scheduler.hpp"
-
+#include "transport/timeout_scheduler.hpp"
 #include <cstdint>
 #include <atomic>
 #include <exception>
@@ -17,50 +16,37 @@
 #include <utility>
 #include <vector>
 
-namespace app {
-
-class GroupCoordinator;
-
-}  // namespace app
-
-namespace proxyman::inbound {
-struct BuildRequest;
-struct ReceiverSettings;
-}
-namespace proxyman::outbound {
-struct PreparedOutboundConfig;
-}
 namespace geo {
 class GeoDatabase;
-}
-namespace app::dns {
-class DNSWorker;
 }
 #include "app/stats.hpp"
 namespace common {
 
 struct OnlineDevice;
+struct DetectRule;
 
 }  // namespace common
 namespace app {
 
+class GroupCoordinator;
+struct BuildRequest;
+struct ReceiverSettings;
+struct PreparedOutboundConfig;
+class DNSWorker;
+class Router;
 struct PortBinding;
 struct StatsShard;
 struct WorkerRuntimeConfig {
     infra::TimeoutsConfig timeouts;
     infra::LimitsConfig limits;
     infra::RoutingConfig routing;
-    std::vector<proxyman::outbound::PreparedOutboundConfig> outbounds;
+    std::vector<PreparedOutboundConfig> outbounds;
+    std::shared_ptr<const app::Router> router;
     uint32_t workers = 0;
     uint32_t pressure_threshold = 1;
     uint32_t pressure_idle_timeout = 0;
 };
 struct WorkerRuntimeStatsSnapshot;
-
-}  // namespace app
-namespace rule {
-struct DetectRule;
-}
 
 // ============================================================================
 // Worker - 同构运行时边界（SO_REUSEPORT：每 Worker 独立 accept）
@@ -68,7 +54,6 @@ struct DetectRule;
 // 每个 Worker 持有同一套 live 能力，由 RuntimeState 统一构造和启动。
 // 热路径只在所属 io_context 上运行。跨线程控制面只能经有界 mailbox 投递。
 // ============================================================================
-namespace app {
 
 class Worker {
 public:
@@ -76,7 +61,7 @@ public:
     // （运行在主控事件循环上）；构造即完成本 Worker 的路由登记。
     Worker(uint32_t id, net::io_context& io_context,
            const WorkerRuntimeConfig& runtime_config, StatsShard& stats,
-           app::dns::DNSWorker& dns_worker,
+           app::DNSWorker& dns_worker,
            std::shared_ptr<GroupCoordinator> coordinator,
            geo::GeoDatabase* geo_database = nullptr);
     ~Worker();
@@ -131,25 +116,25 @@ public:
 
     // 注册 receiver settings + 协议处理器。
     [[nodiscard]] bool RegisterInbound(
-        proxyman::inbound::BuildRequest req,
-        proxyman::inbound::ReceiverSettings receiver);
+        BuildRequest req,
+        ReceiverSettings receiver);
 
     // 添加 UDP 监听（同端口 UDP socket，SO_REUSEPORT）。协议 handler 在
     // Worker 线程内构造，避免跨线程触碰 Worker-local validator / allocator。
     // 替换旧 socket 时等待旧原生分发任务实际结束，因此是协程。
     net::awaitable<bool> AddUdpListenerTask(
         PortBinding binding,
-        proxyman::inbound::BuildRequest req);
+        BuildRequest req);
 
     // 动态出站：XrayR Controller 面板节点 addOutbound/removeOutbound。
-    void AddOutbound(proxyman::outbound::PreparedOutboundConfig config);
+    void AddOutbound(PreparedOutboundConfig config);
     void RemoveOutbound(std::string_view tag);
 
     // 注销监听与 handler；等待 UDP 原生分发任务实际结束后才返回。
     net::awaitable<void> UnregisterListenerTask(std::string tag);
 
-    void UpdateRule(std::string_view tag, std::shared_ptr<const std::vector<rule::DetectRule>> rules);
-    void InstallUserView(proxyman::inbound::UserStore::WorkerView view);
+    void UpdateRule(std::string_view tag, std::shared_ptr<const std::vector<common::DetectRule>> rules);
+    void InstallUserView(UserStore::WorkerView view);
 
     // ── 数据收集（在所属 Worker 线程执行，无竞争）──
 

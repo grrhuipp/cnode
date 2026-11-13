@@ -5,7 +5,6 @@
 
 #include <array>
 #include <cstring>
-#include <memory_resource>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -13,17 +12,16 @@
 
 namespace {
 
-using ContiguousView = ::buf::ContiguousBufferView;
+using ContiguousView = ::common::ContiguousBufferView;
 template<class T>
 concept BorrowableContiguousBytes = requires(T&& view) {
     std::forward<T>(view).Bytes();
 };
-static_assert(std::is_constructible_v<ContiguousView, ::buf::MultiBuffer&>);
-static_assert(std::is_constructible_v<ContiguousView, const ::buf::MultiBuffer&>);
-static_assert(!std::is_constructible_v<ContiguousView, ::buf::MultiBuffer&&>);
-static_assert(!std::is_constructible_v<ContiguousView, const ::buf::MultiBuffer&&>);
-static_assert(std::is_constructible_v<ContiguousView, std::span<const ::net::const_buffer>,
-                                      std::pmr::memory_resource*>);
+static_assert(std::is_constructible_v<ContiguousView, ::common::MultiBuffer&>);
+static_assert(std::is_constructible_v<ContiguousView, const ::common::MultiBuffer&>);
+static_assert(!std::is_constructible_v<ContiguousView, ::common::MultiBuffer&&>);
+static_assert(!std::is_constructible_v<ContiguousView, const ::common::MultiBuffer&&>);
+static_assert(std::is_constructible_v<ContiguousView, std::span<const ::net::const_buffer>>);
 static_assert(BorrowableContiguousBytes<ContiguousView&>);
 static_assert(BorrowableContiguousBytes<const ContiguousView&>);
 static_assert(!BorrowableContiguousBytes<ContiguousView&&>);
@@ -31,12 +29,12 @@ static_assert(!BorrowableContiguousBytes<const ContiguousView&&>);
 
 template<class T>
 concept BorrowableUdpInfo = requires(T&& packet) {
-    ::buf::InspectUdpDatagram(std::forward<T>(packet));
+    ::common::InspectUdpDatagram(std::forward<T>(packet));
 };
-static_assert(BorrowableUdpInfo<::buf::MultiBuffer&>);
-static_assert(BorrowableUdpInfo<const ::buf::MultiBuffer&>);
-static_assert(!BorrowableUdpInfo<::buf::MultiBuffer&&>);
-static_assert(!BorrowableUdpInfo<const ::buf::MultiBuffer&&>);
+static_assert(BorrowableUdpInfo<::common::MultiBuffer&>);
+static_assert(BorrowableUdpInfo<const ::common::MultiBuffer&>);
+static_assert(!BorrowableUdpInfo<::common::MultiBuffer&&>);
+static_assert(!BorrowableUdpInfo<const ::common::MultiBuffer&&>);
 
 template<class T>
 concept BorrowablePrefix = requires(T&& payload) {
@@ -58,56 +56,26 @@ template<class T>
 concept ExtractableInitialPayload = requires(T&& payload) {
     std::forward<T>(payload).MoveToMultiBuffer();
 };
-static_assert(BorrowablePrefix<::buf::MultiBuffer&>);
-static_assert(BorrowablePrefix<const ::buf::MultiBuffer&>);
-static_assert(!BorrowablePrefix<::buf::MultiBuffer&&>);
-static_assert(!BorrowablePrefix<const ::buf::MultiBuffer&&>);
-static_assert(BorrowableFront<::buf::MultiBuffer&>);
-static_assert(BorrowableFront<const ::buf::MultiBuffer&>);
-static_assert(!BorrowableFront<::buf::MultiBuffer&&>);
-static_assert(!BorrowableFront<const ::buf::MultiBuffer&&>);
+static_assert(BorrowablePrefix<::common::MultiBuffer&>);
+static_assert(BorrowablePrefix<const ::common::MultiBuffer&>);
+static_assert(!BorrowablePrefix<::common::MultiBuffer&&>);
+static_assert(!BorrowablePrefix<const ::common::MultiBuffer&&>);
+static_assert(BorrowableFront<::common::MultiBuffer&>);
+static_assert(BorrowableFront<const ::common::MultiBuffer&>);
+static_assert(!BorrowableFront<::common::MultiBuffer&&>);
+static_assert(!BorrowableFront<const ::common::MultiBuffer&&>);
 static_assert(BorrowableDescriptors<::common::ConstBufferSpanBuilder<2>&>);
 static_assert(BorrowableDescriptors<const ::common::ConstBufferSpanBuilder<2>&>);
 static_assert(!BorrowableDescriptors<::common::ConstBufferSpanBuilder<2>&&>);
 static_assert(!BorrowableDescriptors<const ::common::ConstBufferSpanBuilder<2>&&>);
-static_assert(AppendablePacket<::buf::MultiBuffer&>);
-static_assert(AppendablePacket<const ::buf::MultiBuffer&>);
-static_assert(!AppendablePacket<::buf::MultiBuffer&&>);
-static_assert(!AppendablePacket<const ::buf::MultiBuffer&&>);
+static_assert(AppendablePacket<::common::MultiBuffer&>);
+static_assert(AppendablePacket<const ::common::MultiBuffer&>);
+static_assert(!AppendablePacket<::common::MultiBuffer&&>);
+static_assert(!AppendablePacket<const ::common::MultiBuffer&&>);
 static_assert(ExtractableInitialPayload<::common::InitialPayload&&>);
 static_assert(!ExtractableInitialPayload<::common::InitialPayload&>);
 static_assert(!ExtractableInitialPayload<const ::common::InitialPayload&>);
 static_assert(!ExtractableInitialPayload<const ::common::InitialPayload&&>);
-
-// Retain poisoned retired blocks so stale descriptor reads fail deterministically.
-class RetiringResource final : public std::pmr::memory_resource {
-public:
-    size_t live = 0;
-    void RejectNextAllocation() noexcept { reject_next_ = true; }
-    ~RetiringResource() override {
-        for (const auto& block : retired_)
-            std::pmr::new_delete_resource()->deallocate(block.pointer, block.bytes, block.alignment);
-    }
-
-private:
-    struct Block { void* pointer; size_t bytes; size_t alignment; };
-    bool reject_next_ = false;
-    void* do_allocate(size_t bytes, size_t alignment) override {
-        if (std::exchange(reject_next_, false)) throw std::bad_alloc();
-        void* block = std::pmr::new_delete_resource()->allocate(bytes, alignment);
-        ++live;
-        return block;
-    }
-    void do_deallocate(void* pointer, size_t bytes, size_t alignment) override {
-        std::memset(pointer, 0, bytes);
-        --live;
-        retired_.push_back({pointer, bytes, alignment});
-    }
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
-    }
-    std::vector<Block> retired_;
-};
 
 std::string Flatten(std::span<const ::net::const_buffer> buffers) {
     std::string result;
@@ -117,9 +85,8 @@ std::string Flatten(std::span<const ::net::const_buffer> buffers) {
 }
 
 TEST(BufferSpanBuilder, SelfAppendSurvivesInlineAndSpilledGrowth) {
-    RetiringResource resource;
     const std::string text = "abc";
-    ::common::ConstBufferSpanBuilder<2> builder(&resource);
+    ::common::ConstBufferSpanBuilder<2> builder;
     builder.Append(::net::buffer(text.data(), 1));
     builder.Append(::net::buffer(text.data() + 1, 1));
     builder.AppendBuffers(builder.Span());
@@ -145,22 +112,22 @@ TEST(BufferSpanBuilder, AppendingExternalBuffersPreservesOrderAndSkipsEmptyViews
     builder.AppendBuffers(buffers);
     builder.AppendBuffers(buffers);
     EXPECT_EQ(Flatten(builder.Span()), "abcabc");
-    for (const auto& buffer : builder.Span()) EXPECT_EQ(buffer.size(), 1);
+    for (const auto& buffer : builder.Span()) EXPECT_EQ(buffer.size(), 1u);
 }
 
 TEST(BufferSpanBuilder, FailedSpillPreservesBorrowedDescriptorsAndCanRetry) {
-    RetiringResource resource;
     const std::string text = "abc";
     for (const bool already_spilled : {false, true}) {
         SCOPED_TRACE(already_spilled);
-        ::common::ConstBufferSpanBuilder<2> builder(&resource);
+        ::common::ConstBufferSpanBuilder<2> builder;
         builder.Append(::net::buffer(text.data(), 1));
         builder.Append(::net::buffer(text.data() + 1, 1));
         if (already_spilled) builder.AppendBuffers(builder.Span());
         const auto borrowed = builder.Span();
         const auto expected = Flatten(borrowed);
-        resource.RejectNextAllocation();
+        ::common::reject_next_process_allocation = true;
         EXPECT_THROW(builder.AppendBuffers(borrowed), std::bad_alloc);
+        ::common::reject_next_process_allocation = false;
         EXPECT_EQ(builder.Span().data(), borrowed.data());
         EXPECT_EQ(Flatten(builder.Span()), expected);
         builder.AppendBuffers(borrowed);
@@ -172,85 +139,44 @@ TEST(BufferSpanBuilder, FailedSpillPreservesBorrowedDescriptorsAndCanRetry) {
 }
 
 TEST(BufferSpanBuilder, SelfAppendWithinCapacityKeepsBorrowedStorage) {
-    RetiringResource resource;
     const std::string text = "abc";
-    ::common::ConstBufferSpanBuilder<4> builder(&resource);
+    ::common::ConstBufferSpanBuilder<4> builder;
     builder.Append(::net::buffer(text.data(), 1));
     builder.Append(::net::buffer(text.data() + 1, 1));
     auto* storage = builder.Span().data();
-    resource.RejectNextAllocation();
+    ::common::reject_next_process_allocation = true;
     builder.AppendBuffers(builder.Span());
     EXPECT_EQ(builder.Span().data(), storage);
     EXPECT_EQ(Flatten(builder.Span()), "abab");
     EXPECT_THROW(builder.Append(::net::buffer(text.data() + 2, 1)), std::bad_alloc);
+    ::common::reject_next_process_allocation = false;
     EXPECT_EQ(Flatten(builder.Span()), "abab");
     builder.Append(::net::buffer(text.data() + 2, 1));
     storage = builder.Span().data();
-    resource.RejectNextAllocation();
+    ::common::reject_next_process_allocation = true;
     builder.AppendBuffers(builder.Span().subspan(3, 2));
     builder.AppendBuffers(builder.Span().last(1));
     EXPECT_EQ(builder.Span().data(), storage);
     EXPECT_EQ(Flatten(builder.Span()), "ababcbcc");
     EXPECT_THROW(builder.AppendBuffers(builder.Span().last(1)), std::bad_alloc);
+    ::common::reject_next_process_allocation = false;
     EXPECT_EQ(builder.Span().data(), storage);
     EXPECT_EQ(Flatten(builder.Span()), "ababcbcc");
     builder.AppendBuffers(builder.Span().last(1));
     EXPECT_EQ(Flatten(builder.Span()), "ababcbccc");
 }
 
-TEST(BufferSpanBuilder, SparseExternalAppendUsesOnlyNonemptyCapacity) {
-    RetiringResource resource;
-    const std::string text = "abcd";
-    const std::array prefix{
-        ::net::buffer(text.data(), 1), ::net::buffer(text.data() + 1, 1),
-        ::net::buffer(text.data() + 2, 1)};
-    const std::array<::net::const_buffer, 3> suffix{
-        ::net::const_buffer{}, ::net::buffer(text.data() + 3, 1), {}};
-    ::common::ConstBufferSpanBuilder<4> builder(&resource);
-    builder.AppendBuffers(prefix);
-    builder.AppendBuffers(suffix);
-    EXPECT_EQ(Flatten(builder.Span()), "abcd");
-    builder.AppendBuffers(suffix);
-    EXPECT_EQ(Flatten(builder.Span()), "abcdd");
-    builder.Clear();
-    EXPECT_EQ(resource.live, 0u);
-}
+TEST(BufferSpanBuilder, MultiBufferPreservesSliceAcrossInlineAndSpilledAppends) {
+    ::common::MultiBuffer payload;
+    ::common::BufferGuard block{::common::Buffer::New()};
+    ASSERT_TRUE(block);
+    std::memcpy(block->Tail().data(), "abc", 3);
+    block->Produce(3);
+    block->Advance(1);
+    const void* slice = block->Bytes().data();
+    payload.push_back(std::move(block));
 
-TEST(BufferSpanBuilder, SpillUsesConstructionResourceAndClearReleasesItsStorage) {
-    RetiringResource resource;
-    ::common::ConstBufferSpanBuilder<2> builder(&resource);
-    const std::string text = "abc";
-    builder.Append(::net::buffer(text.data(), 1));
-    builder.Append(::net::buffer(text.data() + 1, 1));
-    for (int cycle = 0; cycle < 2; ++cycle) {
-        if (cycle != 0) {
-            builder.Append(::net::buffer(text.data(), 1));
-            builder.Append(::net::buffer(text.data() + 1, 1));
-        }
-        builder.Append(::net::buffer(text.data() + 2, 1));
-        EXPECT_EQ(Flatten(builder.Span()), text);
-        EXPECT_GT(resource.live, 0u);
-        builder.Clear();
-        EXPECT_EQ(resource.live, 0u);
-    }
-}
-
-TEST(BufferSpanBuilder, SparseMultiBufferPreservesSlicesAcrossInlineAndSpilledAppends) {
-    RetiringResource resource;
-    ::buf::MultiBuffer payload;
-    const void* slice = nullptr;
-    for (int index = 0; index < 3; ++index) {
-        ::buf::BufferGuard block{::buf::Buffer::New()};
-        ASSERT_TRUE(block);
-        if (index == 1) {
-            std::memcpy(block->Tail().data(), "abc", 3);
-            block->Produce(3);
-            block->Advance(1);
-            slice = block->Bytes().data();
-        }
-        payload.push_back(std::move(block));
-    }
-    ::common::ConstBufferSpanBuilder<4> builder(&resource);
+    ::common::ConstBufferSpanBuilder<4> builder;
     const std::string prefix = "P";
     builder.Append(::net::buffer(prefix));
     std::string expected = prefix;
@@ -265,99 +191,50 @@ TEST(BufferSpanBuilder, SparseMultiBufferPreservesSlicesAcrossInlineAndSpilledAp
         }
     }
     builder.Clear();
-    EXPECT_EQ(resource.live, 0u);
     payload.clear();
 }
 
-TEST(BufferSpanBuilder, FailedMultiBufferAppendPreservesPrefixAndCanRetry) {
-    ::buf::MultiBuffer payload;
-    for (const char value : {'x', 'y'}) {
-        ::buf::BufferGuard block{::buf::Buffer::New()};
-        ASSERT_TRUE(block);
-        block->Tail()[0] = static_cast<uint8_t>(value);
-        block->Produce(1);
-        payload.push_back(std::move(block));
+TEST(BufferSpanBuilder, ContiguousMultiBufferAlwaysBorrowsZeroCopy) {
+    const auto live_before = ::common::test_buffers_live;
+    std::array<uint8_t, 6> expected{0, 0x42, 0, 0x7f, 0x80, 0xff};
+    ::common::MultiBuffer source;
+    ASSERT_TRUE(::common::AppendSpanToMultiBuffer(expected, source));
+    {
+        const ContiguousView view(std::as_const(source));
+        EXPECT_EQ(view.Bytes().data(), source.FrontSpan().data());
+        (*source.begin())->Bytes()[1] = expected[1] = 0x99;
+        ASSERT_EQ(view.Bytes().size(), expected.size());
+        EXPECT_TRUE(std::equal(view.Bytes().begin(), view.Bytes().end(), expected.begin()));
     }
-    RetiringResource resource;
-    const std::string text = "abc";
-    for (const bool already_spilled : {false, true}) {
-        SCOPED_TRACE(already_spilled);
-        ::common::ConstBufferSpanBuilder<2> builder(&resource);
-        builder.Append(::net::buffer(text.data(), 1));
-        builder.Append(::net::buffer(text.data() + 1, 1));
-        if (already_spilled) builder.Append(::net::buffer(text.data() + 2, 1));
-        const auto borrowed = builder.Span();
-        const auto expected = Flatten(borrowed);
-        resource.RejectNextAllocation();
-        EXPECT_THROW(builder.AppendMultiBuffer(payload), std::bad_alloc);
-        EXPECT_EQ(builder.Span().data(), borrowed.data());
-        EXPECT_EQ(Flatten(builder.Span()), expected);
-        builder.AppendMultiBuffer(payload);
-        EXPECT_EQ(Flatten(builder.Span()), expected + "xy");
-        EXPECT_EQ(payload.byte_size(), 2u);
-    }
+    source.clear();
+    EXPECT_EQ(::common::test_buffers_live, live_before);
 }
-
-class ContiguousMultiBuffer : public ::testing::TestWithParam<bool> {};
-
-TEST_P(ContiguousMultiBuffer, BorrowOrOwnBinaryPayloadAccordingToFragmentation) {
-    const auto live_before = ::memory::detail::test_buffers_live;
-    const bool fragmented = GetParam();
-        std::array<uint8_t, 6> expected{0, 0x42, 0, 0x7f, 0x80, 0xff};
-        ::buf::MultiBuffer source;
-        const size_t chunk_size = fragmented ? 3 : expected.size();
-        for (size_t offset = 0; offset < expected.size(); offset += chunk_size) {
-            ::buf::BufferGuard block{::buf::Buffer::New()};
-            ASSERT_TRUE(block);
-            std::memcpy(block->Tail().data(), expected.data() + offset, chunk_size);
-            block->Produce(static_cast<uint32_t>(chunk_size));
-            source.push_back(std::move(block));
-        }
-        {
-            const ContiguousView view(std::as_const(source));
-            if (fragmented) {
-                source.clear();
-                EXPECT_EQ(::memory::detail::test_buffers_live, live_before);
-            } else {
-                EXPECT_EQ(view.Bytes().data(), source.FrontSpan().data());
-                (*source.begin())->Bytes()[1] = expected[1] = 0x99;
-            }
-            ASSERT_EQ(view.Bytes().size(), expected.size());
-            EXPECT_TRUE(std::equal(view.Bytes().begin(), view.Bytes().end(), expected.begin()));
-        }
-        source.clear();
-        EXPECT_EQ(::memory::detail::test_buffers_live, live_before);
-}
-
-INSTANTIATE_TEST_SUITE_P(ContiguousAndFragmented, ContiguousMultiBuffer, ::testing::Bool());
 
 class ContiguousDescriptors : public ::testing::TestWithParam<bool> {};
 
 TEST_P(ContiguousDescriptors, TemporaryDescriptorsDoNotExtendPayloadLifetime) {
-    RetiringResource resource;
     const bool fragmented = GetParam();
-        std::array<uint8_t, 3> first{1, 0, 2}, second{3, 0xff, 4};
-        std::vector<uint8_t> expected(first.begin(), first.end());
-        if (fragmented) expected.insert(expected.end(), second.begin(), second.end());
-        {
-            std::array<::net::const_buffer, 3> descriptors{
-                ::net::buffer(first), {},
-                fragmented ? ::net::buffer(second) : ::net::const_buffer{}};
-            const ContiguousView view{std::span<const ::net::const_buffer>(descriptors), &resource};
-            descriptors.fill({});
-            if (fragmented) {
-                first.fill(0xaa);
-                second.fill(0xbb);
-            } else {
-                EXPECT_EQ(view.Bytes().data(), first.data());
-                first[1] = expected[1] = 0x80;
-            }
-            ASSERT_EQ(view.Bytes().size(), expected.size());
-            EXPECT_TRUE(std::equal(view.Bytes().begin(), view.Bytes().end(), expected.begin()));
+    std::array<uint8_t, 3> first{1, 0, 2}, second{3, 0xff, 4};
+    std::vector<uint8_t> expected(first.begin(), first.end());
+    if (fragmented) expected.insert(expected.end(), second.begin(), second.end());
+    {
+        std::array<::net::const_buffer, 3> descriptors{
+            ::net::buffer(first), {},
+            fragmented ? ::net::buffer(second) : ::net::const_buffer{}};
+        const ContiguousView view{std::span<const ::net::const_buffer>(descriptors)};
+        descriptors.fill({});
+        if (fragmented) {
+            first.fill(0xaa);
+            second.fill(0xbb);
+        } else {
+            EXPECT_EQ(view.Bytes().data(), first.data());
+            first[1] = expected[1] = 0x80;
         }
-        EXPECT_EQ(resource.live, 0u);
+        ASSERT_EQ(view.Bytes().size(), expected.size());
+        EXPECT_TRUE(std::equal(view.Bytes().begin(), view.Bytes().end(), expected.begin()));
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(ContiguousAndFragmented, ContiguousDescriptors, ::testing::Bool());
 
-} // namespace
+}  // namespace

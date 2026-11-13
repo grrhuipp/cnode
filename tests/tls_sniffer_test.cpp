@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include "sniff/sniffer.hpp"
-
 #include <string_view>
 #include <vector>
 

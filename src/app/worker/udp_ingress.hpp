@@ -1,9 +1,9 @@
 #pragma once
 
-#include "app/proxyman/inbound/handler.hpp"
+#include "app/proxyman/inbound_handler.hpp"
 #include "app/datagram_session_environment.hpp"
 #include "common/allocator.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/const_buffer_span.hpp"
 #include "common/hash_container_shrink.hpp"
 #include "common/error.hpp"
@@ -12,10 +12,10 @@
 #include "common/session.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "common/string_hash.hpp"
-#include "features/routing/dispatcher.hpp"
+#include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
-#include "transport/internet/timeout_scheduler.hpp"
+#include "transport/timeout_scheduler.hpp"
 #include "transport/link.hpp"
 
 #include <chrono>
@@ -52,11 +52,9 @@ namespace routing {
 class Dispatcher;
 }
 
-namespace proxyman::inbound {
-struct ReceiverSettings;
-}
+namespace app {
 
-namespace app::worker_detail {
+struct ReceiverSettings;
 
 class UdpIngress;
 struct UdpSocketState;
@@ -66,10 +64,10 @@ struct ClientSessionKey final {
     ClientSessionKey(proxy::InboundDatagramOwner authenticated_owner,
                      std::optional<uint64_t> protocol_session_id,
                      udp::endpoint client_endpoint = {},
-                     const proxyman::inbound::ProtocolSettings* configuration_identity = nullptr) noexcept
+                     const ProtocolSettings* configuration_identity = nullptr) noexcept
         : owner(authenticated_owner), session_id(protocol_session_id),
           endpoint(protocol_session_id ? udp::endpoint{} :
-              udp::endpoint(iputil::NormalizeAddress(client_endpoint.address()), client_endpoint.port())),
+              udp::endpoint(common::NormalizeAddress(client_endpoint.address()), client_endpoint.port())),
           configuration(configuration_identity) {}
 
     [[nodiscard]] bool operator==(const ClientSessionKey& other) const noexcept {
@@ -80,7 +78,7 @@ struct ClientSessionKey final {
     proxy::InboundDatagramOwner owner;
     std::optional<uint64_t> session_id;
     udp::endpoint endpoint;
-    const proxyman::inbound::ProtocolSettings* configuration = nullptr;
+    const ProtocolSettings* configuration = nullptr;
 };
 
 struct ClientSessionKeyHash final {
@@ -201,13 +199,14 @@ public:
         if (!Acquire(associations_, 1, limits_.associations)) return {};
         return AssociationLease{*this};
     }
-    [[nodiscard]] PayloadReservation ReservePayload(const buf::MultiBuffer& payload) noexcept {
+    [[nodiscard]] PayloadReservation ReservePayload(const common::MultiBuffer& payload) noexcept {
         size_t capacity = 0;
         for (const auto* buffer : payload) {
             if (!buffer) continue;
-            if (capacity > std::numeric_limits<size_t>::max() - buf::Buffer::kSize)
+            const size_t block_capacity = std::max<size_t>(buffer->capacity, common::Buffer::kSize);
+            if (capacity > std::numeric_limits<size_t>::max() - block_capacity)
                 return {};
-            capacity += buf::Buffer::kSize;
+            capacity += block_capacity;
         }
         if (!Acquire(datagrams_, 1, limits_.datagrams)) return {};
         if (!Acquire(payload_capacity_, capacity, limits_.payload_capacity)) {
@@ -254,12 +253,12 @@ struct UdpAssociationHook final {
 // Worker-local min-heap over association rows embedded in UdpIngress maps.
 // One maintenance event sleeps until the nearest row deadline and reclaims at
 // most a bounded batch per wake; no timer runs while no row can expire.
-class UdpAssociationReclaimer final : private transport::internet::TimeoutEvent {
+class UdpAssociationReclaimer final : private transport::TimeoutEvent {
 public:
     using FailureCallback = void (*)(void*, std::exception_ptr);
     using TimePoint = UdpAssociationHook::TimePoint;
 
-    UdpAssociationReclaimer(transport::internet::TimeoutScheduler& scheduler,
+    UdpAssociationReclaimer(transport::TimeoutScheduler& scheduler,
                             void* failure_context,
                             FailureCallback on_failure) noexcept;
     ~UdpAssociationReclaimer() noexcept;
@@ -285,10 +284,10 @@ private:
     void SiftDown(std::size_t index) noexcept;
     void Repair(std::size_t index) noexcept;
 
-    transport::internet::TimeoutScheduler& scheduler_;
+    transport::TimeoutScheduler& scheduler_;
     void* failure_context_ = nullptr;
     FailureCallback on_failure_ = nullptr;
-    std::pmr::vector<UdpAssociationHook*> heap_{memory::process_resource()};
+    std::vector<UdpAssociationHook*> heap_;
     TimePoint armed_deadline_{};
     bool stopped_ = false;
     bool failed_ = false;
@@ -302,7 +301,7 @@ struct UdpDatagramContext {
     UdpSocketState* socket = nullptr;
     udp::endpoint client_endpoint;
     std::span<const uint8_t> payload;
-    const proxyman::inbound::ReceiverSettings* receiver = nullptr;
+    const ReceiverSettings* receiver = nullptr;
     net::io_context& io_context;
     uint32_t worker_id = 0;
     // Session environment of the listener that received the datagram.
@@ -330,11 +329,11 @@ class UdpHandoffDirectory final {
 public:
     [[nodiscard]] std::shared_ptr<UdpHandoffRecord> Claim(
         const UdpHandoffIdentity& key,
-        std::shared_ptr<const proxyman::inbound::ProtocolSettings> configuration,
+        std::shared_ptr<const ProtocolSettings> configuration,
         const proxy::InboundDatagramAssociationPolicy& policy);
 private:
-    std::pmr::unordered_map<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
-                            UdpHandoffIdentityHash> records_{memory::process_resource()};
+    std::unordered_map<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
+                       UdpHandoffIdentityHash> records_;
     UdpHandoffRecord* cursor_ = nullptr;
 };
 
@@ -352,9 +351,9 @@ public:
     struct PendingUdpReply {
         uint64_t id = 0;
         udp::endpoint endpoint;
-        buf::MultiBuffer payload;
+        common::MultiBuffer payload;
         UdpResourceBudget::PayloadReservation reservation;
-        common::ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> send_buffers;
+        common::ConstBufferSpanBuilder<common::MultiBuffer::kInlineCapacity> send_buffers;
 
         [[nodiscard]] std::span<const net::const_buffer> SendBuffers() const noexcept;
     };
@@ -411,7 +410,7 @@ public:
     [[nodiscard]] ReplyEnqueueResult EnqueueReply(
         const SocketStatePtr& socket,
         udp::endpoint endpoint,
-        buf::MultiBuffer payload);
+        common::MultiBuffer payload);
     // Hands the oldest queued datagram to the sender admitted by StartSend.
     [[nodiscard]] std::optional<PendingUdpReply> BeginReplySend(SocketState& socket);
     // Completes the active send and hands the next queued datagram to the same
@@ -421,7 +420,7 @@ public:
         uint64_t completed_id);
     void ClearReplyQueue(SocketState& socket) noexcept;
     [[nodiscard]] bool SendReply(const SocketStatePtr& socket, udp::endpoint endpoint,
-                                 buf::MultiBuffer payload, uint32_t worker_id);
+                                 common::MultiBuffer payload, uint32_t worker_id);
 
     [[nodiscard]] ClientSessionPtr CreateClientSession(
         const SocketStatePtr& socket,
@@ -472,11 +471,13 @@ private:
                              proxy::InboundDatagramAssociation* association) noexcept;
     void Unlink(UdpClientSession& row) noexcept;
 
-    std::pmr::string tag_;
+    template <typename Pred>
+    void CloseMatchingJobs(Pred&& match) noexcept;
+    std::string tag_;
     std::unique_ptr<::proxy::Inbound> proxy_;
     UdpAssociationReclaimer& reclaimer_;
     UdpResourceBudget& budget_;
-    std::pmr::unordered_map<const SocketState*, SocketStatePtr> sockets_{memory::process_resource()};
+    std::unordered_map<const SocketState*, SocketStatePtr> sockets_;
     net::io_context& io_context_;
     common::SignalChannel completion_signal_;
     UdpHandoffDirectory handoff_directory_;
@@ -496,17 +497,17 @@ struct UdpIngress::UdpClientSession {
 struct UdpSocketState final {
     struct QueuedReply {
         udp::endpoint endpoint;
-        buf::MultiBuffer payload;
+        common::MultiBuffer payload;
         size_t payload_size = 0;
         UdpResourceBudget::PayloadReservation reservation;
     };
     UdpIngress* owner = nullptr;
     UdpIngress::SocketPtr socket;
     std::optional<tcp::endpoint> local_endpoint;
-    proxy::InboundDatagramAssociationIndex associations{memory::process_resource()};
-    std::pmr::unordered_map<ClientSessionKey, UdpIngress::UdpClientSession,
-                            ClientSessionKeyHash> sessions{memory::process_resource()};
-    memory::RingDeque<QueuedReply> pending;
+    proxy::InboundDatagramAssociationIndex associations;
+    std::unordered_map<ClientSessionKey, UdpIngress::UdpClientSession,
+                       ClientSessionKeyHash> sessions;
+    common::RingDeque<QueuedReply> pending;
     size_t queued_bytes = 0;
     uint64_t active_id = 0;
     size_t active_payload_size = 0;
@@ -538,11 +539,11 @@ public:
     void UpdateReplyEndpoint(udp::endpoint endpoint) noexcept;
     [[nodiscard]] bool Push(
         const common::TargetAddress& target,
-        buf::MultiBuffer payload);
+        common::MultiBuffer payload);
     void Close() noexcept;
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override;
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
         return WriteBuffersAsMultiBuffer(buffers);
@@ -554,11 +555,11 @@ private:
     struct RequestData {
         explicit RequestData(routing::DispatchPolicy dispatch_policy)
             : policy(std::move(dispatch_policy)) {}
-        session::Context context;
+        common::Context context;
         routing::DispatchPolicy policy;
         routing::Dispatcher* dispatcher = nullptr;
         net::io_context* io_context = nullptr;
-        const proxyman::inbound::AdmissionEnvironment* admission = nullptr;
+        const AdmissionEnvironment* admission = nullptr;
         app::RequestLoadState* request_load = nullptr;
         infra::TimeoutsConfig timeouts;
         // Owned copy of the authenticating credential's profile.
@@ -566,7 +567,7 @@ private:
     };
 
     struct QueuedInput {
-        buf::MultiBuffer payload;
+        common::MultiBuffer payload;
         size_t bytes = 0;
         UdpResourceBudget::PayloadReservation reservation;
     };
@@ -581,7 +582,7 @@ private:
     common::SignalChannel reader_signal_;
     ReplyRoute reply_;
     udp::endpoint reply_endpoint_;
-    memory::RingDeque<QueuedInput> input_queue_;
+    common::RingDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
     bool closed_ = false;
     common::ErrorCode terminal_error_ = common::ErrorCode::OK;
@@ -604,7 +605,7 @@ private:
 struct UdpHandoffRecord {
     std::unique_ptr<proxy::InboundDatagramAssociation> association;
     std::weak_ptr<UdpIngress::ClientSession> session;
-    std::shared_ptr<const proxyman::inbound::ProtocolSettings> configuration;
+    std::shared_ptr<const ProtocolSettings> configuration;
     UdpSocketStatePtr socket_pin;
     // 借用节点内的键；unordered_map rehash 不移动节点，摘除时先解除借用。
     const UdpHandoffIdentity* identity = nullptr;
@@ -613,4 +614,4 @@ struct UdpHandoffRecord {
     explicit UdpHandoffRecord(const proxy::InboundDatagramAssociationPolicy& policy)
         : association(policy.create()) {}
 };
-}  // namespace app::worker_detail
+}  // namespace app

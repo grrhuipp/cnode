@@ -19,7 +19,7 @@
 
 #include <arpa/inet.h>
 #include <net/if.h>
-namespace iputil {
+namespace common {
 
 // Parse one complete IP literal, never an endpoint or a hostname. Numeric
 // IPv6 scope IDs are data; resolving interface names is outside this boundary.
@@ -244,4 +244,4 @@ inline std::string FormatEndpointForLog(
     return out;
 }
 
-}  // namespace iputil
+}  // namespace common

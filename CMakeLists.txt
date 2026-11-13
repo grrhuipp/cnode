@@ -80,119 +80,89 @@ set(CNODE_CORE_SOURCES
     src/infra/config.cpp
     src/infra/outbound_config.cpp
 
-    # App - DNS
-    src/app/dns/dns.cpp
-
-    # Geo
-    src/geo/geodata.cpp
-
-    # Transport - common stream interface
+    # Transport
     src/transport/async_stream.cpp
-    src/transport/internet/stream_settings.cpp
+    src/transport/stream_settings.cpp
+    src/transport/datagram_socket.cpp
+    src/transport/tcp_stream.cpp
+    src/transport/timeout_scheduler.cpp
+    src/transport/tls_context.cpp
+    src/transport/tls_stream.cpp
+    src/transport/reality_tls.cpp
+    src/transport/ws_stream.cpp
+    src/transport/http1_handshake.cpp
+    src/transport/xhttp_session.cpp
+    src/transport/hpack.cpp
+    src/transport/h2_frame.cpp
+    src/transport/http2_client.cpp
+    src/transport/http2_server.cpp
+    src/transport/transport_stack.cpp
+    src/transport/transport_dialer.cpp
+    src/transport/outbound_bind.cpp
+    src/transport/xhttp_client.cpp
+    src/transport/hysteria/hysteria_ingress.cpp
+    src/transport/hysteria/hysteria_wire.cpp
+    src/transport/proxy_protocol.cpp
 
-    # Transport - Internet
-    src/transport/internet/datagram_socket.cpp
-    src/transport/internet/tcp_stream.cpp
-    src/transport/internet/timeout_scheduler.cpp
-    src/transport/internet/tls_context.cpp
-    src/transport/internet/tls_stream.cpp
-    src/transport/internet/reality_tls.cpp
-    src/transport/internet/ws_stream.cpp
-    src/transport/internet/http1_handshake.cpp
-    src/transport/internet/xhttp_session.cpp
-    src/transport/internet/http2_session.cpp
-    src/transport/internet/hpack.cpp
-    src/transport/internet/h2_frame.cpp
-    src/transport/internet/http2_client.cpp
-    src/transport/internet/http2_server.cpp
-    src/transport/internet/xhttp_http2.cpp
-    src/transport/internet/transport_stack.cpp
-    src/transport/internet/transport_dialer.cpp
-    src/transport/internet/outbound_bind.cpp
-    src/transport/internet/xhttp_client.cpp
-    src/transport/internet/hysteria/hysteria_ingress.cpp
-    src/transport/internet/hysteria/hysteria_wire.cpp
-    src/transport/internet/proxy_protocol.cpp
+    # Common
+    src/common/rule.cpp
+    src/common/session.cpp
+    src/common/sharded_user_stats.cpp
+    src/common/mux_codec.cpp
 
-    # App (Application layer)
+    # Geo & Sniff
+    src/geo/geodata.cpp
+    src/sniff/sniffer.cpp
+
+    # App, DNS, Router, Controller, API
+    src/app/dns/dns.cpp
     src/app/dispatcher/default_dispatcher.cpp
     src/app/session_tracking.cpp
     src/app/rate_limiter.cpp
     src/app/relay.cpp
-    src/app/proxyman/inbound/handler.cpp
+    src/app/proxyman/inbound_handler.cpp
     src/app/worker/udp_ingress.cpp
-    src/app/proxyman/inbound/user_store.cpp
-    src/app/proxyman/outbound/handler.cpp
+    src/app/proxyman/user_store.cpp
+    src/app/proxyman/outbound_handler.cpp
     src/app/worker.cpp
     src/app/session_group_executor.cpp
-    src/service/controller/controller.cpp
-    src/service/controller/traffic_journal.cpp
     src/app/prepared_inbound.cpp
-    src/common/rule.cpp
-    src/common/session.cpp
-    src/common/sharded_user_stats.cpp
     src/app/bootstrap.cpp
+    src/app/router/router.cpp
+    src/controller/controller.cpp
+    src/controller/traffic_journal.cpp
+    src/api/v2board.cpp
 
-    # Sniff
-    src/sniff/sniffer.cpp
-
-    # Common - Mux
-    src/common/mux/mux_codec.cpp
-
-    # Proxy - Mux
+    # Proxy
     src/proxy/mux/mux_server.cpp
-
-    # Proxy - VMess
     src/proxy/vmess/vmess_crypto.cpp
-    src/proxy/vmess/encoding/body.cpp
-    src/proxy/vmess/inbound/vmess_inbound.cpp
-    src/proxy/vmess/outbound/vmess_outbound.cpp
-
-    # Proxy - VLESS
+    src/proxy/vmess/body.cpp
+    src/proxy/vmess/vmess_inbound.cpp
+    src/proxy/vmess/vmess_outbound.cpp
     src/proxy/vless/vless_codec.cpp
     src/proxy/vless/vless_encryption_config.cpp
     src/proxy/vless/vless_encryption_primitives.cpp
     src/proxy/vless/vless_encryption_handshake.cpp
     src/proxy/vless/vless_encryption_ticket.cpp
     src/proxy/vless/vless_encryption_record.cpp
-    src/proxy/vless/inbound/vless_inbound.cpp
-    src/proxy/vless/outbound/vless_outbound.cpp
-
-    # Proxy - Trojan
+    src/proxy/vless/vless_inbound.cpp
+    src/proxy/vless/vless_outbound.cpp
     src/proxy/trojan/trojan_codec.cpp
-    src/proxy/trojan/inbound/trojan_inbound.cpp
-    src/proxy/trojan/outbound/trojan_outbound.cpp
-
-    # Proxy - UDP over TCP
+    src/proxy/trojan/trojan_inbound.cpp
+    src/proxy/trojan/trojan_outbound.cpp
     src/proxy/uot/uot.cpp
-
-    # Proxy - Hysteria
     src/proxy/hysteria/hysteria_inbound.cpp
-
-    # Proxy - Shadowsocks
     src/proxy/shadowsocks/shadowsocks_protocol.cpp
     src/proxy/shadowsocks/ss_udp.cpp
     src/proxy/shadowsocks/ss_stream.cpp
     src/proxy/shadowsocks/ss_salt_pool.cpp
-    src/proxy/shadowsocks/inbound/ss_inbound.cpp
-    src/proxy/shadowsocks/outbound/ss_outbound.cpp
-
-    # Proxy - AnyTLS
+    src/proxy/shadowsocks/ss_inbound.cpp
+    src/proxy/shadowsocks/ss_outbound.cpp
     src/proxy/anytls/anytls_codec.cpp
-    src/proxy/anytls/inbound/anytls_inbound.cpp
-    src/proxy/anytls/outbound/anytls_outbound.cpp
-
-    # Proxy - Freedom
+    src/proxy/anytls/anytls_inbound.cpp
+    src/proxy/anytls/anytls_outbound.cpp
     src/proxy/freedom/freedom_outbound.cpp
-
-    # Proxy - Blackhole
     src/proxy/blackhole/blackhole_outbound.cpp
-
-    # App - Router
-    src/app/router/router.cpp
-
-    # API / panel clients
-    src/api/v2board/v2board.cpp
 )
 
 # Full runtime consumers retain self-registering protocol translation units.
@@ -280,7 +250,7 @@ endforeach()
 cnode_unit(awaitable_batch LIBRARY cnode_build_options)
 cnode_unit(awaitable_task_group LIBRARY cnode_build_options)
 cnode_unit(shadowsocks_stream_crypto LIBRARY cnode_build_options SOURCES src/proxy/shadowsocks/shadowsocks_protocol.cpp)
-cnode_unit(timeout_scheduler LIBRARY cnode_build_options SOURCES src/transport/internet/timeout_scheduler.cpp src/app/session_group_executor.cpp src/infra/log.cpp)
+cnode_unit(timeout_scheduler LIBRARY cnode_build_options SOURCES src/transport/timeout_scheduler.cpp src/app/session_group_executor.cpp src/infra/log.cpp)
 cnode_unit(vmess_cipher LIBRARY cnode_build_options SOURCES src/proxy/vmess/vmess_crypto.cpp)
 
 file(GLOB unit_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cpp")

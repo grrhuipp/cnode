@@ -2,8 +2,8 @@
 
 #include "app/dns/dns.hpp"
 #include "app/prepared_inbound.hpp"
-#include "app/proxyman/inbound/handler.hpp"
-#include "app/proxyman/outbound/handler.hpp"
+#include "app/proxyman/inbound_handler.hpp"
+#include "app/proxyman/outbound_handler.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
 #include "worker_coordinator_fixture.hpp"
@@ -33,7 +33,7 @@ inline void Require(bool condition, const char* message) {
 class Fixture final {
 public:
     explicit Fixture(std::string_view protocol = "vless")
-        : dns(io, app::dns::Config{.servers = {{net::ip::address_v4::loopback(), 53}}}, 8),
+        : dns(io, app::DnsConfig{.servers = {{net::ip::address_v4::loopback(), 53}}}, 8),
           coordinator(io),
           worker(0, io, Configuration(), totals, dns, coordinator.Get()),
           destination(io, {net::ip::address_v4::loopback(), 0}), protocol_(protocol) {}
@@ -43,31 +43,31 @@ public:
         infra::OutboundSourceConfig outbound;
         outbound.tag = "sampling-direct";
         outbound.protocol = "freedom";
-        outbound.settings = infra::FreedomSettings{.domain_strategy = proxy::freedom::outbound::DomainStrategy::UseIP};
-        auto prepared = proxyman::outbound::PrepareOutboundConfig(outbound);
+        outbound.settings = infra::FreedomSettings{.domain_strategy = proxy::DomainStrategy::UseIP};
+        auto prepared = app::PrepareOutboundConfig(outbound);
         Require(prepared.has_value(), "Freedom preparation failed");
         worker.AddOutbound(std::move(*prepared));
 
-        auto request = proxyman::inbound::PrepareBuildRequest("vless", "sampling", infra::InboundProtocolSettings{});
+        auto request = app::PrepareBuildRequest("vless", "sampling", infra::InboundProtocolSettings{});
         Require(request.has_value(), "VLESS preparation failed");
         const std::array users{infra::InboundUserSpec{
             .user_id = 1, .email = "sampling",
             .credential = "00112233-4455-6677-8899-aabbccddeeff", .flow = {}}};
-        auto credentials = proxyman::inbound::BuildUsers(*request, users);
+        auto credentials = app::BuildUsers(*request, users);
         Require(credentials.has_value(), "VLESS user preparation failed");
-        using Store = proxyman::inbound::UserStore;
+        using Store = app::UserStore;
         worker.InstallUserView(Store::PrepareWorkerView(Store::PrepareUsers("sampling", *credentials)));
         request->protocol = protocol_;
-        proxyman::inbound::ReceiverSettings receiver{
+        app::ReceiverSettings receiver{
             .inbound_tag = "sampling", .inbound_tags = {}, .protocol = std::string(protocol_),
             .stream_settings = {},
             .dispatch_policy = {{}, routing::ForceOutbound{"sampling-direct"}},
-            .proxy_protocol = transport::internet::ProxyProtocolMode::Off};
+            .proxy_protocol = transport::ProxyProtocolMode::Off};
         Require(worker.RegisterInbound(std::move(*request), std::move(receiver)), "VLESS registration failed");
         tcp::acceptor reservation(io, {net::ip::address_v4::loopback(), 0});
         port = reservation.local_endpoint().port();
         reservation.close();
-        const auto listen = transport::internet::InboundListen::Parse("127.0.0.1");
+        const auto listen = transport::InboundListen::Parse("127.0.0.1");
         Require(listen.has_value(), "loopback listen parsing failed");
         Require(worker.AddListener(app::PortBinding{.port = port, .protocol = std::string(protocol_), .tag = "sampling", .listen = *listen}),
                 "VLESS listener failed");
@@ -147,7 +147,7 @@ public:
     }
 
     net::io_context io;
-    app::dns::DNSWorker dns;
+    app::DNSWorker dns;
     app::StatsShard totals;
     WorkerCoordinatorFixture coordinator;
     app::Worker worker;

@@ -10,8 +10,7 @@
 #include "common/byte_reader.hpp"
 #include "common/clock.hpp"
 #include "common/hash_container_shrink.hpp"
-#include "transport/internet/timeout_scheduler.hpp"
-
+#include "transport/timeout_scheduler.hpp"
 #include <asio/as_tuple.hpp>
 #include <asio/experimental/channel.hpp>
 #include <asio/this_coro.hpp>
@@ -32,26 +31,20 @@
 #include <string_view>
 #include <variant>
 #include <list>
-#include <memory_resource>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-namespace app::dns {
+namespace app {
 
-// One bounded cache owned by the main/control DNS executor. Its storage lives
-// in `resource` (process layer when none is named).
+// One bounded cache owned by the main/control DNS executor.
 class DnsCache {
 public:
     using NegativeEvent = void (*)(std::string_view domain, std::string_view reason,
                                   uint64_t hits, std::string_view event);
     explicit DnsCache(size_t max_size, uint32_t min_ttl, uint32_t max_ttl,
-                      NegativeEvent negative_event = nullptr,
-                      std::pmr::memory_resource* resource = nullptr)
-        : resource_(memory::ResourceOrProcess(resource))
-        , order_(resource_)
-        , entries_(resource_)
-        , capacity_(max_size)
+                      NegativeEvent negative_event = nullptr)
+        : capacity_(max_size)
         , min_ttl_(std::min(min_ttl, max_ttl))
         , max_ttl_(std::max(min_ttl, max_ttl))
         , negative_event_(negative_event) {}
@@ -74,7 +67,7 @@ public:
         const auto node = found->second;
         const auto now = common::steady_clock::now();
         if (now >= node->entry.expire_time) {
-            if (std::holds_alternative<std::pmr::string>(node->entry.answer)) {
+            if (std::holds_alternative<std::string>(node->entry.answer)) {
                 // Keep only bounded recovery metadata, never serve an expired
                 // answer. It shares the cache's eviction slots, not a second map.
                 if (!node->entry.expired_negative) {
@@ -93,12 +86,12 @@ public:
 
         DnsCacheEntry& entry = node->entry;
         DnsResult result;
-        if (const auto* reason = std::get_if<std::pmr::string>(&entry.answer)) {
+        if (const auto* reason = std::get_if<std::string>(&entry.answer)) {
             result.error = common::ErrorCode::DNS_NO_RECORD;
             result.error_msg.assign(reason->data(), reason->size());
             if (entry.negative_hits != UINT64_MAX) ++entry.negative_hits;
         } else {
-            const auto& addresses = std::get<std::pmr::vector<net::ip::address>>(entry.answer);
+            const auto& addresses = std::get<std::vector<net::ip::address>>(entry.answer);
             result.addresses.assign(addresses.begin(), addresses.end());
         }
         const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
@@ -126,13 +119,14 @@ public:
             return;
         }
 
-        DnsCacheEntry prepared(resource_);
+        common::CheckTestAllocationFault();
+        DnsCacheEntry prepared;
         if (result.Ok()) {
-            auto& addresses = prepared.answer.emplace<std::pmr::vector<net::ip::address>>(resource_);
+            auto& addresses = prepared.answer.emplace<std::vector<net::ip::address>>();
             addresses.assign(result.addresses.begin(), result.addresses.end());
         } else {
-            prepared.answer.emplace<std::pmr::string>(
-                result.error_msg.data(), result.error_msg.size(), resource_);
+            prepared.answer.emplace<std::string>(
+                result.error_msg.data(), result.error_msg.size());
         }
         const uint32_t ttl = result.ttl == 0 ? 0 : std::clamp(result.ttl, min_ttl_, max_ttl_);
         prepared.expire_time = common::steady_clock::now() + std::chrono::seconds(ttl);
@@ -151,7 +145,7 @@ public:
 
         // Stage both owners before eviction. If hash-node allocation fails, remove
         // the unindexed list node while all old entries and their views are intact.
-        order_.emplace_front(domain, std::move(prepared), resource_);
+        order_.emplace_front(domain, std::move(prepared));
         const auto node = order_.begin();
         try {
             entries_.emplace(std::string_view(node->domain), node);
@@ -182,24 +176,23 @@ public:
     }
 private:
     struct DnsCacheEntry {
-        explicit DnsCacheEntry(std::pmr::memory_resource* resource)
-            : answer(std::in_place_type<std::pmr::vector<net::ip::address>>, resource) {}
-        std::variant<std::pmr::vector<net::ip::address>,
-                     std::pmr::string> answer;
+        DnsCacheEntry() = default;
+        std::variant<std::vector<net::ip::address>,
+                     std::string> answer;
         common::time_point expire_time;
         uint64_t negative_hits = 0;
         bool expired_negative = false;
     };
     struct CacheNode {
-        std::pmr::string domain;
+        std::string domain;
         DnsCacheEntry entry;
 
-        CacheNode(std::string_view name, DnsCacheEntry value, std::pmr::memory_resource* resource)
-            : domain(name, resource), entry(std::move(value)) {}
+        CacheNode(std::string_view name, DnsCacheEntry value)
+            : domain(name), entry(std::move(value)) {}
     };
-    using NodeList = std::pmr::list<CacheNode>;
+    using NodeList = std::list<CacheNode>;
     void Report(const CacheNode& node, std::string_view event) const noexcept {
-        const auto* reason = std::get_if<std::pmr::string>(&node.entry.answer);
+        const auto* reason = std::get_if<std::string>(&node.entry.answer);
         if (!negative_event_ || !reason) return;
         try {
             negative_event_(std::string_view(node.domain), std::string_view(*reason),
@@ -209,10 +202,9 @@ private:
         }
     }
 
-    std::pmr::memory_resource* resource_;
     // New and replaced entries move to the front. Read hits do not reorder.
     NodeList order_;
-    std::pmr::unordered_map<std::string_view, NodeList::iterator> entries_;
+    std::unordered_map<std::string_view, NodeList::iterator> entries_;
     size_t capacity_;
     uint32_t min_ttl_;
     uint32_t max_ttl_;
@@ -235,8 +227,8 @@ public:
     };
 
     DatagramExchange(net::io_context& io, udp::endpoint endpoint)
-        : socket_(io), endpoint_(endpoint), scheduler_(transport::internet::TimeoutScheduler::ForIoContext(io)),
-          joined_(io), pending_(memory::process_resource()) {}
+        : socket_(io), endpoint_(endpoint), scheduler_(transport::TimeoutScheduler::ForIoContext(io)),
+          joined_(io) {}
 
     void RequestStop() noexcept {
         if (stopping_) return;
@@ -292,6 +284,7 @@ public:
         while (used_ids_.test(id)) ++id;
         common::StoreU16BE(query.data(), id);
         Pending request(*this, id, query);
+        common::CheckTestAllocationFault();
         pending_.emplace(id, &request);
         if (!scheduler_.ScheduleAfter(timeout, request)) {
             pending_.erase(id);
@@ -312,6 +305,37 @@ public:
         co_return std::move(request.reply);
     }
 
+    [[nodiscard]] static bool SkipWireName(std::span<const uint8_t> packet, size_t& offset) noexcept {
+        size_t current_offset = offset;
+        size_t next_offset = 0;
+        size_t wire_len = 0;
+        bool jumped = false;
+        while (current_offset < packet.size()) {
+            const uint8_t len = packet[current_offset];
+            if (len == 0) {
+                if (wire_len + 1 > 255) return false;
+                offset = jumped ? next_offset : current_offset + 1;
+                return true;
+            }
+            if ((len & 0xC0) == 0xC0) {
+                if (current_offset + 1 >= packet.size()) return false;
+                const size_t ptr = common::LoadU16BE(packet.data() + current_offset) & 0x3FFFu;
+                if (ptr < 12 || ptr >= current_offset) return false;
+                if (!jumped) {
+                    next_offset = current_offset + 2;
+                    jumped = true;
+                }
+                current_offset = ptr;
+                continue;
+            }
+            if ((len & 0xC0) != 0) return false;
+            if (packet.size() - current_offset <= static_cast<size_t>(len) + 1) return false;
+            wire_len += static_cast<size_t>(len) + 1;
+            if (wire_len >= 255) return false;
+            current_offset += static_cast<size_t>(len) + 1;
+        }
+        return false;
+    }
 private:
     struct ActiveExchange {
         explicit ActiveExchange(DatagramExchange& owner) noexcept : owner(owner) {
@@ -328,7 +352,7 @@ private:
         if (stopping_ && active_ == 0 && !reading_) joined_.close();
     }
 
-    struct Pending final : transport::internet::TimeoutEvent {
+    struct Pending final : transport::TimeoutEvent {
         Pending(DatagramExchange& owner, uint16_t id, std::span<const uint8_t> query)
             : owner(owner), id(id), query(query), completion(owner.socket_.get_executor()) {}
         ~Pending() {
@@ -344,6 +368,7 @@ private:
         void OnTimeout() override { owner.Complete(id, io_error::timed_out); }
         Reply reply;
     };
+
 
     // Match the echoed QNAME/QTYPE/QCLASS, not just the 16-bit transaction ID.
     // Support compressed names with bounded pointer traversal and ASCII folding.
@@ -441,9 +466,9 @@ private:
 
     udp::socket socket_;
     udp::endpoint endpoint_;
-    transport::internet::TimeoutScheduler& scheduler_;
+    transport::TimeoutScheduler& scheduler_;
     common::SignalChannel joined_;
-    std::pmr::unordered_map<uint16_t, Pending*> pending_;
+    std::unordered_map<uint16_t, Pending*> pending_;
     std::array<uint8_t, 512> buffer_{};
     std::bitset<65536> used_ids_;
     size_t issued_ = 0;
@@ -458,9 +483,9 @@ private:
 class InflightResolves {
     struct Pending {
         Pending(net::io_context& io_context, std::string_view name)
-            : domain(name, memory::process_resource()), completion(io_context) {}
+            : domain(name), completion(io_context) {}
 
-        std::pmr::string domain;
+        std::string domain;
         common::SignalChannel completion;
         std::optional<DnsResult> result;
         std::exception_ptr failure;
@@ -468,8 +493,7 @@ class InflightResolves {
         size_t waiters = 0;
     };
     using PendingPtr = std::shared_ptr<Pending>;
-    using Table = std::pmr::unordered_map<std::string_view, PendingPtr>;
-
+    using Table = std::unordered_map<std::string_view, PendingPtr>;
     void Remove(Pending& pending) noexcept {
         const auto found = table_.find(std::string_view(pending.domain));
         if (found != table_.end() && found->second.get() == &pending) {
@@ -585,11 +609,11 @@ public:
 
 private:
     net::io_context& io_context_;
-    Table table_{memory::process_resource()};
+    Table table_;
     size_t capacity_;
     size_t active_ = 0;
     bool stopping_ = false;
     common::ResidentTaskGroup tasks_;
 };
 
-}  // namespace app::dns
+}  // namespace app

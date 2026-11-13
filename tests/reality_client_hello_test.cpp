@@ -1,13 +1,13 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/reality_tls.hpp"
+#include "transport/reality_tls.hpp"
 #include <algorithm>
 #include <array>
 #include <tuple>
 #include <vector>
 
 namespace {
-using Reader = ::transport::internet::RealityClientHelloReader;
+using Reader = ::transport::RealityClientHelloReader;
 std::vector<uint8_t> Records(const std::vector<uint8_t>& hello, size_t fragment) {
     std::vector<uint8_t> wire;
     for (size_t offset = 0; offset < hello.size();) {

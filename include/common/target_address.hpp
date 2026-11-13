@@ -3,8 +3,7 @@
 #include "common/allocator.hpp"
 #include "common/domain_name.hpp"
 #include "common/ip_utils.hpp"
-#include "core/constants.hpp"
-
+#include "common/constants.hpp"
 #include <charconv>
 #include <format>
 #include <optional>
@@ -24,9 +23,9 @@ enum class Network : uint8_t {
 
 constexpr const char* NetworkToString(Network n) {
     switch (n) {
-        case Network::TCP: return constants::protocol::kTcp.data();
-        case Network::UDP: return constants::protocol::kUdp.data();
-        case Network::MUX: return constants::protocol::kMux.data();
+        case Network::TCP: return kTcp.data();
+        case Network::UDP: return kUdp.data();
+        case Network::MUX: return kMux.data();
         default: return "unknown";
     }
 }
@@ -53,19 +52,16 @@ struct UserProfile {
 // ============================================================================
 struct TargetAddress {
     AddressType type = AddressType::Invalid;
-    std::pmr::string host{memory::process_resource()};  // 域名；IP 目标只保留 resolved_addr
+    std::string host;  // 域名；IP 目标只保留 resolved_addr
     uint16_t port = 0;
 
     // DNS 解析后的地址
     std::optional<net::ip::address> resolved_addr;
 
     TargetAddress() = default;
-    TargetAddress(const TargetAddress& other)
-        : type(other.type), host(other.host, memory::process_resource()),
-          port(other.port), resolved_addr(other.resolved_addr) {}
+    TargetAddress(const TargetAddress&) = default;
     TargetAddress(TargetAddress&&) noexcept = default;
     TargetAddress& operator=(const TargetAddress&) = default;
-    // Every constructor binds host to the process resource; assignment retains it.
     TargetAddress& operator=(TargetAddress&&) noexcept = default;
 
 
@@ -76,7 +72,7 @@ struct TargetAddress {
 
     TargetAddress(const net::ip::address& addr, uint16_t p)
         : port(p) {
-        const net::ip::address normalized = iputil::NormalizeAddress(addr);
+        const net::ip::address normalized = NormalizeAddress(addr);
         if (normalized.is_v4()) {
             type = AddressType::IPv4;
             resolved_addr = normalized;
@@ -90,8 +86,8 @@ struct TargetAddress {
         if (port == 0) return false;
         switch (type) {
             case AddressType::Domain:
-                return domain::IsValidDnsHostname(
-                    host, domain::TrailingDotPolicy::Allow);
+                return IsValidDnsHostname(
+                    host, TrailingDotPolicy::Allow);
             case AddressType::IPv4:
                 return host.empty() && resolved_addr && resolved_addr->is_v4();
             case AddressType::IPv6:
@@ -108,7 +104,7 @@ struct TargetAddress {
         }
         if (IsDomain() || other.IsDomain()) {
             return IsDomain() && other.IsDomain() &&
-                   domain::DnsHostnamesEqual(host, other.host);
+                   DnsHostnamesEqual(host, other.host);
         }
         return *resolved_addr == *other.resolved_addr;
     }
@@ -155,8 +151,8 @@ private:
         if (h.empty()) {
             return;
         }
-        if (auto literal = iputil::ParseLiteral(h)) {
-            const auto addr = iputil::NormalizeAddress(*literal);
+        if (auto literal = ParseLiteral(h)) {
+            const auto addr = NormalizeAddress(*literal);
             if (addr.is_v4()) {
                 type = AddressType::IPv4;
                 resolved_addr = addr;
@@ -166,10 +162,10 @@ private:
             }
             return;
         }
-        if (domain::IsValidDnsHostname(
-                h, domain::TrailingDotPolicy::Allow)) {
+        if (IsValidDnsHostname(
+                h, TrailingDotPolicy::Allow)) {
             host.assign(h);
-            domain::NormalizeDnsHostnameInPlace(host);
+            NormalizeDnsHostnameInPlace(host);
             type = AddressType::Domain;
         }
     }
@@ -244,9 +240,9 @@ struct ForwardedMetadataView {
 // 链式代理透传的最初入站身份与真实客户端 IP 拥有型存储。
 struct ForwardedMetadata {
     int64_t user_id = 0;
-    std::pmr::string user_email{memory::process_resource()};
+    std::string user_email;
     std::optional<net::ip::address> client_ip;
-    std::pmr::string inbound_tag{memory::process_resource()};
+    std::string inbound_tag;
 
     [[nodiscard]] bool Empty() const noexcept {
         return user_id <= 0 && user_email.empty() &&
@@ -286,7 +282,7 @@ struct std::formatter<::common::TargetAddress> {
 
     template <class FormatContext>
     auto format(const ::common::TargetAddress& target, FormatContext& ctx) const {
-        std::optional<::iputil::AddressText> ip_storage;
+        std::optional<::common::AddressText> ip_storage;
         std::string_view host(target.host.data(), target.host.size());
         const bool use_resolved = host.empty() && target.resolved_addr.has_value();
         if (use_resolved) {

@@ -1,0 +1,423 @@
+#include "app/proxyman/user_store.hpp"
+#include <openssl/crypto.h>
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <format>
+#include <stdexcept>
+#include <limits>
+#include <string_view>
+#include <unordered_set>
+#include <utility>
+
+namespace app {
+
+namespace {
+
+using VmessTagMap =
+    std::unordered_map<std::string,
+                       std::shared_ptr<const UserStore::VmessUserMap>,
+                       common::TransparentStringHash,
+                       common::TransparentStringEq>;
+using VlessTagMap =
+    std::unordered_map<std::string,
+                       std::shared_ptr<const UserStore::VlessUserMap>,
+                       common::TransparentStringHash,
+                       common::TransparentStringEq>;
+using TrojanTagMap =
+    std::unordered_map<std::string,
+                       std::shared_ptr<const UserStore::TrojanUserMap>,
+                       common::TransparentStringHash,
+                       common::TransparentStringEq>;
+using ShadowsocksTagMap =
+    std::unordered_map<std::string,
+                       std::shared_ptr<const UserStore::ShadowsocksUserList>,
+                       common::TransparentStringHash,
+                       common::TransparentStringEq>;
+using AnyTlsTagMap =
+    std::unordered_map<std::string,
+                       std::shared_ptr<const UserStore::AnyTlsUserMap>,
+                       common::TransparentStringHash,
+                       common::TransparentStringEq>;
+using HysteriaTagMap =
+    std::unordered_map<std::string,
+                       std::shared_ptr<const UserStore::HysteriaUserMap>,
+                       common::TransparentStringHash,
+                       common::TransparentStringEq>;
+
+}  // namespace
+
+struct UserStore::Snapshot {
+    VmessTagMap vmess;
+    VlessTagMap vless;
+    TrojanTagMap trojan;
+    ShadowsocksTagMap shadowsocks;
+    AnyTlsTagMap anytls;
+    HysteriaTagMap hysteria;
+    std::array<std::unordered_map<std::string, uint64_t,
+                                  common::TransparentStringHash, common::TransparentStringEq>,
+               std::variant_size_v<UserSet>> credential_revisions;
+
+    template <typename Fn>
+    void ForEachProtocolMap(Fn&& fn) {
+        fn(vmess);
+        fn(vless);
+        fn(trojan);
+        fn(shadowsocks);
+        fn(anytls);
+        fn(hysteria);
+    }
+
+    template <typename Fn>
+    void ForEachProtocolMap(Fn&& fn) const {
+        fn(vmess);
+        fn(vless);
+        fn(trojan);
+        fn(shadowsocks);
+        fn(anytls);
+        fn(hysteria);
+    }
+};
+
+struct UserStore::WorkerLease {
+    PublishedSnapshot snapshot;
+    uint64_t revision;
+};
+
+namespace {
+
+std::atomic<UserStore::PublishedSnapshot>& GlobalSnapshot() {
+    static std::atomic<UserStore::PublishedSnapshot> snapshot{
+        std::make_shared<const UserStore::Snapshot>()};
+    return snapshot;
+}
+
+UserStore::WorkerView& LocalView() {
+    static thread_local UserStore::WorkerView view;
+    return view;
+}
+
+
+// Two users deriving one credential would let authentication pick an
+// arbitrary owner for traffic, limits and online devices; reject the update.
+[[noreturn]] void ThrowAmbiguousCredential(std::string_view protocol) {
+    throw std::invalid_argument(std::format("{} users share one credential", protocol));
+}
+
+UserStore::VmessCredential
+BuildVmessCredential(const PreparedVmessUser& user) {
+    UserStore::VmessCredential credential{
+        .uuid_bytes = user.uuid_bytes,
+        .cmd_key = user.cmd_key,
+        .auth_id_key = {},
+        .profile = user.profile,
+    };
+    if (AES_set_decrypt_key(user.auth_key.data(), 128, &credential.auth_id_key) != 0) {
+        throw std::logic_error("VMess AuthID key schedule rejected a 128-bit key");
+    }
+    return credential;
+}
+
+std::shared_ptr<const UserStore::VmessUserMap>
+BuildVmessUsers(const std::vector<PreparedVmessUser>& users) {
+    auto list = std::make_shared<UserStore::VmessUserMap>();
+    list->reserve(users.size());
+    std::unordered_set<std::array<uint8_t, 16>, UserStore::Array16Hash> seen;
+    seen.reserve(users.size());
+    for (const auto& user : users) {
+        if (!seen.insert(user.uuid_bytes).second) ThrowAmbiguousCredential("VMess");
+        list->push_back(BuildVmessCredential(user));
+    }
+    return list;
+}
+
+template <typename UserMap, auto KeyMember, typename PreparedUser, typename Project>
+std::shared_ptr<const UserMap>
+BuildKeyedUsers(const std::vector<PreparedUser>& users, std::string_view protocol,
+                Project project) {
+    auto map = std::make_shared<UserMap>();
+    map->reserve(users.size());
+    for (const auto& user : users) {
+        if (!map->try_emplace(user.*KeyMember, project(user)).second) {
+            ThrowAmbiguousCredential(protocol);
+        }
+    }
+    return map;
+}
+
+UserStore::ProfileCredential ProjectProfile(const auto& user) {
+    return UserStore::ProfileCredential{user.profile};
+}
+
+UserStore::VlessCredential ProjectVless(const PreparedVlessUser& user) {
+    return UserStore::VlessCredential{.flow = user.flow, .profile = user.profile};
+}
+
+std::shared_ptr<const UserStore::ShadowsocksUserList>
+BuildShadowsocksUsers(const std::vector<PreparedShadowsocksUser>& users) {
+    auto list = std::make_shared<UserStore::ShadowsocksUserList>();
+    list->reserve(users.size());
+    std::unordered_set<std::string_view> seen;
+    seen.reserve(users.size());
+    for (const auto& user : users) {
+        if (user.identity_key.size > user.identity_key.bytes.size()) {
+            throw std::invalid_argument("Shadowsocks identity key exceeds prepared storage");
+        }
+        const std::string_view key(
+            reinterpret_cast<const char*>(user.derived_key.data()), user.derived_key.size);
+        if (!seen.insert(key).second) ThrowAmbiguousCredential("Shadowsocks");
+        list->push_back(user);
+    }
+    // Non-identity handshakes still scan candidates; keep their original hint
+    // and first-candidate behavior rather than imposing an unused hash order.
+    if (std::none_of(list->begin(), list->end(),
+                     [](const auto& user) { return !user.identity_key.empty(); })) {
+        return list;
+    }
+    // The immutable vector is also the identity index: no second per-user
+    // table, and sessions retaining an old snapshot retain its ordering.
+    std::sort(list->begin(), list->end(), [](const auto& a, const auto& b) {
+        if (a.identity_key.size != b.identity_key.size) {
+            return a.identity_key.size < b.identity_key.size;
+        }
+        const int key_order = std::memcmp(a.identity_key.data(), b.identity_key.data(),
+                                          a.identity_key.size);
+        return key_order != 0 ? key_order < 0 : a.psk_hash < b.psk_hash;
+    });
+    return list;
+}
+
+template <typename TagMap>
+void EraseByTag(TagMap& map, std::string_view tag) {
+    if (auto it = map.find(tag); it != map.end()) {
+        map.erase(it);
+    }
+}
+
+template <typename TagMap, typename ContainerPtr>
+void SetOrErase(TagMap& map, std::string_view tag, ContainerPtr users) {
+    if (!users || users->empty()) {
+        EraseByTag(map, tag);
+        return;
+    }
+    if (auto it = map.find(tag); it != map.end()) {
+        it->second = std::move(users);
+        return;
+    }
+    map.emplace(std::string(tag), std::move(users));
+}
+
+template <typename Credential, typename TagMap, typename Key>
+std::shared_ptr<const Credential>
+FindKeyedUser(const TagMap UserStore::Snapshot::* member,
+              std::string_view tag,
+              const Key& key) {
+    const auto& view = LocalView();
+    if (!view || !view->snapshot) return nullptr;
+    const auto& tags = (*view->snapshot).*member;
+    auto tag_it = tags.find(tag);
+    if (tag_it == tags.end()) return nullptr;
+    auto user_it = tag_it->second->find(key);
+    if (user_it == tag_it->second->end()) return nullptr;
+    return std::shared_ptr<const Credential>(view, &user_it->second);
+}
+}  // namespace
+
+size_t UserStore::Array16Hash::operator()(const std::array<uint8_t, 16>& value) const noexcept {
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+    std::memcpy(&lo, value.data(), sizeof(lo));
+    std::memcpy(&hi, value.data() + sizeof(lo), sizeof(hi));
+    uint64_t h = lo ^ (hi + 0x9e3779b97f4a7c15ull + (lo << 6) + (lo >> 2));
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+    return static_cast<size_t>(h);
+}
+
+size_t UserStore::Array32Hash::operator()(const std::array<uint8_t, 32>& value) const noexcept {
+    uint64_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+    std::memcpy(&w0, value.data(), 8);
+    std::memcpy(&w1, value.data() + 8, 8);
+    std::memcpy(&w2, value.data() + 16, 8);
+    std::memcpy(&w3, value.data() + 24, 8);
+    uint64_t h = w0 ^ (w1 * 0x9e3779b97f4a7c15ull) ^ (w2 * 0xbf58476d1ce4e5b9ull) ^ (w3 * 0x94d049bb133111ebull);
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+    return static_cast<size_t>(h);
+}
+
+UserStore::PublishedSnapshot UserStore::CaptureSnapshot() {
+    return GlobalSnapshot().load(std::memory_order_acquire);
+}
+
+UserStore::WorkerView UserStore::PrepareWorkerView(PublishedSnapshot snapshot) {
+    static std::atomic<uint64_t> next_revision{1};
+    return std::make_shared<const WorkerLease>(WorkerLease{
+        std::move(snapshot), next_revision.fetch_add(1, std::memory_order_relaxed)});
+}
+
+void UserStore::InstallWorkerView(WorkerView view) noexcept {
+    LocalView() = std::move(view);
+}
+
+void UserStore::ClearWorkerView() noexcept {
+    InstallWorkerView({});
+}
+
+uint64_t UserStore::WorkerViewRevision() noexcept {
+    const auto& view = LocalView();
+    return view ? view->revision : 0;
+}
+
+uint64_t UserStore::CredentialRevision(
+    UserProtocol protocol, std::string_view tag) noexcept {
+    const auto& view = LocalView();
+    if (!view || !view->snapshot) return 0;
+    const auto& revisions = view->snapshot->credential_revisions[static_cast<size_t>(protocol)];
+    const auto found = revisions.find(tag);
+    return found == revisions.end() ? 0 : found->second;
+}
+
+void UserStore::CommitSnapshot(PublishedSnapshot snapshot) noexcept {
+    GlobalSnapshot().store(std::move(snapshot), std::memory_order_release);
+}
+
+UserStore::PublishedSnapshot UserStore::PrepareUsers(
+    std::string_view tag, const UserSet& users) {
+    const UserUpdate update{tag, users};
+    return PrepareUsers(std::span(&update, 1));
+}
+
+UserStore::PublishedSnapshot UserStore::PrepareUsers(
+    std::span<const UserUpdate> updates) {
+    auto next = std::make_shared<Snapshot>(*CaptureSnapshot());
+    for (const auto& [tag, borrowed_users] : updates) {
+        const auto& users = borrowed_users.get();
+        if (const auto* vmess = std::get_if<PreparedVmessUsers>(&users)) {
+            SetOrErase(next->vmess, tag, BuildVmessUsers(*vmess));
+        } else if (const auto* vless = std::get_if<PreparedVlessUsers>(&users)) {
+            SetOrErase(next->vless, tag, BuildKeyedUsers<VlessUserMap, &PreparedVlessUser::uuid_bytes>(
+                *vless, "VLESS", ProjectVless));
+        } else if (const auto* trojan = std::get_if<PreparedTrojanUsers>(&users)) {
+            SetOrErase(next->trojan, tag, BuildKeyedUsers<TrojanUserMap, &PreparedTrojanUser::password_hash>(
+                *trojan, "Trojan", ProjectProfile<PreparedTrojanUser>));
+        } else if (const auto* shadowsocks = std::get_if<PreparedShadowsocksUsers>(&users)) {
+            SetOrErase(next->shadowsocks, tag, BuildShadowsocksUsers(*shadowsocks));
+        } else if (const auto* anytls = std::get_if<PreparedAnyTlsUsers>(&users)) {
+            SetOrErase(next->anytls, tag, BuildKeyedUsers<AnyTlsUserMap, &PreparedAnyTlsUser::password_hash>(
+                *anytls, "AnyTLS", ProjectProfile<PreparedAnyTlsUser>));
+        } else if (const auto* hysteria = std::get_if<PreparedHysteriaUsers>(&users)) {
+            SetOrErase(next->hysteria, tag, BuildKeyedUsers<HysteriaUserMap, &PreparedHysteriaUser::credential_hash>(
+                *hysteria, "Hysteria", ProjectProfile<PreparedHysteriaUser>));
+        }
+        const auto protocol = UserProtocolOf(users);
+        if (!std::visit([](const auto& entries) {
+                return kHasKeyedInboundCredential<std::decay_t<decltype(entries)>>;
+            }, users)) continue;
+        auto& revisions = next->credential_revisions[static_cast<size_t>(protocol)];
+        if (std::visit([](const auto& entries) { return entries.empty(); }, users)) {
+            EraseByTag(revisions, tag);
+        } else {
+            // Prepare operations are serialized by the control-plane gate.
+            static uint64_t next_revision = 1;
+            if (next_revision == std::numeric_limits<uint64_t>::max()) {
+                throw std::overflow_error("credential revision exhausted");
+            }
+            revisions.insert_or_assign(std::string(tag), next_revision++);
+        }
+    }
+    return next;
+}
+
+
+UserStore::PublishedSnapshot UserStore::PrepareClearUsers(
+    UserProtocol protocol, std::string_view tag) {
+    auto next = std::make_shared<Snapshot>(*CaptureSnapshot());
+    switch (protocol) {
+        case UserProtocol::Vmess: EraseByTag(next->vmess, tag); break;
+        case UserProtocol::Vless: EraseByTag(next->vless, tag); break;
+        case UserProtocol::Trojan: EraseByTag(next->trojan, tag); break;
+        case UserProtocol::Shadowsocks: EraseByTag(next->shadowsocks, tag); break;
+        case UserProtocol::AnyTls: EraseByTag(next->anytls, tag); break;
+        case UserProtocol::Hysteria: EraseByTag(next->hysteria, tag); break;
+    }
+    EraseByTag(next->credential_revisions[static_cast<size_t>(protocol)], tag);
+    return next;
+}
+
+UserStore::VmessUsersView UserStore::VmessUsers(std::string_view tag) {
+    const auto& view = LocalView();
+    if (!view || !view->snapshot) return {};
+    auto it = view->snapshot->vmess.find(tag);
+    return {it == view->snapshot->vmess.end()
+        ? nullptr : std::shared_ptr<const VmessUserMap>(view, it->second.get())};
+}
+
+std::shared_ptr<const UserStore::VlessCredential>
+UserStore::FindVlessUser(std::string_view tag,
+                         const std::array<uint8_t, 16>& uuid_bytes) {
+    return FindKeyedUser<VlessCredential>(&Snapshot::vless, tag, uuid_bytes);
+}
+
+std::shared_ptr<const UserStore::TrojanCredential>
+UserStore::FindTrojanUser(std::string_view tag, std::string_view password_hash) {
+    return FindKeyedUser<TrojanCredential>(&Snapshot::trojan, tag, password_hash);
+}
+
+UserStore::ShadowsocksUsersView UserStore::ShadowsocksUsers(std::string_view tag) {
+    const auto& view = LocalView();
+    if (!view || !view->snapshot) return {};
+    auto it = view->snapshot->shadowsocks.find(tag);
+    return {it == view->snapshot->shadowsocks.end()
+        ? nullptr : std::shared_ptr<const ShadowsocksUserList>(view, it->second.get())};
+}
+
+size_t UserStore::ShadowsocksUsersView::IdentityGroupEnd(size_t begin) const noexcept {
+    const auto& list = *users;
+    const auto& key = list[begin].identity_key;
+    const auto same_group = [&key](const auto& user) {
+        return user.identity_key.size == key.size &&
+            CRYPTO_memcmp(user.identity_key.data(), key.data(), key.size) == 0;
+    };
+    // 有序快照首尾同组即可确认只有一组；多组遍历时不再重复探测末项。
+    if (begin == 0 && same_group(list.back())) return list.size();
+    const auto end = std::partition_point(list.begin() + begin, list.end(), same_group);
+    return static_cast<size_t>(end - list.begin());
+}
+
+size_t UserStore::ShadowsocksUsersView::IdentityHashLowerBound(
+    size_t begin, size_t end, const std::array<uint8_t, 16>& hash) const noexcept {
+    const auto& list = *users;
+    const auto candidate = std::lower_bound(list.begin() + begin, list.begin() + end, hash,
+        [](const auto& user, const auto& value) { return user.psk_hash < value; });
+    return static_cast<size_t>(candidate - list.begin());
+}
+
+std::shared_ptr<const UserStore::AnyTlsCredential>
+UserStore::FindAnyTlsUser(std::string_view tag,
+                          const std::array<uint8_t, 32>& password_hash) {
+    return FindKeyedUser<AnyTlsCredential>(&Snapshot::anytls, tag, password_hash);
+}
+
+std::shared_ptr<const UserStore::HysteriaCredential>
+UserStore::FindHysteriaUser(
+    std::string_view tag,
+    const std::array<uint8_t, 32>& credential_hash) {
+    return FindKeyedUser<HysteriaCredential>(&Snapshot::hysteria, tag, credential_hash);
+}
+
+size_t UserStore::TotalUsers() {
+    auto snapshot = CaptureSnapshot();
+    size_t total = 0;
+    snapshot->ForEachProtocolMap([&](const auto& tags) {
+        for (const auto& [tag, users] : tags) {
+            (void)tag;
+            total += users->size();
+        }
+    });
+    return total;
+}
+
+}  // namespace app

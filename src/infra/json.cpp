@@ -2,13 +2,14 @@
 #include "common/ascii.hpp"
 #include "common/binary_text_codec.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <format>
 #include <limits>
 #include <stdexcept>
 #include <utility>
-namespace json {
+namespace infra {
 
 void object_deleter::operator()(object* ptr) const noexcept {
     delete ptr;
@@ -30,14 +31,10 @@ void NormalizeKey(std::string& key, KeyComparison comparison) noexcept {
 bool object::key_compare::operator()(std::string_view lhs,
                                      std::string_view rhs) const noexcept {
     if (comparison == KeyComparison::CaseSensitive) return lhs < rhs;
-
-    const size_t length = lhs.size() < rhs.size() ? lhs.size() : rhs.size();
-    for (size_t i = 0; i < length; ++i) {
-        const auto left = common::ToLowerAscii(static_cast<unsigned char>(lhs[i]));
-        const auto right = common::ToLowerAscii(static_cast<unsigned char>(rhs[i]));
-        if (left != right) return left < right;
-    }
-    return lhs.size() < rhs.size();
+    return std::ranges::lexicographical_compare(
+        lhs, rhs, {},
+        [](char ch) { return common::ToLowerAscii(static_cast<unsigned char>(ch)); },
+        [](char ch) { return common::ToLowerAscii(static_cast<unsigned char>(ch)); });
 }
 
 object::object() = default;
@@ -54,16 +51,16 @@ object::object(object&& other) noexcept = default;
 
 object& object::operator=(const object& other) {
     if (this != &other) {
-        object temp(other);
-        values_.swap(temp.values_);
+        object copy(other);
+        values_.swap(copy.values_);
     }
     return *this;
 }
 
 object& object::operator=(object&& other) noexcept {
     if (this != &other) {
-        object temp(std::move(other));
-        values_.swap(temp.values_);
+        object moved(std::move(other));
+        values_.swap(moved.values_);
     }
     return *this;
 }
@@ -117,16 +114,16 @@ array::array(array&& other) noexcept = default;
 
 array& array::operator=(const array& other) {
     if (this != &other) {
-        array temp(other);
-        values_.swap(temp.values_);
+        array copy(other);
+        values_.swap(copy.values_);
     }
     return *this;
 }
 
 array& array::operator=(array&& other) noexcept {
     if (this != &other) {
-        array temp(std::move(other));
-        values_.swap(temp.values_);
+        array moved(std::move(other));
+        values_.swap(moved.values_);
     }
     return *this;
 }
@@ -173,14 +170,14 @@ value::value(const value& other)
 value::value(value&& other) noexcept = default;
 value& value::operator=(const value& other) {
     if (this != &other) {
-        *this = value(other);
+        data_ = value(other).data_;
     }
     return *this;
 }
 value& value::operator=(value&& other) noexcept {
     if (this != &other) {
-        value temp(std::move(other));
-        data_.swap(temp.data_);
+        value moved(std::move(other));
+        data_.swap(moved.data_);
     }
     return *this;
 }
@@ -583,11 +580,8 @@ std::string serialize(const value& v) {
     return out;
 }
 
-}  // namespace json
 
-namespace infra {
-
-std::optional<uint64_t> JsonUnsignedInteger(const json::value& value) noexcept {
+std::optional<uint64_t> JsonUnsignedInteger(const infra::value& value) noexcept {
     if (value.is_uint64()) {
         return value.as_uint64();
     }
@@ -598,7 +592,7 @@ std::optional<uint64_t> JsonUnsignedInteger(const json::value& value) noexcept {
 }
 
 tl::expected<std::optional<bool>, std::string>
-ParseJsonBool(const json::object& source, std::string_view key) {
+ParseJsonBool(const object& source, std::string_view key) {
     const auto* raw = source.if_contains(key);
     if (!raw) {
         return std::optional<bool>{};
@@ -610,7 +604,7 @@ ParseJsonBool(const json::object& source, std::string_view key) {
 }
 
 tl::expected<std::optional<std::string>, std::string>
-ParseJsonString(const json::object& source, std::string_view key) {
+ParseJsonString(const object& source, std::string_view key) {
     const auto* raw = source.if_contains(key);
     if (!raw) {
         return std::optional<std::string>{};
@@ -622,7 +616,7 @@ ParseJsonString(const json::object& source, std::string_view key) {
 }
 
 tl::expected<std::optional<std::vector<std::string>>, std::string>
-ParseJsonStringArray(const json::object& source, std::string_view key) {
+ParseJsonStringArray(const object& source, std::string_view key) {
     const auto* raw = source.if_contains(key);
     if (!raw) {
         return std::optional<std::vector<std::string>>{};
@@ -646,7 +640,7 @@ ParseJsonStringArray(const json::object& source, std::string_view key) {
 
 tl::expected<std::optional<uint64_t>, std::string>
 ParseJsonUint64(
-    const json::object& source,
+    const object& source,
     std::string_view key,
     uint64_t maximum) {
     const auto* raw = source.if_contains(key);
@@ -661,8 +655,8 @@ ParseJsonUint64(
     return std::optional<uint64_t>{*value};
 }
 
-tl::expected<const json::object*, std::string>
-ParseJsonObject(const json::object& source, std::string_view key) {
+tl::expected<const object*, std::string>
+ParseJsonObject(const object& source, std::string_view key) {
     const auto* raw = source.if_contains(key);
     if (!raw) {
         return nullptr;
@@ -674,18 +668,18 @@ ParseJsonObject(const json::object& source, std::string_view key) {
 }
 
 std::string JsonStringOr(
-    const json::object& source, std::string_view key, std::string_view fallback) {
+    const object& source, std::string_view key, std::string_view fallback) {
     auto parsed = RequireJson(ParseJsonString(source, key));
     if (parsed) return std::move(*parsed);
     return std::string(fallback);
 }
 
-bool JsonBoolOr(const json::object& source, std::string_view key, bool fallback) {
+bool JsonBoolOr(const object& source, std::string_view key, bool fallback) {
     return RequireJson(ParseJsonBool(source, key)).value_or(fallback);
 }
 
 void RequireJsonKeys(
-    const json::object& source,
+    const object& source,
     std::initializer_list<std::string_view> allowed,
     std::string_view path,
     std::initializer_list<std::string_view> additional) {
@@ -703,7 +697,7 @@ void RequireJsonKeys(
 }
 
 JsonPortResult ReadJsonPort(
-    const json::object& source, std::string_view key) noexcept {
+    const object& source, std::string_view key) noexcept {
     const auto* raw = source.if_contains(key);
     if (!raw) {
         return {};

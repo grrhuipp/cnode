@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <optional>
 #include <memory>
-#include <memory_resource>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -20,7 +19,7 @@ struct ConnectionFamily;
 
 }  // namespace app
 
-namespace session {
+namespace common {
 
 struct Context;
 
@@ -30,12 +29,12 @@ using ID = uint64_t;
 [[nodiscard]] ID NewID(uint32_t worker_id) noexcept;
 
 // xray-core common/session.Inbound 对应的连接入站元数据。
-// 配置标签、协议与安全方式按值保存在 Worker 本地，PMR 容器显式绑定进程资源。
+// 配置标签、协议与安全方式按值保存在 Worker 本地。
 struct Inbound {
     enum class ClientIpSource : uint8_t { Socket, ProxyProtocol, HttpHeader };
 
     net::ip::address source_addr;
-    std::pmr::string source_ip{memory::process_resource()};
+    std::string source_ip;
     uint16_t source_port = 0;
     ClientIpSource client_ip_source = ClientIpSource::Socket;
 
@@ -43,25 +42,25 @@ struct Inbound {
         return client_ip_source == ClientIpSource::ProxyProtocol && !source_ip.empty();
     }
     std::optional<tcp::endpoint> local_endpoint;
-    std::pmr::string tag{memory::process_resource()};
-    std::pmr::string accounting_key{memory::process_resource()};
-    std::pmr::vector<std::pmr::string> tags{memory::process_resource()};
+    std::string tag;
+    std::string accounting_key;
+    std::vector<std::string> tags;
     int64_t user_id = 0;
-    std::pmr::string user_email{memory::process_resource()};
+    std::string user_email;
 
     // 链式代理透传自最初入站的标签、身份与真实客户端 IP。
-    std::pmr::string origin_tag{memory::process_resource()};
+    std::string origin_tag;
     int64_t origin_user_id = 0;
-    std::pmr::string origin_user_email{memory::process_resource()};
+    std::string origin_user_email;
     net::ip::address origin_source_addr;
-    std::pmr::string origin_source_ip{memory::process_resource()};
+    std::string origin_source_ip;
 
     // Connection-limit family lease of the physical connection this request
     // arrived on. Set by the inbound handler; substreams inherit it and take
     // their logical admission against it.
     std::shared_ptr<app::ConnectionFamily> connection_family;
 
-    void ApplyForwardedMetadata(const common::ForwardedMetadata& metadata) {
+    void ApplyForwardedMetadata(const ForwardedMetadata& metadata) {
         if (!metadata.inbound_tag.empty()) {
             origin_tag.assign(metadata.inbound_tag.data(), metadata.inbound_tag.size());
         } else {
@@ -74,10 +73,10 @@ struct Inbound {
             origin_user_email.clear();
         }
         if (metadata.client_ip) {
-            const auto normalized = iputil::NormalizeAddress(*metadata.client_ip);
+            const auto normalized = NormalizeAddress(*metadata.client_ip);
             if (!normalized.is_unspecified()) {
                 origin_source_addr = normalized;
-                const auto text = iputil::AddressText(origin_source_addr);
+                const auto text = AddressText(origin_source_addr);
                 origin_source_ip.assign(text.View());
                 return;
             }
@@ -117,25 +116,25 @@ struct Inbound {
     }
     std::string_view EffectiveClientIp() const&& = delete;
 
-    [[nodiscard]] common::ForwardedMetadataView MakeForwardedMetadata() const& noexcept {
+    [[nodiscard]] ForwardedMetadataView MakeForwardedMetadata() const& noexcept {
         std::optional<net::ip::address> client_ip;
         const auto& addr = EffectiveClientAddress();
         if (!addr.is_unspecified()) {
             client_ip = addr;
-        } else if (const auto literal = iputil::ParseLiteral(EffectiveClientIp())) {
-            const auto normalized = iputil::NormalizeAddress(*literal);
+        } else if (const auto literal = ParseLiteral(EffectiveClientIp())) {
+            const auto normalized = NormalizeAddress(*literal);
             if (!normalized.is_unspecified()) {
                 client_ip = normalized;
             }
         }
-        return common::ForwardedMetadataView{
+        return ForwardedMetadataView{
             .user_id = EffectiveUserId(),
             .user_email = EffectiveUserEmail(),
             .client_ip = client_ip,
             .inbound_tag = EffectiveInboundTag(),
         };
     }
-    common::ForwardedMetadataView MakeForwardedMetadata() const&& = delete;
+    ForwardedMetadataView MakeForwardedMetadata() const&& = delete;
 };
 using ClientIpSource = Inbound::ClientIpSource;
 
@@ -143,9 +142,9 @@ using ClientIpSource = Inbound::ClientIpSource;
 // xray-core common/session.Outbound 对应的出站目标/路由元数据。
 struct Outbound {
     // 仅当嗅探改写了 target 时保存改写前的请求目标；否则为空（与 target 相同）。
-    common::TargetAddress original_target;
-    common::TargetAddress target;
-    common::TargetAddress route_target;
+    TargetAddress original_target;
+    TargetAddress target;
+    TargetAddress route_target;
     // Local egress address of the established outbound socket. Unlike the
     // remote field this is meaningful for direct and proxy next-hop sockets.
     std::optional<net::ip::address> connected_local_addr;
@@ -154,8 +153,8 @@ struct Outbound {
 
 // xray-core common/session.Content 对应的内容元数据。
 struct Content {
-    common::Network network = common::Network::TCP;
-    std::pmr::string protocol{memory::process_resource()};
+    Network network = Network::TCP;
+    std::string protocol;
     uint64_t speed_limit = 0;
 };
 
@@ -164,8 +163,7 @@ struct Traffic {
     uint64_t bytes_down = 0;
 };
 
-// Per-connection metadata stays Worker-local even though its memory resource
-// has process lifetime.
+// Per-connection metadata stays Worker-local.
 struct Context {
     Context() = default;
 
@@ -186,14 +184,10 @@ struct Context {
     void InitSubstreamFrom(const Context& parent, uint16_t sub_source_port = 0);
 };
 
-}  // namespace session
-
-namespace common {
-
 enum class AccessStatus { Accepted, Rejected };
 
 std::string FormatAccessLog(
-    const session::Context& ctx,
+    const Context& ctx,
     AccessStatus status = AccessStatus::Accepted,
     std::string_view reason = {});
 

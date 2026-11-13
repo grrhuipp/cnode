@@ -1,8 +1,8 @@
-#include "app/proxyman/outbound/handler.hpp"
+#include "app/proxyman/outbound_handler.hpp"
 #include "app/relay.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/session.hpp"
-#include "core/constants.hpp"
+#include "common/constants.hpp"
 #include "infra/log.hpp"
 #include "proxy/outbound.hpp"
 
@@ -12,7 +12,7 @@
 #include <span>
 #include <string>
 #include <string_view>
-namespace proxy::blackhole::outbound {
+namespace proxy {
 
 namespace {
 constexpr std::string_view kHttp403Response =
@@ -25,18 +25,18 @@ constexpr std::string_view kHttp403Response =
 }  // namespace
 
 
-class Handler final : public Outbound {
+class BlackholeOutbound final : public Outbound {
 public:
-    explicit Handler(const infra::BlackholeSettings& settings);
+    explicit BlackholeOutbound(const infra::BlackholeSettings& settings);
 
     net::awaitable<OutboundProcessResult> Process(
-        session::Context& ctx,
+        common::Context& ctx,
         transport::Link inbound,
-        transport::internet::OutboundDialer& dialer,
+        transport::OutboundDialer& dialer,
         const infra::TimeoutsConfig& timeouts,
         app::StatsShard& stats,
         const app::RelayConfig& relay_config,
-        buf::MultiBufferBatch first_payload) override;
+        common::MultiBufferBatch first_payload) override;
 
 private:
     bool http_response_;
@@ -46,18 +46,18 @@ private:
 // Handler 实现
 // ============================================================================
 
-Handler::Handler(const infra::BlackholeSettings& settings)
+BlackholeOutbound::BlackholeOutbound(const infra::BlackholeSettings& settings)
     : http_response_(settings.http_response) {
 }
 
-net::awaitable<OutboundProcessResult> Handler::Process(
-    session::Context& ctx,
+net::awaitable<OutboundProcessResult> BlackholeOutbound::Process(
+    common::Context& ctx,
     transport::Link inbound,
-    transport::internet::OutboundDialer& /*dialer*/,
+    transport::OutboundDialer& /*dialer*/,
     const infra::TimeoutsConfig& /*timeouts*/,
     app::StatsShard& /*stats*/,
     const app::RelayConfig& /*relay_config*/,
-    buf::MultiBufferBatch first_payload) {
+    common::MultiBufferBatch first_payload) {
     first_payload.clear();
     const bool send_http =
         http_response_ && ctx.content.network == common::Network::TCP && inbound.writer;
@@ -75,26 +75,26 @@ net::awaitable<OutboundProcessResult> Handler::Process(
     co_return tl::unexpected(common::ErrorCode::BLOCKED);
 }
 
-}  // namespace proxy::blackhole::outbound
+}  // namespace proxy
 
 // ============================================================================
 // 自注册（静态初始化，Xray init() 设计）
 // ============================================================================
 namespace {
-const bool kBlackholeRegistered = (::proxyman::outbound::RegisterProxy(
-    ::constants::protocol::kBlackhole,
+const bool kBlackholeRegistered = (::app::RegisterProxy(
+    ::common::kBlackhole,
     [](const ::infra::OutboundSourceConfig& cfg)
-        -> std::optional<::proxyman::outbound::PreparedOutboundProxy> {
+        -> std::optional<::app::PreparedOutboundProxy> {
         const auto* settings = std::get_if<::infra::BlackholeSettings>(&cfg.settings);
         if (!settings) return std::nullopt;
-        return ::proxyman::outbound::PreparedOutboundProxy{
-            .create = ::proxyman::outbound::MakePreparedOutboundCreator<
+        return ::app::PreparedOutboundProxy{
+            .create = ::app::MakePreparedOutboundCreator<
                 ::infra::BlackholeSettings,
                 +[](std::string_view /*tag*/,
                     std::shared_ptr<const ::infra::BlackholeSettings> s,
                     ::net::io_context& /*io_context*/,
                     ::common::AwaitableTaskGroup& /*tasks*/) -> std::unique_ptr<::proxy::Outbound> {
-                    return std::make_unique<::proxy::blackhole::outbound::Handler>(*s);
+                    return std::make_unique<::proxy::BlackholeOutbound>(*s);
                 }>(*settings),
             .sender = {},
         };

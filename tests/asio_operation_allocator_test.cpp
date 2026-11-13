@@ -1,9 +1,8 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/tcp_stream.hpp"
+#include "transport/tcp_stream.hpp"
 #include "common/allocator.hpp"
 
-#include <asio/bind_allocator.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
@@ -37,7 +36,7 @@ protected:
     net::io_context io_;
     ::tcp::acceptor acceptor_;
     ::tcp::socket peer_;
-    ::transport::internet::TcpStream stream_;
+    ::transport::TcpStream stream_;
 };
 
 TEST_F(AsioOperationAllocatorTest, NativeWriteDeliversEveryByteToPeer) {
@@ -154,7 +153,7 @@ INSTANTIATE_TEST_SUITE_P(AllNativeReads, NativeReadCancellation,
     ::testing::Values(ReadKind::Readiness, ReadKind::Bytes, ReadKind::MultiBuffer));
 
 TEST_F(AsioOperationAllocatorTest, QueuedReadinessOwnsPayloadUntilCallbackCompletes) {
-    auto payload = ::buf::BufferGuard{::buf::Buffer::New()};
+    auto payload = ::common::BufferGuard{::common::Buffer::New()};
     ASSERT_TRUE(payload);
     bool consumed = false;
     bool released = false;
@@ -165,14 +164,13 @@ TEST_F(AsioOperationAllocatorTest, QueuedReadinessOwnsPayloadUntilCallbackComple
     auto lifetime = std::make_shared<CompletionLifetime>(released);
     std::weak_ptr<CompletionLifetime> pending = lifetime;
     peer_.async_wait(::tcp::socket::wait_read,
-        net::bind_allocator(::memory::ProcessAllocator<std::byte>{},
-            [&, payload = std::move(payload), lifetime = std::move(lifetime)](::IoErrorCode error) {
-                EXPECT_FALSE(error);
-                if (error) return;
-                const auto count = peer_.read_some(net::buffer(payload->Tail().data(), 1));
-                payload->Produce(static_cast<uint32_t>(count));
-                consumed = payload->Bytes()[0] == 'q';
-            }));
+        [&, payload = std::move(payload), lifetime = std::move(lifetime)](::IoErrorCode error) {
+            EXPECT_FALSE(error);
+            if (error) return;
+            const auto count = peer_.read_some(net::buffer(payload->Tail().data(), 1));
+            payload->Produce(static_cast<uint32_t>(count));
+            consumed = payload->Bytes()[0] == 'q';
+        });
     EXPECT_FALSE(pending.expired());
     const char value = 'q';
     auto written = net::co_spawn(io_, stream_.AsyncWrite(net::buffer(&value, 1)), net::use_future);
@@ -201,8 +199,8 @@ TEST(AsioOperationAllocator, ReactorDestructionReleasesPendingHandlerOnShutdownT
     };
     auto capture = std::make_shared<Capture>(destruction_thread);
     std::weak_ptr<Capture> pending = capture;
-    timer->async_wait(net::bind_allocator(::memory::ProcessAllocator<std::byte>{},
-        [capture = std::move(capture), &called](::IoErrorCode) { called = true; }));
+    timer->async_wait(
+        [capture = std::move(capture), &called](::IoErrorCode) { called = true; });
     EXPECT_FALSE(pending.expired());
     std::thread::id shutdown_thread;
     std::thread shutdown([&] {

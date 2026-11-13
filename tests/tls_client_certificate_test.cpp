@@ -1,8 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/tls_stream.hpp"
-#include "transport/internet/tls_context.hpp"
-
+#include "transport/tls_stream.hpp"
+#include "transport/tls_context.hpp"
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 
@@ -109,21 +108,21 @@ bool ReplaceCommonName(X509* certificate,
 class ClientCertificateFiles : public testing::Test {
 protected:
     void SetUp() override {
-        material = ::transport::internet::AutoSignCertificate::Create("client.example");
+        material = ::transport::AutoSignCertificate::Create("client.example");
         ASSERT_NE(material, nullptr);
         ASSERT_TRUE(WriteCertificateFiles(files, material->Certificate(), material->Key()));
         config.cert_file = files.cert.string();
         config.key_file = files.key.string();
         config.allow_insecure = true;
-        ::transport::internet::LoadTlsPemMaterial(config);
+        ::transport::LoadTlsPemMaterial(config);
     }
-    decltype(::transport::internet::AutoSignCertificate::Create("")) material;
+    decltype(::transport::AutoSignCertificate::Create("")) material;
     CertificateFiles files;
-    ::transport::internet::TlsConfig config;
+    ::transport::TlsConfig config;
 };
 
 TEST_F(ClientCertificateFiles, LoadsMatchingClientCredentials) {
-    auto context = ::transport::internet::SslContext::CreateClient(config);
+    auto context = ::transport::SslContext::CreateClient(config);
     ASSERT_NE(context, nullptr);
     EXPECT_NE(SSL_CTX_get0_certificate(context->Native()), nullptr);
     EXPECT_NE(SSL_CTX_get0_privatekey(context->Native()), nullptr);
@@ -131,36 +130,36 @@ TEST_F(ClientCertificateFiles, LoadsMatchingClientCredentials) {
 }
 
 TEST_F(ClientCertificateFiles, PrivateCaCanVerifyConfiguredCertificate) {
-    ::transport::internet::TlsConfig ca_config;
+    ::transport::TlsConfig ca_config;
     ca_config.ca_file = files.cert.string();
-    ::transport::internet::LoadTlsPemMaterial(ca_config);
-    auto context = ::transport::internet::SslContext::CreateClient(ca_config);
+    ::transport::LoadTlsPemMaterial(ca_config);
+    auto context = ::transport::SslContext::CreateClient(ca_config);
     ASSERT_NE(context, nullptr);
     EXPECT_TRUE(VerifyCertificateWithContextStore(material->Certificate(), context->Native()));
 }
 
 TEST_F(ClientCertificateFiles, RejectsMalformedPemAfterLeafCertificate) {
-    auto malformed = std::make_shared<::transport::internet::TlsPemMaterial>();
+    auto malformed = std::make_shared<::transport::TlsPemMaterial>();
     malformed->certificate_chain = config.pem->certificate_chain +
         "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
     malformed->private_key = config.pem->private_key;
     config.pem = std::move(malformed);
-    EXPECT_EQ(::transport::internet::SslContext::CreateClient(config), nullptr);
+    EXPECT_EQ(::transport::SslContext::CreateClient(config), nullptr);
 }
 
 TEST_F(ClientCertificateFiles, RejectsUnreadableCaWithoutPublishingPartialMaterial) {
-    ::transport::internet::TlsConfig unreadable;
+    ::transport::TlsConfig unreadable;
     unreadable.ca_file = files.cert.string() + ".missing";
-    EXPECT_THROW(::transport::internet::LoadTlsPemMaterial(unreadable), std::invalid_argument);
+    EXPECT_THROW(::transport::LoadTlsPemMaterial(unreadable), std::invalid_argument);
     EXPECT_FALSE(unreadable.pem);
 }
 
 TEST(TlsClientCertificate, EnforcesExplicitTls13OnlyPolicy) {
-    ::transport::internet::TlsConfig config;
+    ::transport::TlsConfig config;
     config.allow_insecure = true;
-    config.min_version = ::transport::internet::TlsVersion::V1_3;
-    config.max_version = ::transport::internet::TlsVersion::V1_3;
-    auto context = ::transport::internet::SslContext::CreateClient(config);
+    config.min_version = ::transport::TlsVersion::V1_3;
+    config.max_version = ::transport::TlsVersion::V1_3;
+    auto context = ::transport::SslContext::CreateClient(config);
     ASSERT_NE(context, nullptr);
     EXPECT_EQ(SSL_CTX_get_min_proto_version(context->Native()), TLS1_3_VERSION);
     EXPECT_EQ(SSL_CTX_get_max_proto_version(context->Native()), TLS1_3_VERSION);
@@ -169,20 +168,20 @@ TEST(TlsClientCertificate, EnforcesExplicitTls13OnlyPolicy) {
 class TlsIdentityTest : public testing::Test {
 protected:
     void SetUp() override {
-        ::transport::internet::TlsConfig config;
+        ::transport::TlsConfig config;
         config.allow_insecure = true;
-        context = ::transport::internet::SslContext::CreateClient(config);
+        context = ::transport::SslContext::CreateClient(config);
         ASSERT_NE(context, nullptr);
         client.reset(SSL_new(context->Native()));
         ASSERT_NE(client, nullptr);
     }
-    decltype(::transport::internet::SslContext::CreateClient(::transport::internet::TlsConfig{})) context;
+    decltype(::transport::SslContext::CreateClient(::transport::TlsConfig{})) context;
     bssl::UniquePtr<SSL> client;
 };
 
 class InvalidTlsIdentity : public TlsIdentityTest, public testing::WithParamInterface<std::string_view> {};
 TEST_P(InvalidTlsIdentity, RejectsInvalidIdentityBeforeConfiguringSniOrSan) {
-    EXPECT_FALSE(::transport::internet::ConfigureTlsServerIdentity(client.get(), GetParam()));
+    EXPECT_FALSE(::transport::ConfigureTlsServerIdentity(client.get(), GetParam()));
 }
 using namespace std::string_view_literals;
 INSTANTIATE_TEST_SUITE_P(Identities, InvalidTlsIdentity, testing::Values(
@@ -190,7 +189,7 @@ INSTANTIATE_TEST_SUITE_P(Identities, InvalidTlsIdentity, testing::Values(
 
 class Ipv6TlsIdentity : public TlsIdentityTest, public testing::WithParamInterface<const char*> {};
 TEST_P(Ipv6TlsIdentity, ConfiguresIpVerificationWithoutSendingSni) {
-    ASSERT_TRUE(::transport::internet::ConfigureTlsServerIdentity(client.get(), GetParam()));
+    ASSERT_TRUE(::transport::ConfigureTlsServerIdentity(client.get(), GetParam()));
     EXPECT_EQ(SSL_get_servername(client.get(), TLSEXT_NAMETYPE_host_name), nullptr);
 }
 INSTANTIATE_TEST_SUITE_P(Addresses, Ipv6TlsIdentity,
@@ -198,10 +197,10 @@ INSTANTIATE_TEST_SUITE_P(Addresses, Ipv6TlsIdentity,
 
 class IpSanVerification : public TlsIdentityTest, public testing::WithParamInterface<bool> {};
 TEST_P(IpSanVerification, VerifiesOnlyMatchingIpSanWithoutCommonNameFallback) {
-    auto material = ::transport::internet::AutoSignCertificate::Create("192.0.2.1");
+    auto material = ::transport::AutoSignCertificate::Create("192.0.2.1");
     ASSERT_NE(material, nullptr);
     ASSERT_TRUE(ReplaceCommonName(material->Certificate(), material->Key(), "unrelated.example"));
-    ASSERT_TRUE(::transport::internet::ConfigureTlsServerIdentity(client.get(), GetParam() ? "192.0.2.1" : "192.0.2.2"));
+    ASSERT_TRUE(::transport::ConfigureTlsServerIdentity(client.get(), GetParam() ? "192.0.2.1" : "192.0.2.2"));
     EXPECT_EQ(SSL_get_servername(client.get(), TLSEXT_NAMETYPE_host_name), nullptr);
     EXPECT_EQ(VerifyCertificate(material->Certificate(), SSL_get0_param(client.get())), GetParam());
 }
@@ -209,9 +208,9 @@ INSTANTIATE_TEST_SUITE_P(MatchingAddress, IpSanVerification, testing::Bool());
 
 class DnsSanVerification : public TlsIdentityTest, public testing::WithParamInterface<const char*> {};
 TEST_P(DnsSanVerification, NormalizesRootDotForSniAndCertificateVerification) {
-    auto material = ::transport::internet::AutoSignCertificate::Create("client.example");
+    auto material = ::transport::AutoSignCertificate::Create("client.example");
     ASSERT_NE(material, nullptr);
-    ASSERT_TRUE(::transport::internet::ConfigureTlsServerIdentity(client.get(), GetParam()));
+    ASSERT_TRUE(::transport::ConfigureTlsServerIdentity(client.get(), GetParam()));
     const auto* sni = SSL_get_servername(client.get(), TLSEXT_NAMETYPE_host_name);
     ASSERT_NE(sni, nullptr);
     EXPECT_STREQ(sni, "client.example");
@@ -221,23 +220,23 @@ INSTANTIATE_TEST_SUITE_P(HostNames, DnsSanVerification, testing::Values("client.
 
 TEST(TlsClientCertificate, EncodesAlpnAsLengthPrefixedProtocolNames) {
     std::vector<unsigned char> wire;
-    ASSERT_TRUE(::transport::internet::EncodeTlsAlpnProtocols(std::vector<std::string>{"h2", "http/1.1"}, wire));
+    ASSERT_TRUE(::transport::EncodeTlsAlpnProtocols(std::vector<std::string>{"h2", "http/1.1"}, wire));
     EXPECT_EQ(wire, (std::vector<unsigned char>{2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'}));
 }
 
 class InvalidTlsAlpn : public testing::TestWithParam<std::vector<std::string>> {};
 TEST_P(InvalidTlsAlpn, RejectsEmptyOverlongOrDuplicateProtocolNames) {
     std::vector<unsigned char> wire;
-    EXPECT_FALSE(::transport::internet::EncodeTlsAlpnProtocols(GetParam(), wire));
+    EXPECT_FALSE(::transport::EncodeTlsAlpnProtocols(GetParam(), wire));
 }
 INSTANTIATE_TEST_SUITE_P(Protocols, InvalidTlsAlpn, testing::Values(
     std::vector<std::string>{""}, std::vector<std::string>{std::string(256, 'a')},
     std::vector<std::string>{"h2", "h2"}));
 
 TEST_F(ClientCertificateFiles, QuicServerRestrictsTlsToVersion13) {
-    config.min_version = ::transport::internet::TlsVersion::V1_2;
-    config.max_version = ::transport::internet::TlsVersion::V1_3;
-    auto context = ::transport::internet::SslContext::CreateQuicServer(config, std::vector<std::string>{"h3"});
+    config.min_version = ::transport::TlsVersion::V1_2;
+    config.max_version = ::transport::TlsVersion::V1_3;
+    auto context = ::transport::SslContext::CreateQuicServer(config, std::vector<std::string>{"h3"});
     ASSERT_NE(context, nullptr);
     EXPECT_EQ(SSL_CTX_get_min_proto_version(context->Native()), TLS1_3_VERSION);
     EXPECT_EQ(SSL_CTX_get_max_proto_version(context->Native()), TLS1_3_VERSION);
@@ -246,16 +245,16 @@ TEST_F(ClientCertificateFiles, QuicServerRestrictsTlsToVersion13) {
 enum class InvalidQuicPolicy { Tls12Only, UnknownVersion, MissingAlpn, EmptyAlpn };
 class QuicRejectedPolicy : public ClientCertificateFiles, public testing::WithParamInterface<InvalidQuicPolicy> {};
 TEST_P(QuicRejectedPolicy, RejectsUnsupportedVersionOrAlpnPolicy) {
-    config.min_version = ::transport::internet::TlsVersion::V1_2;
-    config.max_version = ::transport::internet::TlsVersion::V1_3;
+    config.min_version = ::transport::TlsVersion::V1_2;
+    config.max_version = ::transport::TlsVersion::V1_3;
     std::vector<std::string> alpn{"h3"};
     switch (GetParam()) {
-        case InvalidQuicPolicy::Tls12Only: config.max_version = ::transport::internet::TlsVersion::V1_2; break;
-        case InvalidQuicPolicy::UnknownVersion: config.min_version = static_cast<::transport::internet::TlsVersion>(255); break;
+        case InvalidQuicPolicy::Tls12Only: config.max_version = ::transport::TlsVersion::V1_2; break;
+        case InvalidQuicPolicy::UnknownVersion: config.min_version = static_cast<::transport::TlsVersion>(255); break;
         case InvalidQuicPolicy::MissingAlpn: alpn.clear(); break;
         case InvalidQuicPolicy::EmptyAlpn: alpn = {""}; break;
     }
-    EXPECT_EQ(::transport::internet::SslContext::CreateQuicServer(config, alpn), nullptr);
+    EXPECT_EQ(::transport::SslContext::CreateQuicServer(config, alpn), nullptr);
 }
 INSTANTIATE_TEST_SUITE_P(Policies, QuicRejectedPolicy, testing::Values(
     InvalidQuicPolicy::Tls12Only, InvalidQuicPolicy::UnknownVersion,
@@ -263,13 +262,13 @@ INSTANTIATE_TEST_SUITE_P(Policies, QuicRejectedPolicy, testing::Values(
 
 class QuicAlpnHandshake : public ClientCertificateFiles, public testing::WithParamInterface<bool> {};
 TEST_P(QuicAlpnHandshake, NegotiatesOnlyACommonConfiguredProtocol) {
-    auto context = ::transport::internet::SslContext::CreateQuicServer(config, std::vector<std::string>{"h3"});
+    auto context = ::transport::SslContext::CreateQuicServer(config, std::vector<std::string>{"h3"});
     ASSERT_NE(context, nullptr);
-    ::transport::internet::TlsConfig client_config;
+    ::transport::TlsConfig client_config;
     client_config.allow_insecure = true;
     client_config.alpn = GetParam()
         ? std::vector<std::string>{"unrelated", "h3"} : std::vector<std::string>{"unrelated"};
-    auto client_context = ::transport::internet::SslContext::CreateClient(client_config);
+    auto client_context = ::transport::SslContext::CreateClient(client_config);
     ASSERT_NE(client_context, nullptr);
     bssl::UniquePtr<SSL> client(SSL_new(client_context->Native()));
     bssl::UniquePtr<SSL> server(SSL_new(context->Native()));

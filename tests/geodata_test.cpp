@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include "geo/geodata.hpp"
-
 #include <array>
 #include <cstdint>
 #include <cstdlib>

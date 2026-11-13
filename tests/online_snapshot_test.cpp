@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "service/controller/node_transaction.hpp"
-
+#include "controller/node_transaction.hpp"
 TEST(OnlineSnapshot, CountsUsersSeparatelyFromTheirDevices) {
     const auto snapshot = ::controller::BuildOnlineSnapshot({
         {7, "203.0.113.1"}, {7, "203.0.113.2"}, {8, "203.0.113.8"}});

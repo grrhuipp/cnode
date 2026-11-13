@@ -3,7 +3,7 @@
 #include "common/address_codec.hpp"
 #include "common/const_buffer_span.hpp"
 #include "common/eof_cancellation.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/byte_reader.hpp"
 #include "common/error.hpp"
 
@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <list>
 
-namespace proxy::vless {
+namespace proxy {
 
 namespace {
 
@@ -27,7 +27,7 @@ constexpr uint64_t kProtoWireLengthDelimited = 2;
 constexpr uint64_t kProtoAddonsFlowField = 1;
 
 bool ParseHeaderAddons(std::span<const uint8_t> data,
-                       RequestHeader& request) {
+                       VlessRequestHeader& request) {
     common::ByteReader reader(data);
     bool seen_flow = false;
     while (!reader.Empty()) {
@@ -182,7 +182,7 @@ size_t EncodeRequiredUdpHeaderTo(const common::TargetAddress& target,
 
 constexpr size_t kVisionBaseHeaderLen = 1 + 2 + 2;
 constexpr size_t kVisionUuidHeaderLen = 16 + kVisionBaseHeaderLen;
-using detail::kVisionFrameContentLimit;
+
 
 constexpr uint8_t kCommandPaddingContinue = 0x00;
 constexpr uint8_t kCommandPaddingEnd = 0x01;
@@ -231,7 +231,7 @@ constexpr std::array<uint8_t, 2048> kZeroPadding{};
 }
 
 [[nodiscard]] uint16_t PaddingLen(size_t content_len, bool padding_tls) noexcept {
-    return detail::VisionPaddingSize(content_len, padding_tls,
+    return VisionPaddingSize(content_len, padding_tls,
         RandomU16(content_len < 900 && padding_tls ? 500 : 256));
 }
 
@@ -276,7 +276,7 @@ struct CompleteRecords {
 
 
 using VisionFrameBufferBuilder =
-    common::ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity * 3>;
+    common::ConstBufferSpanBuilder<common::MultiBuffer::kInlineCapacity * 3>;
 
 class VisionHeaderArena {
 public:
@@ -299,7 +299,7 @@ private:
     static constexpr size_t kBlockSize = 128;
     std::array<uint8_t, kBlockSize> inline_{};
     size_t inline_used_ = 0;
-    std::pmr::list<std::array<uint8_t, kBlockSize>> overflow_{memory::process_resource()};
+    std::list<std::array<uint8_t, kBlockSize>> overflow_;
     size_t overflow_used_ = 0;
 };
 
@@ -406,7 +406,7 @@ net::awaitable<void> WriteVisionFramed(
     const bool filter = traffic.packets_to_filter > 0;
     size_t remaining_bytes = 0;
     for (const auto& buffer : buffers) {
-        const auto bytes = buf::ChunkBytes(buffer);
+        const auto bytes = common::ChunkBytes(buffer);
         if (!bytes.empty()) {
             if (filter) {
                 traffic.FilterTLS(bytes);
@@ -422,7 +422,7 @@ net::awaitable<void> WriteVisionFramed(
     VisionHeaderArena header_owner;
     VisionFrameBufferBuilder out;
     for (const auto& buffer : buffers) {
-        const auto bytes = buf::ChunkBytes(buffer);
+        const auto bytes = common::ChunkBytes(buffer);
         if (!bytes.empty()) {
             remaining_bytes -= bytes.size();
             AppendVisionFramed(
@@ -436,16 +436,16 @@ net::awaitable<void> WriteVisionFramed(
 }
 }  // namespace
 
-RequestHeaderDecodeResult DecodeRequestHeader(std::span<const uint8_t> data) {
+VlessRequestDecodeResult DecodeVlessRequestHeader(std::span<const uint8_t> data) {
     constexpr size_t kUuidOffset = 1;
     constexpr size_t kAddonsLenOffset = kUuidOffset + 16;
-    RequestHeaderDecodeResult result;
+    VlessRequestDecodeResult result;
     if (data.empty()) {
         result.required = 1;
         return result;
     }
-    if (data[0] != kVersion) {
-        result.status = RequestHeaderDecodeStatus::InvalidVersion;
+    if (data[0] != kVlessVersion) {
+        result.status = VlessRequestDecodeStatus::InvalidVersion;
         return result;
     }
     if (data.size() <= kAddonsLenOffset) {
@@ -459,18 +459,18 @@ RequestHeaderDecodeResult DecodeRequestHeader(std::span<const uint8_t> data) {
         return result;
     }
 
-    RequestHeader& header = result.header;
+    VlessRequestHeader& header = result.header;
     const uint8_t command = data[command_offset];
     size_t consumed = command_offset + 1;
-    if (command == static_cast<uint8_t>(Command::MUX)) {
+    if (command == static_cast<uint8_t>(VlessCommand::MUX)) {
         header.target = common::TargetAddress("v1.mux.cool", 9527);
-    } else if (command == static_cast<uint8_t>(Command::TCP) ||
-               command == static_cast<uint8_t>(Command::UDP)) {
+    } else if (command == static_cast<uint8_t>(VlessCommand::TCP) ||
+               command == static_cast<uint8_t>(VlessCommand::UDP)) {
         auto address = common::DecodeAddress(
             data.subspan(consumed), common::AddressWireFormat::PortFirst,
             {.require_non_empty_domain = true, .allow_metadata = true});
         if (address.status == common::AddressDecodeStatus::Invalid) {
-            result.status = RequestHeaderDecodeStatus::InvalidAddress;
+            result.status = VlessRequestDecodeStatus::InvalidAddress;
             return result;
         }
         if (address.status == common::AddressDecodeStatus::Incomplete) {
@@ -480,31 +480,31 @@ RequestHeaderDecodeResult DecodeRequestHeader(std::span<const uint8_t> data) {
         header.target = std::move(address.target);
         header.forwarded = std::move(address.forwarded);
         if (!header.target.IsValid() &&
-            !(command == static_cast<uint8_t>(Command::UDP) &&
+            !(command == static_cast<uint8_t>(VlessCommand::UDP) &&
               IsPacketAddrMagic(header.target))) {
-            result.status = RequestHeaderDecodeStatus::InvalidAddress;
+            result.status = VlessRequestDecodeStatus::InvalidAddress;
             return result;
         }
         consumed += address.consumed;
     } else {
-        result.status = RequestHeaderDecodeStatus::InvalidCommand;
+        result.status = VlessRequestDecodeStatus::InvalidCommand;
         return result;
     }
 
-    header.command = static_cast<Command>(command);
+    header.command = static_cast<VlessCommand>(command);
     std::memcpy(header.uuid.data(), data.data() + kUuidOffset, header.uuid.size());
     if (!ParseHeaderAddons(data.subspan(kAddonsLenOffset + 1, addons_len), header)) {
-        result.status = RequestHeaderDecodeStatus::InvalidAddons;
+        result.status = VlessRequestDecodeStatus::InvalidAddons;
         return result;
     }
-    result.status = RequestHeaderDecodeStatus::Complete;
+    result.status = VlessRequestDecodeStatus::Complete;
     result.consumed = consumed;
     return result;
 }
 
 size_t EncodeRequestHeaderTo(
     const std::array<uint8_t, 16>& uuid,
-    Command command,
+    VlessCommand command,
     const common::TargetAddress& target,
     uint8_t* output,
     size_t output_size,
@@ -515,7 +515,7 @@ size_t EncodeRequestHeaderTo(
         return 0;
     }
     size_t address_size = 0;
-    if (command != Command::MUX) {
+    if (command != VlessCommand::MUX) {
         if (target.IsDomain() && (target.host.empty() || target.host.size() > 253)) {
             return 0;
         }
@@ -529,7 +529,7 @@ size_t EncodeRequestHeaderTo(
     }
 
     common::ByteWriter writer(output, output_size);
-    writer.WriteU8(kVersion);
+    writer.WriteU8(kVlessVersion);
     writer.WriteBytes(uuid.data(), uuid.size());
     if (!WriteHeaderAddons(writer, flow)) {
         return 0;
@@ -538,7 +538,7 @@ size_t EncodeRequestHeaderTo(
     if (!writer.Ok()) {
         return 0;
     }
-    if (command == Command::MUX) {
+    if (command == VlessCommand::MUX) {
         return writer.Position();
     }
     const size_t encoded = common::EncodeAddressTo(target, output + writer.Position(),
@@ -551,22 +551,22 @@ bool IsPacketAddrMagic(const common::TargetAddress& target) noexcept {
     return target.IsDomain() && target.host == kPacketAddrMagicAddress;
 }
 
-void UdpFramer::Feed(buf::MultiBuffer input) {
+void VlessUdpFramer::Feed(common::MultiBuffer input) {
     if (!pending_.Append(std::move(input))) {
         throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 }
 
-bool UdpFramer::Next(FramedUdpPacket& out) {
+bool VlessUdpFramer::Next(VlessFramedUdpPacket& out) {
     out = {};
-    buf::MultiBuffer payload;
+    common::MultiBuffer payload;
     switch (pending_.Pop(payload)) {
-    case buf::LengthPrefixedPacketBuffer::PopResult::NeedMore:
-    case buf::LengthPrefixedPacketBuffer::PopResult::Finished:
+    case common::LengthPrefixedPacketBuffer::PopResult::NeedMore:
+    case common::LengthPrefixedPacketBuffer::PopResult::Finished:
         return false;
-    case buf::LengthPrefixedPacketBuffer::PopResult::Invalid:
+    case common::LengthPrefixedPacketBuffer::PopResult::Invalid:
         throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-    case buf::LengthPrefixedPacketBuffer::PopResult::Packet:
+    case common::LengthPrefixedPacketBuffer::PopResult::Packet:
         break;
     }
     if (packet_addr_) {
@@ -585,41 +585,41 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
     return true;
 }
 
-void UdpFramer::Finish() {
+void VlessUdpFramer::Finish() {
     if (!pending_.Finish()) {
         throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
 }
 
-net::awaitable<buf::MultiBuffer> UdpFramer::ReadDatagram(
+net::awaitable<common::MultiBuffer> VlessUdpFramer::ReadDatagram(
     transport::MultiBufferReader& src,
     const common::TargetAddress& session_target) {
-    if (pending_.Finished()) co_return buf::MultiBuffer{};
+    if (pending_.Finished()) co_return common::MultiBuffer{};
     for (;;) {
-        FramedUdpPacket packet;
+        VlessFramedUdpPacket packet;
         if (Next(packet)) {
             const common::TargetAddress& target = packet.target
                 ? *packet.target
                 : session_target;
-            if (!buf::SetUdpTarget(packet.payload, target)) {
+            if (!common::SetUdpTarget(packet.payload, target)) {
                 pending_.Fail();
                 throw std::bad_alloc();
             }
             co_return std::move(packet.payload);
         }
 
-        buf::MultiBuffer raw = co_await src.ReadMultiBuffer();
+        common::MultiBuffer raw = co_await src.ReadMultiBuffer();
         if (raw.byte_size() == 0) {
             co_await common::ThrowIfCancelledOnEof();
             Finish();
-            co_return buf::MultiBuffer{};
+            co_return common::MultiBuffer{};
         }
         Feed(std::move(raw));
     }
 }
 
-net::awaitable<void> WriteUdpDatagram(
-    transport::MultiBufferWriter& writer, buf::MultiBuffer payload,
+net::awaitable<void> WriteVlessUdpDatagram(
+    transport::MultiBufferWriter& writer, common::MultiBuffer payload,
     bool packet_addr, const common::TargetAddress* fixed_target) {
     const auto datagram = proxy::RequireUdpDatagram(
         payload, packet_addr ? nullptr : fixed_target);
@@ -630,7 +630,7 @@ net::awaitable<void> WriteUdpDatagram(
     co_await proxy::WriteFramedDatagram(writer, std::span(header).first(size), payload);
 }
 
-net::awaitable<void> WriteUdpDatagram(
+net::awaitable<void> WriteVlessUdpDatagram(
     transport::MultiBufferWriter& writer, const common::TargetAddress& target,
     bool packet_addr, std::span<const net::const_buffer> payload) {
     const auto payload_size = proxy::RequireUdpPayloadSize(payload);
@@ -650,7 +650,7 @@ VisionReader::VisionReader(transport::MultiBufferReader& src,
     , user_uuid_(user_uuid)
     , traffic_(traffic) {}
 
-void VisionReader::Decode(buf::MultiBuffer& out) {
+void VisionReader::Decode(common::MultiBuffer& out) {
     while (read_process_) {
         if (frame_active_) {
             if (content_remaining_ > 0) {
@@ -718,16 +718,16 @@ void VisionReader::Decode(buf::MultiBuffer& out) {
     pending_.ReleaseIfIdle();
 }
 
-net::awaitable<buf::MultiBuffer> VisionReader::ReadMultiBuffer() {
+net::awaitable<common::MultiBuffer> VisionReader::ReadMultiBuffer() {
     if (!read_process_ && pending_.empty() && traffic_.packets_to_filter <= 0) {
         return src_.ReadMultiBuffer();
     }
     return ReadFramedMultiBuffer();
 }
 
-net::awaitable<buf::MultiBuffer> VisionReader::ReadFramedMultiBuffer() {
+net::awaitable<common::MultiBuffer> VisionReader::ReadFramedMultiBuffer() {
     while (true) {
-        buf::MultiBuffer out;
+        common::MultiBuffer out;
         Decode(out);
         if (out.byte_size() != 0) {
             if (traffic_.packets_to_filter > 0) {
@@ -739,20 +739,20 @@ net::awaitable<buf::MultiBuffer> VisionReader::ReadFramedMultiBuffer() {
         }
 
         if (!read_process_) {
-            buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
+            common::MultiBuffer raw = co_await src_.ReadMultiBuffer();
             if (raw.byte_size() == 0) {
                 co_await common::ThrowIfCancelledOnEof();
             }
             co_return raw;
         }
 
-        buf::MultiBuffer raw = co_await src_.ReadMultiBuffer();
+        common::MultiBuffer raw = co_await src_.ReadMultiBuffer();
         if (raw.byte_size() == 0) {
             co_await common::ThrowIfCancelledOnEof();
             if (read_process_ && (header_read_ != 0 || frame_active_ || expect_uuid_)) {
                 throw IoSystemError(io_error::connection_reset, "VLESS Vision frame truncated");
             }
-            co_return buf::MultiBuffer{};
+            co_return common::MultiBuffer{};
         }
         raw.MoveTo(pending_);
     }
@@ -791,14 +791,14 @@ void VisionTrafficState::FilterTLS(std::span<const uint8_t> data) noexcept {
 }
 
 
-net::awaitable<void> VisionWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
+net::awaitable<void> VisionWriter::WriteMultiBuffer(common::MultiBuffer mb) {
     if (!write_process_) {
         return dst_.WriteMultiBuffer(std::move(mb));
     }
     return WriteFramedMultiBuffer(std::move(mb));
 }
 
-net::awaitable<void> VisionWriter::WriteFramedMultiBuffer(buf::MultiBuffer mb) {
+net::awaitable<void> VisionWriter::WriteFramedMultiBuffer(common::MultiBuffer mb) {
     co_await WriteVisionFramed(
         dst_, user_uuid_, send_uuid_, write_process_, traffic_, mb);
     mb.clear();
@@ -819,4 +819,4 @@ net::awaitable<void> VisionWriter::WriteFramedBuffers(std::span<const net::const
 net::awaitable<void> VisionWriter::AsyncShutdownWrite() {
     return dst_.AsyncShutdownWrite();
 }
-}  // namespace proxy::vless
+}  // namespace proxy

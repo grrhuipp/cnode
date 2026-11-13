@@ -1,7 +1,6 @@
 #include "transport/async_stream.hpp"
 #include "common/const_buffer_span.hpp"
-#include "transport/internet/tcp_stream.hpp"
-
+#include "transport/tcp_stream.hpp"
 #include <new>
 
 
@@ -18,7 +17,7 @@ PhaseDeadlineHandle StreamPhaseDeadline::Start(std::chrono::seconds timeout) {
     ++generation_;
     expired_ = 0;
     if (timeout <= std::chrono::seconds::zero() || !owner_.IsOpen()) {
-        transport::internet::TimeoutEvent::Cancel();
+        TimeoutEvent::Cancel();
         return {};
     }
     constexpr auto maximum =
@@ -27,14 +26,14 @@ PhaseDeadlineHandle StreamPhaseDeadline::Start(std::chrono::seconds timeout) {
         ? std::chrono::milliseconds::max()
         : std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
     if (!ScheduleAfter(delay)) {
-        transport::internet::TimeoutEvent::Cancel();
+        TimeoutEvent::Cancel();
         return {};
     }
     return {&expired_, 1, &generation_, generation_};
 }
 
 void StreamPhaseDeadline::Clear() noexcept {
-    transport::internet::TimeoutEvent::Cancel();
+    TimeoutEvent::Cancel();
     ++generation_;
     expired_ = 0;
 }
@@ -54,12 +53,12 @@ void StreamPhaseDeadline::OnTimeout() noexcept {
 //
 // 将 MultiBuffer 展开为 const_buffer 视图序列转发至 WriteBuffers，完成后释放。
 // ============================================================================
-net::awaitable<void> AsyncStream::WriteMultiBuffer(buf::MultiBuffer mb) {
+net::awaitable<void> AsyncStream::WriteMultiBuffer(common::MultiBuffer mb) {
     if (mb.byte_size() == 0) {
         mb.clear();
         co_return;
     }
-    common::ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> buffers;
+    common::ConstBufferSpanBuilder<common::MultiBuffer::kInlineCapacity> buffers;
     buffers.AppendMultiBuffer(mb);
     try {
         co_await WriteBuffers(buffers.Span());
@@ -128,7 +127,7 @@ void AsyncStream::PrependReadData(std::span<const uint8_t> data) {
         "HTTP handshake requires a TCP or TLS byte stream");
 }
 
-void AsyncStream::PrependReadMultiBuffer(buf::MultiBuffer&& mb) {
+void AsyncStream::PrependReadMultiBuffer(common::MultiBuffer&& mb) {
     if (mb.byte_size() == 0) {
         mb.clear();
         return;

@@ -2,9 +2,8 @@
 
 #include "app/relay.hpp"
 #include "common/initial_payload.hpp"
-#include "transport/internet/tcp_stream.hpp"
-#include "transport/internet/timeout_scheduler.hpp"
-
+#include "transport/tcp_stream.hpp"
+#include "transport/timeout_scheduler.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/use_future.hpp>
@@ -23,25 +22,25 @@ namespace {
 using namespace std::chrono_literals;
 
 template<class F>
-struct TestEvent final : transport::internet::TimeoutEvent {
+struct TestEvent final : transport::TimeoutEvent {
     explicit TestEvent(F callback) : callback(std::move(callback)) {}
     void OnTimeout() override { callback(); }
     F callback;
 };
 
-buf::MultiBuffer Payload(size_t size, uint8_t byte) {
+common::MultiBuffer Payload(size_t size, uint8_t byte) {
     std::vector<uint8_t> bytes(size, byte);
-    buf::MultiBuffer result;
-    if (!buf::AppendSpanToMultiBuffer(bytes, result)) throw std::bad_alloc();
+    common::MultiBuffer result;
+    if (!common::AppendSpanToMultiBuffer(bytes, result)) throw std::bad_alloc();
     return result;
 }
 
-buf::MultiBuffer Payload(size_t size) {
+common::MultiBuffer Payload(size_t size) {
     return Payload(size, 0x42);
 }
 
-struct Endpoint : transport::internet::TimeoutEvent {
-    buf::MultiBuffer input;
+struct Endpoint : transport::TimeoutEvent {
+    common::MultiBuffer input;
     net::io_context* io = nullptr;
     bool phase_expired = false;
     uint8_t phase_flags = 0;
@@ -74,11 +73,11 @@ struct Endpoint : transport::internet::TimeoutEvent {
     std::chrono::steady_clock::time_point first_write{};
     std::chrono::steady_clock::time_point last_write{};
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() {
         ++read_calls;
         if (unknown_read_failure) throw std::runtime_error("read failed");
         if (read_error != common::ErrorCode::OK) throw transport::LinkError(read_error);
-        if (cancelled) co_return buf::MultiBuffer{};
+        if (cancelled) co_return common::MultiBuffer{};
         if (pending_read) {
             struct ReadScope {
                 int& active;
@@ -100,7 +99,7 @@ struct Endpoint : transport::internet::TimeoutEvent {
         last_write = std::chrono::steady_clock::now();
         written += size;
     }
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer payload) {
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer payload) {
         if (pending_write) {
             struct WriteScope {
                 int& active;
@@ -153,7 +152,7 @@ struct Endpoint : transport::internet::TimeoutEvent {
         const auto maximum = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::milliseconds::max());
         const auto delay = timeout >= maximum ? std::chrono::milliseconds::max()
             : std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
-        if (!transport::internet::TimeoutScheduler::ForIoContext(*io).ScheduleAfter(delay, *this)) return {};
+        if (!transport::TimeoutScheduler::ForIoContext(*io).ScheduleAfter(delay, *this)) return {};
         return {&phase_flags, 1, &phase_generation, phase_generation};
     }
     void OnTimeout() override {
@@ -162,7 +161,7 @@ struct Endpoint : transport::internet::TimeoutEvent {
         Cancel();
     }
     void ClearPhaseDeadline() noexcept {
-        transport::internet::TimeoutEvent::Cancel();
+        transport::TimeoutEvent::Cancel();
         ++phase_generation;
         phase_flags = 0;
         phase_expired = false;
@@ -182,9 +181,9 @@ class ClientStream final : public transport::AsyncStream {
 public:
     ClientStream(net::io_context& io, Endpoint& endpoint) : endpoint_(endpoint), phase_(io, *this) {}
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override { return endpoint_.ReadMultiBuffer(); }
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override { return endpoint_.ReadMultiBuffer(); }
     transport::EofAction ReadEofAction() const noexcept override { return endpoint_.ReadEofAction(); }
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer payload) override {
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer payload) override {
         return endpoint_.WriteMultiBuffer(std::move(payload));
     }
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
@@ -233,16 +232,16 @@ net::awaitable<bool> TestRateCancellation(net::io_context& io, int mode) {
         target.Cancel(mode >= 10 ? common::ErrorCode::RESOURCE_EXHAUSTED : common::ErrorCode::CANCELLED);
     });
     if (mode >= 6 && mode < 14)
-        (void)transport::internet::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external_cancel);
+        (void)transport::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external_cancel);
     app::StatsShard stats;
-    session::Context context;
+    common::Context context;
     const app::RelayConfig config{.uplink_only = mode == 4 ? 0s : 1s,
                              .downlink_only = mode == 4 ? 0s : 1s, .speed_limit = 1000};
     const auto start = std::chrono::steady_clock::now();
     const bool controlled = !(mode == 1 || mode == 5 || mode == 7 || mode == 9 || mode == 11 || mode >= 12);
     const auto result = co_await app::DoRelayLink(io, link, link, controlled ? &link : nullptr,
         target, context, stats, config,
-        buf::MultiBufferBatch(mode >= 14 ? Payload(4000) : buf::MultiBuffer{}));
+        common::MultiBufferBatch(mode >= 14 ? Payload(4000) : common::MultiBuffer{}));
     const auto elapsed = std::chrono::steady_clock::now() - start;
     const auto expected = mode == 12 || mode == 14 ? common::ErrorCode::CANCELLED :
         mode >= 10 ? common::ErrorCode::RESOURCE_EXHAUSTED : mode == 2 ? common::ErrorCode::SOCKET_READ_FAILED :
@@ -268,13 +267,13 @@ net::awaitable<bool> TestPendingRead(net::io_context& io, bool controlled, int m
     if (mode != 1) block(client);
     if (mode != 0 && mode != 4) block(target);
     app::StatsShard stats;
-    session::Context context;
+    common::Context context;
     net::cancellation_signal parent;
     TestEvent external([&] {
         if (mode == 3) parent.emit(net::cancellation_type::terminal);
         else target.Cancel();
     });
-    if (mode >= 2) (void)transport::internet::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
+    if (mode >= 2) (void)transport::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
     const auto budget = mode == 4 ? std::chrono::seconds::max() : 1s;
     const app::RelayConfig config{.uplink_only = budget, .downlink_only = budget};
     const auto start = std::chrono::steady_clock::now();
@@ -298,7 +297,7 @@ net::awaitable<bool> TestTcpCancellation(net::io_context& io, bool controlled, i
     tcp::acceptor listener(io, tcp::endpoint(net::ip::address_v4::loopback(), 0));
     tcp::socket peer(io);
     peer.connect(listener.local_endpoint());
-    transport::internet::TcpStream target(listener.accept());
+    transport::TcpStream target(listener.accept());
     Endpoint client;
     client.io = &io;
     ClientStream link(io, client);
@@ -311,9 +310,9 @@ net::awaitable<bool> TestTcpCancellation(net::io_context& io, bool controlled, i
     if (mode == 4) target.SetReadTimeout(1s);
     TestEvent external([&] { target.Cancel(); });
     if (mode == 2 || mode == 3)
-        (void)transport::internet::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
+        (void)transport::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
     app::StatsShard stats;
-    session::Context context;
+    common::Context context;
     const app::RelayConfig config{.speed_limit = 1000};
     const auto start = std::chrono::steady_clock::now();
     const auto result = co_await app::DoRelayLink(io, link, link, controlled ? &link : nullptr,
@@ -333,16 +332,16 @@ net::awaitable<bool> TestTcpPending(net::io_context& io, bool controlled, bool p
     tcp::acceptor listener(io, tcp::endpoint(net::ip::address_v4::loopback(), 0));
     tcp::socket client_peer(io), target_peer(io);
     client_peer.connect(listener.local_endpoint());
-    transport::internet::TcpStream client(listener.accept());
+    transport::TcpStream client(listener.accept());
     target_peer.connect(listener.local_endpoint());
-    transport::internet::TcpStream target(listener.accept());
+    transport::TcpStream target(listener.accept());
     net::cancellation_signal parent;
     TestEvent external([&] {
         if (parent_cancel) parent.emit(net::cancellation_type::terminal);
         else target.Cancel();
     });
-    (void)transport::internet::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
-    session::Context context;
+    (void)transport::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
+    common::Context context;
     app::StatsShard stats;
     const app::RelayConfig config{.uplink_only = 1s, .downlink_only = 1s,
         .speed_limit = limited ? 1000u : 0u};
@@ -372,13 +371,13 @@ net::awaitable<bool> TestInitialPayload(net::io_context& io, bool controlled, in
     if (failure == 3) target.write_error = common::ErrorCode::CANCELLED;
     auto prefix = Payload(prefix_size);
     app::StatsShard stats;
-    session::Context context;
+    common::Context context;
     const app::RelayConfig config{.uplink_only = 5s, .downlink_only = 5s,
                              .speed_limit = limited ? 1000u : 0u};
     app::RelayResult result;
     const auto start = std::chrono::steady_clock::now();
     result = co_await app::DoRelayLink(io, link, link, controlled ? &link : nullptr,
-                                 target, context, stats, config, buf::MultiBufferBatch(std::move(prefix)));
+                                 target, context, stats, config, common::MultiBufferBatch(std::move(prefix)));
     const auto stats_bytes = stats.Snapshot().bytes_out;
     const auto first_write_ms = target.written == 0 ? -1 :
         std::chrono::duration_cast<std::chrono::milliseconds>(target.first_write - start).count();
@@ -409,33 +408,33 @@ net::awaitable<bool> TestInitialPayload(net::io_context& io, bool controlled, in
 bool TestBatchOwnership() {
     auto first = Payload(3);
     auto second = Payload(5);
-    memory::reject_next_process_allocation = true;
-    buf::MultiBufferBatch batch(std::move(first));
-    bool passed = memory::reject_next_process_allocation && batch.byte_size() == 3;
+    common::reject_next_process_allocation = true;
+    common::MultiBufferBatch batch(std::move(first));
+    bool passed = common::reject_next_process_allocation && batch.byte_size() == 3;
     bool failed = false;
     try { batch.Push(std::move(second)); }
     catch (const std::bad_alloc&) { failed = true; }
-    memory::reject_next_process_allocation = false;
+    common::reject_next_process_allocation = false;
     passed = passed && failed && batch.byte_size() == 3;
     batch.Push(Payload(7));
     batch.Push(Payload(11));
-    buf::MultiBufferBatch moved(std::move(batch));
+    common::MultiBufferBatch moved(std::move(batch));
     passed = passed && batch.empty() && batch.byte_size() == 0 &&
         moved.PopFront().byte_size() == 3 && moved.byte_size() == 18;
-    buf::MultiBufferBatch assigned(Payload(1));
+    common::MultiBufferBatch assigned(Payload(1));
     assigned = std::move(moved);
     passed = passed && moved.empty() && moved.byte_size() == 0 &&
         assigned.PopFront().byte_size() == 7 && assigned.PopFront().byte_size() == 11 &&
         assigned.empty() && assigned.byte_size() == 0 && assigned.PopFront().empty();
     first = Payload(13);
     second = Payload(17);
-    memory::reject_next_process_allocation = true;
+    common::reject_next_process_allocation = true;
     assigned.Push(std::move(first));
-    passed = passed && memory::reject_next_process_allocation;
+    passed = passed && common::reject_next_process_allocation;
     failed = false;
     try { assigned.Push(std::move(second)); }
     catch (const std::bad_alloc&) { failed = true; }
-    memory::reject_next_process_allocation = false;
+    common::reject_next_process_allocation = false;
     passed = passed && failed && assigned.byte_size() == 13;
     assigned.clear();
     passed = passed && assigned.empty() && assigned.byte_size() == 0;
@@ -449,16 +448,16 @@ net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int
     ClientStream link(io, client);
     auto packet = [](size_t size, uint8_t byte, uint16_t port) {
         auto result = Payload(size, byte);
-        if (!buf::SetUdpTarget(result, common::TargetAddress("127.0.0.1", port))) throw std::bad_alloc();
+        if (!common::SetUdpTarget(result, common::TargetAddress("127.0.0.1", port))) throw std::bad_alloc();
         return result;
     };
-    buf::MultiBufferBatch batch;
+    common::MultiBufferBatch batch;
     batch.Push(packet(3, 0x11, 1001));
     batch.Push(packet(0, 0, 1005));
-    batch.Push(packet(buf::Buffer::kSize + 7, 0x22, 1002));
+    batch.Push(packet(common::Buffer::kSize + 7, 0x22, 1002));
     batch.Push(packet(0, 0, 1006));
     batch.Push(packet(5, 0x33, 1003));
-    const size_t queued_bytes = 3 + buf::Buffer::kSize + 7 + 5;
+    const size_t queued_bytes = 3 + common::Buffer::kSize + 7 + 5;
     const bool queued_ok = batch.byte_size() == queued_bytes;
     client.input = packet(9, 0x44, 1004);
     if (mode == 1) client.read_error = common::ErrorCode::SOCKET_READ_FAILED;
@@ -467,7 +466,7 @@ net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int
         target.later_write_error = mode == 2 ? common::ErrorCode::RESOURCE_EXHAUSTED : common::ErrorCode::CANCELLED;
     }
     app::StatsShard stats;
-    session::Context context;
+    common::Context context;
     context.content.network = common::Network::UDP;
     const app::RelayConfig config{.uplink_only = 5s, .downlink_only = 5s};
     const auto result = co_await app::DoRelayLink(io, link, link, controlled ? &link : nullptr,
@@ -477,10 +476,10 @@ net::awaitable<bool> TestDatagramBatch(net::io_context& io, bool controlled, int
     std::vector<uint16_t> ports{1001};
     std::vector<uint8_t> bytes(3, 0x11);
     if (mode < 2) {
-        sizes.insert(sizes.end(), {0, buf::Buffer::kSize + 7, 0, 5});
-        fragments.insert(fragments.end(), {1, 2, 1, 1});
+        sizes.insert(sizes.end(), {0, common::Buffer::kSize + 7, 0, 5});
+        fragments.insert(fragments.end(), {1, 1, 1, 1});
         ports.insert(ports.end(), {1005, 1002, 1006, 1003});
-        bytes.insert(bytes.end(), buf::Buffer::kSize + 7, 0x22);
+        bytes.insert(bytes.end(), common::Buffer::kSize + 7, 0x22);
         bytes.insert(bytes.end(), 5, 0x33);
         if (mode == 0) {
             sizes.push_back(9);
@@ -534,7 +533,7 @@ net::awaitable<bool> TestFullClose(net::io_context& io, bool controlled, int mod
             mode == 4 ? common::ErrorCode::BLOCKED : common::ErrorCode::RELAY_WRITE_FAILED;
     }
     app::StatsShard stats;
-    session::Context context;
+    common::Context context;
     const app::RelayConfig config{.uplink_only = 10s, .downlink_only = 10s, .speed_limit = 1000};
     const auto start = std::chrono::steady_clock::now();
     const auto result = co_await app::DoRelayLink(io, link, link, controlled ? &link : nullptr,
@@ -571,7 +570,7 @@ net::awaitable<bool> TestExceptionClassification(net::io_context& io, bool contr
         mode == 2 ? common::ErrorCode::RESOURCE_EXHAUSTED :
         mode == 3 ? common::ErrorCode::BLOCKED : common::ErrorCode::RELAY_WRITE_FAILED;
     app::StatsShard stats;
-    session::Context context;
+    common::Context context;
     const auto result = co_await app::DoRelayLink(io, link, link, controlled ? &link : nullptr,
                                            target, context, stats);
     const bool passed = result.error == expected &&
@@ -589,10 +588,10 @@ net::awaitable<bool> TestTcpHalfClose(net::io_context& io, bool controlled, bool
     tcp::acceptor listener(io, tcp::endpoint(net::ip::address_v4::loopback(), 0));
     tcp::socket client_peer(io), target_peer(io);
     client_peer.connect(listener.local_endpoint());
-    transport::internet::TcpStream client(listener.accept());
+    transport::TcpStream client(listener.accept());
     target_peer.connect(listener.local_endpoint());
-    transport::internet::TcpStream target(listener.accept());
-    session::Context context;
+    transport::TcpStream target(listener.accept());
+    common::Context context;
     app::StatsShard stats;
     auto peers = [&]() -> net::awaitable<bool> {
         auto& first = upload_first ? client_peer : target_peer;
@@ -655,8 +654,8 @@ net::awaitable<bool> TestBackpressuredWrite(net::io_context& io, bool controlled
         else target.Cancel(common::ErrorCode::RESOURCE_EXHAUSTED);
     });
     if (mode == 2) (void)target.StartPhaseDeadline(1s);
-    else (void)transport::internet::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, stop);
-    session::Context context;
+    else (void)transport::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, stop);
+    common::Context context;
     app::StatsShard stats;
     const auto start = std::chrono::steady_clock::now();
     const auto result = co_await net::co_spawn(io,

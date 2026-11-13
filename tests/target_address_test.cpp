@@ -26,7 +26,7 @@ struct NumericCase { ::net::ip::address address; std::string_view text; std::str
 class NumericTarget : public testing::TestWithParam<NumericCase> {};
 TEST_P(NumericTarget, FormatsCanonicalEndpointWithoutLosingScope) {
     const auto& item = GetParam();
-    const ::iputil::AddressText text(item.address);
+    const ::common::AddressText text(item.address);
     EXPECT_EQ(text.View(), item.text);
     const ::common::TargetAddress target(item.address, 65535);
     std::array<char, 128> logged;
@@ -73,6 +73,6 @@ TEST(TargetAddress, MappedIpv6SharesIpv4EndpointIdentity) {
 
 TEST(TargetAddress, FormatsNamedScopeUsingPlatformInterfaceName) {
     const ::net::ip::address_v6 address(::net::ip::make_address_v6("fe80::1").to_bytes(), 1);
-    const ::iputil::AddressText text(address);
+    const ::common::AddressText text(address);
     EXPECT_EQ(text.View(), address.to_string());
 }

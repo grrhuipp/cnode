@@ -27,7 +27,7 @@ TEST(ShadowsocksIdentityBenchmark, AuthenticationMatrix) {
         const char* value = std::getenv("CNODE_BENCH_ITERATIONS");
         return value ? std::max(size_t{1}, static_cast<size_t>(std::stoull(value))) : size_t{512};
     }();
-    const auto cipher = *proxy::shadowsocks::ParseCipherMethod("2022-blake3-aes-128-gcm");
+    const auto cipher = *proxy::ParseCipherMethod("2022-blake3-aes-128-gcm");
     net::io_context io;
     const size_t idle_rss = ResidentBytes();
     for (size_t count : {1u, 16u, 256u, 4096u}) {

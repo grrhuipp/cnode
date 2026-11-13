@@ -1,3 +1,6 @@
+#ifndef CNODE_TEST_ALLOCATOR
+#define CNODE_TEST_ALLOCATOR
+#endif
 #include <gtest/gtest.h>
 
 #include "app/dns/dns_internal.hpp"
@@ -12,40 +15,24 @@
 
 namespace {
 
-thread_local int fail_after = -1;
-
-class FailingResource final : public std::pmr::memory_resource {
-public:
-    explicit FailingResource(std::pmr::memory_resource* upstream) : upstream_(upstream) {}
-    [[nodiscard]] size_t Live() const noexcept { return live_; }
-    ~FailingResource() override { EXPECT_EQ(live_, 0u); }
-private:
-    void* do_allocate(size_t size, size_t alignment) override {
-        if (fail_after >= 0 && fail_after-- == 0) throw std::bad_alloc();
-        void* pointer = upstream_->allocate(size, alignment);
-        ++live_;
-        return pointer;
-    }
-    void do_deallocate(void* pointer, size_t size, size_t alignment) override {
-        --live_;
-        upstream_->deallocate(pointer, size, alignment);
-    }
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
-    }
-    std::pmr::memory_resource* upstream_;
-    size_t live_ = 0;
-};
-
 class FailAllocation {
 public:
-    explicit FailAllocation(int after) noexcept { fail_after = after; }
-    ~FailAllocation() { fail_after = -1; }
+    explicit FailAllocation(int after) noexcept {
+        if (after == 0) {
+            ::common::reject_next_process_allocation = true;
+        } else {
+            ::common::process_allocation_budget = after;
+        }
+    }
+    ~FailAllocation() {
+        ::common::reject_next_process_allocation = false;
+        ::common::process_allocation_budget = -1;
+    }
 };
 
 
-using ::app::dns::DnsCache;
-using ::app::dns::DnsResult;
+using ::app::DnsCache;
+using ::app::DnsResult;
 
 DnsResult Answer(std::string_view address, size_t count = 1) {
     DnsResult result;
@@ -56,8 +43,6 @@ DnsResult Answer(std::string_view address, size_t count = 1) {
 
 class DnsCacheInsertion : public testing::TestWithParam<bool> {};
 TEST_P(DnsCacheInsertion, FailedInsertionRetainsIndexedAnswerAndAllowsLaterEviction) {
-    FailingResource storage(::memory::process_resource());
-    auto* resource = &storage;
     const bool negative = GetParam();
     const std::array domains{std::string("cached.example"), std::string(60, 'a') + ".example"};
     const auto old_answer = Answer("192.0.2.1");
@@ -70,7 +55,7 @@ TEST_P(DnsCacheInsertion, FailedInsertionRetainsIndexedAnswerAndAllowsLaterEvict
     int failures = 0;
     bool completed = false;
     for (int allocation = 0; allocation < 20; ++allocation) {
-        DnsCache cache(1, 10, 600, nullptr, resource);
+        DnsCache cache(1, 10, 600);
         cache.Store(domains[0], old_answer);
         bool rejected = false;
         {
@@ -113,9 +98,7 @@ INSTANTIATE_TEST_SUITE_P(AnswerKind, DnsCacheInsertion, testing::Bool(),
     });
 
 TEST(DnsCache, CapacityEvictsOldestWrite) {
-    FailingResource storage(::memory::process_resource());
-    auto* resource = &storage;
-    DnsCache cache(2, 10, 600, nullptr, resource);
+    DnsCache cache(2, 10, 600);
     const auto answer = Answer("192.0.2.3");
     cache.Store("one.example", answer);
     cache.Store("two.example", answer);
@@ -173,9 +156,7 @@ TEST(DnsCache, ZeroCapacityAndExpiredAnswersRetainNoEntries) {
 }
 
 TEST(DnsCache, FailedReplacementRetainsCompleteOldAnswer) {
-    FailingResource storage(::memory::process_resource());
-    auto* resource = &storage;
-    DnsCache cache(1, 10, 600, nullptr, resource);
+    DnsCache cache(1, 10, 600);
     const auto original = Answer("192.0.2.1");
     const auto replacement = Answer("192.0.2.2", 400);
     cache.Store("same.example", original);
@@ -206,8 +187,6 @@ void RecordNegativeEvent(std::string_view domain, std::string_view reason,
 }
 
 TEST(DnsCache, NegativeDiagnosticsSummarizeRecoveryExpiryEvictionAndShutdown) {
-    FailingResource storage(::memory::process_resource());
-    auto* resource = &storage;
     negative_events.clear();
     struct ClearEvents {
         ~ClearEvents() { negative_events.clear(); }
@@ -217,7 +196,7 @@ TEST(DnsCache, NegativeDiagnosticsSummarizeRecoveryExpiryEvictionAndShutdown) {
     negative.error_msg = "NXDOMAIN";
     negative.ttl = 60;
     {
-        DnsCache cache(1, 0, 600, RecordNegativeEvent, resource);
+        DnsCache cache(1, 0, 600, RecordNegativeEvent);
         cache.Store("negative.example", negative);
         for (size_t i = 0; i < 128; ++i) {
             const auto result = cache.GetResult("negative.example");
@@ -263,9 +242,8 @@ TEST(DnsCache, NegativeDiagnosticsSummarizeRecoveryExpiryEvictionAndShutdown) {
 
 
 TEST(DnsCache, ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage) {
-    FailingResource resource(::memory::process_resource());
     {
-        DnsCache cache(2, 60, 3600, nullptr, &resource);
+        DnsCache cache(2, 60, 3600);
         cache.Store("ttl.example", Answer("192.0.2.1", 400));
         auto current = Answer("192.0.2.2");
         current.ttl = 0;
@@ -292,5 +270,4 @@ TEST(DnsCache, ZeroTtlAddressesInvalidateOldAnswersAndReleaseTheirStorage) {
         ASSERT_TRUE(cached);
         EXPECT_EQ(cached->addresses, retained.addresses);
     }
-    EXPECT_EQ(resource.Live(), 0u);
 }

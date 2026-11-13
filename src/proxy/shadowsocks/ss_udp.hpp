@@ -1,8 +1,8 @@
 #pragma once
 
-#include "app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/user_store.hpp"
 #include "common/allocator.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/target_address.hpp"
 #include "proxy/inbound.hpp"
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
@@ -29,7 +29,7 @@ namespace app {
 struct StatsShard;
 
 }  // namespace app
-namespace proxy::shadowsocks {
+namespace proxy {
 
 class Ss2022UdpReplayWindow {
 public:
@@ -94,7 +94,7 @@ private:
 
     void PruneExpired(std::chrono::steady_clock::time_point now);
 
-    std::pmr::unordered_map<SessionKey, Session, SessionKeyHash> sessions_{memory::process_resource()};
+    std::unordered_map<SessionKey, Session, SessionKeyHash> sessions_;
 };
 
 // The sole SS2022 path/replay authority, retained by the ingress directory
@@ -160,7 +160,7 @@ public:
     UdpResponse(KeyBytes reply_key, SsCipherInfo cipher_info)
         : state_(ClassicState{std::move(reply_key), cipher_info}) {}
     explicit UdpResponse(Ss2022UdpTxState session) : state_(std::move(session)) {}
-    [[nodiscard]] buf::MultiBuffer Encode(UDPPacketView packet) override;
+    [[nodiscard]] common::MultiBuffer Encode(UDPPacketView packet) override;
 private:
     struct ClassicState {
         KeyBytes reply_key;
@@ -178,7 +178,7 @@ struct Ss2022UdpSessionState : Ss2022UdpTxState {
 // SS UDP 解码结果
 struct SsUdpDecodeResult {
     common::TargetAddress        target;       // 解析出的 SOCKS5 目标地址
-    buf::MultiBuffer     payload;      // 解密后的 payload Buffer 所有权
+    common::MultiBuffer     payload;      // 解密后的 payload Buffer 所有权
     std::optional<common::ForwardedMetadata> forwarded;
     std::optional<uint64_t> session_id;
     // SS2022 authenticated metadata, available before replay acceptance.
@@ -204,7 +204,7 @@ struct SsUdpDecodeResult {
 [[nodiscard]] std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const uint8_t*               datagram,
     size_t                       datagram_len,
-    const proxyman::inbound::UserStore::ShadowsocksUsersView& users,
+    const app::UserStore::ShadowsocksUsersView& users,
     SsCipherType                 cipher_type,
     size_t                       key_size,
     size_t                       salt_size,
@@ -269,5 +269,5 @@ struct SsUdpDecodeResult {
     Ss2022UdpSessionState& state);
 
 
-}  // namespace proxy::shadowsocks
+}  // namespace proxy
 

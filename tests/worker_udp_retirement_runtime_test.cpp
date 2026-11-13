@@ -3,8 +3,8 @@
 #include "app/dns/dns.hpp"
 #include "app/relay.hpp"
 #include "app/prepared_inbound.hpp"
-#include "app/proxyman/inbound/handler.hpp"
-#include "app/proxyman/outbound/handler.hpp"
+#include "app/proxyman/inbound_handler.hpp"
+#include "app/proxyman/outbound_handler.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
 #include "worker_coordinator_fixture.hpp"
@@ -15,8 +15,7 @@
 #include "proxy/inbound.hpp"
 #include "proxy/outbound.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/internet/inbound_listen.hpp"
-
+#include "transport/inbound_listen.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/buffer.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -116,12 +115,12 @@ public:
             state_.wrong_destructor_thread = true;
         ++state_.destroyed;
     }
-    ::buf::MultiBuffer Encode(::proxy::UDPPacketView) override { return {}; }
+    ::common::MultiBuffer Encode(::proxy::UDPPacketView) override { return {}; }
 private:
     FixtureState& state_;
 };
 
-struct Settings final : ::proxyman::inbound::ProtocolSettings {};
+struct Settings final : ::app::ProtocolSettings {};
 
 class NativeDecoder final : public ::proxy::Inbound {
 public:
@@ -138,8 +137,8 @@ public:
     }
     ::net::awaitable<::app::RelayResult> Process(
         std::unique_ptr<::transport::AsyncStream>, ::routing::Dispatcher&,
-        const ::proxyman::inbound::ReceiverSettings&, ::net::io_context&,
-        ::session::Context&, const ::infra::TimeoutsConfig&, uint32_t) override {
+        const ::app::ReceiverSettings&, ::net::io_context&,
+        ::common::Context&, const ::infra::TimeoutsConfig&, uint32_t) override {
         co_return ::app::RelayResult{};
     }
     tl::expected<::proxy::InboundDatagramResult, ::common::ErrorCode> Process(
@@ -154,12 +153,12 @@ public:
         const std::array<uint8_t, 8> owner{0x44, 0x4e, 0x53, 0x2d, 0x6f, 0x77, 0x6e, 0x72};
         if (!decoded.session_owner.Assign(owner)) throw std::bad_alloc();
         decoded.user = &profile_;
-        auto* first = ::buf::Buffer::New();
+        auto* first = ::common::Buffer::New();
         if (!first) throw std::bad_alloc();
         first->data[0] = 0x51;
         first->data[1] = 0x52;
         first->Produce(2);
-        decoded.payload.push_back(::buf::BufferGuard(first));
+        decoded.payload.push_back(::common::BufferGuard(first));
         return decoded;
     }
     tl::expected<std::shared_ptr<::proxy::InboundDatagramResponse>, ::common::ErrorCode>
@@ -173,17 +172,17 @@ private:
 
 thread_local FixtureState* g_state = nullptr;
 std::unique_ptr<::proxy::Inbound> MakeHandler(
-    const ::proxyman::inbound::AdmissionEnvironment&,
-    const ::proxyman::inbound::BuildRequest&) {
+    const ::app::AdmissionEnvironment&,
+    const ::app::BuildRequest&) {
     if (!g_state) throw std::logic_error("fixture state not installed on Worker thread");
     return std::make_unique<NativeDecoder>(*g_state);
 }
 void RegisterProtocol() {
     static const bool registered = [] {
-        ::proxyman::inbound::RegisterProxy(kProtocol, {
+        ::app::RegisterProxy(kProtocol, {
             .user_protocol = std::nullopt,
             .datagram_transport =
-                ::proxyman::inbound::DatagramTransport::Packet,
+                ::app::DatagramTransport::Packet,
             .create_tcp_handler = MakeHandler,
             .create_datagram_handler = MakeHandler,
         });
@@ -207,9 +206,9 @@ public:
         : tag_(std::move(tag)), state_(state) {}
 
     ::net::awaitable<::proxy::OutboundProcessResult> Process(
-        ::session::Context& ctx, ::transport::Link inbound,
-        ::transport::internet::OutboundDialer&, const ::infra::TimeoutsConfig&, ::app::StatsShard&,
-        const ::app::RelayConfig&, ::buf::MultiBufferBatch first_payload) override {
+        ::common::Context& ctx, ::transport::Link inbound,
+        ::transport::OutboundDialer&, const ::infra::TimeoutsConfig&, ::app::StatsShard&,
+        const ::app::RelayConfig&, ::common::MultiBufferBatch first_payload) override {
         if (!inbound.reader || !state_.cleanup_gate)
             throw std::logic_error("delayed outbound missing owner-local link/gate");
         std::array<uint8_t, 2> bytes{};
@@ -264,7 +263,7 @@ private:
     FixtureState& state_;
 };
 
-::proxyman::outbound::PreparedOutboundConfig MakeDelayedOutbound(
+::app::PreparedOutboundConfig MakeDelayedOutbound(
     FixtureState& state, std::string tag) {
     struct DelayedState {
         FixtureState* owner_state = nullptr;
@@ -275,7 +274,7 @@ private:
         .tag = std::move(tag),
         .protocol = "test-delayed-completion",
         .sender = {},
-        .create = ::proxyman::outbound::MakePreparedOutboundCreator<
+        .create = ::app::MakePreparedOutboundCreator<
             DelayedState,
             +[](std::string_view requested_tag,
                 std::shared_ptr<const DelayedState> s,
@@ -357,22 +356,22 @@ void SendLateDnsReply(::udp::socket& socket, DnsPacket& query) {
         auto outbound_source = ::infra::OutboundSourceConfig{};
         outbound_source.tag = "native-test";
         outbound_source.protocol = "freedom";
-        outbound_source.settings = infra::FreedomSettings{.domain_strategy = proxy::freedom::outbound::DomainStrategy::UseIP};
-        auto prepared = ::proxyman::outbound::PrepareOutboundConfig(outbound_source);
+        outbound_source.settings = infra::FreedomSettings{.domain_strategy = proxy::DomainStrategy::UseIP};
+        auto prepared = ::app::PrepareOutboundConfig(outbound_source);
         if (!prepared) Fail("production Freedom outbound preparation failed");
         worker.AddOutbound(std::move(*prepared));
     }
 
-    ::proxyman::inbound::BuildRequest request{
+    ::app::BuildRequest request{
         .tag = std::string(kTag), .protocol = std::string(kProtocol),
         .settings = std::make_shared<Settings>()};
-    ::proxyman::inbound::ReceiverSettings receiver{
+    ::app::ReceiverSettings receiver{
         .inbound_tag = std::string(kTag), .inbound_tags = {}, .protocol = std::string(kProtocol),
         .stream_settings = {},
         .dispatch_policy = {.sniffing = {.enabled = false, .domains_excluded = {}}, .outbound = ::routing::ForceOutbound{"native-test"}}};
     if (!worker.RegisterInbound(request, receiver))
         Fail("real native inbound registration failed");
-    const auto listen = ::transport::internet::InboundListen::Parse("127.0.0.1");
+    const auto listen = ::transport::InboundListen::Parse("127.0.0.1");
     if (!listen) Fail("loopback inbound address could not be parsed");
     if (!co_await worker.AddUdpListenerTask(
             ::app::PortBinding{.port = inbound_port, .protocol = std::string(kProtocol), .tag = std::string(kTag), .listen = *listen}, request))
@@ -416,12 +415,12 @@ template <typename Predicate>
     deadline.cancel();
 }
 
-::proxyman::inbound::BuildRequest BuildFixtureRequest(std::string tag) {
+::app::BuildRequest BuildFixtureRequest(std::string tag) {
     return {.tag = std::move(tag), .protocol = std::string(kProtocol),
             .settings = std::make_shared<Settings>()};
 }
 
-::proxyman::inbound::ReceiverSettings BuildFixtureReceiver(
+::app::ReceiverSettings BuildFixtureReceiver(
     std::string tag, std::string outbound_tag) {
     return {.inbound_tag = std::move(tag), .inbound_tags = {}, .protocol = std::string(kProtocol),
             .stream_settings = {},
@@ -642,7 +641,7 @@ uint16_t BindUdp(::net::io_context& io, ::udp::socket& socket) {
 }
 
 ::net::awaitable<void> RunControl(
-    ::net::io_context& control_io, ::app::dns::DNSWorker& dns,
+    ::net::io_context& control_io, ::app::DNSWorker& dns,
     ::app::Worker& worker, ::udp::socket& dns_peer, DnsPacket& held_query,
     uint16_t inbound_port, ::udp::socket& echo_observer, bool shutdown_worker) {
     // Send one valid datagram through the real listener; its owned first Link
@@ -733,10 +732,10 @@ TEST_P(WorkerUdpRetirementRuntime, Lifecycle) {
         WorkerCoordinatorFixture coordinator(control_io);
         ::udp::socket dns_peer(control_io);
         const auto dns_port = BindUdp(control_io, dns_peer);
-        ::app::dns::Config dns_config{
+        ::app::DnsConfig dns_config{
             .servers = {{::net::ip::address_v4::loopback(), dns_port}},
             .timeout_sec = 15};
-        ::app::dns::DNSWorker dns(control_io, dns_config, 8);
+        ::app::DNSWorker dns(control_io, dns_config, 8);
 
         ::udp::socket echo_observer(control_io);
         const auto echo_port = BindUdp(control_io, echo_observer);

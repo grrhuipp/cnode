@@ -6,11 +6,10 @@
 #include "proxy/vless/vless_codec.hpp"
 #include "proxy/vless/vless_encryption_config.hpp"
 #include "proxy/vmess/vmess_crypto.hpp"
-
 #include <limits>
 #include <stdexcept>
 
-namespace proxy::freedom::outbound {
+namespace proxy {
 std::optional<DomainStrategy> ParseDomainStrategy(std::string_view value) {
     if (common::EqualsAsciiCI(value, "asis")) return DomainStrategy::AsIs;
     if (common::EqualsAsciiCI(value, "useip")) return DomainStrategy::UseIP;
@@ -25,12 +24,12 @@ std::optional<DomainStrategy> ParseDomainStrategy(std::string_view value) {
     if (common::EqualsAsciiCI(value, "forceipv4")) return DomainStrategy::ForceIPv4;
     return std::nullopt;
 }
-}  // namespace proxy::freedom::outbound
+}  // namespace proxy
 
 namespace infra {
 namespace {
 
-const json::object& SingleObject(const json::object& source, std::string_view key) {
+const object& SingleObject(const object& source, std::string_view key) {
     const auto* value = source.if_contains(key);
     if (!value || !value->is_array() || value->as_array().size() != 1 ||
         !value->as_array()[0].is_object()) {
@@ -39,31 +38,31 @@ const json::object& SingleObject(const json::object& source, std::string_view ke
     return value->as_array()[0].as_object();
 }
 
-transport::internet::OutboundServer Server(const json::object& source, uint16_t default_port) {
+transport::OutboundServer Server(const object& source, uint16_t default_port) {
     const auto port = ReadJsonPort(source, "port");
     if (port.error != JsonPortError::None && port.error != JsonPortError::Missing) {
         throw std::invalid_argument("outbound server port must be an integer between 1 and 65535");
     }
-    auto server = transport::internet::MakeOutboundServer(JsonStringOr(source, "address", ""),
+    auto server = transport::MakeOutboundServer(JsonStringOr(source, "address", ""),
                                     port.Valid() ? port.value : default_port);
     if (!server) throw std::invalid_argument(std::string(server.error()));
     return std::move(*server);
 }
 
-std::string Password(const json::object& source) {
+std::string Password(const object& source) {
     auto password = JsonStringOr(source, "password", "");
     if (password.empty()) throw std::invalid_argument("outbound password is required");
     return password;
 }
 
-proxy::uot::Version UotVersion(const json::value& value) {
+proxy::UotVersion ParseUotVersion(const infra::value& value) {
     const auto number = JsonUnsignedInteger(value);
-    if (number == 1) return proxy::uot::Version::V1;
-    if (number == 2) return proxy::uot::Version::V2;
+    if (number == 1) return proxy::UotVersion::V1;
+    if (number == 2) return proxy::UotVersion::V2;
     throw std::invalid_argument("UoT version must be 1 or 2");
 }
 
-std::optional<proxy::uot::Version> Uot(const json::object& source) {
+std::optional<proxy::UotVersion> Uot(const object& source) {
     const auto* value = source.if_contains("uot");
     const auto* version = source.if_contains("uotVersion");
     if (!value) {
@@ -75,7 +74,7 @@ std::optional<proxy::uot::Version> Uot(const json::object& source) {
             if (version) throw std::invalid_argument("disabled UoT cannot specify a version");
             return std::nullopt;
         }
-        return version ? UotVersion(*version) : proxy::uot::Version::V2;
+        return version ? ParseUotVersion(*version) : proxy::UotVersion::V2;
     }
     if (!value->is_object()) throw std::invalid_argument("uot must be a boolean or object");
     if (version) throw std::invalid_argument("uot object cannot be combined with uotVersion");
@@ -87,10 +86,10 @@ std::optional<proxy::uot::Version> Uot(const json::object& source) {
         if (version) throw std::invalid_argument("disabled UoT cannot specify a version");
         return std::nullopt;
     }
-    return version ? UotVersion(*version) : proxy::uot::Version::V2;
+    return version ? ParseUotVersion(*version) : proxy::UotVersion::V2;
 }
 
-std::chrono::seconds PositiveSeconds(const json::object& source, std::string_view key,
+std::chrono::seconds PositiveSeconds(const object& source, std::string_view key,
                                      std::chrono::seconds fallback) {
     const auto value = RequireJson(ParseJsonUint64(source, key));
     if (!value) return fallback;
@@ -113,12 +112,12 @@ constexpr std::initializer_list<std::string_view> kVmessFields{
 
 }  // namespace
 
-OutboundSettings ParseOutboundSettings(std::string_view protocol, const json::object& source) {
-    if (protocol == constants::protocol::kFreedom) {
+OutboundSettings ParseOutboundSettings(std::string_view protocol, const object& source) {
+    if (protocol == common::kFreedom) {
         RequireJsonKeys(source, {"domainStrategy", "redirect"},
                         "outbound.settings");
         FreedomSettings result;
-        const auto strategy = proxy::freedom::outbound::ParseDomainStrategy(
+        const auto strategy = proxy::ParseDomainStrategy(
             JsonStringOr(source, "domainStrategy", "AsIs"));
         if (!strategy) throw std::invalid_argument("unsupported freedom domainStrategy");
         result.domain_strategy = *strategy;
@@ -131,7 +130,7 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const json::ob
         }
         return result;
     }
-    if (protocol == constants::protocol::kBlackhole) {
+    if (protocol == common::kBlackhole) {
         RequireJsonKeys(source, {"response"}, "outbound.settings");
         BlackholeSettings result;
         if (const auto* response = RequireJson(ParseJsonObject(source, "response"))) {
@@ -144,14 +143,14 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const json::ob
         }
         return result;
     }
-    if (protocol == constants::protocol::kAnyTLS) {
+    if (protocol == common::kAnyTLS) {
         RequireJsonKeys(source, {"address", "port", "password", "idleSessionCheckInterval",
                                 "idleSessionTimeout", "minIdleSession"}, "outbound.settings");
         AnyTlsSettings result;
         result.server = Server(source, 0);
         auto password = Password(source);
         common::ScopedCleanse cleanse{password};
-        result.password_hash = proxy::anytls::PasswordHash(password);
+        result.password_hash = proxy::HashAnyTlsPassword(password);
         result.idle_session_check_interval = PositiveSeconds(
             source, "idleSessionCheckInterval", result.idle_session_check_interval);
         result.idle_session_timeout = PositiveSeconds(source, "idleSessionTimeout", result.idle_session_timeout);
@@ -159,9 +158,9 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const json::ob
             source, "minIdleSession", std::numeric_limits<size_t>::max())).value_or(0));
         return result;
     }
-    if (protocol == constants::protocol::kShadowsocks || protocol == constants::protocol::kTrojan) {
-        const bool shadowsocks = protocol == constants::protocol::kShadowsocks;
-        const json::object* server = &source;
+    if (protocol == common::kShadowsocks || protocol == common::kTrojan) {
+        const bool shadowsocks = protocol == common::kShadowsocks;
+        const object* server = &source;
         if (source.contains("servers")) {
             RequireJsonKeys(source, {"servers"}, "outbound.settings");
             server = &SingleObject(source, "servers");
@@ -170,7 +169,7 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const json::ob
         if (shadowsocks) {
             ShadowsocksSettings result;
             result.server = Server(*server, 8388);
-            const auto cipher = proxy::shadowsocks::ParseCipherMethod(JsonStringOr(*server, "method", "aes-256-gcm"));
+            const auto cipher = proxy::ParseCipherMethod(JsonStringOr(*server, "method", "aes-256-gcm"));
             if (!cipher) throw std::invalid_argument("unsupported Shadowsocks method");
             result.cipher = *cipher;
             result.password = Password(*server);
@@ -186,10 +185,10 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const json::ob
             .alpn = RequireJson(ParseJsonStringArray(*server, "alpn")).value_or(std::vector<std::string>{}),
         };
     }
-    if (protocol == constants::protocol::kVless || protocol == constants::protocol::kVmess) {
-        const bool vless_protocol = protocol == constants::protocol::kVless;
-        const json::object* server = &source;
-        const json::object* user = &source;
+    if (protocol == common::kVless || protocol == common::kVmess) {
+        const bool vless_protocol = protocol == common::kVless;
+        const object* server = &source;
+        const object* user = &source;
         const auto fields = vless_protocol ? kVlessFields : kVmessFields;
         if (source.contains("vnext")) {
             RequireJsonKeys(source, {"vnext"}, "outbound.settings");
@@ -205,17 +204,17 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const json::ob
         if (vless_protocol) {
             VlessSettings result;
             result.server = std::move(endpoint);
-            const auto uuid = proxy::vless::ParseUuidBytes(id);
+            const auto uuid = proxy::ParseUuidBytes(id);
             if (!uuid) throw std::invalid_argument("VLESS id must be a UUID or a 1-30 byte custom id");
             result.id = *uuid;
-            result.flow = proxy::vless::NormalizeFlow(JsonStringOr(*user, "flow", ""));
+            result.flow = proxy::NormalizeFlow(JsonStringOr(*user, "flow", ""));
             if (!result.flow.empty() && result.flow != "xtls-rprx-vision" &&
                 result.flow != "xtls-rprx-vision-udp443") {
                 throw std::invalid_argument("unsupported VLESS flow");
             }
-            auto encryption = proxy::vless::ParseVlessClientEncryption(JsonStringOr(*user, "encryption", ""));
-            if (!encryption) throw std::invalid_argument(std::string(proxy::vless::VlessEncryptionParseErrorMessage(encryption.error())));
-            if (*encryption) result.encryption = std::make_shared<const proxy::vless::VlessEncryptionConfig>(std::move(**encryption));
+            auto encryption = proxy::ParseVlessClientEncryption(JsonStringOr(*user, "encryption", ""));
+            if (!encryption) throw std::invalid_argument(std::string(proxy::VlessEncryptionParseErrorMessage(encryption.error())));
+            if (*encryption) result.encryption = std::make_shared<const proxy::VlessEncryptionConfig>(std::move(**encryption));
             const auto packet = common::LowerAscii(JsonStringOr(*user, "packetEncoding", "xudp"));
             if (packet == "none") result.packet_encoding = PacketEncoding::None;
             else if (packet == "packetaddr") result.packet_encoding = PacketEncoding::PacketAddr;
@@ -228,11 +227,11 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const json::ob
         const auto alter_id = RequireJson(ParseJsonUint64(*user, "alterId"));
         if (alter_id && *alter_id != 0) throw std::invalid_argument("VMess alterId must be zero");
         const auto security = common::LowerAscii(JsonStringOr(*user, "security", "auto"));
-        proxy::vmess::Security cipher;
-        if (security.empty() || security == "auto" || security == "aes-128-gcm") cipher = proxy::vmess::Security::AES_128_GCM;
-        else if (security == "chacha20-poly1305") cipher = proxy::vmess::Security::CHACHA20_POLY1305;
-        else if (security == "none") cipher = proxy::vmess::Security::NONE;
-        else if (security == "zero") cipher = proxy::vmess::Security::ZERO;
+        proxy::VmessSecurity cipher;
+        if (security.empty() || security == "auto" || security == "aes-128-gcm") cipher = proxy::VmessSecurity::AES_128_GCM;
+        else if (security == "chacha20-poly1305") cipher = proxy::VmessSecurity::CHACHA20_POLY1305;
+        else if (security == "none") cipher = proxy::VmessSecurity::NONE;
+        else if (security == "zero") cipher = proxy::VmessSecurity::ZERO;
         else throw std::invalid_argument("unsupported VMess security");
         return VmessSettings{.server = std::move(endpoint), .id = *uuid, .security = cipher};
     }

@@ -1,8 +1,8 @@
 #include "transport_coordinator_fixture.hpp"
 #include <gtest/gtest.h>
 
-#include "transport/internet/tcp_stream.hpp"
-#include "transport/internet/transport_stack.hpp"
+#include "transport/tcp_stream.hpp"
+#include "transport/transport_stack.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
@@ -108,11 +108,11 @@ void Settle(net::io_context& io) {
     io.run_for(50ms);
 }
 
-::transport::internet::StreamSettings GrpcSettings() {
-    ::transport::internet::StreamSettings settings;
-    settings.network_mode = transport::internet::NetworkMode::Grpc;
+::transport::StreamSettings GrpcSettings() {
+    ::transport::StreamSettings settings;
+    settings.network_mode = transport::NetworkMode::Grpc;
     settings.grpc.service_name = "fixture";
-    return ::transport::internet::NormalizeStreamSettings(settings);
+    return ::transport::NormalizeStreamSettings(settings);
 }
 
 struct WireFrame {
@@ -222,7 +222,7 @@ TEST(Http2FlowControl, ClientWaitsForPeerWindows) {
     ::tcp::socket dialed(io), server(io);
     dialed.connect(acceptor.local_endpoint());
     acceptor.accept(server);
-    auto raw = std::make_unique<::transport::internet::TcpStream>(std::move(dialed));
+    auto raw = std::make_unique<::transport::TcpStream>(std::move(dialed));
     const auto settings = GrpcSettings();
     const std::string payload(200000, 'x');
     std::unique_ptr<::transport::AsyncStream> stream;
@@ -230,7 +230,7 @@ TEST(Http2FlowControl, ClientWaitsForPeerWindows) {
     bool finished = false;
     std::exception_ptr failure;
     auto client = [&]() -> net::awaitable<void> {
-        auto result = co_await ::transport::internet::BuildOutboundTransport(std::move(raw), settings, nullptr);
+        auto result = co_await ::transport::BuildOutboundTransport(std::move(raw), settings, nullptr);
         if (!result || !*result) throw std::runtime_error("gRPC client handshake failed");
         stream = std::move(*result);
         (void)co_await stream->AsyncWrite(net::buffer(payload));
@@ -281,9 +281,9 @@ struct ParkedWriterClient {
         : io_(io), acceptor(io, {net::ip::address_v4::loopback(), 0}), dialed(io), server(io) {
         dialed.connect(acceptor.local_endpoint());
         acceptor.accept(server);
-        auto client = [this, raw = std::make_unique<::transport::internet::TcpStream>(std::move(dialed))]()
+        auto client = [this, raw = std::make_unique<::transport::TcpStream>(std::move(dialed))]()
             mutable -> net::awaitable<void> {
-            auto result = co_await ::transport::internet::BuildOutboundTransport(std::move(raw), settings, nullptr);
+            auto result = co_await ::transport::BuildOutboundTransport(std::move(raw), settings, nullptr);
             if (!result || !*result) throw std::runtime_error("gRPC client handshake failed");
             stream = std::move(*result);
             (void)co_await stream->AsyncWrite(net::buffer(payload));
@@ -321,7 +321,7 @@ struct ParkedWriterClient {
     ::tcp::acceptor acceptor;
     ::tcp::socket dialed;
     ::tcp::socket server;
-    ::transport::internet::StreamSettings settings = GrpcSettings();
+    ::transport::StreamSettings settings = GrpcSettings();
     std::string payload = std::string(200000, 'x');
     std::unique_ptr<::transport::AsyncStream> stream;
     std::exception_ptr writer_failure;
@@ -414,13 +414,13 @@ TEST(Http2FlowControl, ClientReturnsCreditAsReaderTakesData) {
     RunUntil(io, [&] { return client.writer_finished; }, "client writer did not finish");
 }
 
-class WritingSink final : public ::transport::internet::InboundTransportStreamHandler {
+class WritingSink final : public ::transport::InboundTransportStreamHandler {
 public:
     WritingSink(net::io_context& io, size_t size) : release(io, 1), payload(size, 'y') {}
 
     net::awaitable<void> OnInboundTransportStream(
         std::unique_ptr<::transport::AsyncStream> stream,
-        ::transport::internet::InboundTransportMetadata) override {
+        ::transport::InboundTransportMetadata) override {
         try {
             (void)co_await stream->AsyncWrite(net::buffer(payload));
             written = true;
@@ -445,13 +445,13 @@ TEST(Http2FlowControl, ServerWaitsForPeerWindows) {
     ::tcp::socket client(io), accepted(io);
     client.connect(acceptor.local_endpoint());
     acceptor.accept(accepted);
-    auto raw = std::make_unique<::transport::internet::TcpStream>(std::move(accepted));
+    auto raw = std::make_unique<::transport::TcpStream>(std::move(accepted));
     auto sink = std::make_shared<WritingSink>(io, 100000);
     const auto settings = GrpcSettings();
     bool returned = false;
     std::exception_ptr failure;
     auto build = [&]() -> net::awaitable<void> {
-        (void)co_await ::transport::internet::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr, 0, sink);
+        (void)co_await ::transport::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr, 0, sink);
     };
     net::co_spawn(io, build(), [&](std::exception_ptr error) {
         failure = error;

@@ -10,9 +10,9 @@
 
 namespace {
 
-::rule::DetectRulePolicy::RuleListPtr MakeRules(
-    std::initializer_list<::rule::DetectRule> rules) {
-    return std::make_shared<const ::rule::DetectRulePolicy::RuleList>(rules);
+::common::DetectRulePolicy::RuleListPtr MakeRules(
+    std::initializer_list<::common::DetectRule> rules) {
+    return std::make_shared<const ::common::DetectRulePolicy::RuleList>(rules);
 }
 
 }  // namespace
@@ -23,13 +23,13 @@ protected:
         context.inbound.user_id = 42;
         context.inbound.user_email = "alice@example.com";
         context.outbound.target = ::common::TargetAddress("blocked.example", 443);
-        policy.UpdateRule(tag, MakeRules({::rule::DetectRule{
+        policy.UpdateRule(tag, MakeRules({::common::DetectRule{
             .Pattern = std::regex("blocked\\.example"),
         }}));
     }
     static constexpr std::string_view tag = "panel|vmess|443";
-    ::rule::DetectRulePolicy policy;
-    ::session::Context context;
+    ::common::DetectRulePolicy policy;
+    ::common::Context context;
 };
 
 TEST_F(RuleLifecycle, MatchesTargetOnlyForAuthenticatedInboundIdentity) {
@@ -46,7 +46,7 @@ TEST_F(RuleLifecycle, MatchesTargetOnlyForAuthenticatedInboundIdentity) {
 
 TEST_F(RuleLifecycle, ReplacementAndRemovalTakeEffectWithoutRetainingOldRules) {
     EXPECT_TRUE(policy.Blocked(context));
-    policy.UpdateRule(tag, MakeRules({::rule::DetectRule{
+    policy.UpdateRule(tag, MakeRules({::common::DetectRule{
         .Pattern = std::regex("replacement\\.example"),
     }}));
     EXPECT_FALSE(policy.Blocked(context));
@@ -68,7 +68,7 @@ TEST_F(RuleLifecycle, RouteOnlyAndOriginalTargetsCannotBypassBlocking) {
 }
 
 TEST_F(RuleLifecycle, ResolvedAddressCannotBypassIpBlocking) {
-    policy.UpdateRule(tag, MakeRules({::rule::DetectRule{
+    policy.UpdateRule(tag, MakeRules({::common::DetectRule{
         .Pattern = std::regex("192\\.0\\.2\\.99"),
     }}));
     context.outbound.target = ::common::TargetAddress("allowed.example", 443);

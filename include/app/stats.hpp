@@ -260,9 +260,9 @@ private:
 }  // namespace app
 
 
-namespace session {
+namespace common {
 struct Traffic;
-}  // namespace session
+}  // namespace common
 
 namespace app {
 
@@ -297,7 +297,7 @@ public:
         ActiveSession* prev = nullptr;
         ActiveSession* next = nullptr;
         int64_t user_id = 0;
-        session::Traffic* traffic = nullptr;
+        common::Traffic* traffic = nullptr;
         uint64_t last_reported_up = 0;
         uint64_t last_reported_down = 0;
         // 非空即已挂入 bucket 的活跃链表。
@@ -317,7 +317,7 @@ public:
     void RegisterActiveSession(ActiveSession& node,
                                std::string_view tag,
                                int64_t user_id,
-                               session::Traffic& traffic);
+                               common::Traffic& traffic);
 
     void UnregisterActiveSession(ActiveSession& node) noexcept;
 

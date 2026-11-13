@@ -26,7 +26,7 @@ bool AcquireDeviceCount(Map& devices,
     bool tag_inserted = false;
     if (tag_it == devices.end()) {
         std::tie(tag_it, tag_inserted) =
-            devices.try_emplace(TagKey(tag, devices.get_allocator()));
+            devices.try_emplace(TagKey(tag));
     }
     try {
         auto [user_it, user_inserted] = tag_it->second.try_emplace(user_id);
@@ -40,7 +40,7 @@ bool AcquireDeviceCount(Map& devices,
                     if (tag_inserted && tag_it->second.empty()) devices.erase(tag_it);
                     return false;
                 }
-                all_ips.emplace(IpKey(ip, all_ips.get_allocator()), 1u);
+                all_ips.emplace(IpKey(ip), 1u);
             }
         } catch (...) {
             if (user_inserted && user_it->second.empty()) tag_it->second.erase(user_it);
@@ -79,12 +79,12 @@ void ReleaseDeviceCount(Map& devices,
 }
 
 struct DeviceQuota {
-    using IpMap = std::pmr::unordered_map<std::pmr::string, uint32_t,
-                                         TransparentStringHash, TransparentStringEq>;
-    using Users = std::pmr::unordered_map<uint64_t, IpMap>;
-    std::pmr::unordered_map<std::pmr::string, Users,
-                            TransparentStringHash, TransparentStringEq>
-        devices{memory::process_resource()};
+    using IpMap = std::unordered_map<std::string, uint32_t,
+                                     TransparentStringHash, TransparentStringEq>;
+    using Users = std::unordered_map<uint64_t, IpMap>;
+    std::unordered_map<std::string, Users,
+                       TransparentStringHash, TransparentStringEq>
+        devices;
 
     void Release(std::string_view tag, uint64_t user, std::string_view ip) noexcept {
         ReleaseDeviceCount(devices, tag, user, ip);
@@ -111,9 +111,7 @@ struct DeviceReturn final : app::GroupCoordinator::ReservedOperation {
 
 } // namespace
 
-}  // namespace common
-
-struct common::UserOnlineTracker::DeviceReservation {
+struct UserOnlineTracker::DeviceReservation {
     std::unique_ptr<DeviceReturn> node;
     ~DeviceReservation() {
         if (node && node->admitted) {
@@ -123,7 +121,6 @@ struct common::UserOnlineTracker::DeviceReservation {
     }
 };
 
-namespace common {
 
 void UserOnlineSessionGuard::Reset() noexcept {
     if (auto* tracker = std::exchange(tracker_, nullptr)) {

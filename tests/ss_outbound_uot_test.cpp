@@ -2,13 +2,12 @@
 
 #include "infra/config.hpp"
 #include "proxy/uot/uot.hpp"
-
 #include <string_view>
 
 namespace {
 
-std::optional<proxy::uot::Version> Parse(std::string_view fields) {
-    auto source = json::parse(fields, json::KeyComparison::AsciiCaseInsensitive);
+std::optional<proxy::UotVersion> Parse(std::string_view fields) {
+    auto source = infra::parse(fields, infra::KeyComparison::AsciiCaseInsensitive);
     source.as_object()["address"] = "example.com";
     source.as_object()["password"] = "secret";
     return std::get<infra::ShadowsocksSettings>(
@@ -16,7 +15,7 @@ std::optional<proxy::uot::Version> Parse(std::string_view fields) {
 }
 
 TEST(SsOutboundUot, ExplicitVersionsAreNormalized) {
-    using proxy::uot::Version;
+    using Version = proxy::UotVersion;
     EXPECT_EQ(Parse(R"({"uot":true,"uotVersion":1})"), Version::V1);
     EXPECT_EQ(Parse(R"({"uot":true,"uotVersion":2})"), Version::V2);
     EXPECT_EQ(Parse(R"({"uot":{"enabled":true,"version":2}})"), Version::V2);

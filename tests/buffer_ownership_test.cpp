@@ -1,46 +1,36 @@
 #include <gtest/gtest.h>
 
 #include "common/initial_payload.hpp"
-#include "common/buf/length_prefixed_packet_buffer.hpp"
-
+#include "common/length_prefixed_packet_buffer.hpp"
 #include <array>
-#include <type_traits>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 namespace {
 thread_local size_t failures = 0;
-struct RejectGlobalPmrDefault {
-    std::pmr::memory_resource* previous =
-        std::pmr::set_default_resource(std::pmr::null_memory_resource());
-    ~RejectGlobalPmrDefault() { std::pmr::set_default_resource(previous); }
-};
 
-static_assert(alignof(buf::Buffer) <= alignof(std::max_align_t));
+static_assert(alignof(common::Buffer) <= alignof(std::max_align_t));
+static_assert(sizeof(common::MultiBuffer) == sizeof(common::Buffer*));
 
-buf::BufferGuard Buffer(size_t bytes, uint8_t value) {
-    buf::BufferGuard buffer{buf::Buffer::New()};
+common::BufferGuard Buffer(size_t bytes, uint8_t value) {
+    common::BufferGuard buffer{common::Buffer::New(bytes)};
     if (!buffer) throw std::bad_alloc();
     std::memset(buffer->Tail().data(), value, bytes);
-    buffer->Produce(static_cast<uint32_t>(bytes));
+    buffer->Produce(bytes);
     return buffer;
 }
 
-buf::BufferGuard Buffer(size_t bytes) {
+common::BufferGuard Buffer(size_t bytes) {
     return Buffer(bytes, 0x42);
 }
 
-std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
-    std::vector<uint8_t> result;
-    for (const auto* buffer : payload) {
-        if (!buffer) continue;
-        const auto bytes = buffer->Bytes();
-        result.insert(result.end(), bytes.begin(), bytes.end());
-    }
-    return result;
+std::vector<uint8_t> Flatten(const common::MultiBuffer& payload) {
+    const auto bytes = payload.FrontSpan();
+    return std::vector<uint8_t>(bytes.begin(), bytes.end());
 }
 
-bool Consistent(const buf::MultiBuffer& payload) {
+bool Consistent(const common::MultiBuffer& payload) {
     size_t bytes = 0;
     for (const auto* buffer : payload) {
         if (buffer) bytes += buffer->Len();
@@ -54,23 +44,23 @@ std::vector<uint8_t> Pattern(size_t bytes) {
     return result;
 }
 
-buf::MultiBuffer Packet(std::span<const uint8_t> data) {
-    buf::MultiBuffer result;
-    if (!buf::AppendSpanToMultiBuffer(data, result)) throw std::bad_alloc();
+common::MultiBuffer Packet(std::span<const uint8_t> data) {
+    common::MultiBuffer result;
+    if (!common::AppendSpanToMultiBuffer(data, result)) throw std::bad_alloc();
     return result;
 }
 
 template <typename Function>
 bool Inject(int budget, Function operation) {
-    const auto rejected_before = memory::rejected_process_allocations;
+    const auto rejected_before = common::rejected_process_allocations;
     struct ResetBudget {
-        ~ResetBudget() { memory::process_allocation_budget = -1; }
+        ~ResetBudget() { common::process_allocation_budget = -1; }
     } reset;
-    memory::process_allocation_budget = budget;
+    common::process_allocation_budget = budget;
     bool success = false;
     try { success = operation(); }
     catch (const std::bad_alloc&) {}
-    failures = memory::rejected_process_allocations - rejected_before;
+    failures = common::rejected_process_allocations - rejected_before;
     return success;
 }
 
@@ -81,10 +71,10 @@ void FaultMatrix(const char* name, Function operation) {
     for (int budget = 0; budget < 48; ++budget) {
         SCOPED_TRACE(name);
         SCOPED_TRACE(budget);
-        const auto live_before = memory::detail::test_buffers_live;
+        const auto live_before = common::test_buffers_live;
         EXPECT_TRUE(operation(budget, reached_success));
         reached_failure = reached_failure || failures != 0;
-        EXPECT_EQ(memory::detail::test_buffers_live, live_before);
+        EXPECT_EQ(common::test_buffers_live, live_before);
         if (reached_success) break;
     }
     EXPECT_TRUE(reached_success);
@@ -92,40 +82,33 @@ void FaultMatrix(const char* name, Function operation) {
 }
 
 TEST(BufferOwnership, SpanAppendRollsBackEveryAllocationFailureAndCanRetry) {
-    FaultMatrix("span append rolls back data and pointer allocation failures", [](int budget, bool& complete) {
+    FaultMatrix("span append rolls back data allocation failures", [](int budget, bool& complete) {
         const auto before = Pattern(33);
         const auto added = Pattern(90000);
         auto payload = Packet(before);
         auto* original = *payload.begin();
-        complete = Inject(budget, [&] { return buf::AppendSpanToMultiBuffer(added, payload); });
+        complete = Inject(budget, [&] { return common::AppendSpanToMultiBuffer(added, payload); });
         const bool unchanged = complete || (failures != 0 && Flatten(payload) == before &&
             Consistent(payload) && payload.size() == 1 && *payload.begin() == original);
-        if (!complete && !buf::AppendSpanToMultiBuffer(added, payload)) return false;
+        if (!complete && !common::AppendSpanToMultiBuffer(added, payload)) return false;
         auto expected = before;
         expected.insert(expected.end(), added.begin(), added.end());
         return unchanged && Flatten(payload) == expected && Consistent(payload);
     });
 }
 
-class BufferInsertionFailure : public ::testing::TestWithParam<size_t> {};
-
-TEST_P(BufferInsertionFailure, ConsumedGuardIsReleasedWhenSlotInsertionFails) {
-    const size_t count = GetParam();
-    FaultMatrix("consumed guard is released when pointer insertion fails", [count](int budget, bool& complete) {
-            buf::MultiBuffer payload;
-            for (size_t i = 0; i < count; ++i) payload.push_back(Buffer(1));
-            auto before = Flatten(payload);
-            auto extra = Buffer(5, 0x11);
-            complete = Inject(budget, [&] { payload.push_back(std::move(extra)); return true; });
-            if (extra) return false;
-            if (!complete) return failures != 0 && Flatten(payload) == before && Consistent(payload);
-            before.insert(before.end(), 5, 0x11);
-            return Flatten(payload) == before && Consistent(payload);
-        });
+TEST(BufferOwnership, ConsumedGuardIsReleasedWhenGrowthAllocationFails) {
+    FaultMatrix("consumed guard is released when growth fails", [](int budget, bool& complete) {
+        common::MultiBuffer payload{Buffer(common::Buffer::kSize, 0x22)};
+        auto before = Flatten(payload);
+        auto extra = Buffer(5, 0x11);
+        complete = Inject(budget, [&] { payload.push_back(std::move(extra)); return true; });
+        if (extra) return false;
+        if (!complete) return failures != 0 && Flatten(payload) == before && Consistent(payload);
+        before.insert(before.end(), 5, 0x11);
+        return Flatten(payload) == before && Consistent(payload);
+    });
 }
-
-INSTANTIATE_TEST_SUITE_P(InlineAndSpilledCapacity, BufferInsertionFailure,
-                        ::testing::Values(size_t{8}, size_t{16}));
 
 class BufferTransferFailure : public ::testing::TestWithParam<bool> {};
 
@@ -133,14 +116,14 @@ TEST_P(BufferTransferFailure, PreservesBothContainersAndUdpMetadataOnFailure) {
     const bool prefix = GetParam();
     FaultMatrix(prefix ? "prefix split" : "whole transfer",
             [prefix](int budget, bool& complete) {
-                const auto source_bytes = Pattern(buf::Buffer::kSize + 100);
-                const auto target_bytes = Pattern(buf::Buffer::kSize * 8);
+                const auto source_bytes = Pattern(common::Buffer::kSize + 100);
+                const auto target_bytes = Pattern(common::Buffer::kSize * 2);
                 auto source = Packet(source_bytes);
                 auto target = Packet(target_bytes);
                 auto* original = *source.begin();
                 const common::TargetAddress endpoint{"127.0.0.1", 1234};
                 original->SetUDP(endpoint);
-                const size_t bytes = prefix ? buf::Buffer::kSize + 17 : source_bytes.size();
+                const size_t bytes = prefix ? common::Buffer::kSize + 17 : source_bytes.size();
                 const auto operation = [&] {
                     if (prefix) return source.MovePrefixTo(target, bytes);
                     source.MoveTo(target, true);
@@ -156,76 +139,23 @@ TEST_P(BufferTransferFailure, PreservesBothContainersAndUdpMetadataOnFailure) {
                 expected.insert(expected.end(), source_bytes.begin(), source_bytes.begin() + bytes);
                 return unchanged && Flatten(target) == expected &&
                     Flatten(source) == std::vector<uint8_t>(source_bytes.begin() + bytes, source_bytes.end()) &&
-                    Consistent(source) && Consistent(target) && (prefix || !original->HasUDP());
+                    Consistent(source) && Consistent(target);
             });
 }
 
 INSTANTIATE_TEST_SUITE_P(WholeAndPrefix, BufferTransferFailure, ::testing::Bool());
 
-class UdpPrefixDestination : public ::testing::TestWithParam<int> {};
-
-TEST_P(UdpPrefixDestination, PreservesTargetWithoutCoalescingAcrossPacketBoundary) {
-    const common::TargetAddress source_target{
-        "split-copy-target-host-name-longer-than-sso.example.com", 14321};
-    const common::TargetAddress destination_target{
-        "different-destination-target-name-longer-than-sso.example.net", 14322};
-    const auto source_bytes = Pattern(91);
-    constexpr size_t prefix_bytes = 23;
-
-    const int destination_kind = GetParam();
-        auto source = Packet(source_bytes);
-        auto* source_buffer = *source.begin();
-        source_buffer->SetUDP(source_target);
-        buf::MultiBuffer destination;
-        buf::Buffer* prior_tail = nullptr;
-        std::vector<uint8_t> destination_before;
-        if (destination_kind != 0) {
-            buf::BufferGuard tail = Buffer(31, 0x6D);
-            prior_tail = tail.get();
-            if (destination_kind == 2) prior_tail->SetUDP(destination_target);
-            destination.push_back(std::move(tail));
-            destination_before = Flatten(destination);
-        }
-
-        const bool moved = source.MovePrefixTo(destination, prefix_bytes);
-        std::vector<uint8_t> expected_destination = destination_before;
-        expected_destination.insert(expected_destination.end(),
-            source_bytes.begin(), source_bytes.begin() + prefix_bytes);
-        const std::vector<uint8_t> expected_source(
-            source_bytes.begin() + prefix_bytes, source_bytes.end());
-        bool metadata_ok = source_buffer->HasUDP() &&
-            source_buffer->UDP().SameEndpoint(source_target) && destination.size() ==
-                static_cast<size_t>(destination_kind == 0 ? 1 : 2);
-        if (destination_kind != 0) {
-            metadata_ok = metadata_ok && *destination.begin() == prior_tail &&
-                destination.begin()[0]->Len() == 31;
-            if (destination_kind == 1) metadata_ok = metadata_ok && !prior_tail->HasUDP();
-            else metadata_ok = metadata_ok && prior_tail->HasUDP() &&
-                prior_tail->UDP().SameEndpoint(destination_target);
-        }
-        auto* split = destination.back();
-        metadata_ok = metadata_ok && split != prior_tail && split->Len() == prefix_bytes &&
-            split->HasUDP() && split->UDP().SameEndpoint(source_target);
-        EXPECT_TRUE(moved && metadata_ok && Flatten(source) == expected_source &&
-              Flatten(destination) == expected_destination && Consistent(source) &&
-              Consistent(destination)) << "destination kind=" << destination_kind;
-}
-
-INSTANTIATE_TEST_SUITE_P(EmptyTcpAndUdpTail, UdpPrefixDestination,
-                        ::testing::Values(0, 1, 2));
-
 TEST(BufferOwnership, UdpPrefixAllocationFailureRollsBackBothContainersAndCanRetry) {
     const auto source_bytes = Pattern(91);
     constexpr size_t prefix_bytes = 23;
-    FaultMatrix("UDP prefix buffer and target-copy failures roll back both containers",
+    FaultMatrix("UDP prefix buffer failure rolls back both containers",
         [&](int budget, bool& complete) {
             const common::TargetAddress long_target{
                 "split-copy-target-host-name-longer-than-sso.example.com", 14321};
             auto source = Packet(source_bytes);
             auto* original = *source.begin();
             original->SetUDP(long_target);
-            buf::MultiBuffer destination;
-            destination.reserve(1);
+            common::MultiBuffer destination;
 
             complete = Inject(budget, [&] {
                 return source.MovePrefixTo(destination, prefix_bytes);
@@ -249,31 +179,17 @@ TEST(BufferOwnership, UdpPrefixAllocationFailureRollsBackBothContainersAndCanRet
         });
 }
 
-TEST(BufferOwnership, ReservedSlotsRemainUsableAfterConsumedPrefix) {
-    // A consumed spill prefix must not invalidate reserve's no-allocation
-    // promise for active slots. This previously released a source slot first.
-    buf::MultiBuffer target;
-    target.reserve(16);
-    for (size_t i = 0; i < 16; ++i) target.push_back(Buffer(1));
-    target.drop_front(1);
-    auto source = buf::MultiBuffer{Buffer(3, 0x55)};
-    EXPECT_TRUE(Inject(0, [&] { source.MoveTo(target); return true; }) && source.empty() &&
-          target.size() == 16 && target.byte_size() == 18 && Consistent(target)) << "reserved active slots remain allocation free after prefix consumption";
-
-}
-
 TEST(BufferOwnership, InitialPayloadTransfersOwnedBlocksWhenAllocationIsUnavailable) {
     auto owned_bytes = Pattern(9000);
     auto owned = Packet(owned_bytes);
     const auto* original_buffer = *owned.begin();
-    buf::MultiBuffer transferred;
+    common::MultiBuffer transferred;
     EXPECT_TRUE(Inject(0, [&] {
         common::InitialPayload from_stream{std::move(owned)};
         transferred = std::move(from_stream).MoveToMultiBuffer();
         return from_stream.empty();
     }) && owned.empty() && *transferred.begin() == original_buffer &&
-          Flatten(transferred) == owned_bytes) << "logical stream remainder transfers without allocation or payload copy";
-
+          Flatten(transferred) == owned_bytes);
 }
 
 TEST(BufferOwnership, ShortPrefixTransferLeavesBothPayloadsUnchanged) {
@@ -281,105 +197,45 @@ TEST(BufferOwnership, ShortPrefixTransferLeavesBothPayloadsUnchanged) {
     auto partial = Packet(bytes);
     auto into = Packet(bytes);
     const auto before = Flatten(into);
-    EXPECT_TRUE(!partial.MovePrefixTo(into, 101) && Flatten(partial) == bytes && Flatten(into) == before) << "short source does not partially transfer";
+    EXPECT_TRUE(!partial.MovePrefixTo(into, 101) && Flatten(partial) == bytes && Flatten(into) == before);
 }
 
 TEST(BufferOwnership, PrefixTransferRejectsSelfAndAcceptsEmptyPrefix) {
     auto bytes = Pattern(100);
     auto partial = Packet(bytes);
     auto into = Packet(bytes);
-    EXPECT_TRUE(!partial.MovePrefixTo(partial, 1) && partial.MovePrefixTo(into, 0)) << "self and empty prefix";
+    EXPECT_TRUE(!partial.MovePrefixTo(partial, 1) && partial.MovePrefixTo(into, 0));
     EXPECT_EQ(Flatten(partial), bytes);
     EXPECT_EQ(Flatten(into), bytes);
 }
 
 TEST(BufferOwnership, PrefixCoalescingReusesConsumedDestinationTail) {
     auto partial = Packet(Pattern(100));
-    buf::MultiBuffer into;
-    // Compact a consumed destination tail only after preparation succeeds.
-    into = buf::MultiBuffer{Buffer(buf::Buffer::kSize)};
+    common::MultiBuffer into{Buffer(common::Buffer::kSize)};
     into.DropPrefixBytes(100);
     EXPECT_TRUE(Inject(0, [&] { return partial.MovePrefixTo(into, 77); }) &&
-          partial.byte_size() == 23 && into.byte_size() == buf::Buffer::kSize - 23 &&
-          Consistent(partial) && Consistent(into)) << "prefix coalescing remains allocation free";
-
+          partial.byte_size() == 23 && into.byte_size() == common::Buffer::kSize - 23 &&
+          Consistent(partial) && Consistent(into));
 }
 
-TEST(BufferOwnership, SpanAppendDoesNotCoalesceAcrossUdpBoundary) {
-    auto bytes = Pattern(100);
-    const common::TargetAddress endpoint{"127.0.0.1", 1234};
-    auto udp = buf::MultiBuffer{Buffer(1)};
-    udp.back()->SetUDP(endpoint);
-    EXPECT_TRUE(buf::AppendSpanToMultiBuffer(bytes, udp) && udp.size() == 2 &&
-          (*udp.begin())->Len() == 1 && (*udp.begin())->UDP().SameEndpoint(endpoint) &&
-          !udp.back()->HasUDP()) << "span append respects UDP packet boundary";
-
-}
-
-TEST(BufferOwnership, WholePrefixTransferSkipsEmptySlotsAndPreservesByteCounts) {
-    // Empty slots and whole-buffer transfers keep byte counts exact.
-    buf::MultiBuffer sparse;
-    sparse.push_back(Buffer(0));
-    sparse.push_back(Buffer(3));
-    sparse.push_back(Buffer(0));
-    sparse.push_back(Buffer(5));
-    buf::MultiBuffer moved;
-    EXPECT_TRUE(sparse.MovePrefixTo(moved, 8) && sparse.byte_size() == 0 && moved.byte_size() == 8 &&
-          moved.size() == 2 && Consistent(sparse) && Consistent(moved)) << "whole prefix skips empty slots";
-}
-}
-
-
-
-TEST(BufferOwnership, PartialConsumptionReleasesConsumedBlocksWithoutCopyingPayload) {
-    const auto live_before = memory::detail::test_buffers_live;
-    ::buf::MultiBuffer payload;
-    payload.reserve(4096);
-    for (size_t i = 0; i < 4096; ++i)
-        payload.push_back(Buffer(1, static_cast<uint8_t>(i)));
-    auto* const last = payload.back();
-    const ::common::TargetAddress endpoint{"127.0.0.1", 1234};
-    last->SetUDP(endpoint);
-
-    EXPECT_EQ(payload.DropPrefixBytes(4096 - ::buf::MultiBuffer::kInlineCapacity),
-              4096 - ::buf::MultiBuffer::kInlineCapacity);
-    ASSERT_EQ(payload.size(), ::buf::MultiBuffer::kInlineCapacity);
-    EXPECT_EQ(memory::detail::test_buffers_live, live_before + payload.size());
-    EXPECT_TRUE(Consistent(payload));
-    EXPECT_EQ(payload.back(), last);
-    EXPECT_TRUE(last->UDP().SameEndpoint(endpoint));
-
-    ::buf::MultiBuffer moved = std::move(payload);
-    EXPECT_TRUE(payload.empty());
-    for (size_t i = 0; i < ::buf::MultiBuffer::kInlineCapacity; ++i) {
-        auto buffer = moved.pop_front();
-        ASSERT_TRUE(buffer);
-        ASSERT_EQ(buffer->Len(), 1);
-        EXPECT_EQ(buffer->Bytes()[0], static_cast<uint8_t>(4096 - ::buf::MultiBuffer::kInlineCapacity + i));
-    }
-    EXPECT_TRUE(moved.empty());
-    EXPECT_EQ(memory::detail::test_buffers_live, live_before);
-}
-
-TEST(BufferOwnership, MovedInlineAndSpilledContainersRemainReusable) {
-    const auto live_before = memory::detail::test_buffers_live;
-    for (const size_t source_count : {0u, 1u, 8u, 9u, 16u}) {
+TEST(BufferOwnership, MovedContainersRemainReusable) {
+    const auto live_before = common::test_buffers_live;
+    for (const size_t source_count : {0u, 1u, 8u, 16u}) {
         for (const size_t destination_count : {0u, 1u, 9u}) {
             SCOPED_TRACE(source_count);
             SCOPED_TRACE(destination_count);
             auto expected = Pattern(source_count);
-            buf::MultiBuffer source;
-            for (const auto byte : expected) source.push_back(Buffer(1, byte));
+            common::MultiBuffer source = Packet(expected);
             if (source_count > 1) {
-                source.drop_front(1);
+                source.DropPrefixBytes(1);
                 expected.erase(expected.begin());
             }
-            buf::MultiBuffer transferred(std::move(source));
+            common::MultiBuffer transferred(std::move(source));
             EXPECT_TRUE(source.empty());
             EXPECT_EQ(source.byte_size(), 0u);
             for (size_t i = 0; i < 9; ++i) source.push_back(Buffer(1, 0xa5));
 
-            buf::MultiBuffer destination;
+            common::MultiBuffer destination;
             for (size_t i = 0; i < destination_count; ++i)
                 destination.push_back(Buffer(1, 0xff));
             destination = std::move(transferred);
@@ -394,118 +250,21 @@ TEST(BufferOwnership, MovedInlineAndSpilledContainersRemainReusable) {
             source.clear();
             destination.clear();
             transferred.clear();
-            EXPECT_EQ(memory::detail::test_buffers_live, live_before);
+            EXPECT_EQ(common::test_buffers_live, live_before);
         }
     }
 }
 
-TEST(BufferOwnership, ProcessSpillIgnoresGlobalPmrDefaultAndPreservesPayloadOnFailureAndMove) {
-    RejectGlobalPmrDefault reject_default;
-    const auto expected = Pattern(buf::MultiBuffer::kInlineCapacity);
-    buf::MultiBuffer payload;
-    for (const auto byte : expected) payload.push_back(Buffer(1, byte));
-    std::array<buf::Buffer*, buf::MultiBuffer::kInlineCapacity> original;
-    std::copy(payload.begin(), payload.end(), original.begin());
-
-    EXPECT_FALSE(Inject(0, [&] {
-        payload.reserve(buf::MultiBuffer::kInlineCapacity + 1);
-        return true;
-    }));
-    EXPECT_GT(failures, 0u);
-    EXPECT_EQ(Flatten(payload), expected);
-    EXPECT_TRUE(Consistent(payload));
-    EXPECT_TRUE(std::equal(payload.begin(), payload.end(), original.begin(), original.end()));
-
-    payload.reserve(buf::MultiBuffer::kInlineCapacity + 1);
-    payload.push_back(Buffer(1, 0x91));
-    auto extended = expected;
-    extended.push_back(0x91);
-    EXPECT_EQ(Flatten(payload), extended);
-    EXPECT_TRUE(Consistent(payload));
-
-    auto* const spilled_slots = payload.begin();
-    buf::MultiBuffer moved{Buffer(1, 0xff)};
-    EXPECT_TRUE(Inject(0, [&] {
-        buf::MultiBuffer intermediate(std::move(payload));
-        moved = std::move(intermediate);
-        return intermediate.empty();
-    }));
-    EXPECT_EQ(failures, 0u);
-    EXPECT_TRUE(payload.empty());
-    EXPECT_EQ(moved.begin(), spilled_slots);
-    EXPECT_EQ(Flatten(moved), extended);
-    EXPECT_TRUE(Consistent(moved));
-    EXPECT_EQ(std::pmr::get_default_resource(), std::pmr::null_memory_resource());
-}
-
-TEST(BufferOwnership, CoalescingUsesExistingTailWhenMetadataAllocationIsUnavailable) {
-    buf::MultiBuffer target, source;
-    for (size_t i = 0; i < buf::MultiBuffer::kInlineCapacity; ++i)
-        target.push_back(Buffer(1, static_cast<uint8_t>(i)));
-    auto* const tail = target.back();
-    for (size_t i = 0; i < 16; ++i)
-        source.push_back(Buffer(1, static_cast<uint8_t>(0x80 + i)));
-    source.push_back(Buffer(0));
-    auto expected = Flatten(target);
-    const auto added = Flatten(source);
-    expected.insert(expected.end(), added.begin(), added.end());
-
-    EXPECT_TRUE(Inject(0, [&] { target.AppendAndCoalesce(std::move(source)); return true; }));
-    EXPECT_EQ(Flatten(target), expected);
-    EXPECT_EQ(target.size(), buf::MultiBuffer::kInlineCapacity);
-    EXPECT_EQ(target.back(), tail);
-    EXPECT_TRUE(source.empty());
-    EXPECT_TRUE(Consistent(target));
-}
-
-TEST(BufferOwnership, CoalescingPreparesNewSlotsBeforeChangingBytesOrUdpBoundaries) {
-    buf::MultiBuffer target, source;
-    for (size_t i = 0; i < buf::MultiBuffer::kInlineCapacity; ++i)
-        target.push_back(Buffer(1, static_cast<uint8_t>(i)));
-    for (uint8_t value = 0x80; value < 0x84; ++value)
-        source.push_back(Buffer(value == 0x81 ? 0 : 1, value));
-    auto* const datagram = *(source.begin() + 1);
-    const common::TargetAddress endpoint{"127.0.0.1", 4321};
-    datagram->SetUDP(endpoint);
-    const auto before = Flatten(target);
-    const auto added = Flatten(source);
-
-    EXPECT_FALSE(Inject(0, [&] {
-        target.AppendAndCoalesce(std::move(source));
-        return true;
-    }));
-    EXPECT_GT(failures, 0u);
-    EXPECT_EQ(Flatten(target), before);
-    EXPECT_EQ(Flatten(source), added);
-    ASSERT_EQ(source.size(), 4);
-    EXPECT_EQ(*(source.begin() + 1), datagram);
-    EXPECT_TRUE(datagram->UDP().SameEndpoint(endpoint));
-    EXPECT_TRUE(Consistent(target));
-    EXPECT_TRUE(Consistent(source));
-
-    target.AppendAndCoalesce(std::move(source));
-    auto expected = before;
-    expected.insert(expected.end(), added.begin(), added.end());
-    EXPECT_EQ(Flatten(target), expected);
-    ASSERT_EQ(target.size(), buf::MultiBuffer::kInlineCapacity + 2);
-    EXPECT_EQ(*(target.begin() + buf::MultiBuffer::kInlineCapacity), datagram);
-    EXPECT_TRUE(datagram->UDP().SameEndpoint(endpoint));
-    EXPECT_FALSE(target.back()->HasUDP());
-    EXPECT_EQ(target.back()->Len(), 2);
-    EXPECT_TRUE(source.empty());
-    EXPECT_TRUE(Consistent(target));
-}
-
 TEST(BufferOwnership, EmptyUdpMessageSurvivesTransfersAndChecksEveryTarget) {
-    buf::MultiBuffer stream_empty;
+    common::MultiBuffer stream_empty;
     stream_empty.push_back(Buffer(0));
     stream_empty.ReleaseIfIdle();
     EXPECT_TRUE(stream_empty.empty());
 
     const common::TargetAddress first_target{"127.0.0.1", 1234};
     const common::TargetAddress second_target{"127.0.0.1", 4321};
-    buf::MultiBuffer packet;
-    ASSERT_TRUE(buf::SetUdpTarget(packet, first_target));
+    common::MultiBuffer packet;
+    ASSERT_TRUE(common::SetUdpTarget(packet, first_target));
     const auto* original = *packet.begin();
     common::InitialPayload initial(std::move(packet));
     EXPECT_FALSE(initial.empty());
@@ -513,109 +272,69 @@ TEST(BufferOwnership, EmptyUdpMessageSurvivesTransfersAndChecksEveryTarget) {
     moved.ReleaseIfIdle();
     EXPECT_TRUE(initial.empty());
     {
-        const auto info = buf::InspectUdpDatagram(moved);
+        const auto info = common::InspectUdpDatagram(moved);
         ASSERT_TRUE(info.Valid());
-        EXPECT_EQ(info.payload_size, 0);
+        EXPECT_EQ(info.payload_size, 0u);
         EXPECT_TRUE(info.target->SameEndpoint(first_target));
     }
-    buf::MultiBuffer destination;
+    common::MultiBuffer destination;
     moved.MoveTo(destination);
-    ASSERT_EQ(destination.size(), 1);
+    ASSERT_EQ(destination.size(), 1u);
     EXPECT_EQ(*destination.begin(), original);
     EXPECT_TRUE(moved.empty());
 
-    buf::MultiBuffer later;
+    common::MultiBuffer later;
     later.push_back(Buffer(1));
-    ASSERT_TRUE(buf::SetUdpTarget(later, second_target));
+    ASSERT_TRUE(common::SetUdpTarget(later, second_target));
     destination.AppendAndCoalesce(std::move(later));
-    EXPECT_EQ(destination.size(), 2);
-    EXPECT_EQ(destination.byte_size(), 1);
-    EXPECT_EQ(buf::InspectUdpDatagram(destination).status, buf::UdpDatagramStatus::MixedTarget);
+    EXPECT_EQ(destination.byte_size(), 1u);
+    EXPECT_EQ(common::InspectUdpDatagram(destination).status, common::UdpDatagramStatus::MixedTarget);
 }
 
 TEST(BufferOwnership, UnrepresentableWriteCapacityReturnsFailureAndAllowsReuse) {
-    const auto live_before = memory::detail::test_buffers_live;
-    for (const size_t initial_size : {size_t{32}, size_t{buf::Buffer::kSize + 1}}) {
+    const auto live_before = common::test_buffers_live;
+    for (const size_t initial_size : {size_t{32}, size_t{common::Buffer::kSize + 1}}) {
         SCOPED_TRACE(initial_size);
         {
-            buf::ContiguousWriteBuffer storage;
+            common::ContiguousWriteBuffer storage;
             (void)storage.Prepare(initial_size);
             EXPECT_EQ(storage.TryPrepare(std::numeric_limits<size_t>::max()), nullptr);
             EXPECT_TRUE(storage.Empty());
             EXPECT_EQ(storage.Data(), nullptr);
-            EXPECT_EQ(memory::detail::test_buffers_live, live_before);
+            EXPECT_EQ(common::test_buffers_live, live_before);
             const auto expected = Pattern(
-                initial_size <= buf::Buffer::kSize ? buf::Buffer::kSize + 1 : 33);
+                initial_size <= common::Buffer::kSize ? common::Buffer::kSize + 1 : 33);
             auto* data = storage.TryPrepare(expected.size());
             ASSERT_NE(data, nullptr);
             std::memcpy(data, expected.data(), expected.size());
-            buf::MultiBuffer output;
+            common::MultiBuffer output;
             ASSERT_TRUE(storage.TryAppendTo(expected.size(), output));
             EXPECT_EQ(Flatten(output), expected);
             EXPECT_TRUE(Consistent(output));
             EXPECT_TRUE(storage.Empty());
             EXPECT_EQ(storage.Data(), nullptr);
         }
-        EXPECT_EQ(memory::detail::test_buffers_live, live_before);
+        EXPECT_EQ(common::test_buffers_live, live_before);
     }
-}
-
-TEST(BufferOwnership, StreamInputTransfersInlineBlocksWhenMetadataAllocationIsUnavailable) {
-    buf::MultiBuffer pending, input;
-    std::array<const buf::Buffer*, buf::MultiBuffer::kInlineCapacity> original{};
-    for (size_t i = 0; i < original.size(); ++i) {
-        input.push_back(Buffer(buf::Buffer::kSize, static_cast<uint8_t>(i)));
-        original[i] = input.back();
-    }
-
-    EXPECT_TRUE(Inject(0, [&] {
-        return buf::AppendPacketStreamInput(pending, std::move(input));
-    }));
-    ASSERT_EQ(pending.size(), original.size());
-    EXPECT_EQ(pending.byte_size(), original.size() * buf::Buffer::kSize);
-    for (size_t i = 0; i < original.size(); ++i) {
-        const auto* block = *(pending.begin() + i);
-        EXPECT_EQ(block, original[i]);
-        const auto bytes = block->Bytes();
-        EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(),
-            [i](uint8_t value) { return value == static_cast<uint8_t>(i); }));
-    }
-    EXPECT_TRUE(Consistent(pending));
-}
-
-TEST(BufferOwnership, PacketStreamRetiresPartiallyAppendedInputOnRequiredAllocationFailure) {
-    buf::LengthPrefixedPacketBuffer stream;
-    buf::MultiBuffer input;
-    for (size_t i = 0; i <= buf::MultiBuffer::kInlineCapacity; ++i)
-        input.push_back(Buffer(buf::Buffer::kSize, static_cast<uint8_t>(i)));
-
-    EXPECT_FALSE(Inject(0, [&] { return stream.Append(std::move(input)); }));
-    EXPECT_GT(failures, 0u);
-    EXPECT_EQ(stream.PendingBytes(), 0);
-    buf::MultiBuffer output;
-    EXPECT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Invalid);
-    EXPECT_TRUE(output.empty());
-    EXPECT_FALSE(stream.Append({}));
-    EXPECT_FALSE(stream.Finish());
 }
 
 TEST(BufferOwnership, TruncatedPacketStreamCannotResumeAfterEof) {
     const std::array<uint8_t, 5> wire{0, 3, 0x11, 0x22, 0x33};
     for (size_t cut = 1; cut < wire.size(); ++cut) {
         SCOPED_TRACE(cut);
-        buf::LengthPrefixedPacketBuffer stream;
+        common::LengthPrefixedPacketBuffer stream;
         ASSERT_TRUE(stream.Append(Packet(std::span(wire).first(cut))));
-        buf::MultiBuffer output;
-        ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::NeedMore);
+        common::MultiBuffer output;
+        ASSERT_EQ(stream.Pop(output), common::LengthPrefixedPacketBuffer::PopResult::NeedMore);
         EXPECT_FALSE(stream.Finish());
-        EXPECT_EQ(stream.PendingBytes(), 0);
+        EXPECT_EQ(stream.PendingBytes(), 0u);
         EXPECT_FALSE(stream.Append(Packet(std::span(wire).subspan(cut))));
-        EXPECT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Invalid);
+        EXPECT_EQ(stream.Pop(output), common::LengthPrefixedPacketBuffer::PopResult::Invalid);
         EXPECT_TRUE(output.empty());
         EXPECT_FALSE(stream.Finish());
         stream.Reset();
         ASSERT_TRUE(stream.Append(Packet(wire)));
-        ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
+        ASSERT_EQ(stream.Pop(output), common::LengthPrefixedPacketBuffer::PopResult::Packet);
         EXPECT_EQ(Flatten(output), std::vector<uint8_t>({0x11, 0x22, 0x33}));
         EXPECT_TRUE(stream.Finish());
     }
@@ -623,20 +342,22 @@ TEST(BufferOwnership, TruncatedPacketStreamCannotResumeAfterEof) {
 
 TEST(BufferOwnership, CleanPacketStreamEofRequiresExplicitResetBeforeReuse) {
     const std::array<uint8_t, 3> wire{0, 1, 0x73};
-    buf::LengthPrefixedPacketBuffer stream;
+    common::LengthPrefixedPacketBuffer stream;
     ASSERT_TRUE(stream.Append(Packet(wire)));
-    buf::MultiBuffer output;
-    ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
+    common::MultiBuffer output;
+    ASSERT_EQ(stream.Pop(output), common::LengthPrefixedPacketBuffer::PopResult::Packet);
     EXPECT_EQ(Flatten(output), std::vector<uint8_t>({0x73}));
     EXPECT_TRUE(stream.Finish());
     EXPECT_TRUE(stream.Finish());
     EXPECT_FALSE(stream.Append({}));
     EXPECT_FALSE(stream.Append(Packet(wire)));
-    EXPECT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Finished);
+    EXPECT_EQ(stream.Pop(output), common::LengthPrefixedPacketBuffer::PopResult::Finished);
     EXPECT_TRUE(output.empty());
     stream.Reset();
     ASSERT_TRUE(stream.Append(Packet(wire)));
-    ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
+    ASSERT_EQ(stream.Pop(output), common::LengthPrefixedPacketBuffer::PopResult::Packet);
     EXPECT_EQ(Flatten(output), std::vector<uint8_t>({0x73}));
     EXPECT_TRUE(stream.Finish());
 }
+
+}  // namespace

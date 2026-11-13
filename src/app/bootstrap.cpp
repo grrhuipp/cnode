@@ -5,23 +5,23 @@
 #include "api/api.hpp"
 #include "app/dns/dns.hpp"
 #include "app/prepared_inbound.hpp"
-#include "app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/user_store.hpp"
 #include "app/session_group_executor.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
+#include "app/router/router.hpp"
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/defaults.hpp"
-#include "core/constants.hpp"
+#include "common/constants.hpp"
 #include "geo/geodata.hpp"
 #include "infra/config.hpp"
 #include "infra/log.hpp"
 #include "common/error.hpp"
-#include "app/proxyman/outbound/handler.hpp"
-#include "service/controller/controller.hpp"
-#include "transport/internet/timeout_scheduler.hpp"
-#include "transport/internet/tls_stream.hpp"
-
+#include "app/proxyman/outbound_handler.hpp"
+#include "controller/controller.hpp"
+#include "transport/timeout_scheduler.hpp"
+#include "transport/tls_stream.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/executor_work_guard.hpp>
 #include <asio/post.hpp>
@@ -107,7 +107,7 @@ enum class ConfigPathMode {
 };
 
 struct CommandLineOptions {
-    std::string config_path = std::string(constants::paths::kDefaultConfigFile);
+    std::string config_path = std::string(common::kDefaultConfigFile);
     ConfigPathMode config_mode = ConfigPathMode::Auto;
     bool test_mode = false;
     CommandLineAction action = CommandLineAction::None;
@@ -184,7 +184,7 @@ bool ReadValue(
 void PrintUsage(std::ostream& out, std::string_view prog) {
     out << "Usage: " << prog << " [options]\n"
         << "  -c, --config <path>       Config file or directory (default: "
-        << constants::paths::kDefaultConfigFile << ")\n"
+        << common::kDefaultConfigFile << ")\n"
         << "      --config-file <file>  Load one config file; sidecars use its directory\n"
         << "  -C, --config-dir <dir>    Load config.json and sidecars from directory\n"
         << "  -t, --test                Test mode with built-in user\n"
@@ -192,10 +192,10 @@ void PrintUsage(std::ostream& out, std::string_view prog) {
         << "  -v, --version             Show version\n"
         << "\n"
         << "Directory mode reads: "
-        << constants::paths::kDefaultConfigFile << ", "
-        << constants::paths::kInboundFile << ", "
-        << constants::paths::kOutboundFile << ", "
-        << constants::paths::kRouteFile << "\n";
+        << common::kDefaultConfigFile << ", "
+        << common::kInboundFile << ", "
+        << common::kOutboundFile << ", "
+        << common::kRouteFile << "\n";
 }
 
 void PrintVersion(std::ostream& out) {
@@ -251,8 +251,8 @@ struct WorkerPool {
 
 struct BootstrapEnvironment {
     std::unique_ptr<net::io_context> main_ctx;
-    std::unique_ptr<app::dns::DNSWorker> dns_worker;
-    std::unique_ptr<app::dns::DNS> panel_dns_service;
+    std::unique_ptr<app::DNSWorker> dns_worker;
+    std::unique_ptr<app::DNS> panel_dns_service;
     std::unique_ptr<geo::GeoDatabase> geo_database;
     std::unique_ptr<ShardedStats> stats;
     WorkerPool worker_pool;
@@ -261,8 +261,8 @@ struct BootstrapEnvironment {
     bool enable_controller = false;
 };
 
-::app::dns::Config MakeDnsServiceConfig(const infra::Config& config) {
-    ::app::dns::Config dns_config;
+::app::DnsConfig MakeDnsServiceConfig(const infra::Config& config) {
+    ::app::DnsConfig dns_config;
     dns_config.servers     = config.dns.servers;
     dns_config.timeout_sec = config.dns.timeout;
     dns_config.cache_size  = config.dns.cache_size;
@@ -279,8 +279,8 @@ std::unique_ptr<geo::GeoDatabase> LoadGeoDatabase(const infra::Config& config) {
         return nullptr;
     }
 
-    const auto geoip_path   = config.config_dir / constants::paths::kGeoIpFile;
-    const auto geosite_path = config.config_dir / constants::paths::kGeoSiteFile;
+    const auto geoip_path   = config.config_dir / common::kGeoIpFile;
+    const auto geosite_path = config.config_dir / common::kGeoSiteFile;
     if (!geoip_tags.empty() && !std::filesystem::exists(geoip_path)) {
         throw std::runtime_error(std::format(
             "routing geoip tags require '{}'", geoip_path.string()));
@@ -302,7 +302,7 @@ uint32_t ComputePressureThreshold(const WorkerRuntimeConfig& config) {
     const uint32_t configured_max = config.limits.max_connections;
     const uint32_t workers = std::max<uint32_t>(1, config.workers);
     const uint64_t scaled_default = std::min<uint64_t>(
-        static_cast<uint64_t>(defaults::kMaxConnectionsPerWorker) * workers,
+        static_cast<uint64_t>(common::kMaxConnectionsPerWorker) * workers,
         std::numeric_limits<uint32_t>::max());
     uint32_t effective_max = static_cast<uint32_t>(scaled_default);
     if (configured_max > 0) {
@@ -314,21 +314,21 @@ uint32_t ComputePressureThreshold(const WorkerRuntimeConfig& config) {
     const uint32_t per_worker_max = effective_max / workers;
     return std::max<uint32_t>(
         1, static_cast<uint32_t>(
-               static_cast<uint64_t>(per_worker_max) * defaults::kPressurePercent / 100));
+               static_cast<uint64_t>(per_worker_max) * common::kPressurePercent / 100));
 }
 
 uint32_t ComputePressureIdleTimeout(const WorkerRuntimeConfig& config) {
-    return config.timeouts.idle > defaults::kPressureIdleTimeout
-        ? defaults::kPressureIdleTimeout
+    return config.timeouts.idle > common::kPressureIdleTimeout
+        ? common::kPressureIdleTimeout
         : 0;
 }
 
-std::vector<proxyman::outbound::PreparedOutboundConfig> PrepareStartupOutbounds(
+std::vector<PreparedOutboundConfig> PrepareStartupOutbounds(
     std::span<const infra::OutboundSourceConfig> sources) {
-    std::vector<proxyman::outbound::PreparedOutboundConfig> prepared;
+    std::vector<PreparedOutboundConfig> prepared;
     prepared.reserve(sources.size());
     for (const auto& raw_config : sources) {
-        auto item = proxyman::outbound::PrepareOutboundConfig(raw_config);
+        auto item = PrepareOutboundConfig(raw_config);
         if (!item) {
             throw std::invalid_argument(
                 "outbound '" + raw_config.tag + "' protocol '" +
@@ -342,11 +342,14 @@ std::vector<proxyman::outbound::PreparedOutboundConfig> PrepareStartupOutbounds(
 WorkerRuntimeConfig MakeWorkerRuntimeConfig(
     const infra::Config& config,
     infra::RoutingConfig routing,
-    std::vector<proxyman::outbound::PreparedOutboundConfig> outbounds) {
+    std::vector<PreparedOutboundConfig> outbounds,
+    geo::GeoDatabase* geo_database) {
     WorkerRuntimeConfig runtime_config;
     runtime_config.timeouts = config.timeouts;
     runtime_config.limits = config.limits;
     runtime_config.routing = std::move(routing);
+    runtime_config.router = std::make_shared<const app::Router>(
+        runtime_config.routing, geo_database);
     runtime_config.outbounds = std::move(outbounds);
     runtime_config.workers = config.workers;
     runtime_config.pressure_threshold = ComputePressureThreshold(runtime_config);
@@ -357,7 +360,7 @@ WorkerRuntimeConfig MakeWorkerRuntimeConfig(
 void SetupPanels(net::io_context& main_ctx,
                  controller::Controller& controller,
                  const infra::Config& config,
-                 app::dns::DNS& panel_dns_service) {
+                 app::DNS& panel_dns_service) {
     if (config.panels.empty()) {
         return;
     }
@@ -388,7 +391,7 @@ void SetupPanels(net::io_context& main_ctx,
     const WorkerRuntimeConfig& runtime_config,
     ShardedStats& stats,
     geo::GeoDatabase* geo_database,
-    app::dns::DNSWorker& dns_worker,
+    app::DNSWorker& dns_worker,
     net::io_context& control_io) {
     WorkerPool pool;
     const uint32_t workers = std::max<uint32_t>(1, runtime_config.workers);
@@ -417,7 +420,7 @@ void SetupPanels(net::io_context& main_ctx,
 [[nodiscard]] BootstrapEnvironment CreateBootstrapEnvironment(
     infra::Config config,
     bool test_mode) {
-    transport::internet::TlsStream::InitializeIo();
+    transport::TlsStream::InitializeIo();
     BootstrapEnvironment env;
     const bool enable_test_mode =
         test_mode || (config.panels.empty() && config.static_inbounds.empty());
@@ -426,19 +429,20 @@ void SetupPanels(net::io_context& main_ctx,
     constexpr int kMainIoConcurrencyHint =
         static_cast<int>(ASIO_CONCURRENCY_HINT_ID | ASIO_CONCURRENCY_HINT_LOCKING_SCHEDULER);
     env.main_ctx = std::make_unique<net::io_context>(kMainIoConcurrencyHint);
-    env.dns_worker = std::make_unique<app::dns::DNSWorker>(
-        *env.main_ctx, MakeDnsServiceConfig(config), defaults::kWorkerMailboxCapacity);
-    env.panel_dns_service = std::make_unique<app::dns::DNS>(*env.dns_worker);
+    env.dns_worker = std::make_unique<app::DNSWorker>(
+        *env.main_ctx, MakeDnsServiceConfig(config), common::kWorkerMailboxCapacity);
+    env.panel_dns_service = std::make_unique<app::DNS>(*env.dns_worker);
     // Geo tags are read from the routing rules before they move to the Workers.
     env.geo_database = LoadGeoDatabase(config);
     env.stats = std::make_unique<ShardedStats>(config.workers);
     const WorkerRuntimeConfig worker_runtime_config =
-        MakeWorkerRuntimeConfig(config, std::move(config.routing), std::move(outbounds));
+        MakeWorkerRuntimeConfig(config, std::move(config.routing), std::move(outbounds),
+                                env.geo_database.get());
     // Every source and protocol payload is prepared before one RCU publication
     // through the core shared with panel nodes. Workers do not exist yet: each
     // captures the committed snapshot when it is constructed below. These
     // borrowed references stay in this call.
-    std::vector<proxyman::inbound::UserStore::UserUpdate> user_updates;
+    std::vector<UserStore::UserUpdate> user_updates;
     user_updates.reserve(inbounds.size());
     for (const auto& inbound : inbounds) {
         user_updates.push_back({inbound.binding.tag, *inbound.users});
@@ -446,7 +450,7 @@ void SetupPanels(net::io_context& main_ctx,
     std::optional<PreparedUserPublication> user_publication;
     if (!user_updates.empty()) {
         user_publication = PrepareUserPublication(
-            proxyman::inbound::UserStore::PrepareUsers(user_updates), 0);
+            UserStore::PrepareUsers(user_updates), 0);
         user_publication->Commit();
     }
     for (auto& inbound : inbounds) {
@@ -461,14 +465,14 @@ void SetupPanels(net::io_context& main_ctx,
 
         SetupPanels(*env.main_ctx, *env.controller, config, *env.panel_dns_service);
         if (enable_test_mode) {
-            LOG_CONSOLE("Test mode enabled: port={}", constants::test::kTestPort);
+            LOG_CONSOLE("Test mode enabled: port={}", common::kTestPort);
         }
         env.inbound_startup = std::move(inbounds);
         env.enable_controller = !config.panels.empty();
         return env;
     } catch (...) {
         if (user_publication) {
-            proxyman::inbound::UserStore::CommitSnapshot(
+            UserStore::CommitSnapshot(
                 std::move(user_publication->rollback.previous));
         }
         throw;
@@ -693,12 +697,12 @@ public:
                     // collection is safe because it never releases live blocks.
                     co_await PostToEachWorker(env.main_ctx->get_executor(), idle_workers,
                         stopping, [](Worker& worker, size_t) {
-                            return worker.PostCall([] { memory::CollectThreadHeap(); });
+                            return worker.PostCall([] { common::CollectThreadHeap(); });
                         });
                     ThrowIfStopping(stopping);
                     for (const Worker* worker : idle_workers)
                         heap_states[worker->Id()].collected = true;
-                    memory::CollectThreadHeap();
+                    common::CollectThreadHeap();
                 } catch (const std::exception& error) {
                     ThrowIfStopping(stopping);
                     LOG_CONSOLE_WARN("Idle thread heap collection skipped: {}", error.what());
@@ -742,7 +746,7 @@ public:
             for (const auto& worker_snapshot : worker_snapshots) {
                 total_udp_sockets += worker_snapshot.udp_sockets;
             }
-            const auto total_users = proxyman::inbound::UserStore::TotalUsers();
+            const auto total_users = UserStore::TotalUsers();
             LOG_CONSOLE("Runtime activity: conn={} users={} udp_sockets={}",
                         total_conns, total_users, total_udp_sockets);
             LOG_CONSOLE("Runtime memory: resident={:.1f}MB", mem_mb);
@@ -799,7 +803,7 @@ public:
                          ::app::FormatBytes(node_down));
             }
 
-            timer.expires_after(std::chrono::seconds(defaults::kStatsOutputInterval));
+            timer.expires_after(std::chrono::seconds(common::kStatsOutputInterval));
             auto [ec] = co_await timer.async_wait(net::as_tuple(net::use_awaitable));
             if (ec) break;
         }
@@ -917,7 +921,7 @@ void RunDataThread(RuntimeOwner& owner, size_t index) noexcept {
     // Live state and maintenance have already joined. Release cancels the
     // scheduler's final timer; drain that completion before destroying its PMR
     // container capacity on this same thread.
-    transport::internet::TimeoutScheduler::ReleaseForIoContext(context);
+    transport::TimeoutScheduler::ReleaseForIoContext(context);
     context.restart();
     for (;;) {
         try { context.run(); break; }
@@ -965,7 +969,7 @@ int RunApplicationRuntime(BootstrapEnvironment& env) noexcept {
         for (auto& thread : threads) thread.join();
         for (size_t i = owner.started_threads; i < env.worker_pool.work_guards.size(); ++i)
             env.worker_pool.work_guards[i].reset();
-        transport::internet::TimeoutScheduler::ReleaseForIoContext(main_ctx);
+        transport::TimeoutScheduler::ReleaseForIoContext(main_ctx);
         main_ctx.restart();
         for (;;) {
             try { main_ctx.run(); break; }

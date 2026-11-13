@@ -2,6 +2,7 @@
 #include "infra/config_types.hpp"
 
 #include "common/clock.hpp"
+#include "common/session.hpp"
 
 #include <concurrentqueue.h>
 #include <lightweightsemaphore.h>
@@ -1480,6 +1481,32 @@ void Log::WriteConnection(LogLevel level,
         .source_file = location.file_name(),
         .connection = std::move(context),
     });
+}
+
+void Log::WriteConnection(LogLevel level,
+                          uint64_t conn_id,
+                          std::string_view message,
+                          std::source_location location) {
+    ConnectionLogContext log_context;
+    log_context.conn_id = conn_id;
+    WriteConnection(level, std::move(log_context), std::string(message), location);
+}
+
+void Log::WriteConnection(LogLevel level,
+                          const common::Context& ctx,
+                          std::string_view message,
+                          std::source_location location) {
+    ConnectionLogContext log_context;
+    log_context.conn_id = ctx.conn_id;
+    log_context.inbound_tag = std::string(ctx.inbound.tag);
+    if (ctx.inbound.user_id > 0) {
+        log_context.user_id = ctx.inbound.user_id;
+    }
+    const std::string_view outbound = ctx.outbound.tag;
+    if (outbound != log_context.inbound_tag) {
+        log_context.outbound_tag = outbound;
+    }
+    WriteConnection(level, std::move(log_context), std::string(message), location);
 }
 
 void Log::WriteAccess(std::string message) {

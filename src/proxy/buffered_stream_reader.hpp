@@ -1,8 +1,8 @@
 #pragma once
 
 #include "common/asio_types.hpp"
-#include "common/buf/multi_buffer.hpp"
-#include "common/buf/length_prefixed_packet_buffer.hpp"
+#include "common/multi_buffer.hpp"
+#include "common/length_prefixed_packet_buffer.hpp"
 #include "transport/link.hpp"
 
 #include <asio/this_coro.hpp>
@@ -28,7 +28,7 @@ public:
         return ReadBufferedFrom(pending_, data, len, done);
     }
     [[nodiscard]] static bool ReadBufferedFrom(
-        buf::MultiBuffer& pending, uint8_t* data, size_t len, size_t& done) noexcept {
+        common::MultiBuffer& pending, uint8_t* data, size_t len, size_t& done) noexcept {
         if (done < len)
             done += pending.ConsumePrefixTo(std::span<uint8_t>(data + done, len - done));
         return done >= len;
@@ -38,13 +38,13 @@ public:
         return ReadExactFrom(src_, pending_, data, len, progress);
     }
     static net::awaitable<bool> ReadExactFrom(
-        transport::MultiBufferReader& src, buf::MultiBuffer& pending,
+        transport::MultiBufferReader& src, common::MultiBuffer& pending,
         uint8_t* data, size_t len, size_t* progress = nullptr) {
         return ReadPendingFrom(src, pending, data, len, progress, true, SIZE_MAX);
     }
     // UoT 等按地址/长度头分段窥读时保留缓冲所有权，不复制已收到的帧。
     static net::awaitable<bool> EnsureBufferedFrom(
-        transport::MultiBufferReader& src, buf::MultiBuffer& pending, size_t required,
+        transport::MultiBufferReader& src, common::MultiBuffer& pending, size_t required,
         size_t maximum = SIZE_MAX) {
         return ReadPendingFrom(src, pending, nullptr, required, nullptr, false, maximum);
     }
@@ -59,7 +59,7 @@ public:
         }
         co_return true;
     }
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         if (pending_.byte_size() != 0) return TakePending();
         return src_.ReadMultiBuffer();
     }
@@ -67,7 +67,7 @@ public:
 private:
     // 精确消费与只缓冲两种读取共用这一处 I/O、追加和取消处理。
     static net::awaitable<bool> ReadPendingFrom(
-        transport::MultiBufferReader& src, buf::MultiBuffer& pending,
+        transport::MultiBufferReader& src, common::MultiBuffer& pending,
         uint8_t* data, size_t len, size_t* progress, bool consume, size_t maximum) {
         size_t local_done = 0;
         size_t& done = progress ? *progress : local_done;
@@ -79,7 +79,7 @@ private:
             if (received) {
                 if (pending.byte_size() > maximum || incoming.byte_size() > maximum - pending.byte_size())
                     throw IoSystemError(io_error::message_size, "stream pending buffer exceeded");
-                buf::AppendCoalescedStreamInput(pending, std::move(incoming));
+                common::AppendCoalescedStreamInput(pending, std::move(incoming));
             }
             if ((co_await net::this_coro::cancellation_state).cancelled() != net::cancellation_type::none)
                 throw IoSystemError(io_error::operation_aborted);
@@ -87,9 +87,9 @@ private:
         }
         co_return true;
     }
-    net::awaitable<buf::MultiBuffer> TakePending() { co_return std::move(pending_); }
+    net::awaitable<common::MultiBuffer> TakePending() { co_return std::move(pending_); }
     transport::MultiBufferReader& src_;
-    buf::MultiBuffer pending_;
+    common::MultiBuffer pending_;
 };
 
 }  // namespace proxy

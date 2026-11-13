@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/proxy_protocol.hpp"
-
+#include "transport/proxy_protocol.hpp"
 #include <algorithm>
 #include <array>
 #include <string>
@@ -10,10 +9,10 @@
 #include <utility>
 
 namespace {
-::transport::internet::ProxyProtocolResult Parse(std::span<const uint8_t> bytes) {
-    return ::transport::internet::ParseProxyProtocolHeader(bytes);
+::transport::ProxyProtocolResult Parse(std::span<const uint8_t> bytes) {
+    return ::transport::ParseProxyProtocolHeader(bytes);
 }
-::transport::internet::ProxyProtocolResult Parse(std::string_view text) {
+::transport::ProxyProtocolResult Parse(std::string_view text) {
     return Parse(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
 }
 
@@ -62,8 +61,8 @@ TEST_P(ProxyRoundTrip, EncodingPreservesSourceEndpointAndHeaderBoundary) {
     const auto [version, text] = GetParam();
     const auto address = ::net::ip::make_address(text);
     const ::tcp::endpoint source(address, 45678), destination(address, 443);
-    std::array<uint8_t, ::transport::internet::kProxyProtocolMaxHeaderSize> encoded{};
-    const auto size = ::transport::internet::EncodeProxyProtocolHeader(version, source, destination, encoded);
+    std::array<uint8_t, ::transport::kProxyProtocolMaxHeaderSize> encoded{};
+    const auto size = ::transport::EncodeProxyProtocolHeader(version, source, destination, encoded);
     ASSERT_NE(size, 0);
     const auto parsed = Parse(std::span<const uint8_t>(encoded.data(), size));
     ASSERT_TRUE(parsed.success());
@@ -89,13 +88,13 @@ INSTANTIATE_TEST_SUITE_P(V1, ProxyUnknown, testing::Values(
 TEST(ProxyProtocolLiteral, V1RejectsLineWithoutCrLfWithin107Bytes) {
     const std::string line = "PROXY " + std::string(101, 'x');
     EXPECT_TRUE(Parse(std::string_view(line).substr(0, 106)).incomplete());
-    EXPECT_EQ(Parse(std::string_view(line)).status, ::transport::internet::ProxyProtocolParseStatus::Invalid);
-    EXPECT_EQ(Parse(std::string_view(line + "\r\n")).status, ::transport::internet::ProxyProtocolParseStatus::Invalid);
+    EXPECT_EQ(Parse(std::string_view(line)).status, ::transport::ProxyProtocolParseStatus::Invalid);
+    EXPECT_EQ(Parse(std::string_view(line + "\r\n")).status, ::transport::ProxyProtocolParseStatus::Invalid);
 }
 
 class ProxyInvalidV1 : public testing::TestWithParam<const char*> {};
 TEST_P(ProxyInvalidV1, RejectsInvalidDestinationPortOrTrailingFields) {
-    EXPECT_EQ(Parse(std::string_view(GetParam())).status, ::transport::internet::ProxyProtocolParseStatus::Invalid);
+    EXPECT_EQ(Parse(std::string_view(GetParam())).status, ::transport::ProxyProtocolParseStatus::Invalid);
 }
 INSTANTIATE_TEST_SUITE_P(V1, ProxyInvalidV1, testing::Values(
     "PROXY TCP4 192.0.2.1 GARBAGE 32100 443\r\n",
@@ -105,8 +104,8 @@ INSTANTIATE_TEST_SUITE_P(V1, ProxyInvalidV1, testing::Values(
 class ProxyInvalidV2 : public testing::TestWithParam<std::pair<uint8_t, uint8_t>> {};
 TEST_P(ProxyInvalidV2, RejectsInvalidVersionCommandFamilyOrTransportBeforeAddressBlock) {
     const auto header = V2Header(GetParam().first, GetParam().second);
-    EXPECT_EQ(Parse(header).status, ::transport::internet::ProxyProtocolParseStatus::Invalid);
-    EXPECT_EQ(Parse(std::span(header).first(16)).status, ::transport::internet::ProxyProtocolParseStatus::Invalid);
+    EXPECT_EQ(Parse(header).status, ::transport::ProxyProtocolParseStatus::Invalid);
+    EXPECT_EQ(Parse(std::span(header).first(16)).status, ::transport::ProxyProtocolParseStatus::Invalid);
 }
 INSTANTIATE_TEST_SUITE_P(V2, ProxyInvalidV2, testing::Values(
     std::pair<uint8_t, uint8_t>{0x11, 0x11}, std::pair<uint8_t, uint8_t>{0x31, 0x11},
@@ -118,7 +117,7 @@ TEST(ProxyProtocolLiteral, V2RejectsOversizedLengthFromFixedHeader) {
     auto header = V2Header(0x21, 0x11);
     header[14] = 0x10;
     header[15] = 0;
-    EXPECT_EQ(Parse(std::span(header).first(16)).status, ::transport::internet::ProxyProtocolParseStatus::Invalid);
+    EXPECT_EQ(Parse(std::span(header).first(16)).status, ::transport::ProxyProtocolParseStatus::Invalid);
 }
 
 class ProxyLocal : public testing::TestWithParam<uint8_t> {};

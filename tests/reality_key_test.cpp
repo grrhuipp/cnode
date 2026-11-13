@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/stream_settings.hpp"
-
+#include "transport/stream_settings.hpp"
 #include <openssl/bytestring.h>
 #include <openssl/mem.h>
 #include <openssl/mldsa.h>
@@ -13,8 +12,8 @@
 
 namespace {
 
-using ::transport::internet::RealityKey;
-using ::transport::internet::RealityMldsa65PublicKey;
+using ::transport::RealityKey;
+using ::transport::RealityMldsa65PublicKey;
 
 // The product parses configured keys; key derivation is only fixture setup.
 std::optional<RealityMldsa65PublicKey> DeriveRealityMldsa65PublicKeyFromSeed(
@@ -61,7 +60,7 @@ std::string EncodeRealityBase64Url(std::span<const uint8_t> bytes) {
 }  // namespace
 
 TEST(RealityKey, DecodesCanonicalBase64UrlKey) {
-    const auto parsed = ::transport::internet::ParseRealityKey(std::string(43, 'A'));
+    const auto parsed = ::transport::ParseRealityKey(std::string(43, 'A'));
     ASSERT_TRUE(parsed.has_value());
     EXPECT_EQ(*parsed, RealityKey{});
 }
@@ -69,7 +68,7 @@ TEST(RealityKey, DecodesCanonicalBase64UrlKey) {
 namespace {
 class RealityInvalidKey : public testing::TestWithParam<std::string> {};
 TEST_P(RealityInvalidKey, RejectsNoncanonicalOrMalformedKey) {
-    EXPECT_FALSE(::transport::internet::ParseRealityKey(GetParam()));
+    EXPECT_FALSE(::transport::ParseRealityKey(GetParam()));
 }
 INSTANTIATE_TEST_SUITE_P(Base64Url, RealityInvalidKey, testing::Values(
     std::string(42, 'A'), std::string(44, 'A'), std::string(42, 'A') + "=",
@@ -77,28 +76,28 @@ INSTANTIATE_TEST_SUITE_P(Base64Url, RealityInvalidKey, testing::Values(
 }
 
 TEST(RealityKey, ParsesMldsaSeedAndDerivedPublicKey) {
-    const auto seed = ::transport::internet::ParseRealityMldsa65Seed(std::string(43, 'A'));
+    const auto seed = ::transport::ParseRealityMldsa65Seed(std::string(43, 'A'));
     ASSERT_TRUE(seed.has_value());
     const auto public_key = DeriveRealityMldsa65PublicKeyFromSeed(*seed);
     ASSERT_TRUE(public_key.has_value());
-    const auto parsed = ::transport::internet::ParseRealityMldsa65PublicKey(EncodeRealityBase64Url(*public_key));
+    const auto parsed = ::transport::ParseRealityMldsa65PublicKey(EncodeRealityBase64Url(*public_key));
     ASSERT_TRUE(parsed.has_value());
     EXPECT_EQ(*parsed, *public_key);
 }
 
 TEST(RealityKey, RejectsMalformedMldsaPublicKey) {
-    EXPECT_FALSE(::transport::internet::ParseRealityMldsa65PublicKey("invalid-pub"));
+    EXPECT_FALSE(::transport::ParseRealityMldsa65PublicKey("invalid-pub"));
 }
 
 namespace {
 class RealityFingerprint : public testing::TestWithParam<std::pair<const char*, const char*>> {};
 TEST_P(RealityFingerprint, NormalizesSupportedBrowserName) {
-    EXPECT_EQ(::transport::internet::NormalizeRealityFingerprint(GetParam().first), GetParam().second);
+    EXPECT_EQ(::transport::NormalizeRealityFingerprint(GetParam().first), GetParam().second);
 }
 INSTANTIATE_TEST_SUITE_P(Browsers, RealityFingerprint, testing::Values(
     std::pair{"Chrome", "chrome"}, std::pair{"Firefox", "firefox"}, std::pair{"iOS", "ios"}));
 }
 
 TEST(RealityKey, RejectsUnsupportedFingerprint) {
-    EXPECT_FALSE(::transport::internet::NormalizeRealityFingerprint("unknown-browser"));
+    EXPECT_FALSE(::transport::NormalizeRealityFingerprint("unknown-browser"));
 }

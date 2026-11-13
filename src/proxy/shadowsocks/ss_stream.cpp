@@ -5,13 +5,10 @@
 #include <asio/this_coro.hpp>
 #include <type_traits>
 
-namespace proxy::shadowsocks {
-using buf::ChunkBytes;
-using detail::kStreamChunkPayloadSize;
-using detail::MakeNonce;
-using detail::ThrowSsWriteError;
+namespace proxy {
+using common::ChunkBytes;
 
-net::awaitable<void> SsStreamWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
+net::awaitable<void> SsStreamWriter::WriteMultiBuffer(common::MultiBuffer mb) {
     return WriteEncrypted(std::move(mb));
 }
 
@@ -105,19 +102,19 @@ net::awaitable<void> SsStreamWriter::WriteEncrypted(BufferRange buffers) {
             }
         }
 
-        buf::MultiBuffer out_mb;
+        common::MultiBuffer out_mb;
         out_mb.reserve(buffers.size());
         for (const auto& buffer : buffers) {
             const auto bytes = ChunkBytes(buffer);
             if (bytes.empty()) continue;
-            detail::EncryptToMultiBuffer(
+            EncryptToMultiBuffer(
                 *write_cipher_,
                 write_nonce_,
                 bytes,
                 out_mb,
                 &skip_first_bytes_);
         }
-        if constexpr (std::is_same_v<BufferRange, buf::MultiBuffer>) {
+        if constexpr (std::is_same_v<BufferRange, common::MultiBuffer>) {
             buffers.clear();
         }
 
@@ -137,7 +134,7 @@ net::awaitable<void> SsStreamWriter::WriteEncrypted(BufferRange buffers) {
 
 net::awaitable<void> SsStreamWriter::FlushPendingAndWrite(
     transport::AsyncStream& stream,
-    buf::MultiBuffer out_mb) {
+    common::MultiBuffer out_mb) {
     if (out_mb.byte_size() == 0 && pending_prefix_.byte_size() == 0) {
         co_return;
     }
@@ -170,7 +167,7 @@ bool SsStreamWriter::InitResponseCipher() {
 
     std::array<uint8_t, 64> write_subkey{};
     common::ScopedCleanse cleanse_init_legacy{server_salt, write_subkey};
-    if (!DeriveSubkey(pending_handshake_->master_key.data(), key_size,
+    if (!DeriveSsSubkey(pending_handshake_->master_key.data(), key_size,
                       server_salt.data(), key_size,
                       write_subkey.data())) {
         return false;
@@ -180,7 +177,7 @@ bool SsStreamWriter::InitResponseCipher() {
     OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
     write_nonce_ = 0;
 
-    if (!buf::AppendSpanToMultiBuffer(
+    if (!common::AppendSpanToMultiBuffer(
             std::span<const uint8_t>(server_salt.data(), key_size),
             pending_prefix_)) {
         return false;
@@ -193,7 +190,7 @@ bool SsStreamWriter::InitResponseCipher() {
 template <typename BufferRange>
 bool SsStreamWriter::AppendFirstResponsePayload(const BufferRange& buffers, size_t want) {
     if (want == 0) return true;
-    buf::BufferGuard payload_cipher{buf::Buffer::New()};
+    common::BufferGuard payload_cipher{common::Buffer::New()};
     if (!payload_cipher ||
         want + SsAeadCipher::kTagSize > payload_cipher->Available()) {
         pending_prefix_.clear();
@@ -282,10 +279,10 @@ bool SsStreamWriter::InitResponseCipher2022(
     write_nonce_ = 1;
 
     pending_prefix_.clear();
-    if (!buf::AppendSpanToMultiBuffer(
+    if (!common::AppendSpanToMultiBuffer(
             std::span<const uint8_t>(server_salt.data(), key_size),
             pending_prefix_) ||
-        !buf::AppendSpanToMultiBuffer(
+        !common::AppendSpanToMultiBuffer(
             std::span<const uint8_t>(fixed_cipher.data(), fixed_cipher_size),
             pending_prefix_)) {
         pending_prefix_.clear();
@@ -298,4 +295,4 @@ bool SsStreamWriter::InitResponseCipher2022(
     write_init_ = true;
     return true;
 }
-}  // namespace proxy::shadowsocks
+}  // namespace proxy

@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "service/controller/node_transaction.hpp"
-
+#include "controller/node_transaction.hpp"
 #include <chrono>
 
 TEST(PanelSchedule, UsesPositiveConfiguredInterval) {

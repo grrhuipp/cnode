@@ -21,7 +21,7 @@
 
 namespace {
 using namespace std::chrono_literals;
-using UdpRequest = proxy::freedom::outbound::UdpRequest;
+using UdpRequest = proxy::FreedomUdpRequest;
 
 enum class WriteAbort { RequestCancel, ParentCancellation, Deadline };
 enum class Deadline { Idle, Read, Phase };
@@ -31,11 +31,11 @@ common::TargetAddress Target(const udp::endpoint& endpoint) {
     return common::TargetAddress(endpoint.address(), endpoint.port());
 }
 
-buf::MultiBuffer Packet(const common::TargetAddress& target, size_t size) {
+common::MultiBuffer Packet(const common::TargetAddress& target, size_t size) {
     std::vector<uint8_t> bytes(size);
     for (size_t i = 0; i < size; ++i) bytes[i] = static_cast<uint8_t>(i * 37);
-    buf::MultiBuffer payload;
-    EXPECT_TRUE(buf::AppendSpanToMultiBuffer(bytes, payload));
+    common::MultiBuffer payload;
+    EXPECT_TRUE(common::AppendSpanToMultiBuffer(bytes, payload));
     for (auto* buffer : payload) buffer->SetUDP(target);
     return payload;
 }
@@ -138,9 +138,9 @@ class UdpRequestTest : public testing::Test {
 protected:
     net::io_context io;
     DnsPeer dns_peer{io};
-    app::dns::DNSWorker dns_worker{
-        io, app::dns::Config{.servers = {dns_peer.Endpoint()}}, 8};
-    app::dns::DNS dns{dns_worker};
+    app::DNSWorker dns_worker{
+        io, app::DnsConfig{.servers = {dns_peer.Endpoint()}}, 8};
+    app::DNS dns{dns_worker};
     std::vector<std::shared_ptr<UdpRequest>> requests;
 
     UdpRequest& Request() {
@@ -157,7 +157,7 @@ protected:
         net::cancellation_signal cancellation;
         net::steady_timer watchdog(io, 8s);
         auto cancel_requests = [&] {
-            for (const auto& request : requests) request->Cancel();
+            for (const auto& request : requests) request->RelayControl().Cancel();
         };
         watchdog.async_wait([&](const IoErrorCode& ec) {
             if (!ec) {
@@ -194,7 +194,7 @@ net::awaitable<void> RoundTrip(net::io_context& io, UdpRequest& channel, size_t 
         EXPECT_EQ(received[i], static_cast<uint8_t>(i * 37)) << "offset " << i;
     co_await peer.async_send_to(net::buffer(received.data(), count), source, net::use_awaitable);
     auto reply = co_await channel.ReadMultiBuffer();
-    const auto datagram = buf::InspectUdpDatagram(reply);
+    const auto datagram = common::InspectUdpDatagram(reply);
     EXPECT_TRUE(datagram.Valid());
     EXPECT_EQ(datagram.payload_size, size);
     EXPECT_NE(datagram.target, nullptr);
@@ -222,13 +222,13 @@ TEST_F(UdpRequestTest, CancellingOneReaderLeavesOtherRequestsUsable) {
         auto& survivor = Request();
         auto completion = std::make_shared<Completion>();
         net::co_spawn(io, cancelled.ReadMultiBuffer(),
-            [completion](std::exception_ptr error, buf::MultiBuffer) {
+            [completion](std::exception_ptr error, common::MultiBuffer) {
                 completion->failure = error;
                 completion->finished = true;
             });
         co_await Pause(io, 20ms);
         const auto started = std::chrono::steady_clock::now();
-        cancelled.Cancel();
+        cancelled.RelayControl().Cancel();
         co_await Join(io, *completion);
         EXPECT_LT(std::chrono::steady_clock::now() - started, 500ms);
         EXPECT_NE(completion->failure, nullptr);
@@ -245,7 +245,7 @@ TEST_F(UdpRequestTest, CancellingOneReaderLeavesOtherRequestsUsable) {
 TEST_F(UdpRequestTest, ClosedRequestRejectsNewReads) {
     Run([&]() -> net::awaitable<void> {
         auto& request = Request();
-        request.Close();
+        request.RelayControl().Close();
         bool rejected = false;
         try { co_await request.ReadMultiBuffer(); }
         catch (const transport::LinkError& error) {
@@ -259,10 +259,10 @@ TEST_F(UdpRequestTest, ClosedRequestRejectsNewReads) {
 TEST_F(UdpRequestTest, CompletedWriteRetiresItsDeadline) {
     Run([&]() -> net::awaitable<void> {
         auto& request = Request();
-        request.SetWriteTimeout(1s);
+        request.RelayControl().SetWriteTimeout(1s);
         co_await RoundTrip(io, request, 32);
         co_await Pause(io, 1100ms);
-        EXPECT_FALSE(request.ConsumeWriteTimeout());
+        EXPECT_FALSE(request.RelayControl().ConsumeWriteTimeout());
         co_await RoundTrip(io, request, 11);
     });
 }
@@ -276,7 +276,7 @@ TEST_P(DnsWriteAbortTest, AbortedResolutionCannotSendAfterLateDnsResponse) {
         auto& request = Request();
         auto& survivor = Request();
         udp::socket sink(io, udp::endpoint(net::ip::address_v4::loopback(), 0));
-        request.SetWriteTimeout(1s);
+        request.RelayControl().SetWriteTimeout(1s);
         auto completion = std::make_shared<Completion>();
         net::cancellation_signal parent;
         net::co_spawn(io, request.WriteMultiBuffer(
@@ -289,7 +289,7 @@ TEST_P(DnsWriteAbortTest, AbortedResolutionCannotSendAfterLateDnsResponse) {
 
         // Observe a real DNS exchange before releasing a valid, late A response.
         co_await dns_peer.WaitForQuery();
-        if (abort == WriteAbort::RequestCancel) request.Cancel();
+        if (abort == WriteAbort::RequestCancel) request.RelayControl().Cancel();
         if (abort == WriteAbort::ParentCancellation)
             parent.emit(net::cancellation_type::all);
         if (abort == WriteAbort::Deadline) co_await Pause(io, 1100ms);
@@ -304,7 +304,7 @@ TEST_P(DnsWriteAbortTest, AbortedResolutionCannotSendAfterLateDnsResponse) {
             }
         }
         if (abort == WriteAbort::Deadline) {
-            EXPECT_TRUE(request.ConsumeWriteTimeout());
+            EXPECT_TRUE(request.RelayControl().ConsumeWriteTimeout());
             dns_peer.ReplyPendingAndEnable();
         }
         co_await Pause(io, 40ms);
@@ -314,7 +314,7 @@ TEST_P(DnsWriteAbortTest, AbortedResolutionCannotSendAfterLateDnsResponse) {
         EXPECT_FALSE(error);
         co_await RoundTrip(io, survivor, 32);
         co_await Pause(io, 1100ms);
-        EXPECT_FALSE(request.ConsumeWriteTimeout()) << "aborted write retained a deadline";
+        EXPECT_FALSE(request.RelayControl().ConsumeWriteTimeout()) << "aborted write retained a deadline";
     });
 }
 
@@ -338,9 +338,9 @@ TEST_P(UdpDeadlineTest, PendingReadExpiresOnceAtItsDeadline) {
         auto& channel = Request();
         transport::PhaseDeadlineHandle phase;
         const auto kind = GetParam();
-        if (kind == Deadline::Idle) channel.SetIdleTimeout(1s);
-        if (kind == Deadline::Read) channel.SetReadTimeout(1s);
-        if (kind == Deadline::Phase) phase = channel.StartPhaseDeadline(1s);
+        if (kind == Deadline::Idle) channel.RelayControl().SetIdleTimeout(1s);
+        if (kind == Deadline::Read) channel.RelayControl().SetReadTimeout(1s);
+        if (kind == Deadline::Phase) phase = channel.RelayControl().StartPhaseDeadline(1s);
         const auto started = std::chrono::steady_clock::now();
         bool cancelled = false;
         try { co_await channel.ReadMultiBuffer(); }
@@ -353,19 +353,19 @@ TEST_P(UdpDeadlineTest, PendingReadExpiresOnceAtItsDeadline) {
         EXPECT_GE(elapsed, 800ms);
         EXPECT_LT(elapsed, 3s);
         if (kind == Deadline::Idle) {
-            EXPECT_TRUE(channel.ConsumeIdleTimeout());
-            EXPECT_FALSE(channel.ConsumeIdleTimeout());
+            EXPECT_TRUE(channel.RelayControl().ConsumeIdleTimeout());
+            EXPECT_FALSE(channel.RelayControl().ConsumeIdleTimeout());
         }
         if (kind == Deadline::Read) {
-            EXPECT_TRUE(channel.ConsumeReadTimeout());
-            EXPECT_FALSE(channel.ConsumeReadTimeout());
+            EXPECT_TRUE(channel.RelayControl().ConsumeReadTimeout());
+            EXPECT_FALSE(channel.RelayControl().ConsumeReadTimeout());
         }
         if (kind == Deadline::Phase) {
             EXPECT_TRUE(phase.Expired());
-            channel.ClearPhaseDeadline();
+            channel.RelayControl().ClearPhaseDeadline();
             EXPECT_FALSE(phase.Expired());
-            EXPECT_FALSE(channel.ConsumePhaseDeadline());
-            EXPECT_FALSE(channel.StartPhaseDeadline(1s));
+            EXPECT_FALSE(channel.RelayControl().ConsumePhaseDeadline());
+            EXPECT_FALSE(channel.RelayControl().StartPhaseDeadline(1s));
         }
     });
 }
@@ -384,26 +384,26 @@ INSTANTIATE_TEST_SUITE_P(Deadlines, UdpDeadlineTest,
 TEST_F(UdpRequestTest, DatagramActivityRefreshesIdleTimeout) {
     Run([&]() -> net::awaitable<void> {
         auto& channel = Request();
-        channel.SetIdleTimeout(1s);
+        channel.RelayControl().SetIdleTimeout(1s);
         for (int i = 0; i < 3; ++i) {
             co_await Pause(io, 450ms);
             co_await RoundTrip(io, channel, 32);
         }
-        EXPECT_FALSE(channel.ConsumeIdleTimeout());
+        EXPECT_FALSE(channel.RelayControl().ConsumeIdleTimeout());
     });
 }
 
 TEST_F(UdpRequestTest, ClearedDeadlinesDoNotCancelLaterTraffic) {
     Run([&]() -> net::awaitable<void> {
         auto& channel = Request();
-        channel.SetIdleTimeout(1s);
-        const auto phase = channel.StartPhaseDeadline(1s);
-        channel.ClearPhaseDeadline();
-        channel.SetIdleTimeout(0s);
+        channel.RelayControl().SetIdleTimeout(1s);
+        const auto phase = channel.RelayControl().StartPhaseDeadline(1s);
+        channel.RelayControl().ClearPhaseDeadline();
+        channel.RelayControl().SetIdleTimeout(0s);
         co_await Pause(io, 1100ms);
         EXPECT_FALSE(phase.Expired());
-        EXPECT_FALSE(channel.ConsumeIdleTimeout());
-        EXPECT_FALSE(channel.ConsumePhaseDeadline());
+        EXPECT_FALSE(channel.RelayControl().ConsumeIdleTimeout());
+        EXPECT_FALSE(channel.RelayControl().ConsumePhaseDeadline());
         co_await RoundTrip(io, channel, 32);
     });
 }
@@ -416,7 +416,7 @@ TEST_F(UdpRequestTest, ParentCancellationJoinsReaderWithoutAffectingOtherRequest
         auto completion = std::make_shared<Completion>();
         net::co_spawn(io, channel.ReadMultiBuffer(),
             net::bind_cancellation_slot(cancellation.slot(),
-                [completion](std::exception_ptr error, buf::MultiBuffer) {
+                [completion](std::exception_ptr error, common::MultiBuffer) {
                     completion->failure = error;
                     completion->finished = true;
                 }));
@@ -443,7 +443,7 @@ TEST_F(UdpRequestTest, QueuedDeadlineCallbacksDoNotBorrowDestroyedRequests) {
     Run([&]() -> net::awaitable<void> {
         {
             UdpRequest old(io, dns, net::ip::address_v4::loopback());
-            old.StartPhaseDeadline(1s);
+            old.RelayControl().StartPhaseDeadline(1s);
             std::this_thread::sleep_for(1050ms);
         }
         co_await RoundTrip(io, Request(), 32);
@@ -453,9 +453,9 @@ TEST_F(UdpRequestTest, QueuedDeadlineCallbacksDoNotBorrowDestroyedRequests) {
 TEST_F(UdpRequestTest, MaximumDurationDeadlineDoesNotOverflow) {
     Run([&]() -> net::awaitable<void> {
         auto& current = Request();
-        current.StartPhaseDeadline(std::chrono::seconds::max());
+        current.RelayControl().StartPhaseDeadline(std::chrono::seconds::max());
         co_await Pause(io, 20ms);
-        EXPECT_FALSE(current.ConsumePhaseDeadline());
+        EXPECT_FALSE(current.RelayControl().ConsumePhaseDeadline());
         co_await RoundTrip(io, current, 32);
     });
 }
@@ -466,8 +466,8 @@ public:
 
     OnePacketReader(common::TargetAddress target)
         : target_(std::move(target)) {}
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        if (used_) co_return buf::MultiBuffer{};
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
+        if (used_) co_return common::MultiBuffer{};
         used_ = true;
         co_return Packet(target_, 2000);
     }
@@ -480,7 +480,7 @@ private:
 
 class IgnoreWriter final : public transport::MultiBufferWriter {
 public:
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer) override { co_return; }
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer) override { co_return; }
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer>) override { co_return; }
 };
 
@@ -490,7 +490,7 @@ TEST_F(UdpRequestTest, RelayRateLimitAndHalfCloseBudgetPreserveSuccessfulWriteAc
         auto& target = Request();
         OnePacketReader input(Target(peer.local_endpoint()));
         IgnoreWriter output;
-        session::Context context;
+        common::Context context;
         context.content.network = common::Network::UDP;
         app::StatsShard stats;
         const auto started = std::chrono::steady_clock::now();
@@ -512,7 +512,7 @@ TEST_F(UdpRequestTest, InvalidDatagramRetainsErrorWithoutCountingFailedSend) {
         auto& target = Request();
         OnePacketReader input(common::TargetAddress{});
         IgnoreWriter output;
-        session::Context context;
+        common::Context context;
         context.content.network = common::Network::UDP;
         app::StatsShard stats;
         const auto result = co_await app::DoRelayLink(io, input, output, nullptr,
@@ -533,16 +533,16 @@ TEST_P(UdpRelayAbortTest, CancellationJoinsRateLimitedRelayWithoutCountingUnsent
         auto& target = Request();
         OnePacketReader input(Target(peer.local_endpoint()));
         IgnoreWriter output;
-        session::Context context;
+        common::Context context;
         context.content.network = common::Network::UDP;
         app::StatsShard stats;
         net::steady_timer cancellation(io);
         const bool deadline = GetParam() == RelayAbort::Deadline;
-        if (deadline) target.StartPhaseDeadline(1s);
+        if (deadline) target.RelayControl().StartPhaseDeadline(1s);
         else {
             cancellation.expires_after(50ms);
             cancellation.async_wait([&](const IoErrorCode& error) {
-                if (!error) target.Cancel();
+                if (!error) target.RelayControl().Cancel();
             });
         }
         const auto start = std::chrono::steady_clock::now();

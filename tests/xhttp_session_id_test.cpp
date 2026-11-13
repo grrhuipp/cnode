@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/xhttp_client.hpp"
-
+#include "transport/xhttp_client.hpp"
 #include <set>
 #include <string>
 
@@ -11,7 +10,7 @@ TEST(XHttpSessionId, IsRandomLowercaseHex) {
     constexpr int kSamples = 256;
     std::set<std::string> seen;
     for (int i = 0; i < kSamples; ++i) {
-        const transport::internet::XHttpSessionId id = transport::internet::GenerateXHttpSessionId();
+        const transport::XHttpSessionId id = transport::GenerateXHttpSessionId();
         ASSERT_EQ(id.size(), 32u);
         for (const char ch : id) {
             ASSERT_TRUE((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) << ch;

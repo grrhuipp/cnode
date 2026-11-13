@@ -1,10 +1,9 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/stream_settings.hpp"
-
+#include "transport/stream_settings.hpp"
 namespace {
-using ::transport::internet::ParseRealityShortId;
-using ::transport::internet::RealityShortId;
+using ::transport::ParseRealityShortId;
+using ::transport::RealityShortId;
 
 TEST(RealityShortId, EmptyIdentifierRepresentsZeroPaddedIdentity) {
     const auto parsed = ParseRealityShortId("");

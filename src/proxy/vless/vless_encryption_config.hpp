@@ -14,7 +14,7 @@
 
 // VLESS Encryption 配置：线上字符串到只读配置聚合的唯一解析入口，
 // 只在冷路径（入站/出站准备期）调用。
-namespace proxy::vless {
+namespace proxy {
 
 enum class VlessEncryptionMode : uint8_t {
     Native,
@@ -99,4 +99,4 @@ using VlessEncryptionParseResult =
 [[nodiscard]] std::string_view VlessEncryptionParseErrorMessage(
     VlessEncryptionParseError error) noexcept;
 
-}  // namespace proxy::vless
+}  // namespace proxy

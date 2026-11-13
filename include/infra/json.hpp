@@ -14,7 +14,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
-namespace json {
+namespace infra {
 
 enum class KeyComparison {
     CaseSensitive,
@@ -208,11 +208,8 @@ private:
     KeyComparison comparison = KeyComparison::CaseSensitive);
 [[nodiscard]] std::string serialize(const value& v);
 
-}  // namespace json
 
 // 配置加载器统一在此将值语义的字段错误转换为 invalid_argument。
-namespace infra {
-
 template <typename T>
 T RequireJson(tl::expected<T, std::string> result) {
     if (!result) {
@@ -225,7 +222,7 @@ T RequireJson(tl::expected<T, std::string> result) {
 
 // 只用于本地配置；远端协议对象保留各自的扩展字段接收语义。
 void RequireJsonKeys(
-    const json::object& source,
+    const object& source,
     std::initializer_list<std::string_view> allowed,
     std::string_view path,
     std::initializer_list<std::string_view> additional = {});
@@ -237,35 +234,35 @@ void RequireJsonKeys(
 // The parser stores integers up to INT64_MAX as int64 and larger ones as
 // uint64; this is the single conversion of either form to a non-negative value.
 [[nodiscard]] std::optional<uint64_t> JsonUnsignedInteger(
-    const json::value& value) noexcept;
+    const infra::value& value) noexcept;
 
 [[nodiscard]] tl::expected<std::optional<bool>, std::string>
-ParseJsonBool(const json::object& source, std::string_view key);
+ParseJsonBool(const object& source, std::string_view key);
 
 [[nodiscard]] tl::expected<std::optional<std::string>, std::string>
-ParseJsonString(const json::object& source, std::string_view key);
+ParseJsonString(const object& source, std::string_view key);
 
 [[nodiscard]]
 tl::expected<std::optional<std::vector<std::string>>, std::string>
-ParseJsonStringArray(const json::object& source, std::string_view key);
+ParseJsonStringArray(const object& source, std::string_view key);
 
 [[nodiscard]] tl::expected<std::optional<uint64_t>, std::string>
 ParseJsonUint64(
-    const json::object& source,
+    const object& source,
     std::string_view key,
     uint64_t maximum = std::numeric_limits<uint64_t>::max());
 
 // The returned object borrows from source and is valid only while source
 // remains alive and unmodified.
-[[nodiscard]] tl::expected<const json::object*, std::string>
-ParseJsonObject(const json::object& source, std::string_view key);
+[[nodiscard]] tl::expected<const object*, std::string>
+ParseJsonObject(const object& source, std::string_view key);
 
 // Throwing forms for configuration loaders that report errors as
 // std::invalid_argument; the fallback applies only to an absent key.
 [[nodiscard]] std::string JsonStringOr(
-    const json::object& source, std::string_view key, std::string_view fallback);
+    const object& source, std::string_view key, std::string_view fallback);
 [[nodiscard]] bool JsonBoolOr(
-    const json::object& source, std::string_view key, bool fallback);
+    const object& source, std::string_view key, bool fallback);
 
 enum class JsonPortError {
     None,
@@ -285,6 +282,6 @@ struct JsonPortResult {
 };
 
 [[nodiscard]] JsonPortResult ReadJsonPort(
-    const json::object& source, std::string_view key) noexcept;
+    const object& source, std::string_view key) noexcept;
 
 }  // namespace infra

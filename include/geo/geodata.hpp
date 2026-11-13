@@ -6,7 +6,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <memory_resource>
 #include <regex>
 #include <span>
 #include <string>
@@ -23,8 +22,7 @@ namespace geo {
 // ============================================================================
 class CidrSet {
 public:
-    explicit CidrSet(
-        std::pmr::memory_resource* resource = std::pmr::get_default_resource());
+    CidrSet();
 
     // network 为 4（IPv4）或 16（IPv6）字节网络序地址，prefix 不得超过其位宽。
     void Insert(std::span<const uint8_t> network, uint8_t prefix);
@@ -37,7 +35,7 @@ private:
         int32_t children[2]{-1, -1};
         bool terminal = false;
     };
-    using Trie = std::pmr::vector<Node>;
+    using Trie = std::vector<Node>;
 
     static void InsertBits(Trie& trie, std::span<const uint8_t> network, uint8_t prefix);
     [[nodiscard]] static bool MatchBits(const Trie& trie,
@@ -54,8 +52,7 @@ private:
 // ============================================================================
 class DomainRuleSet {
 public:
-    explicit DomainRuleSet(
-        std::pmr::memory_resource* resource = std::pmr::get_default_resource());
+    DomainRuleSet();
 
     void AddFull(std::string_view domain);
     void AddSuffix(std::string_view suffix);
@@ -75,16 +72,16 @@ private:
         uint32_t node_index;
     };
     struct SuffixNode {
-        std::pmr::vector<SuffixChild> children;
+        std::vector<SuffixChild> children;
         bool terminal = false;
     };
 
     [[nodiscard]] bool MatchSuffix(std::string_view lower_domain) const noexcept;
 
-    std::pmr::unordered_set<std::pmr::string, common::TransparentStringHash, common::TransparentStringEq> full_;
-    std::pmr::vector<SuffixNode> suffix_nodes_;
-    std::pmr::vector<std::pmr::string> keywords_;
-    std::pmr::vector<std::regex> regexes_;
+    std::unordered_set<std::string, common::TransparentStringHash, common::TransparentStringEq> full_;
+    std::vector<SuffixNode> suffix_nodes_;
+    std::vector<std::string> keywords_;
+    std::vector<std::regex> regexes_;
 };
 
 // ============================================================================

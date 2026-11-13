@@ -1,8 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "allocation_hook.hpp"
-#include "transport/internet/http2_session.hpp"
-
+#include "transport/http2_session.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -11,7 +10,7 @@
 #include <vector>
 
 namespace {
-using namespace ::transport::internet;
+using namespace ::transport;
 bool measuring = false;
 size_t largest = 0, allocated = 0, denied = 0, live_large = 0, peak_large = 0;
 size_t allocation_limit = kMaxGrpcHunkMessageSize;

@@ -2,7 +2,6 @@
 
 #include "proxy/shadowsocks/ss_outbound.hpp"
 #include "app/dns/dns.hpp"
-
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/steady_timer.hpp>
@@ -23,11 +22,11 @@
 
 namespace {
 using namespace std::chrono_literals;
-using UdpRequest = proxy::shadowsocks::outbound::UdpRequest;
+using UdpRequest = proxy::SsUdpRequest;
 
 struct ClassicCipher {
-    proxy::shadowsocks::SsCipherInfo info;
-    proxy::shadowsocks::KeyBytes key;
+    proxy::SsCipherInfo info;
+    proxy::KeyBytes key;
 };
 
 enum class Noise { ReadGarbage, IdleWrongPeer, IdleGarbage };
@@ -35,24 +34,24 @@ enum class Noise { ReadGarbage, IdleWrongPeer, IdleGarbage };
 class SsUdpRequestFixture : public testing::Test {
 protected:
     net::io_context io;
-    app::dns::DNSWorker dns_worker{
-        io, app::dns::Config{.servers = {{net::ip::address_v4::loopback(), 53}}}, 8};
-    app::dns::DNS dns{dns_worker};
+    app::DNSWorker dns_worker{
+        io, app::DnsConfig{.servers = {{net::ip::address_v4::loopback(), 53}}}, 8};
+    app::DNS dns{dns_worker};
     std::optional<ClassicCipher> cipher;
     std::vector<std::shared_ptr<UdpRequest>> requests;
 
     void ConfigureCipher(const char* method) {
-        const auto info = proxy::shadowsocks::ParseCipherMethod(method);
+        const auto info = proxy::ParseCipherMethod(method);
         ASSERT_TRUE(info.has_value());
         cipher.emplace(ClassicCipher{
-            *info, proxy::shadowsocks::DeriveKey("ss-udp-request-regression", info->key_size)});
+            *info, proxy::DeriveKey("ss-udp-request-regression", info->key_size)});
     }
 
     UdpRequest& Request(const udp::endpoint& server) {
         requests.push_back(std::make_shared<UdpRequest>(
             io, dns, net::ip::address_v4::loopback(),
             common::TargetAddress(server.address(), server.port()), cipher->info, cipher->key,
-            std::span<const proxy::shadowsocks::KeyBytes>{}));
+            std::span<const proxy::KeyBytes>{}));
         return *requests.back();
     }
 
@@ -64,7 +63,7 @@ protected:
         net::cancellation_signal cancellation;
         net::steady_timer watchdog(io, 12s);
         auto cancel_requests = [&] {
-            for (const auto& request : requests) request->Cancel();
+            for (const auto& request : requests) request->RelayControl().Cancel();
         };
         watchdog.async_wait([&](const IoErrorCode& error) {
             if (!error) {
@@ -107,15 +106,15 @@ std::vector<uint8_t> Pattern(size_t size, uint8_t seed = 17) {
     return bytes;
 }
 
-buf::MultiBuffer MakePayload(
+common::MultiBuffer MakePayload(
     const common::TargetAddress& target, const std::vector<uint8_t>& bytes) {
-    buf::MultiBuffer payload;
-    EXPECT_TRUE(buf::AppendSpanToMultiBuffer(bytes, payload));
+    common::MultiBuffer payload;
+    EXPECT_TRUE(common::AppendSpanToMultiBuffer(bytes, payload));
     for (auto* buffer : payload) buffer->SetUDP(target);
     return payload;
 }
 
-std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
+std::vector<uint8_t> Flatten(const common::MultiBuffer& payload) {
     std::vector<uint8_t> bytes;
     bytes.reserve(payload.byte_size());
     for (const auto* buffer : payload) {
@@ -129,12 +128,12 @@ std::vector<uint8_t> EncodeClassic(
     const common::TargetAddress& target,
     const std::vector<uint8_t>& payload,
     const ClassicCipher& cipher) {
-    const size_t size = proxy::shadowsocks::EncodeUdpPacketTo(
+    const size_t size = proxy::EncodeUdpPacketTo(
         target, payload.data(), payload.size(), cipher.key.span(),
         cipher.info.type, cipher.info.key_size, cipher.info.salt_size, nullptr, 0);
     EXPECT_NE(size, 0u);
     std::vector<uint8_t> packet(size);
-    EXPECT_EQ(proxy::shadowsocks::EncodeUdpPacketTo(
+    EXPECT_EQ(proxy::EncodeUdpPacketTo(
                   target, payload.data(), payload.size(), cipher.key.span(),
                   cipher.info.type, cipher.info.key_size, cipher.info.salt_size,
                   packet.data(), packet.size()), packet.size());
@@ -164,7 +163,7 @@ struct ReadNoiseState {
     bool watchdog_fired = false;
     std::exception_ptr read_error;
     std::exception_ptr noise_error;
-    buf::MultiBuffer received;
+    common::MultiBuffer received;
     size_t noise_packets = 0;
 };
 
@@ -200,7 +199,7 @@ TEST_P(SsUdpRequestTest, AuthenticatedRoundTripPreservesPayloadAndInnerTarget) {
         udp::endpoint client;
         const auto wire_size = co_await server.async_receive_from(
             net::buffer(wire), client, net::use_awaitable);
-        const auto decoded = proxy::shadowsocks::DecodeUdpPacketWithKey(
+        const auto decoded = proxy::DecodeUdpPacketWithKey(
             wire.data(), wire_size, key.key.span(), key.info.type,
             key.info.key_size, key.info.salt_size);
         EXPECT_TRUE(decoded.has_value());
@@ -214,7 +213,7 @@ TEST_P(SsUdpRequestTest, AuthenticatedRoundTripPreservesPayloadAndInnerTarget) {
         const auto response = EncodeClassic(response_target, response_bytes, key);
         co_await server.async_send_to(net::buffer(response), client, net::use_awaitable);
         auto reply = co_await request.ReadMultiBuffer();
-        const auto datagram = buf::InspectUdpDatagram(reply);
+        const auto datagram = common::InspectUdpDatagram(reply);
         EXPECT_TRUE(datagram.Valid());
         EXPECT_NE(datagram.target, nullptr);
         if (datagram.target) EXPECT_TRUE(datagram.target->SameEndpoint(response_target));
@@ -230,8 +229,8 @@ TEST_P(SsUdpNoiseTest, RejectedPacketsCannotSatisfyReadOrRefreshItsTimeout) {
         const auto mode = std::get<1>(GetParam());
         const bool read_timeout = mode == Noise::ReadGarbage;
         const bool wrong_peer = mode == Noise::IdleWrongPeer;
-        if (read_timeout) request.SetReadTimeout(1s);
-        else request.SetIdleTimeout(1s);
+        if (read_timeout) request.RelayControl().SetReadTimeout(1s);
+        else request.RelayControl().SetIdleTimeout(1s);
         const auto client = co_await SendOneAndGetClientEndpoint(request, server);
         const auto packet = wrong_peer
             ? EncodeClassic(common::TargetAddress(net::ip::address_v4::loopback(), 8123),
@@ -239,7 +238,7 @@ TEST_P(SsUdpNoiseTest, RejectedPacketsCannotSatisfyReadOrRefreshItsTimeout) {
             : std::vector<uint8_t>(64, 0xa7);
         // Validate the stimulus: a wrong-peer packet authenticates, while
         // same-peer garbage must fail authentication.
-        const auto decoded = proxy::shadowsocks::DecodeUdpPacketWithKey(
+        const auto decoded = proxy::DecodeUdpPacketWithKey(
             packet.data(), packet.size(), cipher->key.span(), cipher->info.type,
             cipher->info.key_size, cipher->info.salt_size);
         EXPECT_EQ(decoded.has_value(), wrong_peer);
@@ -255,13 +254,13 @@ TEST_P(SsUdpNoiseTest, RejectedPacketsCannotSatisfyReadOrRefreshItsTimeout) {
             if (!error) {
                 state.watchdog_fired = true;
                 state.stop_noise = true;
-                request.Cancel();
+                request.RelayControl().Cancel();
                 IoErrorCode ignored;
                 sender.cancel(ignored);
             }
         });
         net::co_spawn(io, request.ReadMultiBuffer(),
-            [&](std::exception_ptr error, buf::MultiBuffer payload) {
+            [&](std::exception_ptr error, common::MultiBuffer payload) {
                 state.read_error = error;
                 state.received = std::move(payload);
                 state.read_done = true;
@@ -290,8 +289,8 @@ TEST_P(SsUdpNoiseTest, RejectedPacketsCannotSatisfyReadOrRefreshItsTimeout) {
         const auto elapsed = std::chrono::steady_clock::now() - started;
         EXPECT_GE(elapsed, 800ms);
         EXPECT_LT(elapsed, 3s);
-        if (read_timeout) EXPECT_TRUE(request.ConsumeReadTimeout());
-        else EXPECT_TRUE(request.ConsumeIdleTimeout());
+        if (read_timeout) EXPECT_TRUE(request.RelayControl().ConsumeReadTimeout());
+        else EXPECT_TRUE(request.RelayControl().ConsumeIdleTimeout());
     });
 }
 
@@ -320,7 +319,7 @@ TEST_P(SsUdpRequestTest, OversizedWirePayloadIsRejectedWithoutSendingAndValidWri
         udp::endpoint source;
         const auto wire_size = co_await server.async_receive_from(
             net::buffer(wire), source, net::use_awaitable);
-        const auto decoded = proxy::shadowsocks::DecodeUdpPacketWithKey(
+        const auto decoded = proxy::DecodeUdpPacketWithKey(
             wire.data(), wire_size, key.key.span(), key.info.type,
             key.info.key_size, key.info.salt_size);
         EXPECT_TRUE(decoded.has_value());

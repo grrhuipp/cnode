@@ -1,8 +1,8 @@
 #pragma once
 
-#include "features/routing/dispatcher.hpp"
+#include "routing/dispatcher.hpp"
 #include "app/relay.hpp"
-#include "features/routing/router.hpp"
+#include "routing/router.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -11,31 +11,15 @@
 #include <string_view>
 #include <variant>
 
-namespace proxyman::outbound {
-class Handler;
-class HandlerRegistry;
-}  // namespace proxyman::outbound
-
-namespace rule {
+namespace common {
 class DetectRulePolicy;
-}  // namespace rule
+}  // namespace common
 namespace app {
+class OutboundHandler;
+class OutboundHandlerRegistry;
 class SessionTrackingState;
 class RequestLoadState;
-namespace dns {
 class DNS;
-}  // namespace dns
-}  // namespace app
-
-namespace common {
-
-class AwaitableTaskGroup;
-
-}  // namespace common
-
-namespace app::dispatcher {
-
-namespace detail {
 
 enum class SelectionSource : uint8_t {
     Forced,
@@ -74,7 +58,7 @@ OutboundSelection SelectOutbound(
     const routing::OutboundSelectionPolicy&&,
     const routing::RouteDecision& = {}) noexcept = delete;
 
-}  // namespace detail
+
 
 // ============================================================================
 // DefaultDispatcher - app/dispatcher implementation
@@ -87,10 +71,10 @@ class DefaultDispatcher final : public routing::Dispatcher {
 public:
     DefaultDispatcher(
         const routing::Router& router,
-        const proxyman::outbound::HandlerRegistry& outbound_handlers,
-        rule::DetectRulePolicy& request_policy,
+        const OutboundHandlerRegistry& outbound_handlers,
+        common::DetectRulePolicy& request_policy,
         app::SessionTrackingState& session_tracking,
-        app::dns::DNS& dns_service,
+        app::DNS& dns_service,
         app::RequestLoadState& request_load) noexcept;
 
     net::awaitable<RelayResult> Dispatch(
@@ -99,13 +83,13 @@ public:
         std::unique_ptr<transport::AsyncStream> inbound,
         transport::Link inbound_link,
         common::InitialPayload first_packet,
-        session::Context& ctx,
+        common::Context& ctx,
         StatsShard& stats,
         const infra::TimeoutsConfig& timeouts) override;
 
 private:
     struct RouteResult {
-        std::shared_ptr<proxyman::outbound::Handler> handler;
+        std::shared_ptr<OutboundHandler> handler;
         common::ErrorCode error;
     };
 
@@ -115,30 +99,29 @@ private:
         std::unique_ptr<transport::AsyncStream> inbound,
         transport::Link inbound_link,
         common::InitialPayload& first_packet,
-        session::Context& ctx,
+        common::Context& ctx,
         StatsShard& stats,
         const infra::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout,
         RelayResult& result,
-        common::AwaitableTaskGroup& request_group,
         common::ErrorCode& cancellation_reason);
-    [[nodiscard]] detail::OutboundSelection SelectRoute(
-        session::Context& ctx,
+    [[nodiscard]] OutboundSelection SelectRoute(
+        common::Context& ctx,
         const routing::DispatchPolicy& policy) const;
     [[nodiscard]] RouteResult FinishRoute(
-        session::Context& ctx,
-        const detail::OutboundSelection& selection) const;
+        common::Context& ctx,
+        const OutboundSelection& selection) const;
     [[nodiscard]] net::awaitable<RouteResult> RouteAsync(
-        session::Context& ctx,
+        common::Context& ctx,
         const routing::DispatchPolicy& policy,
-        std::optional<detail::OutboundSelection> initial_selection);
+        std::optional<OutboundSelection> initial_selection);
 
     const routing::Router& router_;
-    const proxyman::outbound::HandlerRegistry& outbound_handlers_;
-    rule::DetectRulePolicy& request_policy_;
+    const OutboundHandlerRegistry& outbound_handlers_;
+    common::DetectRulePolicy& request_policy_;
     app::SessionTrackingState& session_tracking_;
-    app::dns::DNS& dns_service_;
+    app::DNS& dns_service_;
     app::RequestLoadState& request_load_;
 };
 
-}  // namespace app::dispatcher
+}  // namespace app

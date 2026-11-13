@@ -29,7 +29,7 @@ struct RateLimitConfig {
 };
 
 // Lease shared by one physical connection and its logical children; carried in
-// session::Inbound so protocol substreams reserve against the same family.
+// common::Inbound so protocol substreams reserve against the same family.
 struct ConnectionFamily {
     size_t children = 0; // control-executor only
     bool physical = true;

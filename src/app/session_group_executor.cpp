@@ -32,7 +32,6 @@ struct app::GroupCoordinator::ReservedState {
     bool stopping = false;
     bool joined = false;
     std::atomic<uint32_t> worker_count{0};
-    std::pmr::vector<net::io_context*> workers{memory::process_resource()};
 };
 
 namespace app {
@@ -59,13 +58,8 @@ void GroupCoordinator::Start() {
 }
 
 
-void GroupCoordinator::RegisterWorker(net::io_context& reactor) {
-    // Fixed cold-path routes only; consumers receive this coordinator directly.
-    if (std::find(reserved_->workers.begin(), reserved_->workers.end(), &reactor) ==
-        reserved_->workers.end()) {
-        reserved_->workers.push_back(&reactor);
-        reserved_->worker_count.fetch_add(1, std::memory_order_release);
-    }
+void GroupCoordinator::RegisterWorker(net::io_context&) {
+    reserved_->worker_count.fetch_add(1, std::memory_order_release);
 }
 
 uint32_t GroupCoordinator::WorkerCount() const noexcept {

@@ -7,8 +7,7 @@
 
 #include "benchmark_memory.hpp"
 #include "common/allocator.hpp"
-#include "transport/internet/datagram_socket.hpp"
-
+#include "transport/datagram_socket.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/use_future.hpp>
 #include <algorithm>
@@ -22,7 +21,7 @@
 
 namespace {
 using namespace std::chrono_literals;
-using transport::internet::DatagramSocket;
+using transport::DatagramSocket;
 
 uint64_t CpuNanoseconds() {
     timespec time{};
@@ -31,10 +30,10 @@ uint64_t CpuNanoseconds() {
     return uint64_t(time.tv_sec) * 1000000000 + uint64_t(time.tv_nsec);
 }
 
-buf::MultiBuffer MakePayload(std::span<const uint8_t> bytes) {
-    buf::MultiBuffer payload;
+common::MultiBuffer MakePayload(std::span<const uint8_t> bytes) {
+    common::MultiBuffer payload;
     while (!bytes.empty()) {
-        buf::BufferGuard buffer{buf::Buffer::New()};
+        common::BufferGuard buffer{common::Buffer::New()};
         if (!buffer) throw std::bad_alloc();
         const auto count = std::min(bytes.size(), size_t(buffer->Available()));
         std::copy_n(bytes.begin(), count, buffer->Tail().begin());

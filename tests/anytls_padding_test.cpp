@@ -25,7 +25,7 @@ public:
     ~AllocationMeasurement() { measuring = false; }
 };
 
-using namespace ::proxy::anytls;
+using namespace ::proxy;
 constexpr std::array invalid{
     "", "stop=0\n0=30-30", "stop=-1\n0=30-30", "stop=4294967296\n0=30-30",
     "stop=\n0=30-30", "stop=+1\n0=30-30", "stop=1x\n0=30-30",
@@ -41,16 +41,16 @@ constexpr std::array invalid{
     "stop=2\n1=30-30\nstop=invalid", "stop=2\n1=30-30\nstop=0\nstop=2"};
 class InvalidPadding : public testing::TestWithParam<const char*> {};
 TEST_P(InvalidPadding, RejectsMalformedPolicy) {
-    EXPECT_FALSE(ParsePaddingScheme(GetParam()));
+    EXPECT_FALSE(ParseAnyTlsPaddingScheme(GetParam()));
 }
 INSTANTIATE_TEST_SUITE_P(InvalidFields, InvalidPadding, testing::ValuesIn(invalid));
 
 class SparsePadding : public testing::TestWithParam<const char*> {};
 TEST_P(SparsePadding, LargeIndicesDoNotDriveUnboundedAllocation) {
-    std::optional<PaddingScheme> parsed;
+    std::optional<AnyTlsPaddingScheme> parsed;
     {
         AllocationMeasurement measurement;
-        try { parsed = ParsePaddingScheme(GetParam()); }
+        try { parsed = ParseAnyTlsPaddingScheme(GetParam()); }
         catch (const std::bad_alloc&) {}
     }
     ASSERT_TRUE(parsed);
@@ -68,7 +68,7 @@ TEST(AnytlsPadding, IgnoresInvalidRecordIndicesWithoutInventingPadding) {
     for (const auto text : {"stop=1\n", "stop=2\n1=0-10", "stop=2\n-1=30-30",
             "stop=2\n4294967296=30-30", "stop=2\n1x=30-30", "stop=2\n+1=30-30"}) {
         SCOPED_TRACE(text);
-        const auto parsed = ParsePaddingScheme(text);
+        const auto parsed = ParseAnyTlsPaddingScheme(text);
         ASSERT_TRUE(parsed);
         EXPECT_EQ(parsed->Raw(), text);
         EXPECT_EQ(parsed->SampleAuthPaddingSize(), 0);
@@ -80,7 +80,7 @@ TEST(AnytlsPadding, IgnoresInvalidRecordIndicesWithoutInventingPadding) {
 TEST(AnytlsPadding, SparseRecordsSeparateAuthAndHonorLastValidDuplicate) {
     const std::string raw = " \tstop=4294967295\r\n\n4294967294=64-65\n7=96-96\n"
         "0=45-45\n7=80-80\n7=invalid\n1= 120-100 , c , 32-32 \r\n4294967295=99-99\n";
-    const auto scheme = ParsePaddingScheme(raw);
+    const auto scheme = ParseAnyTlsPaddingScheme(raw);
     ASSERT_TRUE(scheme);
     EXPECT_EQ(scheme->Raw(), raw);
     EXPECT_EQ(scheme->SampleAuthPaddingSize(), 45);
@@ -104,7 +104,7 @@ TEST(AnytlsPadding, SparseRecordsSeparateAuthAndHonorLastValidDuplicate) {
 
 TEST(AnytlsPadding, MissingAuthRecordDoesNotFallBackToFramePadding) {
     for (const auto text : {"stop=1\n0=0-0", "stop=1\n1=99-99", "stop=2\n1=99-99"}) {
-        const auto parsed = ParsePaddingScheme(text);
+        const auto parsed = ParseAnyTlsPaddingScheme(text);
         ASSERT_TRUE(parsed);
         EXPECT_EQ(parsed->SampleAuthPaddingSize(), 0);
     }
@@ -112,7 +112,7 @@ TEST(AnytlsPadding, MissingAuthRecordDoesNotFallBackToFramePadding) {
 
 TEST(AnytlsPadding, AuthRangesNormalizeReversedHalfOpenBounds) {
     for (const auto text : {"stop=2\n0=45-77\n1=99-99", "stop=1\n0= 77-45 \r\n"}) {
-        const auto parsed = ParsePaddingScheme(text);
+        const auto parsed = ParseAnyTlsPaddingScheme(text);
         ASSERT_TRUE(parsed);
         for (size_t index = 0; index < 2048; ++index) {
             const auto size = parsed->SampleAuthPaddingSize();
@@ -123,15 +123,15 @@ TEST(AnytlsPadding, AuthRangesNormalizeReversedHalfOpenBounds) {
 }
 
 TEST(AnytlsPadding, AuthBoundaryAndLastStopAndDuplicateWin) {
-    const auto boundary = ParsePaddingScheme("stop=2\n0=65535-65535\nstop=1");
+    const auto boundary = ParseAnyTlsPaddingScheme("stop=2\n0=65535-65535\nstop=1");
     ASSERT_TRUE(boundary);
     EXPECT_EQ(boundary->SampleAuthPaddingSize(), 65535);
     EXPECT_TRUE(boundary->RecordFor(1).empty());
-    const auto upper = ParsePaddingScheme("stop=1\n0=65536-65535");
+    const auto upper = ParseAnyTlsPaddingScheme("stop=1\n0=65536-65535");
     ASSERT_TRUE(upper);
     EXPECT_EQ(upper->SampleAuthPaddingSize(), 65535);
     EXPECT_TRUE(upper->RecordFor(0).empty());
-    const auto duplicate = ParsePaddingScheme("stop=1\n0=45-45\n0=91-91");
+    const auto duplicate = ParseAnyTlsPaddingScheme("stop=1\n0=45-45\n0=91-91");
     ASSERT_TRUE(duplicate);
     EXPECT_EQ(duplicate->SampleAuthPaddingSize(), 91);
 }
@@ -139,13 +139,13 @@ TEST(AnytlsPadding, AuthBoundaryAndLastStopAndDuplicateWin) {
 TEST(AnytlsPadding, FrameSizesCoverBufferAndWireBoundaries) {
     for (const int size : {1, 7, 8, 8191, 8192, 8193, 16384, 65535}) {
         SCOPED_TRACE(size);
-        const auto parsed = ParsePaddingScheme("stop=2\n1=" + std::to_string(size) + "-" + std::to_string(size));
+        const auto parsed = ParseAnyTlsPaddingScheme("stop=2\n1=" + std::to_string(size) + "-" + std::to_string(size));
         ASSERT_TRUE(parsed);
         ASSERT_EQ(parsed->RecordFor(1).size(), 1);
         EXPECT_EQ(parsed->RecordFor(1)[0].SampleSize(), size);
     }
     for (const auto text : {"stop=2\n1=65535-65536", "stop=2\n1=65536-65535"}) {
-        const auto parsed = ParsePaddingScheme(text);
+        const auto parsed = ParseAnyTlsPaddingScheme(text);
         ASSERT_TRUE(parsed);
         ASSERT_EQ(parsed->RecordFor(1).size(), 1);
         EXPECT_EQ(parsed->RecordFor(1)[0].SampleSize(), 65535);
@@ -156,10 +156,10 @@ TEST(AnytlsPadding, SparseStorageScalesWithPresentRecords) {
     std::string many = "stop=4294967295\n";
     for (uint32_t index = 0; index < 2048; ++index)
         many += std::to_string(UINT32_MAX - 1 - index * 1000000) + "=64-65\n";
-    std::optional<PaddingScheme> parsed;
+    std::optional<AnyTlsPaddingScheme> parsed;
     {
         AllocationMeasurement measurement;
-        try { parsed = ParsePaddingScheme(many); }
+        try { parsed = ParseAnyTlsPaddingScheme(many); }
         catch (const std::bad_alloc&) {}
     }
     ASSERT_TRUE(parsed);

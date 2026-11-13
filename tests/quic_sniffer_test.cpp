@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include "sniff/sniffer.hpp"
-
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 

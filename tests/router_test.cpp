@@ -8,7 +8,7 @@
 #include <stdexcept>
 
 namespace {
-using ::app::router::Router;
+using ::app::Router;
 
 ::infra::RoutingConfig RoutingRules() {
     ::infra::RoutingConfig config;
@@ -27,7 +27,7 @@ using ::app::router::Router;
 
 TEST(Router, FirstMatchingRuleWins) {
     const Router router(RoutingRules(), nullptr);
-    ::session::Context ctx;
+    ::common::Context ctx;
     ctx.content.network = ::common::Network::TCP;
     ctx.outbound.target = ::common::TargetAddress("WWW.EXAMPLE.COM.", 443);
     ctx.outbound.target.resolved_addr = ::net::ip::make_address("192.0.2.1");
@@ -38,7 +38,7 @@ TEST(Router, FirstMatchingRuleWins) {
 
 TEST(Router, NetworkConstraintSkipsTcpRuleForUdp) {
     const Router router(RoutingRules(), nullptr);
-    ::session::Context ctx;
+    ::common::Context ctx;
     ctx.content.network = ::common::Network::UDP;
     ctx.outbound.target = ::common::TargetAddress("example.com", 443);
     ctx.outbound.target.resolved_addr = ::net::ip::make_address("192.0.2.1");
@@ -49,7 +49,7 @@ TEST(Router, NetworkConstraintSkipsTcpRuleForUdp) {
 
 TEST(Router, MatchesIpv6Network) {
     const Router router(RoutingRules(), nullptr);
-    ::session::Context ctx;
+    ::common::Context ctx;
     ctx.outbound.target = ::common::TargetAddress("2001:db8::7", 53);
     EXPECT_EQ(router.Route(ctx).outbound_tag, "ip-proxy");
 }
@@ -61,7 +61,7 @@ TEST(Router, RouteOnlyTargetControlsPortAndResolvedIpMatching) {
     port.outbound_tag = "port-proxy";
     config.rules[0] = port;
     const Router router(config, nullptr);
-    ::session::Context ctx;
+    ::common::Context ctx;
     ctx.outbound.target = ::common::TargetAddress("example.org", 80);
     ctx.outbound.route_target = ::common::TargetAddress("sniffed.example.org", 8443);
     EXPECT_EQ(router.Route(ctx).outbound_tag, "port-proxy");
@@ -72,7 +72,7 @@ TEST(Router, RouteOnlyTargetControlsPortAndResolvedIpMatching) {
 
 TEST(Router, SuffixBoundaryMissHasNoFallback) {
     const Router router(RoutingRules(), nullptr);
-    ::session::Context ctx;
+    ::common::Context ctx;
     ctx.content.network = ::common::Network::TCP;
     ctx.outbound.target = ::common::TargetAddress("notexample.com", 443);
     const auto match = router.Route(ctx);
@@ -84,7 +84,7 @@ TEST(Router, ConfigurationReplacementPreservesExistingRulesAndDecisions) {
     auto config = RoutingRules();
     const Router router(config, nullptr);
     const ::routing::Router& query = router;
-    ::session::Context ctx;
+    ::common::Context ctx;
     ctx.content.network = ::common::Network::TCP;
     ctx.outbound.target = ::common::TargetAddress("example.com", 443);
     const auto decision = query.Route(ctx);
@@ -110,7 +110,7 @@ TEST(Router, PrimaryAndAdditionalInboundTagsParticipateInRouting) {
     extra_tag.outbound_tag = "extra-out";
     config.rules = {main_tag, extra_tag};
     const Router router(config, nullptr);
-    ::session::Context ctx;
+    ::common::Context ctx;
     ctx.inbound.tag = std::string(96, 'm');
     ctx.inbound.tags.emplace_back(std::string(112, 'x'));
     ctx.outbound.target = ::common::TargetAddress("main.example", 443);
@@ -146,6 +146,6 @@ INSTANTIATE_TEST_SUITE_P(ConfigurationErrors, InvalidRoutingRule,
 
 TEST(Router, EmptyRulesHaveNoImplicitDefault) {
     const Router router(::infra::RoutingConfig{}, nullptr);
-    EXPECT_FALSE(router.Route(::session::Context{}).matched);
+    EXPECT_FALSE(router.Route(::common::Context{}).matched);
 }
 }  // namespace

@@ -1,7 +1,6 @@
 #pragma once
 
-#include "common/buf/multi_buffer.hpp"
-
+#include "common/multi_buffer.hpp"
 #include <utility>
 
 // The upstream bytes a protocol already decoded before dispatch. They cross
@@ -12,7 +11,7 @@ namespace common {
 class InitialPayload {
 public:
     InitialPayload() noexcept = default;
-    explicit InitialPayload(buf::MultiBuffer data) noexcept : data_(std::move(data)) {
+    explicit InitialPayload(MultiBuffer data) noexcept : data_(std::move(data)) {
         data_.ReleaseIfIdle();
     }
 
@@ -23,10 +22,10 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return data_.empty(); }
 
-    [[nodiscard]] buf::MultiBuffer MoveToMultiBuffer() && noexcept { return std::move(data_); }
+    [[nodiscard]] MultiBuffer MoveToMultiBuffer() && noexcept { return std::move(data_); }
 
 private:
-    buf::MultiBuffer data_;
+    MultiBuffer data_;
 };
 
 }  // namespace common

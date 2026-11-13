@@ -14,38 +14,38 @@ protected:
     void TearDown() override { UserStore::ClearWorkerView(); }
 
     std::vector<uint8_t> Packet(const PreparedShadowsocksUser& user,
-                                const proxy::shadowsocks::SsCipherInfo& cipher, uint64_t packet_id = 0) {
-        proxy::shadowsocks::KeyBytes key;
+                                const proxy::SsCipherInfo& cipher, uint64_t packet_id = 0) {
+        proxy::KeyBytes key;
         Require(key.assign(user.derived_key.span()));
-        std::array<proxy::shadowsocks::KeyBytes, 2> chain;
-        std::span<const proxy::shadowsocks::KeyBytes> psk_chain;
+        std::array<proxy::KeyBytes, 2> chain;
+        std::span<const proxy::KeyBytes> psk_chain;
         if (!user.identity_key.empty()) {
             Require(chain[0].assign(user.identity_key.span()));
             chain[1] = key;
             psk_chain = chain;
         }
-        proxy::shadowsocks::Ss2022UdpSessionState state;
-        Require(proxy::shadowsocks::Init2022UdpSessionState(state, cipher, key));
+        proxy::Ss2022UdpSessionState state;
+        Require(proxy::Init2022UdpSessionState(state, cipher, key));
         state.client_session_id = {0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde};
         state.next_packet_id = packet_id;
-        const size_t size = proxy::shadowsocks::Encode2022UdpRequestPacketTo(
+        const size_t size = proxy::Encode2022UdpRequestPacketTo(
             target, payload.data(), payload.size(), state, psk_chain, nullptr, 0);
         Require(size != 0);
         std::vector<uint8_t> packet(size);
-        Require(proxy::shadowsocks::Encode2022UdpRequestPacketTo(target, payload.data(), payload.size(),
+        Require(proxy::Encode2022UdpRequestPacketTo(target, payload.data(), payload.size(),
             state, psk_chain, packet.data(), packet.size()) == size);
         return packet;
     }
 
     auto Decode(const std::vector<uint8_t>& packet,
                 const UserStore::ShadowsocksUsersView& view,
-                const proxy::shadowsocks::SsCipherInfo& cipher, proxy::shadowsocks::Ss2022UdpReplayCache& replay,
+                const proxy::SsCipherInfo& cipher, proxy::Ss2022UdpReplayCache& replay,
                 bool deferred = false) {
-        return proxy::shadowsocks::DecodeUdpPacket(packet.data(), packet.size(), view,
+        return proxy::DecodeUdpPacket(packet.data(), packet.size(), view,
             cipher.type, cipher.key_size, cipher.salt_size, replay, deferred);
     }
 
-    void ExpectUser(const proxy::shadowsocks::SsUdpDecodeResult& decoded,
+    void ExpectUser(const proxy::SsUdpDecodeResult& decoded,
                     const UserStore::ShadowsocksUsersView& view,
                     const PreparedShadowsocksUser& user, uint64_t packet_id = 0) {
         ASSERT_LT(decoded.user_index, view.size());
@@ -62,7 +62,7 @@ protected:
             actual.insert(actual.end(), bytes.begin(), bytes.end());
         }
         EXPECT_EQ(actual, std::vector<uint8_t>(payload.begin(), payload.end()));
-        const auto datagram = buf::InspectUdpDatagram(decoded.payload);
+        const auto datagram = common::InspectUdpDatagram(decoded.payload);
         ASSERT_TRUE(datagram.Valid());
         EXPECT_TRUE(datagram.target->SameEndpoint(target));
         EXPECT_EQ(datagram.payload_size, payload.size());
@@ -71,12 +71,12 @@ protected:
 
 TEST_F(ShadowsocksUdpIdentity, EverySortedPositionAndGroupAuthenticates) {
     for (auto method : {"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"}) {
-        const auto cipher = *proxy::shadowsocks::ParseCipherMethod(method);
+        const auto cipher = *proxy::ParseCipherMethod(method);
         for (size_t groups : {0u, 1u, 4u, 19u}) {
             const auto users = Users(19, cipher, groups);
             Install(users);
             const auto view = UserStore::ShadowsocksUsers(kTag);
-            proxy::shadowsocks::Ss2022UdpReplayCache replay;
+            proxy::Ss2022UdpReplayCache replay;
             // Visit every snapshot position, including each group's first,
             // middle and last hash; all users share session and packet IDs.
             for (size_t index = 0; index < view.size(); ++index) {
@@ -98,7 +98,7 @@ TEST_F(ShadowsocksUdpIdentity, EverySortedPositionAndGroupAuthenticates) {
 
 TEST_F(ShadowsocksUdpIdentity, HashCollisionsRequireFullPayloadAuthentication) {
     for (auto method : {"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"}) {
-        const auto cipher = *proxy::shadowsocks::ParseCipherMethod(method);
+        const auto cipher = *proxy::ParseCipherMethod(method);
         for (size_t chosen : {0u, 3u, 6u}) {
             auto users = Users(7, cipher);
             const auto hash = users[chosen].psk_hash;
@@ -107,7 +107,7 @@ TEST_F(ShadowsocksUdpIdentity, HashCollisionsRequireFullPayloadAuthentication) {
             const auto packet = Packet(expected, cipher);
             Install(users);
             auto view = UserStore::ShadowsocksUsers(kTag);
-            proxy::shadowsocks::Ss2022UdpReplayCache replay;
+            proxy::Ss2022UdpReplayCache replay;
             auto decoded = Decode(packet, view, cipher, replay, true);
             ASSERT_TRUE(decoded);
             ExpectUser(*decoded, view, expected);
@@ -126,13 +126,13 @@ TEST_F(ShadowsocksUdpIdentity, HashCollisionsRequireFullPayloadAuthentication) {
 
 TEST_F(ShadowsocksUdpIdentity, MixedIdentityAndNonidentityCredentialsAuthenticate) {
     for (auto method : {"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"}) {
-        const auto cipher = *proxy::shadowsocks::ParseCipherMethod(method);
+        const auto cipher = *proxy::ParseCipherMethod(method);
         auto users = Users(15, cipher, 3);
         for (size_t i = 0; i < users.size(); i += 2) users[i].identity_key = {};
         std::reverse(users.begin(), users.end());
         Install(users);
         const auto view = UserStore::ShadowsocksUsers(kTag);
-        proxy::shadowsocks::Ss2022UdpReplayCache replay;
+        proxy::Ss2022UdpReplayCache replay;
         for (const auto& user : users) {
             const auto packet = Packet(user, cipher);
             auto decoded = Decode(packet, view, cipher, replay);
@@ -145,7 +145,7 @@ TEST_F(ShadowsocksUdpIdentity, MixedIdentityAndNonidentityCredentialsAuthenticat
 }
 
 TEST_F(ShadowsocksUdpIdentity, RetiredSnapshotKeepsItsOwnCredentialsAndOrdering) {
-    const auto cipher = *proxy::shadowsocks::ParseCipherMethod("2022-blake3-aes-256-gcm");
+    const auto cipher = *proxy::ParseCipherMethod("2022-blake3-aes-256-gcm");
     auto users = Users(13, cipher, 3);
     Install(users);
     const auto old_view = UserStore::ShadowsocksUsers(kTag);
@@ -153,13 +153,13 @@ TEST_F(ShadowsocksUdpIdentity, RetiredSnapshotKeepsItsOwnCredentialsAndOrdering)
     const auto old_packet = Packet(retired, cipher);
     for (auto& user : users) {
         user.derived_key.bytes[15] ^= 0x5a;
-        Require(proxy::shadowsocks::Hash2022Psk(user.derived_key.span(), user.psk_hash));
+        Require(proxy::Hash2022Psk(user.derived_key.span(), user.psk_hash));
     }
     std::reverse(users.begin(), users.end());
     Install(users);
     const auto new_view = UserStore::ShadowsocksUsers(kTag);
     UserStore::ClearWorkerView();
-    proxy::shadowsocks::Ss2022UdpReplayCache replay;
+    proxy::Ss2022UdpReplayCache replay;
     EXPECT_FALSE(Decode(old_packet, new_view, cipher, replay));
     EXPECT_EQ(replay.Size(), 0u);
     auto old_decoded = Decode(old_packet, old_view, cipher, replay);
@@ -180,12 +180,12 @@ TEST_F(ShadowsocksUdpIdentity, RetiredSnapshotKeepsItsOwnCredentialsAndOrdering)
 }
 
 TEST_F(ShadowsocksUdpIdentity, DeferredAndInvalidAuthenticationLeaveReplayUntouched) {
-    const auto cipher = *proxy::shadowsocks::ParseCipherMethod("2022-blake3-aes-256-gcm");
+    const auto cipher = *proxy::ParseCipherMethod("2022-blake3-aes-256-gcm");
     const auto users = Users(17, cipher, 3);
     Install(users);
     const auto view = UserStore::ShadowsocksUsers(kTag);
     const auto& user = users[view[view.size() - 1].profile.user_id - 1];
-    proxy::shadowsocks::Ss2022UdpReplayCache replay;
+    proxy::Ss2022UdpReplayCache replay;
     for (uint64_t packet_id : {0u, 1u}) {
         const auto packet = Packet(user, cipher, packet_id);
         auto invalid = packet;

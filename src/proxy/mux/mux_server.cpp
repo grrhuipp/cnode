@@ -1,17 +1,17 @@
 #include "proxy/mux/mux_server.hpp"
-#include "common/mux/mux_codec.hpp"
+#include "common/mux_codec.hpp"
 #include "app/relay.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "common/awaitable_task_group.hpp"
 #include "app/stats.hpp"
 #include "common/address_codec.hpp"
 #include "common/allocator.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/const_buffer_span.hpp"
 #include "common/byte_reader.hpp"
 #include "common/hash_container_shrink.hpp"
 #include "common/session.hpp"
-#include "features/routing/dispatcher.hpp"
+#include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
 #include "transport/async_stream.hpp"
@@ -31,7 +31,7 @@
 #include <utility>
 #include <vector>
 namespace proxy {
-using namespace mux;
+
 // ============================================================================
 // 内部类型
 // ============================================================================
@@ -54,11 +54,11 @@ constexpr size_t kMaxConcurrentSubSessions = 1024;
 }
 
 struct QueuedInput {
-    QueuedInput(buf::MultiBuffer p, size_t n) noexcept
+    QueuedInput(common::MultiBuffer p, size_t n) noexcept
         : payload(std::move(p))
         , bytes(n) {}
 
-    buf::MultiBuffer payload;
+    common::MultiBuffer payload;
     size_t bytes = 0;
 };
 
@@ -69,7 +69,7 @@ struct MuxReply {
     bool is_error = false;   // END carries OptionError (child refused)
     bool dispatch_done = false;
     bool is_udp = false;     // true → EncodeKeepUDP（带源地址）
-    buf::MultiBuffer payload;
+    common::MultiBuffer payload;
 
     [[nodiscard]] size_t PayloadSize() const noexcept {
         return payload.byte_size();
@@ -81,7 +81,7 @@ class TcpSubState;
 struct ReplyQueueState {
     explicit ReplyQueueState(common::SignalChannel& main_signal)
         : main_signal_(main_signal) {}
-    memory::RingDeque<MuxReply> queue;
+    common::RingDeque<MuxReply> queue;
     size_t tcp_queued_bytes = 0;   // TCP 子会话回包字节（含 overhead）
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
     uint32_t active_sub_loops = 0;
@@ -257,7 +257,7 @@ struct ClientReadQueueState {
         , main_signal_(main_signal) {}
     common::SignalChannel space_signal;
     common::SignalChannel& main_signal_;
-    memory::RingDeque<QueuedInput> queue;
+    common::RingDeque<QueuedInput> queue;
     size_t queued_bytes = 0;
     bool running = true;
     bool read_backpressured = false;
@@ -272,7 +272,7 @@ struct ClientReadQueueState {
         (void)space_signal.try_send(IoErrorCode{});
     }
 
-    [[nodiscard]] bool Push(buf::MultiBuffer mb, size_t bytes) {
+    [[nodiscard]] bool Push(common::MultiBuffer mb, size_t bytes) {
         if (QueueBytesWouldExceed(
                 queued_bytes, bytes, kMuxQueueEmergencyBytes)) {
             mb.clear();
@@ -292,7 +292,7 @@ struct ClientReadQueueState {
         return true;
     }
 
-    bool Pop(buf::MultiBuffer& mb) {
+    bool Pop(common::MultiBuffer& mb) {
         if (queue.empty()) {
             return false;
         }
@@ -354,7 +354,7 @@ public:
     }
 
     virtual void PushClientFramePayload(
-        buf::MultiBuffer mb,
+        common::MultiBuffer mb,
         size_t data_len,
         const common::TargetAddress* packet_target = nullptr) = 0;
 
@@ -362,19 +362,19 @@ public:
         return dispatch_done_;
     }
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         while (!cancelled_) {
             if (!input_queue_.empty()) {
                 auto& input = input_queue_.front();
                 const size_t bytes = input.bytes;
-                buf::MultiBuffer payload = std::move(input.payload);
+                common::MultiBuffer payload = std::move(input.payload);
                 input_queue_.pop_front();
                 queued_bytes_ -= std::min(queued_bytes_, bytes);
                 reply_queue_.ReleaseSubInput(bytes);
                 co_return payload;
             }
             if (input_done_) {
-                co_return buf::MultiBuffer{};
+                co_return common::MultiBuffer{};
             }
 
             auto [ec] = co_await input_signal_.async_receive(
@@ -429,7 +429,7 @@ public:
         return WriteBuffersAsMultiBuffer(buffers);
     }
 
-    session::Context ctx;
+    common::Context ctx;
 
 protected:
     MuxSubSession(
@@ -455,7 +455,7 @@ protected:
 
     // Per-sub backlog needs no own cap: the frame loop stops parsing client
     // frames once all sub-sessions together hold kMuxQueueHighWaterBytes.
-    void QueueInput(buf::MultiBuffer mb, size_t bytes, bool coalesce = false) {
+    void QueueInput(common::MultiBuffer mb, size_t bytes, bool coalesce = false) {
         if (coalesce && !input_queue_.empty()) {
             input_queue_.back().payload.AppendAndCoalesce(std::move(mb));
             input_queue_.back().bytes += bytes;
@@ -501,7 +501,7 @@ private:
 
     common::SignalChannel input_signal_;
     transport::CancellationSource cancellation_;
-    memory::RingDeque<QueuedInput> input_queue_;
+    common::RingDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
     common::ErrorCode terminal_error_ = common::ErrorCode::CANCELLED;
     bool end_sent_ = false;
@@ -523,7 +523,7 @@ public:
     }
 
     void PushClientFramePayload(
-        buf::MultiBuffer mb,
+        common::MultiBuffer mb,
         size_t data_len,
         const common::TargetAddress* packet_target) override {
         (void)data_len;
@@ -540,7 +540,7 @@ public:
         return transport::EofAction::ShutdownPeerWrite;
     }
 
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
         if (reply_queue_.ShouldBackpressureTcpReads()) {
             co_await WaitForOutputWindow();
         }
@@ -555,7 +555,7 @@ public:
             throw transport::WriteClosed{};
         }
 
-        for (buf::Buffer*& buffer : mb) {
+        for (common::Buffer*& buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
                 mb.FreeSlot(buffer);
             }
@@ -698,21 +698,21 @@ public:
     }
 
     void PushClientFramePayload(
-        buf::MultiBuffer mb,
+        common::MultiBuffer mb,
         size_t data_len,
         const common::TargetAddress* packet_target) override {
         if (InputClosed()) {
             mb.clear();
             return;
         }
-        if (!buf::SetUdpTarget(mb, packet_target ? *packet_target : default_target_)) {
+        if (!common::SetUdpTarget(mb, packet_target ? *packet_target : default_target_)) {
             throw std::bad_alloc();
         }
         // Empty datagrams still own a Buffer and a queue entry.
-        QueueInput(std::move(mb), std::max(data_len, size_t{buf::Buffer::kSize}));
+        QueueInput(std::move(mb), std::max(data_len, size_t{common::Buffer::kSize}));
     }
 
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
         if (cancelled_ || !reply_queue_.running) {
             mb.clear();
             throw IoSystemError(
@@ -724,8 +724,8 @@ public:
             throw transport::WriteClosed{};
         }
 
-        const auto datagram = buf::InspectUdpDatagram(mb);
-        if (datagram.status == buf::UdpDatagramStatus::Empty) {
+        const auto datagram = common::InspectUdpDatagram(mb);
+        if (datagram.status == common::UdpDatagramStatus::Empty) {
             mb.clear();
             co_return;
         }
@@ -773,7 +773,7 @@ net::awaitable<void> RunSubDispatch(
     net::io_context& io_context,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& policy,
-    const proxyman::inbound::AdmissionEnvironment& environment,
+    const app::AdmissionEnvironment& environment,
     MuxSubSession* sub,
     app::StatsShard& stats,
     const infra::TimeoutsConfig& timeouts,
@@ -788,8 +788,7 @@ net::awaitable<void> RunSubDispatch(
     try {
         // Held for the child's lifetime; a refusal ends only this child.
         proxy::InboundSubstreamAdmission admission(stats);
-        auto pending = proxy::AdmitInboundSubstream(environment, sub->ctx);
-        if (pending && !admission.Hold(co_await std::move(*pending), sub->ctx, stats)) {
+        if (!co_await admission.Admit(environment, sub->ctx)) {
             sub->Reject();
         } else {
             (void)co_await dispatcher.Dispatch(
@@ -816,8 +815,8 @@ class MuxServerSession final {
 public:
     MuxServerSession(net::io_context& io_context, transport::Link client_link,
         transport::AsyncStream& client_control, routing::Dispatcher& dispatcher,
-        const routing::DispatchPolicy& policy, const proxyman::inbound::AdmissionEnvironment& environment,
-        session::Context& parent_ctx, app::StatsShard& stats, const infra::TimeoutsConfig& timeouts,
+        const routing::DispatchPolicy& policy, const app::AdmissionEnvironment& environment,
+        common::Context& parent_ctx, app::StatsShard& stats, const infra::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout)
         : io_context(io_context), client_link(client_link), client_control(client_control),
           dispatcher(dispatcher), policy(policy), environment(environment), parent_ctx(parent_ctx),
@@ -876,7 +875,7 @@ private:
     net::awaitable<void> ReadClient() {
         while (client_reads.running) {
             try {
-                buf::MultiBuffer read_mb = co_await client_link.reader->ReadMultiBuffer();
+                common::MultiBuffer read_mb = co_await client_link.reader->ReadMultiBuffer();
                 if (read_mb.byte_size() == 0) {
                     client_reads.MarkDone(common::ErrorCode::OK);
                     co_return;
@@ -940,8 +939,8 @@ private:
                 size_t header_len = 0;
                 if (reply.is_udp) {
                     // 入队前已校验整份 datagram 带同一合法目标；队列不改写 Buffer 标签。
-                    const auto datagram = buf::InspectUdpDatagram(reply.payload);
-                    header_len = datagram.target == nullptr ? 0 : mux::EncodeKeepUDPHeaderTo(
+                    const auto datagram = common::InspectUdpDatagram(reply.payload);
+                    header_len = datagram.target == nullptr ? 0 : common::EncodeKeepUDPHeaderTo(
                         write_frame,
                         reply.session_id,
                         *datagram.target,
@@ -956,7 +955,7 @@ private:
                         co_return true;
                     }
                 } else {
-                    header_len = mux::EncodeKeepDataHeaderTo(
+                    header_len = common::EncodeKeepDataHeaderTo(
                         write_frame,
                         reply.session_id,
                         payload_size);
@@ -971,7 +970,7 @@ private:
                     co_return true;
                 }
 
-                common::ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+                common::ConstBufferSpanBuilder<1 + common::MultiBuffer::kInlineCapacity> framed;
                 framed.Append(net::const_buffer(write_frame.data(), header_len));
                 framed.AppendMultiBuffer(reply.payload);
                 try {
@@ -1005,7 +1004,7 @@ private:
                         continue;
                     }
                     std::array<uint8_t, 6> write_frame{};
-                    const size_t header_len = mux::EncodeEndTo(
+                    const size_t header_len = common::EncodeEndTo(
                         write_frame, reply.session_id, reply.is_error);
                     if (!co_await WriteFrameToClient(
                             std::span<const uint8_t>(write_frame.data(), header_len))) {
@@ -1067,7 +1066,7 @@ private:
             // 2. 消费客户端读队列。读操作由独立协程持有，避免为了轮询回包而
             //    Cancel 底层协议 reader，导致 VMess/VLESS 流被提前关闭。
             // --------------------------------------------------------------------
-            buf::MultiBuffer read_mb;
+            common::MultiBuffer read_mb;
             const bool popped_read = client_reads.Pop(read_mb);
             if (popped_read) {
                 const size_t read_bytes = read_mb.byte_size();
@@ -1087,11 +1086,11 @@ private:
             while (running && frame_buf.byte_size() > 0 &&
                    !reply_queue.ShouldBackpressureClientFrames() &&
                    !reply_queue.tcp_overflowed) {
-                auto opt_hdr = mux::DecodeFrame(frame_buf);
+                auto opt_hdr = common::DecodeFrame(frame_buf);
                 if (!opt_hdr) break;  // 数据不足，等待下次读取
                 decoded_any_frame = true;
 
-                mux::FrameHeader& hdr = *opt_hdr;
+                common::FrameHeader& hdr = *opt_hdr;
                 if (hdr.frame_size == 0) {
                     LOG_CONN_DEBUG(parent_ctx, "invalid frame");
                     result.error = common::ErrorCode::PROTOCOL_DECODE_FAILED;
@@ -1099,12 +1098,12 @@ private:
                     break;
                 }
 
-                buf::MultiBuffer frame_payload;
+                common::MultiBuffer frame_payload;
                 const bool should_extract_payload =
                     hdr.has_data && hdr.data_len > 0 &&
-                    hdr.status != mux::SessionStatus::KEEPALIVE &&
-                    (hdr.status == mux::SessionStatus::NEW ||
-                     (hdr.option & mux::kOptionError) == 0);
+                    hdr.status != common::SessionStatus::KEEPALIVE &&
+                    (hdr.status == common::SessionStatus::NEW ||
+                     (hdr.option & common::kOptionError) == 0);
                 if (should_extract_payload) {
                     if (frame_buf.DropPrefixBytes(hdr.data_offset) != hdr.data_offset ||
                         !frame_buf.MovePrefixTo(frame_payload, hdr.data_len)) {
@@ -1123,9 +1122,9 @@ private:
                 switch (hdr.status) {
 
                 // ----------------------------------------------------------------
-                case mux::SessionStatus::KEEPALIVE: {
+                case common::SessionStatus::KEEPALIVE: {
                     std::array<uint8_t, 6> write_frame{};
-                    const size_t header_len = mux::EncodeKeepAliveTo(write_frame);
+                    const size_t header_len = common::EncodeKeepAliveTo(write_frame);
                     if (!co_await WriteFrameToClient(
                             std::span<const uint8_t>(write_frame.data(), header_len))) {
                         running = false;
@@ -1134,13 +1133,13 @@ private:
                 }
 
                 // ----------------------------------------------------------------
-                case mux::SessionStatus::NEW: {
-                    const bool is_udp = hdr.network == mux::NetworkType::UDP;
+                case common::SessionStatus::NEW: {
+                    const bool is_udp = hdr.network == common::NetworkType::UDP;
                     // A reused ID or a sub-session beyond the budget is refused
                     // with an error END; the refused frame's payload is dropped.
                     if (sub_sessions.contains(hdr.session_id) ||
                         sub_sessions.size() >= kMaxConcurrentSubSessions) {
-                        session::Context rejected_ctx;
+                        common::Context rejected_ctx;
                         rejected_ctx.InitSubstreamFrom(parent_ctx);
                         proxy::BindInboundRequestTarget(
                             rejected_ctx,
@@ -1156,7 +1155,7 @@ private:
                                 ? "duplicate stream ID" : "concurrent stream limit"));
                         std::array<uint8_t, 6> write_frame{};
                         const size_t header_len =
-                            mux::EncodeEndTo(write_frame, hdr.session_id, true);
+                            common::EncodeEndTo(write_frame, hdr.session_id, true);
                         if (!co_await WriteFrameToClient(
                                 std::span<const uint8_t>(write_frame.data(), header_len))) {
                             running = false;
@@ -1219,7 +1218,7 @@ private:
                 }
 
                 // ----------------------------------------------------------------
-                case mux::SessionStatus::KEEP: {
+                case common::SessionStatus::KEEP: {
                     auto session_it = sub_sessions.find(hdr.session_id);
                     MuxSubSession* sub = session_it == sub_sessions.end()
                         ? nullptr
@@ -1232,7 +1231,7 @@ private:
                     if (!sub) {
                         break;
                     }
-                    if ((hdr.option & mux::kOptionError) != 0) {
+                    if ((hdr.option & common::kOptionError) != 0) {
                         sub->Cancel();
                         break;
                     }
@@ -1246,14 +1245,14 @@ private:
                 }
 
                 // ----------------------------------------------------------------
-                case mux::SessionStatus::END: {
+                case common::SessionStatus::END: {
                     const uint16_t sid = hdr.session_id;
                     auto session_it = sub_sessions.find(sid);
                     const bool known_session = session_it != sub_sessions.end();
 
                     if (known_session) {
                         MuxSubSession& sub = *session_it->second;
-                        if ((hdr.option & mux::kOptionError) != 0) {
+                        if ((hdr.option & common::kOptionError) != 0) {
                             sub.Cancel();
                         } else {
                             if (hdr.has_data) {
@@ -1270,7 +1269,7 @@ private:
                     // 旧回包在同 sid 的新 NEW 之后误删新子会话。
                     if (!known_session) {
                         std::array<uint8_t, 6> write_frame{};
-                        const size_t header_len = mux::EncodeEndTo(write_frame, sid);
+                        const size_t header_len = common::EncodeEndTo(write_frame, sid);
                         if (!co_await WriteFrameToClient(
                                 std::span<const uint8_t>(write_frame.data(), header_len))) {
                             running = false;
@@ -1341,16 +1340,16 @@ private:
     transport::AsyncStream& client_control;
     routing::Dispatcher& dispatcher;
     const routing::DispatchPolicy& policy;
-    const proxyman::inbound::AdmissionEnvironment& environment;
-    session::Context& parent_ctx;
+    const app::AdmissionEnvironment& environment;
+    common::Context& parent_ctx;
     app::StatsShard& stats;
     const infra::TimeoutsConfig& timeouts;
     uint32_t pressure_idle_timeout;
     common::SignalChannel main_signal;
     ReplyQueueState reply_queue;
     ClientReadQueueState client_reads;
-    std::pmr::unordered_map<uint16_t, std::unique_ptr<MuxSubSession>> sub_sessions{memory::process_resource()};
-    buf::MultiBuffer frame_buf;
+    std::unordered_map<uint16_t, std::unique_ptr<MuxSubSession>> sub_sessions;
+    common::MultiBuffer frame_buf;
     const uint64_t parent_conn_id;
     bool running = true;
     bool client_input_done = false;
@@ -1365,8 +1364,8 @@ net::awaitable<app::RelayResult> ServeMuxInbound(
     transport::AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& policy,
-    const proxyman::inbound::AdmissionEnvironment& environment,
-    session::Context& parent_ctx,
+    const app::AdmissionEnvironment& environment,
+    common::Context& parent_ctx,
     app::StatsShard& stats,
     const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout)

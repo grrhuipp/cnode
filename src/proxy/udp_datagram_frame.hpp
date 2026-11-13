@@ -1,8 +1,8 @@
 #pragma once
 
 #include "common/asio_types.hpp"
-#include "common/buf/length_prefixed_packet_buffer.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/length_prefixed_packet_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/const_buffer_span.hpp"
 #include "common/error.hpp"
 #include "common/target_address.hpp"
@@ -31,11 +31,11 @@ struct RequiredUdpDatagram {
 // 混合或无效，或与 fixed_target（非空时）不是同一端点 → PROTOCOL_INVALID_ADDRESS；
 // 负载超过 max_payload → PROTOCOL_ENCODE_FAILED。
 [[nodiscard]] inline std::optional<RequiredUdpDatagram> RequireUdpDatagram(
-    const buf::MultiBuffer& mb,
+    const common::MultiBuffer& mb,
     const common::TargetAddress* fixed_target,
     size_t max_payload = kMaxFramedDatagramPayload) {
-    const auto datagram = buf::InspectUdpDatagram(mb);
-    if (datagram.status == buf::UdpDatagramStatus::Empty) {
+    const auto datagram = common::InspectUdpDatagram(mb);
+    if (datagram.status == common::UdpDatagramStatus::Empty) {
         return std::nullopt;
     }
     if (!datagram.Valid() || !datagram.target || !datagram.target->IsValid() ||
@@ -53,7 +53,7 @@ struct RequiredUdpDatagram {
 [[nodiscard]] inline size_t RequireUdpPayloadSize(
     std::span<const net::const_buffer> payload,
     size_t max_payload = kMaxFramedDatagramPayload) {
-    const auto size = buf::TrySumBufferSizes(payload, max_payload);
+    const auto size = common::TrySumBufferSizes(payload, max_payload);
     if (!size) {
         throw transport::LinkError(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
@@ -64,8 +64,8 @@ struct RequiredUdpDatagram {
 inline net::awaitable<void> WriteFramedDatagram(
     transport::MultiBufferWriter& writer,
     std::span<const uint8_t> header,
-    const buf::MultiBuffer& payload) {
-    common::ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+    const common::MultiBuffer& payload) {
+    common::ConstBufferSpanBuilder<1 + common::MultiBuffer::kInlineCapacity> framed;
     framed.Append(net::buffer(header.data(), header.size()));
     framed.AppendMultiBuffer(payload);
     co_await writer.WriteBuffers(framed.Span());

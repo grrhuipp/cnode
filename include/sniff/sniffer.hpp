@@ -2,8 +2,7 @@
 
 #include "common/allocator.hpp"
 #include "common/target_address.hpp"
-#include "core/constants.hpp"
-
+#include "common/constants.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -23,7 +22,7 @@ struct SniffResult {
     bool success = false;           // 是否嗅探成功
     bool need_more = false;         // 已识别协议，但还要更多字节（对齐 xray ErrProtoNeedMoreData）
     std::string_view protocol;      // 协议类型："tls", "http", "quic"（常量视图）
-    std::pmr::string domain{memory::process_resource()}; // 嗅探到的域名
+    std::string domain;             // 嗅探到的域名
     uint16_t port = 0;              // 嗅探到的端口（HTTP 可能有）
 };
 
@@ -34,26 +33,7 @@ struct SniffResult {
 [[nodiscard]] SniffResult SniffHttp(std::span<const uint8_t> data);
 
 // BitTorrent 嗅探（只识别协议，用于 routing.protocol）
-[[nodiscard]] inline SniffResult SniffBittorrent(std::span<const uint8_t> data) {
-    SniffResult result;
-    static constexpr std::string_view kHandshake = "BitTorrent protocol";
-    if (data.empty() || data[0] != static_cast<uint8_t>(kHandshake.size())) {
-        return result;
-    }
-    const size_t prefix_len = std::min(data.size() - 1, kHandshake.size());
-    if (!std::equal(data.begin() + 1,
-                    data.begin() + 1 + static_cast<std::ptrdiff_t>(prefix_len),
-                    kHandshake.begin())) {
-        return result;
-    }
-    result.protocol = constants::protocol::kBitTorrent;
-    if (data.size() < kHandshake.size() + 1) {
-        result.need_more = true;
-    } else {
-        result.success = true;
-    }
-    return result;
-}
+[[nodiscard]] SniffResult SniffBittorrent(std::span<const uint8_t> data);
 
 class QuicSniffer {
 public:
@@ -61,8 +41,8 @@ public:
 
 private:
     // Stage-local, demand-grown storage; holes are tracked independently of bytes.
-    std::pmr::vector<uint8_t> crypto_{memory::process_resource()};
-    std::pmr::vector<uint8_t> coverage_{memory::process_resource()};
+    std::vector<uint8_t> crypto_;
+    std::vector<uint8_t> coverage_;
     std::array<uint8_t, 20> dcid_{};
     std::array<uint8_t, 16> hp_key_{};
     std::array<uint8_t, 16> key_{};

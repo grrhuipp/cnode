@@ -1,8 +1,8 @@
 #include "transport_coordinator_fixture.hpp"
 #include <gtest/gtest.h>
 
-#include "transport/internet/tcp_stream.hpp"
-#include "transport/internet/transport_stack.hpp"
+#include "transport/tcp_stream.hpp"
+#include "transport/transport_stack.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
@@ -60,13 +60,13 @@ std::string Headers(std::string_view network) {
     return block;
 }
 
-class CleanupSink final : public ::transport::internet::InboundTransportStreamHandler {
+class CleanupSink final : public ::transport::InboundTransportStreamHandler {
 public:
     explicit CleanupSink(net::io_context& io) : release_cleanup(io, 1) {}
 
     net::awaitable<void> OnInboundTransportStream(
         std::unique_ptr<::transport::AsyncStream> stream,
-        ::transport::internet::InboundTransportMetadata) override {
+        ::transport::InboundTransportMetadata) override {
         ++started;
         std::array<uint8_t, 1> byte{};
         try {
@@ -112,16 +112,16 @@ void RunUntil(net::io_context& io, Predicate predicate, const char* message) {
     EXPECT_TRUE(predicate()) << message;
 }
 
-::transport::internet::StreamSettings FixtureSettings(std::string_view network) {
-    ::transport::internet::StreamSettings settings;
-    settings.network_mode = transport::internet::ParseNetworkMode(network);
+::transport::StreamSettings FixtureSettings(std::string_view network) {
+    ::transport::StreamSettings settings;
+    settings.network_mode = transport::ParseNetworkMode(network);
     settings.http.force_http2 = common::EqualsAsciiCI(network, "h2");
     settings.grpc.service_name = "fixture";
     settings.http.path = "/fixture";
     settings.http.method = "POST";
     settings.xhttp.path = "/fixture";
-    settings.xhttp.mode = ::transport::internet::XHttpMode::StreamOne;
-    return ::transport::internet::NormalizeStreamSettings(settings);
+    settings.xhttp.mode = ::transport::XHttpMode::StreamOne;
+    return ::transport::NormalizeStreamSettings(settings);
 }
 
 void ParentWaitsForCleanup(std::string_view network, bool protocol_error) {
@@ -131,13 +131,13 @@ void ParentWaitsForCleanup(std::string_view network, bool protocol_error) {
     ::tcp::socket client(io), accepted(io);
     client.connect(acceptor.local_endpoint());
     acceptor.accept(accepted);
-    auto raw = std::make_unique<::transport::internet::TcpStream>(std::move(accepted));
+    auto raw = std::make_unique<::transport::TcpStream>(std::move(accepted));
     auto sink = std::make_shared<CleanupSink>(io);
     const auto settings = FixtureSettings(network);
     bool returned = false;
     std::exception_ptr failure;
     auto build = [&]() -> net::awaitable<void> {
-        const auto result = co_await ::transport::internet::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr, 0, sink);
+        const auto result = co_await ::transport::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr, 0, sink);
         EXPECT_TRUE(result.has_value() && !*result);
         EXPECT_EQ(sink->cleanup_finished, 1);
     };
@@ -201,13 +201,13 @@ void ResetsMalformedRequest(std::string_view network, std::string_view extra_fie
     ::tcp::socket client(io), accepted(io);
     client.connect(acceptor.local_endpoint());
     acceptor.accept(accepted);
-    auto raw = std::make_unique<::transport::internet::TcpStream>(std::move(accepted));
+    auto raw = std::make_unique<::transport::TcpStream>(std::move(accepted));
     auto sink = std::make_shared<CleanupSink>(io);
     const auto settings = FixtureSettings(network);
     bool returned = false;
     std::exception_ptr failure;
     auto build = [&]() -> net::awaitable<void> {
-        const auto result = co_await ::transport::internet::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr, 0, sink);
+        const auto result = co_await ::transport::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr, 0, sink);
         EXPECT_TRUE(result.has_value() && !*result);
     };
     net::co_spawn(io, build(), [&](std::exception_ptr error) {

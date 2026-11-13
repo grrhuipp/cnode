@@ -3,12 +3,12 @@
 #include "common/defaults.hpp"
 #include "common/error.hpp"
 #include "common/session.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/failure.hpp"
 #include "app/stats.hpp"
 #include "infra/log.hpp"
-#include "transport/internet/async_delay.hpp"
+#include "transport/async_delay.hpp"
 
 #include <asio/experimental/awaitable_operators.hpp>
 #include <asio/experimental/channel.hpp>
@@ -26,8 +26,8 @@
 namespace app {
 
 struct RelayConfig {
-    std::chrono::seconds uplink_only{defaults::kUplinkOnlyTimeout};     // 下行 EOF 后上行最多保留多久
-    std::chrono::seconds downlink_only{defaults::kDownlinkOnlyTimeout}; // 上行 EOF 后下行最多保留多久
+    std::chrono::seconds uplink_only{common::kUplinkOnlyTimeout};     // 下行 EOF 后上行最多保留多久
+    std::chrono::seconds downlink_only{common::kDownlinkOnlyTimeout}; // 上行 EOF 后下行最多保留多久
     std::chrono::seconds idle_timeout{0};
     std::chrono::seconds write_timeout{0};
     uint64_t speed_limit = 0;              // bytes/s，0 = 不限速
@@ -43,9 +43,6 @@ struct RelayResult : common::ResultStatus {
     bool close_side_known = false;
 };
 
-}  // namespace app
-
-namespace app::relay_detail {
 
 inline constexpr uint64_t kRelayStatsFlushBytes = 64 * 1024;
 inline constexpr auto kRelayCloseGraceTimeout = std::chrono::seconds(1);
@@ -70,9 +67,29 @@ void CancelRelayRateWaits(RelayRateLimits& limits) noexcept;
     RelayRateLimits& limits, bool upload, std::chrono::milliseconds delay);
 
 template <typename Endpoint>
+decltype(auto) RelayControlOf(Endpoint& endpoint) noexcept {
+    if constexpr (requires { endpoint.RelayControl(); }) {
+        return RelayControlOf(endpoint.RelayControl());
+    } else {
+        return (endpoint);
+    }
+}
+
+template <typename Endpoint>
+decltype(auto) RelayControlOf(const Endpoint& endpoint) noexcept {
+    if constexpr (requires { endpoint.RelayControl(); }) {
+        return RelayControlOf(endpoint.RelayControl());
+    } else {
+        return (endpoint);
+    }
+}
+
+template <typename Endpoint>
 void CloseIfSupported(Endpoint& endpoint) noexcept {
     if constexpr (requires { endpoint.Close(); }) {
         try { endpoint.Close(); } catch (...) {}
+    } else if constexpr (requires { endpoint.RelayControl(); }) {
+        CloseIfSupported(endpoint.RelayControl());
     }
 }
 
@@ -80,6 +97,10 @@ template <typename Endpoint>
 void CloseAbortiveIfSupported(Endpoint& endpoint) noexcept {
     if constexpr (requires { endpoint.CloseAbortive(); }) {
         try { endpoint.CloseAbortive(); } catch (...) {}
+    } else if constexpr (requires { endpoint.SetAbortiveClose(true); endpoint.Close(); }) {
+        try { endpoint.SetAbortiveClose(true); endpoint.Close(); } catch (...) {}
+    } else if constexpr (requires { endpoint.RelayControl(); }) {
+        CloseAbortiveIfSupported(endpoint.RelayControl());
     } else {
         if constexpr (requires { endpoint.SetAbortiveClose(true); }) endpoint.SetAbortiveClose(true);
         CloseIfSupported(endpoint);
@@ -90,19 +111,42 @@ template <typename Endpoint>
 void CancelIfSupported(Endpoint& endpoint) noexcept {
     if constexpr (requires { endpoint.Cancel(); }) {
         try { endpoint.Cancel(); } catch (...) {}
+    } else if constexpr (requires { endpoint.RelayControl(); }) {
+        CancelIfSupported(endpoint.RelayControl());
+    }
+}
+
+template <typename Endpoint>
+bool StartPhaseDeadlineIfSupported(Endpoint& endpoint, std::chrono::seconds timeout) {
+    auto& ctrl = RelayControlOf(endpoint);
+    if constexpr (requires { static_cast<bool>(endpoint.StartPhaseDeadline(timeout)); }) {
+        return static_cast<bool>(endpoint.StartPhaseDeadline(timeout));
+    } else if constexpr (requires { static_cast<bool>(ctrl.StartPhaseDeadline(timeout)); }) {
+        return static_cast<bool>(ctrl.StartPhaseDeadline(timeout));
+    } else {
+        return true;
+    }
+}
+
+template <typename Endpoint>
+void ClearPhaseDeadlineIfSupported(Endpoint& endpoint) noexcept {
+    auto& ctrl = RelayControlOf(endpoint);
+    if constexpr (requires { endpoint.ClearPhaseDeadline(); }) {
+        try { endpoint.ClearPhaseDeadline(); } catch (...) {}
+    } else if constexpr (requires { ctrl.ClearPhaseDeadline(); }) {
+        try { ctrl.ClearPhaseDeadline(); } catch (...) {}
     }
 }
 
 template <typename Writer, typename Control>
 net::awaitable<void> ShutdownWriteForClose(
-    Writer& writer, Control& control, bool preserve_phase_deadline = false) {
+    Writer& writer, Control& raw_control, bool preserve_phase_deadline = false) {
+    auto& control = RelayControlOf(raw_control);
     if constexpr (requires { control.SetWriteTimeout(kRelayCloseGraceTimeout); }) {
         control.SetWriteTimeout(kRelayCloseGraceTimeout);
     }
     if (!preserve_phase_deadline) {
-        if constexpr (requires { control.StartPhaseDeadline(kRelayCloseGraceTimeout); }) {
-            (void)control.StartPhaseDeadline(kRelayCloseGraceTimeout);
-        }
+        (void)StartPhaseDeadlineIfSupported(control, kRelayCloseGraceTimeout);
     }
     try {
         if constexpr (requires { writer.AsyncShutdownWrite(); }) {
@@ -114,39 +158,78 @@ net::awaitable<void> ShutdownWriteForClose(
         }
     } catch (...) {
         if (!preserve_phase_deadline) {
-            if constexpr (requires { control.ClearPhaseDeadline(); }) control.ClearPhaseDeadline();
+            ClearPhaseDeadlineIfSupported(control);
         }
         throw;
     }
     if (!preserve_phase_deadline) {
-        if constexpr (requires { control.ClearPhaseDeadline(); }) control.ClearPhaseDeadline();
+        ClearPhaseDeadlineIfSupported(control);
     }
 }
 
 template <typename Reader>
 transport::EofAction ReadEofAction(const Reader& reader) noexcept {
+    const auto& ctrl = RelayControlOf(reader);
     if constexpr (requires { reader.ReadEofAction(); }) return reader.ReadEofAction();
+    else if constexpr (requires { ctrl.ReadEofAction(); }) return ctrl.ReadEofAction();
     else return transport::EofAction::WaitForPeer;
 }
 
 template <typename Writer>
 bool WriteShutdownClosesLink(const Writer& writer) noexcept {
+    const auto& ctrl = RelayControlOf(writer);
     if constexpr (requires { writer.WriteShutdownClosesLink(); }) return writer.WriteShutdownClosesLink();
+    else if constexpr (requires { ctrl.WriteShutdownClosesLink(); }) return ctrl.WriteShutdownClosesLink();
     else return false;
 }
 
 void FlushRelayStats(StatsShard& stats, LocalStatsAccumulator& acc);
 
 template <typename Control>
-bool ConsumeTimeoutSignals(Control& control) {
-    // Consume every flag, including when another flag is already set.
-    const bool read = control.ConsumeReadTimeout();
-    const bool write = control.ConsumeWriteTimeout();
-    const bool idle = control.ConsumeIdleTimeout();
-    const bool phase = control.ConsumePhaseDeadline();
-    return read || write || idle || phase;
+bool ConsumeTimeoutSignals(Control& raw_control) {
+    auto& control = RelayControlOf(raw_control);
+    bool expired = false;
+    if constexpr (requires { control.ConsumeReadTimeout(); }) {
+        expired = control.ConsumeReadTimeout() || expired;
+    }
+    if constexpr (requires { control.ConsumeWriteTimeout(); }) {
+        expired = control.ConsumeWriteTimeout() || expired;
+    }
+    if constexpr (requires { control.ConsumeIdleTimeout(); }) {
+        expired = control.ConsumeIdleTimeout() || expired;
+    }
+    if constexpr (requires { control.ConsumePhaseDeadline(); }) {
+        expired = control.ConsumePhaseDeadline() || expired;
+    }
+    return expired;
 }
 
+struct RelayTargetAdapter {
+    void* target = nullptr;
+    transport::CancellationSource* cancellation = nullptr;
+    net::awaitable<common::MultiBuffer> (*read)(void*) = nullptr;
+    net::awaitable<void> (*write)(void*, common::MultiBuffer) = nullptr;
+    net::awaitable<void> (*shutdown_write)(void*, bool preserve_phase_deadline) = nullptr;
+    transport::EofAction (*read_eof_action)(const void*) noexcept = nullptr;
+    bool (*write_shutdown_closes_link)(const void*) noexcept = nullptr;
+    bool (*start_phase_deadline)(void*, std::chrono::seconds) = nullptr;
+    void (*clear_phase_deadline)(void*) noexcept = nullptr;
+    bool (*consume_timeouts)(void*) = nullptr;
+    void (*cancel)(void*) noexcept = nullptr;
+    void (*close)(void*) noexcept = nullptr;
+    void (*close_abortive)(void*) noexcept = nullptr;
+};
+
+net::awaitable<RelayResult> DoRelayLinkImpl(
+    net::io_context& io_context,
+    transport::MultiBufferReader& client_reader,
+    transport::MultiBufferWriter& client_writer,
+    transport::AsyncStream* client_control,
+    RelayTargetAdapter target,
+    common::Context& ctx,
+    StatsShard& stats,
+    const RelayConfig& config,
+    common::MultiBufferBatch initial_payload);
 enum class RelayPhase { Transferring, HalfClosed, Completing, Stopping, Joined };
 struct RelayDirectionState {
     bool eof = false;
@@ -173,13 +256,9 @@ struct RelayState {
     common::SignalChannel wake;
 };
 
-}  // namespace relay_detail
-
 // A null client control denotes split/logical input. It changes only the
 // available transport controls, never EOF, error, accounting or join semantics.
 // The reader cancellation source and the joined watchdog cover this case too.
-namespace app {
-
 template <typename TargetEndpoint>
 net::awaitable<RelayResult> DoRelayLink(
     net::io_context& io_context,
@@ -187,252 +266,51 @@ net::awaitable<RelayResult> DoRelayLink(
     transport::MultiBufferWriter& client_writer,
     transport::AsyncStream* client_control,
     TargetEndpoint& target,
-    session::Context& ctx,
+    common::Context& ctx,
     StatsShard& stats,
     const RelayConfig& config = RelayConfig{},
-    buf::MultiBufferBatch initial_payload = {}) {
-
-    using namespace net::experimental::awaitable_operators;
-    using app::relay_detail::RelayPhase;
-    app::relay_detail::RelayState state(io_context);
-    const auto limits = app::relay_detail::AllocateRelayRateLimits(io_context, config.speed_limit);
-    ctx.traffic.bytes_up = ctx.traffic.bytes_down = 0;
-    const auto parent_cancellation = co_await net::this_coro::cancellation_state;
-
-    struct CancellationContext {
-        struct Subscription final : transport::CancellationSubscription {
-            explicit Subscription(CancellationContext& owner) noexcept : owner(owner) {}
-            CancellationContext& owner;
-        private:
-            void OnCancellation(transport::Cancellation cancellation) noexcept override {
-                owner.Stop(cancellation.reason);
-            }
-        };
-        transport::AsyncStream* client;
-        TargetEndpoint& target;
-        app::relay_detail::RelayState& state;
-        app::relay_detail::RelayRateLimits* limits;
-        bool notifying = false;
-        Subscription client_cancel{*this};
-        Subscription target_cancel{*this};
-
-        CancellationContext(transport::AsyncStream* client, TargetEndpoint& target,
-                            app::relay_detail::RelayState& state, app::relay_detail::RelayRateLimits* limits)
-            : client(client), target(target), state(state), limits(limits) {}
-
-        bool ConsumeTimeout() {
-            const bool target_timeout = app::relay_detail::ConsumeTimeoutSignals(target);
-            const bool client_timeout = client && app::relay_detail::ConsumeTimeoutSignals(*client);
-            return target_timeout || client_timeout;
-        }
-        void Stop(common::ErrorCode reason) noexcept {
-            if (notifying) return;
-            notifying = true;
-            if (ConsumeTimeout()) reason = common::ErrorCode::RELAY_TIMEOUT;
-            state.Stop(reason);
-            if (limits) app::relay_detail::CancelRelayRateWaits(*limits);
-            if (client) app::relay_detail::CancelIfSupported(*client);
-            app::relay_detail::CancelIfSupported(target);
-            notifying = false;
-        }
-    } cancellation(client_control, target, state, limits.get());
-    cancellation.client_cancel.Resubscribe(client_reader.Cancellation());
-    cancellation.target_cancel.Resubscribe(target.Cancellation());
-
-    auto arm_half_close = [&](std::chrono::seconds timeout) {
-        if (state.phase != RelayPhase::Transferring) return;
-        state.phase = RelayPhase::HalfClosed;
-        // One absolute budget covers the remaining read, write AND rate wait,
-        // whether or not the input owns a physical control. Never renew it on I/O.
-        if (timeout <= std::chrono::seconds::zero()) cancellation.Stop(common::ErrorCode::RELAY_TIMEOUT);
-        else if (!target.StartPhaseDeadline(timeout)) cancellation.Stop(common::ErrorCode::INTERNAL);
+    common::MultiBufferBatch initial_payload = {}) {
+    RelayTargetAdapter adapter{
+        .target = std::addressof(target),
+        .cancellation = std::addressof(target.Cancellation()),
+        .read = +[](void* p) -> net::awaitable<common::MultiBuffer> {
+            return static_cast<TargetEndpoint*>(p)->ReadMultiBuffer();
+        },
+        .write = +[](void* p, common::MultiBuffer payload) -> net::awaitable<void> {
+            return static_cast<TargetEndpoint*>(p)->WriteMultiBuffer(std::move(payload));
+        },
+        .shutdown_write = +[](void* p, bool preserve_phase_deadline) -> net::awaitable<void> {
+            auto& ep = *static_cast<TargetEndpoint*>(p);
+            return ShutdownWriteForClose(ep, ep, preserve_phase_deadline);
+        },
+        .read_eof_action = +[](const void* p) noexcept -> transport::EofAction {
+            return ReadEofAction(*static_cast<const TargetEndpoint*>(p));
+        },
+        .write_shutdown_closes_link = +[](const void* p) noexcept -> bool {
+            return WriteShutdownClosesLink(*static_cast<const TargetEndpoint*>(p));
+        },
+        .start_phase_deadline = +[](void* p, std::chrono::seconds timeout) -> bool {
+            return StartPhaseDeadlineIfSupported(*static_cast<TargetEndpoint*>(p), timeout);
+        },
+        .clear_phase_deadline = +[](void* p) noexcept {
+            ClearPhaseDeadlineIfSupported(*static_cast<TargetEndpoint*>(p));
+        },
+        .consume_timeouts = +[](void* p) -> bool {
+            return ConsumeTimeoutSignals(*static_cast<TargetEndpoint*>(p));
+        },
+        .cancel = +[](void* p) noexcept {
+            CancelIfSupported(*static_cast<TargetEndpoint*>(p));
+        },
+        .close = +[](void* p) noexcept {
+            CloseIfSupported(*static_cast<TargetEndpoint*>(p));
+        },
+        .close_abortive = +[](void* p) noexcept {
+            CloseAbortiveIfSupported(*static_cast<TargetEndpoint*>(p));
+        },
     };
-
-    auto direction = [&](auto& reader, auto& writer, auto* control, bool upload)
-        -> net::awaitable<void> {
-        auto& current = upload ? state.up : state.down;
-        const auto& peer = upload ? state.down : state.up;
-        auto& bytes = upload ? ctx.traffic.bytes_up : ctx.traffic.bytes_down;
-        LocalStatsAccumulator acc;
-        bool operation_side_is_client = upload;
-        bool writing = false;
-        try {
-            const auto direction_cancellation = co_await net::this_coro::cancellation_state;
-            while (!state.Ending()) {
-                operation_side_is_client = upload;
-                writing = false;
-                buf::MultiBuffer payload;
-                if (upload && !initial_payload.empty()) payload = initial_payload.PopFront();
-                else payload = co_await reader.ReadMultiBuffer();
-                if (state.Ending()) break;
-                if (direction_cancellation.cancelled() != net::cancellation_type::none)
-                    throw transport::LinkError(common::ErrorCode::CANCELLED);
-                if (payload.byte_size() == 0 && !payload.HasUDP()) {
-                    if (cancellation.ConsumeTimeout()) {
-                        cancellation.Stop(common::ErrorCode::RELAY_TIMEOUT);
-                        break;
-                    }
-                    current.eof = true;
-                    state.Mark(upload);
-                    const auto action = app::relay_detail::ReadEofAction(reader);
-                    if (action == transport::EofAction::CloseLink || app::relay_detail::WriteShutdownClosesLink(writer)) {
-                        // No wire shutdown until both directions release their borrows.
-                        state.Complete();
-                        break;
-                    }
-                    if (!peer.eof) {
-                        arm_half_close(upload ? config.downlink_only : config.uplink_only);
-                        if (state.Ending()) break;
-                    }
-                    if (action == transport::EofAction::ShutdownPeerWrite) {
-                        operation_side_is_client = !upload;
-                        writing = true;
-                        const bool preserve_phase_deadline =
-                            upload && !peer.eof && state.phase == RelayPhase::HalfClosed;
-                        if (control) {
-                            co_await app::relay_detail::ShutdownWriteForClose(
-                                writer, *control, preserve_phase_deadline);
-                        } else {
-                            co_await app::relay_detail::ShutdownWriteForClose(
-                                writer, writer, preserve_phase_deadline);
-                        }
-                        current.write_shutdown = true;
-                    }
-                    break;
-                }
-                const auto count = payload.byte_size();
-                if (limits) {
-                    // An under-budget packet must not pay for a wait coroutine.
-                    if (const auto delay = app::relay_detail::ReserveRelayBytes(*limits, upload, count);
-                        delay > std::chrono::milliseconds::zero()) {
-                        co_await app::relay_detail::WaitRelayRate(*limits, upload, delay);
-                    }
-                }
-                if (state.Ending()) break;
-                if (direction_cancellation.cancelled() != net::cancellation_type::none)
-                    throw transport::LinkError(common::ErrorCode::CANCELLED);
-                operation_side_is_client = !upload;
-                writing = true;
-                co_await writer.WriteMultiBuffer(std::move(payload));
-                bytes += count;
-                if (upload) acc.AddBytesOut(count);
-                else acc.AddBytesIn(count);
-                if (acc.bytes_in + acc.bytes_out >= app::relay_detail::kRelayStatsFlushBytes)
-                    app::relay_detail::FlushRelayStats(stats, acc);
-            }
-        } catch (const transport::WriteClosed&) {
-            // A rejected, unstarted write must not discard the reverse payload.
-            current.eof = true;
-            state.Mark(operation_side_is_client);
-            if (!peer.eof) arm_half_close(upload ? config.downlink_only : config.uplink_only);
-        } catch (...) {
-            auto error = transport::ClassifyFailure(std::current_exception(),
-                writing ? common::ErrorCode::RELAY_WRITE_FAILED : common::ErrorCode::INTERNAL);
-            const bool timed_out = cancellation.ConsumeTimeout();
-            if (timed_out) error = common::ErrorCode::RELAY_TIMEOUT;
-            // Only cancellation caused by protocol full-close is clean EOF.
-            if (!(error == common::ErrorCode::CANCELLED && state.phase == RelayPhase::Completing)) {
-                if (error == common::ErrorCode::RESOURCE_EXHAUSTED) {
-                    state.local_failure = true;
-                    state.close_side_known = false;
-                    state.client_closed_first = false;
-                } else state.Mark(operation_side_is_client);
-                cancellation.Stop(error);
-            }
-        }
-        app::relay_detail::FlushRelayStats(stats, acc);
-    };
-    auto watch_stop = [&]() -> net::awaitable<void> {
-        if (!state.Ending())
-            (void)co_await state.wake.async_receive(net::as_tuple(net::use_awaitable));
-        if (!state.Ending()) throw transport::LinkError(common::ErrorCode::CANCELLED);
-    };
-    try {
-        // The winning branch cancels AND joins its sibling, including a split
-        // reader that has no control object and a writer blocked by backpressure.
-        (void)co_await ((direction(client_reader, target, &target, true) &&
-                         direction(target, client_writer, client_control, false)) ||
-                        watch_stop());
-    } catch (...) {
-        cancellation.Stop(transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL));
-    }
-    if (parent_cancellation.cancelled() != net::cancellation_type::none && state.reason == common::ErrorCode::OK)
-        state.Stop(common::ErrorCode::CANCELLED);
-    state.phase = RelayPhase::Joined;
-    if (client_control) client_control->ClearPhaseDeadline();
-    target.ClearPhaseDeadline();
-
-    if (state.reason == common::ErrorCode::OK) {
-        bool client_shutdown_timed_out = false;
-        auto shutdown = [&](auto& writer, auto* control, bool already_shutdown) -> net::awaitable<void> {
-            if (already_shutdown) co_return;
-            try {
-                if (control) co_await app::relay_detail::ShutdownWriteForClose(writer, *control);
-                else co_await app::relay_detail::ShutdownWriteForClose(writer, writer);
-            } catch (const transport::WriteClosed&) {
-            } catch (...) {
-                // Capture each child's original cause before the join can wrap
-                // simultaneous failures in asio::multiple_exceptions.
-                const auto error = transport::ClassifyFailure(
-                    std::current_exception(), common::ErrorCode::RELAY_WRITE_FAILED);
-                state.Stop((client_shutdown_timed_out || cancellation.ConsumeTimeout())
-                               ? common::ErrorCode::RELAY_TIMEOUT
-                               : error);
-            }
-        };
-        auto shutdown_client = [&]() -> net::awaitable<void> {
-            if (!client_control && !state.down.write_shutdown) {
-                transport::internet::AsyncDelay delay(io_context);
-                auto wait_grace = [&]() -> net::awaitable<void> {
-                    co_await delay.WaitFor(app::relay_detail::kRelayCloseGraceTimeout);
-                    const auto cancellation = co_await net::this_coro::cancellation_state;
-                    if (cancellation.cancelled() == net::cancellation_type::none) {
-                        client_shutdown_timed_out = true;
-                    }
-                };
-                (void)co_await (
-                    shutdown(client_writer, client_control, state.down.write_shutdown) ||
-                    wait_grace());
-                if (client_shutdown_timed_out) {
-                    state.Stop(common::ErrorCode::RELAY_TIMEOUT);
-                }
-                co_return;
-            }
-            co_await shutdown(client_writer, client_control, state.down.write_shutdown);
-        };
-        try {
-            co_await (shutdown_client() &&
-                      shutdown(target, &target, state.up.write_shutdown));
-        } catch (...) {
-            const auto error = transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL);
-            state.Stop((client_shutdown_timed_out || cancellation.ConsumeTimeout())
-                           ? common::ErrorCode::RELAY_TIMEOUT
-                           : error);
-        }
-    }
-    // Both directions and shutdowns are joined. Healthy protocol output may
-    // still await transport ACKs; only failure needs an abortive cancellation.
-    cancellation.client_cancel.Unsubscribe();
-    cancellation.target_cancel.Unsubscribe();
-    if (state.reason == common::ErrorCode::OK) {
-        if (client_control) app::relay_detail::CloseIfSupported(*client_control);
-        app::relay_detail::CloseIfSupported(target);
-    } else {
-        if (client_control) app::relay_detail::CancelIfSupported(*client_control);
-        app::relay_detail::CancelIfSupported(target);
-        if (client_control) app::relay_detail::CloseAbortiveIfSupported(*client_control);
-        app::relay_detail::CloseAbortiveIfSupported(target);
-    }
-
-    RelayResult result;
-    result.bytes_up = ctx.traffic.bytes_up;
-    result.bytes_down = ctx.traffic.bytes_down;
-    result.error = state.reason;
-    result.client_closed_first = state.client_closed_first;
-    result.close_side_known = state.close_side_known;
-    LOG_CONN_DEBUG(ctx, "relay finished up={}B down={}B error={}", result.bytes_up,
-                   result.bytes_down, common::ErrorCodeToString(result.error));
-    co_return result;
+    return DoRelayLinkImpl(
+        io_context, client_reader, client_writer, client_control,
+        adapter, ctx, stats, config, std::move(initial_payload));
 }
 
 }  // namespace app

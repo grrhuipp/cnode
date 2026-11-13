@@ -227,7 +227,7 @@ TEST_P(PanelRuntime, RequestLifecycleAndListenerOwnership) {
     ASSERT_TRUE(fixture.WaitForPost());
     if (mode == Mode::Timeout) EXPECT_TRUE(fixture.WaitForClientClose());
     if (mode == Mode::Heartbeat) {
-        // 状态心跳周期固定 60s（defaults::kPanelStatusLogInterval，不可配置）：等第二条状态日志出现即止。
+        // 状态心跳周期固定 60s（common::kPanelStatusLogInterval，不可配置）：等第二条状态日志出现即止。
         Until([&] { return Events(child->LogPath(), "Panel status:", 1) >= 2; }, 70s);
         EXPECT_TRUE(fixture.RequestPending());
     } else std::this_thread::sleep_for(500ms);

@@ -37,9 +37,7 @@ protected:
     ~AwaitableTaskGroup() = default;
 };
 
-}  // namespace common
 
-namespace common::task_group_detail {
 
 struct Child final : transport::CancellationSubscription {
     net::cancellation_signal cancellation;
@@ -157,7 +155,7 @@ private:
 // initiation (executor and start) by value and runs it only when awaited on
 // `executor`, so the caller pays for no frame of its own here.
 template <typename Start>
-net::awaitable<void> Launch(net::any_io_executor executor, Start start) {
+net::awaitable<void> LaunchTaskGroupItem(net::any_io_executor executor, Start start) {
     auto token = net::use_awaitable;
     return net::async_initiate<decltype(token), void(std::exception_ptr)>(
         [executor = std::move(executor),
@@ -196,15 +194,11 @@ net::awaitable<void> RunOnExecutor(Start start) {
     if (cancellation.cancelled() != net::cancellation_type::none) {
         throw IoSystemError(net::error::operation_aborted);
     }
-    co_await Launch(co_await net::this_coro::executor, std::move(start));
+    co_await LaunchTaskGroupItem(co_await net::this_coro::executor, std::move(start));
 }
-
-}  // namespace task_group_detail
 
 // Start is stored by value in the coroutine, without std::function allocation
 // or type erasure. All group/child bookkeeping is allocated on the target thread.
-namespace common {
-
 template <typename Start>
 net::awaitable<void> RunAwaitableTaskGroup(net::any_io_executor executor, Start start) {
     if ((co_await net::this_coro::executor) == executor) {
@@ -214,10 +208,10 @@ net::awaitable<void> RunAwaitableTaskGroup(net::any_io_executor executor, Start 
         if (cancellation.cancelled() != net::cancellation_type::none) {
             throw IoSystemError(net::error::operation_aborted);
         }
-        co_await common::task_group_detail::Launch(std::move(executor), std::move(start));
+        co_await LaunchTaskGroupItem(std::move(executor), std::move(start));
     } else {
         co_await net::co_spawn(executor,
-            common::task_group_detail::RunOnExecutor(std::move(start)), net::use_awaitable);
+            RunOnExecutor(std::move(start)), net::use_awaitable);
     }
     const auto cancellation = co_await net::this_coro::cancellation_state;
     if (cancellation.cancelled() != net::cancellation_type::none) {
@@ -251,7 +245,7 @@ class ResidentTaskGroup final : public AwaitableTaskGroup {
             join->wake.cancel();
         }
     };
-    using Group = common::task_group_detail::Group<Completion>;
+    using GroupState = Group<Completion>;
 
 public:
     explicit ResidentTaskGroup(net::any_io_executor executor)
@@ -292,7 +286,7 @@ private:
     void EnsureStarted() {
         if (group_) return;
         auto join = std::make_shared<JoinState>(executor_);
-        auto group = std::make_shared<Group>(executor_, Completion{join});
+        auto group = std::make_shared<GroupState>(executor_, Completion{join});
         join_ = std::move(join);
         group_ = std::move(group);
     }
@@ -308,7 +302,7 @@ private:
 
     net::any_io_executor executor_;
     std::shared_ptr<JoinState> join_;
-    std::shared_ptr<Group> group_;
+    std::shared_ptr<GroupState> group_;
     bool stopping_ = false;
     bool closed_ = false;
 };

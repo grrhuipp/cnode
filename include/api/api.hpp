@@ -4,8 +4,8 @@
 #include "common/defaults.hpp"
 #include "common/error.hpp"
 #include "common/rule.hpp"
-#include "core/constants.hpp"
-#include "transport/internet/stream_settings.hpp"
+#include "common/constants.hpp"
+#include "transport/stream_settings.hpp"
 
 #include <chrono>
 #include <memory>
@@ -14,9 +14,9 @@
 #include <vector>
 
 
-namespace app::dns {
+namespace app {
 class DNS;
-}  // namespace app::dns
+}  // namespace app
 
 namespace api {
 
@@ -27,9 +27,9 @@ struct Config {
     std::string Name;
     std::string APIHost;
     std::string Key;
-    std::chrono::seconds RequestTimeout{defaults::kPanelRequestTimeout};
+    std::chrono::seconds RequestTimeout{common::kPanelRequestTimeout};
     int NodeID = 0;
-    std::string NodeType = std::string(constants::panel::kDefaultNodeType);
+    std::string NodeType = std::string(common::kDefaultNodeType);
 };
 
 // ============================================================================
@@ -45,16 +45,16 @@ struct UserInfo {
 };
 
 struct NodeInfo {
-    std::string NodeType = std::string(constants::protocol::kDefaultNodeProtocol);
+    std::string NodeType = std::string(common::kDefaultNodeProtocol);
     uint16_t Port = 0;
-    std::string TransportProtocol = std::string(constants::protocol::kTcp);
+    std::string TransportProtocol = std::string(common::kTcp);
     std::string Host;
     std::string Path;
     bool EnableTLS = false;
     bool EnableReality = false;
     std::string Flow;
     std::string ServiceName;
-    transport::internet::RealityConfig Reality;
+    transport::RealityConfig Reality;
     std::string CypherMethod;
     std::string ShadowsocksServerKey;
     std::string PaddingScheme;
@@ -62,8 +62,8 @@ struct NodeInfo {
     uint32_t HysteriaDownMbps = 0;
     // cnode local runtime extensions that are normalized from panel/config cold path.
     std::string TLSServerName;
-    int PullInterval = defaults::kPanelPullInterval;
-    int PushInterval = defaults::kPanelPushInterval;
+    int PullInterval = common::kPanelPullInterval;
+    int PushInterval = common::kPanelPushInterval;
 };
 
 struct UserTraffic {
@@ -77,14 +77,9 @@ struct OnlineUser {
     std::string IP;
 };
 
-
-}  // namespace api
-
-namespace api {
-
 struct NodeInfoFetchResult : common::ResultStatus {
     std::optional<api::NodeInfo> node_info;
-    std::vector<rule::DetectRule> rules;
+    std::vector<common::DetectRule> rules;
     std::string etag;
     bool not_modified = false;
 
@@ -93,7 +88,7 @@ struct NodeInfoFetchResult : common::ResultStatus {
     }
 
     [[nodiscard]] static NodeInfoFetchResult Success(
-        api::NodeInfo node_info, std::vector<rule::DetectRule> rules, std::string etag) {
+        api::NodeInfo node_info, std::vector<common::DetectRule> rules, std::string etag) {
         NodeInfoFetchResult result;
         result.node_info = std::move(node_info);
         result.rules = std::move(rules);
@@ -140,11 +135,6 @@ struct UserListFetchResult : common::ResultStatus {
     }
 };
 
-}  // namespace api
-
-
-namespace api {
-
 // ============================================================================
 // API - XrayR api.API style panel interface
 // ============================================================================
@@ -170,7 +160,7 @@ public:
 [[nodiscard]] std::unique_ptr<API> CreatePanelClient(
     net::io_context& io_context,
     Config config,
-    app::dns::DNS& dns_service);
+    app::DNS& dns_service);
 
 }  // namespace api
 

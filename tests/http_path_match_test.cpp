@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/http_headers.hpp"
-
+#include "transport/http_headers.hpp"
 #include <string_view>
 
 namespace {
@@ -9,7 +8,7 @@ struct PathCase { std::string_view configured, requested; bool matches; };
 class HttpPathPrefix : public testing::TestWithParam<PathCase> {};
 TEST_P(HttpPathPrefix, RequiresSegmentBoundaryForPrefix) {
     const auto& item = GetParam();
-    EXPECT_EQ(::transport::internet::detail::PathPrefixMatchesSegment(item.configured, item.requested), item.matches);
+    EXPECT_EQ(::transport::PathPrefixMatchesSegment(item.configured, item.requested), item.matches);
 }
 INSTANTIATE_TEST_SUITE_P(Paths, HttpPathPrefix, testing::Values(
     PathCase{"/api", "/api", true}, PathCase{"/api", "/api/child", true},
@@ -21,7 +20,7 @@ INSTANTIATE_TEST_SUITE_P(Paths, HttpPathPrefix, testing::Values(
 class HttpPathExact : public testing::TestWithParam<PathCase> {};
 TEST_P(HttpPathExact, IgnoresQueryWithoutMakingRootAWildcard) {
     const auto& item = GetParam();
-    EXPECT_EQ(::transport::internet::detail::PathMatchesExactly(item.configured, item.requested), item.matches);
+    EXPECT_EQ(::transport::PathMatchesExactly(item.configured, item.requested), item.matches);
 }
 INSTANTIATE_TEST_SUITE_P(Paths, HttpPathExact, testing::Values(
     PathCase{"/up", "/up", true}, PathCase{"/up", "/up?ed=2048", true},

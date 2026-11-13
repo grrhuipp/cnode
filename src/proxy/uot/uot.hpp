@@ -3,11 +3,11 @@
 
 #include "common/asio_types.hpp"
 #include "app/relay.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/error.hpp"
 #include "common/target_address.hpp"
 #include "common/address_codec.hpp"
-#include "features/routing/dispatcher.hpp"
+#include "routing/dispatcher.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/link.hpp"
 
@@ -20,7 +20,7 @@
 #include <span>
 #include <string_view>
 
-namespace proxy::uot {
+namespace proxy {
 
 inline constexpr std::string_view kMagicAddress = "sp.v2.udp-over-tcp.arpa";
 inline constexpr std::string_view kV1MagicAddress = "sp.udp-over-tcp.arpa";
@@ -28,8 +28,8 @@ inline constexpr size_t kMaxAddressSize = common::kMaxEncodedAddressSize;
 inline constexpr size_t kMaxRequestSize = 1 + kMaxAddressSize;
 
 
-[[nodiscard]] constexpr std::string_view MagicAddress(Version version) noexcept {
-    return version == Version::V1 ? kV1MagicAddress : kMagicAddress;
+[[nodiscard]] constexpr std::string_view MagicAddress(UotVersion version) noexcept {
+    return version == UotVersion::V1 ? kV1MagicAddress : kMagicAddress;
 }
 
 struct EncodedRequest {
@@ -41,10 +41,10 @@ struct EncodedRequest {
     }
 };
 
-[[nodiscard]] std::optional<Version> VersionFromMagicAddress(
+[[nodiscard]] std::optional<UotVersion> VersionFromMagicAddress(
     const common::TargetAddress& target) noexcept;
 
-[[nodiscard]] tl::expected<EncodedRequest, common::ErrorCode> EncodeRequest(
+[[nodiscard]] tl::expected<EncodedRequest, common::ErrorCode> EncodeUotRequest(
     bool is_connect,
     const common::TargetAddress& destination,
     common::ForwardedMetadataView forwarded = {});
@@ -55,17 +55,17 @@ struct PreparedRequest {
     bool is_connect = false;
     common::TargetAddress destination;
     std::optional<common::ForwardedMetadata> forwarded;
-    buf::MultiBuffer pending;
-    buf::MultiBuffer initial_decoded;
+    common::MultiBuffer pending;
+    common::MultiBuffer initial_decoded;
 };
 
 // EOF before the first UoT byte is the peer's normal close → SOCKET_EOF;
 // EOF or malformed bytes after it → PROTOCOL_DECODE_FAILED.
 [[nodiscard]] net::awaitable<tl::expected<PreparedRequest, common::ErrorCode>>
 ReadUotRequestHeader(
-    Version version,
+    UotVersion version,
     transport::MultiBufferReader& reader,
-    buf::MultiBuffer pending);
+    common::MultiBuffer pending);
 
 [[nodiscard]] net::awaitable<app::RelayResult> DispatchPreparedUotRequest(
     PreparedRequest prepared,
@@ -75,10 +75,10 @@ ReadUotRequestHeader(
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& dispatch_policy,
     net::io_context& io_context,
-    session::Context& ctx,
+    common::Context& ctx,
     app::StatsShard& stats,
     const infra::TimeoutsConfig& timeouts);
-class PacketReader final : public transport::MultiBufferReader {
+class UotPacketReader final : public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return reader_.Cancellation(); }
     // A UDP association has no write-half-close to propagate to its peer.
@@ -86,32 +86,32 @@ public:
         return transport::EofAction::CloseLink;
     }
 
-    PacketReader(transport::MultiBufferReader& reader,
+    UotPacketReader(transport::MultiBufferReader& reader,
                  bool is_connect,
                  common::TargetAddress destination,
-                 buf::MultiBuffer pending = {});
+                 common::MultiBuffer pending = {});
 
-    PacketReader(transport::MultiBufferReader& reader,
+    UotPacketReader(transport::MultiBufferReader& reader,
                  PreparedRequest prepared);
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override;
 
-    [[nodiscard]] buf::MultiBuffer TakePending() noexcept;
+    [[nodiscard]] common::MultiBuffer TakePending() noexcept;
 private:
     transport::MultiBufferReader& reader_;
     bool is_connect_ = false;
     // 非 connect 仅使用帧内地址，请求目标已由会话上下文拥有。
     common::TargetAddress destination_;
-    buf::MultiBuffer pending_;
+    common::MultiBuffer pending_;
 };
 
-class PacketWriter final : public transport::MultiBufferWriter {
+class UotPacketWriter final : public transport::MultiBufferWriter {
 public:
-    PacketWriter(transport::MultiBufferWriter& writer,
+    UotPacketWriter(transport::MultiBufferWriter& writer,
                  bool is_connect,
                  common::TargetAddress destination);
 
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override;
     net::awaitable<void> AsyncShutdownWrite() override;
@@ -124,24 +124,24 @@ private:
 };
 
 template <typename Underlying>
-class FramedEndpoint final
+class UotFramedEndpoint final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
-    FramedEndpoint(Underlying& underlying,
+    UotFramedEndpoint(Underlying& underlying,
                    bool is_connect,
                    common::TargetAddress destination,
-                   buf::MultiBuffer pending = {})
+                   common::MultiBuffer pending = {})
         : underlying_(underlying)
         , reader_(underlying, is_connect, is_connect ? destination : common::TargetAddress{},
                   std::move(pending))
         , writer_(underlying, is_connect, std::move(destination)) {}
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         return reader_.ReadMultiBuffer();
     }
 
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
         return writer_.WriteMultiBuffer(std::move(mb));
     }
 
@@ -158,96 +158,21 @@ public:
     transport::EofAction ReadEofAction() const noexcept override { return reader_.ReadEofAction(); }
     bool WriteShutdownClosesLink() const noexcept override { return writer_.WriteShutdownClosesLink(); }
 
+    Underlying& RelayControl() noexcept { return underlying_; }
+    const Underlying& RelayControl() const noexcept { return underlying_; }
+
     void Cancel() noexcept {
         if constexpr (requires(Underlying& endpoint) { endpoint.Cancel(); }) {
             underlying_.Cancel();
-        }
-    }
-
-    void Close() {
-        if constexpr (requires(Underlying& endpoint) { endpoint.Close(); }) {
-            underlying_.Close();
-        }
-    }
-
-    void CloseAbortive() {
-        if constexpr (requires(Underlying& endpoint) { endpoint.CloseAbortive(); }) {
-            underlying_.CloseAbortive();
-        }
-    }
-
-    void SetIdleTimeout(std::chrono::seconds timeout) {
-        if constexpr (requires(Underlying& endpoint) { endpoint.SetIdleTimeout(timeout); }) {
-            underlying_.SetIdleTimeout(timeout);
-        }
-    }
-
-    void SetReadTimeout(std::chrono::seconds timeout) {
-        if constexpr (requires(Underlying& endpoint) { endpoint.SetReadTimeout(timeout); }) {
-            underlying_.SetReadTimeout(timeout);
-        }
-    }
-
-    void SetWriteTimeout(std::chrono::seconds timeout) {
-        if constexpr (requires(Underlying& endpoint) { endpoint.SetWriteTimeout(timeout); }) {
-            underlying_.SetWriteTimeout(timeout);
-        }
-    }
-
-    [[nodiscard]] bool ConsumeIdleTimeout() noexcept {
-        if constexpr (requires(Underlying& endpoint) { endpoint.ConsumeIdleTimeout(); }) {
-            return underlying_.ConsumeIdleTimeout();
-        } else {
-            return false;
-        }
-    }
-
-    [[nodiscard]] bool ConsumeReadTimeout() noexcept {
-        if constexpr (requires(Underlying& endpoint) { endpoint.ConsumeReadTimeout(); }) {
-            return underlying_.ConsumeReadTimeout();
-        } else {
-            return false;
-        }
-    }
-
-    [[nodiscard]] bool ConsumeWriteTimeout() noexcept {
-        if constexpr (requires(Underlying& endpoint) { endpoint.ConsumeWriteTimeout(); }) {
-            return underlying_.ConsumeWriteTimeout();
-        } else {
-            return false;
-        }
-    }
-
-    void ClearPhaseDeadline() {
-        if constexpr (requires(Underlying& endpoint) { endpoint.ClearPhaseDeadline(); }) {
-            underlying_.ClearPhaseDeadline();
-        }
-    }
-
-    transport::PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
-        if constexpr (requires(Underlying& endpoint) {
-                endpoint.StartPhaseDeadline(timeout);
-            }) {
-            return underlying_.StartPhaseDeadline(timeout);
-        } else {
-            return {};
-        }
-    }
-
-    [[nodiscard]] bool ConsumePhaseDeadline() noexcept {
-        if constexpr (requires(Underlying& endpoint) {
-                endpoint.ConsumePhaseDeadline();
-            }) {
-            return underlying_.ConsumePhaseDeadline();
-        } else {
-            return false;
+        } else if constexpr (requires(Underlying& endpoint) { endpoint.RelayControl().Cancel(); }) {
+            underlying_.RelayControl().Cancel();
         }
     }
 
 private:
     Underlying& underlying_;
-    PacketReader reader_;
-    PacketWriter writer_;
+    UotPacketReader reader_;
+    UotPacketWriter writer_;
 };
 
-}  // namespace proxy::uot
+}  // namespace proxy

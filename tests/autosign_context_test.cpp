@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/tls_context.hpp"
-
+#include "transport/tls_context.hpp"
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <chrono>
@@ -11,11 +10,11 @@
 #include <thread>
 
 namespace {
-using Renewal = ::transport::internet::AutoSignContextRenewal;
+using Renewal = ::transport::AutoSignContextRenewal;
 using namespace std::chrono_literals;
 
 std::shared_ptr<SSL_CTX> Context(long validity_seconds) {
-    auto certificate = ::transport::internet::AutoSignCertificate::Create("renewal.example");
+    auto certificate = ::transport::AutoSignCertificate::Create("renewal.example");
     if (!certificate || !X509_gmtime_adj(X509_get_notAfter(certificate->Certificate()), validity_seconds) ||
         X509_sign(certificate->Certificate(), certificate->Key(), EVP_sha256()) <= 0)
         throw std::runtime_error("test certificate construction failed");
@@ -25,8 +24,8 @@ std::shared_ptr<SSL_CTX> Context(long validity_seconds) {
         throw std::runtime_error("test SSL_CTX construction failed");
     return context;
 }
-::transport::internet::TlsConfig RenewalConfig(std::string server_name) {
-    ::transport::internet::TlsConfig config;
+::transport::TlsConfig RenewalConfig(std::string server_name) {
+    ::transport::TlsConfig config;
     config.server_name = std::move(server_name);
     return config;
 }
@@ -58,8 +57,8 @@ TEST(AutosignContext, FailedRenewalRetainsValidSnapshotButRejectsExpiredSnapshot
     constexpr long kTenDays = 10L * 24 * 60 * 60;
     auto old = Context(kTenDays);
     auto config = RenewalConfig("failing.example");
-    config.min_version = ::transport::internet::TlsVersion::V1_3;
-    config.max_version = ::transport::internet::TlsVersion::V1_2;
+    config.min_version = ::transport::TlsVersion::V1_3;
+    config.max_version = ::transport::TlsVersion::V1_2;
     auto failing = Renewal::Start(old, config);
 
     // The scheduler processes due registrations in order. A later successful

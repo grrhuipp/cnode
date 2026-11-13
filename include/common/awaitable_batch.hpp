@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-namespace common::detail {
+namespace common {
 
 template <typename Handler>
 struct BatchState {
@@ -81,14 +81,11 @@ inline net::awaitable<void> RunBatchOnExecutor(
         }, token);
 }
 
-}  // namespace detail
 
 // Starts every task on the supplied single-threaded executor and resumes only
 // after all tasks finish. The first non-cancellation failure takes precedence
 // over child cancellation. Caller cancellation is deferred until all started
 // tasks finish; it cannot detach tasks that borrow the caller's state.
-namespace common {
-
 inline net::awaitable<void> RunAwaitableBatch(
     net::any_io_executor executor,
     std::vector<net::awaitable<void>> tasks) {
@@ -96,7 +93,7 @@ inline net::awaitable<void> RunAwaitableBatch(
 
     // Cancellation must not detach children from a caller whose state they may
     // borrow. Join on an independent coroutine, then report deferred cancellation.
-    co_await net::co_spawn(executor, detail::RunBatchOnExecutor(std::move(tasks)),
+    co_await net::co_spawn(executor, RunBatchOnExecutor(std::move(tasks)),
         net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
     const auto cancellation = co_await net::this_coro::cancellation_state;
     if (cancellation.cancelled() != net::cancellation_type::none) {

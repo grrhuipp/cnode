@@ -4,12 +4,12 @@
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/binary_text_codec.hpp"
-#include "common/buf/length_prefixed_packet_buffer.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/length_prefixed_packet_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/error.hpp"
 #include "common/target_address.hpp"
 #include <openssl/mem.h>
-#include "core/constants.hpp"
+#include "common/constants.hpp"
 #include "transport/link.hpp"
 
 #include <openssl/sha.h>
@@ -25,7 +25,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-namespace proxy::vless {
+namespace proxy {
 
 // Parses a UUID string, or maps a 1-30 byte VLESS custom id to UUIDv5.
 [[nodiscard]] inline std::optional<std::array<uint8_t, 16>>
@@ -53,30 +53,30 @@ ParseUuidBytes(std::string_view uuid) noexcept {
     return common::LowerAscii(std::string(flow));
 }
 
-inline constexpr uint8_t kVersion = 0x00;
+inline constexpr uint8_t kVlessVersion = 0x00;
 
 // Version, UUID, addons length, 255 addon bytes, command and the largest
 // port-first address (port, type, length, 253-byte domain).
-inline constexpr size_t kMaxRequestHeaderSize = 1 + 16 + 1 + 255 + 1 + common::kMaxEncodedAddressSize;
+inline constexpr size_t kVlessMaxRequestHeaderSize = 1 + 16 + 1 + 255 + 1 + common::kMaxEncodedAddressSize;
 
 // The server never sends response addons.
-inline constexpr std::array<uint8_t, 2> kResponseHeader{kVersion, 0};
+inline constexpr std::array<uint8_t, 2> kResponseHeader{kVlessVersion, 0};
 
-enum class Command : uint8_t {
+enum class VlessCommand : uint8_t {
     TCP = 0x01,
     UDP = 0x02,
     MUX = 0x03,
 };
 
-struct RequestHeader {
+struct VlessRequestHeader {
     std::array<uint8_t, 16> uuid{};
-    std::pmr::string flow{memory::process_resource()};
-    Command command = Command::TCP;
+    std::string flow;
+    VlessCommand command = VlessCommand::TCP;
     common::TargetAddress target;
     std::optional<common::ForwardedMetadata> forwarded;
 };
 
-enum class RequestHeaderDecodeStatus : uint8_t {
+enum class VlessRequestDecodeStatus : uint8_t {
     Complete,
     Incomplete,
     InvalidVersion,
@@ -85,9 +85,9 @@ enum class RequestHeaderDecodeStatus : uint8_t {
     InvalidAddons,
 };
 
-struct RequestHeaderDecodeResult {
-    RequestHeaderDecodeStatus status = RequestHeaderDecodeStatus::Incomplete;
-    RequestHeader header;
+struct VlessRequestDecodeResult {
+    VlessRequestDecodeStatus status = VlessRequestDecodeStatus::Incomplete;
+    VlessRequestHeader header;
     // Complete only: bytes belonging to the header.
     size_t consumed = 0;
     // Incomplete only: minimum total prefix length needed for the next stage.
@@ -96,12 +96,12 @@ struct RequestHeaderDecodeResult {
 
 // Re-submit the same growing prefix until it is complete or invalid; every
 // Incomplete result names the next structural boundary, never a guess.
-[[nodiscard]] RequestHeaderDecodeResult DecodeRequestHeader(
+[[nodiscard]] VlessRequestDecodeResult DecodeVlessRequestHeader(
     std::span<const uint8_t> data);
 
 [[nodiscard]] size_t EncodeRequestHeaderTo(
     const std::array<uint8_t, 16>& uuid,
-    Command command,
+    VlessCommand command,
     const common::TargetAddress& target,
     uint8_t* output,
     size_t output_size,
@@ -114,52 +114,52 @@ inline constexpr std::string_view kPacketAddrMagicAddress =
 
 [[nodiscard]] bool IsPacketAddrMagic(const common::TargetAddress& target) noexcept;
 
-struct FramedUdpPacket {
+struct VlessFramedUdpPacket {
     std::optional<common::TargetAddress> target;
-    buf::MultiBuffer payload;
+    common::MultiBuffer payload;
 };
 
-class UdpFramer {
+class VlessUdpFramer {
 public:
-    explicit UdpFramer(bool packet_addr) noexcept : packet_addr_(packet_addr) {}
+    explicit VlessUdpFramer(bool packet_addr) noexcept : packet_addr_(packet_addr) {}
 
     // Malformed/truncated input, budget overflow and use after EOF/failure
     // throw LinkError(PROTOCOL_DECODE_FAILED); allocation and source I/O
     // exceptions retain their original types.
-    void Feed(buf::MultiBuffer input);
-    [[nodiscard]] bool Next(FramedUdpPacket& out);
+    void Feed(common::MultiBuffer input);
+    [[nodiscard]] bool Next(VlessFramedUdpPacket& out);
     void Finish();
 
     // Returns one framed datagram whose buffers carry its packet address, or
     // `session_target` without one; an empty datagram owns a tagged zero-length
     // Buffer, while an empty container means clean EOF. Partial frames stay
     // in this framer when `src` throws or is cancelled.
-    net::awaitable<buf::MultiBuffer> ReadDatagram(
+    net::awaitable<common::MultiBuffer> ReadDatagram(
         transport::MultiBufferReader& src,
         const common::TargetAddress& session_target);
 
 private:
     bool packet_addr_ = false;
-    buf::LengthPrefixedPacketBuffer pending_;
+    common::LengthPrefixedPacketBuffer pending_;
 };
 
-net::awaitable<void> WriteUdpDatagram(
+net::awaitable<void> WriteVlessUdpDatagram(
     transport::MultiBufferWriter& writer,
-    buf::MultiBuffer payload,
+    common::MultiBuffer payload,
     bool packet_addr,
     const common::TargetAddress* fixed_target = nullptr);
 
-net::awaitable<void> WriteUdpDatagram(
+net::awaitable<void> WriteVlessUdpDatagram(
     transport::MultiBufferWriter& writer,
     const common::TargetAddress& target,
     bool packet_addr,
     std::span<const net::const_buffer> payload);
 
-class UdpStreamEndpoint final
+class VlessUdpStreamEndpoint final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
-    UdpStreamEndpoint(transport::MultiBufferReader& src,
+    VlessUdpStreamEndpoint(transport::MultiBufferReader& src,
                       transport::MultiBufferWriter& dst,
                       const common::TargetAddress& target,
                       bool packet_addr)
@@ -177,12 +177,12 @@ public:
         return src_.ReadEofAction();
     }
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         return framer_.ReadDatagram(src_, target_);
     }
 
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        return WriteUdpDatagram(dst_, std::move(mb), packet_addr_);
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
+        return WriteVlessUdpDatagram(dst_, std::move(mb), packet_addr_);
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
@@ -191,7 +191,7 @@ public:
                 io_error::invalid_argument,
                 "packet-address VLESS UDP write requires a target");
         }
-        return WriteUdpDatagram(dst_, target_, false, buffers);
+        return WriteVlessUdpDatagram(dst_, target_, false, buffers);
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
@@ -206,7 +206,7 @@ private:
     transport::MultiBufferReader& src_;
     transport::MultiBufferWriter& dst_;
     common::TargetAddress target_;
-    UdpFramer framer_;
+    VlessUdpFramer framer_;
     bool packet_addr_ = false;
 };
 
@@ -214,7 +214,7 @@ inline constexpr std::string_view kVisionFlow = "xtls-rprx-vision";
 
 [[nodiscard]] bool IsVisionFlow(std::string_view flow) noexcept;
 
-namespace detail {
+
 inline constexpr size_t kVisionFrameContentLimit = 8192 - 21;
 // `random` is uniform in [0,499] for long TLS padding, otherwise [0,255].
 [[nodiscard]] constexpr uint16_t VisionPaddingSize(
@@ -225,7 +225,7 @@ inline constexpr size_t kVisionFrameContentLimit = 8192 - 21;
         ? kVisionFrameContentLimit - content : 0;
     return static_cast<uint16_t>(padding < available ? padding : available);
 }
-} // namespace detail
+
 
 // Both directions observe the same TLS handshake, as in Xray TrafficState.
 // Access is confined to the connection's owning Worker.
@@ -252,7 +252,7 @@ public:
         OPENSSL_cleanse(header_.data(), header_.size());
     }
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override;
 
 private:
     transport::MultiBufferReader& src_;
@@ -260,7 +260,7 @@ private:
     VisionTrafficState& traffic_;
     // Streaming frame cursor: header bytes, content and padding may each be
     // split across reads; content is moved out as soon as it arrives.
-    buf::MultiBuffer pending_;
+    common::MultiBuffer pending_;
     std::array<uint8_t, 16 + 5> header_{};
     size_t header_read_ = 0;
     size_t content_remaining_ = 0;
@@ -270,8 +270,8 @@ private:
     bool read_process_ = true;
     bool expect_uuid_ = true;
 
-    void Decode(buf::MultiBuffer& out);
-    net::awaitable<buf::MultiBuffer> ReadFramedMultiBuffer();
+    void Decode(common::MultiBuffer& out);
+    net::awaitable<common::MultiBuffer> ReadFramedMultiBuffer();
 };
 
 class VisionWriter final : public transport::MultiBufferWriter {
@@ -283,7 +283,7 @@ public:
         OPENSSL_cleanse(user_uuid_.data(), user_uuid_.size());
     }
 
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     net::awaitable<void> AsyncShutdownWrite() override;
     bool WriteShutdownClosesLink() const noexcept override {
@@ -291,7 +291,7 @@ public:
     }
 
 private:
-    net::awaitable<void> WriteFramedMultiBuffer(buf::MultiBuffer mb);
+    net::awaitable<void> WriteFramedMultiBuffer(common::MultiBuffer mb);
     net::awaitable<void> WriteFramedBuffers(std::span<const net::const_buffer> buffers);
     transport::MultiBufferWriter& dst_;
     std::array<uint8_t, 16> user_uuid_{};
@@ -299,4 +299,4 @@ private:
     bool send_uuid_ = true;
     VisionTrafficState& traffic_;
 };
-}  // namespace proxy::vless
+}  // namespace proxy

@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/hysteria/hysteria_ingress.hpp"
+#include "transport/hysteria/hysteria_ingress.hpp"
 #include "common/asio_types.hpp"
 
 #include <openssl/rand.h>
@@ -9,7 +9,7 @@
 #include <array>
 #include <vector>
 
-using namespace ::transport::internet::hysteria;
+using namespace ::transport;
 
 namespace {
 class QuicDirectory : public testing::TestWithParam<bool> {};

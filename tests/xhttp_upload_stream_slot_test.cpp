@@ -1,8 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "allocation_hook.hpp"
-#include "transport/internet/xhttp_session.hpp"
-
+#include "transport/xhttp_session.hpp"
 #include <cstdlib>
 #include <memory>
 
@@ -35,7 +34,7 @@ constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = RejectArme
 TEST(XhttpUploadStreamSlot, RejectsSecondOwnerAndRetainsInFlightSnapshotUntilReleased) {
     size_t first_destructions = 0;
     size_t rejected_destructions = 0;
-    ::transport::internet::detail::BasicXHttpUploadStreamSlot<TestStream> slot;
+    ::transport::BasicXHttpUploadStreamSlot<TestStream> slot;
     ASSERT_TRUE(slot.Attach(std::make_unique<TestStream>(first_destructions)));
     auto in_flight = slot.Snapshot();
     const bool attached_again = slot.Attach(std::make_unique<TestStream>(rejected_destructions));
@@ -56,7 +55,7 @@ TEST(XhttpUploadStreamSlot, RejectsSecondOwnerAndRetainsInFlightSnapshotUntilRel
 
 TEST(XhttpUploadStreamSlot, AllocationFailurePreservesCallerOwnershipAndAllowsRetry) {
     size_t destructions = 0;
-    ::transport::internet::detail::BasicXHttpUploadStreamSlot<TestStream> slot;
+    ::transport::BasicXHttpUploadStreamSlot<TestStream> slot;
     auto retained = std::make_unique<TestStream>(destructions);
     bool allocation_failed = false;
     {

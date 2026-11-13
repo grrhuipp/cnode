@@ -3,22 +3,22 @@
 #include "proxy/shadowsocks/ss_udp.hpp"
 #include "proxy/inbound.hpp"
 
-namespace proxyman::inbound { struct AdmissionEnvironment; }
+namespace app { struct AdmissionEnvironment; }
 
-namespace proxy::shadowsocks::inbound {
+namespace proxy {
 
-class Handler final : public ::proxy::Inbound {
+class SsInboundHandler final : public ::proxy::Inbound {
 public:
-    Handler(const ::proxyman::inbound::AdmissionEnvironment& environment,
-            ::proxy::shadowsocks::SsCipherInfo cipher_info);
+    SsInboundHandler(const ::app::AdmissionEnvironment& environment,
+            ::proxy::SsCipherInfo cipher_info);
 
     // 解析首包：读 salt + 首 chunk，尝试所有用户密钥，解析 SOCKS5 地址
     ::net::awaitable<::app::RelayResult> Process(
         std::unique_ptr<::transport::AsyncStream> stream,
         ::routing::Dispatcher& dispatcher,
-        const ::proxyman::inbound::ReceiverSettings& receiver,
+        const ::app::ReceiverSettings& receiver,
         ::net::io_context& io_context,
-        ::session::Context& ctx,
+        ::common::Context& ctx,
         const ::infra::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) override;
 
@@ -33,11 +33,11 @@ public:
     CreateDatagramResponse(const ::proxy::InboundDatagramResult& decoded) override;
 
 private:
-    const ::proxyman::inbound::AdmissionEnvironment& environment_;
-    ::proxy::shadowsocks::SsCipherInfo cipher_info_;
-    ::proxy::shadowsocks::Ss2022UdpReplayCache udp_replay_cache_;
+    const ::app::AdmissionEnvironment& environment_;
+    ::proxy::SsCipherInfo cipher_info_;
+    ::proxy::Ss2022UdpReplayCache udp_replay_cache_;
     // 上次匹配成功的用户索引，用于优先尝试（大概率命中同一活跃用户）
     size_t last_matched_index_ = 0;
 };
 
-}  // namespace proxy::shadowsocks::inbound
+}  // namespace proxy

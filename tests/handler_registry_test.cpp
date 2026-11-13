@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 
-#include "app/proxyman/inbound/handler.hpp"
+#include "app/proxyman/inbound_handler.hpp"
 #include "app/relay.hpp"
-#include "app/proxyman/outbound/handler.hpp"
+#include "app/proxyman/outbound_handler.hpp"
 #include "app/dns/dns.hpp"
 #include "common/session.hpp"
 #include "app/stats.hpp"
@@ -19,14 +19,14 @@
 
 namespace {
 
-using ::proxyman::outbound::HandlerRegistry;
-using ::proxyman::outbound::PreparedOutboundConfig;
+using ::app::OutboundHandlerRegistry;
+using ::app::PreparedOutboundConfig;
 
 struct Probe {
     int created = 0;
     int destroyed = 0;
     int processed = 0;
-    ::transport::internet::OutboundDialer* last_dialer = nullptr;
+    ::transport::OutboundDialer* last_dialer = nullptr;
 };
 
 class CountingOutbound final : public ::proxy::Outbound {
@@ -35,9 +35,9 @@ public:
     ~CountingOutbound() noexcept override { ++probe_.destroyed; }
 
     ::net::awaitable<::proxy::OutboundProcessResult> Process(
-        ::session::Context&, ::transport::Link, ::transport::internet::OutboundDialer& dialer,
+        ::common::Context&, ::transport::Link, ::transport::OutboundDialer& dialer,
         const ::infra::TimeoutsConfig&, ::app::StatsShard&, const ::app::RelayConfig&,
-        ::buf::MultiBufferBatch) override {
+        ::common::MultiBufferBatch) override {
         ++probe_.processed;
         probe_.last_dialer = &dialer;
         co_return ::app::RelayResult{};
@@ -52,7 +52,7 @@ PreparedOutboundConfig MakeConfig(std::string tag, Probe& probe) {
         .tag = std::move(tag),
         .protocol = "test-counting",
         .sender = {},
-        .create = ::proxyman::outbound::MakePreparedOutboundCreator<
+        .create = ::app::MakePreparedOutboundCreator<
             Probe*,
             +[](std::string_view, std::shared_ptr<Probe* const> probe,
                 ::net::io_context&, ::common::AwaitableTaskGroup&)
@@ -65,14 +65,14 @@ PreparedOutboundConfig MakeConfig(std::string tag, Probe& probe) {
 class HandlerRegistryTest : public ::testing::Test {
 protected:
     ::net::io_context io;
-    ::app::dns::DNSWorker dns_worker{
-        io, ::app::dns::Config{
+    ::app::DNSWorker dns_worker{
+        io, ::app::DnsConfig{
             .servers = {{::net::ip::address_v4::loopback(), 9}}}, 8};
-    ::app::dns::DNS dns{dns_worker};
+    ::app::DNS dns{dns_worker};
     ::common::ResidentTaskGroup tasks{io.get_executor()};
     Probe first_probe;
     Probe second_probe;
-    HandlerRegistry registry{{MakeConfig("direct", first_probe)}, io, dns,
+    OutboundHandlerRegistry registry{{MakeConfig("direct", first_probe)}, io, dns,
                              std::chrono::seconds(1), tasks.Tasks()};
 
     void TearDown() override {
@@ -102,7 +102,7 @@ TEST_F(HandlerRegistryTest, LookupReturnsPublishedHandlerAndRejectsUnknownTags) 
 TEST_F(HandlerRegistryTest, DispatchReachesPublishedProtocol) {
     auto first = registry.GetHandler("direct");
     ASSERT_TRUE(first);
-    ::session::Context ctx;
+    ::common::Context ctx;
     ::infra::TimeoutsConfig timeouts;
     ::app::StatsShard stats;
     ::app::RelayConfig relay;
@@ -153,7 +153,7 @@ TEST_F(HandlerRegistryTest, RemovalKeepsExistingRequestAliveUntilReleased) {
 TEST_F(HandlerRegistryTest, DuplicateTagsReleaseAllUnpublishedHandlers) {
     Probe probe;
     EXPECT_THROW(
-        (HandlerRegistry({MakeConfig("same", probe), MakeConfig("same", probe)},
+        (OutboundHandlerRegistry({MakeConfig("same", probe), MakeConfig("same", probe)},
                          io, dns, std::chrono::seconds(1), tasks.Tasks())),
         std::logic_error);
     EXPECT_EQ(probe.destroyed, probe.created);

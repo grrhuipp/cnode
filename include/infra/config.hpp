@@ -1,13 +1,12 @@
 #pragma once
 
 #include "common/defaults.hpp"
-#include "core/constants.hpp"
+#include "common/constants.hpp"
 #include "infra/config_types.hpp"
 #include "infra/json.hpp"
-#include "transport/internet/inbound_listen.hpp"
-#include "transport/internet/proxy_protocol.hpp"
-#include "transport/internet/stream_settings.hpp"
-
+#include "transport/inbound_listen.hpp"
+#include "transport/proxy_protocol.hpp"
+#include "transport/stream_settings.hpp"
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -21,26 +20,22 @@
 #include <utility>
 #include <vector>
 
-namespace transport::internet {
+namespace transport {
 
 struct TlsPemMaterial;
 
-}  // namespace transport::internet
+}  // namespace transport
 
 namespace infra {
-[[nodiscard]] transport::internet::WsConfig ParseWsConfig(const json::object& source);
-[[nodiscard]] transport::internet::HttpUpgradeConfig ParseHttpUpgradeConfig(const json::object& source);
-[[nodiscard]] transport::internet::HttpConfig ParseHttpConfig(const json::object& source);
-[[nodiscard]] transport::internet::GrpcConfig ParseGrpcConfig(const json::object& source);
-[[nodiscard]] transport::internet::XHttpConfig ParseXHttpConfig(const json::object& source);
-[[nodiscard]] transport::internet::RealityConfig ParseRealityConfig(const json::object& source);
-[[nodiscard]] transport::internet::StreamSettings ParseStreamSettings(const json::object& source, transport::internet::StreamEndpointRole role);
+[[nodiscard]] transport::WsConfig ParseWsConfig(const object& source);
+[[nodiscard]] transport::HttpUpgradeConfig ParseHttpUpgradeConfig(const object& source);
+[[nodiscard]] transport::HttpConfig ParseHttpConfig(const object& source);
+[[nodiscard]] transport::GrpcConfig ParseGrpcConfig(const object& source);
+[[nodiscard]] transport::XHttpConfig ParseXHttpConfig(const object& source);
+[[nodiscard]] transport::RealityConfig ParseRealityConfig(const object& source);
+[[nodiscard]] transport::StreamSettings ParseStreamSettings(const object& source, transport::StreamEndpointRole role);
 [[nodiscard]] OutboundSettings ParseOutboundSettings(
-    std::string_view protocol, const json::object& settings);
-}  // namespace infra
-
-
-namespace infra {
+    std::string_view protocol, const object& settings);
 
 class PanelNodeIds {
 public:
@@ -50,7 +45,7 @@ public:
     [[nodiscard]] int Front() const noexcept { return values_.front(); }
     [[nodiscard]] std::span<const int> Values() const noexcept { return values_; }
 
-    [[nodiscard]] static PanelNodeIds Parse(const json::value& value);
+    [[nodiscard]] static PanelNodeIds Parse(const infra::value& value);
     [[nodiscard]] static PanelNodeIds Single(int node_id);
 
 private:
@@ -77,20 +72,20 @@ struct PanelApiUrlParts {
 // ============================================================================
 struct PanelConfig {
     std::string Name;                        // 面板名称
-    std::string Type = std::string(constants::panel::kV2BoardType);  // 面板类型
+    std::string Type = std::string(common::kV2BoardType);  // 面板类型
     std::string APIHost;                      // API 地址
     std::string Key;                          // API 密钥
-    std::chrono::seconds RequestTimeout{defaults::kPanelRequestTimeout};
+    std::chrono::seconds RequestTimeout{common::kPanelRequestTimeout};
     PanelNodeIds NodeIDs;
-    std::string NodeType = std::string(constants::panel::kDefaultNodeType);
+    std::string NodeType = std::string(common::kDefaultNodeType);
     // Local durable accounting state; resolved relative to the loaded config directory.
     std::filesystem::path TrafficJournalDir = "traffic-journal";
-    transport::internet::InboundListen ListenIP;
-    transport::internet::OutboundBind SendIP = transport::internet::OutboundBind::Auto();
+    transport::InboundListen ListenIP;
+    transport::OutboundBind SendIP = transport::OutboundBind::Auto();
     bool EnableDNS = true;
-    proxy::freedom::outbound::DomainStrategy DNSType =
-        proxy::freedom::outbound::DomainStrategy::UseIP;
-    transport::internet::ProxyProtocolMode ProxyProtocol = transport::internet::ProxyProtocolMode::Auto; // off / auto / on
+    proxy::DomainStrategy DNSType =
+        proxy::DomainStrategy::UseIP;
+    transport::ProxyProtocolMode ProxyProtocol = transport::ProxyProtocolMode::Auto; // off / auto / on
 
     // TLS 能力配置。
     // true 表示本实例可以为面板中 tls=true 的节点终止 TLS；并不强制所有节点启用 TLS。
@@ -98,8 +93,8 @@ struct PanelConfig {
     bool TLSEnable = false;
     std::string TLSCert;                    // 证书文件路径（空则自签名）
     std::string TLSKey;                     // 私钥文件路径（空则自签名）
-    std::shared_ptr<const transport::internet::TlsPemMaterial> TLSPem;
-    static PanelConfig FromJson(const json::object& j);
+    std::shared_ptr<const transport::TlsPemMaterial> TLSPem;
+    static PanelConfig FromJson(const object& j);
     [[nodiscard]] bool Validate() const;
 };
 struct Config {
@@ -110,14 +105,14 @@ struct Config {
     RoutingConfig routing;
     std::vector<PanelConfig> panels;
     std::vector<StaticInboundConfig> static_inbounds;
-    std::vector<infra::OutboundSourceConfig> outbounds;
+    std::vector<OutboundSourceConfig> outbounds;
     uint32_t workers = 0;  // 加载时将 0 归一化为可用 CPU 核心数。
     std::filesystem::path config_dir;
 };
 
 // 文件与目录共用解析入口；侧车固定从主配置所在目录读取。
 [[nodiscard]] std::optional<Config> LoadConfig(const std::filesystem::path& path);
-[[nodiscard]] std::optional<Config> ParseConfig(const json::object& source);
+[[nodiscard]] std::optional<Config> ParseConfig(const object& source);
 [[nodiscard]] bool ValidateConfig(const Config& config);
 [[nodiscard]] std::vector<std::string> GetUsedGeoIPTags(const RoutingConfig& routing);
 [[nodiscard]] std::vector<std::string> GetUsedGeoSiteTags(const RoutingConfig& routing);
@@ -167,24 +162,20 @@ struct StaticInboundSemanticValidation {
 };
 
 [[nodiscard]] ConfigSemanticValidation ValidateOutboundSelectionSemantics(
-    std::span<const infra::OutboundSourceConfig> outbounds,
+    std::span<const OutboundSourceConfig> outbounds,
     std::span<const RouteRuleConfig> rules,
     std::span<const StaticInboundConfig> inbounds);
 
 [[nodiscard]] StaticInboundSemanticValidation ValidateStaticInboundSemantics(
     std::span<const StaticInboundConfig> inbounds);
 
-}  // namespace infra
-
-
-namespace infra {
 
 // Cold-path configuration normalization. A string preserves the existing
 // binding semantics; an ordered array chooses only assigned local addresses.
-[[nodiscard]] transport::internet::OutboundBind ParseOutboundBindConfig(
-    const json::value& value, const json::value* strategy = nullptr);
-[[nodiscard]] std::optional<transport::internet::OutboundBind> ParseOptionalOutboundBind(
-    const json::object& source, std::string_view context);
+[[nodiscard]] transport::OutboundBind ParseOutboundBindConfig(
+    const infra::value& value, const infra::value* strategy = nullptr);
+[[nodiscard]] std::optional<transport::OutboundBind> ParseOptionalOutboundBind(
+    const object& source, std::string_view context);
 
 
 // ---------------------------------------------------------------------------
@@ -215,11 +206,11 @@ struct RealityServerInput {
 // Validates and writes the server-side fields into `out`; client-only fields
 // of `out` are left untouched.
 [[nodiscard]] tl::expected<void, std::string> ApplyRealityServerInput(
-    const RealityServerInput& input, transport::internet::RealityConfig& out);
+    const RealityServerInput& input, transport::RealityConfig& out);
 
 // Requirements of a REALITY config terminating client connections.
 [[nodiscard]] tl::expected<void, std::string> ValidateInboundReality(
-    const transport::internet::RealityConfig& config);
+    const transport::RealityConfig& config);
 
 // ---------------------------------------------------------------------------
 // TLS / transport request fields
@@ -258,26 +249,26 @@ struct RealityServerInput {
 // unset (""). A non-empty scheme must parse and fit one UpdatePaddingScheme
 // frame.
 [[nodiscard]] tl::expected<std::string, std::string> ParseAnyTlsPaddingScheme(
-    const json::value& value, std::string_view field);
+    const infra::value& value, std::string_view field);
 
 // ---------------------------------------------------------------------------
 // Proxy Protocol & HTTP/2 initial window
 // ---------------------------------------------------------------------------
 
-[[nodiscard]] transport::internet::InboundListen ParseInboundListen(
-    const json::object& object,
+[[nodiscard]] transport::InboundListen ParseInboundListen(
+    const object& object,
     std::string_view key,
     std::string_view field_label,
-    transport::internet::InboundListen fallback = transport::internet::InboundListen{});
+    transport::InboundListen fallback = transport::InboundListen{});
 
 // Header presence policy is independent of v1/v2 format detection.
-[[nodiscard]] transport::internet::ProxyProtocolMode ParseProxyProtocolMode(
-    const json::object& object, std::string_view key,
-    transport::internet::ProxyProtocolMode fallback = transport::internet::ProxyProtocolMode::Auto);
+[[nodiscard]] transport::ProxyProtocolMode ParseProxyProtocolMode(
+    const object& object, std::string_view key,
+    transport::ProxyProtocolMode fallback = transport::ProxyProtocolMode::Auto);
 
 inline constexpr uint32_t kHttp2MaxInitialWindow = 0x7fffffffU;
 [[nodiscard]] tl::expected<std::optional<uint32_t>, std::string>
-ParseHttp2InitialWindow(const json::object& source);
+ParseHttp2InitialWindow(const object& source);
 
 }  // namespace infra
 

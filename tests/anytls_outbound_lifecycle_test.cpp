@@ -8,10 +8,10 @@
 #include "app/session_group_executor.hpp"
 #include "common/session.hpp"
 #include "infra/config_types.hpp"
-#include "transport/internet/tls_stream.hpp"
-#include "transport/internet/tcp_stream.hpp"
-#include "transport/internet/outbound_target_builder.hpp"
-#include "transport/internet/timeout_scheduler.hpp"
+#include "transport/tls_stream.hpp"
+#include "transport/tcp_stream.hpp"
+#include "transport/outbound_target_builder.hpp"
+#include "transport/timeout_scheduler.hpp"
 #include "common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -29,7 +29,7 @@
 #include <utility>
 
 namespace {
-// Armed together with memory::reject_next_process_allocation; whichever
+// Armed together with common::reject_next_process_allocation; whichever
 // allocation (coroutine frame via operator new, or process-layer string/Buffer)
 // comes first consumes the single injected failure.
 thread_local bool fail_next_allocation = false;
@@ -38,22 +38,22 @@ thread_local size_t armed_process_rejections = 0;
 
 void ArmNextAllocationFailure() {
     fail_next_allocation = true;
-    memory::reject_next_process_allocation = true;
-    armed_process_rejections = memory::rejected_process_allocations;
+    common::reject_next_process_allocation = true;
+    armed_process_rejections = common::rejected_process_allocations;
 }
 
 void DisarmAllocationFailure() {
     fail_next_allocation = false;
-    memory::reject_next_process_allocation = false;
+    common::reject_next_process_allocation = false;
 }
 
 size_t AllocationFailures() {
-    return operator_new_failures + memory::rejected_process_allocations;
+    return operator_new_failures + common::rejected_process_allocations;
 }
-static_assert(alignof(::buf::Buffer) <= alignof(std::max_align_t));
+static_assert(alignof(::common::Buffer) <= alignof(std::max_align_t));
 
 void FailArmedAllocation(std::size_t size) {
-    if (fail_next_allocation && memory::rejected_process_allocations != armed_process_rejections) {
+    if (fail_next_allocation && common::rejected_process_allocations != armed_process_rejections) {
         fail_next_allocation = false;
     }
     if (fail_next_allocation) {
@@ -68,8 +68,8 @@ constinit allocation_hook::Hooks allocation_hook::hooks{.before_new = FailArmedA
 namespace {
 using namespace std::chrono_literals;
 
-size_t BufferCount() noexcept { return memory::detail::test_buffers_live; }
-size_t BufferPeak() noexcept { return memory::detail::test_buffers_peak; }
+size_t BufferCount() noexcept { return common::test_buffers_live; }
+size_t BufferPeak() noexcept { return common::test_buffers_peak; }
 
 struct QueueScenario {
     int mode = 0;
@@ -149,18 +149,18 @@ struct Wire {
             const uint32_t sid = (uint32_t(header[1]) << 24) | (uint32_t(header[2]) << 16) |
                 (uint32_t(header[3]) << 8) | header[4];
             parsed_outgoing += 7 + length;
-            if (command == proxy::anytls::kCmdSettings)
+            if (command == proxy::kCmdSettings)
                 client_settings.assign(reinterpret_cast<const char*>(header + 7), length);
-            if (command == proxy::anytls::kCmdWaste) padding_lengths.push_back(length);
-            if (command == proxy::anytls::kCmdHeartResponse) ++heart_responses;
-            if (command != proxy::anytls::kCmdPSH || responded) continue;
+            if (command == proxy::kCmdWaste) padding_lengths.push_back(length);
+            if (command == proxy::kCmdHeartResponse) ++heart_responses;
+            if (command != proxy::kCmdPSH || responded) continue;
             responded = true;
-            Frame(proxy::anytls::kCmdServerSettings, 0, "v=2");
-            if (padding_index == 0) Frame(proxy::anytls::kCmdUpdatePaddingScheme, 0, kPaddingA);
-            Frame(proxy::anytls::kCmdSYNACK, sid);
-            Frame(proxy::anytls::kCmdPSH, sid, "reply");
+            Frame(proxy::kCmdServerSettings, 0, "v=2");
+            if (padding_index == 0) Frame(proxy::kCmdUpdatePaddingScheme, 0, kPaddingA);
+            Frame(proxy::kCmdSYNACK, sid);
+            Frame(proxy::kCmdPSH, sid, "reply");
             // The first request stays busy while another physical session opens.
-            if (padding_index != 0) Frame(proxy::anytls::kCmdFIN, sid);
+            if (padding_index != 0) Frame(proxy::kCmdFIN, sid);
             wake.cancel();
         }
     }
@@ -169,13 +169,13 @@ struct Wire {
         if (!open_order || open_order->delivered) return;
         open_order->delivered = true;
         const int mode = open_order->mode;
-        if (mode == 0 || mode == 5) Frame(proxy::anytls::kCmdSYNACK, 2);
-        if (mode == 0 || mode == 2) Frame(proxy::anytls::kCmdPSH, 2, "reply");
-        if (mode <= 2) Frame(proxy::anytls::kCmdFIN, 2);
-        if (mode == 3) Frame(proxy::anytls::kCmdSYNACK, 2, "rejected");
-        if (mode == 4 || mode == 5) Frame(proxy::anytls::kCmdAlert, 0, "closed");
+        if (mode == 0 || mode == 5) Frame(proxy::kCmdSYNACK, 2);
+        if (mode == 0 || mode == 2) Frame(proxy::kCmdPSH, 2, "reply");
+        if (mode <= 2) Frame(proxy::kCmdFIN, 2);
+        if (mode == 3) Frame(proxy::kCmdSYNACK, 2, "rejected");
+        if (mode == 4 || mode == 5) Frame(proxy::kCmdAlert, 0, "closed");
         if (mode == 8) {
-            Frame(proxy::anytls::kCmdSYNACK, 2, "rejected");
+            Frame(proxy::kCmdSYNACK, 2, "rejected");
             input.resize(input.size() - 5);
             read_eof = true;
         }
@@ -192,8 +192,8 @@ struct Wire {
             const uint32_t sid = (uint32_t(header[1]) << 24) | (uint32_t(header[2]) << 16) |
                 (uint32_t(header[3]) << 8) | header[4];
             parsed_outgoing += 7 + length;
-            if (command == proxy::anytls::kCmdFIN && sid == 2) ++open_order->fin_replies;
-            if (command != proxy::anytls::kCmdPSH || sid >= target_seen.size()) continue;
+            if (command == proxy::kCmdFIN && sid == 2) ++open_order->fin_replies;
+            if (command != proxy::kCmdPSH || sid >= target_seen.size()) continue;
             if (target_seen[sid]) {
                 if (sid == 2 && open_order->delivered) ++open_order->payload_after_close;
                 continue;
@@ -204,12 +204,12 @@ struct Wire {
                 if (open_order->before_write_completion) DeliverOpenResult();
             } else {
                 if (sid == 1) {
-                    Frame(proxy::anytls::kCmdServerSettings, 0, "v=2");
-                    Frame(proxy::anytls::kCmdUpdatePaddingScheme, 0, "stop=1\n");
+                    Frame(proxy::kCmdServerSettings, 0, "v=2");
+                    Frame(proxy::kCmdUpdatePaddingScheme, 0, "stop=1\n");
                 }
-                Frame(proxy::anytls::kCmdSYNACK, sid);
-                Frame(proxy::anytls::kCmdPSH, sid, "reply");
-                Frame(proxy::anytls::kCmdFIN, sid);
+                Frame(proxy::kCmdSYNACK, sid);
+                Frame(proxy::kCmdPSH, sid, "reply");
+                Frame(proxy::kCmdFIN, sid);
                 wake.cancel();
             }
         }
@@ -228,33 +228,33 @@ struct Wire {
         input.insert(input.end(), payload.begin(), payload.end());
     }
     void Fault() {
-        Frame(proxy::anytls::kCmdUpdatePaddingScheme, 0, std::string(1024, 'x'));
+        Frame(proxy::kCmdUpdatePaddingScheme, 0, std::string(1024, 'x'));
         fail_on_header = true;
         wake.cancel();
     }
     void Reply() {
         if (queue) {
-            Frame(proxy::anytls::kCmdServerSettings, 0, "v=2");
-            Frame(proxy::anytls::kCmdSYNACK, 1);
+            Frame(proxy::kCmdServerSettings, 0, "v=2");
+            Frame(proxy::kCmdSYNACK, 1);
             size_t payload_offset = 0;
             for (size_t bytes : queue->fragments) {
-                Frame(proxy::anytls::kCmdPSH, 1, std::string_view(
+                Frame(proxy::kCmdPSH, 1, std::string_view(
                     reinterpret_cast<const char*>(queue->wire_payload.data() + payload_offset), bytes));
                 payload_offset += bytes;
-                if (queue->mode >= 13 && payload_offset == 3 * 65535) Frame(proxy::anytls::kCmdHeartRequest, 0);
+                if (queue->mode >= 13 && payload_offset == 3 * 65535) Frame(proxy::kCmdHeartRequest, 0);
             }
-            if (queue->mode != 6 && queue->mode != 9) Frame(proxy::anytls::kCmdFIN, 1);
-            if (queue->mode == 12) Frame(proxy::anytls::kCmdAlert, 0);
+            if (queue->mode != 6 && queue->mode != 9) Frame(proxy::kCmdFIN, 1);
+            if (queue->mode == 12) Frame(proxy::kCmdAlert, 0);
         } else if (fail_settings) {
-            Frame(proxy::anytls::kCmdServerSettings, 0, std::string(1024, 'x'));
+            Frame(proxy::kCmdServerSettings, 0, std::string(1024, 'x'));
             fail_on_header = true;
         } else {
-            Frame(proxy::anytls::kCmdServerSettings, 0, "v=2");
-            if (io_fault_mode >= 3) Frame(proxy::anytls::kCmdUpdatePaddingScheme, 0, "stop=2\n1=64-65\n");
-            Frame(proxy::anytls::kCmdSYNACK, 1);
+            Frame(proxy::kCmdServerSettings, 0, "v=2");
+            if (io_fault_mode >= 3) Frame(proxy::kCmdUpdatePaddingScheme, 0, "stop=2\n1=64-65\n");
+            Frame(proxy::kCmdSYNACK, 1);
             if (io_fault_mode < 2) {
-                Frame(proxy::anytls::kCmdPSH, 1, "reply");
-                Frame(proxy::anytls::kCmdFIN, 1);
+                Frame(proxy::kCmdPSH, 1, "reply");
+                Frame(proxy::kCmdFIN, 1);
             }
         }
         wake.cancel();
@@ -327,8 +327,8 @@ public:
                 if (wire_->padding_index == 1) {
                     // Authentication bytes already belong to A. Publish B on
                     // the older live session before this write completes.
-                    dialed[0]->Frame(proxy::anytls::kCmdUpdatePaddingScheme, 0, kPaddingB);
-                    dialed[0]->Frame(proxy::anytls::kCmdHeartRequest, 0);
+                    dialed[0]->Frame(proxy::kCmdUpdatePaddingScheme, 0, kPaddingB);
+                    dialed[0]->Frame(proxy::kCmdHeartRequest, 0);
                     dialed[0]->wake.cancel();
                     size_t turns = 0;
                     while (dialed[0]->heart_responses == 0 && !dialed[0]->closed) {
@@ -354,10 +354,10 @@ public:
             }
             co_return data.size();
         }
-        if (data.size() == 7 && bytes[0] == proxy::anytls::kCmdHeartResponse) ++wire_->heart_responses;
+        if (data.size() == 7 && bytes[0] == proxy::kCmdHeartResponse) ++wire_->heart_responses;
         if ((wire_->io_fault_mode == 2 && wire_->writes == 2) ||
             (wire_->io_fault_mode >= 3 && data.size() == 7 &&
-             bytes[0] == (wire_->io_fault_mode == 5 ? proxy::anytls::kCmdFIN : proxy::anytls::kCmdPSH))) {
+             bytes[0] == (wire_->io_fault_mode == 5 ? proxy::kCmdFIN : proxy::kCmdPSH))) {
             wire_->partial_write += 3;
             co_await net::post(net::use_awaitable);
             wire_->RaiseIoFault();
@@ -385,7 +385,7 @@ public:
         }
         co_return data.size();
     }
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override { co_return buf::MultiBuffer{}; }
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override { co_return common::MultiBuffer{}; }
     void ShutdownWrite() override {}
     void Cancel() noexcept override { NotifyCancellation(); wire_->wake.cancel(); }
     void Close() override { wire_->closed = true; NotifyClosed(); wire_->wake.cancel(); }
@@ -401,7 +401,7 @@ public:
     size_t received = 0;
     int active_reads = 0;
     bool eof = false;
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         struct PendingRead {
             int& count;
             explicit PendingRead(int& count) : count(count) { ++count; }
@@ -412,13 +412,13 @@ public:
             pending.expires_at(net::steady_timer::time_point::max());
             co_await pending.async_wait(net::use_awaitable);
         }
-        co_return buf::MultiBuffer{};
+        co_return common::MultiBuffer{};
     }
     transport::CancellationSource& Cancellation() noexcept override { return source; }
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
         co_return co_await WriteBuffersAsMultiBuffer(buffers);
     }
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer bytes) override {
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer bytes) override {
         if (queue_scenario && queue_scenario->mode >= 13 && !queue_scenario->consumer_started) {
             auto& queue = *queue_scenario;
             queue.consumer_started = true;
@@ -445,9 +445,9 @@ public:
             }
             if (queue_scenario->mode == 9 && queue_scenario->received.size() == 65535) {
                 auto& wire = *dialed[0];
-                wire.Frame(proxy::anytls::kCmdPSH, 1, std::string_view(
+                wire.Frame(proxy::kCmdPSH, 1, std::string_view(
                     reinterpret_cast<const char*>(queue_scenario->expected.data() + 65535), 65535));
-                wire.Frame(proxy::anytls::kCmdFIN, 1);
+                wire.Frame(proxy::kCmdFIN, 1);
                 wire.wake.cancel();
             }
         }
@@ -459,8 +459,8 @@ public:
 // Only the external dial boundary is replaced. The production target builder,
 // Handler, codec, session pool, logical endpoint and relay execute unchanged.
 
-net::awaitable<transport::DialResult> transport::internet::DialOutboundTransport(net::io_context& io, session::Context&,
-                                                const transport::internet::OutboundTransportTarget&) {
+net::awaitable<transport::DialResult> transport::DialOutboundTransport(net::io_context& io, common::Context&,
+                                                const transport::OutboundTransportTarget&) {
     auto wire = std::make_shared<Wire>(io);
     wire->fail_settings = fail_first_session && dialed.empty();
     wire->respond_on_auth = respond_on_auth;
@@ -488,12 +488,12 @@ private:
 class AnyTlsLifecycleTest : public testing::Test {
 protected:
     void SetUp() override {
-        peak_ = memory::detail::test_buffers_peak;
+        peak_ = common::test_buffers_peak;
         ResetHooks();
     }
     void TearDown() override {
         ResetHooks();
-        memory::detail::test_buffers_peak = peak_;
+        common::test_buffers_peak = peak_;
     }
 private:
     static void ResetHooks() {
@@ -525,13 +525,13 @@ bool JoinResidentTasks(net::io_context& io, common::ResidentTaskGroup& tasks) {
 // The Handler's production dialer over the default raw TCP sender settings;
 // only DialOutboundTransport above is replaced.
 struct TestDialer {
-    TestDialer(net::io_context& io, app::dns::DNS& dns) : dialer(io, dns, sender, 1s) {}
-    transport::internet::OutboundSenderSettings sender;
-    transport::internet::OutboundDialer dialer;
+    TestDialer(net::io_context& io, app::DNS& dns) : dialer(io, dns, sender, 1s) {}
+    transport::OutboundSenderSettings sender;
+    transport::OutboundDialer dialer;
 };
 
-transport::internet::OutboundServer LoopbackServer() {
-    return transport::internet::OutboundServer{
+transport::OutboundServer LoopbackServer() {
+    return transport::OutboundServer{
         .address = "127.0.0.1",
         .literal_address = net::ip::address_v4::loopback(),
         .port = 443,
@@ -540,10 +540,10 @@ transport::internet::OutboundServer LoopbackServer() {
 
 void RunClientPadding() {
     net::io_context io;
-    app::dns::Config dns_config;
+    app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
-    app::dns::DNSWorker dns_worker(io, dns_config, 8);
-    app::dns::DNS dns(dns_worker);
+    app::DNSWorker dns_worker(io, dns_config, 8);
+    app::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
     common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
@@ -552,7 +552,7 @@ void RunClientPadding() {
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
     auto make_handler = [&] {
-        return std::make_unique<proxy::anytls::outbound::Handler>(
+        return std::make_unique<proxy::AnyTlsOutboundHandler>(
             "same-client-tag", io,
             std::make_shared<const infra::AnyTlsSettings>(settings),
             tasks.Tasks());
@@ -563,12 +563,12 @@ void RunClientPadding() {
     io_fault_mode = io_fault_kind = 0;
     client_padding_probe = true;
     std::array<Client, 4> clients;
-    std::array<session::Context, 4> contexts;
+    std::array<common::Context, 4> contexts;
     std::array<net::cancellation_signal, 4> cancellations;
     std::array<bool, 4> done{};
     std::array<bool, 4> failed{};
     std::array<common::ErrorCode, 4> errors{};
-    auto request = [&](proxy::anytls::outbound::Handler& active, size_t index) -> net::awaitable<proxy::OutboundProcessResult> {
+    auto request = [&](proxy::AnyTlsOutboundHandler& active, size_t index) -> net::awaitable<proxy::OutboundProcessResult> {
         auto& ctx = contexts[index];
         ctx.outbound.target = common::TargetAddress("192.0.2.1", 443);
         app::StatsShard stats;
@@ -580,7 +580,7 @@ void RunClientPadding() {
             {&clients[index], &clients[index], nullptr}, outbound.dialer, timeouts,
             stats, config, {});
     };
-    auto start = [&](proxy::anytls::outbound::Handler& active, size_t index) {
+    auto start = [&](proxy::AnyTlsOutboundHandler& active, size_t index) {
         net::co_spawn(io, request(active, index), net::bind_cancellation_slot(cancellations[index].slot(),
             [&, index](std::exception_ptr exception, proxy::OutboundProcessResult result) {
                 failed[index] = bool(exception);
@@ -590,7 +590,7 @@ void RunClientPadding() {
         io.restart();
         io.poll();
     };
-    std::unique_ptr<proxy::anytls::outbound::Handler> replacement;
+    std::unique_ptr<proxy::AnyTlsOutboundHandler> replacement;
     CleanupGuard cleanup([&] {
         DisarmAllocationFailure();
         for (auto& cancellation : cancellations) cancellation.emit(net::cancellation_type::all);
@@ -620,7 +620,7 @@ void RunClientPadding() {
             EXPECT_EQ(dialed[1]->auth_padding, 45);
         }
         EXPECT_EQ(dialed[1]->padding_lengths, (std::vector<size_t>{160}));
-        dialed[1]->Frame(proxy::anytls::kCmdAlert, 0, "fresh session required");
+        dialed[1]->Frame(proxy::kCmdAlert, 0, "fresh session required");
         dialed[1]->wake.cancel();
         io.restart();
         io.run_for(40ms);
@@ -668,10 +668,10 @@ void RunClientPadding() {
 
 void RunOpenOrder(int mode, bool before) {
     net::io_context io;
-    app::dns::Config dns_config;
+    app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
-    app::dns::DNSWorker dns_worker(io, dns_config, 8);
-    app::dns::DNS dns(dns_worker);
+    app::DNSWorker dns_worker(io, dns_config, 8);
+    app::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
     common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
@@ -682,10 +682,10 @@ void RunOpenOrder(int mode, bool before) {
     OpenOrderScenario scenario{.mode = mode, .before_write_completion = before};
     open_order_scenario = &scenario;
     dialed.clear();
-    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("open-order", io,
+    auto handler = std::make_unique<proxy::AnyTlsOutboundHandler>("open-order", io,
         std::make_shared<const infra::AnyTlsSettings>(settings),
         tasks.Tasks());
-    auto request = [&](Client& client, session::Context& ctx) -> net::awaitable<proxy::OutboundProcessResult> {
+    auto request = [&](Client& client, common::Context& ctx) -> net::awaitable<proxy::OutboundProcessResult> {
         ctx.outbound.target = common::TargetAddress("192.0.2.1", 443);
         ctx.content.network = common::Network::TCP;
         app::StatsShard stats;
@@ -697,7 +697,7 @@ void RunOpenOrder(int mode, bool before) {
             {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {});
     };
     Client warm, tested, recovery;
-    session::Context warm_ctx, tested_ctx, recovery_ctx;
+    common::Context warm_ctx, tested_ctx, recovery_ctx;
     bool warm_done = false, done = false, recovery_done = false;
     common::ErrorCode observed = common::ErrorCode::OK;
     std::exception_ptr failure;
@@ -821,10 +821,10 @@ void RunQueue(int mode, unsigned seed = 1) {
             payload_offset += length;
         }
     } else queue.wire_payload.assign(queue.expected.begin(), queue.expected.begin() + bytes);
-    app::dns::Config dns_config;
+    app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
-    app::dns::DNSWorker dns_worker(io, dns_config, 8);
-    app::dns::DNS dns(dns_worker);
+    app::DNSWorker dns_worker(io, dns_config, 8);
+    app::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
     common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
@@ -832,25 +832,25 @@ void RunQueue(int mode, unsigned seed = 1) {
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
-    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("queue", io,
+    auto handler = std::make_unique<proxy::AnyTlsOutboundHandler>("queue", io,
         std::make_shared<const infra::AnyTlsSettings>(settings),
         tasks.Tasks());
     queue_scenario = &queue;
     dialed.clear();
     fail_first_session = respond_on_auth = false;
     io_fault_mode = io_fault_kind = 0;
-    memory::detail::test_buffers_peak = BufferCount();
+    common::test_buffers_peak = BufferCount();
     Client client;
     auto control_wire = std::make_shared<Wire>(io);
     Stream control(control_wire);
     const bool use_control = mode == 0 || mode == 10 || mode == 11;
-    struct RequestTimeout final : transport::internet::TimeoutEvent {
+    struct RequestTimeout final : transport::TimeoutEvent {
         explicit RequestTimeout(Client& client) : client(client) {}
         void OnTimeout() override { client.source.Stop(common::ErrorCode::RELAY_TIMEOUT); }
         Client& client;
     } request_timeout(client);
-    if (mode == 15) (void)transport::internet::TimeoutScheduler::ForIoContext(io).ScheduleAfter(1s, request_timeout);
-    session::Context ctx;
+    if (mode == 15) (void)transport::TimeoutScheduler::ForIoContext(io).ScheduleAfter(1s, request_timeout);
+    common::Context ctx;
     ctx.outbound.target = common::TargetAddress("192.0.2.1", 443);
     ctx.content.network = mode == 10 || mode == 11 ? common::Network::UDP : common::Network::TCP;
     app::StatsShard stats;
@@ -961,10 +961,10 @@ void RunQueue(int mode, unsigned seed = 1) {
 
 void RunIoFault(int mode, int kind) {
     net::io_context io;
-    app::dns::Config dns_config;
+    app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
-    app::dns::DNSWorker dns_worker(io, dns_config, 8);
-    app::dns::DNS dns(dns_worker);
+    app::DNSWorker dns_worker(io, dns_config, 8);
+    app::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
     common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
@@ -972,7 +972,7 @@ void RunIoFault(int mode, int kind) {
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
-    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("io-fault", io,
+    auto handler = std::make_unique<proxy::AnyTlsOutboundHandler>("io-fault", io,
         std::make_shared<const infra::AnyTlsSettings>(settings),
         tasks.Tasks());
     dialed.clear();
@@ -982,7 +982,7 @@ void RunIoFault(int mode, int kind) {
     io_fault_kind = kind;
     auto control_wire = std::make_shared<Wire>(io);
     Stream control(control_wire);
-    auto request = [&](Client& client, session::Context& ctx, bool first) -> net::awaitable<proxy::OutboundProcessResult> {
+    auto request = [&](Client& client, common::Context& ctx, bool first) -> net::awaitable<proxy::OutboundProcessResult> {
         ctx.outbound.target = common::TargetAddress("192.0.2.1", 443);
         ctx.content.network = first && mode == 4 ? common::Network::UDP : common::Network::TCP;
         app::StatsShard stats;
@@ -990,9 +990,9 @@ void RunIoFault(int mode, int kind) {
         app::RelayConfig config;
         config.idle_timeout = config.write_timeout = 10s;
         config.uplink_only = config.downlink_only = 5s;
-        buf::MultiBuffer payload;
+        common::MultiBuffer payload;
         if (first && (mode == 3 || mode == 4)) {
-            buf::BufferGuard block{buf::Buffer::New()};
+            common::BufferGuard block{common::Buffer::New()};
             if (!block) throw std::bad_alloc();
             std::memcpy(block->Tail().data(), "abc", 3);
             block->Produce(3);
@@ -1001,7 +1001,7 @@ void RunIoFault(int mode, int kind) {
         }
         co_return co_await handler->Process(ctx,
             {&client, &client, first && mode == 4 ? &control : nullptr}, outbound.dialer,
-            timeouts, stats, config, buf::MultiBufferBatch(std::move(payload)));
+            timeouts, stats, config, common::MultiBufferBatch(std::move(payload)));
     };
     // Relay payload and FIN failures retain the write-phase category. An open
     // exception escapes Process unchanged; unknown physical reads are INTERNAL.
@@ -1009,7 +1009,7 @@ void RunIoFault(int mode, int kind) {
         mode >= 3 ? common::ErrorCode::RELAY_WRITE_FAILED : common::ErrorCode::INTERNAL;
     Client first, second;
     first.eof = mode == 5;
-    session::Context first_ctx, second_ctx;
+    common::Context first_ctx, second_ctx;
     bool first_done = false, second_done = false;
     bool request_joined = false;
     common::ErrorCode observed = common::ErrorCode::OK;
@@ -1083,10 +1083,10 @@ void RunIoFault(int mode, int kind) {
 
 void RunSessionRetirement(int mode) {
     net::io_context io;
-    app::dns::Config dns_config;
+    app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
-    app::dns::DNSWorker dns_worker(io, dns_config, 8);
-    app::dns::DNS dns(dns_worker);
+    app::DNSWorker dns_worker(io, dns_config, 8);
+    app::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
     common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
@@ -1094,7 +1094,7 @@ void RunSessionRetirement(int mode) {
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 60s;
     settings.min_idle_sessions = 1;
-    auto handler = std::make_unique<proxy::anytls::outbound::Handler>(
+    auto handler = std::make_unique<proxy::AnyTlsOutboundHandler>(
         "test", io,
         std::make_shared<const infra::AnyTlsSettings>(settings),
         tasks.Tasks());
@@ -1102,7 +1102,7 @@ void RunSessionRetirement(int mode) {
     fail_first_session = mode == 0 || mode == 3;
     respond_on_auth = mode == 3;
     const auto failures_before = AllocationFailures();
-    auto request = [&](Client& client, session::Context& ctx) -> net::awaitable<proxy::OutboundProcessResult> {
+    auto request = [&](Client& client, common::Context& ctx) -> net::awaitable<proxy::OutboundProcessResult> {
         ctx.outbound.target = common::TargetAddress("192.0.2.1", 443);
         ctx.content.network = common::Network::TCP;
         app::StatsShard stats;
@@ -1114,7 +1114,7 @@ void RunSessionRetirement(int mode) {
             {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {});
     };
     Client first, second;
-    session::Context ctx_first, ctx_second;
+    common::Context ctx_first, ctx_second;
     bool first_done = false, second_done = false;
     proxy::OutboundProcessResult first_result, second_result;
     std::exception_ptr failure;
@@ -1217,10 +1217,10 @@ void RunSessionRetirement(int mode) {
 // loops and later admissions fail instead of starting unowned work.
 void RunPoolLifecycle(bool join_before_retirement) {
     net::io_context io;
-    app::dns::Config dns_config;
+    app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
-    app::dns::DNSWorker dns_worker(io, dns_config, 8);
-    app::dns::DNS dns(dns_worker);
+    app::DNSWorker dns_worker(io, dns_config, 8);
+    app::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
     common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
@@ -1228,13 +1228,13 @@ void RunPoolLifecycle(bool join_before_retirement) {
     settings.idle_session_check_interval = 1s;
     settings.idle_session_timeout = 1s;
     settings.min_idle_sessions = 1;
-    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("pool", io,
+    auto handler = std::make_unique<proxy::AnyTlsOutboundHandler>("pool", io,
         std::make_shared<const infra::AnyTlsSettings>(settings),
         tasks.Tasks());
     dialed.clear();
     fail_first_session = respond_on_auth = false;
     io_fault_mode = io_fault_kind = 0;
-    auto request = [&](Client& client, session::Context& ctx) -> net::awaitable<proxy::OutboundProcessResult> {
+    auto request = [&](Client& client, common::Context& ctx) -> net::awaitable<proxy::OutboundProcessResult> {
         ctx.outbound.target = common::TargetAddress("192.0.2.1", 443);
         ctx.content.network = common::Network::TCP;
         app::StatsShard stats;
@@ -1246,7 +1246,7 @@ void RunPoolLifecycle(bool join_before_retirement) {
             {&client, &client, nullptr}, outbound.dialer, timeouts, stats, config, {});
     };
     std::array<Client, 3> clients;
-    std::array<session::Context, 3> contexts;
+    std::array<common::Context, 3> contexts;
     std::array<bool, 3> succeeded{};
     std::array<bool, 3> threw{};
     auto start = [&](size_t index) {
@@ -1330,17 +1330,17 @@ void RunDomainPoolIsolation() {
     net::io_context io;
     auto coordinator = std::make_shared<app::GroupCoordinator>(io, 2);
     coordinator->RegisterWorker(io);
-    app::dns::Config dns_config;
+    app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
-    app::dns::DNSWorker dns_worker(io, dns_config, 8);
-    app::dns::DNS dns(dns_worker);
+    app::DNSWorker dns_worker(io, dns_config, 8);
+    app::DNS dns(dns_worker);
     TestDialer outbound(io, dns);
     auto tasks = std::make_unique<common::ResidentTaskGroup>(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 60s;
     settings.idle_session_timeout = 60s;
-    auto handler = std::make_unique<proxy::anytls::outbound::Handler>("isolation", io,
+    auto handler = std::make_unique<proxy::AnyTlsOutboundHandler>("isolation", io,
         std::make_shared<const infra::AnyTlsSettings>(settings), tasks->Tasks());
     OpenOrderScenario scenario{.mode = 0, .before_write_completion = false};
     open_order_scenario = &scenario;
@@ -1348,7 +1348,7 @@ void RunDomainPoolIsolation() {
     io_fault_mode = io_fault_kind = 0;
     dialed.clear();
     std::array<Client, 4> clients;
-    std::array<session::Context, 4> contexts;
+    std::array<common::Context, 4> contexts;
     std::array<bool, 4> done{};
     auto request = [&](size_t index) -> net::awaitable<proxy::OutboundProcessResult> {
         contexts[index].outbound.target = common::TargetAddress("192.0.2.1", 443);

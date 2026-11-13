@@ -8,7 +8,7 @@
 namespace {
 
 infra::AnyTlsSettings Parse(std::string_view body) {
-    const auto source = json::parse(body, json::KeyComparison::AsciiCaseInsensitive);
+    const auto source = infra::parse(body, infra::KeyComparison::AsciiCaseInsensitive);
     return std::get<infra::AnyTlsSettings>(infra::ParseOutboundSettings("anytls", source.as_object()));
 }
 

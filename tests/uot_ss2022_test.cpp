@@ -16,7 +16,6 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
-#include <memory_resource>
 #include <new>
 #include <span>
 #include <string>
@@ -28,10 +27,10 @@ namespace {
 
 
 
-std::vector<uint8_t> Flatten(const buf::MultiBuffer& mb) {
+std::vector<uint8_t> Flatten(const common::MultiBuffer& mb) {
     std::vector<uint8_t> out;
     out.reserve(mb.byte_size());
-    for (const buf::Buffer* buffer : mb) {
+    for (const common::Buffer* buffer : mb) {
         if (!buffer || buffer->IsEmpty()) {
             continue;
         }
@@ -41,12 +40,12 @@ std::vector<uint8_t> Flatten(const buf::MultiBuffer& mb) {
     return out;
 }
 
-buf::MultiBuffer MakePacket(std::string_view payload, const common::TargetAddress& target) {
-    buf::MultiBuffer packet;
-    if (!buf::AppendSpanToMultiBuffer(
+common::MultiBuffer MakePacket(std::string_view payload, const common::TargetAddress& target) {
+    common::MultiBuffer packet;
+    if (!common::AppendSpanToMultiBuffer(
             std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(payload.data()), payload.size()), packet) ||
-        !buf::SetUdpTarget(packet, target)) {
+        !common::SetUdpTarget(packet, target)) {
         throw std::runtime_error("packet fixture allocation failed");
     }
     return packet;
@@ -54,8 +53,8 @@ buf::MultiBuffer MakePacket(std::string_view payload, const common::TargetAddres
 
 class CaptureWriter final : public transport::MultiBufferWriter {
 public:
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override {
-        for (const buf::Buffer* buffer : mb) {
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
+        for (const common::Buffer* buffer : mb) {
             if (!buffer || buffer->IsEmpty()) {
                 continue;
             }
@@ -85,16 +84,16 @@ public:
                    std::vector<size_t> fragments)
         : bytes_(std::move(bytes)), fragments_(std::move(fragments)) {}
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         if (offset_ >= bytes_.size()) {
-            co_return buf::MultiBuffer{};
+            co_return common::MultiBuffer{};
         }
         const size_t requested = fragment_index_ < fragments_.size()
             ? fragments_[fragment_index_++]
             : bytes_.size() - offset_;
         const size_t size = std::min(requested, bytes_.size() - offset_);
-        buf::MultiBuffer out;
-        if (!buf::AppendSpanToMultiBuffer(
+        common::MultiBuffer out;
+        if (!common::AppendSpanToMultiBuffer(
                 std::span<const uint8_t>(bytes_.data() + offset_, size), out)) {
             throw std::runtime_error("reader fixture allocation failed");
         }
@@ -125,12 +124,12 @@ public:
 
     void Cancel() noexcept { ++cancel_calls; }
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         ++read_calls;
         co_return co_await reader_.ReadMultiBuffer();
     }
 
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer) override {
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer) override {
         co_return;
     }
 
@@ -183,7 +182,7 @@ void Run(Factory&& factory) {
 }
 
 TEST(UotSs2022, V2BoardSs2022Keys) {
-    const auto cipher = proxy::shadowsocks::ParseCipherMethod("2022-blake3-aes-256-gcm");
+    const auto cipher = proxy::ParseCipherMethod("2022-blake3-aes-256-gcm");
     ASSERT_TRUE(cipher.has_value());
 
     constexpr std::string_view uuid = "01234567-89ab-cdef-0123-456789abcdef";
@@ -193,33 +192,33 @@ TEST(UotSs2022, V2BoardSs2022Keys) {
     constexpr std::string_view server_psk =
         "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=";
 
-    const auto uuid_key = proxy::shadowsocks::Build2022UserKeyFromUuid(uuid, *cipher);
+    const auto uuid_key = proxy::Build2022UserKeyFromUuid(uuid, *cipher);
     ASSERT_EQ(uuid_key.size, 32u);
     EXPECT_EQ(std::memcmp(uuid_key.data(), prefix.data(), prefix.size()), 0);
 
-    const auto decoded_user = proxy::shadowsocks::Decode2022Psk(user_psk, cipher->key_size);
+    const auto decoded_user = proxy::Decode2022Psk(user_psk, cipher->key_size);
     ASSERT_EQ(decoded_user.size, uuid_key.size);
     EXPECT_EQ(std::memcmp(decoded_user.data(), uuid_key.data(), uuid_key.size), 0);
 
-    const auto decoded_server = proxy::shadowsocks::Decode2022Psk(server_psk, cipher->key_size);
+    const auto decoded_server = proxy::Decode2022Psk(server_psk, cipher->key_size);
     EXPECT_EQ(decoded_server.size, 32u);
-    EXPECT_TRUE(proxy::shadowsocks::Decode2022Psk(
+    EXPECT_TRUE(proxy::Decode2022Psk(
         "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYw", cipher->key_size).empty());
 }
 
 TEST(UotSs2022, MagicAddressesRequireExactMatches) {
-    EXPECT_TRUE(proxy::uot::VersionFromMagicAddress(
-        common::TargetAddress(proxy::uot::kMagicAddress, 0)) == proxy::uot::Version::V2);
-    EXPECT_TRUE(proxy::uot::VersionFromMagicAddress(
-        common::TargetAddress(proxy::uot::kV1MagicAddress, 0)) ==
-            proxy::uot::Version::V1);
-    EXPECT_TRUE(!proxy::uot::VersionFromMagicAddress(
+    EXPECT_TRUE(proxy::VersionFromMagicAddress(
+        common::TargetAddress(proxy::kMagicAddress, 0)) == proxy::UotVersion::V2);
+    EXPECT_TRUE(proxy::VersionFromMagicAddress(
+        common::TargetAddress(proxy::kV1MagicAddress, 0)) ==
+            proxy::UotVersion::V1);
+    EXPECT_TRUE(!proxy::VersionFromMagicAddress(
         common::TargetAddress("prefix.sp.v2.udp-over-tcp.arpa", 0)));
  }
 
 TEST(UotSs2022, RequestEncodesDestinationAndPort) {
     const common::TargetAddress target("dns.example", 53);
-    const auto request = proxy::uot::EncodeRequest(false, target);
+    const auto request = proxy::EncodeUotRequest(false, target);
     ASSERT_TRUE(request.has_value());
     const auto bytes = request->span();
     ASSERT_EQ(bytes.size(), 16u);
@@ -233,21 +232,21 @@ TEST(UotSs2022, RequestEncodesDestinationAndPort) {
 TEST(UotSs2022, ConnectPacketRoundTrip) {
     const common::TargetAddress target("1.1.1.1", 53);
     CaptureWriter capture;
-    proxy::uot::PacketWriter writer(capture, true, target);
+    proxy::UotPacketWriter writer(capture, true, target);
     ::Run([&]() -> net::awaitable<void> {
         co_await writer.WriteMultiBuffer(MakePacket("alpha", target));
         co_await writer.WriteMultiBuffer(MakePacket("beta-payload", target));
     });
 
     FragmentReader source(capture.bytes, {1, 1, 2, 3, 1, 4, 2});
-    proxy::uot::PacketReader reader(source, true, target);
+    proxy::UotPacketReader reader(source, true, target);
     ::Run([&]() -> net::awaitable<void> {
         auto first = co_await reader.ReadMultiBuffer();
         auto second = co_await reader.ReadMultiBuffer();
         EXPECT_TRUE(Flatten(first) == std::vector<uint8_t>({'a','l','p','h','a'}));
         EXPECT_TRUE(Flatten(second) == std::vector<uint8_t>(
             {'b','e','t','a','-','p','a','y','l','o','a','d'}));
-        const auto datagram = buf::InspectUdpDatagram(first);
+        const auto datagram = common::InspectUdpDatagram(first);
         EXPECT_TRUE(datagram.Valid());
         EXPECT_NE(datagram.target, nullptr);
         if (!datagram.Valid() || !datagram.target) co_return;
@@ -257,10 +256,10 @@ TEST(UotSs2022, ConnectPacketRoundTrip) {
 
 TEST(UotSs2022, LargeConnectPacketRoundTrip) {
     const common::TargetAddress target("1.1.1.1", 53);
-    const std::string large_payload(buf::Buffer::kSize + 257, '\x6d');
+    const std::string large_payload(common::Buffer::kSize + 257, '\x6d');
 
     CaptureWriter capture;
-    proxy::uot::PacketWriter writer(capture, true, target);
+    proxy::UotPacketWriter writer(capture, true, target);
     ::Run([&]() -> net::awaitable<void> {
         co_await writer.WriteMultiBuffer(MakePacket(large_payload, target));
     });
@@ -271,7 +270,7 @@ TEST(UotSs2022, LargeConnectPacketRoundTrip) {
     EXPECT_TRUE(wire_length == large_payload.size());
 
     FragmentReader source(capture.bytes, {1, 2, 4096, 17, 2048, 3, 1024});
-    proxy::uot::PacketReader reader(source, true, target);
+    proxy::UotPacketReader reader(source, true, target);
     ::Run([&]() -> net::awaitable<void> {
         auto decoded = co_await reader.ReadMultiBuffer();
         EXPECT_TRUE(Flatten(decoded) == std::vector<uint8_t>(
@@ -286,7 +285,7 @@ TEST_P(UotPacketMode, EmptyDatagramsPreserveSequenceAndTargets) {
     const common::TargetAddress second("8.8.8.8", 5353);
     const bool connect = GetParam();
         CaptureWriter capture;
-        proxy::uot::PacketWriter writer(capture, connect, first);
+        proxy::UotPacketWriter writer(capture, connect, first);
         const auto& last = connect ? first : second;
         ::Run([&]() -> net::awaitable<void> {
             co_await writer.WriteMultiBuffer({});
@@ -301,13 +300,13 @@ TEST_P(UotPacketMode, EmptyDatagramsPreserveSequenceAndTargets) {
         });
         EXPECT_EQ(capture.bytes.size(), connect ? 10u : 31u);
         FragmentReader source(capture.bytes, {1, 1, 1, 1, 1, 1, 1, 1});
-        proxy::uot::PacketReader reader(source, connect, first);
+        proxy::UotPacketReader reader(source, connect, first);
         ::Run([&]() -> net::awaitable<void> {
             const std::array<size_t, 3> sizes{0, 4, 0};
             for (size_t index = 0; index < sizes.size(); ++index) {
                 const size_t size = sizes[index];
                 auto packet = co_await reader.ReadMultiBuffer();
-                const auto datagram = buf::InspectUdpDatagram(packet);
+                const auto datagram = common::InspectUdpDatagram(packet);
                 EXPECT_TRUE(datagram.Valid());
                 EXPECT_NE(datagram.target, nullptr);
                 if (!datagram.Valid() || !datagram.target) co_return;
@@ -322,21 +321,21 @@ TEST_P(UotPacketMode, EmptyDatagramsPreserveSequenceAndTargets) {
 TEST(UotSs2022, V1FirstEmptyDatagramSurvivesPreparation) {
     const common::TargetAddress target("dns.example", 53);
     CaptureWriter capture;
-    proxy::uot::PacketWriter writer(capture, false, target);
+    proxy::UotPacketWriter writer(capture, false, target);
     ::Run([&]() -> net::awaitable<void> {
         co_await writer.WriteMultiBuffer(MakePacket("", target));
         co_await writer.WriteMultiBuffer(MakePacket("next", target));
     });
     FragmentReader source(capture.bytes, {1, 2, 3, 1});
     ::Run([&]() -> net::awaitable<void> {
-        auto prepared = co_await proxy::uot::ReadUotRequestHeader(
-            proxy::uot::Version::V1, source, {});
+        auto prepared = co_await proxy::ReadUotRequestHeader(
+            proxy::UotVersion::V1, source, {});
         EXPECT_TRUE(prepared.has_value());
         if (!prepared) co_return;
         EXPECT_TRUE(prepared->destination.SameEndpoint(target));
         auto empty = std::move(prepared->initial_decoded);
-        proxy::uot::PacketReader reader(source, std::move(*prepared));
-        const auto datagram = buf::InspectUdpDatagram(empty);
+        proxy::UotPacketReader reader(source, std::move(*prepared));
+        const auto datagram = common::InspectUdpDatagram(empty);
         EXPECT_TRUE(datagram.Valid());
         EXPECT_NE(datagram.target, nullptr);
         if (!datagram.Valid() || !datagram.target) co_return;
@@ -352,7 +351,7 @@ TEST(UotSs2022, FramedOwnedWritePreservesPayloadAcrossSuspension) {
     const common::TargetAddress target("1.1.1.1", 53);
     FramedEndpointDouble underlying;
     underlying.suspend_write = true;
-    proxy::uot::FramedEndpoint endpoint(underlying, true, target);
+    proxy::UotFramedEndpoint endpoint(underlying, true, target);
     auto pending = endpoint.WriteMultiBuffer(MakePacket("framed", target));
     EXPECT_EQ(underlying.write_calls, 0u);
     ::Run([&]() -> net::awaitable<void> { co_await std::move(pending); });
@@ -364,7 +363,7 @@ TEST(UotSs2022, FramedBorrowedWritePreservesPayloadAcrossSuspension) {
     const common::TargetAddress target("1.1.1.1", 53);
     FramedEndpointDouble underlying;
     underlying.suspend_write = true;
-    proxy::uot::FramedEndpoint endpoint(underlying, true, target);
+    proxy::UotFramedEndpoint endpoint(underlying, true, target);
     const std::array<uint8_t, 4> payload{'n', 'e', 'x', 't'};
     const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
     auto pending = endpoint.WriteBuffers(buffers);
@@ -376,7 +375,7 @@ TEST(UotSs2022, FramedBorrowedWritePreservesPayloadAcrossSuspension) {
 
 TEST(UotSs2022, FramedEndpointForwardsCancellation) {
     FramedEndpointDouble underlying;
-    proxy::uot::FramedEndpoint endpoint(underlying, true, common::TargetAddress("1.1.1.1", 53));
+    proxy::UotFramedEndpoint endpoint(underlying, true, common::TargetAddress("1.1.1.1", 53));
     endpoint.Cancel();
     EXPECT_EQ(underlying.cancel_calls, 1u);
 }
@@ -385,7 +384,7 @@ TEST(UotSs2022, FramedReadReassemblesFragmentedFrames) {
     const common::TargetAddress target("1.1.1.1", 53);
     FramedEndpointDouble underlying(
         {0, 6, 'f', 'r', 'a', 'm', 'e', 'd', 0, 4, 'n', 'e', 'x', 't'}, {1, 1, 2, 1, 3});
-    proxy::uot::FramedEndpoint endpoint(underlying, true, target);
+    proxy::UotFramedEndpoint endpoint(underlying, true, target);
     auto pending = endpoint.ReadMultiBuffer();
     EXPECT_EQ(underlying.read_calls, 0u);
     ::Run([&]() -> net::awaitable<void> {
@@ -401,7 +400,7 @@ TEST(UotSs2022, FramedEndpointWriteException) {
     const common::TargetAddress target("1.1.1.1", 53);
     FramedEndpointDouble underlying;
     underlying.throw_on_write = true;
-    proxy::uot::FramedEndpoint endpoint(underlying, true, target);
+    proxy::UotFramedEndpoint endpoint(underlying, true, target);
     EXPECT_THROW(::Run([&]() -> net::awaitable<void> {
         co_await endpoint.WriteMultiBuffer(MakePacket("failure", target));
     }), std::runtime_error);
@@ -411,13 +410,13 @@ TEST(UotSs2022, NonConnectRequestAndPackets) {
     const common::TargetAddress initial("dns.example", 53);
     const common::TargetAddress second("8.8.8.8", 5353);
 
-    const auto request = proxy::uot::EncodeRequest(false, initial);
+    const auto request = proxy::EncodeUotRequest(false, initial);
     ASSERT_TRUE(request.has_value());
 
     CaptureWriter capture;
     capture.bytes.insert(
         capture.bytes.end(), request->span().begin(), request->span().end());
-    proxy::uot::PacketWriter writer(capture, false, initial);
+    proxy::UotPacketWriter writer(capture, false, initial);
     ::Run([&]() -> net::awaitable<void> {
         co_await writer.WriteMultiBuffer(MakePacket("one", initial));
         co_await writer.WriteMultiBuffer(MakePacket("two-two", second));
@@ -425,20 +424,20 @@ TEST(UotSs2022, NonConnectRequestAndPackets) {
 
     FragmentReader source(capture.bytes, {1, 2, 1, 3, 2, 5, 1, 4});
     ::Run([&]() -> net::awaitable<void> {
-        auto decoded_request = co_await proxy::uot::ReadUotRequestHeader(
-            proxy::uot::Version::V2, source, {});
+        auto decoded_request = co_await proxy::ReadUotRequestHeader(
+            proxy::UotVersion::V2, source, {});
         EXPECT_TRUE(decoded_request.has_value());
         if (!decoded_request) co_return;
         EXPECT_FALSE(decoded_request->is_connect);
         EXPECT_TRUE(decoded_request->destination.SameEndpoint(initial));
 
-        proxy::uot::PacketReader reader(source, std::move(*decoded_request));
+        proxy::UotPacketReader reader(source, std::move(*decoded_request));
         auto first = co_await reader.ReadMultiBuffer();
         auto next = co_await reader.ReadMultiBuffer();
         EXPECT_TRUE(Flatten(first) == std::vector<uint8_t>({'o','n','e'}));
         EXPECT_TRUE(Flatten(next) == std::vector<uint8_t>({'t','w','o','-','t','w','o'}));
-        const auto first_datagram = buf::InspectUdpDatagram(first);
-        const auto next_datagram = buf::InspectUdpDatagram(next);
+        const auto first_datagram = common::InspectUdpDatagram(first);
+        const auto next_datagram = common::InspectUdpDatagram(next);
         EXPECT_TRUE(first_datagram.Valid());
         EXPECT_TRUE(next_datagram.Valid());
         EXPECT_NE(first_datagram.target, nullptr);
@@ -535,7 +534,7 @@ TEST_P(UotAddressCodec, IncrementalReadPreservesCallerPrefixAndFollowingByte) {
                 input.insert(input.end(), encoded.begin(), encoded.begin() + size);
                 input.push_back(0xbb);
                 FragmentReader source(input, {1, split ? split : 1, 1});
-                buf::MultiBuffer pending;
+                common::MultiBuffer pending;
                 ::Run([&]() -> net::awaitable<void> {
                     auto decoded = co_await common::ReadAddress(source, pending, format, 1);
                     EXPECT_TRUE(decoded.has_value());
@@ -566,7 +565,7 @@ TEST_P(UotAddressCodec, TruncatedInputFailsAtEof) {
         for (size_t split = 0; split < size; ++split) {
             SCOPED_TRACE(split);
                 FragmentReader truncated(std::vector<uint8_t>(encoded.begin(), encoded.begin() + split), {1, 2});
-                buf::MultiBuffer incomplete;
+                common::MultiBuffer incomplete;
                 ::Run([&]() -> net::awaitable<void> {
                     auto decoded = co_await common::ReadAddress(truncated, incomplete, format);
                     EXPECT_FALSE(decoded.has_value());
@@ -692,12 +691,12 @@ TEST_P(UotPacketMode, CompletePacketIsFollowedByEof) {
     const bool connect = GetParam();
     const common::TargetAddress target("192.0.2.1", 53);
     CaptureWriter capture;
-    proxy::uot::PacketWriter writer(capture, connect, target);
+    proxy::UotPacketWriter writer(capture, connect, target);
     ::Run([&]() -> net::awaitable<void> {
         co_await writer.WriteMultiBuffer(MakePacket("end", target));
     });
     FragmentReader source(capture.bytes, {1, 1, 2});
-    proxy::uot::PacketReader reader(source, connect, target);
+    proxy::UotPacketReader reader(source, connect, target);
     ::Run([&]() -> net::awaitable<void> {
         EXPECT_EQ(Flatten(co_await reader.ReadMultiBuffer()), std::vector<uint8_t>({'e','n','d'}));
         EXPECT_TRUE((co_await reader.ReadMultiBuffer()).empty());
@@ -706,7 +705,7 @@ TEST_P(UotPacketMode, CompletePacketIsFollowedByEof) {
 
 TEST_P(UotPacketMode, EmptyTransportIsEofNotAnEmptyDatagram) {
     FragmentReader source({}, {});
-    proxy::uot::PacketReader reader(source, GetParam(), common::TargetAddress("192.0.2.1", 53));
+    proxy::UotPacketReader reader(source, GetParam(), common::TargetAddress("192.0.2.1", 53));
     ::Run([&]() -> net::awaitable<void> {
         EXPECT_TRUE((co_await reader.ReadMultiBuffer()).empty());
     });
@@ -716,7 +715,7 @@ TEST_P(UotPacketMode, TruncatedFrameFailsWithProtocolDecodeError) {
     const bool connect = GetParam();
     const common::TargetAddress target("192.0.2.1", 53);
     CaptureWriter capture;
-    proxy::uot::PacketWriter writer(capture, connect, target);
+    proxy::UotPacketWriter writer(capture, connect, target);
     ::Run([&]() -> net::awaitable<void> {
         co_await writer.WriteMultiBuffer(MakePacket("end", target));
     });
@@ -724,7 +723,7 @@ TEST_P(UotPacketMode, TruncatedFrameFailsWithProtocolDecodeError) {
         SCOPED_TRACE(length);
         FragmentReader source(std::vector<uint8_t>(capture.bytes.begin(), capture.bytes.begin() + length),
                               {1, 1, 2});
-        proxy::uot::PacketReader reader(source, connect, target);
+        proxy::UotPacketReader reader(source, connect, target);
         EXPECT_THROW({
             try {
                 ::Run([&]() -> net::awaitable<void> { (void)co_await reader.ReadMultiBuffer(); });
@@ -748,16 +747,16 @@ TEST(UotSs2022, NonConnectIpPacketDecodesFromPendingWithUnusedDomainRequestAndRe
     for (const bool prepared_constructor : {false, true}) {
         SCOPED_TRACE(prepared_constructor);
 #ifdef CNODE_TEST_BUFFER_STATS
-        const auto live_before = memory::detail::test_buffers_live;
+        const auto live_before = common::test_buffers_live;
 #endif
         {
-            buf::MultiBuffer pending;
-            ASSERT_TRUE(buf::AppendSpanToMultiBuffer(wire, pending));
+            common::MultiBuffer pending;
+            ASSERT_TRUE(common::AppendSpanToMultiBuffer(wire, pending));
             FragmentReader source({}, {});
-            std::optional<proxy::uot::PacketReader> reader;
+            std::optional<proxy::UotPacketReader> reader;
             common::TargetAddress unused(domain, 53);
             if (prepared_constructor) {
-                proxy::uot::PreparedRequest prepared;
+                proxy::PreparedRequest prepared;
                 prepared.destination = std::move(unused);
                 prepared.pending = std::move(pending);
                 reader.emplace(source, std::move(prepared));
@@ -766,7 +765,7 @@ TEST(UotSs2022, NonConnectIpPacketDecodesFromPendingWithUnusedDomainRequestAndRe
             }
             ASSERT_NO_THROW(::Run([&]() -> net::awaitable<void> {
                 auto packet = co_await reader->ReadMultiBuffer();
-                const auto datagram = buf::InspectUdpDatagram(packet);
+                const auto datagram = common::InspectUdpDatagram(packet);
                 EXPECT_TRUE(datagram.Valid());
                 EXPECT_NE(datagram.target, nullptr);
                 if (!datagram.Valid() || !datagram.target) co_return;
@@ -775,7 +774,7 @@ TEST(UotSs2022, NonConnectIpPacketDecodesFromPendingWithUnusedDomainRequestAndRe
             }));
         }
 #ifdef CNODE_TEST_BUFFER_STATS
-        EXPECT_EQ(memory::detail::test_buffers_live, live_before);
+        EXPECT_EQ(common::test_buffers_live, live_before);
 #endif
     }
 }

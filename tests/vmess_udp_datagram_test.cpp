@@ -2,10 +2,9 @@
 #include <gtest/gtest.h>
 
 #include "proxy/vmess/vmess_crypto.hpp"
-#include "proxy/vmess/encoding/body.hpp"
-#include "transport/internet/tcp_stream.hpp"
-#include "app/proxyman/inbound/user_store.hpp"
-
+#include "proxy/vmess/body.hpp"
+#include "transport/tcp_stream.hpp"
+#include "app/proxyman/user_store.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
@@ -20,17 +19,16 @@
 #include <exception>
 #include <string_view>
 #include <tuple>
-#include <memory_resource>
 #include <vector>
 
 namespace {
 
 
 
-buf::BufferGuard MakeBuffer(size_t size,
+common::BufferGuard MakeBuffer(size_t size,
                         const common::TargetAddress* target,
                         uint8_t value) {
-    buf::BufferGuard buffer{buf::Buffer::New()};
+    common::BufferGuard buffer{common::Buffer::New()};
     if (!buffer) throw std::bad_alloc();
     if (size > buffer->Available()) throw std::length_error("VMess fixture exceeds buffer");
     std::fill_n(buffer->Tail().data(), size, value);
@@ -52,9 +50,9 @@ void ExpectLinkError(Factory&& factory, std::string_view message,
     }
 }
 
-proxy::vmess::VMessRequest MakeRequest(proxy::vmess::Security security, uint8_t options,
-                                proxy::vmess::Command command) {
-    proxy::vmess::VMessRequest request;
+proxy::VMessRequest MakeRequest(proxy::VmessSecurity security, uint8_t options,
+                                proxy::VmessCommand command) {
+    proxy::VMessRequest request;
     request.security = security;
     request.options = options;
     request.command = command;
@@ -70,15 +68,15 @@ proxy::vmess::VMessRequest MakeRequest(proxy::vmess::Security security, uint8_t 
 // later records depend on every earlier length/body nonce and padding mask.
 class RequestEncoder {
 public:
-    explicit RequestEncoder(const proxy::vmess::VMessRequest& request)
+    explicit RequestEncoder(const proxy::VMessRequest& request)
         : cipher_(request.security, request.body_key.data(), request.body_iv.data())
-        , padding_((request.options & proxy::vmess::Option::GLOBAL_PADDING) != 0) {
-        if ((request.options & proxy::vmess::Option::AUTHENTICATED_LENGTH) != 0) {
+        , padding_((request.options & proxy::VmessOption::GLOBAL_PADDING) != 0) {
+        if ((request.options & proxy::VmessOption::AUTHENTICATED_LENGTH) != 0) {
             const std::array<std::string_view, 1> path{"auth_len"};
-            auto key = proxy::vmess::KDF16(request.body_key.data(), request.body_key.size(), path);
+            auto key = proxy::KDF16(request.body_key.data(), request.body_key.size(), path);
             length_cipher_.emplace(request.security, key.data(), request.body_iv.data());
         }
-        if ((request.options & proxy::vmess::Option::CHUNK_MASKING) != 0) {
+        if ((request.options & proxy::VmessOption::CHUNK_MASKING) != 0) {
             mask_.emplace(request.body_iv.data());
         }
     }
@@ -87,11 +85,11 @@ public:
         return length_cipher_ ? length_cipher_->Overhead() + 2 : 2;
     }
 
-    std::pmr::vector<uint8_t> Encode(std::span<const uint8_t> payload) {
+    std::vector<uint8_t> Encode(std::span<const uint8_t> payload) {
         const size_t padding = padding_ && mask_ ? mask_->NextMask() % 64 : 0;
         const size_t body_size = payload.size() + cipher_.Overhead();
         const size_t total_size = body_size + padding;
-        std::pmr::vector<uint8_t> wire(HeaderSize() + total_size, memory::process_resource());
+        std::vector<uint8_t> wire(HeaderSize() + total_size);
         EXPECT_EQ((cipher_.Encrypt(payload.data(), payload.size(), wire.data() + HeaderSize())), (static_cast<ssize_t>(body_size))) << "VMess test request encryption failed";
         if (length_cipher_) {
             const auto plain_size = static_cast<uint16_t>(total_size - length_cipher_->Overhead());
@@ -111,9 +109,9 @@ public:
     }
 
 private:
-    proxy::vmess::VMessCipher cipher_;
-    std::optional<proxy::vmess::VMessCipher> length_cipher_;
-    std::optional<proxy::vmess::ShakeMask> mask_;
+    proxy::VMessCipher cipher_;
+    std::optional<proxy::VMessCipher> length_cipher_;
+    std::optional<proxy::ShakeMask> mask_;
     bool padding_;
 };
 
@@ -122,22 +120,22 @@ private:
 // uses the request body key and the request body IV.
 class ResponseDecoder {
 public:
-    explicit ResponseDecoder(const proxy::vmess::VMessRequest& request)
+    explicit ResponseDecoder(const proxy::VMessRequest& request)
         : key_(Sha256(request.body_key))
         , iv_(Sha256(request.body_iv))
         , cipher_(request.security, key_.data(), iv_.data())
-        , padding_((request.options & proxy::vmess::Option::GLOBAL_PADDING) != 0) {
-        if ((request.options & proxy::vmess::Option::AUTHENTICATED_LENGTH) != 0) {
+        , padding_((request.options & proxy::VmessOption::GLOBAL_PADDING) != 0) {
+        if ((request.options & proxy::VmessOption::AUTHENTICATED_LENGTH) != 0) {
             const std::array<std::string_view, 1> path{"auth_len"};
-            length_key_ = proxy::vmess::KDF16(request.body_key.data(), request.body_key.size(), path);
+            length_key_ = proxy::KDF16(request.body_key.data(), request.body_key.size(), path);
             length_cipher_.emplace(request.security, length_key_.data(), request.body_iv.data());
         }
-        if ((request.options & proxy::vmess::Option::CHUNK_MASKING) != 0) {
+        if ((request.options & proxy::VmessOption::CHUNK_MASKING) != 0) {
             mask_.emplace(iv_.data());
         }
     }
 
-    std::pmr::vector<uint8_t> Decode(std::span<const uint8_t> wire, size_t& offset) {
+    std::vector<uint8_t> Decode(std::span<const uint8_t> wire, size_t& offset) {
         const size_t padding = padding_ && mask_ ? mask_->NextMask() % 64 : 0;
         const size_t header_size = length_cipher_ ? length_cipher_->Overhead() + 2 : 2;
         if (offset > wire.size() || wire.size() - offset < header_size)
@@ -158,7 +156,7 @@ public:
         if (total_size < padding + cipher_.Overhead() || wire.size() - offset < total_size)
             throw std::runtime_error("VMess response chunk body truncated");
         const size_t sealed_size = total_size - padding;
-        std::pmr::vector<uint8_t> payload(sealed_size - cipher_.Overhead(), memory::process_resource());
+        std::vector<uint8_t> payload(sealed_size - cipher_.Overhead());
         EXPECT_EQ((cipher_.Decrypt(wire.data() + offset, sealed_size, payload.data())), (static_cast<ssize_t>(payload.size()))) << "VMess response chunk payload failed authentication";
         offset += total_size;
         return payload;
@@ -174,9 +172,9 @@ private:
     std::array<uint8_t, SHA256_DIGEST_LENGTH> key_;
     std::array<uint8_t, SHA256_DIGEST_LENGTH> iv_;
     std::array<uint8_t, 16> length_key_{};
-    proxy::vmess::VMessCipher cipher_;
-    std::optional<proxy::vmess::VMessCipher> length_cipher_;
-    std::optional<proxy::vmess::ShakeMask> mask_;
+    proxy::VMessCipher cipher_;
+    std::optional<proxy::VMessCipher> length_cipher_;
+    std::optional<proxy::ShakeMask> mask_;
     bool padding_;
 };
 
@@ -185,7 +183,7 @@ struct Connection {
     net::io_context io;
     tcp::acceptor acceptor{io, {net::ip::address_v4::loopback(), 0}};
     tcp::socket peer{io};
-    transport::internet::TcpStream stream{Connect()};
+    transport::TcpStream stream{Connect()};
 
     tcp::socket Connect() {
         tcp::socket socket(io);
@@ -195,21 +193,21 @@ struct Connection {
     }
 };
 
-net::awaitable<buf::MultiBuffer> ReadBody(transport::MultiBufferReader& reader,
+net::awaitable<common::MultiBuffer> ReadBody(transport::MultiBufferReader& reader,
                                          bool automatic_cancel = true) {
     co_await net::this_coro::throw_if_cancelled(automatic_cancel);
     co_return co_await reader.ReadMultiBuffer();
 }
 
 void CancelBlockedRead(Connection& connection,
-                       net::awaitable<buf::MultiBuffer> operation) {
+                       net::awaitable<common::MultiBuffer> operation) {
     net::cancellation_signal cancellation;
     bool completed = false;
     std::exception_ptr failure;
     connection.io.restart();
     net::co_spawn(connection.io, std::move(operation),
         net::bind_cancellation_slot(cancellation.slot(),
-            [&](std::exception_ptr error, buf::MultiBuffer result) {
+            [&](std::exception_ptr error, common::MultiBuffer result) {
                 EXPECT_TRUE((result.empty())) << "cancelled VMess read returned partial plaintext";
                 failure = error;
                 completed = true;
@@ -243,14 +241,14 @@ void CancelBlockedRead(Connection& connection, transport::MultiBufferReader& rea
     CancelBlockedRead(connection, ReadBody(reader, automatic_cancel));
 }
 
-buf::MultiBuffer ReadReady(Connection& connection,
-                           net::awaitable<buf::MultiBuffer> operation) {
+common::MultiBuffer ReadReady(Connection& connection,
+                           net::awaitable<common::MultiBuffer> operation) {
     bool completed = false;
     std::exception_ptr failure;
-    buf::MultiBuffer result;
+    common::MultiBuffer result;
     connection.io.restart();
     net::co_spawn(connection.io, std::move(operation),
-        [&](std::exception_ptr error, buf::MultiBuffer value) {
+        [&](std::exception_ptr error, common::MultiBuffer value) {
             failure = error;
             result = std::move(value);
             completed = true;
@@ -269,12 +267,12 @@ buf::MultiBuffer ReadReady(Connection& connection,
     return result;
 }
 
-buf::MultiBuffer ReadReady(Connection& connection, transport::MultiBufferReader& reader) {
+common::MultiBuffer ReadReady(Connection& connection, transport::MultiBufferReader& reader) {
     return ReadReady(connection, reader.ReadMultiBuffer());
 }
 
 void CheckReadFailed(Connection& connection,
-                      net::awaitable<buf::MultiBuffer> operation,
+                      net::awaitable<common::MultiBuffer> operation,
                       std::string_view message) {
     bool reset = false;
     try {
@@ -285,26 +283,26 @@ void CheckReadFailed(Connection& connection,
     EXPECT_TRUE((reset)) << message;
 }
 
-void CheckPayload(const buf::MultiBuffer& result, std::span<const uint8_t> expected,
-                  const proxy::vmess::VMessRequest& request) {
-    const buf::ContiguousBufferView actual(result);
+void CheckPayload(const common::MultiBuffer& result, std::span<const uint8_t> expected,
+                  const proxy::VMessRequest& request) {
+    const common::ContiguousBufferView actual(result);
     EXPECT_TRUE((actual.Bytes().size() == expected.size() &&
               std::equal(actual.Bytes().begin(), actual.Bytes().end(), expected.begin()))) << "resumed VMess record lost, duplicated, or corrupted payload bytes";
-    if (request.command == proxy::vmess::Command::UDP) {
-        proxy::vmess::ValidateFixedUdpDatagram(result, request.target);
+    if (request.command == proxy::VmessCommand::UDP) {
+        proxy::ValidateFixedUdpDatagram(result, request.target);
     }
 }
 
-std::pmr::vector<uint8_t> MakePayload(size_t size, uint8_t seed) {
-    std::pmr::vector<uint8_t> payload(size, memory::process_resource());
+std::vector<uint8_t> MakePayload(size_t size, uint8_t seed) {
+    std::vector<uint8_t> payload(size);
     for (size_t i = 0; i < size; ++i) {
         payload[i] = static_cast<uint8_t>(seed + i * 17);
     }
     return payload;
 }
 
-void TestCancellationResume(proxy::vmess::Security security, uint8_t options,
-                            proxy::vmess::Command command, size_t payload_size) {
+void TestCancellationResume(proxy::VmessSecurity security, uint8_t options,
+                            proxy::VmessCommand command, size_t payload_size) {
     auto request = MakeRequest(security, options, command);
     RequestEncoder encoder(request);
     const auto payload = MakePayload(payload_size, 0x23);
@@ -312,10 +310,10 @@ void TestCancellationResume(proxy::vmess::Security security, uint8_t options,
     const auto wire = encoder.Encode(payload);
     const auto later_wire = encoder.Encode(later_payload);
     const auto eof_wire = encoder.Encode({});
-    const size_t request_prefix = payload_size > buf::Buffer::kSize ? 1 : 0;
+    const size_t request_prefix = payload_size > common::Buffer::kSize ? 1 : 0;
     Connection connection;
     connection.stream.PrependReadData(std::span<const uint8_t>(wire).first(request_prefix));
-    proxy::vmess::encoding::ServerSession session("cancellation-test");
+    proxy::ServerSession session("cancellation-test");
     session.SetRequest(request);
     auto reader = session.DecodeRequestBody(connection.stream);
 
@@ -344,8 +342,8 @@ void TestCancellationResume(proxy::vmess::Security security, uint8_t options,
     EXPECT_TRUE((ReadReady(connection, *reader).empty())) << "VMess EOF marker was not permanent";
 }
 
-void TestBatchCancellation(proxy::vmess::Security security, uint8_t options) {
-    auto request = MakeRequest(security, options, proxy::vmess::Command::TCP);
+void TestBatchCancellation(proxy::VmessSecurity security, uint8_t options) {
+    auto request = MakeRequest(security, options, proxy::VmessCommand::TCP);
     RequestEncoder encoder(request);
     auto expected = MakePayload(113, 0x12);
     const auto second_payload = MakePayload(157, 0x83);
@@ -356,10 +354,10 @@ void TestBatchCancellation(proxy::vmess::Security security, uint8_t options) {
     expected.insert(expected.end(), second_payload.begin(), second_payload.end());
 
     Connection connection;
-    proxy::vmess::encoding::ServerSession session("batch-cancellation-test");
+    proxy::ServerSession session("batch-cancellation-test");
     session.SetRequest(request);
     auto reader = session.DecodeRequestBody(connection.stream);
-    std::pmr::vector<uint8_t> prefix(first_wire.begin(), first_wire.end(), memory::process_resource());
+    std::vector<uint8_t> prefix(first_wire.begin(), first_wire.end());
     const size_t cut = encoder.HeaderSize() + 5;
     prefix.insert(prefix.end(), second_wire.begin(), second_wire.begin() + cut);
     connection.stream.PrependReadData(prefix);
@@ -370,14 +368,14 @@ void TestBatchCancellation(proxy::vmess::Security security, uint8_t options) {
     CheckPayload(ReadReady(connection, *reader), third_payload, request);
 }
 
-void TestTransportEOF(proxy::vmess::Security security, uint8_t options, size_t prefix_size) {
-    auto request = MakeRequest(security, options, proxy::vmess::Command::UDP);
+void TestTransportEOF(proxy::VmessSecurity security, uint8_t options, size_t prefix_size) {
+    auto request = MakeRequest(security, options, proxy::VmessCommand::UDP);
     RequestEncoder encoder(request);
     const auto payload = MakePayload(113, 0x57);
     const auto wire = encoder.Encode(payload);
     Connection connection;
     connection.stream.PrependReadData(std::span<const uint8_t>(wire).first(prefix_size));
-    proxy::vmess::encoding::ServerSession session("transport-eof-test");
+    proxy::ServerSession session("transport-eof-test");
     session.SetRequest(request);
     auto reader = session.DecodeRequestBody(connection.stream);
     CancelBlockedRead(connection, *reader, false);
@@ -394,9 +392,9 @@ void TestTransportEOF(proxy::vmess::Security security, uint8_t options, size_t p
     }
 }
 
-void TestAuthenticationFailure(proxy::vmess::Security security, uint8_t options,
+void TestAuthenticationFailure(proxy::VmessSecurity security, uint8_t options,
                                bool corrupt_length) {
-    auto request = MakeRequest(security, options, proxy::vmess::Command::UDP);
+    auto request = MakeRequest(security, options, proxy::VmessCommand::UDP);
     RequestEncoder encoder(request);
     const auto payload = MakePayload(113, 0x47);
     auto wire = encoder.Encode(payload);
@@ -405,7 +403,7 @@ void TestAuthenticationFailure(proxy::vmess::Security security, uint8_t options,
         : encoder.HeaderSize() + payload.size();
     wire[corrupt_offset] ^= 0x80;
     Connection connection;
-    proxy::vmess::encoding::ServerSession session("authentication-failure-test");
+    proxy::ServerSession session("authentication-failure-test");
     session.SetRequest(request);
     auto reader = session.DecodeRequestBody(connection.stream);
     connection.stream.PrependReadData(std::span<const uint8_t>(wire).first(1));
@@ -418,7 +416,7 @@ void TestAuthenticationFailure(proxy::vmess::Security security, uint8_t options,
     // Corrupted EOF chunk authentication tag must be rejected as connection_reset.
     {
         Connection eof_connection;
-        proxy::vmess::encoding::ServerSession eof_session("eof-auth-failure-test");
+        proxy::ServerSession eof_session("eof-auth-failure-test");
         eof_session.SetRequest(request);
         auto eof_reader = eof_session.DecodeRequestBody(eof_connection.stream);
         RequestEncoder eof_encoder(request);
@@ -432,14 +430,14 @@ void TestAuthenticationFailure(proxy::vmess::Security security, uint8_t options,
     }
 }
 class VmessEncryptedBody : public testing::TestWithParam<
-    std::tuple<proxy::vmess::Security, uint8_t>> {};
+    std::tuple<proxy::VmessSecurity, uint8_t>> {};
 
 TEST_P(VmessEncryptedBody, CancellationResumesWithoutNonceOrMaskDrift) {
     const auto [security, options] = GetParam();
-    for (const auto command : {proxy::vmess::Command::UDP, proxy::vmess::Command::TCP}) {
+    for (const auto command : {proxy::VmessCommand::UDP, proxy::VmessCommand::TCP}) {
         SCOPED_TRACE(static_cast<int>(command));
         TestCancellationResume(security, options, command, 113);
-        TestCancellationResume(security, options, command, buf::Buffer::kSize + 37);
+        TestCancellationResume(security, options, command, common::Buffer::kSize + 37);
     }
 }
 
@@ -453,16 +451,16 @@ TEST_P(VmessEncryptedBody, BodyAuthenticationFailureIsTerminal) {
     TestAuthenticationFailure(security, options, false);
 }
 
-class VmessLengthAuthentication : public testing::TestWithParam<proxy::vmess::Security> {};
+class VmessLengthAuthentication : public testing::TestWithParam<proxy::VmessSecurity> {};
 
 TEST_P(VmessLengthAuthentication, FailureIsTerminal) {
-    constexpr uint8_t options = proxy::vmess::Option::CHUNK_STREAM | proxy::vmess::Option::CHUNK_MASKING |
-        proxy::vmess::Option::GLOBAL_PADDING | proxy::vmess::Option::AUTHENTICATED_LENGTH;
+    constexpr uint8_t options = proxy::VmessOption::CHUNK_STREAM | proxy::VmessOption::CHUNK_MASKING |
+        proxy::VmessOption::GLOBAL_PADDING | proxy::VmessOption::AUTHENTICATED_LENGTH;
     TestAuthenticationFailure(GetParam(), options, true);
 }
 
 INSTANTIATE_TEST_SUITE_P(AeadModes, VmessLengthAuthentication,
-    testing::Values(proxy::vmess::Security::AES_128_GCM, proxy::vmess::Security::CHACHA20_POLY1305));
+    testing::Values(proxy::VmessSecurity::AES_128_GCM, proxy::VmessSecurity::CHACHA20_POLY1305));
 
 TEST_P(VmessEncryptedBody, TransportEofDistinguishesBoundaryFromTruncation) {
     const auto [security, options] = GetParam();
@@ -473,14 +471,14 @@ TEST_P(VmessEncryptedBody, TransportEofDistinguishesBoundaryFromTruncation) {
 }
 
 INSTANTIATE_TEST_SUITE_P(SecurityAndFraming, VmessEncryptedBody, testing::Combine(
-    testing::Values(proxy::vmess::Security::AES_128_GCM, proxy::vmess::Security::CHACHA20_POLY1305),
-    testing::Values(uint8_t{proxy::vmess::Option::CHUNK_STREAM},
-        uint8_t{proxy::vmess::Option::CHUNK_STREAM | proxy::vmess::Option::CHUNK_MASKING | proxy::vmess::Option::GLOBAL_PADDING},
-        uint8_t{proxy::vmess::Option::CHUNK_STREAM | proxy::vmess::Option::CHUNK_MASKING |
-            proxy::vmess::Option::GLOBAL_PADDING | proxy::vmess::Option::AUTHENTICATED_LENGTH})));
+    testing::Values(proxy::VmessSecurity::AES_128_GCM, proxy::VmessSecurity::CHACHA20_POLY1305),
+    testing::Values(uint8_t{proxy::VmessOption::CHUNK_STREAM},
+        uint8_t{proxy::VmessOption::CHUNK_STREAM | proxy::VmessOption::CHUNK_MASKING | proxy::VmessOption::GLOBAL_PADDING},
+        uint8_t{proxy::VmessOption::CHUNK_STREAM | proxy::VmessOption::CHUNK_MASKING |
+            proxy::VmessOption::GLOBAL_PADDING | proxy::VmessOption::AUTHENTICATED_LENGTH})));
 
 void WriteReady(Connection& connection, transport::MultiBufferWriter& writer,
-                buf::MultiBuffer payload) {
+                common::MultiBuffer payload) {
     bool completed = false;
     std::exception_ptr failure;
     connection.io.restart();
@@ -501,25 +499,25 @@ void WriteReady(Connection& connection, transport::MultiBufferWriter& writer,
 
 // A server response with AUTHENTICATED_LENGTH must decode with Xray-core's
 // nonce choice; the production client decoder cannot prove this alone.
-void TestResponseAuthenticatedLength(proxy::vmess::Security security) {
+void TestResponseAuthenticatedLength(proxy::VmessSecurity security) {
     constexpr size_t kResponseHeaderSize = 38;
-    const uint8_t options = proxy::vmess::Option::CHUNK_STREAM | proxy::vmess::Option::CHUNK_MASKING |
-        proxy::vmess::Option::GLOBAL_PADDING | proxy::vmess::Option::AUTHENTICATED_LENGTH;
-    const auto request = MakeRequest(security, options, proxy::vmess::Command::TCP);
+    const uint8_t options = proxy::VmessOption::CHUNK_STREAM | proxy::VmessOption::CHUNK_MASKING |
+        proxy::VmessOption::GLOBAL_PADDING | proxy::VmessOption::AUTHENTICATED_LENGTH;
+    const auto request = MakeRequest(security, options, proxy::VmessCommand::TCP);
     Connection connection;
-    proxy::vmess::encoding::ServerSession session("response-length-test");
+    proxy::ServerSession session("response-length-test");
     session.SetRequest(request);
     auto writer = session.EncodeResponseBodyWithHeader(connection.stream);
     ASSERT_TRUE(writer);
 
     const std::array<std::pair<size_t, uint8_t>, 2> chunks{{{113, 0x5a}, {257, 0x3c}}};
     for (const auto& [size, value] : chunks) {
-        buf::MultiBuffer payload;
+        common::MultiBuffer payload;
         payload.push_back(MakeBuffer(size, nullptr, value));
         WriteReady(connection, *writer, std::move(payload));
     }
 
-    std::pmr::vector<uint8_t> wire(memory::process_resource());
+    std::vector<uint8_t> wire;
     connection.peer.non_blocking(true);
     for (;;) {
         std::array<uint8_t, 4096> block{};
@@ -541,14 +539,14 @@ void TestResponseAuthenticatedLength(proxy::vmess::Security security) {
     EXPECT_EQ((offset), (wire.size())) << "VMess response carried unexpected trailing bytes";
 }
 
-std::pmr::vector<uint8_t> MakeClientResponse(Connection& connection,
-                                     proxy::vmess::encoding::ClientSession& client,
-                                     const proxy::vmess::MemoryAccount& account,
+std::vector<uint8_t> MakeClientResponse(Connection& connection,
+                                     proxy::ClientSession& client,
+                                     const proxy::VmessUserAccount& account,
                                      const AES_KEY& auth_id_key,
                                      const common::TargetAddress& target,
-                                     proxy::vmess::Command command,
-                                     proxy::vmess::VMessRequest* authenticated_request = nullptr) {
-    using namespace proxyman::inbound;
+                                     proxy::VmessCommand command,
+                                     proxy::VMessRequest* authenticated_request = nullptr) {
+    using namespace app;
     constexpr auto tag = "vmess-client-response";
     PreparedVmessUser user;
     user.uuid_bytes = account.uuid_bytes;
@@ -566,7 +564,7 @@ std::pmr::vector<uint8_t> MakeClientResponse(Connection& connection,
     connection.io.restart();
     net::co_spawn(connection.io,
         client.EncodeRequestHeader(connection.stream, account, auth_id_key, target, command),
-        [&](std::exception_ptr error, proxy::vmess::encoding::VMessHandshakeResult result) {
+        [&](std::exception_ptr error, proxy::VMessHandshakeResult result) {
             failure = error;
             EXPECT_TRUE((result.has_value())) << "VMess client request header failed";
             completed = true;
@@ -580,44 +578,44 @@ std::pmr::vector<uint8_t> MakeClientResponse(Connection& connection,
     }
     if (failure) std::rethrow_exception(failure);
     EXPECT_TRUE((completed && !failure)) << "VMess client request header did not complete";
-    std::pmr::vector<uint8_t> header(connection.peer.available(), memory::process_resource());
+    std::vector<uint8_t> header(connection.peer.available());
     EXPECT_TRUE((!header.empty() && net::read(connection.peer, net::buffer(header)) == header.size())) << "VMess client request header was not written";
-    proxy::vmess::encoding::ServerSession server(tag);
+    proxy::ServerSession server(tag);
     auto [request, consumed] = server.DecodeRequestHeader(header.data(), header.size());
     if (!request || consumed != header.size())
         throw std::runtime_error("VMess server could not authenticate the client request");
     if (authenticated_request) *authenticated_request = *request;
     const auto udp_target = request->target;
-    const bool is_udp = request->command == proxy::vmess::Command::UDP;
+    const bool is_udp = request->command == proxy::VmessCommand::UDP;
     server.SetRequest(std::move(*request));
     auto writer = server.EncodeResponseBodyWithHeader(connection.stream);
     if (!writer) throw std::runtime_error("VMess server response writer was not created");
     WriteReady(connection, *writer,
-               buf::MultiBuffer{MakeBuffer(113, is_udp ? &udp_target : nullptr, 0x53)});
-    std::pmr::vector<uint8_t> response(connection.peer.available(), memory::process_resource());
+               common::MultiBuffer{MakeBuffer(113, is_udp ? &udp_target : nullptr, 0x53)});
+    std::vector<uint8_t> response(connection.peer.available());
     EXPECT_TRUE((response.size() > 38 &&
               net::read(connection.peer, net::buffer(response)) == response.size())) << "VMess server response was not written";
     return response;
 }
 
-net::awaitable<buf::MultiBuffer> ReadClientBody(Connection& connection,
-                                               proxy::vmess::encoding::ClientSession& client,
+net::awaitable<common::MultiBuffer> ReadClientBody(Connection& connection,
+                                               proxy::ClientSession& client,
                                                bool automatic_cancel) {
     co_await net::this_coro::throw_if_cancelled(automatic_cancel);
     co_return co_await client.DecodeResponse(connection.stream);
 }
 
 void TestClientAuthenticationFailure(size_t corrupt_offset,
-                                     proxy::vmess::Command command = proxy::vmess::Command::TCP) {
-    auto account = proxy::vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
+                                     proxy::VmessCommand command = proxy::VmessCommand::TCP) {
+    auto account = proxy::VmessUserAccount::FromUUID("11111111-1111-4111-8111-111111111111");
     ASSERT_TRUE(account);
-    const auto auth_id_key = proxy::vmess::ExpandAuthIDEncryptKey(account->auth_key);
+    const auto auth_id_key = proxy::ExpandAuthIDEncryptKey(account->auth_key);
     const common::TargetAddress target("127.0.0.1", 5353);
     Connection connection;
-    proxy::vmess::encoding::ClientSession client(proxy::vmess::Security::AES_128_GCM, command);
+    proxy::ClientSession client(proxy::VmessSecurity::AES_128_GCM, command);
     const auto response = MakeClientResponse(
         connection, client, *account, auth_id_key, target, command);
-    std::pmr::vector<uint8_t> corrupted(response, memory::process_resource());
+    std::vector<uint8_t> corrupted(response);
     corrupted[corrupt_offset] ^= 0x80;
     const size_t prefix_size = corrupt_offset < 18 ? 18
         : corrupt_offset < 38 ? 38 : corrupted.size();
@@ -631,13 +629,13 @@ void TestClientAuthenticationFailure(size_t corrupt_offset,
                     "VMess client revived after response authentication failure");
 }
 
-void TestClientTruncation(proxy::vmess::Command command, size_t cut) {
-    auto account = proxy::vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
+void TestClientTruncation(proxy::VmessCommand command, size_t cut) {
+    auto account = proxy::VmessUserAccount::FromUUID("11111111-1111-4111-8111-111111111111");
     ASSERT_TRUE(account);
-    const auto auth_id_key = proxy::vmess::ExpandAuthIDEncryptKey(account->auth_key);
+    const auto auth_id_key = proxy::ExpandAuthIDEncryptKey(account->auth_key);
     const common::TargetAddress target("127.0.0.1", 5353);
     Connection connection;
-    proxy::vmess::encoding::ClientSession client(proxy::vmess::Security::AES_128_GCM, command);
+    proxy::ClientSession client(proxy::VmessSecurity::AES_128_GCM, command);
     const auto response = MakeClientResponse(
         connection, client, *account, auth_id_key, target, command);
     connection.stream.PrependReadData(std::span<const uint8_t>(response).first(cut));
@@ -649,13 +647,13 @@ void TestClientTruncation(proxy::vmess::Command command, size_t cut) {
                     "VMess client revived after response truncation");
 }
 
-void TestClientHeaderCancellation(proxy::vmess::Security security, proxy::vmess::Command command) {
-    auto account = proxy::vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
+void TestClientHeaderCancellation(proxy::VmessSecurity security, proxy::VmessCommand command) {
+    auto account = proxy::VmessUserAccount::FromUUID("11111111-1111-4111-8111-111111111111");
     ASSERT_TRUE(account);
-    const auto auth_id_key = proxy::vmess::ExpandAuthIDEncryptKey(account->auth_key);
+    const auto auth_id_key = proxy::ExpandAuthIDEncryptKey(account->auth_key);
     const common::TargetAddress target("127.0.0.1", 5353);
     Connection connection;
-    proxy::vmess::encoding::ClientSession client(security, command);
+    proxy::ClientSession client(security, command);
     const auto response = MakeClientResponse(
         connection, client, *account, auth_id_key, target, command);
     size_t supplied = 0;
@@ -667,7 +665,7 @@ void TestClientHeaderCancellation(proxy::vmess::Security security, proxy::vmess:
     }
     connection.stream.PrependReadData(std::span<const uint8_t>(response).subspan(supplied));
     const auto payload = ReadReady(connection, client.DecodeResponse(connection.stream));
-    const buf::ContiguousBufferView bytes(payload);
+    const common::ContiguousBufferView bytes(payload);
     EXPECT_TRUE((bytes.Bytes().size() == 113 &&
               std::all_of(bytes.Bytes().begin(), bytes.Bytes().end(),
                           [](uint8_t byte) { return byte == 0x53; }))) << "VMess client response header cancellation lost plaintext";
@@ -680,7 +678,7 @@ public:
         : prefix_(CopyBytes(prefix)), suffix_(CopyBytes(suffix)) {}
 
     transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         ++reads_;
         if (reads_ == 1) {
             co_return std::move(prefix_);
@@ -690,33 +688,33 @@ public:
         }
         co_return std::move(suffix_);
     }
-    buf::MultiBuffer TakeRemaining() noexcept { return std::move(suffix_); }
+    common::MultiBuffer TakeRemaining() noexcept { return std::move(suffix_); }
 
 private:
-    static buf::MultiBuffer CopyBytes(std::span<const uint8_t> bytes) {
+    static common::MultiBuffer CopyBytes(std::span<const uint8_t> bytes) {
         auto buffer = MakeBuffer(bytes.size(), nullptr, 0x6d);
         std::copy(bytes.begin(), bytes.end(), buffer->Bytes().begin());
-        return buf::MultiBuffer{std::move(buffer)};
+        return common::MultiBuffer{std::move(buffer)};
     }
 
-    buf::MultiBuffer prefix_;
-    buf::MultiBuffer suffix_;
+    common::MultiBuffer prefix_;
+    common::MultiBuffer suffix_;
     transport::CancellationSource cancellation_;
     size_t reads_ = 0;
 };
 
-void TestBodyReadFailure(proxy::vmess::Command command, size_t cut) {
+void TestBodyReadFailure(proxy::VmessCommand command, size_t cut) {
     const auto request = MakeRequest(
-        proxy::vmess::Security::AES_128_GCM,
-        proxy::vmess::Option::CHUNK_STREAM | proxy::vmess::Option::CHUNK_MASKING |
-            proxy::vmess::Option::GLOBAL_PADDING,
+        proxy::VmessSecurity::AES_128_GCM,
+        proxy::VmessOption::CHUNK_STREAM | proxy::VmessOption::CHUNK_MASKING |
+            proxy::VmessOption::GLOBAL_PADDING,
         command);
     RequestEncoder encoder(request);
-    auto prefix = command == proxy::vmess::Command::TCP
-        ? encoder.Encode(MakePayload(37, 0x12)) : std::pmr::vector<uint8_t>(memory::process_resource());
+    auto prefix = command == proxy::VmessCommand::TCP
+        ? encoder.Encode(MakePayload(37, 0x12)) : std::vector<uint8_t>();
     const auto wire = encoder.Encode(MakePayload(113, 0x47));
-    const proxy::vmess::encoding::BodyKey key{request.body_key, request.body_iv};
-    proxy::vmess::encoding::BodyDecoder decoder({request.security, request.options, command}, key, key);
+    const proxy::BodyKey key{request.body_key, request.body_iv};
+    proxy::BodyDecoder decoder({request.security, request.options, command}, key, key);
     prefix.insert(prefix.end(), wire.begin(), wire.begin() + cut);
     InterruptedBodyReader source(prefix, std::span<const uint8_t>(wire).subspan(cut));
     Connection connection;
@@ -725,13 +723,13 @@ void TestBodyReadFailure(proxy::vmess::Command command, size_t cut) {
                         "VMess body reader resumed plaintext after a transport failure");
     }
     auto remaining = source.TakeRemaining();
-    const buf::ContiguousBufferView bytes(remaining);
+    const common::ContiguousBufferView bytes(remaining);
     EXPECT_TRUE((std::equal(bytes.Bytes().begin(), bytes.Bytes().end(),
                      wire.begin() + cut, wire.end()))) << "failed VMess body reader consumed subsequent transport bytes";
 }
 
 TEST(VmessUdpDatagram, AuthenticatedHeaderRejectionPreservesOnlyVerifiedIdentity) {
-    using namespace proxyman::inbound;
+    using namespace app;
     constexpr auto tag = "vmess-header-classification";
     PreparedVmessUser user;
     user.auth_key.fill(0x19);
@@ -748,8 +746,8 @@ TEST(VmessUdpDatagram, AuthenticatedHeaderRejectionPreservesOnlyVerifiedIdentity
     for (int fault = 0; fault != 3; ++fault) {
         std::array<uint8_t, 49> plain{};
         plain[0] = 1;
-        plain[35] = static_cast<uint8_t>(proxy::vmess::Security::NONE);
-        plain[37] = static_cast<uint8_t>(proxy::vmess::Command::UDP);
+        plain[35] = static_cast<uint8_t>(proxy::VmessSecurity::NONE);
+        plain[37] = static_cast<uint8_t>(proxy::VmessCommand::UDP);
         plain[38] = 0;
         plain[39] = 53;
         plain[40] = 1;
@@ -761,16 +759,16 @@ TEST(VmessUdpDatagram, AuthenticatedHeaderRejectionPreservesOnlyVerifiedIdentity
         std::array<uint8_t, 42 + 49 + 16> wire{};
         const auto now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
-        proxy::vmess::GenerateAuthID(proxy::vmess::ExpandAuthIDEncryptKey(user.auth_key), now, wire.data());
+        proxy::GenerateAuthID(proxy::ExpandAuthIDEncryptKey(user.auth_key), now, wire.data());
         const std::span<const uint8_t, 16> auth_id(wire.data(), 16);
         const std::span<const uint8_t, 8> nonce(wire.data() + 34, 8);
-        const auto length_key = proxy::vmess::RequestHeaderLengthKey(user.cmd_key, auth_id, nonce);
-        const auto payload_key = proxy::vmess::RequestHeaderPayloadKey(user.cmd_key, auth_id, nonce);
+        const auto length_key = proxy::RequestHeaderLengthKey(user.cmd_key, auth_id, nonce);
+        const auto payload_key = proxy::RequestHeaderPayloadKey(user.cmd_key, auth_id, nonce);
         const std::array<uint8_t, 2> length{0, static_cast<uint8_t>(plain.size())};
         EXPECT_TRUE((proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {length_key.key.data(), 16}, {length_key.nonce.data(), 12}, {length.data(), length.size()}, {auth_id.data(), auth_id.size()}, wire.data() + 16, {wire.data() + 18, 16}))) << "failed to seal header length";
         EXPECT_TRUE((proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {payload_key.key.data(), 16}, {payload_key.nonce.data(), 12}, {plain.data(), plain.size()}, {auth_id.data(), auth_id.size()}, wire.data() + 42, {wire.data() + 42 + plain.size(), 16}))) << "failed to seal header";
         if (fault == 2) wire.back() ^= 1;
-        proxy::vmess::encoding::ServerSession session(tag);
+        proxy::ServerSession session(tag);
         auto [request, consumed] = session.DecodeRequestHeader(wire.data(), wire.size());
         const auto* rejected = session.AuthenticatedRejectedHeader();
         if (fault == 0) {
@@ -779,7 +777,7 @@ TEST(VmessUdpDatagram, AuthenticatedHeaderRejectionPreservesOnlyVerifiedIdentity
         } else if (fault == 1) {
             EXPECT_TRUE((!request && rejected && rejected->user->profile.user_id == 73 &&
                   rejected->target.SameEndpoint(common::TargetAddress("1.1.1.1", 53)) &&
-                  rejected->command == proxy::vmess::Command::UDP)) << "authenticated malformed header lost verified identity or parsed target";
+                  rejected->command == proxy::VmessCommand::UDP)) << "authenticated malformed header lost verified identity or parsed target";
         } else {
             EXPECT_TRUE((!request && !rejected)) << "unauthenticated header exposed trusted identity";
         }
@@ -794,12 +792,12 @@ void CheckNotSupported(Fn&& fn) {
         "empty VMess UDP must fail explicitly without encoding EOF", common::ErrorCode::NOT_SUPPORTED);
 }
 
-void TestEmptyUdpWrite(proxy::vmess::Security security) {
-    const uint8_t options = proxy::vmess::Option::CHUNK_STREAM | proxy::vmess::Option::CHUNK_MASKING |
-        proxy::vmess::Option::GLOBAL_PADDING | proxy::vmess::Option::AUTHENTICATED_LENGTH;
-    const auto request = MakeRequest(security, options, proxy::vmess::Command::UDP);
+void TestEmptyUdpWrite(proxy::VmessSecurity security) {
+    const uint8_t options = proxy::VmessOption::CHUNK_STREAM | proxy::VmessOption::CHUNK_MASKING |
+        proxy::VmessOption::GLOBAL_PADDING | proxy::VmessOption::AUTHENTICATED_LENGTH;
+    const auto request = MakeRequest(security, options, proxy::VmessCommand::UDP);
     Connection connection;
-    proxy::vmess::encoding::ServerSession session("empty-udp-test");
+    proxy::ServerSession session("empty-udp-test");
     session.SetRequest(request);
     auto writer = session.EncodeResponseBodyWithHeader(connection.stream);
     auto reject = [&](net::awaitable<void> operation) {
@@ -813,27 +811,27 @@ void TestEmptyUdpWrite(proxy::vmess::Security security) {
         ASSERT_TRUE(failure) << "empty VMess UDP write silently succeeded";
         CheckNotSupported([&] { std::rethrow_exception(failure); });
     };
-    buf::MultiBuffer empty{MakeBuffer(0, &request.target, 0x6d)};
+    common::MultiBuffer empty{MakeBuffer(0, &request.target, 0x6d)};
     reject(writer->WriteMultiBuffer(std::move(empty)));
     reject(writer->WriteBuffers(std::span<const net::const_buffer>{}));
     EXPECT_EQ((connection.peer.available()), (0)) << "rejected VMess UDP write emitted an EOF or response header";
 
-    buf::MultiBuffer data{MakeBuffer(17, &request.target, 0x42)};
+    common::MultiBuffer data{MakeBuffer(17, &request.target, 0x42)};
     WriteReady(connection, *writer, std::move(data));
-    buf::MultiBuffer later_empty{MakeBuffer(0, &request.target, 0x6d)};
+    common::MultiBuffer later_empty{MakeBuffer(0, &request.target, 0x6d)};
     reject(writer->WriteMultiBuffer(std::move(later_empty)));
     const size_t available = connection.peer.available();
-    std::pmr::vector<uint8_t> wire(available, memory::process_resource());
+    std::vector<uint8_t> wire(available);
     EXPECT_EQ((net::read(connection.peer, net::buffer(wire))), (wire.size())) << "VMess UDP response wire was incomplete";
     ResponseDecoder decoder(request);
     size_t offset = 38;
     const auto decoded = decoder.Decode(wire, offset);
-    EXPECT_TRUE((decoded == std::pmr::vector<uint8_t>(17, 0x42, memory::process_resource()) && offset == wire.size())) << "rejected empty VMess UDP consumed framing state or appended EOF";
+    EXPECT_TRUE((decoded == std::vector<uint8_t>(17, 0x42) && offset == wire.size())) << "rejected empty VMess UDP consumed framing state or appended EOF";
 
-    const proxy::vmess::encoding::BodyKey key{request.body_key, request.body_iv};
-    proxy::vmess::encoding::BodyEncoder encoder({security, options, proxy::vmess::Command::UDP}, key, key);
-    buf::MultiBuffer encoded;
-    buf::MultiBuffer request_empty{MakeBuffer(0, &request.target, 0x6d)};
+    const proxy::BodyKey key{request.body_key, request.body_iv};
+    proxy::BodyEncoder encoder({security, options, proxy::VmessCommand::UDP}, key, key);
+    common::MultiBuffer encoded;
+    common::MultiBuffer request_empty{MakeBuffer(0, &request.target, 0x6d)};
     CheckNotSupported([&] { encoder.Encode(request_empty, encoded); });
     CheckNotSupported([&] {
         encoder.Encode(std::span<const net::const_buffer>{}, encoded);
@@ -858,7 +856,7 @@ public:
         co_await WriteBuffers(buffers);
         co_return buffer.size();
     }
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         co_return co_await connection_.stream.ReadMultiBuffer();
     }
     net::awaitable<void> WriteBuffers(
@@ -866,7 +864,7 @@ public:
         if (!interrupted_) {
             interrupted_ = true;
             if (write_closed) throw transport::WriteClosed();
-            std::pmr::vector<uint8_t> prefix(memory::process_resource());
+            std::vector<uint8_t> prefix;
             for (const auto buffer : buffers) {
                 const auto* bytes = static_cast<const uint8_t*>(buffer.data());
                 const size_t size = std::min(buffer.size(), size_t{7} - prefix.size());
@@ -887,7 +885,7 @@ public:
     int NativeHandle() const override { return connection_.stream.NativeHandle(); }
     bool IsOpen() const override { return connection_.stream.IsOpen(); }
 
-    std::pmr::vector<uint8_t> published{memory::process_resource()};
+    std::vector<uint8_t> published;
     bool write_closed = false;
 
 private:
@@ -923,16 +921,16 @@ void CheckWriteClosed(std::exception_ptr failure) {
     EXPECT_THROW(std::rethrow_exception(failure), transport::WriteClosed);
 }
 
-proxy::vmess::encoding::VMessHandshakeResult CompleteHeader(
-    Connection& connection, proxy::vmess::encoding::ClientSession& client, transport::AsyncStream& stream,
-    const proxy::vmess::MemoryAccount& account, const AES_KEY& auth_key,
-    const common::TargetAddress& target, proxy::vmess::Command command) {
-    proxy::vmess::encoding::VMessHandshakeResult result;
+proxy::VMessHandshakeResult CompleteHeader(
+    Connection& connection, proxy::ClientSession& client, transport::AsyncStream& stream,
+    const proxy::VmessUserAccount& account, const AES_KEY& auth_key,
+    const common::TargetAddress& target, proxy::VmessCommand command) {
+    proxy::VMessHandshakeResult result;
     std::exception_ptr failure;
     connection.io.restart();
     net::co_spawn(connection.io,
         client.EncodeRequestHeader(stream, account, auth_key, target, command),
-        [&](std::exception_ptr error, proxy::vmess::encoding::VMessHandshakeResult value) {
+        [&](std::exception_ptr error, proxy::VMessHandshakeResult value) {
             failure = error;
             result = std::move(value);
         });
@@ -942,18 +940,18 @@ proxy::vmess::encoding::VMessHandshakeResult CompleteHeader(
 }
 
 void TestWriteFailure(bool server_side, bool eof, IoErrorCode error,
-                      proxy::vmess::Command command) {
+                      proxy::VmessCommand command) {
     const auto request = MakeRequest(
-        proxy::vmess::Security::AES_128_GCM,
-        proxy::vmess::Option::CHUNK_STREAM | proxy::vmess::Option::CHUNK_MASKING |
-            proxy::vmess::Option::GLOBAL_PADDING | proxy::vmess::Option::AUTHENTICATED_LENGTH,
+        proxy::VmessSecurity::AES_128_GCM,
+        proxy::VmessOption::CHUNK_STREAM | proxy::VmessOption::CHUNK_MASKING |
+            proxy::VmessOption::GLOBAL_PADDING | proxy::VmessOption::AUTHENTICATED_LENGTH,
         command);
     Connection connection;
     InterruptedWriteStream stream(connection, error);
     const std::array<uint8_t, 19> payload{0x41, 0x42, 0x43};
     const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
-    proxy::vmess::encoding::ClientSession client(request.security, command);
-    proxy::vmess::encoding::ServerSession server("write-failure");
+    proxy::ClientSession client(request.security, command);
+    proxy::ServerSession server("write-failure");
     server.SetRequest(request);
     auto writer = server.EncodeResponseBodyWithHeader(stream);
     auto write = [&]() -> net::awaitable<void> {
@@ -969,9 +967,9 @@ void TestWriteFailure(bool server_side, bool eof, IoErrorCode error,
     EXPECT_FALSE((stream.published.empty())) << "VMess failure did not publish a TCP prefix";
     CheckWriteError(CompleteWrite(connection, write()), io_error::connection_reset);
     CheckWriteError(CompleteWrite(connection, server_side
-        ? writer->WriteMultiBuffer(buf::MultiBuffer{MakeBuffer(
-            11, command == proxy::vmess::Command::UDP ? &request.target : nullptr, 0x6d)})
-        : client.EncodeRequestBody(stream, buf::MultiBuffer{MakeBuffer(11, nullptr, 0x6d)})),
+        ? writer->WriteMultiBuffer(common::MultiBuffer{MakeBuffer(
+            11, command == proxy::VmessCommand::UDP ? &request.target : nullptr, 0x6d)})
+        : client.EncodeRequestBody(stream, common::MultiBuffer{MakeBuffer(11, nullptr, 0x6d)})),
         io_error::connection_reset);
     if (!server_side) {
         for (int entry = 0; entry != 3; ++entry) {
@@ -981,7 +979,7 @@ void TestWriteFailure(bool server_side, bool eof, IoErrorCode error,
                     co_await client.EncodeRequestBody(healthy.stream, buffers);
                 } else if (entry == 1) {
                     co_await client.EncodeRequestBody(
-                        healthy.stream, buf::MultiBuffer{MakeBuffer(11, nullptr, 0x6d)});
+                        healthy.stream, common::MultiBuffer{MakeBuffer(11, nullptr, 0x6d)});
                 } else {
                     co_await client.EncodeRequestBodyEOF(healthy.stream);
                 }
@@ -992,17 +990,17 @@ void TestWriteFailure(bool server_side, bool eof, IoErrorCode error,
     }
 }
 
-void TestWriteEnd(bool server_side, proxy::vmess::Command command) {
-    const auto request = MakeRequest(proxy::vmess::Security::AES_128_GCM,
-        proxy::vmess::Option::CHUNK_STREAM | proxy::vmess::Option::CHUNK_MASKING, command);
+void TestWriteEnd(bool server_side, proxy::VmessCommand command) {
+    const auto request = MakeRequest(proxy::VmessSecurity::AES_128_GCM,
+        proxy::VmessOption::CHUNK_STREAM | proxy::VmessOption::CHUNK_MASKING, command);
     Connection connection;
-    auto account = proxy::vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
-    const auto auth_key = proxy::vmess::ExpandAuthIDEncryptKey(account->auth_key);
-    proxy::vmess::encoding::ClientSession client(request.security, command);
-    proxy::vmess::encoding::ServerSession server("write-eof");
+    auto account = proxy::VmessUserAccount::FromUUID("11111111-1111-4111-8111-111111111111");
+    const auto auth_key = proxy::ExpandAuthIDEncryptKey(account->auth_key);
+    proxy::ClientSession client(request.security, command);
+    proxy::ServerSession server("write-eof");
     server.SetRequest(request);
     auto writer = server.EncodeResponseBodyWithHeader(connection.stream);
-    const auto response = server_side ? std::pmr::vector<uint8_t>(memory::process_resource())
+    const auto response = server_side ? std::vector<uint8_t>()
         : MakeClientResponse(connection, client, *account, auth_key, request.target, command);
     auto finish = [&]() -> net::awaitable<void> {
         if (server_side) co_await writer->AsyncShutdownWrite();
@@ -1018,9 +1016,9 @@ void TestWriteEnd(bool server_side, proxy::vmess::Command command) {
         ? writer->WriteBuffers(buffers)
         : client.EncodeRequestBody(connection.stream, buffers)));
     CheckWriteClosed(CompleteWrite(connection, server_side
-        ? writer->WriteMultiBuffer(buf::MultiBuffer{MakeBuffer(
-            11, command == proxy::vmess::Command::UDP ? &request.target : nullptr, 0x6d)})
-        : client.EncodeRequestBody(connection.stream, buf::MultiBuffer{MakeBuffer(11, nullptr, 0x6d)})));
+        ? writer->WriteMultiBuffer(common::MultiBuffer{MakeBuffer(
+            11, command == proxy::VmessCommand::UDP ? &request.target : nullptr, 0x6d)})
+        : client.EncodeRequestBody(connection.stream, common::MultiBuffer{MakeBuffer(11, nullptr, 0x6d)})));
     EXPECT_EQ((connection.peer.available()), (eof_size)) << "VMess wrote more bytes after EOF";
     if (server_side) {
         RequestEncoder encoder(request);
@@ -1032,7 +1030,7 @@ void TestWriteEnd(bool server_side, proxy::vmess::Command command) {
     } else {
         connection.stream.PrependReadData(response);
         const auto result = ReadReady(connection, client.DecodeResponse(connection.stream));
-        const buf::ContiguousBufferView bytes(result);
+        const common::ContiguousBufferView bytes(result);
         EXPECT_TRUE((bytes.Bytes().size() == 113 &&
                   std::all_of(bytes.Bytes().begin(), bytes.Bytes().end(),
                               [](uint8_t byte) { return byte == 0x53; }))) << "VMess request EOF damaged the response direction";
@@ -1043,31 +1041,31 @@ void TestWriteEnd(bool server_side, proxy::vmess::Command command) {
 TEST(VmessUdpDatagram, RejectsEmptyMissingMixedAndWrongFixedUdpEndpoints) {
     const common::TargetAddress target("1.1.1.1", 53);
     const common::TargetAddress other("8.8.8.8", 53);
-    buf::MultiBuffer empty{MakeBuffer(0, &target, 0x6d)};
-    CheckNotSupported([&] { proxy::vmess::ValidateFixedUdpDatagram(empty, target); });
+    common::MultiBuffer empty{MakeBuffer(0, &target, 0x6d)};
+    CheckNotSupported([&] { proxy::ValidateFixedUdpDatagram(empty, target); });
 
 
 
-    buf::MultiBuffer mixed;
+    common::MultiBuffer mixed;
     mixed.push_back(MakeBuffer(4096, &target, 0x6d));
     mixed.push_back(MakeBuffer(1024, &other, 0x6d));
-    ExpectLinkError([&] { proxy::vmess::ValidateFixedUdpDatagram(mixed, target); },
+    ExpectLinkError([&] { proxy::ValidateFixedUdpDatagram(mixed, target); },
     "mixed VMess UDP endpoint was partially accepted");
 
-    buf::MultiBuffer missing;
+    common::MultiBuffer missing;
     missing.push_back(MakeBuffer(4096, &target, 0x6d));
     missing.push_back(MakeBuffer(1024, nullptr, 0x6d));
-    ExpectLinkError([&] { proxy::vmess::ValidateFixedUdpDatagram(missing, target); },
+    ExpectLinkError([&] { proxy::ValidateFixedUdpDatagram(missing, target); },
     "missing VMess UDP endpoint was partially accepted");
 
-    buf::MultiBuffer wrong{MakeBuffer(4096, &other, 0x6d)};
-    ExpectLinkError([&] { proxy::vmess::ValidateFixedUdpDatagram(wrong, target); },
+    common::MultiBuffer wrong{MakeBuffer(4096, &other, 0x6d)};
+    ExpectLinkError([&] { proxy::ValidateFixedUdpDatagram(wrong, target); },
     "wrong fixed VMess UDP endpoint was accepted");
 
 
 }
 
-class VmessResponseEncoding : public testing::TestWithParam<proxy::vmess::Security> {};
+class VmessResponseEncoding : public testing::TestWithParam<proxy::VmessSecurity> {};
 
 TEST_P(VmessResponseEncoding, AuthenticatedLengthMatchesXrayNonceChoice) {
     TestResponseAuthenticatedLength(GetParam());
@@ -1078,23 +1076,22 @@ TEST_P(VmessResponseEncoding, EmptyUdpRejectionPreservesNextRecordAndExplicitEof
 }
 
 INSTANTIATE_TEST_SUITE_P(AeadModes, VmessResponseEncoding,
-    testing::Values(proxy::vmess::Security::AES_128_GCM, proxy::vmess::Security::CHACHA20_POLY1305));
-
+    testing::Values(proxy::VmessSecurity::AES_128_GCM, proxy::VmessSecurity::CHACHA20_POLY1305));
 TEST(VmessUdpDatagram, ClientResponseHeaderFailureIsTerminal) {
     TestClientAuthenticationFailure(17);
     TestClientAuthenticationFailure(37);
 }
 
 TEST(VmessUdpDatagram, ClientResponseHeaderCancellationResumes) {
-    for (const auto security : {proxy::vmess::Security::AES_128_GCM, proxy::vmess::Security::CHACHA20_POLY1305}) {
-        for (const auto command : {proxy::vmess::Command::TCP, proxy::vmess::Command::UDP}) {
+    for (const auto security : {proxy::VmessSecurity::AES_128_GCM, proxy::VmessSecurity::CHACHA20_POLY1305}) {
+        for (const auto command : {proxy::VmessCommand::TCP, proxy::VmessCommand::UDP}) {
             TestClientHeaderCancellation(security, command);
         }
     }
 }
 
 TEST(VmessUdpDatagram, BodyReadFailureIsTerminal) {
-    for (const auto command : {proxy::vmess::Command::TCP, proxy::vmess::Command::UDP}) {
+    for (const auto command : {proxy::VmessCommand::TCP, proxy::VmessCommand::UDP}) {
         for (const size_t cut : {size_t{1}, size_t{9}}) {
             TestBodyReadFailure(command, cut);
         }
@@ -1102,7 +1099,7 @@ TEST(VmessUdpDatagram, BodyReadFailureIsTerminal) {
 }
 
 TEST(VmessUdpDatagram, ClientResponseBodyFailureIsTerminal) {
-    for (const auto command : {proxy::vmess::Command::TCP, proxy::vmess::Command::UDP}) {
+    for (const auto command : {proxy::VmessCommand::TCP, proxy::VmessCommand::UDP}) {
         TestClientAuthenticationFailure(40, command);
         for (const size_t cut : {size_t{0}, size_t{1}, size_t{18}, size_t{37}, size_t{40}}) {
             TestClientTruncation(command, cut);
@@ -1115,19 +1112,19 @@ TEST(VmessUdpDatagram, RequestHeaderWriteFailureIsTerminal) {
                                    IoErrorCode{io_error::operation_aborted}}) {
         Connection connection;
         InterruptedWriteStream stream(connection, error);
-        auto account = proxy::vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
-        const auto auth_key = proxy::vmess::ExpandAuthIDEncryptKey(account->auth_key);
+        auto account = proxy::VmessUserAccount::FromUUID("11111111-1111-4111-8111-111111111111");
+        const auto auth_key = proxy::ExpandAuthIDEncryptKey(account->auth_key);
         const common::TargetAddress target("127.0.0.1", 5353);
-        proxy::vmess::encoding::ClientSession client(proxy::vmess::Security::AES_128_GCM, proxy::vmess::Command::TCP);
+        proxy::ClientSession client(proxy::VmessSecurity::AES_128_GCM, proxy::VmessCommand::TCP);
         const auto first = CompleteHeader(
-            connection, client, stream, *account, auth_key, target, proxy::vmess::Command::TCP);
+            connection, client, stream, *account, auth_key, target, proxy::VmessCommand::TCP);
         EXPECT_TRUE((!first && first.error() == common::MapAsioError(error))) << "VMess request header changed the original write error";
         EXPECT_FALSE((stream.published.empty())) << "VMess request header fault had no wire prefix";
         const auto next = CompleteHeader(
-            connection, client, stream, *account, auth_key, target, proxy::vmess::Command::TCP);
+            connection, client, stream, *account, auth_key, target, proxy::VmessCommand::TCP);
         EXPECT_FALSE((next)) << "VMess retried a request header after its key was erased";
         CheckWriteError(CompleteWrite(connection, client.EncodeRequestBody(
-            stream, buf::MultiBuffer{MakeBuffer(13, nullptr, 0x6d)})), io_error::connection_reset);
+            stream, common::MultiBuffer{MakeBuffer(13, nullptr, 0x6d)})), io_error::connection_reset);
         CheckWriteError(CompleteWrite(connection, client.EncodeRequestBodyEOF(stream)),
                         io_error::connection_reset);
     }
@@ -1136,7 +1133,7 @@ TEST(VmessUdpDatagram, RequestHeaderWriteFailureIsTerminal) {
 TEST(VmessUdpDatagram, BodyWriteFailureIsTerminal) {
     for (const bool server_side : {false, true}) {
         for (const bool eof : {false, true}) {
-            for (const auto command : {proxy::vmess::Command::TCP, proxy::vmess::Command::UDP}) {
+            for (const auto command : {proxy::VmessCommand::TCP, proxy::VmessCommand::UDP}) {
                 for (const IoErrorCode error : {IoErrorCode{io_error::connection_reset},
                                                IoErrorCode{io_error::operation_aborted}}) {
                     TestWriteFailure(server_side, eof, error, command);
@@ -1148,32 +1145,32 @@ TEST(VmessUdpDatagram, BodyWriteFailureIsTerminal) {
 
 TEST(VmessUdpDatagram, BodyWriteEndPreservesReverseRead) {
     for (const bool server_side : {false, true}) {
-        for (const auto command : {proxy::vmess::Command::TCP, proxy::vmess::Command::UDP}) {
+        for (const auto command : {proxy::VmessCommand::TCP, proxy::VmessCommand::UDP}) {
             TestWriteEnd(server_side, command);
         }
     }
 }
 
 TEST(VmessUdpDatagram, BodyEncoderRejectsAliasBeforeAdvancing) {
-    const auto request = MakeRequest(proxy::vmess::Security::AES_128_GCM,
-        proxy::vmess::Option::CHUNK_STREAM | proxy::vmess::Option::CHUNK_MASKING |
-            proxy::vmess::Option::AUTHENTICATED_LENGTH, proxy::vmess::Command::UDP);
-    const proxy::vmess::encoding::BodyKey key{request.body_key, request.body_iv};
-    proxy::vmess::encoding::BodyEncoder encoder({request.security, request.options, request.command}, key, key);
-    buf::MultiBuffer payload{MakeBuffer(19, &request.target, 0x31)};
+    const auto request = MakeRequest(proxy::VmessSecurity::AES_128_GCM,
+        proxy::VmessOption::CHUNK_STREAM | proxy::VmessOption::CHUNK_MASKING |
+            proxy::VmessOption::AUTHENTICATED_LENGTH, proxy::VmessCommand::UDP);
+    const proxy::BodyKey key{request.body_key, request.body_iv};
+    proxy::BodyEncoder encoder({request.security, request.options, request.command}, key, key);
+    common::MultiBuffer payload{MakeBuffer(19, &request.target, 0x31)};
     ExpectLinkError([&] { encoder.Encode(payload, payload); },
                   "VMess BodyEncoder accepted the same input/output object",
                   common::ErrorCode::INVALID_ARGUMENT);
-    const buf::ContiguousBufferView original(payload);
+    const common::ContiguousBufferView original(payload);
     EXPECT_TRUE((original.Bytes().size() == 19 &&
               std::all_of(original.Bytes().begin(), original.Bytes().end(),
                           [](uint8_t byte) { return byte == 0x31; }))) << "VMess alias rejection modified its input";
     EXPECT_FALSE((encoder.Failed())) << "VMess alias rejection retired the encoder";
-    buf::MultiBuffer encoded;
+    common::MultiBuffer encoded;
     encoder.Encode(payload, encoded);
     RequestEncoder reference(request);
-    const auto expected = reference.Encode(std::pmr::vector<uint8_t>(19, 0x31, memory::process_resource()));
-    const buf::ContiguousBufferView actual(encoded);
+    const auto expected = reference.Encode(std::vector<uint8_t>(19, 0x31));
+    const common::ContiguousBufferView actual(encoded);
     EXPECT_TRUE((std::equal(actual.Bytes().begin(), actual.Bytes().end(),
                      expected.begin(), expected.end()))) << "VMess alias rejection advanced nonce or mask";
     std::array<uint8_t, 128> eof_chunk{};
@@ -1187,48 +1184,48 @@ TEST(VmessUdpDatagram, BodyEncoderRejectsAliasBeforeAdvancing) {
 
 TEST(VmessUdpDatagram, RequestHeaderInputRejectionPreservesKeys) {
     Connection connection;
-    auto account = proxy::vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
-    const auto auth_key = proxy::vmess::ExpandAuthIDEncryptKey(account->auth_key);
+    auto account = proxy::VmessUserAccount::FromUUID("11111111-1111-4111-8111-111111111111");
+    const auto auth_key = proxy::ExpandAuthIDEncryptKey(account->auth_key);
     common::TargetAddress target;
-    proxy::vmess::encoding::ClientSession client(proxy::vmess::Security::AES_128_GCM, proxy::vmess::Command::TCP);
+    proxy::ClientSession client(proxy::VmessSecurity::AES_128_GCM, proxy::VmessCommand::TCP);
     const auto rejected = CompleteHeader(
-        connection, client, connection.stream, *account, auth_key, target, proxy::vmess::Command::TCP);
+        connection, client, connection.stream, *account, auth_key, target, proxy::VmessCommand::TCP);
     EXPECT_TRUE((!rejected && rejected.error() == common::ErrorCode::PROTOCOL_INVALID_ADDRESS)) << "VMess invalid request target changed its error";
     EXPECT_EQ((connection.peer.available()), (0)) << "VMess invalid target published header bytes";
     target = common::TargetAddress("127.0.0.1", 5353);
     const auto response = MakeClientResponse(
-        connection, client, *account, auth_key, target, proxy::vmess::Command::TCP);
+        connection, client, *account, auth_key, target, proxy::VmessCommand::TCP);
     connection.stream.PrependReadData(response);
     const auto decoded = ReadReady(connection, client.DecodeResponse(connection.stream));
-    const buf::ContiguousBufferView bytes(decoded);
+    const common::ContiguousBufferView bytes(decoded);
     EXPECT_TRUE((bytes.Bytes().size() == 113 &&
               std::all_of(bytes.Bytes().begin(), bytes.Bytes().end(),
                           [](uint8_t byte) { return byte == 0x53; }))) << "VMess input rejection erased the keys needed by the next legal request";
 }
 
 TEST(VmessUdpDatagram, BodyInputRejectionPreservesNextRecord) {
-    const auto request = MakeRequest(proxy::vmess::Security::AES_128_GCM,
-        proxy::vmess::Option::CHUNK_STREAM | proxy::vmess::Option::CHUNK_MASKING |
-            proxy::vmess::Option::AUTHENTICATED_LENGTH, proxy::vmess::Command::UDP);
-    const proxy::vmess::encoding::BodyKey key{request.body_key, request.body_iv};
-    proxy::vmess::encoding::BodyEncoder encoder({request.security, request.options, request.command}, key, key);
-    buf::MultiBuffer encoded;
+    const auto request = MakeRequest(proxy::VmessSecurity::AES_128_GCM,
+        proxy::VmessOption::CHUNK_STREAM | proxy::VmessOption::CHUNK_MASKING |
+            proxy::VmessOption::AUTHENTICATED_LENGTH, proxy::VmessCommand::UDP);
+    const proxy::BodyKey key{request.body_key, request.body_iv};
+    proxy::BodyEncoder encoder({request.security, request.options, request.command}, key, key);
+    common::MultiBuffer encoded;
     CheckNotSupported([&] {
         encoder.Encode(std::span<const net::const_buffer>{}, encoded);
     });
-    const auto oversized = MakePayload(proxy::vmess::MAX_CHUNK_SIZE + 1, 0x21);
+    const auto oversized = MakePayload(proxy::MAX_CHUNK_SIZE + 1, 0x21);
     const std::array<net::const_buffer, 1> large{net::buffer(oversized)};
     ExpectLinkError([&] { encoder.Encode(large, encoded); },
                   "VMess accepted an oversized UDP record",
                   common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     const auto one_over = MakePayload(
-        proxy::vmess::MAX_CHUNK_SIZE - proxy::vmess::GCM_TAG_SIZE + 1, 0x19);
+        proxy::MAX_CHUNK_SIZE - proxy::GCM_TAG_SIZE + 1, 0x19);
     const std::array<net::const_buffer, 1> one_over_buffers{net::buffer(one_over)};
     ExpectLinkError([&] { encoder.Encode(one_over_buffers, encoded); },
                   "VMess accepted one byte beyond its authenticated payload limit",
                   common::ErrorCode::PROTOCOL_ENCODE_FAILED);
-    buf::MultiBuffer large_packet;
-    EXPECT_TRUE((buf::AppendSpanToMultiBuffer(oversized, large_packet))) << "VMess oversized test packet allocation failed";
+    common::MultiBuffer large_packet;
+    EXPECT_TRUE((common::AppendSpanToMultiBuffer(oversized, large_packet))) << "VMess oversized test packet allocation failed";
     ExpectLinkError([&] { encoder.Encode(large_packet, encoded); },
                   "VMess accepted oversized multi-buffer UDP",
                   common::ErrorCode::PROTOCOL_ENCODE_FAILED);
@@ -1242,36 +1239,36 @@ TEST(VmessUdpDatagram, BodyInputRejectionPreservesNextRecord) {
     encoder.Encode(legal, encoded);
     RequestEncoder reference(request);
     const auto expected = reference.Encode(payload);
-    const buf::ContiguousBufferView actual(encoded);
+    const common::ContiguousBufferView actual(encoded);
     EXPECT_TRUE((std::equal(actual.Bytes().begin(), actual.Bytes().end(),
                      expected.begin(), expected.end()))) << "VMess input rejection advanced the next record's framing state";
     encoded.clear();
-    const auto maximum = MakePayload(proxy::vmess::MAX_CHUNK_SIZE - proxy::vmess::GCM_TAG_SIZE, 0x61);
+    const auto maximum = MakePayload(proxy::MAX_CHUNK_SIZE - proxy::GCM_TAG_SIZE, 0x61);
     const std::array<net::const_buffer, 2> maximum_buffers{
         net::buffer(maximum.data(), 17),
         net::buffer(maximum.data() + 17, maximum.size() - 17)};
     encoder.Encode(maximum_buffers, encoded);
     const auto expected_maximum = reference.Encode(maximum);
-    const buf::ContiguousBufferView actual_maximum(encoded);
+    const common::ContiguousBufferView actual_maximum(encoded);
     EXPECT_TRUE((std::equal(actual_maximum.Bytes().begin(), actual_maximum.Bytes().end(),
                      expected_maximum.begin(), expected_maximum.end()))) << "VMess maximum UDP payload damaged the next authenticated record";
 }
 
 TEST(VmessUdpDatagram, LowerWriteClosedPreservesReverseRead) {
     for (const bool server_side : {false, true}) {
-        const auto request = MakeRequest(proxy::vmess::Security::AES_128_GCM,
-            proxy::vmess::Option::CHUNK_STREAM | proxy::vmess::Option::CHUNK_MASKING,
-            proxy::vmess::Command::TCP);
+        const auto request = MakeRequest(proxy::VmessSecurity::AES_128_GCM,
+            proxy::VmessOption::CHUNK_STREAM | proxy::VmessOption::CHUNK_MASKING,
+            proxy::VmessCommand::TCP);
         Connection connection;
         InterruptedWriteStream stream(connection, io_error::connection_reset);
         stream.write_closed = true;
-        auto account = proxy::vmess::MemoryAccount::FromUUID("11111111-1111-4111-8111-111111111111");
-        const auto auth_key = proxy::vmess::ExpandAuthIDEncryptKey(account->auth_key);
-        proxy::vmess::encoding::ClientSession client(request.security, request.command);
-        const auto response = server_side ? std::pmr::vector<uint8_t>(memory::process_resource())
+        auto account = proxy::VmessUserAccount::FromUUID("11111111-1111-4111-8111-111111111111");
+        const auto auth_key = proxy::ExpandAuthIDEncryptKey(account->auth_key);
+        proxy::ClientSession client(request.security, request.command);
+        const auto response = server_side ? std::vector<uint8_t>()
             : MakeClientResponse(
                   connection, client, *account, auth_key, request.target, request.command);
-        proxy::vmess::encoding::ServerSession server("lower-write-closed");
+        proxy::ServerSession server("lower-write-closed");
         server.SetRequest(request);
         auto writer = server.EncodeResponseBodyWithHeader(stream);
         const auto payload = MakePayload(17, 0x31);
@@ -1290,7 +1287,7 @@ TEST(VmessUdpDatagram, LowerWriteClosedPreservesReverseRead) {
         } else {
             connection.stream.PrependReadData(response);
             const auto decoded = ReadReady(connection, client.DecodeResponse(stream));
-            const buf::ContiguousBufferView bytes(decoded);
+            const common::ContiguousBufferView bytes(decoded);
             EXPECT_TRUE((bytes.Bytes().size() == 113 &&
                       std::all_of(bytes.Bytes().begin(), bytes.Bytes().end(),
                                   [](uint8_t byte) { return byte == 0x53; }))) << "VMess clean lower write close discarded the response direction";
@@ -1301,31 +1298,31 @@ TEST(VmessUdpDatagram, LowerWriteClosedPreservesReverseRead) {
 TEST(VmessUdpDatagram, PreCancelledWritePreservesNextRecord) {
     // Entry: MultiBuffer, buffer sequence, EOF, and client request header.
     for (const bool server_side : {false, true}) {
-        for (const auto command : {proxy::vmess::Command::TCP, proxy::vmess::Command::UDP}) {
+        for (const auto command : {proxy::VmessCommand::TCP, proxy::VmessCommand::UDP}) {
             for (int entry = 0; entry != (server_side ? 3 : 4); ++entry) {
                 Connection connection;
-                auto request = MakeRequest(proxy::vmess::Security::AES_128_GCM,
-                    proxy::vmess::Option::CHUNK_STREAM | proxy::vmess::Option::CHUNK_MASKING |
-                        proxy::vmess::Option::GLOBAL_PADDING |
-                        proxy::vmess::Option::AUTHENTICATED_LENGTH, command);
-                auto account = proxy::vmess::MemoryAccount::FromUUID(
+                auto request = MakeRequest(proxy::VmessSecurity::AES_128_GCM,
+                    proxy::VmessOption::CHUNK_STREAM | proxy::VmessOption::CHUNK_MASKING |
+                        proxy::VmessOption::GLOBAL_PADDING |
+                        proxy::VmessOption::AUTHENTICATED_LENGTH, command);
+                auto account = proxy::VmessUserAccount::FromUUID(
                     "11111111-1111-4111-8111-111111111111");
-                const auto auth_key = proxy::vmess::ExpandAuthIDEncryptKey(account->auth_key);
-                proxy::vmess::encoding::ClientSession client(request.security, command);
-                std::pmr::vector<uint8_t> response(memory::process_resource());
+                const auto auth_key = proxy::ExpandAuthIDEncryptKey(account->auth_key);
+                proxy::ClientSession client(request.security, command);
+                std::vector<uint8_t> response;
                 if (!server_side && entry != 3) {
                     response = MakeClientResponse(
                         connection, client, *account, auth_key, request.target, command, &request);
                 }
-                proxy::vmess::encoding::ServerSession server("pre-cancel-write");
+                proxy::ServerSession server("pre-cancel-write");
                 server.SetRequest(request);
                 auto writer = server.EncodeResponseBodyWithHeader(connection.stream);
-                const std::pmr::vector<uint8_t> payload(19, 0x63, memory::process_resource());
+                const std::vector<uint8_t> payload(19, 0x63);
                 const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
                 auto write_payload = [&]() -> net::awaitable<void> {
                     if (entry == 0) {
-                        buf::MultiBuffer mb{MakeBuffer(
-                            payload.size(), command == proxy::vmess::Command::UDP
+                        common::MultiBuffer mb{MakeBuffer(
+                            payload.size(), command == proxy::VmessCommand::UDP
                                 ? &request.target : nullptr, 0x63)};
                         if (server_side) co_await writer->WriteMultiBuffer(std::move(mb));
                         else co_await client.EncodeRequestBody(connection.stream, std::move(mb));
@@ -1379,7 +1376,7 @@ TEST(VmessUdpDatagram, PreCancelledWritePreservesNextRecord) {
                     std::rethrow_exception(error);
                 }
                 if (server_side) {
-                    std::pmr::vector<uint8_t> wire(connection.peer.available(), memory::process_resource());
+                    std::vector<uint8_t> wire(connection.peer.available());
                     net::read(connection.peer, net::buffer(wire));
                     ResponseDecoder decoder(request);
                     size_t offset = 38;
@@ -1388,12 +1385,12 @@ TEST(VmessUdpDatagram, PreCancelledWritePreservesNextRecord) {
                 } else {
                     connection.stream.PrependReadData(response);
                     const auto decoded = ReadReady(connection, client.DecodeResponse(connection.stream));
-                    const buf::ContiguousBufferView bytes(decoded);
+                    const common::ContiguousBufferView bytes(decoded);
                     EXPECT_TRUE((bytes.Bytes().size() == 113 &&
                               std::all_of(bytes.Bytes().begin(), bytes.Bytes().end(),
                                           [](uint8_t byte) { return byte == 0x53; }))) << "pre-cancelled VMess request damaged response keys";
-                    transport::internet::TcpStream peer_stream(std::move(connection.peer));
-                    proxy::vmess::encoding::ServerSession peer("pre-cancel-request-peer");
+                    transport::TcpStream peer_stream(std::move(connection.peer));
+                    proxy::ServerSession peer("pre-cancel-request-peer");
                     peer.SetRequest(request);
                     auto reader = peer.DecodeRequestBody(peer_stream);
                     CheckPayload(ReadReady(connection, *reader), payload, request);

@@ -1,6 +1,5 @@
 #include "proxy/vless/vless_encryption_config.hpp"
 #include "proxy/vless/vless_encryption.hpp"
-
 #include "common/ascii.hpp"
 #include "common/binary_text_codec.hpp"
 #include "common/scoped_cleanse.hpp"
@@ -15,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-namespace proxy::vless {
+namespace proxy {
 namespace {
 
 constexpr std::string_view kEncryptionName = "mlkem768x25519plus";
@@ -312,4 +311,4 @@ std::string_view VlessEncryptionParseErrorMessage(
     return "unknown error";
 }
 
-}  // namespace proxy::vless
+}  // namespace proxy

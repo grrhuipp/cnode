@@ -7,14 +7,14 @@
 #include <utility>
 
 namespace {
-using ::json::KeyComparison;
+using ::infra::KeyComparison;
 
 struct ParsedObject {
-    ::json::value source;
-    tl::expected<const ::json::object*, std::string> result;
+    ::infra::value source;
+    tl::expected<const ::infra::object*, std::string> result;
 
     explicit ParsedObject(std::string_view body)
-        : source(::json::parse(body)),
+        : source(::infra::parse(body)),
           result(::infra::ParseJsonObject(source.as_object(), "camelObject")) {}
 };
 
@@ -43,7 +43,7 @@ INSTANTIATE_TEST_SUITE_P(ConfigurationErrors, InvalidOptionalObject,
     ::testing::Values(R"({"camelObject":[]})", R"({"camelObject":null})"));
 
 TEST(JsonObject, AsciiInsensitiveLookupPreservesNonAsciiAndKeyBoundaries) {
-    const auto parsed = ::json::parse(
+    const auto parsed = ::infra::parse(
         R"({"CaMeLKey":1,"camel_key":2,"\u00c4":3,"\u00e4":4})",
         KeyComparison::AsciiCaseInsensitive);
     const auto& object = parsed.as_object();
@@ -62,24 +62,24 @@ TEST(JsonObject, AsciiInsensitiveLookupPreservesNonAsciiAndKeyBoundaries) {
 
 TEST(JsonObject, OrdinaryParsingAndConstructionRemainCaseSensitive) {
     for (const auto& parsed : {
-             ::json::parse(R"({"CaMeLKey":1,"camelKey":2})"),
-             ::json::parse(R"({"CaMeLKey":1,"camelKey":2})", KeyComparison::CaseSensitive)}) {
+             ::infra::parse(R"({"CaMeLKey":1,"camelKey":2})"),
+             ::infra::parse(R"({"CaMeLKey":1,"camelKey":2})", KeyComparison::CaseSensitive)}) {
         const auto& object = parsed.as_object();
         EXPECT_EQ(object.size(), 2);
         EXPECT_EQ(object.at("CaMeLKey").as_int64(), 1);
         EXPECT_EQ(object.at("camelKey").as_int64(), 2);
         EXPECT_FALSE(object.contains("CAMELKEY"));
     }
-    ::json::object constructed;
+    ::infra::object constructed;
     constructed["Key"] = 1;
     constructed["key"] = 2;
-    const ::json::object initialized{{"Key", 1}, {"key", 2}};
+    const ::infra::object initialized{{"Key", 1}, {"key", 2}};
     EXPECT_EQ(constructed.size(), 2);
     EXPECT_EQ(initialized.size(), 2);
 }
 
 TEST(JsonObject, NestedObjectsAndInsertionsRetainComparisonMode) {
-    auto parsed = ::json::parse(
+    auto parsed = ::infra::parse(
         R"({"SeTTings":{"PaNeLs":[{"DeEp":{"VaLuE":"UnChanged"}}]},"Empty":{}})",
         KeyComparison::AsciiCaseInsensitive);
     auto* settings = parsed.as_object().if_contains("settings");
@@ -99,49 +99,49 @@ TEST(JsonObject, NestedObjectsAndInsertionsRetainComparisonMode) {
     empty["NewKey"] = 1;
     EXPECT_EQ(empty.at("newkey").as_int64(), 1);
     EXPECT_EQ(empty.begin()->first, "newkey");
-    const auto array_root = ::json::parse(
+    const auto array_root = ::infra::parse(
         R"([[{"MiXeD":true}]])", KeyComparison::AsciiCaseInsensitive);
     EXPECT_TRUE(array_root.as_array()[0].as_array()[0].as_object().at("mixed").as_bool());
 }
 
 TEST(JsonObject, TransferringValuesPreservesNestedComparisonMode) {
-    const auto original = ::json::parse(
+    const auto original = ::infra::parse(
         R"({"Outer":[{"Inner":"OriginalValue"}]})", KeyComparison::AsciiCaseInsensitive);
     auto copied = original;
     auto moved = std::move(copied);
-    ::json::value copy_assigned;
+    ::infra::value copy_assigned;
     copy_assigned = original;
-    ::json::value move_assigned;
+    ::infra::value move_assigned;
     move_assigned = std::move(copy_assigned);
     EXPECT_EQ(moved.as_object().at("outer").as_array()[0].as_object()
                   .at("INNER").as_string(), "OriginalValue");
     EXPECT_EQ(move_assigned.as_object().at("OUTER").as_array()[0].as_object()
                   .at("inner").as_string(), "OriginalValue");
-    ::json::object copied_object(original.as_object());
-    ::json::object moved_object(std::move(copied_object));
-    ::json::object assigned_object;
+    ::infra::object copied_object(original.as_object());
+    ::infra::object moved_object(std::move(copied_object));
+    ::infra::object assigned_object;
     assigned_object = original.as_object();
-    ::json::object moved_assigned_object;
+    ::infra::object moved_assigned_object;
     moved_assigned_object = std::move(assigned_object);
     EXPECT_TRUE(moved_object.contains("OUTER"));
     EXPECT_TRUE(moved_assigned_object.contains("outer"));
-    moved_assigned_object = ::json::object{{"Mixed", 1}};
+    moved_assigned_object = ::infra::object{{"Mixed", 1}};
     EXPECT_TRUE(moved_assigned_object.contains("Mixed"));
     EXPECT_FALSE(moved_assigned_object.contains("MIXED"));
-    const ::json::object sensitive{{"Mixed", 1}};
+    const ::infra::object sensitive{{"Mixed", 1}};
     moved_object = sensitive;
     EXPECT_TRUE(moved_object.contains("Mixed"));
     EXPECT_FALSE(moved_object.contains("MIXED"));
 }
 
 TEST(JsonObject, AssigningContainedObjectPreservesStorageAndComparisonMode) {
-    auto moved = ::json::parse(
+    auto moved = ::infra::parse(
         R"({"child":{"GrandChild":"Kept"},"sibling":1})",
         KeyComparison::AsciiCaseInsensitive).as_object();
     moved = std::move(moved["child"].as_object());
     EXPECT_EQ(moved.size(), 1);
     EXPECT_EQ(moved.at("GRANDCHILD").as_string(), "Kept");
-    auto copied = ::json::parse(
+    auto copied = ::infra::parse(
         R"({"child":{"GrandChild":"Copied"},"sibling":2})",
         KeyComparison::AsciiCaseInsensitive).as_object();
     copied = copied["child"].as_object();
@@ -150,12 +150,12 @@ TEST(JsonObject, AssigningContainedObjectPreservesStorageAndComparisonMode) {
 }
 
 TEST(JsonObject, AssigningContainedArrayPreservesElements) {
-    auto moved = ::json::parse(R"([["KeptElement",42],"Sibling"])").as_array();
+    auto moved = ::infra::parse(R"([["KeptElement",42],"Sibling"])").as_array();
     moved = std::move(moved[0].as_array());
     ASSERT_EQ(moved.size(), 2);
     EXPECT_EQ(moved[0].as_string(), "KeptElement");
     EXPECT_EQ(moved[1].as_int64(), 42);
-    auto copied = ::json::parse(R"([["CopiedElement",7],"Sibling"])").as_array();
+    auto copied = ::infra::parse(R"([["CopiedElement",7],"Sibling"])").as_array();
     copied = copied[0].as_array();
     ASSERT_EQ(copied.size(), 2);
     EXPECT_EQ(copied[0].as_string(), "CopiedElement");
@@ -163,21 +163,21 @@ TEST(JsonObject, AssigningContainedArrayPreservesElements) {
 }
 
 TEST(JsonObject, IntegerEqualityRespectsSignedRange) {
-    EXPECT_EQ(::json::value(int64_t{42}), ::json::value(uint64_t{42}));
-    EXPECT_EQ(::json::value(uint64_t{0}), ::json::value(int64_t{0}));
-    EXPECT_NE(::json::value(int64_t{-1}), ::json::value(uint64_t{1}));
-    EXPECT_NE(::json::value(int64_t{-1}), ::json::value(static_cast<uint64_t>(-1)));
+    EXPECT_EQ(::infra::value(int64_t{42}), ::infra::value(uint64_t{42}));
+    EXPECT_EQ(::infra::value(uint64_t{0}), ::infra::value(int64_t{0}));
+    EXPECT_NE(::infra::value(int64_t{-1}), ::infra::value(uint64_t{1}));
+    EXPECT_NE(::infra::value(int64_t{-1}), ::infra::value(static_cast<uint64_t>(-1)));
 }
 
 TEST(JsonObject, StructuralEqualityIgnoresObjectOrderButNotValues) {
-    EXPECT_EQ(::json::parse(R"({"b":[1,true,"x"],"a":null})"),
-              ::json::parse(R"({"a":null,"b":[1,true,"x"]})"));
-    EXPECT_NE(::json::parse(R"({"a":1})"), ::json::parse(R"({"a":2})"));
+    EXPECT_EQ(::infra::parse(R"({"b":[1,true,"x"],"a":null})"),
+              ::infra::parse(R"({"a":null,"b":[1,true,"x"]})"));
+    EXPECT_NE(::infra::parse(R"({"a":1})"), ::infra::parse(R"({"a":2})"));
 }
 
 class DuplicateInsensitiveKey : public ::testing::TestWithParam<const char*> {};
 TEST_P(DuplicateInsensitiveKey, RejectsAmbiguousKeys) {
-    EXPECT_THROW(static_cast<void>(::json::parse(GetParam(), KeyComparison::AsciiCaseInsensitive)), ::json::parse_error);
+    EXPECT_THROW(static_cast<void>(::infra::parse(GetParam(), KeyComparison::AsciiCaseInsensitive)), ::infra::parse_error);
 }
 INSTANTIATE_TEST_SUITE_P(DuplicateKeys, DuplicateInsensitiveKey, ::testing::Values(
     R"({"Key":1,"key":2})", R"({"key":1,"key":2})", R"({"":1,"":2})",
@@ -186,13 +186,13 @@ INSTANTIATE_TEST_SUITE_P(DuplicateKeys, DuplicateInsensitiveKey, ::testing::Valu
 
 class DuplicateSensitiveKey : public ::testing::TestWithParam<const char*> {};
 TEST_P(DuplicateSensitiveKey, RejectsDuplicateKeys) {
-    EXPECT_THROW(static_cast<void>(::json::parse(GetParam())), ::json::parse_error);
+    EXPECT_THROW(static_cast<void>(::infra::parse(GetParam())), ::infra::parse_error);
 }
 INSTANTIATE_TEST_SUITE_P(DuplicateKeys, DuplicateSensitiveKey, ::testing::Values(
     R"({"key":1,"key":2})", R"({"users":[{"id":1,"uuid":"a","uuid":"b"}]})"));
 
 TEST(JsonObject, KeysInSiblingObjectsAreIndependent) {
-    const auto siblings = ::json::parse(
+    const auto siblings = ::infra::parse(
         R"([{"Key":1},{"KEY":2}])", KeyComparison::AsciiCaseInsensitive);
     EXPECT_EQ(siblings.as_array()[0].as_object().at("key").as_int64(), 1);
     EXPECT_EQ(siblings.as_array()[1].as_object().at("key").as_int64(), 2);
@@ -202,43 +202,43 @@ TEST(JsonObject, EnforcesNestingDepthWithoutLeakingAcrossSiblings) {
     const auto nested = [](size_t depth) {
         return std::string(depth, '[') + std::string(depth, ']');
     };
-    EXPECT_TRUE(::json::parse(nested(128)).is_array());
-    EXPECT_THROW(static_cast<void>(::json::parse(nested(129))), ::json::parse_error);
-    EXPECT_THROW(static_cast<void>(::json::parse(std::string(1'000'000, '['))), ::json::parse_error);
+    EXPECT_TRUE(::infra::parse(nested(128)).is_array());
+    EXPECT_THROW(static_cast<void>(::infra::parse(nested(129))), ::infra::parse_error);
+    EXPECT_THROW(static_cast<void>(::infra::parse(std::string(1'000'000, '['))), ::infra::parse_error);
     std::string nested_objects;
     for (size_t i = 1; i < 127; ++i) nested_objects += R"({"k":)";
     nested_objects += "{}" + std::string(126, '}');
     const std::string siblings = "[" + nested(127) + "," + nested_objects + "," + nested_objects + "]";
-    EXPECT_TRUE(::json::parse(siblings).is_array());
+    EXPECT_TRUE(::infra::parse(siblings).is_array());
 }
 
 TEST(JsonObject, NormalizesKeysWithoutChangingOpaqueStringValues) {
     const std::string_view text = R"({"MiXeD-Key":"VaLuE/ABC_def"})";
-    const auto parsed = ::json::parse(text, KeyComparison::AsciiCaseInsensitive);
+    const auto parsed = ::infra::parse(text, KeyComparison::AsciiCaseInsensitive);
     EXPECT_EQ(parsed.as_object().begin()->first, "mixed-key");
     EXPECT_EQ(parsed.as_object().at("MiXeD-Key").as_string(), "VaLuE/ABC_def");
-    const auto serialized = ::json::parse(::json::serialize(parsed));
+    const auto serialized = ::infra::parse(::infra::serialize(parsed));
     EXPECT_EQ(serialized.as_object().at("mixed-key").as_string(), "VaLuE/ABC_def");
-    const auto ordinary = ::json::parse(::json::serialize(::json::parse(text)));
+    const auto ordinary = ::infra::parse(::infra::serialize(::infra::parse(text)));
     EXPECT_EQ(ordinary.as_object().at("MiXeD-Key").as_string(), "VaLuE/ABC_def");
-    auto object = ::json::object(KeyComparison::AsciiCaseInsensitive);
+    auto object = ::infra::object(KeyComparison::AsciiCaseInsensitive);
     object["SuBscript"] = "MixedValue";
     auto [entry, inserted] = object.insert_or_assign("InSert", "OtherValue");
     EXPECT_TRUE(inserted);
     EXPECT_EQ(entry->first, "insert");
     EXPECT_EQ(object.at("SUBSCRIPT").as_string(), "MixedValue");
-    const auto stored = ::json::parse(::json::serialize(object));
+    const auto stored = ::infra::parse(::infra::serialize(object));
     EXPECT_EQ(stored.as_object().at("insert").as_string(), "OtherValue");
     EXPECT_EQ(stored.as_object().at("subscript").as_string(), "MixedValue");
 }
 
 TEST(JsonObject, DecodesUnicodeSurrogatePair) {
-    EXPECT_EQ(::json::parse(R"("\uD83D\uDE00")").as_string(), "\xF0\x9F\x98\x80");
+    EXPECT_EQ(::infra::parse(R"("\uD83D\uDE00")").as_string(), "\xF0\x9F\x98\x80");
 }
 
 class LoneSurrogate : public ::testing::TestWithParam<const char*> {};
 TEST_P(LoneSurrogate, RejectsInvalidUnicodeEscape) {
-    EXPECT_THROW(static_cast<void>(::json::parse(GetParam())), ::json::parse_error);
+    EXPECT_THROW(static_cast<void>(::infra::parse(GetParam())), ::infra::parse_error);
 }
 INSTANTIATE_TEST_SUITE_P(InvalidUnicode, LoneSurrogate,
     ::testing::Values(R"("\uD83D")", R"("\uDE00")"));

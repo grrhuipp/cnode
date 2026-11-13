@@ -4,10 +4,10 @@
 
 #include <string>
 
-using domain::DnsHostnamesEqual;
-using domain::IsValidDnsHostname;
-using domain::NormalizeDnsHostnameInPlace;
-using domain::TrailingDotPolicy;
+using common::DnsHostnamesEqual;
+using common::IsValidDnsHostname;
+using common::NormalizeDnsHostnameInPlace;
+using common::TrailingDotPolicy;
 
 TEST(DomainName, EnforcesLabelLengthAndHostCharacters) {
     EXPECT_TRUE(IsValidDnsHostname("example.com", TrailingDotPolicy::Forbid));

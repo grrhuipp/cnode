@@ -1,10 +1,9 @@
 #include "app/router/router.hpp"
-#include "features/routing/sniffed_protocol.hpp"
-
+#include "routing/sniffed_protocol.hpp"
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
 #include "common/session.hpp"
-#include "core/constants.hpp"
+#include "common/constants.hpp"
 #include "geo/geodata.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
@@ -17,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace app::router {
+namespace app {
 
 namespace {
 using StringVector = std::vector<std::string>;
@@ -38,7 +37,7 @@ void SortUniqueStrings(StringVector& values) {
     return it != values.end() && std::string_view(*it) == value;
 }
 
-[[nodiscard]] std::string_view RoutingDomain(const session::Context& ctx) noexcept {
+[[nodiscard]] std::string_view RoutingDomain(const common::Context& ctx) noexcept {
     if (ctx.outbound.route_target.IsValid() && ctx.outbound.route_target.IsDomain()) {
         return ctx.outbound.route_target.host;
     }
@@ -48,7 +47,7 @@ void SortUniqueStrings(StringVector& values) {
     return {};
 }
 
-[[nodiscard]] const net::ip::address* RoutingAddress(const session::Context& ctx) noexcept {
+[[nodiscard]] const net::ip::address* RoutingAddress(const common::Context& ctx) noexcept {
     if (ctx.outbound.route_target.IsValid() && ctx.outbound.route_target.resolved_addr) {
         return &*ctx.outbound.route_target.resolved_addr;
     }
@@ -64,14 +63,12 @@ void SortUniqueStrings(StringVector& values) {
 
 }  // namespace
 
-namespace detail {
-
 void CompoundRoutingRule::SetNetworkCondition(const std::vector<std::string>& networks) {
     network_mask = 0;
     for (const auto& network : networks) {
-        if (network == constants::protocol::kTcp) {
+        if (network == common::kTcp) {
             network_mask |= kNetworkTcp;
-        } else if (network == constants::protocol::kUdp) {
+        } else if (network == common::kUdp) {
             network_mask |= kNetworkUdp;
         } else {
             throw std::logic_error(
@@ -122,7 +119,7 @@ bool CompoundRoutingRule::HasAnyCondition() const noexcept {
 }
 
 bool CompoundRoutingRule::Match(
-    const session::Context& ctx,
+    const common::Context& ctx,
     std::string_view target_domain,
     const net::ip::address* target_addr,
     uint16_t target_port) const {
@@ -167,12 +164,12 @@ bool CompoundRoutingRule::Match(
     return true;
 }
 
-bool CompoundRoutingRule::MatchNetwork(const session::Context& ctx) const noexcept {
+bool CompoundRoutingRule::MatchNetwork(const common::Context& ctx) const noexcept {
     const uint8_t bit = (ctx.content.network == common::Network::UDP) ? kNetworkUdp : kNetworkTcp;
     return (network_mask & bit) != 0;
 }
 
-bool CompoundRoutingRule::MatchProtocol(const session::Context& ctx) const {
+bool CompoundRoutingRule::MatchProtocol(const common::Context& ctx) const {
     if (ctx.content.protocol.empty()) return false;
 
     const uint8_t bit = routing::SniffedProtocolBit(ctx.content.protocol);
@@ -182,7 +179,7 @@ bool CompoundRoutingRule::MatchProtocol(const session::Context& ctx) const {
     return ContainsSortedString(protocol_values, ctx.content.protocol);
 }
 
-bool CompoundRoutingRule::MatchInboundTag(const session::Context& ctx) const {
+bool CompoundRoutingRule::MatchInboundTag(const common::Context& ctx) const {
     if (ContainsSortedString(inbound_tag_values, ctx.inbound.tag)) {
         return true;
     }
@@ -195,7 +192,7 @@ bool CompoundRoutingRule::MatchInboundTag(const session::Context& ctx) const {
     return false;
 }
 
-bool CompoundRoutingRule::MatchUser(const session::Context& ctx) const {
+bool CompoundRoutingRule::MatchUser(const common::Context& ctx) const {
     return ContainsSortedString(user_values, ctx.inbound.user_email);
 }
 
@@ -208,8 +205,6 @@ bool CompoundRoutingRule::MatchPortRanges(
     return false;
 }
 
-}  // namespace detail
-
 // ============================================================================
 // Router 实现
 // ============================================================================
@@ -221,7 +216,7 @@ Router::Router(const infra::RoutingConfig& routing, const ::geo::GeoDatabase* ge
         if (rc.outbound_tag.empty()) {
             throw std::logic_error("routing rule without outbound tag reached runtime");
         }
-        detail::CompoundRoutingRule compound;
+        CompoundRoutingRule compound;
         compound.outbound_tag = rc.outbound_tag;
 
         if (!rc.network.empty()) {
@@ -250,7 +245,7 @@ Router::Router(const infra::RoutingConfig& routing, const ::geo::GeoDatabase* ge
 
         if (!rc.source.empty()) {
             auto& source_ip_matcher =
-                compound.source_ip_matcher.emplace(memory::process_resource());
+                compound.source_ip_matcher.emplace();
             for (const auto& value : rc.source) {
                 source_ip_matcher.Insert(NetworkBytes(value), value.Prefix());
             }
@@ -261,7 +256,7 @@ Router::Router(const infra::RoutingConfig& routing, const ::geo::GeoDatabase* ge
 
         if (!rc.ip.empty()) {
             auto& ip_matcher =
-                compound.ip_matcher.emplace(memory::process_resource());
+                compound.ip_matcher.emplace();
             for (const auto& value : rc.ip) {
                 ip_matcher.Insert(NetworkBytes(value), value.Prefix());
             }
@@ -273,7 +268,7 @@ Router::Router(const infra::RoutingConfig& routing, const ::geo::GeoDatabase* ge
         if (!rc.domain_suffix.empty() || !rc.domain_keyword.empty() ||
             !rc.domain_full.empty() || !rc.domain_regex.empty()) {
             auto& domain_matcher =
-                compound.domain_matcher.emplace(memory::process_resource());
+                compound.domain_matcher.emplace();
             for (const auto& value : rc.domain_suffix) {
                 domain_matcher.AddSuffix(value);
             }
@@ -333,7 +328,7 @@ Router::Router(const infra::RoutingConfig& routing, const ::geo::GeoDatabase* ge
 
 Router::~Router() noexcept = default;
 
-routing::RouteDecision Router::Route(const session::Context& ctx) const {
+::routing::RouteDecision Router::Route(const common::Context& ctx) const {
     const auto& target = ctx.outbound.target;
     const std::string_view target_domain = RoutingDomain(ctx);
     const net::ip::address* const target_addr = RoutingAddress(ctx);
@@ -346,7 +341,7 @@ routing::RouteDecision Router::Route(const session::Context& ctx) const {
         if (rule.Match(ctx, target_domain, target_addr, target_port)) {
             LOG_CONN_DEBUG(ctx, "matched compound routing rule target={} outbound={}",
                       target, rule.outbound_tag);
-            return routing::RouteDecision{
+            return ::routing::RouteDecision{
                 .outbound_tag = rule.outbound_tag,
                 .matched = true,
             };
@@ -355,13 +350,13 @@ routing::RouteDecision Router::Route(const session::Context& ctx) const {
     // No match is an explicit empty decision. Dispatcher owns the receiver's
     // explicit fallback.
     LOG_CONN_DEBUG(ctx, "no matching routing rule target={}", target);
-    return routing::RouteDecision{
+    return ::routing::RouteDecision{
         .outbound_tag = {},
         .matched = false,
     };
 }
 
-routing::DomainStrategy Router::DomainStrategy() const noexcept {
+::routing::DomainStrategy Router::DomainStrategy() const noexcept {
     return domain_strategy_;
 }
-}  // namespace app::router
+}  // namespace app

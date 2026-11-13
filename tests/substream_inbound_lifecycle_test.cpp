@@ -2,15 +2,15 @@
 
 #include "proxy/anytls/anytls_codec.hpp"
 #include "app/relay.hpp"
-#include "app/proxyman/inbound/handler.hpp"
-#include "app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/inbound_handler.hpp"
+#include "app/proxyman/user_store.hpp"
 #include "app/stats.hpp"
 #include "app/session_group_executor.hpp"
 #include "common/allocator.hpp"
-#include "common/mux/mux_codec.hpp"
+#include "common/mux_codec.hpp"
 #include "proxy/mux/mux_server.hpp"
 #include "common/session.hpp"
-#include "features/routing/dispatcher.hpp"
+#include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "transport/async_stream.hpp"
 
@@ -29,8 +29,8 @@
 namespace {
 using namespace std::chrono_literals;
 
-size_t BufferCount() noexcept { return memory::detail::test_buffers_live; }
-size_t BufferPeak() noexcept { return memory::detail::test_buffers_peak; }
+size_t BufferCount() noexcept { return common::test_buffers_live; }
+size_t BufferPeak() noexcept { return common::test_buffers_peak; }
 
 template <typename Cleanup>
 class CleanupGuard {
@@ -44,7 +44,7 @@ private:
 // Setup and teardown use the same allocation lease as protocol callbacks.
 // The coordinator stays alive until domain services and reserved returns drain.
 class DomainFixture {
-    using UserStore = proxyman::inbound::UserStore;
+    using UserStore = app::UserStore;
 
 public:
     explicit DomainFixture(net::io_context& io)
@@ -189,11 +189,11 @@ public:
         state_.output.insert(state_.output.end(), bytes, bytes + data.size());
         co_return data.size();
     }
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         std::array<uint8_t, 8192> data{};
         const auto count = co_await AsyncRead(net::buffer(data));
-        buf::MultiBuffer result;
-        if (count && !buf::AppendSpanToMultiBuffer(std::span(data).first(count), result))
+        common::MultiBuffer result;
+        if (count && !common::AppendSpanToMultiBuffer(std::span(data).first(count), result))
             throw std::bad_alloc();
         co_return result;
     }
@@ -221,7 +221,7 @@ public:
     int attempting_writes = 0;
     bool write_payload = false;
     struct Observation {
-        session::Context* context;
+        common::Context* context;
         uint64_t conn_id;
         uint16_t port;
         bool active = true;
@@ -231,11 +231,11 @@ public:
     int changed_contexts = 0;
     net::awaitable<app::RelayResult> Dispatch(net::io_context& io,
         const routing::DispatchPolicy&, std::unique_ptr<transport::AsyncStream>, transport::Link link,
-        common::InitialPayload, session::Context& ctx, app::StatsShard&, const infra::TimeoutsConfig&) override {
+        common::InitialPayload, common::Context& ctx, app::StatsShard&, const infra::TimeoutsConfig&) override {
         struct Scope {
             Dispatcher& owner;
             size_t index;
-            Scope(Dispatcher& d, session::Context& ctx) : owner(d), index(d.observations.size()) {
+            Scope(Dispatcher& d, common::Context& ctx) : owner(d), index(d.observations.size()) {
                 for (const auto& observation : d.observations)
                     if (observation.active && observation.context == &ctx) ++d.overlapping_contexts;
                 d.observations.push_back({&ctx, ctx.conn_id, ctx.outbound.target.port});
@@ -268,9 +268,9 @@ public:
 };
 
 net::awaitable<app::RelayResult> RunMux(std::unique_ptr<transport::AsyncStream> stream,
-    routing::Dispatcher& dispatcher, const proxyman::inbound::ReceiverSettings& receiver,
-    net::io_context& io, const proxyman::inbound::AdmissionEnvironment& environment,
-    session::Context& context, app::StatsShard& stats, const infra::TimeoutsConfig& timeouts) {
+    routing::Dispatcher& dispatcher, const app::ReceiverSettings& receiver,
+    net::io_context& io, const app::AdmissionEnvironment& environment,
+    common::Context& context, app::StatsShard& stats, const infra::TimeoutsConfig& timeouts) {
     co_return co_await proxy::ServeMuxInbound(io, {stream.get(), stream.get(), stream.get()},
         *stream, dispatcher, receiver.dispatch_policy, environment, context, stats, timeouts, 0);
 }
@@ -279,7 +279,7 @@ void RunCase(int mode, bool blocked_writes, bool mux) {
     net::io_context io;
     DomainFixture domain(io);
     StreamState stream(io);
-    const auto hash = proxy::anytls::PasswordHash("lifecycle-test");
+    const auto hash = proxy::HashAnyTlsPassword("lifecycle-test");
     stream.input.assign(hash.begin(), hash.end());
     stream.input.insert(stream.input.end(), {0, 0});
     constexpr std::array<uint8_t, 3> settings{'v', '=', '2'};
@@ -295,7 +295,7 @@ void RunCase(int mode, bool blocked_writes, bool mux) {
             stream.input.insert(stream.input.end(), {0, 12, 0, sid, 1, 0, 1, 0, 80, 1, 127, 0, 0, 1});
         }
     }
-    using namespace proxyman::inbound;
+    using namespace app;
     PreparedAnyTlsUser user;
     user.password_hash = hash;
     user.profile.user_id = 1;
@@ -309,11 +309,11 @@ void RunCase(int mode, bool blocked_writes, bool mux) {
     app::StatsShard stats;
     const AdmissionEnvironment environment{
         domain.Coordinator(), domain.Limiter(), tracker, stats};
-    proxy::anytls::inbound::Handler handler(environment, {});
+    proxy::AnyTlsInboundHandler handler(environment, {});
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
-    session::Context context;
+    common::Context context;
     context.inbound.tag = "lifecycle";
     context.inbound.source_ip = "127.0.0.1";
     infra::TimeoutsConfig timeouts;
@@ -445,7 +445,7 @@ void RunHandshakeCase(int mode) {
     net::io_context io;
     DomainFixture domain(io);
     StreamState stream(io);
-    const auto hash = proxy::anytls::PasswordHash("handshake-test");
+    const auto hash = proxy::HashAnyTlsPassword("handshake-test");
     stream.input.assign(hash.begin(), hash.end());
     stream.input.insert(stream.input.end(), {0, 0});
     constexpr std::array<uint8_t, 3> settings{'v', '=', '2'};
@@ -455,7 +455,7 @@ void RunHandshakeCase(int mode) {
         Frame(stream.input, 1, sid);
         if (mode != 3) Frame(stream.input, 2, sid, target);
     }
-    using namespace proxyman::inbound;
+    using namespace app;
     PreparedAnyTlsUser user;
     user.password_hash = hash;
     const UserSet users = PreparedAnyTlsUsers{user};
@@ -465,11 +465,11 @@ void RunHandshakeCase(int mode) {
     app::StatsShard stats;
     const AdmissionEnvironment environment{
         domain.Coordinator(), domain.Limiter(), tracker, stats};
-    proxy::anytls::inbound::Handler handler(environment, {});
+    proxy::AnyTlsInboundHandler handler(environment, {});
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
-    session::Context context;
+    common::Context context;
     context.inbound.tag = "handshake";
     infra::TimeoutsConfig timeouts;
     timeouts.handshake = 1;
@@ -604,7 +604,7 @@ void RunIdentityCase(int mode) {
     net::io_context io;
     DomainFixture domain(io);
     StreamState stream(io);
-    const auto hash = proxy::anytls::PasswordHash("identity-test");
+    const auto hash = proxy::HashAnyTlsPassword("identity-test");
     stream.input.assign(hash.begin(), hash.end());
     stream.input.insert(stream.input.end(), {0, 0});
     constexpr std::array<uint8_t, 3> settings{'v', '=', '2'};
@@ -615,7 +615,7 @@ void RunIdentityCase(int mode) {
     Frame(stream.input, 1, first_sid);
     const bool pending = mode == 1 || mode == 8;
     if (!pending) Frame(stream.input, 2, first_sid, target);
-    using namespace proxyman::inbound;
+    using namespace app;
     PreparedAnyTlsUser user;
     user.password_hash = hash;
     const UserSet users = PreparedAnyTlsUsers{user};
@@ -625,11 +625,11 @@ void RunIdentityCase(int mode) {
     app::StatsShard stats;
     const AdmissionEnvironment environment{
         domain.Coordinator(), domain.Limiter(), tracker, stats};
-    proxy::anytls::inbound::Handler handler(environment, {});
+    proxy::AnyTlsInboundHandler handler(environment, {});
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
-    session::Context context;
+    common::Context context;
     context.inbound.tag = "identity";
     context.inbound.source_ip = "127.0.0.1";
     infra::TimeoutsConfig timeouts;
@@ -722,7 +722,7 @@ public:
     int calls = 0;
     net::awaitable<app::RelayResult> Dispatch(net::io_context&,
         const routing::DispatchPolicy&, std::unique_ptr<transport::AsyncStream>, transport::Link link,
-        common::InitialPayload first, session::Context& ctx, app::StatsShard&, const infra::TimeoutsConfig&) override {
+        common::InitialPayload first, common::Context& ctx, app::StatsShard&, const infra::TimeoutsConfig&) override {
         ++calls;
         host = ctx.outbound.target.host;
         auto data = std::move(first).MoveToMultiBuffer();
@@ -742,7 +742,7 @@ void RunParsingCase(int mode) {
     net::io_context io;
     DomainFixture execution(io);
     StreamState stream(io);
-    const auto hash = proxy::anytls::PasswordHash("parsing-test");
+    const auto hash = proxy::HashAnyTlsPassword("parsing-test");
     stream.input.assign(hash.begin(), hash.end());
     stream.input.insert(stream.input.end(), {0, 0});
     constexpr std::array<uint8_t, 3> settings{'v', '=', '2'};
@@ -779,7 +779,7 @@ void RunParsingCase(int mode) {
         if (mode < 4) Frame(stream.input, 2, 1, expected);
         if (mode == 7) Frame(stream.input, 3, 1);
     }
-    using namespace proxyman::inbound;
+    using namespace app;
     PreparedAnyTlsUser user;
     user.password_hash = hash;
     const UserSet users = PreparedAnyTlsUsers{user};
@@ -789,11 +789,11 @@ void RunParsingCase(int mode) {
     app::StatsShard stats;
     const AdmissionEnvironment environment{
         execution.Coordinator(), execution.Limiter(), tracker, stats};
-    proxy::anytls::inbound::Handler handler(environment, {});
+    proxy::AnyTlsInboundHandler handler(environment, {});
     ParsingDispatcher dispatcher;
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
-    session::Context context;
+    common::Context context;
     context.inbound.tag = "parsing";
     infra::TimeoutsConfig timeouts;
     net::cancellation_signal cancellation;
@@ -855,7 +855,7 @@ public:
     std::vector<uint8_t> received;
     net::awaitable<app::RelayResult> Dispatch(net::io_context& io,
         const routing::DispatchPolicy&, std::unique_ptr<transport::AsyncStream>, transport::Link link,
-        common::InitialPayload first, session::Context&, app::StatsShard&, const infra::TimeoutsConfig&) override {
+        common::InitialPayload first, common::Context&, app::StatsShard&, const infra::TimeoutsConfig&) override {
         ++active;
         (void)co_await gate.async_wait(net::as_tuple(net::use_awaitable));
         if (consume) {
@@ -885,7 +885,7 @@ void RunQueueCase(int mode, uint32_t seed = 0) {
     net::io_context io;
     DomainFixture domain(io);
     StreamState stream(io);
-    const auto hash = proxy::anytls::PasswordHash("queue-test");
+    const auto hash = proxy::HashAnyTlsPassword("queue-test");
     stream.input.assign(hash.begin(), hash.end());
     stream.input.insert(stream.input.end(), {0, 0});
     constexpr std::array<uint8_t, 3> settings{'v', '=', '2'};
@@ -893,7 +893,7 @@ void RunQueueCase(int mode, uint32_t seed = 0) {
     Frame(stream.input, 4, 0, settings);
     Frame(stream.input, 1, 1);
     Frame(stream.input, 2, 1, target);
-    using namespace proxyman::inbound;
+    using namespace app;
     PreparedAnyTlsUser user;
     user.password_hash = hash;
     const UserSet users = PreparedAnyTlsUsers{user};
@@ -903,20 +903,20 @@ void RunQueueCase(int mode, uint32_t seed = 0) {
     app::StatsShard stats;
     const AdmissionEnvironment environment{
         domain.Coordinator(), domain.Limiter(), tracker, stats};
-    proxy::anytls::inbound::Handler handler(environment, {});
+    proxy::AnyTlsInboundHandler handler(environment, {});
     QueueDispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
-    session::Context context;
+    common::Context context;
     context.inbound.tag = "queue";
     infra::TimeoutsConfig timeouts;
     net::cancellation_signal cancellation;
     bool returned = false;
     int active_at_return = -1;
     EXPECT_EQ(BufferCount(), 0);
-    const auto previous_peak = memory::detail::test_buffers_peak;
-    CleanupGuard restore_peak([&] { memory::detail::test_buffers_peak = previous_peak; });
-    memory::detail::test_buffers_peak = 0;
+    const auto previous_peak = common::test_buffers_peak;
+    CleanupGuard restore_peak([&] { common::test_buffers_peak = previous_peak; });
+    common::test_buffers_peak = 0;
     CleanupGuard cleanup([&] {
         cancellation.emit(net::cancellation_type::all);
         stream.closed = true;
@@ -1024,7 +1024,7 @@ public:
 
     net::awaitable<app::RelayResult> Dispatch(net::io_context&,
         const routing::DispatchPolicy&, std::unique_ptr<transport::AsyncStream>, transport::Link link,
-        common::InitialPayload, session::Context& ctx, app::StatsShard&, const infra::TimeoutsConfig&) override {
+        common::InitialPayload, common::Context& ctx, app::StatsShard&, const infra::TimeoutsConfig&) override {
         struct Scope {
             MuxUdpDispatcher& owner;
             explicit Scope(MuxUdpDispatcher& value) : owner(value) { ++owner.active; }
@@ -1039,7 +1039,7 @@ public:
                     input_eof = true;
                     break;
                 }
-                const auto datagram = buf::InspectUdpDatagram(packet);
+                const auto datagram = common::InspectUdpDatagram(packet);
                 EXPECT_TRUE(datagram.Valid());
                 if (!datagram.Valid()) co_return app::RelayResult{};
                 Packet observation{*datagram.target, {}};
@@ -1066,23 +1066,23 @@ void RunMuxUdpCase(int mode) {
     dispatcher.pause = mode >= 2;
     app::StatsShard stats;
     common::UserOnlineTracker tracker(domain.Coordinator());
-    const proxyman::inbound::AdmissionEnvironment environment{
+    const app::AdmissionEnvironment environment{
         domain.Coordinator(), domain.Limiter(), tracker, stats};
-    proxyman::inbound::ReceiverSettings receiver{
+    app::ReceiverSettings receiver{
         .inbound_tag = {}, .inbound_tags = {}, .protocol = {}, .stream_settings = {},
         .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
-    session::Context context;
+    common::Context context;
     context.inbound.tag = "mux-udp";
     infra::TimeoutsConfig timeouts;
     const common::TargetAddress target("127.0.0.1", 53);
     const common::TargetAddress changed("127.0.0.2", 5353);
-    std::array<uint8_t, mux::kMaxFrameHeaderBytes> header{};
+    std::array<uint8_t, common::kMaxFrameHeaderBytes> header{};
     auto append = [&](size_t size) {
         EXPECT_NE(size, 0);
         stream.input.insert(stream.input.end(), header.begin(), header.begin() + size);
     };
-    const size_t open_size = mux::EncodeNewHeaderTo(
-        header, 1, mux::NetworkType::UDP, target, 0, mode == 1);
+    const size_t open_size = common::EncodeNewHeaderTo(
+        header, 1, common::NetworkType::UDP, target, 0, mode == 1);
     append(open_size);
     std::vector<MuxUdpDispatcher::Packet> expected_packets;
     if (mode == 1) expected_packets.push_back({target, {}});
@@ -1113,13 +1113,13 @@ void RunMuxUdpCase(int mode) {
     stream.input.insert(stream.input.end(), {0, 4, 0, 1, 2, 0, 0, 4, 0, 1, 4, 1, 0, 0});
     const size_t count = mode >= 2 ? 1500 : 1;
     for (size_t i = 0; i < count; ++i) {
-        append(mux::EncodeKeepUDPHeaderTo(header, 1, changed, 0));
+        append(common::EncodeKeepUDPHeaderTo(header, 1, changed, 0));
         expected_packets.push_back({changed, {}});
     }
     if (mode < 2) {
-        append(mux::EncodeKeepDataHeaderTo(header, 1, 1));
+        append(common::EncodeKeepDataHeaderTo(header, 1, 1));
         stream.input.push_back(0x42);
-        append(mux::EncodeKeepDataHeaderTo(header, 1, 0));
+        append(common::EncodeKeepDataHeaderTo(header, 1, 0));
         expected_packets.push_back({target, {0x42}});
         expected_packets.push_back({target, {}});
     }
@@ -1130,7 +1130,7 @@ void RunMuxUdpCase(int mode) {
         if (!end_empty) stream.input.push_back(0xff);
         expected_packets.push_back({target, end_empty ? std::vector<uint8_t>{} : std::vector<uint8_t>{0xff}});
     } else {
-        append(mux::EncodeEndTo(header, 1));
+        append(common::EncodeEndTo(header, 1));
     }
     stream.wake.cancel();
     io.poll();
@@ -1139,7 +1139,7 @@ void RunMuxUdpCase(int mode) {
             EXPECT_TRUE(dispatcher.received.empty());
             EXPECT_EQ(dispatcher.active, 1);
         }
-        EXPECT_LE(BufferCount(), 4 * 1024 * 1024 / buf::Buffer::kSize + 32);
+        EXPECT_LE(BufferCount(), 4 * 1024 * 1024 / common::Buffer::kSize + 32);
         if (mode == 3) {
             cancellation.emit(net::cancellation_type::terminal);
         } else {
@@ -1162,18 +1162,18 @@ void RunMuxUdpCase(int mode) {
                 EXPECT_EQ(packet.bytes, expected_packets[i].bytes);
             }
         }
-        buf::MultiBuffer output;
-        EXPECT_TRUE(buf::AppendSpanToMultiBuffer(stream.output, output));
+        common::MultiBuffer output;
+        EXPECT_TRUE(common::AppendSpanToMultiBuffer(stream.output, output));
         size_t replies = 0;
         while (!output.empty()) {
-            const auto frame = mux::DecodeFrame(output);
+            const auto frame = common::DecodeFrame(output);
             {
                 EXPECT_TRUE(frame);
                 if (!frame) break;
                 EXPECT_NE(frame->frame_size, 0);
             }
             if (!frame || frame->frame_size == 0) break;
-            if (frame->status == mux::SessionStatus::KEEP) {
+            if (frame->status == common::SessionStatus::KEEP) {
                 {
                     EXPECT_TRUE(frame->has_data);
                     EXPECT_TRUE(frame->has_target);
@@ -1285,9 +1285,9 @@ struct PeerVersion { std::string_view text; uint32_t version; };
 class AnyTlsPeerVersion : public testing::TestWithParam<PeerVersion> {};
 TEST_P(AnyTlsPeerVersion, ParsesExactVersionKeyWithoutNarrowing) {
     const auto& value = GetParam();
-    const auto parsed = proxy::anytls::ParsePeerSettings(value.text);
+    const auto parsed = proxy::ParsePeerSettings(value.text);
     ASSERT_TRUE(parsed);
-    EXPECT_EQ(parsed->version, value.version >= 2 ? proxy::anytls::SessionVersion::V2 : proxy::anytls::SessionVersion::V1);
+    EXPECT_EQ(parsed->version, value.version >= 2 ? proxy::SessionVersion::V2 : proxy::SessionVersion::V1);
 }
 INSTANTIATE_TEST_SUITE_P(ValidSettings, AnyTlsPeerVersion, testing::Values(
 PeerVersion{"", 1}, PeerVersion{"v=1", 1}, PeerVersion{"v=2", 2}, PeerVersion{"v=3", 3},
@@ -1297,7 +1297,7 @@ PeerVersion{"", 1}, PeerVersion{"v=1", 1}, PeerVersion{"v=2", 2}, PeerVersion{"v
         PeerVersion{"padding-md5=v=2", 1}, PeerVersion{"client=x\nclient=y\nv=1", 1}));
 class AnyTlsMalformedPeerSettings : public testing::TestWithParam<std::string_view> {};
 TEST_P(AnyTlsMalformedPeerSettings, RejectsMalformedSettingsAtomically) {
-    const auto parsed = proxy::anytls::ParsePeerSettings(GetParam());
+    const auto parsed = proxy::ParsePeerSettings(GetParam());
     ASSERT_FALSE(parsed);
     EXPECT_EQ(parsed.error(), common::ErrorCode::PROTOCOL_DECODE_FAILED);
 }

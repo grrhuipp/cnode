@@ -12,9 +12,9 @@
 #include <stdexcept>
 #include <span>
 
-namespace app::dns {
+namespace app {
 
-namespace wire {
+namespace {
 
 constexpr uint16_t FLAG_QR    = 0x8000;
 constexpr uint16_t FLAG_RCODE = 0x000F;
@@ -25,9 +25,6 @@ constexpr uint16_t TYPE_AAAA  = 28;
 constexpr uint8_t RCODE_OK         = 0;
 constexpr uint8_t RCODE_NAME_ERROR = 3;
 
-}  // namespace wire
-
-namespace {
 
 constexpr size_t kAddressQueryAttempts = 3;
 
@@ -44,7 +41,7 @@ void AppendUniqueAddresses(
 }  // namespace
 
 struct DNSWorker::Impl {
-    Impl(net::io_context& io_context, const Config& config, size_t mailbox_capacity);
+    Impl(net::io_context& io_context, const DnsConfig& config, size_t mailbox_capacity);
 
     net::awaitable<DnsResult> ResolveOwned(std::string domain);
 
@@ -63,7 +60,7 @@ struct DNSWorker::Impl {
                             bool query_aaaa);
 
     net::io_context& io_context;
-    const Config config;
+    const DnsConfig config;
     DnsCache cache;
     InflightResolves inflight_resolves;
     std::vector<std::shared_ptr<DatagramExchange>> upstreams;
@@ -71,7 +68,7 @@ struct DNSWorker::Impl {
     bool stopping = false;
 };
 
-DNSWorker::Impl::Impl(net::io_context& io_context, const Config& config,
+DNSWorker::Impl::Impl(net::io_context& io_context, const DnsConfig& config,
                       size_t mailbox_capacity)
     : io_context(io_context)
     , config(config)
@@ -103,20 +100,20 @@ net::awaitable<DnsResult> DNSWorker::Impl::ResolveOwned(std::string owned_domain
         cancelled.error = common::ErrorCode::CANCELLED;
         co_return cancelled;
     }
-    if (const auto address = iputil::ParseLiteral(domain)) {
+    if (const auto address = common::ParseLiteral(domain)) {
         DnsResult result;
         result.addresses.reserve(1);
         result.addresses.push_back(*address);
         co_return result;
     }
-    if (!::domain::IsValidDnsHostname(
-            domain, ::domain::TrailingDotPolicy::Allow)) {
+    if (!common::IsValidDnsHostname(
+            domain, common::TrailingDotPolicy::Allow)) {
         DnsResult result;
         result.error = common::ErrorCode::INVALID_ARGUMENT;
         co_return result;
     }
 
-    ::domain::NormalizeDnsHostnameInPlace(owned_domain);
+    common::NormalizeDnsHostnameInPlace(owned_domain);
     domain = owned_domain;
     auto cached = cache.GetResult(domain);
     auto result = cached ? std::move(*cached) :
@@ -240,7 +237,7 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
         const auto& endpoint = config.servers[server_index];
         auto reason = std::format(
             "server {} port {} > A: {} > {}; AAAA: {} > {}",
-            iputil::AddressText(endpoint.address()).View(), endpoint.port(),
+            common::AddressText(endpoint.address()).View(), endpoint.port(),
             common::ErrorCodeToString(a_result.error), a_result.error_msg,
             common::ErrorCodeToString(aaaa_result.error), aaaa_result.error_msg);
         last_result = a_result.error == common::ErrorCode::DNS_NO_RECORD && !no_records
@@ -304,7 +301,7 @@ size_t DNSWorker::Impl::BuildQueryTo(
     }
     query[out++] = 0x00;
 
-    const uint16_t qtype = query_aaaa ? wire::TYPE_AAAA : wire::TYPE_A;
+    const uint16_t qtype = query_aaaa ? TYPE_AAAA : TYPE_A;
     common::StoreU16BE(query.data() + out, qtype);
     common::StoreU16BE(query.data() + out + 2, 1);
     return out + 4;
@@ -328,14 +325,14 @@ DnsResult DNSWorker::Impl::ParseResponse(
     }
 
     const uint16_t flags = common::LoadU16BE(response.data() + 2);
-    if (!(flags & wire::FLAG_QR) || (flags & 0x0200)) {
+    if (!(flags & FLAG_QR) || (flags & 0x0200)) {
         result.error = common::ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS packet is not a complete response";
         return result;
     }
 
-    const uint8_t rcode = flags & wire::FLAG_RCODE;
-    if (rcode != wire::RCODE_OK && rcode != wire::RCODE_NAME_ERROR) {
+    const uint8_t rcode = flags & FLAG_RCODE;
+    if (rcode != RCODE_OK && rcode != RCODE_NAME_ERROR) {
         switch (rcode) {
             case 2:
                 result.error = common::ErrorCode::DNS_SERVER_FAILED;
@@ -361,66 +358,22 @@ DnsResult DNSWorker::Impl::ParseResponse(
         return result;
     }
 
-    auto skip_dns_name = [&](size_t& offset) noexcept {
-        size_t current_offset = offset;
-        size_t next_offset = 0;
-        size_t wire_len = 0;
-        bool jumped = false;
-        while (current_offset < response.size()) {
-            const uint8_t len = response[current_offset];
-            if (len == 0) {
-                if (wire_len + 1 > 255) {
-                    return false;
-                }
-                offset = jumped ? next_offset : current_offset + 1;
-                return true;
-            }
-            if ((len & 0xC0) == 0xC0) {
-                if (current_offset + 1 >= response.size()) {
-                    return false;
-                }
-                const size_t ptr = common::LoadU16BE(response.data() + current_offset) & 0x3FFFu;
-                if (ptr < 12 || ptr >= current_offset) {
-                    return false;
-                }
-                if (!jumped) {
-                    next_offset = current_offset + 2;
-                    jumped = true;
-                }
-                current_offset = ptr;
-                continue;
-            }
-            if ((len & 0xC0) != 0) {
-                return false;
-            }
-            if (response.size() - current_offset <= static_cast<size_t>(len) + 1) {
-                return false;
-            }
-            wire_len += static_cast<size_t>(len) + 1;
-            if (wire_len >= 255) {
-                return false;
-            }
-            current_offset += static_cast<size_t>(len) + 1;
-        }
-        return false;
-    };
-
     size_t pos = 12;
-    if (!skip_dns_name(pos) || pos + 4 > response.size()) {
+    if (!DatagramExchange::SkipWireName(response, pos) || pos + 4 > response.size()) {
         result.error = common::ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS question section truncated";
         return result;
     }
     const uint16_t qtype = common::LoadU16BE(response.data() + pos);
     const uint16_t qclass = common::LoadU16BE(response.data() + pos + 2);
-    if (qtype != (query_aaaa ? wire::TYPE_AAAA : wire::TYPE_A) || qclass != 1) {
+    if (qtype != (query_aaaa ? TYPE_AAAA : TYPE_A) || qclass != 1) {
         result.error = common::ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS question section invalid";
         return result;
     }
     pos += 4;
 
-    if (rcode == wire::RCODE_NAME_ERROR) {
+    if (rcode == RCODE_NAME_ERROR) {
         result.error = common::ErrorCode::DNS_NO_RECORD;
         result.error_msg = "NXDOMAIN";
         return result;
@@ -443,7 +396,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
     uint32_t min_ttl = UINT32_MAX;
 
     for (uint16_t i = 0; i < ancount; ++i) {
-        if (!skip_dns_name(pos) || pos + 10 > response.size()) {
+        if (!DatagramExchange::SkipWireName(response, pos) || pos + 10 > response.size()) {
             result.error = common::ErrorCode::DNS_FORMAT_ERROR;
             result.error_msg = "DNS answer header truncated";
             return result;
@@ -467,26 +420,26 @@ DnsResult DNSWorker::Impl::ParseResponse(
             return result;
         }
 
-        if ((type == wire::TYPE_A && rdlength != 4) ||
-            (type == wire::TYPE_AAAA && rdlength != 16)) {
+        if ((type == TYPE_A && rdlength != 4) ||
+            (type == TYPE_AAAA && rdlength != 16)) {
             result.error = common::ErrorCode::DNS_FORMAT_ERROR;
             result.error_msg = std::format("DNS {} record has invalid RDLENGTH {} (expected {})",
-                type == wire::TYPE_A ? "A" : "AAAA", rdlength,
-                type == wire::TYPE_A ? 4 : 16);
+                type == TYPE_A ? "A" : "AAAA", rdlength,
+                type == TYPE_A ? 4 : 16);
             return result;
         }
 
-        if (!query_aaaa && type == wire::TYPE_A) {
+        if (!query_aaaa && type == TYPE_A) {
             min_ttl = std::min(min_ttl, ttl);
             net::ip::address_v4::bytes_type bytes;
             std::memcpy(bytes.data(), &response[pos], 4);
             addresses.emplace_back(net::ip::address_v4(bytes));
-        } else if (query_aaaa && type == wire::TYPE_AAAA) {
+        } else if (query_aaaa && type == TYPE_AAAA) {
             min_ttl = std::min(min_ttl, ttl);
             net::ip::address_v6::bytes_type bytes;
             std::memcpy(bytes.data(), &response[pos], 16);
             addresses.emplace_back(net::ip::address_v6(bytes));
-        } else if (type == wire::TYPE_CNAME) {
+        } else if (type == TYPE_CNAME) {
             min_ttl = std::min(min_ttl, ttl);
         }
         pos += rdlength;
@@ -504,7 +457,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
 }
 
 DNSWorker::DNSWorker(net::io_context& main_context,
-                     const Config& config, size_t mailbox_capacity)
+                     const DnsConfig& config, size_t mailbox_capacity)
     : impl_(std::make_unique<Impl>(main_context, config, mailbox_capacity)) {}
 
 DNSWorker::~DNSWorker() = default;
@@ -546,10 +499,4 @@ net::awaitable<DnsCacheStats> DNSWorker::GetCacheStats() {
     return impl_->mailbox.PostCall([impl = impl_.get()] { return impl->cache.GetStats(); });
 }
 
-net::awaitable<DnsResult> DNS::Resolve(std::string_view domain) {
-    // Capture the caller's view now, before the bounded mailbox hands the
-    // owned request to the main loop. The client has no live DNS state.
-    return worker_.Resolve(std::string(domain));
-}
-
-}  // namespace app::dns
+}  // namespace app

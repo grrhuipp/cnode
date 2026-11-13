@@ -1,8 +1,8 @@
 #include "transport_coordinator_fixture.hpp"
 #include <gtest/gtest.h>
 
-#include "transport/internet/tcp_stream.hpp"
-#include "transport/internet/transport_stack.hpp"
+#include "transport/tcp_stream.hpp"
+#include "transport/transport_stack.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/write.hpp>
@@ -84,11 +84,11 @@ struct WireFrame {
 
 // The sink deliberately retains request ownership without starting a reader.
 // Tests can consume, reject, half-close, or destroy exactly one logical stream.
-class HoldingSink final : public ::transport::internet::InboundTransportStreamHandler {
+class HoldingSink final : public ::transport::InboundTransportStreamHandler {
 public:
     net::awaitable<void> OnInboundTransportStream(
         std::unique_ptr<::transport::AsyncStream> stream,
-        ::transport::internet::InboundTransportMetadata) override {
+        ::transport::InboundTransportMetadata) override {
         if (reject) throw std::runtime_error("fixture rejects callback");
         streams.push_back(std::move(stream));
         co_return;
@@ -100,9 +100,9 @@ public:
 class Fixture {
 public:
     explicit Fixture(std::string_view network = "http", uint32_t initial_window = kStreamWindow,
-                     ::transport::internet::XHttpMode mode = ::transport::internet::XHttpMode::StreamOne)
+                     ::transport::XHttpMode mode = ::transport::XHttpMode::StreamOne)
         : acceptor(io, {net::ip::address_v4::loopback(), 0}), peer(io), sink(std::make_shared<HoldingSink>()) {
-        settings.network_mode = transport::internet::ParseNetworkMode(network);
+        settings.network_mode = transport::ParseNetworkMode(network);
         settings.http.force_http2 = common::EqualsAsciiCI(network, "h2");
         settings.http.path = "/fixture";
         settings.http.method = "POST";
@@ -111,11 +111,11 @@ public:
         settings.grpc.initial_window_size = initial_window;
         settings.xhttp.path = "/fixture";
         settings.xhttp.mode = mode;
-        settings = ::transport::internet::NormalizeStreamSettings(settings);
+        settings = ::transport::NormalizeStreamSettings(settings);
         peer.connect(acceptor.local_endpoint());
         ::tcp::socket accepted(io);
         acceptor.accept(accepted);
-        raw = std::make_unique<::transport::internet::TcpStream>(std::move(accepted));
+        raw = std::make_unique<::transport::TcpStream>(std::move(accepted));
         net::co_spawn(io, Serve(), [this](std::exception_ptr error) {
             failure = error;
             returned = true;
@@ -137,7 +137,7 @@ public:
     }
 
     net::awaitable<void> Serve() {
-        const auto result = co_await ::transport::internet::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr, 0, sink);
+        const auto result = co_await ::transport::BuildInboundTransport(transport_coordinator.Coordinator(), io, std::move(raw), settings, nullptr, 0, sink);
         EXPECT_TRUE(result.has_value() && !*result) << "HTTP/2 server build failed";
     }
 
@@ -276,7 +276,7 @@ public:
     ::tcp::acceptor acceptor;
     ::tcp::socket peer;
     std::shared_ptr<HoldingSink> sink;
-    ::transport::internet::StreamSettings settings;
+    ::transport::StreamSettings settings;
     std::unique_ptr<::transport::AsyncStream> raw;
     std::vector<WireFrame> frames;
     std::string wire;
@@ -502,11 +502,11 @@ void GrpcFragmentedMessageAdvancesWindow(uint32_t window, size_t body_size) {
     f.Stop();
 }
 
-void XHttpSplitCredit(::transport::internet::XHttpMode mode) {
+void XHttpSplitCredit(::transport::XHttpMode mode) {
     Fixture f("xhttp", kStreamWindow, mode);
-    const std::string session = mode == ::transport::internet::XHttpMode::StreamUp ? "/fixture/receive-stream" : "/fixture/receive-packet";
+    const std::string session = mode == ::transport::XHttpMode::StreamUp ? "/fixture/receive-stream" : "/fixture/receive-packet";
     f.Open(1, session, "GET", true);
-    const bool packet = mode == ::transport::internet::XHttpMode::PacketUp;
+    const bool packet = mode == ::transport::XHttpMode::PacketUp;
     f.Open(3, packet ? session + "/0" : session);
     f.Send(Frame(0, packet ? 1 : 0, 3, "upload"));
     f.Barrier();
@@ -603,7 +603,7 @@ INSTANTIATE_TEST_SUITE_P(Windows, GrpcReceiveWindow, testing::Values(
     std::pair<uint32_t, size_t>{32, 4096},
     std::pair<uint32_t, size_t>{65535, kStreamWindow - 5},
     std::pair<uint32_t, size_t>{kStreamWindow, kStreamWindow - 5}));
-class XHttpReceiveCredit : public testing::TestWithParam<::transport::internet::XHttpMode> {};
+class XHttpReceiveCredit : public testing::TestWithParam<::transport::XHttpMode> {};
 TEST_P(XHttpReceiveCredit, SplitUploadReclaimsExactCredit) { XHttpSplitCredit(GetParam()); }
 INSTANTIATE_TEST_SUITE_P(Modes, XHttpReceiveCredit,
-    testing::Values(::transport::internet::XHttpMode::StreamUp, ::transport::internet::XHttpMode::PacketUp));
+    testing::Values(::transport::XHttpMode::StreamUp, ::transport::XHttpMode::PacketUp));

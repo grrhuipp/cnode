@@ -1,0 +1,73 @@
+#pragma once
+
+#include "common/asio_types.hpp"
+
+#include <asio/cancel_after.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/use_awaitable.hpp>
+#include <chrono>
+#include <exception>
+#include <format>
+#include <optional>
+#include <string>
+#include <system_error>
+#include <utility>
+
+namespace api {
+
+struct PanelHttpResponse {
+    int status = 0;
+    std::string body{};
+    std::string etag{};
+    bool not_modified = false;
+};
+
+// Cancels and joins the owning exchange; completed responses remain authoritative.
+inline net::awaitable<PanelHttpResponse> ExecutePanelHttpRequest(
+    net::awaitable<PanelHttpResponse> exchange,
+    std::chrono::steady_clock::duration timeout) {
+    struct RequestCancelled {};
+    const auto executor = co_await net::this_coro::executor;
+    const auto caller_cancellation = co_await net::this_coro::cancellation_state;
+    const auto execute = [](net::awaitable<PanelHttpResponse> task) -> net::awaitable<PanelHttpResponse> {
+        const auto cancellation = co_await net::this_coro::cancellation_state;
+        try {
+            auto response = co_await std::move(task);
+            if (response.status <= 0 && cancellation.cancelled() != net::cancellation_type::none)
+                throw RequestCancelled{};
+            co_return response;
+        } catch (const std::system_error&) {
+            if (cancellation.cancelled() != net::cancellation_type::none)
+                throw RequestCancelled{};
+            throw;
+        }
+    };
+    const bool throw_if_cancelled = co_await net::this_coro::throw_if_cancelled();
+    co_await net::this_coro::throw_if_cancelled(false);
+    std::optional<PanelHttpResponse> result;
+    std::exception_ptr failure;
+    try {
+        result.emplace(co_await net::co_spawn(executor, execute(std::move(exchange)),
+            net::cancel_after(timeout, net::use_awaitable)));
+    } catch (const RequestCancelled&) {
+        if (caller_cancellation.cancelled() != net::cancellation_type::none)
+            failure = std::make_exception_ptr(std::system_error(net::error::operation_aborted));
+        else
+            result.emplace(PanelHttpResponse{-1, std::format("HTTP request timed out after {} ms",
+                std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count()), {}, false});
+    } catch (const std::system_error& error) {
+        if (caller_cancellation.cancelled() != net::cancellation_type::none)
+            failure = std::current_exception();
+        else
+            result.emplace(PanelHttpResponse{-1, error.what(), {}, false});
+    } catch (const std::exception& error) {
+        result.emplace(PanelHttpResponse{-1, error.what(), {}, false});
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    co_await net::this_coro::throw_if_cancelled(throw_if_cancelled);
+    if (failure) std::rethrow_exception(failure);
+    co_return std::move(*result);
+}
+
+}  // namespace api

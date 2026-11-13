@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "service/controller/node_transaction.hpp"
-
+#include "controller/node_transaction.hpp"
 namespace {
 struct TlsCase { const char* protocol; bool panel; bool node; bool enabled; };
 class InboundTlsPolicy : public testing::TestWithParam<TlsCase> {};

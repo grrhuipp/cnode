@@ -9,7 +9,7 @@
 #include <thread>
 
 namespace {
-using namespace ::proxy::vless;
+using namespace ::proxy;
 using Ticket = std::array<uint8_t, 16>;
 net::awaitable<bool> Seed(app::GroupCoordinator& coordinator,
                          std::shared_ptr<const VlessEncryptionConfig> config,

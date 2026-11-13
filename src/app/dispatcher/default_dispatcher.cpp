@@ -2,26 +2,27 @@
 #include "app/relay.hpp"
 
 #include "common/allocator.hpp"
-#include "common/awaitable_task_group.hpp"
 
 #include "app/stats.hpp"
 #include "app/request_load.hpp"
 #include "app/dns/dns.hpp"
 #include "common/session.hpp"
 #include "common/rule.hpp"
-#include "app/proxyman/outbound/handler.hpp"
+#include "app/proxyman/outbound_handler.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
-#include "features/routing/router.hpp"
+#include "routing/router.hpp"
 #include "sniff/sniffer.hpp"
 #include "transport/link.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/failure.hpp"
-#include "common/buf/multi_buffer.hpp"
-
+#include "common/multi_buffer.hpp"
 #include <algorithm>
+#include <asio/async_result.hpp>
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/co_spawn.hpp>
 #include <asio/experimental/awaitable_operators.hpp>
-#include "transport/internet/async_delay.hpp"
+#include "transport/async_delay.hpp"
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 #include <charconv>
@@ -33,12 +34,12 @@
 #include <vector>
 #include <variant>
 
-namespace app::dispatcher {
+namespace app {
 
 namespace {
 
 void ApplySniffOverride(
-    session::Context& ctx,
+    common::Context& ctx,
     const routing::SniffConfig& sniffing,
     const sniff::SniffResult& result) {
     if (!result.success) {
@@ -79,7 +80,7 @@ void ApplySniffOverride(
 
 // Dispatch 顶层唯一的失败收尾，必须在 catch 处理块内调用：错误码只经
 // ClassifyFailure 分类；请求取消且已有更具体的结果时保留原结果。
-void FinishDispatchFailure(session::Context& ctx, StatsShard& stats,
+void FinishDispatchFailure(common::Context& ctx, StatsShard& stats,
                            RelayResult& result, const char* detail) noexcept {
     const common::ErrorCode error = transport::ClassifyFailure(
         std::current_exception(), common::ErrorCode::INTERNAL);
@@ -109,9 +110,9 @@ net::awaitable<bool> SniffInitialPayload(
     transport::MultiBufferReader* inbound_reader,
     transport::AsyncStream* inbound_control,
     common::InitialPayload& first_packet,
-    session::Context& ctx,
+    common::Context& ctx,
     StatsShard& stats,
-    buf::MultiBufferBatch& outbound_first_payload,
+    common::MultiBufferBatch& outbound_first_payload,
     RelayResult& result,
     common::ErrorCode& cancellation_reason,
     const net::cancellation_state& sniff_cancellation) {
@@ -120,13 +121,13 @@ net::awaitable<bool> SniffInitialPayload(
     const size_t sniff_byte_limit = datagram ? 64 * 1024 : 4096;
     static constexpr size_t kSniffMaxDatagrams = 64;
     static constexpr auto kSniffWindow = std::chrono::milliseconds(200);
-    buf::MultiBuffer sniff_payload;
-    std::pmr::vector<uint8_t> sniff_scratch(memory::process_resource());
+    common::MultiBuffer sniff_payload;
+    std::vector<uint8_t> sniff_scratch;
     sniff::Sniffer sniffer;
     size_t cached_bytes = 0;
     size_t cached_datagrams = 0;
 
-    auto copy_cached_bytes = [&](const buf::MultiBuffer& mb) {
+    auto copy_cached_bytes = [&](const common::MultiBuffer& mb) {
         const size_t total = mb.byte_size();
         if (total == 0) {
             return std::span<const uint8_t>{};
@@ -167,7 +168,7 @@ net::awaitable<bool> SniffInitialPayload(
         // and the capture of its failure for the timer race below.
         auto read_more = [&]() -> net::awaitable<void> {
             try {
-                buf::MultiBuffer payload;
+                common::MultiBuffer payload;
                 try {
                     payload = co_await inbound_reader->ReadMultiBuffer();
                 } catch (const IoSystemError& e) {
@@ -239,8 +240,7 @@ net::awaitable<bool> SniffInitialPayload(
                 break;
             }
             read = {};
-            std::pmr::vector<uint8_t>(sniff_scratch.get_allocator()).swap(sniff_scratch);
-            transport::internet::AsyncDelay delay(io_context);
+            transport::AsyncDelay delay(io_context);
             auto next = co_await (read_more() || delay.WaitFor(remaining));
             if (sniff_cancellation.cancelled() != net::cancellation_type::none) {
                 throw IoSystemError(net::error::operation_aborted);
@@ -286,7 +286,7 @@ struct ActiveSessionScope {
     app::SessionTrackingState& session_tracking;
     app::SessionTrackingState::ActiveSession node{};
 
-    ActiveSessionScope(session::Context& session_ctx,
+    ActiveSessionScope(common::Context& session_ctx,
                        app::SessionTrackingState& tracking)
         : session_tracking(tracking) {
         if (session_ctx.inbound.user_id > 0) {
@@ -307,10 +307,10 @@ struct ActiveSessionScope {
 
 DefaultDispatcher::DefaultDispatcher(
     const routing::Router& router,
-    const proxyman::outbound::HandlerRegistry& outbound_handlers,
-    rule::DetectRulePolicy& request_policy,
+    const OutboundHandlerRegistry& outbound_handlers,
+    common::DetectRulePolicy& request_policy,
     app::SessionTrackingState& session_tracking,
-    app::dns::DNS& dns_service,
+    app::DNS& dns_service,
     app::RequestLoadState& request_load) noexcept
     : router_(router)
     , outbound_handlers_(outbound_handlers)
@@ -325,20 +325,74 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     std::unique_ptr<transport::AsyncStream> inbound,
     transport::Link inbound_link,
     common::InitialPayload first_packet,
-    session::Context& ctx,
+    common::Context& ctx,
     StatsShard& stats,
     const infra::TimeoutsConfig& timeouts) {
     app::RequestLoadState::DispatchScope load_scope(request_load_);
     const uint32_t pressure_idle_timeout = request_load_.PressureIdleTimeout();
     RelayResult result;
     common::ErrorCode cancellation_reason = common::ErrorCode::OK;
+    struct RequestCancellation final : transport::CancellationSubscription {
+        net::cancellation_slot parent_slot;
+        net::cancellation_signal signal;
+        common::ErrorCode& reason;
+        explicit RequestCancellation(common::ErrorCode& r) noexcept : reason(r) {}
+        ~RequestCancellation() {
+            if (parent_slot.is_connected()) parent_slot.clear();
+        }
+        void BindParent(net::cancellation_slot slot) noexcept {
+            parent_slot = slot;
+            if (parent_slot.is_connected()) {
+                parent_slot.assign([this](net::cancellation_type type) {
+                    signal.emit(type);
+                });
+            }
+        }
+    private:
+        void OnCancellation(transport::Cancellation event) noexcept override {
+            reason = event.reason == common::ErrorCode::OK ? common::ErrorCode::CANCELLED : event.reason;
+            signal.emit(net::cancellation_type::all);
+        }
+    } cancellation(cancellation_reason);
+
     try {
-        co_await common::RunAwaitableTaskGroup(co_await net::this_coro::executor, [&](common::AwaitableTaskGroup& group) {
-            group.Spawn(DispatchPreparedLink(
-                io_context, policy, std::move(inbound), inbound_link,
-                first_packet, ctx, stats, timeouts, pressure_idle_timeout,
-                result, group, cancellation_reason));
-        });
+        const auto parent_cancellation = co_await net::this_coro::cancellation_state;
+        if (parent_cancellation.cancelled() != net::cancellation_type::none) {
+            throw IoSystemError(net::error::operation_aborted);
+        }
+        auto* cancellation_reader = inbound_link.Valid() ? inbound_link.reader : inbound.get();
+        if (cancellation_reader) {
+            cancellation.Resubscribe(cancellation_reader->Cancellation());
+        }
+        if (cancellation_reason != common::ErrorCode::OK) {
+            stats.OnError();
+            co_return MakeRelayError(cancellation_reason);
+        }
+        auto exec = co_await net::this_coro::executor;
+        co_await net::async_initiate<const net::use_awaitable_t<>&, void(std::exception_ptr)>(
+            [&, exec = std::move(exec),
+             task = DispatchPreparedLink(
+                 io_context, policy, std::move(inbound), inbound_link,
+                 first_packet, ctx, stats, timeouts, pressure_idle_timeout,
+                 result, cancellation_reason)](auto handler) mutable {
+                cancellation.BindParent(net::get_associated_cancellation_slot(handler));
+                net::co_spawn(
+                    exec,
+                    std::move(task),
+                    net::bind_cancellation_slot(
+                        cancellation.signal.slot(),
+                        [handler = std::move(handler), &cancellation](std::exception_ptr error) mutable {
+                            cancellation.Unsubscribe();
+                            if (cancellation.parent_slot.is_connected()) {
+                                cancellation.parent_slot.clear();
+                            }
+                            std::move(handler)(std::move(error));
+                        }));
+            },
+            net::use_awaitable);
+        if (parent_cancellation.cancelled() != net::cancellation_type::none) {
+            throw IoSystemError(net::error::operation_aborted);
+        }
     } catch (const std::exception& e) {
         FinishDispatchFailure(ctx, stats, result, e.what());
     } catch (...) {
@@ -356,36 +410,12 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     std::unique_ptr<transport::AsyncStream> inbound,
     transport::Link inbound_link,
     common::InitialPayload& first_packet,
-    session::Context& ctx,
+    common::Context& ctx,
     StatsShard& stats,
     const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout,
     RelayResult& result,
-    common::AwaitableTaskGroup& request_group,
     common::ErrorCode& cancellation_reason) {
-
-    struct RequestCancellation final : transport::CancellationSubscription {
-        RequestCancellation(common::AwaitableTaskGroup& group, common::ErrorCode& reason) noexcept
-            : group(group), reason(reason) {}
-        common::AwaitableTaskGroup& group;
-        common::ErrorCode& reason;
-
-    private:
-        void OnCancellation(transport::Cancellation event) noexcept override {
-            reason = event.reason == common::ErrorCode::OK ? common::ErrorCode::CANCELLED : event.reason;
-            group.Cancel();
-        }
-    } cancellation(request_group, cancellation_reason);
-    auto* cancellation_reader = inbound_link.Valid() ? inbound_link.reader : inbound.get();
-    if (cancellation_reader) {
-        cancellation.Resubscribe(cancellation_reader->Cancellation());
-    }
-    if (cancellation_reason != common::ErrorCode::OK) {
-        stats.OnError();
-        result = MakeRelayError(cancellation_reason);
-        co_return;
-    }
-
     const bool has_protocol_link = inbound_link.Valid();
     if (!inbound && !has_protocol_link) {
         stats.OnError();
@@ -414,7 +444,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     LOG_CONN_DEBUG(ctx, "protocol authenticated target={} email={}",
                    ctx.outbound.target, ctx.inbound.user_email);
 
-    buf::MultiBufferBatch outbound_first_payload;
+    common::MultiBufferBatch outbound_first_payload;
     const auto sniff_cancellation = co_await net::this_coro::cancellation_state;
     if (policy.sniffing.enabled && !policy.sniffing.metadata_only) {
         if (!co_await SniffInitialPayload(
@@ -435,17 +465,17 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     // Only an unresolved domain under a resolving strategy can need DNS, and
     // IPIfNonMatch needs it only after the domain itself matched no rule.
     const auto strategy =
-        detail::RequiresRouting(policy.outbound) && route_target.IsDomain() &&
+        RequiresRouting(policy.outbound) && route_target.IsDomain() &&
                 !route_target.resolved_addr
             ? router_.DomainStrategy()
             : routing::DomainStrategy::AsIs;
-    std::optional<detail::OutboundSelection> selection;
+    std::optional<OutboundSelection> selection;
     if (strategy != routing::DomainStrategy::IPOnDemand) {
         selection = SelectRoute(ctx, policy);
     }
     RouteResult dispatch =
         (selection && (strategy == routing::DomainStrategy::AsIs ||
-                       selection->source != detail::SelectionSource::Fallback))
+                       selection->source != SelectionSource::Fallback))
             ? FinishRoute(ctx, *selection)
             : co_await RouteAsync(ctx, policy, selection);
     auto outbound_handler = std::move(dispatch.handler);
@@ -552,10 +582,10 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
 }
 
 DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
-    session::Context& ctx,
-    const detail::OutboundSelection& selection) const {
+    common::Context& ctx,
+    const OutboundSelection& selection) const {
     ctx.outbound.tag = selection.outbound_tag;
-    if (selection.source == detail::SelectionSource::Forced) {
+    if (selection.source == SelectionSource::Forced) {
         LOG_CONN_DEBUG(ctx, "selected fixed route target={}", ctx.outbound.target);
     } else {
         LOG_CONN_DEBUG(ctx, "selected route target={}", ctx.outbound.target);
@@ -582,30 +612,30 @@ DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
     };
 }
 
-detail::OutboundSelection DefaultDispatcher::SelectRoute(
-    session::Context& ctx,
+OutboundSelection DefaultDispatcher::SelectRoute(
+    common::Context& ctx,
     const routing::DispatchPolicy& policy) const {
     routing::RouteDecision decision;
-    if (detail::RequiresRouting(policy.outbound)) {
+    if (RequiresRouting(policy.outbound)) {
         decision = router_.Route(ctx);
     }
 
-    return detail::SelectOutbound(policy.outbound, decision);
+    return SelectOutbound(policy.outbound, decision);
 }
 
 // Entered only for an unresolved domain whose strategy needs DNS: IPOnDemand
 // (no initial selection) or IPIfNonMatch after the domain fell back.
 net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
-    session::Context& ctx,
+    common::Context& ctx,
     const routing::DispatchPolicy& policy,
-    std::optional<detail::OutboundSelection> initial_selection) {
+    std::optional<OutboundSelection> initial_selection) {
     common::TargetAddress& route_target = ctx.outbound.route_target.IsValid()
         ? ctx.outbound.route_target
         : ctx.outbound.target;
     const bool sync_dial_target =
         &route_target == &ctx.outbound.target ||
         (ctx.outbound.target.IsDomain() &&
-         domain::DnsHostnamesEqual(ctx.outbound.target.host, route_target.host));
+         common::DnsHostnamesEqual(ctx.outbound.target.host, route_target.host));
 
     auto set_resolved_address = [&](const net::ip::address& addr) {
         route_target.resolved_addr = addr;
@@ -615,7 +645,7 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
     };
 
     auto select_with_addresses =
-        [&](const std::vector<net::ip::address>& addresses) -> detail::OutboundSelection {
+        [&](const std::vector<net::ip::address>& addresses) -> OutboundSelection {
             auto select_address = [&](const net::ip::address& addr) {
                 set_resolved_address(addr);
                 return SelectRoute(ctx, policy);
@@ -623,13 +653,13 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
 
             auto address = addresses.begin();
             auto last = select_address(*address);
-            if (last.source != detail::SelectionSource::Fallback) {
+            if (last.source != SelectionSource::Fallback) {
                 return last;
             }
             for (++address; address != addresses.end(); ++address) {
                 auto selection = select_address(*address);
                 last = selection;
-                if (selection.source != detail::SelectionSource::Fallback) {
+                if (selection.source != SelectionSource::Fallback) {
                     return selection;
                 }
             }
@@ -654,4 +684,4 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
         initial_selection ? *initial_selection : SelectRoute(ctx, policy));
 }
 
-}  // namespace app::dispatcher
+}  // namespace app

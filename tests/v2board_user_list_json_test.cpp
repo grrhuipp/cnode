@@ -1,15 +1,14 @@
 #include <gtest/gtest.h>
 
-#include "api/v2board/panel_data.hpp"
-
+#include "api/panel_data.hpp"
 #include <limits>
 #include <string_view>
 
 namespace {
 
 auto Parse(std::string_view body) {
-    const auto parsed = ::json::parse(body);
-    return ::api::v2board::ParseUserList(parsed.as_object());
+    const auto parsed = ::infra::parse(body);
+    return ::api::ParseUserList(parsed.as_object());
 }
 
 TEST(V2BoardUserListJson, ValidUsersAreNormalized) {

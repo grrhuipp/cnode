@@ -2,7 +2,6 @@
 
 #include "app/session_group_executor.hpp"
 #include "proxy/shadowsocks/ss_salt_pool.hpp"
-
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
@@ -16,18 +15,18 @@
 #include <thread>
 
 namespace {
-using Admission = proxy::shadowsocks::Ss2022SaltAdmission;
-using Clock = proxy::shadowsocks::Ss2022SaltPool::Clock;
+using Admission = proxy::Ss2022SaltAdmission;
+using Clock = proxy::Ss2022SaltPool::Clock;
 
-proxy::shadowsocks::KeyBytes Salt(uint8_t byte, uint8_t size = 16) {
-    proxy::shadowsocks::KeyBytes salt;
+proxy::KeyBytes Salt(uint8_t byte, uint8_t size = 16) {
+    proxy::KeyBytes salt;
     salt.size = size;
     salt.bytes.fill(byte);
     return salt;
 }
 
 TEST(Ss2022SaltPool, KeysContainFullSaltAndLength) {
-    proxy::shadowsocks::Ss2022SaltPool pool;
+    proxy::Ss2022SaltPool pool;
     const auto now = Clock::time_point{};
     auto short_salt = Salt(7);
     auto long_salt = Salt(7, 32);
@@ -41,18 +40,18 @@ TEST(Ss2022SaltPool, KeysContainFullSaltAndLength) {
 }
 
 TEST(Ss2022SaltPool, RetainsUntilExactSixtyFiveSecondBoundaryWithoutRefreshingReplay) {
-    proxy::shadowsocks::Ss2022SaltPool pool;
+    proxy::Ss2022SaltPool pool;
     const auto now = Clock::time_point{};
     const auto salt = Salt(1);
     EXPECT_EQ(pool.Admit(salt.span(), now), Admission::Accepted);
-    EXPECT_EQ(pool.Admit(salt.span(), now + proxy::shadowsocks::Ss2022SaltPool::kRetention -
+    EXPECT_EQ(pool.Admit(salt.span(), now + proxy::Ss2022SaltPool::kRetention -
         std::chrono::nanoseconds(1)), Admission::Replayed);
-    EXPECT_EQ(pool.Admit(salt.span(), now + proxy::shadowsocks::Ss2022SaltPool::kRetention), Admission::Accepted);
+    EXPECT_EQ(pool.Admit(salt.span(), now + proxy::Ss2022SaltPool::kRetention), Admission::Accepted);
     EXPECT_EQ(pool.Size(), 1u);
 }
 
 TEST(Ss2022SaltPool, FullTableRejectsNewSaltWithoutEvictingUnexpiredEntries) {
-    proxy::shadowsocks::Ss2022SaltPool pool(2);
+    proxy::Ss2022SaltPool pool(2);
     const auto now = Clock::time_point{};
     const auto first = Salt(1), second = Salt(2, 32), third = Salt(3);
     EXPECT_EQ(pool.Admit(first.span(), now), Admission::Accepted);
@@ -61,33 +60,33 @@ TEST(Ss2022SaltPool, FullTableRejectsNewSaltWithoutEvictingUnexpiredEntries) {
     EXPECT_EQ(pool.Admit(first.span(), now + std::chrono::seconds(2)), Admission::Replayed);
     EXPECT_EQ(pool.Admit(second.span(), now + std::chrono::seconds(2)), Admission::Replayed);
     EXPECT_EQ(pool.Size(), 2u);
-    EXPECT_EQ(pool.Admit(third.span(), now + proxy::shadowsocks::Ss2022SaltPool::kRetention), Admission::Accepted);
-    EXPECT_EQ(pool.Admit(second.span(), now + proxy::shadowsocks::Ss2022SaltPool::kRetention), Admission::Replayed);
+    EXPECT_EQ(pool.Admit(third.span(), now + proxy::Ss2022SaltPool::kRetention), Admission::Accepted);
+    EXPECT_EQ(pool.Admit(second.span(), now + proxy::Ss2022SaltPool::kRetention), Admission::Replayed);
     EXPECT_EQ(pool.Size(), 2u);
 }
 
 TEST(Ss2022SaltPool, InvalidLengthsAndZeroCapacityFailClosed) {
-    proxy::shadowsocks::Ss2022SaltPool pool;
+    proxy::Ss2022SaltPool pool;
     const std::array<uint8_t, 33> bytes{};
     for (const auto size : {0u, 15u, 17u, 31u, 33u}) {
         EXPECT_EQ(pool.Admit(std::span(bytes).first(size), Clock::time_point{}), Admission::Limited);
     }
     EXPECT_EQ(pool.Size(), 0u);
-    proxy::shadowsocks::Ss2022SaltPool empty(0);
+    proxy::Ss2022SaltPool empty(0);
     EXPECT_EQ(empty.Admit(Salt(1).span(), Clock::time_point{}), Admission::Limited);
 }
 
 TEST(Ss2022SaltPool, AllocationFailureRejectsWithoutForgettingAcceptedSalt) {
-    proxy::shadowsocks::Ss2022SaltPool pool(4);
+    proxy::Ss2022SaltPool pool(4);
     const auto first = Salt(1), second = Salt(2);
     const auto now = Clock::time_point{};
     ASSERT_EQ(pool.Admit(first.span(), now), Admission::Accepted);
-    const auto failures = memory::rejected_process_allocations;
-    memory::reject_next_process_allocation = true;
+    const auto failures = common::rejected_process_allocations;
+    common::reject_next_process_allocation = true;
     const auto result = pool.Admit(second.span(), now);
-    memory::reject_next_process_allocation = false;
+    common::reject_next_process_allocation = false;
     EXPECT_EQ(result, Admission::Limited);
-    EXPECT_EQ(memory::rejected_process_allocations, failures + 1);
+    EXPECT_EQ(common::rejected_process_allocations, failures + 1);
     EXPECT_EQ(pool.Size(), 1u);
     EXPECT_EQ(pool.Admit(first.span(), now), Admission::Replayed);
     EXPECT_EQ(pool.Admit(second.span(), now), Admission::Accepted);
@@ -110,8 +109,8 @@ protected:
         first_thread = std::thread([this] { first.run(); });
         second_thread = std::thread([this] { second.run(); });
     }
-    Admission Admit(net::io_context& worker, const proxy::shadowsocks::KeyBytes& salt) {
-        return net::co_spawn(worker, proxy::shadowsocks::AdmitSs2022RequestSalt(*coordinator, salt), net::use_future).get();
+    Admission Admit(net::io_context& worker, const proxy::KeyBytes& salt) {
+        return net::co_spawn(worker, proxy::AdmitSs2022RequestSalt(*coordinator, salt), net::use_future).get();
     }
     void TearDown() override {
         if (coordinator) {
@@ -174,7 +173,7 @@ TEST_F(SaltCoordinator, CancellationJoinsAcceptedOwnerWorkBeforeReturning) {
     }), net::use_future);
     entered.get_future().get();
     net::cancellation_signal cancellation;
-    auto admitted = net::co_spawn(second, proxy::shadowsocks::AdmitSs2022RequestSalt(*coordinator, salt),
+    auto admitted = net::co_spawn(second, proxy::AdmitSs2022RequestSalt(*coordinator, salt),
         net::bind_cancellation_slot(cancellation.slot(), net::use_future));
     net::post(second, [&] {
         cancellation.emit(net::cancellation_type::all);

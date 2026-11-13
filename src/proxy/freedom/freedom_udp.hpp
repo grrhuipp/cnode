@@ -5,8 +5,8 @@
 // 而不是 .cpp 内。
 
 #include "app/dns/dns.hpp"
-#include "common/buf/length_prefixed_packet_buffer.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/length_prefixed_packet_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/error.hpp"
 #include "common/ip_utils.hpp"
 #include "common/target_address.hpp"
@@ -16,35 +16,35 @@
 
 #include <utility>
 
-namespace proxy::freedom::outbound {
+namespace proxy {
 
 // One direct UDP association. Target resolution belongs to this outbound;
 // its concrete transport owns the socket, byte I/O and aggregate deadlines.
-class UdpRequest final : public ::proxy::OutboundDatagramEndpointBase {
+class FreedomUdpRequest final : public ::proxy::OutboundDatagramEndpointBase {
 public:
-    UdpRequest(net::io_context& io, app::dns::DNS& dns, const net::ip::address& bind_address)
+    FreedomUdpRequest(net::io_context& io, app::DNS& dns, const net::ip::address& bind_address)
         : OutboundDatagramEndpointBase(io, bind_address), dns_(dns) {}
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        auto read = socket_.StartRead();
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         for (;;) {
+            auto read = socket_.StartRead();
             auto packet = co_await read.Receive();
             if (packet.source.port() == 0) {
                 continue;
             }
-            const common::TargetAddress source(iputil::NormalizeAddress(packet.source.address()),
+            const common::TargetAddress source(common::NormalizeAddress(packet.source.address()),
                                        packet.source.port());
-            if (!buf::SetUdpTarget(packet.payload, source))
+            if (!common::SetUdpTarget(packet.payload, source))
                 throw transport::LinkError(common::ErrorCode::RESOURCE_EXHAUSTED);
             socket_.TouchActivity();
             co_return std::move(packet.payload);
         }
     }
 
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer payload) override {
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer payload) override {
         // Native socket arguments are not a UDP-over-stream protocol frame.
-        const auto datagram = buf::InspectUdpDatagram(payload);
-        if (datagram.status == buf::UdpDatagramStatus::Empty) co_return;
+        const auto datagram = common::InspectUdpDatagram(payload);
+        if (datagram.status == common::UdpDatagramStatus::Empty) co_return;
         if (!datagram.Valid() || !datagram.target || !datagram.target->IsValid())
             throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
         const common::TargetAddress& target = *datagram.target;
@@ -64,7 +64,7 @@ public:
     }
 
 private:
-    app::dns::DNS& dns_;
+    app::DNS& dns_;
 };
 
-}  // namespace proxy::freedom::outbound
+}  // namespace proxy

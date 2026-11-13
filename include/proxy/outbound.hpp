@@ -3,7 +3,7 @@
 #include "common/asio_types.hpp"
 #include "app/relay.hpp"
 #include "common/error.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "transport/link.hpp"
 
 #include <chrono>
@@ -20,13 +20,13 @@ namespace infra {
 struct TimeoutsConfig;
 
 }  // namespace infra
-namespace transport::internet {
+namespace transport {
 
 class OutboundDialer;
 
-}  // namespace transport::internet
+}  // namespace transport
 
-namespace session {
+namespace common {
 struct Context;
 }
 
@@ -48,13 +48,13 @@ public:
     virtual ~Outbound() noexcept = default;
 
     virtual net::awaitable<OutboundProcessResult> Process(
-        session::Context& ctx,
+        common::Context& ctx,
         transport::Link inbound,
-        transport::internet::OutboundDialer& dialer,
+        transport::OutboundDialer& dialer,
         const infra::TimeoutsConfig& timeouts,
         app::StatsShard& stats,
         const app::RelayConfig& relay_config,
-        buf::MultiBufferBatch first_payload) = 0;
+        common::MultiBufferBatch first_payload) = 0;
 };
 
 }  // namespace proxy

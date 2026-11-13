@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
 #include "proxy/vmess/vmess_crypto.hpp"
-
 #include <algorithm>
 #include <array>
 #include <new>
@@ -30,7 +29,7 @@ extern "C" int __wrap_EVP_DigestSqueeze(EVP_MD_CTX* ctx, uint8_t* out, size_t si
 #endif
 
 namespace {
-using namespace ::proxy::vmess;
+using namespace ::proxy;
 constexpr std::array<uint8_t, 16> key{}, iv{};
 
 #ifdef CNODE_TEST_CRYPTO_FAULT
@@ -50,7 +49,7 @@ TEST(VmessCipher, DigestAllocationFailureRejectsMaskAndCipherConstruction) {
         fail_digest_allocation = true;
         try { ShakeMask mask(iv.data()); }
         catch (const std::bad_alloc&) { mask_failed = true; }
-        try { VMessCipher cipher(Security::CHACHA20_POLY1305, key.data(), iv.data()); }
+        try { VMessCipher cipher(VmessSecurity::CHACHA20_POLY1305, key.data(), iv.data()); }
         catch (const std::bad_alloc&) { key_failed = true; }
     }
     EXPECT_TRUE(mask_failed);
@@ -62,7 +61,7 @@ TEST(VmessCipher, AeadAllocationFailureRejectsConstruction) {
     {
         CryptoFaultReset reset;
         cipher_allocation_countdown = 1;
-        try { VMessCipher cipher(Security::AES_128_GCM, key.data(), iv.data()); }
+        try { VMessCipher cipher(VmessSecurity::AES_128_GCM, key.data(), iv.data()); }
         catch (const std::bad_alloc&) { failed = true; }
     }
     EXPECT_TRUE(failed);
@@ -85,13 +84,13 @@ TEST(VmessCipher, EmptyAesGcmMatchesZeroKeyZeroNonceVector) {
     const std::array<uint8_t, 16> expected{
         0x58, 0xe2, 0xfc, 0xce, 0xfa, 0x7e, 0x30, 0x61,
         0x36, 0x7f, 0x1d, 0x57, 0xa4, 0xe7, 0x45, 0x5a};
-    VMessCipher encoder(Security::AES_128_GCM, key.data(), iv.data());
+    VMessCipher encoder(VmessSecurity::AES_128_GCM, key.data(), iv.data());
     std::array<uint8_t, 16> wire{};
     ASSERT_EQ(encoder.Encrypt(nullptr, 0, wire.data()), 16);
     EXPECT_EQ(wire, expected);
 }
 
-class VmessCipherRecords : public testing::TestWithParam<Security> {};
+class VmessCipherRecords : public testing::TestWithParam<VmessSecurity> {};
 TEST_P(VmessCipherRecords, EmptyAndDataRecordsAdvanceMatchingNonces) {
     VMessCipher encoder(GetParam(), key.data(), iv.data());
     VMessCipher decoder(GetParam(), key.data(), iv.data());
@@ -110,9 +109,9 @@ TEST_P(VmessCipherRecords, EmptyAndDataRecordsAdvanceMatchingNonces) {
     }
 }
 INSTANTIATE_TEST_SUITE_P(SecurityModes, VmessCipherRecords,
-    testing::Values(Security::AES_128_GCM, Security::CHACHA20_POLY1305, Security::NONE, Security::ZERO));
+    testing::Values(VmessSecurity::AES_128_GCM, VmessSecurity::CHACHA20_POLY1305, VmessSecurity::NONE, VmessSecurity::ZERO));
 
-class VmessAuthenticatedCipher : public testing::TestWithParam<Security> {};
+class VmessAuthenticatedCipher : public testing::TestWithParam<VmessSecurity> {};
 TEST_P(VmessAuthenticatedCipher, RejectsTamperedEmptyRecordTag) {
     VMessCipher encoder(GetParam(), key.data(), iv.data());
     VMessCipher decoder(GetParam(), key.data(), iv.data());
@@ -123,5 +122,5 @@ TEST_P(VmessAuthenticatedCipher, RejectsTamperedEmptyRecordTag) {
     EXPECT_LT(decoder.Decrypt(tag.data(), tag.size(), &unused), 0);
 }
 INSTANTIATE_TEST_SUITE_P(AeadModes, VmessAuthenticatedCipher,
-    testing::Values(Security::AES_128_GCM, Security::CHACHA20_POLY1305));
+    testing::Values(VmessSecurity::AES_128_GCM, VmessSecurity::CHACHA20_POLY1305));
 }  // namespace

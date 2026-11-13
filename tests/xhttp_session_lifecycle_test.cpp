@@ -1,8 +1,8 @@
 #include "transport_coordinator_fixture.hpp"
 #include <gtest/gtest.h>
 
-#include "transport/internet/xhttp_session.hpp"
-#include "transport/internet/tcp_stream.hpp"
+#include "transport/xhttp_session.hpp"
+#include "transport/tcp_stream.hpp"
 #include "app/session_group_executor.hpp"
 
 #include <asio/co_spawn.hpp>
@@ -25,7 +25,7 @@
 
 namespace {
 namespace net = ::net;
-using namespace ::transport::internet;
+using namespace ::transport;
 using namespace std::chrono_literals;
 
 
@@ -184,7 +184,7 @@ TEST(XhttpSessionLifecycle, UploadResponseDrainPreservesWritesAndJoinsReaderOnCl
     listener.accept(peer);
     peer.non_blocking(true);
     peer.set_option(net::socket_base::send_buffer_size(4096));
-    ::transport::internet::HttpConfig config;
+    ::transport::HttpConfig config;
     config.path = "/fixture/id";
     config.method = "POST";
     config.headers.emplace("Connection", "keep-alive");
@@ -193,9 +193,9 @@ TEST(XhttpSessionLifecycle, UploadResponseDrainPreservesWritesAndJoinsReaderOnCl
     bool built = false;
     const std::string initial = "first";
     const std::array<net::const_buffer, 1> payload{net::buffer(initial)};
-    net::co_spawn(io, DoXHttp1ClientRequest(std::make_unique<::transport::internet::TcpStream>(std::move(client)),
-        config, "localhost", ::transport::internet::XHttpClientRequestKind::StreamUp, payload, 0),
-        [&](std::exception_ptr error, ::transport::internet::TransportBuildResult result) {
+    net::co_spawn(io, DoXHttp1ClientRequest(std::make_unique<::transport::TcpStream>(std::move(client)),
+        config, "localhost", ::transport::XHttpClientRequestKind::StreamUp, payload, 0),
+        [&](std::exception_ptr error, ::transport::TransportBuildResult result) {
             failure = error;
             if (!error && result) upload = std::move(*result);
             built = true;
@@ -272,30 +272,30 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
         worker1.reset();
     });
 
-    struct OriginBoundSink final : ::transport::internet::InboundTransportStreamHandler {
+    struct OriginBoundSink final : ::transport::InboundTransportStreamHandler {
         explicit OriginBoundSink(std::thread::id owner)
-            : owner_thread(owner), local_tag(128, 'x', ::memory::process_resource()) {}
+            : owner_thread(owner), local_tag(128, 'x') {}
         ~OriginBoundSink() noexcept override {
             EXPECT_EQ(std::this_thread::get_id(), owner_thread);
         }
         net::awaitable<void> OnInboundTransportStream(
-            std::unique_ptr<::transport::AsyncStream> s, ::transport::internet::InboundTransportMetadata) override {
+            std::unique_ptr<::transport::AsyncStream> s, ::transport::InboundTransportMetadata) override {
             logical = std::move(s);
             co_return;
         }
         std::chrono::seconds TransportHandshakeTimeout() const noexcept override { return 5s; }
         std::chrono::seconds TransportIdleTimeout() const noexcept override { return 10s; }
         std::thread::id owner_thread;
-        std::pmr::string local_tag;
+        std::string local_tag;
         std::unique_ptr<::transport::AsyncStream> logical;
     };
 
-    ::transport::internet::HttpConfig http_cfg;
+    ::transport::HttpConfig http_cfg;
     http_cfg.path = "/fixture";
-    ::transport::internet::XHttpConfig xhttp_cfg;
+    ::transport::XHttpConfig xhttp_cfg;
     xhttp_cfg.path = "/fixture";
     xhttp_cfg.normalized_path = "/fixture/";
-    xhttp_cfg.mode = ::transport::internet::XHttpMode::PacketUp;
+    xhttp_cfg.mode = ::transport::XHttpMode::PacketUp;
     xhttp_cfg.session_namespace = "cross-worker-handoff";
 
     ::tcp::acceptor acceptor(control, {net::ip::address_v4::loopback(), 0});
@@ -318,7 +318,7 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
             [&, sock = std::move(server_up)]() mutable -> net::awaitable<void> {
                 auto sink = std::make_shared<OriginBoundSink>(std::this_thread::get_id());
                 auto res = co_await DoXHttp1ServerHandshake(
-                    *coordinator,                     *worker1, std::make_unique<::transport::internet::TcpStream>(std::move(sock)),
+                    *coordinator,                     *worker1, std::make_unique<::transport::TcpStream>(std::move(sock)),
                     http_cfg, xhttp_cfg, 1, nullptr, {}, sink);
                 EXPECT_TRUE(res.has_value() && !*res) << "packet-up handoff failed";
             }, net::use_future);
@@ -335,7 +335,7 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
             [&, sock = std::move(server_down)]() mutable -> net::awaitable<std::string> {
                 auto sink = std::make_shared<OriginBoundSink>(std::this_thread::get_id());
                 auto res = co_await DoXHttp1ServerHandshake(
-                    *coordinator,                     *worker0, std::make_unique<::transport::internet::TcpStream>(std::move(sock)),
+                    *coordinator,                     *worker0, std::make_unique<::transport::TcpStream>(std::move(sock)),
                     http_cfg, xhttp_cfg, 2, nullptr, {}, sink);
                 EXPECT_TRUE(res.has_value() && !*res && sink->logical != nullptr) << "packet-down did not produce logical stream";
                 if (!sink->logical) co_return std::string{};

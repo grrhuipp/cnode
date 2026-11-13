@@ -14,7 +14,7 @@
 #include <memory>
 #include <new>
 #include <utility>
-namespace proxy::vless {
+namespace proxy {
 namespace {
 
 [[nodiscard]] std::shared_ptr<EVP_PKEY> ShareKey(
@@ -553,4 +553,4 @@ bool VlessEncryptionHeaderXor::FinishHeader() noexcept {
 // ============================================================================
 // Handshake Protocol
 // ============================================================================
-}  // namespace proxy::vless
+}  // namespace proxy

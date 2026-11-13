@@ -6,7 +6,7 @@
 #include <string>
 #include <string_view>
 
-using iputil::ParseLiteral;
+using common::ParseLiteral;
 using namespace std::string_view_literals;
 
 TEST(IpAddress, AcceptsCompleteIPv4IPv6AndNumericScopes) {
@@ -73,15 +73,15 @@ TEST(IpAddress, RoundTripsAllOctetsAndIPv6CompressionPositions) {
 }
 
 TEST(IpAddress, NetworkMasksHostBitsInItsOriginalFamily) {
-    const auto ipv4 = iputil::ParseNetwork("192.0.2.129/24");
+    const auto ipv4 = common::ParseNetwork("192.0.2.129/24");
     ASSERT_TRUE(ipv4);
     EXPECT_EQ(ipv4->address, net::ip::make_address("192.0.2.0"));
     EXPECT_EQ(ipv4->prefix_length, 24);
-    const auto ipv6 = iputil::ParseNetwork("2001:db8:abcd:1234::1/48");
+    const auto ipv6 = common::ParseNetwork("2001:db8:abcd:1234::1/48");
     ASSERT_TRUE(ipv6);
     EXPECT_EQ(ipv6->address, net::ip::make_address("2001:db8:abcd::"));
     EXPECT_EQ(ipv6->prefix_length, 48);
-    const auto mapped = iputil::ParseNetwork("::ffff:192.0.2.1");
+    const auto mapped = common::ParseNetwork("::ffff:192.0.2.1");
     ASSERT_TRUE(mapped);
     EXPECT_EQ(mapped->address, net::ip::make_address("192.0.2.1"));
     EXPECT_EQ(mapped->prefix_length, 32);
@@ -90,6 +90,6 @@ TEST(IpAddress, NetworkMasksHostBitsInItsOriginalFamily) {
 TEST(IpAddress, NetworkRejectsAmbiguousAndOutOfRangePrefixes) {
     for (const auto text : {"192.0.2.1/024", "192.0.2.1/33", "::1/129", "::1/-1", "::1/64/1",
                             "::ffff:192.0.2.1/120", "192.0.2.1/"}) {
-        EXPECT_FALSE(iputil::ParseNetwork(text)) << text;
+        EXPECT_FALSE(common::ParseNetwork(text)) << text;
     }
 }

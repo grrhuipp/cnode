@@ -10,7 +10,7 @@
 #include <regex>
 #include <string>
 
-namespace rule {
+namespace common {
 
 DetectRulePolicy::DetectRulePolicy() = default;
 DetectRulePolicy::~DetectRulePolicy() = default;
@@ -29,10 +29,10 @@ void DetectRulePolicy::UpdateRule(std::string_view tag,
         it->second = std::move(new_rule_list);
         return;
     }
-    rules_.emplace(std::pmr::string(tag, memory::process_resource()), std::move(new_rule_list));
+    rules_.emplace(std::string(tag), std::move(new_rule_list));
 }
 
-bool DetectRulePolicy::Blocked(const session::Context& ctx) {
+bool DetectRulePolicy::Blocked(const Context& ctx) {
     if (ctx.inbound.user_id <= 0 || rules_.empty()) {
         return false;
     }
@@ -49,7 +49,7 @@ bool DetectRulePolicy::Blocked(const session::Context& ctx) {
 
         char buf[280];
         char* out = buf;
-        const bool bracket_ipv6 = iputil::NeedsIpv6Brackets(host);
+        const bool bracket_ipv6 = NeedsIpv6Brackets(host);
         const std::size_t max_host_len = sizeof(buf) - (bracket_ipv6 ? 2 : 0) - 6;
         // 合法目标受 DNS/IP 长度边界约束；未来扩展若超出预算，也不能匹配截断后的目标。
         if (host.size() > max_host_len) return true;
@@ -76,7 +76,7 @@ bool DetectRulePolicy::Blocked(const session::Context& ctx) {
         return false;
     };
 
-    auto matches_target = [&](const common::TargetAddress& target) {
+    auto matches_target = [&](const TargetAddress& target) {
         if (!target.IsValid()) {
             return false;
         }
@@ -85,7 +85,7 @@ bool DetectRulePolicy::Blocked(const session::Context& ctx) {
             return true;
         }
         if (target.resolved_addr) {
-            const iputil::AddressText addr_text(*target.resolved_addr);
+            const AddressText addr_text(*target.resolved_addr);
             if (addr_text.View() != host &&
                 matches_host_port(addr_text.View(), target.port)) {
                 return true;
@@ -94,7 +94,7 @@ bool DetectRulePolicy::Blocked(const session::Context& ctx) {
         return false;
     };
 
-    auto same_target = [](const common::TargetAddress& a, const common::TargetAddress& b) {
+    auto same_target = [](const TargetAddress& a, const TargetAddress& b) {
         return a.SameEndpoint(b) && a.resolved_addr == b.resolved_addr;
     };
 
@@ -116,4 +116,4 @@ bool DetectRulePolicy::Blocked(const session::Context& ctx) {
     return false;
 }
 
-}  // namespace rule
+}  // namespace common

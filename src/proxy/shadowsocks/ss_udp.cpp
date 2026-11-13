@@ -17,7 +17,7 @@
 #include <span>
 #include <vector>
 
-namespace proxy::shadowsocks {
+namespace proxy {
 
 namespace {
 
@@ -207,8 +207,8 @@ struct Parsed2022Body {
 }
 
 struct PlaintextScratch {
-    buf::BufferGuard pooled;
-    std::pmr::vector<uint8_t> large{memory::process_resource()};
+    common::BufferGuard pooled;
+    std::vector<uint8_t> large;
     size_t len = 0;
 
     ~PlaintextScratch() noexcept {
@@ -222,9 +222,9 @@ struct PlaintextScratch {
 
     [[nodiscard]] uint8_t* Prepare(size_t size) {
         len = size;
-        if (size <= buf::Buffer::kSize) {
+        if (size <= common::Buffer::kSize) {
             if (!pooled) {
-                pooled = buf::BufferGuard{buf::Buffer::New()};
+                pooled = common::BufferGuard{common::Buffer::New()};
                 if (!pooled) {
                     return nullptr;
                 }
@@ -245,7 +245,7 @@ struct PlaintextScratch {
         return {large.data(), len};
     }
 
-    [[nodiscard]] bool MoveSuffixTo(size_t offset, buf::MultiBuffer& out) {
+    [[nodiscard]] bool MoveSuffixTo(size_t offset, common::MultiBuffer& out) {
         if (offset > len) {
             return false;
         }
@@ -264,7 +264,7 @@ struct PlaintextScratch {
                 return false;
             }
         }
-        return buf::AppendSpanToMultiBuffer(
+        return common::AppendSpanToMultiBuffer(
             std::span<const uint8_t>(large.data() + offset, payload_len), out);
     }
 };
@@ -291,7 +291,7 @@ struct PlaintextScratch {
     const auto full = scratch.Span();
     const size_t payload_offset = static_cast<size_t>(parsed.payload.data() - full.data());
     if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
-        !buf::SetUdpTarget(result.payload, result.target)) {
+        !common::SetUdpTarget(result.payload, result.target)) {
         return std::nullopt;
     }
     return result;
@@ -300,7 +300,7 @@ struct PlaintextScratch {
 [[nodiscard]] std::optional<SsUdpDecodeResult> Decode2022UdpAesRequest(
     const uint8_t* datagram,
     size_t datagram_len,
-    const proxyman::inbound::UserStore::ShadowsocksUsersView& users,
+    const app::UserStore::ShadowsocksUsersView& users,
     const SsCipherInfo& cipher_info,
     Ss2022UdpReplayCache& replay_cache,
     bool deferred_replay) {
@@ -406,7 +406,7 @@ struct PlaintextScratch {
 [[nodiscard]] std::optional<SsUdpDecodeResult> Decode2022UdpChachaRequest(
     const uint8_t* datagram,
     size_t datagram_len,
-    const proxyman::inbound::UserStore::ShadowsocksUsersView& users,
+    const app::UserStore::ShadowsocksUsersView& users,
     Ss2022UdpReplayCache& replay_cache,
     bool deferred_replay) {
 
@@ -499,7 +499,7 @@ struct PlaintextScratch {
     }
 
     std::array<uint8_t, 64> subkey{};
-    if (!DeriveSubkey(master_key.data(), key_size,
+    if (!DeriveSsSubkey(master_key.data(), key_size,
                       salt, salt_size,
                       subkey.data())) {
         OPENSSL_cleanse(subkey.data(), subkey.size());
@@ -851,7 +851,7 @@ bool Ss2022UdpAssociation::Check(
 std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const uint8_t* datagram,
     size_t datagram_len,
-    const proxyman::inbound::UserStore::ShadowsocksUsersView& users,
+    const app::UserStore::ShadowsocksUsersView& users,
     SsCipherType cipher_type,
     size_t key_size,
     size_t salt_size,
@@ -894,7 +894,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
         const auto& user = users[i];
 
         std::array<uint8_t, 64> subkey{};
-        if (!DeriveSubkey(user.derived_key.data(), key_size,
+        if (!DeriveSsSubkey(user.derived_key.data(), key_size,
                           salt, salt_size,
                           subkey.data())) {
             OPENSSL_cleanse(subkey.data(), subkey.size());
@@ -926,7 +926,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
 
         const size_t payload_offset = std::min(addr.consumed, plaintext_len);
         if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
-            !buf::SetUdpTarget(result.payload, result.target)) {
+            !common::SetUdpTarget(result.payload, result.target)) {
             return std::nullopt;
         }
 
@@ -987,7 +987,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
     const size_t plaintext_len = cipherlen - SsAeadCipher::kTagSize;
 
     std::array<uint8_t, 64> subkey{};
-    if (!DeriveSubkey(master_key.data(), key_size,
+    if (!DeriveSsSubkey(master_key.data(), key_size,
                       salt, salt_size,
                       subkey.data())) {
         OPENSSL_cleanse(subkey.data(), subkey.size());
@@ -1024,7 +1024,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
 
     const size_t payload_offset = std::min(addr.consumed, plaintext_len);
     if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
-        !buf::SetUdpTarget(result.payload, result.target)) {
+        !common::SetUdpTarget(result.payload, result.target)) {
         return std::nullopt;
     }
     return result;
@@ -1188,19 +1188,19 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     const size_t payload_offset = static_cast<size_t>(
         parsed->payload.data() - scratch.Span().data());
     if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
-        !buf::SetUdpTarget(result.payload, result.target)) {
+        !common::SetUdpTarget(result.payload, result.target)) {
         return std::nullopt;
     }
     return result;
 }
 
-size_t proxy::shadowsocks::UdpResponse::EncodePacketTo(
+size_t proxy::UdpResponse::EncodePacketTo(
     const common::TargetAddress& target,
     std::span<const uint8_t> payload,
     uint8_t* out,
     size_t out_capacity) {
-    if (auto* ss2022 = std::get_if<proxy::shadowsocks::Ss2022UdpTxState>(&state_)) {
-        return proxy::shadowsocks::Encode2022UdpResponsePacketTo(
+    if (auto* ss2022 = std::get_if<proxy::Ss2022UdpTxState>(&state_)) {
+        return proxy::Encode2022UdpResponsePacketTo(
             target,
             payload.data(),
             payload.size(),
@@ -1209,7 +1209,7 @@ size_t proxy::shadowsocks::UdpResponse::EncodePacketTo(
             out_capacity);
     }
     const auto& classic = std::get<ClassicState>(state_);
-    return proxy::shadowsocks::EncodeUdpPacketTo(
+    return proxy::EncodeUdpPacketTo(
         target,
         payload.data(),
         payload.size(),
@@ -1221,14 +1221,14 @@ size_t proxy::shadowsocks::UdpResponse::EncodePacketTo(
         out_capacity);
 }
 
-buf::MultiBuffer proxy::shadowsocks::UdpResponse::Encode(UDPPacketView packet) {
+common::MultiBuffer proxy::UdpResponse::Encode(UDPPacketView packet) {
     const size_t encoded_len = EncodePacketTo(
         packet.target, packet.data, nullptr, 0);
     if (encoded_len == 0) {
         return {};
     }
 
-    buf::ContiguousWriteBuffer encoded;
+    common::ContiguousWriteBuffer encoded;
     uint8_t* dst = encoded.TryPrepare(encoded_len);
     if (!dst) {
         return {};
@@ -1242,10 +1242,10 @@ buf::MultiBuffer proxy::shadowsocks::UdpResponse::Encode(UDPPacketView packet) {
         return {};
     }
 
-    buf::MultiBuffer payload;
+    common::MultiBuffer payload;
     if (!encoded.TryAppendTo(written, payload)) {
         return {};
     }
     return payload;
 }
-}  // namespace proxy::shadowsocks
+}  // namespace proxy

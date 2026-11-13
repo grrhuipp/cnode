@@ -6,7 +6,7 @@
 #include <optional>
 
 
-namespace session {
+namespace common {
 
 ID NewID(uint32_t worker_id) noexcept {
     thread_local uint32_t local_counter = 0;
@@ -29,23 +29,20 @@ void Context::InitSubstreamFrom(const Context& parent, uint16_t sub_source_port)
     }
     outbound = {};
     outbound.tag = parent_outbound_tag;
-    content.network = common::Network::TCP;
+    content.network = Network::TCP;
     content.protocol.clear();
     content.speed_limit = parent_speed_limit;
     traffic = {};
 }
-}  // namespace session
 
-namespace common {
-
-std::string FormatAccessLog(const session::Context& ctx,
+std::string FormatAccessLog(const Context& ctx,
                             AccessStatus status,
                             std::string_view reason) {
-    std::optional<iputil::AddressText> src_host_storage;
+    std::optional<AddressText> src_host_storage;
     std::string_view src_host = ctx.inbound.source_ip;
     if (src_host.empty()) {
         if (!ctx.inbound.source_addr.is_unspecified()) {
-            src_host_storage.emplace(iputil::NormalizeAddress(ctx.inbound.source_addr));
+            src_host_storage.emplace(NormalizeAddress(ctx.inbound.source_addr));
             src_host = src_host_storage->View();
         } else {
             src_host = "unknown";
@@ -55,11 +52,11 @@ std::string FormatAccessLog(const session::Context& ctx,
 
     const TargetAddress& t = ctx.outbound.target;
     const bool target_valid = t.IsValid();
-    std::optional<iputil::AddressText> target_host_storage;
+    std::optional<AddressText> target_host_storage;
     std::string_view target_host = t.host;
     if (target_host.empty()) {
         if (target_valid && t.resolved_addr) {
-            target_host_storage.emplace(iputil::NormalizeAddress(*t.resolved_addr));
+            target_host_storage.emplace(NormalizeAddress(*t.resolved_addr));
             target_host = target_host_storage->View();
         } else {
             target_host = "unknown";
@@ -72,10 +69,10 @@ std::string FormatAccessLog(const session::Context& ctx,
     const bool has_target = accepted || target_valid;
     // Only the final owning string crosses the logging queue. Do not use the
     // Worker PMR for it or retain connection-local formatting scratch.
-    std::optional<iputil::AddressText> origin_host_storage;
+    std::optional<AddressText> origin_host_storage;
     std::string_view origin_host = ctx.inbound.origin_source_ip;
     if (origin_host.empty() && !ctx.inbound.origin_source_addr.is_unspecified()) {
-        origin_host_storage.emplace(iputil::NormalizeAddress(ctx.inbound.origin_source_addr));
+        origin_host_storage.emplace(NormalizeAddress(ctx.inbound.origin_source_addr));
         origin_host = origin_host_storage->View();
     }
     std::string access;
@@ -85,21 +82,9 @@ std::string FormatAccessLog(const session::Context& ctx,
                    origin_host.size() + ctx.inbound.origin_tag.size() +
                    ctx.inbound.origin_user_email.size() +
                    reason.size());
-    auto endpoint = [&](std::string_view host, uint16_t port) {
-        const bool brackets = iputil::NeedsIpv6Brackets(host);
-        if (brackets) access.push_back('[');
-        access.append(host);
-        if (brackets) access.push_back(']');
-        access.push_back(':');
-        char port_buf[5];
-        const auto [ptr, ec] = std::to_chars(
-            port_buf, port_buf + sizeof(port_buf), port);
-        (void)ec;
-        access.append(port_buf, ptr);
-    };
     if (accepted || src_host != "unknown") {
         access.append("from ");
-        endpoint(src_host, ctx.inbound.source_port);
+        access.append(FormatEndpointForLog(src_host, ctx.inbound.source_port));
         access.push_back(' ');
     }
     access.append(accepted ? "accepted" : "rejected");
@@ -107,7 +92,7 @@ std::string FormatAccessLog(const session::Context& ctx,
         access.push_back(' ');
         access.append(net_str);
         access.push_back(':');
-        endpoint(target_host, t.port);
+        access.append(FormatEndpointForLog(target_host, t.port));
     }
     if (!accepted && !reason.empty()) {
         access.push_back(' ');
@@ -167,7 +152,7 @@ std::string FormatAccessLog(const session::Context& ctx,
     if (ctx.outbound.connected_local_addr &&
         !ctx.outbound.connected_local_addr->is_unspecified()) {
         access.append(" sendThrough:");
-        access.append(iputil::AddressText(iputil::NormalizeAddress(
+        access.append(AddressText(NormalizeAddress(
             *ctx.outbound.connected_local_addr)).View());
     }
     return access;

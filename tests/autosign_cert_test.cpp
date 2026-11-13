@@ -1,14 +1,13 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/tls_context.hpp"
-
+#include "transport/tls_context.hpp"
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 #include <memory>
 #include <string>
 
 namespace {
-using ::transport::internet::AutoSignCertificate;
+using ::transport::AutoSignCertificate;
 
 TEST(AutosignCert, LiteralIdentityCannotInjectDnsSan) {
     auto certificate = AutoSignCertificate::Create("first.example,DNS:second.example");

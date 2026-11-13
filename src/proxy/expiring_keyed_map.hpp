@@ -64,7 +64,7 @@ public:
     };
 
     explicit ExpiringKeyedMap(size_t capacity)
-        : entries_(0, SecretKeyedHash::Random(), TimingSafeEqual{}, memory::process_resource())
+        : entries_(0, SecretKeyedHash::Random(), TimingSafeEqual{})
         , capacity_(capacity) {}
     ExpiringKeyedMap(const ExpiringKeyedMap&) = delete;
     ExpiringKeyedMap& operator=(const ExpiringKeyedMap&) = delete;
@@ -94,6 +94,7 @@ public:
     Entry* Insert(const Key& key, TimePoint expires_at, Value value, OnErase&& on_erase = {}) {
         if (capacity_ == 0 || entries_.find(key) != entries_.end()) return nullptr;
         while (entries_.size() >= capacity_) EvictOldest(on_erase);
+        common::CheckTestAllocationFault();
         auto [it, inserted] = entries_.try_emplace(key, Entry{expires_at, std::move(value)});
         if (!inserted) return nullptr;
         it->second.key = &it->first;
@@ -132,7 +133,7 @@ private:
         entry.previous = entry.next = nullptr;
     }
 
-    std::pmr::unordered_map<Key, Entry, SecretKeyedHash, TimingSafeEqual> entries_;
+    std::unordered_map<Key, Entry, SecretKeyedHash, TimingSafeEqual> entries_;
     size_t capacity_;
     Entry* first_ = nullptr;
     Entry* last_ = nullptr;

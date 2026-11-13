@@ -15,7 +15,7 @@ class GroupCoordinator;
 
 }  // namespace app
 
-namespace proxy::shadowsocks {
+namespace proxy {
 
 enum class Ss2022SaltAdmission : uint8_t { Accepted, Replayed, Limited };
 
@@ -49,4 +49,4 @@ private:
 [[nodiscard]] net::awaitable<Ss2022SaltAdmission> AdmitSs2022RequestSalt(
     app::GroupCoordinator& coordinator, const KeyBytes& salt);
 
-}  // namespace proxy::shadowsocks
+}  // namespace proxy

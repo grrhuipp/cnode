@@ -1,7 +1,7 @@
 #include "proxy/trojan/trojan_codec.hpp"
 #include "common/address_codec.hpp"
 #include "common/binary_text_codec.hpp"
-#include "common/buf/length_prefixed_packet_buffer.hpp"
+#include "common/length_prefixed_packet_buffer.hpp"
 #include "common/eof_cancellation.hpp"
 #include "common/byte_reader.hpp"
 #include "proxy/udp_datagram_frame.hpp"
@@ -11,14 +11,14 @@
 #include <cstring>
 #include <new>
 
-namespace proxy::trojan {
+namespace proxy {
 
 // ============================================================================
 // TCP 请求编解码
 // ============================================================================
 
-RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
-    RequestDecodeResult result;
+TrojanRequestDecodeResult DecodeTrojanRequest(std::span<const uint8_t> data) {
+    TrojanRequestDecodeResult result;
     // hash(56) + CRLF + command, validated before the address is awaited.
     if (data.size() < kRequestPrefixSize) {
         result.required = kRequestPrefixSize;
@@ -26,7 +26,7 @@ RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
     }
     for (size_t i = 0; i < kPasswordHashSize; ++i) {
         if (common::HexDigitValue(data[i]) < 0) {
-            result.status = RequestDecodeStatus::InvalidHeader;
+            result.status = TrojanRequestDecodeStatus::InvalidHeader;
             return result;
         }
     }
@@ -34,7 +34,7 @@ RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
     if (data[kPasswordHashSize] != 0x0D || data[kPasswordHashSize + 1] != 0x0A ||
         (command != static_cast<uint8_t>(TrojanCommand::CONNECT) &&
          command != static_cast<uint8_t>(TrojanCommand::UDP_ASSOCIATE))) {
-        result.status = RequestDecodeStatus::InvalidHeader;
+        result.status = TrojanRequestDecodeStatus::InvalidHeader;
         return result;
     }
 
@@ -42,7 +42,7 @@ RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
         data.subspan(kRequestPrefixSize), common::AddressWireFormat::Socks5,
         {.require_non_empty_domain = true, .allow_metadata = true});
     if (address.status == common::AddressDecodeStatus::Invalid) {
-        result.status = RequestDecodeStatus::InvalidAddress;
+        result.status = TrojanRequestDecodeStatus::InvalidAddress;
         return result;
     }
     // A request always ends with CRLF after the address, so asking for it with
@@ -56,11 +56,11 @@ RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
         return result;
     }
     if (data[address_end] != 0x0D || data[address_end + 1] != 0x0A) {
-        result.status = RequestDecodeStatus::InvalidHeader;
+        result.status = TrojanRequestDecodeStatus::InvalidHeader;
         return result;
     }
     if (!address.target.IsValid()) {
-        result.status = RequestDecodeStatus::InvalidAddress;
+        result.status = TrojanRequestDecodeStatus::InvalidAddress;
         return result;
     }
     std::memcpy(result.request.password_hash.data(), data.data(), kPasswordHashSize);
@@ -68,7 +68,7 @@ RequestDecodeResult DecodeRequest(std::span<const uint8_t> data) {
     result.request.target = std::move(address.target);
     result.request.forwarded = std::move(address.forwarded);
     result.consumed = address_end + 2;
-    result.status = RequestDecodeStatus::Complete;
+    result.status = TrojanRequestDecodeStatus::Complete;
     return result;
 }
 
@@ -148,12 +148,12 @@ size_t EncodeUdpPacketHeaderTo(
 }
 
 
-void UdpFramer::Feed(buf::MultiBuffer input) {
+void TrojanUdpFramer::Feed(common::MultiBuffer input) {
     if (state_ != State::Active) {
         throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     try {
-        if (!buf::AppendPacketStreamInput(pending_, std::move(input))) {
+        if (!common::AppendPacketStreamInput(pending_, std::move(input))) {
             throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         }
     } catch (...) {
@@ -162,7 +162,7 @@ void UdpFramer::Feed(buf::MultiBuffer input) {
     }
 }
 
-bool UdpFramer::Next(FramedUdpPacket& out) {
+bool TrojanUdpFramer::Next(TrojanFramedUdpPacket& out) {
     out = {};
     if (state_ == State::Failed) {
         throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -207,14 +207,14 @@ bool UdpFramer::Next(FramedUdpPacket& out) {
     pending_.ReleaseIfIdle();
     out.target = std::move(*target_);
     target_.reset();
-    if (!buf::SetUdpTarget(out.payload, out.target)) {
+    if (!common::SetUdpTarget(out.payload, out.target)) {
         Fail();
         throw std::bad_alloc();
     }
     return true;
 }
 
-void UdpFramer::Finish() {
+void TrojanUdpFramer::Finish() {
     if (state_ == State::Failed || target_ || pending_.byte_size() != 0) {
         Fail();
         throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
@@ -222,27 +222,27 @@ void UdpFramer::Finish() {
     state_ = State::Finished;
 }
 
-void UdpFramer::Fail() noexcept {
+void TrojanUdpFramer::Fail() noexcept {
     pending_.clear();
     target_.reset();
     payload_size_ = 0;
     state_ = State::Failed;
 }
 
-net::awaitable<buf::MultiBuffer> ReadUdpDatagram(
+net::awaitable<common::MultiBuffer> ReadUdpDatagram(
     transport::AsyncStream& stream,
-    UdpFramer& framer) {
-    if (framer.Finished()) co_return buf::MultiBuffer{};
+    TrojanUdpFramer& framer) {
+    if (framer.Finished()) co_return common::MultiBuffer{};
     while (true) {
-        FramedUdpPacket packet;
+        TrojanFramedUdpPacket packet;
         if (framer.Next(packet)) {
             co_return std::move(packet.payload);
         }
-        buf::MultiBuffer raw = co_await stream.ReadMultiBuffer();
+        common::MultiBuffer raw = co_await stream.ReadMultiBuffer();
         if (raw.byte_size() == 0) {
             co_await common::ThrowIfCancelledOnEof();
             framer.Finish();
-            co_return buf::MultiBuffer{};
+            co_return common::MultiBuffer{};
         }
         framer.Feed(std::move(raw));
     }
@@ -261,9 +261,9 @@ static size_t EncodeRequiredUdpPacketHeader(
     return header_size;
 }
 
-net::awaitable<void> WriteUdpDatagram(
+net::awaitable<void> WriteTrojanUdpDatagram(
     transport::MultiBufferWriter& writer,
-    buf::MultiBuffer payload) {
+    common::MultiBuffer payload) {
     const auto datagram = proxy::RequireUdpDatagram(payload, nullptr);
     if (!datagram) {
         co_return;
@@ -275,7 +275,7 @@ net::awaitable<void> WriteUdpDatagram(
         writer, std::span<const uint8_t>(header.data(), header_size), payload);
 }
 
-net::awaitable<void> WriteUdpDatagram(
+net::awaitable<void> WriteTrojanUdpDatagram(
     transport::MultiBufferWriter& writer,
     const common::TargetAddress& target,
     std::span<const net::const_buffer> payload) {
@@ -286,4 +286,4 @@ net::awaitable<void> WriteUdpDatagram(
         writer, std::span<const uint8_t>(header.data(), header_size), payload);
 }
 
-}  // namespace proxy::trojan
+}  // namespace proxy

@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "transport/internet/async_write_gate.hpp"
+#include "transport/async_write_gate.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>
 #include <asio/use_awaitable.hpp>
@@ -9,7 +9,7 @@
 #include <utility>
 
 TEST(AsyncWriteGate, MovedLeaseRetainsExclusiveOwnershipAndReleaseAllowsReuse) {
-    ::transport::internet::AsyncWriteGate gate;
+    ::transport::AsyncWriteGate gate;
     for (int i = 0; i < 64; ++i) {
         auto lease = gate.TryAcquire();
         ASSERT_TRUE(lease);
@@ -23,7 +23,7 @@ TEST(AsyncWriteGate, MovedLeaseRetainsExclusiveOwnershipAndReleaseAllowsReuse) {
 
 TEST(AsyncWriteGate, ContendedWriterWaitsForReleaseDespiteStaleNotifications) {
     ::net::io_context io;
-    ::transport::internet::AsyncWriteGate gate;
+    ::transport::AsyncWriteGate gate;
     for (int i = 0; i < 64; ++i) { auto lease = gate.TryAcquire(); }
     auto held = gate.TryAcquire();
     bool resumed = false;
@@ -45,7 +45,7 @@ TEST(AsyncWriteGate, ContendedWriterWaitsForReleaseDespiteStaleNotifications) {
 
 TEST(AsyncWriteGate, CancellationJoinsAllWaitersAndPermanentlyClosesAdmission) {
     ::net::io_context io;
-    ::transport::internet::AsyncWriteGate gate;
+    ::transport::AsyncWriteGate gate;
     constexpr size_t count = 4;
     std::array<std::future<bool>, count> waiters;
     auto held = gate.TryAcquire();

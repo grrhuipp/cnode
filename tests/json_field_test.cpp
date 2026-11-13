@@ -12,8 +12,8 @@
 namespace {
 
 
-::json::object ParseObject(std::string_view body) {
-    return ::json::parse(body).as_object();
+::infra::object ParseObject(std::string_view body) {
+    return ::infra::parse(body).as_object();
 }
 
 TEST(JsonField, Bool) {
@@ -97,7 +97,7 @@ TEST(JsonField, Unsigned) {
 TEST(JsonField, Port) {
     using ::infra::JsonPortError;
     using ::infra::ReadJsonPort;
-    using ::json::object;
+    using ::infra::object;
 
     auto result = infra::ReadJsonPort(object{}, "port");
     ASSERT_TRUE((result.error == infra::JsonPortError::Missing && result.value == 0)) << "absent port became configured";

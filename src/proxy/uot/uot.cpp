@@ -7,15 +7,14 @@
 #include "common/address_codec.hpp"
 
 #include "common/eof_cancellation.hpp"
-#include "common/buf/length_prefixed_packet_buffer.hpp"
-
+#include "common/length_prefixed_packet_buffer.hpp"
 #include <array>
 #include <cstring>
 #include <memory>
 #include <new>
 #include <utility>
 
-namespace proxy::uot {
+namespace proxy {
 namespace {
 
 [[noreturn]] void ThrowDecodeFailure() {
@@ -44,8 +43,8 @@ size_t EncodePacketHeader(bool is_connect,
 // V2: an explicit request precedes the packet stream.
 net::awaitable<tl::expected<PreparedRequest, common::ErrorCode>> ReadV2Request(
     transport::MultiBufferReader& reader,
-    buf::MultiBuffer pending) {
-    if (!co_await BufferedStreamReader::EnsureBufferedFrom(reader, pending, 1, buf::kPacketStreamPendingLimit)) {
+    common::MultiBuffer pending) {
+    if (!co_await BufferedStreamReader::EnsureBufferedFrom(reader, pending, 1, common::kPacketStreamPendingLimit)) {
         co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
     }
     std::array<uint8_t, 1> first{};
@@ -75,14 +74,14 @@ net::awaitable<tl::expected<PreparedRequest, common::ErrorCode>> ReadV2Request(
 // V1: the first packet's target is the request target.
 net::awaitable<tl::expected<PreparedRequest, common::ErrorCode>> ReadV1Request(
     transport::MultiBufferReader& reader,
-    buf::MultiBuffer pending) {
-    PacketReader packet_reader(reader, false, common::TargetAddress{}, std::move(pending));
+    common::MultiBuffer pending) {
+    UotPacketReader packet_reader(reader, false, common::TargetAddress{}, std::move(pending));
     auto first_packet = co_await packet_reader.ReadMultiBuffer();
     if (first_packet.empty()) {
         co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
     }
     PreparedRequest out;
-    const auto datagram = buf::InspectUdpDatagram(first_packet);
+    const auto datagram = common::InspectUdpDatagram(first_packet);
     if (datagram.Valid()) {
         out.destination = *datagram.target;
     }
@@ -96,21 +95,21 @@ net::awaitable<tl::expected<PreparedRequest, common::ErrorCode>> ReadV1Request(
 
 }  // namespace
 
-std::optional<Version> VersionFromMagicAddress(
+std::optional<UotVersion> VersionFromMagicAddress(
     const common::TargetAddress& target) noexcept {
     if (!target.IsDomain()) {
         return std::nullopt;
     }
     if (target.host == kMagicAddress) {
-        return Version::V2;
+        return UotVersion::V2;
     }
     if (target.host == kV1MagicAddress) {
-        return Version::V1;
+        return UotVersion::V1;
     }
     return std::nullopt;
 }
 
-tl::expected<EncodedRequest, common::ErrorCode> EncodeRequest(
+tl::expected<EncodedRequest, common::ErrorCode> EncodeUotRequest(
     bool is_connect,
     const common::TargetAddress& destination,
     common::ForwardedMetadataView forwarded) {
@@ -129,11 +128,11 @@ tl::expected<EncodedRequest, common::ErrorCode> EncodeRequest(
 }
 
 net::awaitable<tl::expected<PreparedRequest, common::ErrorCode>> ReadUotRequestHeader(
-    Version version,
+    UotVersion version,
     transport::MultiBufferReader& reader,
-    buf::MultiBuffer pending) {
+    common::MultiBuffer pending) {
     try {
-        co_return version == Version::V2
+        co_return version == UotVersion::V2
             ? co_await ReadV2Request(reader, std::move(pending))
             : co_await ReadV1Request(reader, std::move(pending));
     } catch (const transport::LinkError& e) {
@@ -151,7 +150,7 @@ net::awaitable<app::RelayResult> DispatchPreparedUotRequest(
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& dispatch_policy,
     net::io_context& io_context,
-    session::Context& ctx,
+    common::Context& ctx,
     app::StatsShard& stats,
     const infra::TimeoutsConfig& timeouts) {
     const bool is_connect = prepared.is_connect;
@@ -162,8 +161,8 @@ net::awaitable<app::RelayResult> DispatchPreparedUotRequest(
             common::Network::UDP,
             prepared.destination,
             std::move(prepared.forwarded)});
-    PacketReader uot_reader(request_reader, std::move(prepared));
-    PacketWriter uot_writer(response_writer, is_connect, ctx.outbound.target);
+    UotPacketReader uot_reader(request_reader, std::move(prepared));
+    UotPacketWriter uot_writer(response_writer, is_connect, ctx.outbound.target);
     co_return co_await dispatcher.Dispatch(
         io_context,
         dispatch_policy,
@@ -175,31 +174,31 @@ net::awaitable<app::RelayResult> DispatchPreparedUotRequest(
         timeouts);
 }
 
-PacketReader::PacketReader(transport::MultiBufferReader& reader,
+UotPacketReader::UotPacketReader(transport::MultiBufferReader& reader,
                            bool is_connect,
                            common::TargetAddress destination,
-                           buf::MultiBuffer pending)
+                           common::MultiBuffer pending)
     : reader_(reader)
     , is_connect_(is_connect)
     , destination_(is_connect ? std::move(destination) : common::TargetAddress{})
     , pending_(std::move(pending)) {}
 
-PacketReader::PacketReader(transport::MultiBufferReader& reader,
+UotPacketReader::UotPacketReader(transport::MultiBufferReader& reader,
                            PreparedRequest prepared)
     : reader_(reader)
     , is_connect_(prepared.is_connect)
     , destination_(prepared.is_connect ? std::move(prepared.destination) : common::TargetAddress{})
     , pending_(std::move(prepared.pending)) {}
 
-buf::MultiBuffer PacketReader::TakePending() noexcept {
-    buf::MultiBuffer out = std::move(pending_);
+common::MultiBuffer UotPacketReader::TakePending() noexcept {
+    common::MultiBuffer out = std::move(pending_);
     pending_.ReleaseIfIdle();
     return out;
 }
-net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
+net::awaitable<common::MultiBuffer> UotPacketReader::ReadMultiBuffer() {
     if (pending_.byte_size() < 1 &&
-        !co_await BufferedStreamReader::EnsureBufferedFrom(reader_, pending_, 1, buf::kPacketStreamPendingLimit))
-        co_return buf::MultiBuffer{};
+        !co_await BufferedStreamReader::EnsureBufferedFrom(reader_, pending_, 1, common::kPacketStreamPendingLimit))
+        co_return common::MultiBuffer{};
     common::TargetAddress packet_target;
     if (!is_connect_) {
         auto address = co_await ::common::ReadAddress(
@@ -212,7 +211,7 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
         (void)pending_.DropPrefixBytes(address->consumed);
     }
     if (pending_.byte_size() < 2 &&
-        !co_await BufferedStreamReader::EnsureBufferedFrom(reader_, pending_, 2, buf::kPacketStreamPendingLimit)) {
+        !co_await BufferedStreamReader::EnsureBufferedFrom(reader_, pending_, 2, common::kPacketStreamPendingLimit)) {
         ThrowDecodeFailure();
     }
 
@@ -223,28 +222,28 @@ net::awaitable<buf::MultiBuffer> PacketReader::ReadMultiBuffer() {
     const size_t payload_size = common::LoadU16BE(len_bytes.data());
     (void)pending_.DropPrefixBytes(len_bytes.size());
     if (pending_.byte_size() < payload_size &&
-        !co_await BufferedStreamReader::EnsureBufferedFrom(reader_, pending_, payload_size, buf::kPacketStreamPendingLimit)) {
+        !co_await BufferedStreamReader::EnsureBufferedFrom(reader_, pending_, payload_size, common::kPacketStreamPendingLimit)) {
         ThrowDecodeFailure();
     }
-    buf::MultiBuffer packet;
+    common::MultiBuffer packet;
     if (!pending_.MovePrefixTo(packet, payload_size)) {
         ThrowDecodeFailure();
     }
     pending_.ReleaseIfIdle();
-    if (!buf::SetUdpTarget(packet, is_connect_ ? destination_ : packet_target)) {
+    if (!common::SetUdpTarget(packet, is_connect_ ? destination_ : packet_target)) {
         throw std::bad_alloc();
     }
     co_return packet;
 }
 
-PacketWriter::PacketWriter(transport::MultiBufferWriter& writer,
+UotPacketWriter::UotPacketWriter(transport::MultiBufferWriter& writer,
                            bool is_connect,
                            common::TargetAddress destination)
     : writer_(writer)
     , is_connect_(is_connect)
     , destination_(std::move(destination)) {}
 
-net::awaitable<void> PacketWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
+net::awaitable<void> UotPacketWriter::WriteMultiBuffer(common::MultiBuffer mb) {
     // Connect mode frames carry no address: the response is bound to the
     // session destination whatever endpoint the datagram reports.
     const auto datagram = RequireUdpDatagram(mb, nullptr);
@@ -262,7 +261,7 @@ net::awaitable<void> PacketWriter::WriteMultiBuffer(buf::MultiBuffer mb) {
         writer_, std::span<const uint8_t>(header.data(), header_size), mb);
 }
 
-net::awaitable<void> PacketWriter::WriteBuffers(
+net::awaitable<void> UotPacketWriter::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
     if (!destination_.IsValid()) {
         throw transport::LinkError(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
@@ -275,8 +274,8 @@ net::awaitable<void> PacketWriter::WriteBuffers(
         writer_, std::span<const uint8_t>(header.data(), header_size), buffers);
 }
 
-net::awaitable<void> PacketWriter::AsyncShutdownWrite() {
+net::awaitable<void> UotPacketWriter::AsyncShutdownWrite() {
     return writer_.AsyncShutdownWrite();
 }
 
-}  // namespace proxy::uot
+}  // namespace proxy

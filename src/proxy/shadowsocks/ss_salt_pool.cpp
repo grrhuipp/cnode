@@ -1,12 +1,11 @@
 #include "proxy/shadowsocks/ss_salt_pool.hpp"
-
 #include "app/session_group_executor.hpp"
 
 #include <algorithm>
 #include <array>
 #include <new>
 
-namespace proxy::shadowsocks {
+namespace proxy {
 
 static_assert(Ss2022SaltPool::kRetention > std::chrono::seconds(2 * kSs2022MaxTimestampSkew));
 
@@ -51,4 +50,4 @@ net::awaitable<Ss2022SaltAdmission> AdmitSs2022RequestSalt(
     }
 }
 
-}  // namespace proxy::shadowsocks
+}  // namespace proxy

@@ -1,10 +1,10 @@
 #include <gtest/gtest.h>
 
-#include "app/proxyman/inbound/handler.hpp"
+#include "app/proxyman/inbound_handler.hpp"
 #include "app/relay.hpp"
 #include "app/stats.hpp"
-#include "app/proxyman/inbound/user_store.hpp"
-#include "app/proxyman/outbound/handler.hpp"
+#include "app/proxyman/user_store.hpp"
+#include "app/proxyman/outbound_handler.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"
@@ -23,9 +23,9 @@ public:
     ::net::awaitable<::app::RelayResult> Process(
         std::unique_ptr<::transport::AsyncStream>,
         ::routing::Dispatcher&,
-        const ::proxyman::inbound::ReceiverSettings&,
+        const ::app::ReceiverSettings&,
         ::net::io_context&,
-        ::session::Context&,
+        ::common::Context&,
         const ::infra::TimeoutsConfig&,
         uint32_t) override {
         co_return ::app::RelayResult{};
@@ -42,74 +42,74 @@ public:
 class DummyOutbound final : public ::proxy::Outbound {
 public:
     ::net::awaitable<::proxy::OutboundProcessResult> Process(
-        ::session::Context&,
+        ::common::Context&,
         ::transport::Link,
-        ::transport::internet::OutboundDialer&,
+        ::transport::OutboundDialer&,
         const ::infra::TimeoutsConfig&,
         ::app::StatsShard&,
         const ::app::RelayConfig&,
-        ::buf::MultiBufferBatch) override {
+        ::common::MultiBufferBatch) override {
         co_return ::app::RelayResult{};
     }
 };
 
 std::unique_ptr<::proxy::Inbound> CreateInboundHandler(
-    const ::proxyman::inbound::AdmissionEnvironment&,
-    const ::proxyman::inbound::BuildRequest&) {
+    const ::app::AdmissionEnvironment&,
+    const ::app::BuildRequest&) {
     return std::make_unique<DummyDatagramHandler>();
 }
 
 std::unique_ptr<::proxy::Inbound> FailDatagramHandler(
-    const ::proxyman::inbound::AdmissionEnvironment&,
-    const ::proxyman::inbound::BuildRequest&) {
+    const ::app::AdmissionEnvironment&,
+    const ::app::BuildRequest&) {
     return nullptr;
 }
 
 std::unique_ptr<::proxy::Inbound> CreateDatagramHandler(
-    const ::proxyman::inbound::AdmissionEnvironment&,
-    const ::proxyman::inbound::BuildRequest&) {
+    const ::app::AdmissionEnvironment&,
+    const ::app::BuildRequest&) {
     return std::make_unique<DummyDatagramHandler>();
 }
 
-std::optional<::proxyman::inbound::UserSet> BuildVmessUsers(
-    const ::proxyman::inbound::BuildRequest&,
+std::optional<::app::UserSet> BuildVmessUsers(
+    const ::app::BuildRequest&,
     std::span<const ::infra::InboundUserSpec>) {
-    return ::proxyman::inbound::UserSet{
-        ::proxyman::inbound::PreparedVmessUsers{
-            ::proxyman::inbound::PreparedVmessUser{.profile = {}}}};
+    return ::app::UserSet{
+        ::app::PreparedVmessUsers{
+            ::app::PreparedVmessUser{.profile = {}}}};
 }
 
-std::optional<::proxyman::inbound::UserSet> BuildTrojanUsers(
-    const ::proxyman::inbound::BuildRequest&,
+std::optional<::app::UserSet> BuildTrojanUsers(
+    const ::app::BuildRequest&,
     std::span<const ::infra::InboundUserSpec>) {
-    return ::proxyman::inbound::UserSet{
-        ::proxyman::inbound::PreparedTrojanUsers{}};
+    return ::app::UserSet{
+        ::app::PreparedTrojanUsers{}};
 }
 
-std::optional<::proxyman::outbound::PreparedOutboundProxy>
+std::optional<::app::PreparedOutboundProxy>
 CreateOutboundConfig(
     const ::infra::OutboundSourceConfig&) {
-    return ::proxyman::outbound::PreparedOutboundProxy{
-        .create = ::proxyman::outbound::PreparedOutboundCreator{
+    return ::app::PreparedOutboundProxy{
+        .create = ::app::PreparedOutboundCreator{
             {},
             [](std::string_view,
-               const std::shared_ptr<const ::proxyman::outbound::OutboundProtocolSettings>&,
+               const std::shared_ptr<const ::app::OutboundProtocolSettings>&,
                ::net::io_context&,
                ::common::AwaitableTaskGroup&) -> std::unique_ptr<::proxy::Outbound> {
                 return std::make_unique<DummyOutbound>();
             }},
-        .sender = {.stream_settings = {}, .send_through = ::transport::internet::OutboundBind::Auto()},
+        .sender = {.stream_settings = {}, .send_through = ::transport::OutboundBind::Auto()},
     };
 }
 
-std::optional<::proxyman::outbound::PreparedOutboundProxy>
+std::optional<::app::PreparedOutboundProxy>
 CreateNullOutboundConfig(
     const ::infra::OutboundSourceConfig&) {
-    return ::proxyman::outbound::PreparedOutboundProxy{
-        .create = ::proxyman::outbound::PreparedOutboundCreator{
+    return ::app::PreparedOutboundProxy{
+        .create = ::app::PreparedOutboundCreator{
             {},
             [](std::string_view,
-               const std::shared_ptr<const ::proxyman::outbound::OutboundProtocolSettings>&,
+               const std::shared_ptr<const ::app::OutboundProtocolSettings>&,
                ::net::io_context&,
                ::common::AwaitableTaskGroup&) -> std::unique_ptr<::proxy::Outbound> {
                 return nullptr;
@@ -118,14 +118,14 @@ CreateNullOutboundConfig(
     };
 }
 
-std::optional<::proxyman::outbound::PreparedOutboundProxy>
+std::optional<::app::PreparedOutboundProxy>
 CreateEmptyOutboundConfig(
     const ::infra::OutboundSourceConfig&) {
-    return ::proxyman::outbound::PreparedOutboundProxy{};
+    return ::app::PreparedOutboundProxy{};
 }
 
-::proxyman::inbound::ProxyRegistration InboundRegistration() {
-    ::proxyman::inbound::ProxyRegistration registration;
+::app::ProxyRegistration InboundRegistration() {
+    ::app::ProxyRegistration registration;
     registration.create_tcp_handler = &CreateInboundHandler;
     return registration;
 }
@@ -141,16 +141,16 @@ TEST_P(InvalidInboundRegistration, RejectsIncompleteRegistration) {
     switch (GetParam()) {
         case InvalidInbound::EmptyName: protocol.clear(); break;
         case InvalidInbound::MissingQuicFactory:
-            registration.datagram_transport = ::proxyman::inbound::DatagramTransport::Quic;
+            registration.datagram_transport = ::app::DatagramTransport::Quic;
             break;
         case InvalidInbound::OrphanQuicFactory:
             registration.create_quic_listener = [](uint32_t, uint32_t, ::net::io_context&,
-                ::app::DatagramSessionEnvironment) -> std::unique_ptr<::transport::internet::QuicListener> {
+                ::app::DatagramSessionEnvironment) -> std::unique_ptr<::transport::QuicListener> {
                 return {};
             };
             break;
         case InvalidInbound::MissingPacketFactory:
-            registration.datagram_transport = ::proxyman::inbound::DatagramTransport::Packet;
+            registration.datagram_transport = ::app::DatagramTransport::Packet;
             break;
         case InvalidInbound::OrphanPacketFactory:
             registration.create_datagram_handler = &CreateDatagramHandler;
@@ -158,10 +158,10 @@ TEST_P(InvalidInboundRegistration, RejectsIncompleteRegistration) {
         case InvalidInbound::MissingHandler: registration.create_tcp_handler = nullptr; break;
         case InvalidInbound::MissingUserProtocol: registration.build_users = &BuildVmessUsers; break;
         case InvalidInbound::OrphanUserProtocol:
-            registration.user_protocol = ::proxyman::inbound::UserProtocol::Vmess;
+            registration.user_protocol = ::app::UserProtocol::Vmess;
             break;
     }
-    EXPECT_THROW(::proxyman::inbound::RegisterProxy(protocol, registration), std::invalid_argument);
+    EXPECT_THROW(::app::RegisterProxy(protocol, registration), std::invalid_argument);
 }
 
 INSTANTIATE_TEST_SUITE_P(RequiredCapabilities, InvalidInboundRegistration, ::testing::Values(InvalidInbound::EmptyName, InvalidInbound::MissingQuicFactory,
@@ -181,27 +181,27 @@ return "Unknown"; }));
 
 TEST(ProtocolRegistration, DuplicateInboundDoesNotReplacePublishedFactory) {
     const auto registration = InboundRegistration();
-    ::proxyman::inbound::RegisterProxy("lifecycle-inbound", registration);
-    EXPECT_THROW(::proxyman::inbound::RegisterProxy("lifecycle-inbound", registration),
+    ::app::RegisterProxy("lifecycle-inbound", registration);
+    EXPECT_THROW(::app::RegisterProxy("lifecycle-inbound", registration),
                  std::logic_error);
     ::net::io_context io;
     ::WorkerCoordinatorFixture coordinator(io);
     auto limiter = ::app::ConnectionLimiter::Acquire({}, coordinator.Get());
     ::common::UserOnlineTracker tracker(*coordinator.Get());
     ::app::StatsShard stats;
-    const ::proxyman::inbound::AdmissionEnvironment environment{
+    const ::app::AdmissionEnvironment environment{
         *coordinator.Get(), *limiter, tracker, stats};
-    ::proxyman::inbound::HandlerRegistry registry(environment);
+    ::app::InboundHandlerRegistry registry(environment);
     EXPECT_TRUE(registry.NewHandler({.tag = "lifecycle-inbound", .protocol = "lifecycle-inbound", .settings = {}}));
 }
 
 TEST(ProtocolRegistration, PreservesRegisteredTraitsAndQuicFactoryCapability) {
-    using namespace ::proxyman::inbound;
+    using namespace ::app;
     auto registration = InboundRegistration();
     registration.datagram_transport = DatagramTransport::Quic;
     registration.traits = {.mailbox_email_defaults_to_tag = true, .requires_tls = true};
     registration.create_quic_listener = [](uint32_t, uint32_t, ::net::io_context&,
-        ::app::DatagramSessionEnvironment) -> std::unique_ptr<::transport::internet::QuicListener> {
+        ::app::DatagramSessionEnvironment) -> std::unique_ptr<::transport::QuicListener> {
         return {};
     };
     EXPECT_NO_THROW(RegisterProxy("lifecycle-quic-traits", registration));
@@ -222,7 +222,7 @@ enum class DatagramBuild { Unknown, Unsupported, Failed, Ready };
 class DatagramRegistration : public ::testing::TestWithParam<DatagramBuild> {};
 
 TEST_P(DatagramRegistration, ReportsCapabilityAndConstructionOutcome) {
-    using namespace ::proxyman::inbound;
+    using namespace ::app;
     auto registration = InboundRegistration();
     std::string protocol;
     auto expected = DatagramHandlerBuildStatus::Failed;
@@ -251,7 +251,7 @@ TEST_P(DatagramRegistration, ReportsCapabilityAndConstructionOutcome) {
     ::common::UserOnlineTracker tracker(*coordinator.Get());
     ::app::StatsShard stats;
     const AdmissionEnvironment environment{*coordinator.Get(), *limiter, tracker, stats};
-    HandlerRegistry registry(environment);
+    InboundHandlerRegistry registry(environment);
     const BuildRequest request{.tag = {}, .protocol = protocol, .settings = {}};
     auto result = registry.NewDatagramHandler(request);
     EXPECT_EQ(result.status, expected);
@@ -268,7 +268,7 @@ INSTANTIATE_TEST_SUITE_P(Capabilities, DatagramRegistration, ::testing::Values(D
 return "Unknown"; }));
 
 TEST(ProtocolRegistration, AliasUsesRegisteredCredentialTypeForPublicationAndRemoval) {
-    using namespace ::proxyman::inbound;
+    using namespace ::app;
     auto registration = InboundRegistration();
     registration.user_protocol = UserProtocol::Vmess;
     registration.build_users = &BuildVmessUsers;
@@ -300,7 +300,7 @@ TEST(ProtocolRegistration, AliasUsesRegisteredCredentialTypeForPublicationAndRem
 }
 
 TEST(ProtocolRegistration, RejectsCredentialBuilderReturningDifferentProtocol) {
-    using namespace ::proxyman::inbound;
+    using namespace ::app;
     auto registration = InboundRegistration();
     registration.user_protocol = UserProtocol::Vmess;
     registration.build_users = &BuildTrojanUsers;
@@ -313,7 +313,7 @@ TEST(ProtocolRegistration, RejectsCredentialBuilderReturningDifferentProtocol) {
 class InvalidOutboundRegistration : public ::testing::TestWithParam<bool> {};
 
 TEST_P(InvalidOutboundRegistration, RejectsMissingNameOrCreator) {
-    EXPECT_THROW(::proxyman::outbound::RegisterProxy(
+    EXPECT_THROW(::app::RegisterProxy(
         GetParam() ? "" : "lifecycle-missing-creator",
         GetParam() ? &CreateOutboundConfig : nullptr), std::invalid_argument);
 }
@@ -321,7 +321,7 @@ TEST_P(InvalidOutboundRegistration, RejectsMissingNameOrCreator) {
 INSTANTIATE_TEST_SUITE_P(RequiredCapabilities, InvalidOutboundRegistration, ::testing::Bool(), ([](const ::testing::TestParamInfo<bool>& info) { return info.param ? "EmptyName" : "MissingCreator"; }));
 
 TEST(ProtocolRegistration, DuplicateOutboundDoesNotReplacePublishedCreator) {
-    using namespace ::proxyman::outbound;
+    using namespace ::app;
     RegisterProxy("lifecycle-outbound", &CreateOutboundConfig);
     EXPECT_THROW(RegisterProxy("lifecycle-outbound", &CreateNullOutboundConfig), std::logic_error);
     ::infra::OutboundSourceConfig source;
@@ -335,21 +335,21 @@ TEST(ProtocolRegistration, DuplicateOutboundDoesNotReplacePublishedCreator) {
 }
 
 TEST(ProtocolRegistration, ExplicitSendThroughOverridesProtocolBinding) {
-    using namespace ::proxyman::outbound;
+    using namespace ::app;
     RegisterProxy("lifecycle-bound-outbound", &CreateOutboundConfig);
     ::infra::OutboundSourceConfig source;
     source.tag = "lifecycle-bound-tag";
     source.protocol = "lifecycle-bound-outbound";
-    source.send_through = ::transport::internet::OutboundBind{};
+    source.send_through = ::transport::OutboundBind{};
     const auto prepared = PrepareOutboundConfig(source);
     ASSERT_TRUE(prepared);
-    EXPECT_EQ(prepared->sender.send_through.GetMode(), ::transport::internet::OutboundBind::Mode::None);
+    EXPECT_EQ(prepared->sender.send_through.GetMode(), ::transport::OutboundBind::Mode::None);
 }
 
 class InvalidRuntimeCreator : public ::testing::TestWithParam<bool> {};
 
 TEST_P(InvalidRuntimeCreator, RejectsMissingOrNullRuntimeCreator) {
-    using namespace ::proxyman::outbound;
+    using namespace ::app;
     ::net::io_context io;
     ::common::ResidentTaskGroup tasks(io.get_executor());
     PreparedOutboundConfig config;
@@ -369,7 +369,7 @@ TEST_P(InvalidRuntimeCreator, RejectsMissingOrNullRuntimeCreator) {
 INSTANTIATE_TEST_SUITE_P(RuntimeCreation, InvalidRuntimeCreator, ::testing::Bool(), ([](const ::testing::TestParamInfo<bool>& info) { return info.param ? "NullRuntime" : "MissingCreator"; }));
 
 TEST(ProtocolRegistration, RejectsPreparedOutboundWithoutCreator) {
-    using namespace ::proxyman::outbound;
+    using namespace ::app;
     RegisterProxy("lifecycle-empty-outbound", &CreateEmptyOutboundConfig);
     ::infra::OutboundSourceConfig source;
     source.protocol = "lifecycle-empty-outbound";
@@ -387,13 +387,13 @@ TEST_P(BuiltinOutboundSettings, CreatesOnlyProtocolMatchingTypedSettings) {
         .tag = "typed-outbound",
         .protocol = freedom_protocol ? "freedom" : "blackhole",
         .settings = infra::FreedomSettings{
-            .domain_strategy = proxy::freedom::outbound::DomainStrategy::UseIPv6v4},
+            .domain_strategy = proxy::DomainStrategy::UseIPv6v4},
         .stream_settings = {},
         .send_through = {},
         .passthrough = false,
     };
     if (!freedom_settings) source.settings = infra::BlackholeSettings{.http_response = true};
-    auto prepared = proxyman::outbound::PrepareOutboundConfig(source);
+    auto prepared = app::PrepareOutboundConfig(source);
     if (freedom_protocol != freedom_settings) {
         EXPECT_FALSE(prepared);
         return;
@@ -401,7 +401,7 @@ TEST_P(BuiltinOutboundSettings, CreatesOnlyProtocolMatchingTypedSettings) {
     ASSERT_TRUE(prepared);
     net::io_context io;
     common::ResidentTaskGroup tasks(io.get_executor());
-    EXPECT_TRUE(proxyman::outbound::NewProxy(*prepared, io, tasks.Tasks()));
+    EXPECT_TRUE(app::NewProxy(*prepared, io, tasks.Tasks()));
 }
 
 INSTANTIATE_TEST_SUITE_P(ProtocolsAndSettings, BuiltinOutboundSettings, ::testing::Combine(::testing::Bool(), ::testing::Bool()), ([](const ::testing::TestParamInfo<BuiltinOutboundSettings::ParamType>& info) { const auto [freedom_protocol, freedom_settings] = info.param;

@@ -4,7 +4,7 @@
 #include <chrono>
 
 namespace {
-using namespace ::proxy::vless;
+using namespace ::proxy;
 using namespace std::chrono_literals;
 class VlessTicketStore : public testing::Test {
 protected:

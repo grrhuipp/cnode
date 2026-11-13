@@ -15,6 +15,7 @@ namespace app {
 
 class ConnectionLimiter;
 struct StatsShard;
+struct AdmissionEnvironment;
 
 }  // namespace app
 namespace infra {
@@ -22,16 +23,16 @@ namespace infra {
 struct TimeoutsConfig;
 
 }  // namespace infra
-namespace proxyman::inbound { struct AdmissionEnvironment; }
+
 
 namespace routing {
 class Dispatcher;
 struct DispatchPolicy;
 }  // namespace routing
 
-namespace session {
+namespace common {
 struct Context;
-}  // namespace session
+}  // namespace common
 
 namespace proxy {
 
@@ -51,8 +52,8 @@ net::awaitable<app::RelayResult> ServeMuxInbound(
     transport::AsyncStream& client_control,
     routing::Dispatcher& dispatcher,
     const routing::DispatchPolicy& policy,
-    const proxyman::inbound::AdmissionEnvironment& environment,
-    session::Context& parent_ctx,
+    const app::AdmissionEnvironment& environment,
+    common::Context& parent_ctx,
     app::StatsShard& stats,
     const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout);

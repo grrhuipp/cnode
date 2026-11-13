@@ -1,8 +1,7 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/datagram_socket.hpp"
-
-#include "common/buf/multi_buffer.hpp"
+#include "transport/datagram_socket.hpp"
+#include "common/multi_buffer.hpp"
 #include "transport/link.hpp"
 #include <optional>
 #include <thread>
@@ -23,14 +22,14 @@
 
 namespace {
 using namespace std::chrono_literals;
-using ::transport::internet::DatagramSocket;
-using ::transport::internet::ReceivedDatagram;
+using ::transport::DatagramSocket;
+using ::transport::ReceivedDatagram;
 
-::buf::MultiBuffer MakePayload(std::span<const uint8_t> bytes) {
-    ::buf::MultiBuffer payload;
+::common::MultiBuffer MakePayload(std::span<const uint8_t> bytes) {
+    ::common::MultiBuffer payload;
     std::size_t offset = 0;
     while (offset < bytes.size()) {
-        ::buf::BufferGuard buffer{::buf::Buffer::New()};
+        ::common::BufferGuard buffer{::common::Buffer::New()};
         if (!buffer) throw std::bad_alloc();
         const auto count = std::min<std::size_t>(buffer->Available(), bytes.size() - offset);
         std::memcpy(buffer->Tail().data(), bytes.data() + offset, count);
@@ -42,7 +41,7 @@ using ::transport::internet::ReceivedDatagram;
 }
 
 ::net::awaitable<void> SendPayload(
-    DatagramSocket& socket, ::udp::endpoint destination, ::buf::MultiBuffer payload) {
+    DatagramSocket& socket, ::udp::endpoint destination, ::common::MultiBuffer payload) {
     auto operation = socket.StartWrite();
     co_await operation.SendTo(std::move(destination), std::move(payload));
 }
@@ -76,13 +75,13 @@ TEST_P(DatagramSocketPayload, PreservesPayloadAndSourceWithIndependentBindings) 
     std::vector<uint8_t> bytes(GetParam() == SendShape::LargeOwnedPayload ? 60000 : 100);
     for (std::size_t i = 0; i < bytes.size(); ++i)
         bytes[i] = static_cast<uint8_t>(GetParam() == SendShape::LargeOwnedPayload ? i * 31u : i);
-    ::buf::MultiBuffer payload;
+    ::common::MultiBuffer payload;
     std::vector<::net::const_buffer> scatter;
     if (GetParam() == SendShape::LargeOwnedPayload) {
         payload = MakePayload(bytes);
     } else if (GetParam() == SendShape::FragmentedOwnedPayload) {
         for (const auto byte : bytes) {
-            ::buf::BufferGuard buffer{::buf::Buffer::New()};
+            ::common::BufferGuard buffer{::common::Buffer::New()};
             ASSERT_TRUE(buffer);
             buffer->Tail()[0] = byte;
             buffer->Produce(1);
@@ -376,7 +375,7 @@ TEST(DatagramSocket, PeekDatagramSizeReportsHeadWithoutConsuming) {
     ::udp::socket sender(io, ::udp::v4());
     receiver.non_blocking(true);
     ::IoErrorCode error;
-    EXPECT_EQ(::transport::internet::PeekDatagramSize(receiver, error), 0u);
+    EXPECT_EQ(::transport::PeekDatagramSize(receiver, error), 0u);
     // The empty-queue code must match the asio enum receive paths compare with.
     EXPECT_TRUE(error == ::io_error::would_block || error == ::io_error::try_again);
 
@@ -385,14 +384,14 @@ TEST(DatagramSocket, PeekDatagramSizeReportsHeadWithoutConsuming) {
     sender.send_to(::net::const_buffer{}, receiver.local_endpoint());
     std::vector<uint8_t> received(65536);
     ::udp::endpoint source;
-    EXPECT_EQ(::transport::internet::PeekDatagramSize(receiver, error), large.size());
+    EXPECT_EQ(::transport::PeekDatagramSize(receiver, error), large.size());
     EXPECT_FALSE(error);
-    EXPECT_EQ(::transport::internet::PeekDatagramSize(receiver, error), large.size());
+    EXPECT_EQ(::transport::PeekDatagramSize(receiver, error), large.size());
     EXPECT_EQ(receiver.receive_from(::net::buffer(received), source), large.size());
     // A zero-length datagram is a real datagram, not an empty queue.
-    EXPECT_EQ(::transport::internet::PeekDatagramSize(receiver, error), 0u);
+    EXPECT_EQ(::transport::PeekDatagramSize(receiver, error), 0u);
     EXPECT_FALSE(error);
     EXPECT_EQ(receiver.receive_from(::net::buffer(received), source), 0u);
-    (void)::transport::internet::PeekDatagramSize(receiver, error);
+    (void)::transport::PeekDatagramSize(receiver, error);
     EXPECT_TRUE(error == ::io_error::would_block || error == ::io_error::try_again);
 }

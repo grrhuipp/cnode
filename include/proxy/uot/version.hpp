@@ -2,11 +2,11 @@
 
 #include <cstdint>
 
-namespace proxy::uot {
+namespace proxy {
 
-enum class Version : uint8_t {
+enum class UotVersion : uint8_t {
     V1 = 1,
     V2 = 2,
 };
 
-}  // namespace proxy::uot
+}  // namespace proxy

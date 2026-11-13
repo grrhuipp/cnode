@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common/asio_types.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/eof_cancellation.hpp"
 #include "common/byte_reader.hpp"
 #include "common/error.hpp"
@@ -59,9 +59,6 @@ struct AddressDecodeResult {
     std::optional<ForwardedMetadata> forwarded;
 };
 
-}  // namespace common
-
-namespace common::detail {
 
 [[nodiscard]] inline bool ReadAddressMetadataVarint(
     std::span<const uint8_t> data, size_t& pos, uint64_t& out) noexcept {
@@ -108,7 +105,7 @@ struct NormalizedMetadataView {
         out.payload_size += 1 + email.size();
     }
     if (metadata.client_ip) {
-        const auto normalized = iputil::NormalizeAddress(*metadata.client_ip);
+        const auto normalized = NormalizeAddress(*metadata.client_ip);
         if (!normalized.is_unspecified()) {
             out.client_ip = normalized;
             if (normalized.is_v4()) {
@@ -147,17 +144,14 @@ struct NormalizedMetadataView {
     return 0;
 }
 
-}  // namespace detail
 
 // Every AddressWireFormat encodes the same fields, so the size is format-free.
-namespace common {
-
 [[nodiscard]] inline size_t AddressEncodedSize(
     const TargetAddress& target,
     ForwardedMetadataView metadata = {}) noexcept {
-    const size_t base_size = detail::BaseAddressEncodedSize(target);
+    const size_t base_size = BaseAddressEncodedSize(target);
     if (base_size == 0) return 0;
-    const auto normalized = detail::NormalizeMetadataView(metadata);
+    const auto normalized = NormalizeMetadataView(metadata);
     if (normalized.payload_size == 0) return base_size;
     return base_size + 1 + normalized.payload_size;
 }
@@ -166,9 +160,9 @@ namespace common {
     const TargetAddress& target, uint8_t* output, size_t capacity,
     AddressWireFormat format,
     ForwardedMetadataView metadata = {}) noexcept {
-    const size_t base_size = detail::BaseAddressEncodedSize(target);
+    const size_t base_size = BaseAddressEncodedSize(target);
     if (!output || base_size < 4) return 0;
-    const auto normalized = detail::NormalizeMetadataView(metadata);
+    const auto normalized = NormalizeMetadataView(metadata);
     const size_t size = normalized.payload_size == 0
         ? base_size
         : base_size + 1 + normalized.payload_size;
@@ -333,7 +327,7 @@ namespace common {
         }
         if ((flags & kAddressMetaHasUserId) != 0) {
             uint64_t uid = 0;
-            if (!detail::ReadAddressMetadataVarint(meta, meta_pos, uid)) {
+            if (!ReadAddressMetadataVarint(meta, meta_pos, uid)) {
                 result.status = AddressDecodeStatus::Invalid;
                 result.required = 0;
                 return result;
@@ -387,7 +381,7 @@ namespace common {
             net::ip::address_v6::bytes_type v6_bytes{};
             std::memcpy(v6_bytes.data(), meta.data() + meta_pos, v6_bytes.size());
             meta_pos += v6_bytes.size();
-            const auto addr = iputil::NormalizeAddress(net::ip::make_address_v6(v6_bytes));
+            const auto addr = NormalizeAddress(net::ip::make_address_v6(v6_bytes));
             if (addr.is_unspecified()) {
                 result.status = AddressDecodeStatus::Invalid;
                 result.required = 0;
@@ -451,7 +445,7 @@ namespace common {
 // A clean EOF before an address is still an incomplete address, not success.
 template <typename Reader>
 [[nodiscard]] net::awaitable<tl::expected<DecodedAddress, ErrorCode>> ReadAddress(
-    Reader& reader, buf::MultiBuffer& pending, AddressWireFormat format,
+    Reader& reader, MultiBuffer& pending, AddressWireFormat format,
     size_t offset = 0, AddressDecodeOptions options = {}) {
     std::array<uint8_t, kMaxEncodedAddressSize> bytes{};
     size_t copied = 0;

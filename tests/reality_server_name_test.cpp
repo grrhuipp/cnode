@@ -1,15 +1,14 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/stream_settings.hpp"
-#include "transport/internet/tls_server_name.hpp"
-
+#include "transport/stream_settings.hpp"
+#include "transport/tls_server_name.hpp"
 #include <array>
 #include <string>
 #include <vector>
 
 namespace {
-using ::transport::internet::IsRealityServerNameAllowed;
-using ::transport::internet::ParseTlsServerNameExtension;
+using ::transport::IsRealityServerNameAllowed;
+using ::transport::ParseTlsServerNameExtension;
 
 TEST(RealityServerName, ParsesCanonicalHostName) {
     constexpr std::array<uint8_t, 16> extension{

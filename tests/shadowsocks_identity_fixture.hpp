@@ -1,6 +1,6 @@
 #pragma once
 
-#include "app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/user_store.hpp"
 #include "proxy/shadowsocks/ss_udp.hpp"
 #include "proxy/shadowsocks/ss_stream.hpp"
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
@@ -12,7 +12,7 @@
 #include <vector>
 
 namespace ss_identity_test {
-using namespace proxyman::inbound;
+using namespace app;
 inline constexpr std::string_view kTag = "ss-identity-fixture";
 
 inline void Require(bool condition) {
@@ -35,10 +35,10 @@ public:
         bytes.insert(bytes.end(), first, first + in.size());
         co_return in.size();
     }
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
-        co_return buf::MultiBuffer{};
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
+        co_return common::MultiBuffer{};
     }
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer input) override {
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer input) override {
         for (const auto* buffer : input) {
             const auto data = buffer->Bytes();
             bytes.insert(bytes.end(), data.begin(), data.end());
@@ -52,7 +52,7 @@ public:
     bool IsOpen() const override { return true; }
 };
 
-inline PreparedShadowsocksUsers Users(size_t count, const proxy::shadowsocks::SsCipherInfo& cipher,
+inline PreparedShadowsocksUsers Users(size_t count, const proxy::SsCipherInfo& cipher,
                                       size_t groups = 1) {
     PreparedShadowsocksUsers users;
     users.reserve(count);
@@ -69,7 +69,7 @@ inline PreparedShadowsocksUsers Users(size_t count, const proxy::shadowsocks::Ss
             for (size_t byte = 0; byte < sizeof(group); ++byte)
                 user.identity_key.bytes[byte] = static_cast<uint8_t>(group >> (byte * 8));
         }
-        Require(proxy::shadowsocks::Hash2022Psk(user.derived_key.span(), user.psk_hash));
+        Require(proxy::Hash2022Psk(user.derived_key.span(), user.psk_hash));
         user.profile.user_id = static_cast<int>(i + 1);
         users.push_back(std::move(user));
     }
@@ -82,38 +82,38 @@ inline void Install(const PreparedShadowsocksUsers& users) {
 }
 
 inline net::awaitable<void> PrepareWire(Wire& wire, const PreparedShadowsocksUser& user,
-                                        const proxy::shadowsocks::SsCipherInfo& cipher) {
-    proxy::shadowsocks::KeyBytes key;
+                                        const proxy::SsCipherInfo& cipher) {
+    proxy::KeyBytes key;
     Require(key.assign(user.derived_key.span()));
-    std::vector<proxy::shadowsocks::KeyBytes> chain;
+    std::vector<proxy::KeyBytes> chain;
     if (!user.identity_key.empty()) {
-        proxy::shadowsocks::KeyBytes identity;
+        proxy::KeyBytes identity;
         Require(identity.assign(user.identity_key.span()));
         chain.push_back(identity);
         chain.push_back(key);
     }
-    auto request = co_await proxy::shadowsocks::WriteTCPRequest(
+    auto request = co_await proxy::WriteTCPRequest(
         common::TargetAddress("127.0.0.1", 443), cipher, key, chain, wire);
     Require(bool(request));
-    buf::MultiBuffer payload;
+    common::MultiBuffer payload;
     const std::array<uint8_t, 3> data{0x17, 0x29, 0x41};
-    Require(buf::AppendSpanToMultiBuffer(data, payload));
+    Require(common::AppendSpanToMultiBuffer(data, payload));
     co_await request->request_writer.WriteMultiBuffer(std::move(payload));
 }
 
 inline void Prepare(net::io_context& io, Wire& wire, const PreparedShadowsocksUser& user,
-                    const proxy::shadowsocks::SsCipherInfo& cipher) {
+                    const proxy::SsCipherInfo& cipher) {
     io.restart();
     auto done = net::co_spawn(io, PrepareWire(wire, user, cipher), net::use_future);
     io.run();
     done.get();
 }
 
-inline auto Authenticate(net::io_context& io, Wire& wire, const proxy::shadowsocks::SsCipherInfo& cipher,
+inline auto Authenticate(net::io_context& io, Wire& wire, const proxy::SsCipherInfo& cipher,
                          size_t& hint) {
     wire.offset = 0;
     io.restart();
-    auto done = net::co_spawn(io, proxy::shadowsocks::ReadTCPSession(wire, cipher, kTag, hint), net::use_future);
+    auto done = net::co_spawn(io, proxy::ReadTCPSession(wire, cipher, kTag, hint), net::use_future);
     io.run();
     return done.get();
 }

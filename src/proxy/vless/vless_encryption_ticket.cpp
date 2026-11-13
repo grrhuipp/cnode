@@ -9,7 +9,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
-namespace proxy::vless {
+namespace proxy {
 namespace {
 [[nodiscard]] std::array<uint8_t, 32> DigestNfsKey(
     const VlessEncryptionNfsKey& nfs_key) noexcept {
@@ -106,7 +106,7 @@ void VlessEncryptionServerTicketStore::Store(
     sessions_.Insert(key, now + std::chrono::seconds(seconds), Session{
         .pfs_key = pfs_key, .identity = std::nullopt,
         .seen_nfs_keys = decltype(Session::seen_nfs_keys)(
-            0, sessions_.hash_function(), proxy::TimingSafeEqual{}, memory::process_resource()),
+            0, sessions_.hash_function(), proxy::TimingSafeEqual{}),
     }, [this](auto& entry) noexcept {
         seen_nfs_keys_ -= entry.value.seen_nfs_keys.size();
     });
@@ -223,4 +223,4 @@ net::awaitable<std::optional<Resumed>> LookupVlessTicket(
             return result;
         });
 }
-}  // namespace proxy::vless
+}  // namespace proxy

@@ -4,8 +4,8 @@
 #include "proxy/outbound_endpoint_base.hpp"
 #include "app/relay.hpp"
 #include "proxy/uot/uot.hpp"
-#include "app/proxyman/inbound/user_store.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "app/proxyman/user_store.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/initial_payload.hpp"
 #include "common/sharded_user_stats.hpp"
 #include "common/target_address.hpp"
@@ -14,7 +14,7 @@
 #include "proxy/outbound.hpp"
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/internet/outbound_target_builder.hpp"
+#include "transport/outbound_target_builder.hpp"
 #include "transport/link.hpp"
 
 #include <algorithm>
@@ -36,36 +36,36 @@
 // ============================================================================
 // SS Outbound 配置
 // ============================================================================
-namespace proxy::shadowsocks::outbound {
+namespace proxy {
 
 struct SsOutboundConfig {
-    transport::internet::OutboundServer server;
-    std::optional<proxy::uot::Version> uot_version;
+    transport::OutboundServer server;
+    std::optional<proxy::UotVersion> uot_version;
 };
 
-}  // namespace proxy::shadowsocks::outbound
+}  // namespace proxy
 
 // ============================================================================
 // SsOutbound — 出站编排（握手、初始 payload、relay、收尾）
 // 协议加密状态由 shadowsocks_protocol.cpp 承担。
 // ============================================================================
-namespace proxy::shadowsocks::outbound {
+namespace proxy {
 
 // One authenticated UDP association, with a fixed proxy next hop. The inner
 // packet target is encoded as supplied; only the server name is resolved here.
-class UdpRequest final : public ::proxy::OutboundDatagramEndpointBase {
+class SsUdpRequest final : public ::proxy::OutboundDatagramEndpointBase {
 public:
-    UdpRequest(net::io_context& io, app::dns::DNS& dns,
+    SsUdpRequest(net::io_context& io, app::DNS& dns,
                const net::ip::address& bind_address, common::TargetAddress server,
-               const proxy::shadowsocks::SsCipherInfo& cipher_info, const proxy::shadowsocks::KeyBytes& master_key,
-               std::span<const proxy::shadowsocks::KeyBytes> psk_chain,
+               const proxy::SsCipherInfo& cipher_info, const proxy::KeyBytes& master_key,
+               std::span<const proxy::KeyBytes> psk_chain,
                common::ForwardedMetadataView forwarded = {})
         : OutboundDatagramEndpointBase(io, bind_address), dns_(dns), server_(std::move(server)),
           cipher_info_(cipher_info), master_key_(master_key), psk_chain_(psk_chain) {
         forwarded_ = common::ForwardedMetadata::FromView(forwarded);
-        if (proxy::shadowsocks::Is2022Cipher(cipher_info_.type)) {
+        if (proxy::Is2022Cipher(cipher_info_.type)) {
             ss2022_state_.emplace();
-            if (!proxy::shadowsocks::Init2022UdpSessionState(*ss2022_state_, cipher_info_, master_key_))
+            if (!proxy::Init2022UdpSessionState(*ss2022_state_, cipher_info_, master_key_))
                 throw transport::LinkError(common::ErrorCode::INTERNAL);
         }
         if (server_.resolved_addr) {
@@ -75,18 +75,18 @@ public:
         }
     }
 
-    net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
+    net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         // Keep one absolute read budget across unauthenticated or wrong-source
         // packets. Only an authenticated payload is valid receive activity.
         auto read = socket_.StartRead();
         while (true) {
             auto packet = co_await read.Receive();
             if (!server_endpoint_ || packet.source != *server_endpoint_) continue;
-            const buf::ContiguousBufferView view(packet.payload);
+            const common::ContiguousBufferView view(packet.payload);
             const auto bytes = view.Bytes();
             auto decoded = ss2022_state_
-                ? proxy::shadowsocks::Decode2022UdpResponsePacket(bytes.data(), bytes.size(), *ss2022_state_)
-                : proxy::shadowsocks::DecodeUdpPacketWithKey(bytes.data(), bytes.size(), master_key_.span(),
+                ? proxy::Decode2022UdpResponsePacket(bytes.data(), bytes.size(), *ss2022_state_)
+                : proxy::DecodeUdpPacketWithKey(bytes.data(), bytes.size(), master_key_.span(),
                     cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size);
             if (!decoded) continue;
             if (!decoded->target.IsValid()) continue;
@@ -95,7 +95,7 @@ public:
         }
     }
 
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer payload) override {
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer payload) override {
         const auto datagram = proxy::RequireUdpDatagram(payload, nullptr);
         if (!datagram) co_return;
         if (write_closed_) throw transport::WriteClosed{};
@@ -106,13 +106,13 @@ public:
             server_endpoint_ = *server;
         }
         if (write.Cancelled()) throw transport::LinkError(write.CancellationReason());
-        const buf::ContiguousBufferView view(payload);
+        const common::ContiguousBufferView view(payload);
         const auto bytes = view.Bytes();
         const size_t encoded_len = EncodedPacketSize(*datagram->target, bytes);
         const size_t maximum = server_endpoint_->address().is_v6() ? 65527 : 65507;
         if (encoded_len == 0 || encoded_len > maximum)
             throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
-        buf::ContiguousWriteBuffer encoded;
+        common::ContiguousWriteBuffer encoded;
         uint8_t* dst = encoded.Prepare(encoded_len);
         if (EncodePacketTo(*datagram->target, bytes, dst, encoded_len) != encoded_len)
             throw transport::LinkError(common::ErrorCode::INTERNAL);
@@ -128,49 +128,49 @@ private:
         const common::ForwardedMetadataView forwarded =
             forwarded_ ? forwarded_->View() : common::ForwardedMetadataView{};
         if (ss2022_state_)
-            return proxy::shadowsocks::Encode2022UdpRequestPacketTo(target, payload.data(), payload.size(),
+            return proxy::Encode2022UdpRequestPacketTo(target, payload.data(), payload.size(),
                 *ss2022_state_, psk_chain_, output, output_size, forwarded);
-        return proxy::shadowsocks::EncodeUdpPacketTo(target, payload.data(), payload.size(), master_key_.span(),
+        return proxy::EncodeUdpPacketTo(target, payload.data(), payload.size(), master_key_.span(),
             cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size,
             output, output_size, forwarded);
     }
 
-    app::dns::DNS& dns_;
+    app::DNS& dns_;
     const common::TargetAddress server_;
     std::optional<udp::endpoint> server_endpoint_;
-    const proxy::shadowsocks::SsCipherInfo cipher_info_;
-    proxy::shadowsocks::KeyBytes master_key_;
-    const std::span<const proxy::shadowsocks::KeyBytes> psk_chain_;
+    const proxy::SsCipherInfo cipher_info_;
+    proxy::KeyBytes master_key_;
+    const std::span<const proxy::KeyBytes> psk_chain_;
     std::optional<common::ForwardedMetadata> forwarded_;
-    std::optional<proxy::shadowsocks::Ss2022UdpSessionState> ss2022_state_;
+    std::optional<proxy::Ss2022UdpSessionState> ss2022_state_;
 };
 
 // A complete, validated credential value. Preparation never drops a chain link
 // or substitutes a different cipher; Worker handlers only consume this value.
-class Credentials {
+class SsCredentials {
 public:
-    [[nodiscard]] static std::optional<Credentials> Prepare(
-        const proxy::shadowsocks::SsCipherInfo& cipher, std::string_view password);
+    [[nodiscard]] static std::optional<SsCredentials> Prepare(
+        const proxy::SsCipherInfo& cipher, std::string_view password);
 
-    [[nodiscard]] const proxy::shadowsocks::SsCipherInfo& Cipher() const noexcept { return cipher_; }
-    [[nodiscard]] const proxy::shadowsocks::KeyBytes& MasterKey() const noexcept { return master_key_; }
-    [[nodiscard]] std::span<const proxy::shadowsocks::KeyBytes> PskChain() const noexcept {
+    [[nodiscard]] const proxy::SsCipherInfo& Cipher() const noexcept { return cipher_; }
+    [[nodiscard]] const proxy::KeyBytes& MasterKey() const noexcept { return master_key_; }
+    [[nodiscard]] std::span<const proxy::KeyBytes> PskChain() const noexcept {
         return psk_chain_;
     }
 
 private:
-    Credentials(proxy::shadowsocks::SsCipherInfo cipher, proxy::shadowsocks::KeyBytes master_key,
-                std::vector<proxy::shadowsocks::KeyBytes> psk_chain)
+    SsCredentials(proxy::SsCipherInfo cipher, proxy::KeyBytes master_key,
+                std::vector<proxy::KeyBytes> psk_chain)
         : cipher_(cipher), master_key_(master_key), psk_chain_(std::move(psk_chain)) {}
 
-    proxy::shadowsocks::SsCipherInfo cipher_;
-    proxy::shadowsocks::KeyBytes master_key_;
-    std::vector<proxy::shadowsocks::KeyBytes> psk_chain_;
+    proxy::SsCipherInfo cipher_;
+    proxy::KeyBytes master_key_;
+    std::vector<proxy::KeyBytes> psk_chain_;
 };
 
 
-struct PreparedSettings {
+struct SsPreparedSettings {
     SsOutboundConfig config;
-    Credentials credentials;
+    SsCredentials credentials;
 };
-}  // namespace proxy::shadowsocks::outbound
+}  // namespace proxy

@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
-#include "app/proxyman/inbound/handler.hpp"
-
+#include "app/proxyman/inbound_handler.hpp"
 TEST(WorkerRequestLoad, NestedDispatchesReleasePressureWhenTheyComplete) {
     ::app::RequestLoadState load(3, 7);
     {

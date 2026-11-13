@@ -1,20 +1,19 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/xhttp_session.hpp"
-
+#include "transport/xhttp_session.hpp"
 #include <algorithm>
 #include <cstdlib>
 
 namespace {
 
-::buf::MultiBuffer MakePayload(uint8_t value, size_t size) {
-    ::buf::MultiBuffer payload;
+::common::MultiBuffer MakePayload(uint8_t value, size_t size) {
+    ::common::MultiBuffer payload;
     while (size > 0) {
-        ::buf::BufferGuard buffer{::buf::Buffer::New()};
+        ::common::BufferGuard buffer{::common::Buffer::New()};
         if (!buffer) {
             std::abort();
         }
-        const size_t chunk = std::min<size_t>(size, ::buf::Buffer::kSize);
+        const size_t chunk = std::min<size_t>(size, ::common::Buffer::kSize);
         std::fill_n(buffer->data, chunk, value);
         buffer->Produce(static_cast<uint32_t>(chunk));
         payload.push_back(std::move(buffer));
@@ -23,14 +22,14 @@ namespace {
     return payload;
 }
 
-::buf::MultiBuffer MakePayload(uint8_t value) {
+::common::MultiBuffer MakePayload(uint8_t value) {
     return MakePayload(value, 1);
 }
 
 }  // namespace
 
 TEST(XhttpPacketQueue, OrdersPacketsAndIgnoresDuplicateSequences) {
-    ::transport::internet::detail::XHttpPacketQueue queue;
+    ::transport::XHttpPacketQueue queue;
     ASSERT_TRUE(queue.Push(1, MakePayload(0x22)));
     ASSERT_TRUE(queue.Push(1, MakePayload(0x99)));
     ASSERT_TRUE(queue.Push(0, MakePayload(0x11)));
@@ -45,24 +44,24 @@ TEST(XhttpPacketQueue, OrdersPacketsAndIgnoresDuplicateSequences) {
 }
 
 TEST(XhttpPacketQueue, RejectsPacketsBeyondCountLimit) {
-    ::transport::internet::detail::XHttpPacketQueue queue;
-    for (size_t i = 0; i < ::transport::internet::detail::XHttpPacketQueue::kMaxQueuedPackets; ++i)
+    ::transport::XHttpPacketQueue queue;
+    for (size_t i = 0; i < ::transport::XHttpPacketQueue::kMaxQueuedPackets; ++i)
         ASSERT_TRUE(queue.Push(i + 1, {}));
-    EXPECT_FALSE(queue.Push(::transport::internet::detail::XHttpPacketQueue::kMaxQueuedPackets + 1, {}));
+    EXPECT_FALSE(queue.Push(::transport::XHttpPacketQueue::kMaxQueuedPackets + 1, {}));
 }
 
 TEST(XhttpPacketQueue, RejectsOversizedPayload) {
-    ::transport::internet::detail::XHttpPacketQueue queue;
-    EXPECT_FALSE(queue.Push(0, MakePayload(0x55, ::transport::internet::detail::XHttpPacketQueue::kMaxQueuedBytes + 1)));
+    ::transport::XHttpPacketQueue queue;
+    EXPECT_FALSE(queue.Push(0, MakePayload(0x55, ::transport::XHttpPacketQueue::kMaxQueuedBytes + 1)));
 }
 
 TEST(XhttpPacketQueue, PopAndClearReleaseCapacity) {
-    ::transport::internet::detail::XHttpPacketQueue queue;
-    constexpr size_t blocks = ::transport::internet::detail::XHttpPacketQueue::kMaxQueuedBytes / ::buf::Buffer::kSize;
+    ::transport::XHttpPacketQueue queue;
+    constexpr size_t blocks = ::transport::XHttpPacketQueue::kMaxQueuedBytes / ::common::Buffer::kSize;
     for (size_t i = 0; i < blocks; ++i)
         ASSERT_TRUE(queue.Push(i, MakePayload(0x66)));
     EXPECT_FALSE(queue.Push(blocks, MakePayload(0x77)));
-    EXPECT_EQ(queue.UsedCapacity(), ::transport::internet::detail::XHttpPacketQueue::kMaxQueuedBytes);
+    EXPECT_EQ(queue.UsedCapacity(), ::transport::XHttpPacketQueue::kMaxQueuedBytes);
     auto released = queue.Pop();
     EXPECT_TRUE(queue.Push(blocks, MakePayload(0x77)));
     queue.Clear();
@@ -70,42 +69,42 @@ TEST(XhttpPacketQueue, PopAndClearReleaseCapacity) {
 }
 
 TEST(XhttpPacketQueue, ReservationsSharePayloadBudget) {
-    ::transport::internet::detail::XHttpPacketQueue queue;
-    constexpr size_t budget = ::transport::internet::detail::XHttpPacketQueue::kMaxQueuedBytes;
+    ::transport::XHttpPacketQueue queue;
+    constexpr size_t budget = ::transport::XHttpPacketQueue::kMaxQueuedBytes;
     ASSERT_TRUE(queue.Reserve(budget));
     EXPECT_FALSE(queue.Reserve(1));
     EXPECT_FALSE(queue.Push(0, MakePayload(0x88)));
-    queue.Release(::buf::Buffer::kSize);
+    queue.Release(::common::Buffer::kSize);
     EXPECT_TRUE(queue.Push(0, MakePayload(0x88)));
     EXPECT_FALSE(queue.Reserve(1));
     queue.Clear();
-    EXPECT_EQ(queue.UsedCapacity(), budget - ::buf::Buffer::kSize);
-    queue.Release(budget - ::buf::Buffer::kSize);
+    EXPECT_EQ(queue.UsedCapacity(), budget - ::common::Buffer::kSize);
+    queue.Release(budget - ::common::Buffer::kSize);
     EXPECT_TRUE(queue.Reserve(budget));
     queue.Release(budget);
 }
 
 TEST(XhttpPacketQueue, UploadAdmissionRecoversReleasedSlots) {
-    ::transport::internet::detail::XHttpPacketQueue queue;
-    for (size_t i = 0; i < ::transport::internet::detail::XHttpPacketQueue::kMaxUploads; ++i)
+    ::transport::XHttpPacketQueue queue;
+    for (size_t i = 0; i < ::transport::XHttpPacketQueue::kMaxUploads; ++i)
         ASSERT_TRUE(queue.AcquireUpload());
     EXPECT_FALSE(queue.AcquireUpload());
     queue.ReleaseUpload();
     EXPECT_TRUE(queue.AcquireUpload());
-    for (size_t i = 0; i < ::transport::internet::detail::XHttpPacketQueue::kMaxUploads; ++i)
+    for (size_t i = 0; i < ::transport::XHttpPacketQueue::kMaxUploads; ++i)
         queue.ReleaseUpload();
     EXPECT_TRUE(queue.AcquireUpload());
     queue.ReleaseUpload();
 }
 
 TEST(XhttpPacketQueue, OutOfOrderPacketsLeaveRoomForMissingHead) {
-    ::transport::internet::detail::XHttpPacketQueue queue;
+    ::transport::XHttpPacketQueue queue;
     constexpr size_t blocks =
-        (::transport::internet::detail::XHttpPacketQueue::kMaxQueuedBytes -
-         ::transport::internet::detail::XHttpPacketQueue::kInOrderHeadroomBytes) / ::buf::Buffer::kSize;
+        (::transport::XHttpPacketQueue::kMaxQueuedBytes -
+         ::transport::XHttpPacketQueue::kInOrderHeadroomBytes) / ::common::Buffer::kSize;
     for (size_t i = 0; i < blocks; ++i)
-        ASSERT_TRUE(queue.Push(i + 1, MakePayload(0x33, ::buf::Buffer::kSize)));
-    EXPECT_FALSE(queue.Push(blocks + 1, MakePayload(0x33, ::buf::Buffer::kSize)));
-    EXPECT_TRUE(queue.Push(0, MakePayload(0x44, ::buf::Buffer::kSize)));
+        ASSERT_TRUE(queue.Push(i + 1, MakePayload(0x33, ::common::Buffer::kSize)));
+    EXPECT_FALSE(queue.Push(blocks + 1, MakePayload(0x33, ::common::Buffer::kSize)));
+    EXPECT_TRUE(queue.Push(0, MakePayload(0x44, ::common::Buffer::kSize)));
     EXPECT_TRUE(queue.HasReady());
 }

@@ -1,17 +1,15 @@
 #pragma once
 #include "proxy/vmess/security.hpp"
-
-// ============================================================================
 // vmess_crypto.hpp — VMess 协议类型与密码学原语
 //
 // 职责：协议常量/枚举/请求结构体、底层加密函数、密钥派生（KDF）、哈希、AuthID 生成。
 // 底层 OpenSSL 失败属于系统故障，统一以异常上报，不返回未初始化输出。
 // ============================================================================
 
-#include "app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/user_store.hpp"
 #include "proxy/aead.hpp"
 #include "common/hash.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/target_address.hpp"
 #include <openssl/mem.h>
 #include <openssl/aes.h>
@@ -23,7 +21,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
-namespace proxy::vmess {
+namespace proxy {
 
 
 constexpr uint8_t VERSION             = 1;
@@ -31,63 +29,63 @@ constexpr size_t  GCM_TAG_SIZE        = 16;
 constexpr size_t  MAX_CHUNK_SIZE      = 16 * 1024;  // 16KB
 constexpr int64_t TIMESTAMP_TOLERANCE = 60;         // ±60秒，防重放攻击
 
-enum class Command : uint8_t {
+enum class VmessCommand : uint8_t {
     TCP = 1,
     UDP = 2,
     Mux = 3,  // XUDP/Mux 模式，每个包有地址头
 };
 
-namespace Option {
-    constexpr uint8_t CHUNK_STREAM         = 0x01;
-    constexpr uint8_t CHUNK_MASKING        = 0x04;
-    constexpr uint8_t GLOBAL_PADDING       = 0x08;
-    constexpr uint8_t AUTHENTICATED_LENGTH = 0x10;
-}
+struct VmessOption {
+    static constexpr uint8_t CHUNK_STREAM         = 0x01;
+    static constexpr uint8_t CHUNK_MASKING        = 0x04;
+    static constexpr uint8_t GLOBAL_PADDING       = 0x08;
+    static constexpr uint8_t AUTHENTICATED_LENGTH = 0x10;
+};
 
-namespace KDFSalt {
-    constexpr const char* AUTH_ID_ENCRYPTION_KEY                = "AES Auth ID Encryption";
+struct KDFSalt {
+    static constexpr const char* AUTH_ID_ENCRYPTION_KEY                = "AES Auth ID Encryption";
     // 响应头
-    constexpr const char* AEAD_RESP_HEADER_LEN_KEY              = "AEAD Resp Header Len Key";
-    constexpr const char* AEAD_RESP_HEADER_LEN_IV               = "AEAD Resp Header Len IV";
-    constexpr const char* AEAD_RESP_HEADER_PAYLOAD_KEY          = "AEAD Resp Header Key";
-    constexpr const char* AEAD_RESP_HEADER_PAYLOAD_IV           = "AEAD Resp Header IV";
+    static constexpr const char* AEAD_RESP_HEADER_LEN_KEY              = "AEAD Resp Header Len Key";
+    static constexpr const char* AEAD_RESP_HEADER_LEN_IV               = "AEAD Resp Header Len IV";
+    static constexpr const char* AEAD_RESP_HEADER_PAYLOAD_KEY          = "AEAD Resp Header Key";
+    static constexpr const char* AEAD_RESP_HEADER_PAYLOAD_IV           = "AEAD Resp Header IV";
     // 请求头（客户端使用）
-    constexpr const char* VMESS_AEAD_KDF                        = "VMess AEAD KDF";
-    constexpr const char* VMESS_HEADER_PAYLOAD_AEAD_KEY         = "VMess Header AEAD Key";
-    constexpr const char* VMESS_HEADER_PAYLOAD_AEAD_IV          = "VMess Header AEAD Nonce";
-    constexpr const char* VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY  = "VMess Header AEAD Key_Length";
-    constexpr const char* VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV   = "VMess Header AEAD Nonce_Length";
-}
+    static constexpr const char* VMESS_AEAD_KDF                        = "VMess AEAD KDF";
+    static constexpr const char* VMESS_HEADER_PAYLOAD_AEAD_KEY         = "VMess Header AEAD Key";
+    static constexpr const char* VMESS_HEADER_PAYLOAD_AEAD_IV          = "VMess Header AEAD Nonce";
+    static constexpr const char* VMESS_HEADER_PAYLOAD_LENGTH_AEAD_KEY  = "VMess Header AEAD Key_Length";
+    static constexpr const char* VMESS_HEADER_PAYLOAD_LENGTH_AEAD_IV   = "VMess Header AEAD Nonce_Length";
+};
 
 struct VMessRequest {
     std::array<uint8_t, 16> body_iv{};
     std::array<uint8_t, 16> body_key{};
     uint8_t response_header = 0;
     uint8_t options         = 0;
-    Security security       = Security::AES_128_GCM;
-    Command  command        = Command::TCP;
+    VmessSecurity security  = VmessSecurity::AES_128_GCM;
+    VmessCommand  command   = VmessCommand::TCP;
     common::TargetAddress target;
     std::optional<common::ForwardedMetadata> forwarded;
 
-    std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential> user;
+    std::shared_ptr<const app::UserStore::VmessCredential> user;
     ~VMessRequest() noexcept {
         OPENSSL_cleanse(body_iv.data(), body_iv.size());
         OPENSSL_cleanse(body_key.data(), body_key.size());
     }
 };
 
-struct MemoryAccount {
+struct VmessUserAccount {
     std::array<uint8_t, 16> uuid_bytes{};
     std::array<uint8_t, 16> cmd_key{};
     std::array<uint8_t, 16> auth_key{};
 
-    ~MemoryAccount() noexcept {
+    ~VmessUserAccount() noexcept {
         OPENSSL_cleanse(uuid_bytes.data(), uuid_bytes.size());
         OPENSSL_cleanse(cmd_key.data(), cmd_key.size());
         OPENSSL_cleanse(auth_key.data(), auth_key.size());
     }
-    static std::optional<MemoryAccount> FromUUID(std::string_view uuid_str);
-    static MemoryAccount FromUuidBytes(const std::array<uint8_t, 16>& uuid);
+    static std::optional<VmessUserAccount> FromUUID(std::string_view uuid_str);
+    static VmessUserAccount FromUuidBytes(const std::array<uint8_t, 16>& uuid);
 };
 
 // ============================================================================
@@ -157,7 +155,7 @@ void GenerateAuthID(const AES_KEY& auth_id_key, int64_t timestamp, uint8_t* out_
 // ============================================================================
 class VMessCipher {
 public:
-    VMessCipher(Security security, const uint8_t* key, const uint8_t* iv);
+    VMessCipher(VmessSecurity security, const uint8_t* key, const uint8_t* iv);
     ~VMessCipher() noexcept {
         OPENSSL_cleanse(iv_.data(), iv_.size());
     }
@@ -181,7 +179,7 @@ public:
 private:
     void BuildNonce(uint16_t count, uint8_t* nonce);
 
-    Security security_;
+    VmessSecurity security_;
     std::array<uint8_t, 16> iv_;
     uint16_t count_ = 0;
 
@@ -218,4 +216,4 @@ private:
     void Refill();
 };
 
-}  // namespace proxy::vmess
+}  // namespace proxy

@@ -4,10 +4,10 @@
 #include "common/initial_payload.hpp"
 #include "common/target_address.hpp"
 
-namespace proxy::shadowsocks {
+namespace proxy {
 class SsStreamWriter final : public transport::MultiBufferWriter {
 public:
-    SsStreamWriter(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
+    SsStreamWriter(const app::UserStore::ShadowsocksCredential& user,
                        const SsCipherInfo& cipher_info,
                        const KeyBytes& request_salt,
                        transport::AsyncStream& stream)
@@ -70,7 +70,7 @@ public:
         return *this;
     }
 
-    net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     net::awaitable<void> AsyncShutdownWrite() override;
 
@@ -110,7 +110,7 @@ private:
     template <typename BufferRange>
     net::awaitable<void> WriteEncrypted(BufferRange buffers);
 
-    net::awaitable<void> FlushPendingAndWrite(transport::AsyncStream& stream, buf::MultiBuffer out_mb);
+    net::awaitable<void> FlushPendingAndWrite(transport::AsyncStream& stream, common::MultiBuffer out_mb);
 
     bool InitResponseCipher();
 
@@ -124,7 +124,7 @@ private:
     uint8_t key_size_ = 0;
     std::optional<PendingHandshake> pending_handshake_;
     std::optional<SsAeadCipher> write_cipher_;
-    buf::MultiBuffer pending_prefix_;
+    common::MultiBuffer pending_prefix_;
     uint64_t write_nonce_ = 0;
     bool write_init_ = false;
     bool write_finished_ = false;
@@ -133,11 +133,11 @@ private:
 };
 
 struct ReadTCPSessionResult {
-    std::shared_ptr<const proxyman::inbound::UserStore::ShadowsocksCredential> user;
+    std::shared_ptr<const app::UserStore::ShadowsocksCredential> user;
     common::TargetAddress target;
     std::optional<common::ForwardedMetadata> forwarded;
     common::InitialPayload initial_payload;
-    std::optional<detail::BodyReader> body_reader;
+    std::optional<BodyReader> body_reader;
     KeyBytes request_salt;
 };
 
@@ -149,7 +149,7 @@ ReadTCPSession(transport::AsyncStream& stream,
                size_t& last_matched_index);
 
 [[nodiscard]] tl::expected<SsStreamWriter, common::ErrorCode>
-WriteTCPResponse(const proxyman::inbound::UserStore::ShadowsocksCredential& user,
+WriteTCPResponse(const app::UserStore::ShadowsocksCredential& user,
                  const SsCipherInfo& cipher_info,
                  const KeyBytes& request_salt,
                  transport::AsyncStream& stream);
@@ -169,8 +169,8 @@ WriteTCPRequest(const common::TargetAddress& target,
 
 // 2022 固定响应头可携带首段载荷；它在 reader 之前交付，reader 只负责后续记录。
 struct ReadTCPResponseResult {
-    detail::BodyReader reader;
-    buf::MultiBuffer initial_payload;
+    BodyReader reader;
+    common::MultiBuffer initial_payload;
 };
 
 [[nodiscard]] net::awaitable<tl::expected<ReadTCPResponseResult, common::ErrorCode>>
@@ -178,4 +178,4 @@ ReadTCPResponse(const SsCipherInfo& cipher_info,
                 const KeyBytes& master_key,
                 const KeyBytes& request_salt,
                 transport::AsyncStream& stream);
-}  // namespace proxy::shadowsocks
+}  // namespace proxy

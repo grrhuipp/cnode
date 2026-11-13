@@ -1,11 +1,10 @@
 #include <gtest/gtest.h>
 
 #include "common/allocator.hpp"
-#include "common/buf/multi_buffer.hpp"
-#include "transport/internet/tcp_stream.hpp"
-#include "transport/internet/stream_settings.hpp"
-#include "transport/internet/tls_stream.hpp"
-
+#include "common/multi_buffer.hpp"
+#include "transport/tcp_stream.hpp"
+#include "transport/stream_settings.hpp"
+#include "transport/tls_stream.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/use_future.hpp>
@@ -17,7 +16,6 @@
 #include <chrono>
 #include <filesystem>
 #include <future>
-#include <memory_resource>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -111,19 +109,19 @@ public:
 
 struct Fixture {
     explicit Fixture(bool product_server = false, bool large_chain = false) {
-        ::transport::internet::TlsStream::InitializeIo();
+        ::transport::TlsStream::InitializeIo();
         const auto dir = std::filesystem::path(CNODE_TEST_SOURCE_DIR) / "tests/fixtures/anytls-pool";
-        ::transport::internet::TlsConfig server_config;
+        ::transport::TlsConfig server_config;
         server_config.cert_file = (dir / "cert.pem").string();
         server_config.key_file = (dir / "key.pem").string();
-        ::transport::internet::LoadTlsPemMaterial(server_config);
+        ::transport::LoadTlsPemMaterial(server_config);
         server_config.alpn = {"h2"};
-        server_config.min_version = ::transport::internet::TlsVersion::V1_3;
-        server = ::transport::internet::SslContext::CreateServer(server_config);
-        ::transport::internet::TlsConfig client_config;
+        server_config.min_version = ::transport::TlsVersion::V1_3;
+        server = ::transport::SslContext::CreateServer(server_config);
+        ::transport::TlsConfig client_config;
         client_config.allow_insecure = true;
         client_config.alpn = {"h2"};
-        client = ::transport::internet::SslContext::CreateClient(client_config);
+        client = ::transport::SslContext::CreateClient(client_config);
         if (!server || !client) throw std::runtime_error("TLS fixture contexts failed");
         SSL_CTX_set_num_tickets(server->Native(), 0);
         SSL_CTX_set_max_cert_list(client->Native(), 512 * 1024);
@@ -144,10 +142,10 @@ struct Fixture {
         other.set_option(net::socket_base::receive_buffer_size(32768));
         peer = std::make_unique<Peer>(std::move(other),
             product_server ? client->Native() : server->Native(), !product_server);
-        stream = std::make_unique<::transport::internet::TlsStream>(
-            std::make_unique<::transport::internet::TcpStream>(std::move(socket)),
+        stream = std::make_unique<::transport::TlsStream>(
+            std::make_unique<::transport::TcpStream>(std::move(socket)),
             product_server ? *server : *client, product_server);
-        relay_buffers_before_handshake = ::memory::detail::test_buffers_live;
+        relay_buffers_before_handshake = ::common::test_buffers_live;
         try {
             auto first = net::co_spawn(io, stream->Handshake(), net::use_future);
             auto second = net::co_spawn(io, peer->Handshake(), net::use_future);
@@ -162,12 +160,12 @@ struct Fixture {
 
     ~Fixture() {
         CloseAndJoin();
-        EXPECT_EQ(::memory::detail::test_buffers_live, relay_buffers_before_handshake);
-        ::memory::reject_next_process_allocation = previous_reject;
+        EXPECT_EQ(::common::test_buffers_live, relay_buffers_before_handshake);
+        ::common::reject_next_process_allocation = previous_reject;
     }
 
     void CloseAndJoin() {
-        ::memory::reject_next_process_allocation = false;
+        ::common::reject_next_process_allocation = false;
         stream->CloseAbortive();
         ::IoErrorCode ignored;
         peer->socket.close(ignored);
@@ -186,11 +184,11 @@ struct Fixture {
     }
 
     net::io_context io;
-    std::unique_ptr<::transport::internet::SslContext> server, client;
+    std::unique_ptr<::transport::SslContext> server, client;
     std::unique_ptr<Peer> peer;
-    std::unique_ptr<::transport::internet::TlsStream> stream;
+    std::unique_ptr<::transport::TlsStream> stream;
     std::size_t relay_buffers_before_handshake = 0;
-    const bool previous_reject = ::memory::reject_next_process_allocation;
+    const bool previous_reject = ::common::reject_next_process_allocation;
 };
 
 struct JoinPending {
@@ -198,7 +196,7 @@ struct JoinPending {
     Fixture& fixture;
 };
 
-std::string Flatten(::buf::MultiBuffer data) {
+std::string Flatten(::common::MultiBuffer data) {
     std::string result;
     while (!data.empty()) {
         auto buffer = data.pop_front();
@@ -208,7 +206,7 @@ std::string Flatten(::buf::MultiBuffer data) {
     return result;
 }
 
-net::awaitable<std::string> ReadBytes(::transport::internet::TlsStream& stream, std::size_t count) {
+net::awaitable<std::string> ReadBytes(::transport::TlsStream& stream, std::size_t count) {
     std::string result;
     while (result.size() < count) {
         auto data = co_await stream.ReadMultiBuffer();
@@ -220,7 +218,7 @@ net::awaitable<std::string> ReadBytes(::transport::internet::TlsStream& stream, 
 
 TEST(TlsRecordBuffer, FragmentedAndCoalescedRecordsPreserveUnreadPlaintextAfterCancellation) {
     Fixture fixture;
-    const auto idle_buffers = ::memory::detail::test_buffers_live;
+    const auto idle_buffers = ::common::test_buffers_live;
     auto first = fixture.peer->Encrypt(std::string(9000, 'a'));
     const auto second = fixture.peer->Encrypt("second-record");
     first.insert(first.end(), second.begin(), second.end());
@@ -229,7 +227,7 @@ TEST(TlsRecordBuffer, FragmentedAndCoalescedRecordsPreserveUnreadPlaintextAfterC
     fixture.io.restart();
     fixture.io.run_for(20ms);
     EXPECT_TRUE(read.wait_for(0s) != std::future_status::ready) << "partial TLS header completed a read";
-    EXPECT_TRUE(::memory::detail::test_buffers_live == idle_buffers) << "partial record wait retained a relay buffer";
+    EXPECT_TRUE(::common::test_buffers_live == idle_buffers) << "partial record wait retained a relay buffer";
     fixture.stream->Cancel();
     bool cancelled = false;
     try { (void)fixture.Wait(read); }
@@ -248,7 +246,7 @@ TEST(TlsRecordBuffer, FragmentedAndCoalescedRecordsPreserveUnreadPlaintextAfterC
         plain += Flatten(std::move(data));
     }
     EXPECT_TRUE(plain == std::string(9000, 'a') + "second-record") << "coalesced TLS records lost their suffix";
-    EXPECT_TRUE(::memory::detail::test_buffers_live == idle_buffers) << "completed TLS read retained relay payload";
+    EXPECT_TRUE(::common::test_buffers_live == idle_buffers) << "completed TLS read retained relay payload";
 }
 
 TEST(TlsRecordBuffer, AllocationFailurePreservesRetainedPlaintextForRetry) {
@@ -262,14 +260,14 @@ TEST(TlsRecordBuffer, AllocationFailurePreservesRetainedPlaintextForRetry) {
     EXPECT_TRUE(fixture.Wait(consume) == 1 && prefix == 'a') << "OOM fixture did not retain plaintext";
     // SSL_pending avoids socket-wait allocation; the next process-resource request
     // is the relay Buffer itself, not a coroutine or asynchronous socket handler.
-    ::memory::reject_next_process_allocation = true;
+    ::common::reject_next_process_allocation = true;
     bool rejected = false;
     try {
         auto failed = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
         (void)fixture.Wait(failed);
     } catch (const std::bad_alloc&) { rejected = true; }
-    const bool consumed_fault = !::memory::reject_next_process_allocation;
-    ::memory::reject_next_process_allocation = false;
+    const bool consumed_fault = !::common::reject_next_process_allocation;
+    ::common::reject_next_process_allocation = false;
     EXPECT_TRUE(rejected && consumed_fault && fixture.stream->IsOpen()) << "read allocation failure became EOF or closed TLS";
     auto retry = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
     EXPECT_TRUE(Flatten(fixture.Wait(retry)) == "fter-resource-failure") << "OOM consumed retained plaintext";
@@ -277,7 +275,7 @@ TEST(TlsRecordBuffer, AllocationFailurePreservesRetainedPlaintextForRetry) {
 
 TEST(TlsRecordBuffer, DuplexKeyUpdatePreservesFramesThroughCancellationAndHalfClose) {
     Fixture fixture;
-    const auto idle_buffers = ::memory::detail::test_buffers_live;
+    const auto idle_buffers = ::common::test_buffers_live;
     const std::string payload(512 * 1024, 'w');
     const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
     EXPECT_TRUE(fixture.stream->DeferWriteCancellation()) << "TLS cancellation deferral unavailable";
@@ -300,7 +298,7 @@ TEST(TlsRecordBuffer, DuplexKeyUpdatePreservesFramesThroughCancellationAndHalfCl
     }
     EXPECT_TRUE(fixture.Wait(received) == payload) << "logical cancellation truncated or interleaved physical TLS output";
     EXPECT_TRUE(Flatten(fixture.Wait(read)) == "concurrent-control-record") << "full-duplex TLS control record stalled";
-    EXPECT_TRUE(::memory::detail::test_buffers_live == idle_buffers) << "completed duplex TLS operation retained relay payload";
+    EXPECT_TRUE(::common::test_buffers_live == idle_buffers) << "completed duplex TLS operation retained relay payload";
 
     const std::string next_record = "after-backpressure-and-key-update";
     auto next_write = net::co_spawn(fixture.io,
@@ -309,7 +307,7 @@ TEST(TlsRecordBuffer, DuplexKeyUpdatePreservesFramesThroughCancellationAndHalfCl
         fixture.peer->Read(next_record.size()), net::use_future);
     EXPECT_TRUE(fixture.Wait(next_write) == next_record.size() &&
                 fixture.Wait(next_read) == next_record) << "resuming direct output after a queued TLS control record corrupted the sequence";
-    EXPECT_TRUE(::memory::detail::test_buffers_live == idle_buffers) << "resumed TLS output retained relay payload";
+    EXPECT_TRUE(::common::test_buffers_live == idle_buffers) << "resumed TLS output retained relay payload";
 
     auto close = net::co_spawn(fixture.io, fixture.stream->AsyncShutdownWrite(), net::use_future);
     auto eof = net::co_spawn(fixture.io, fixture.peer->Read(1), net::use_future);
@@ -352,7 +350,7 @@ TEST(TlsRecordBuffer, BidirectionalBackpressureStillAllowsConcurrentReaders) {
 
 TEST(TlsRecordBuffer, LargeHandshakeReleasesPayloadAndPreservesRecordSequence) {
     Fixture fixture(true, true);
-    EXPECT_TRUE(::memory::detail::test_buffers_live == fixture.relay_buffers_before_handshake) << "large handshake retained relay payload";
+    EXPECT_TRUE(::common::test_buffers_live == fixture.relay_buffers_before_handshake) << "large handshake retained relay payload";
     const auto record = fixture.peer->Encrypt("after-large-flight");
     net::write(fixture.peer->socket, net::buffer(record));
     auto read = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
@@ -410,7 +408,7 @@ INSTANTIATE_TEST_SUITE_P(WriteStates, TlsWriteReset, testing::Bool(),
     });
 
 TEST(TlsRecordBuffer, PeerResetCannotBecomeSuccessfulCloseNotify) {
-    transport::internet::TlsStream::InitializeIo();
+    transport::TlsStream::InitializeIo();
     Fixture fixture;
     JoinPending join{fixture};
     fixture.peer->socket.set_option(net::socket_base::linger(true, 0));
@@ -432,7 +430,7 @@ namespace {
 class TlsReadShutdown : public testing::TestWithParam<std::string> {};
 
 TEST_P(TlsReadShutdown, PendingReadEndsWithoutClosingWriteDirection) {
-    transport::internet::TlsStream::InitializeIo();
+    transport::TlsStream::InitializeIo();
     Fixture fixture;
     const bool multi_buffer = GetParam().starts_with("multi");
     if (GetParam().ends_with("partial")) {

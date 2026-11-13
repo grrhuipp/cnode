@@ -2,17 +2,14 @@
 
 #include "common/allocator.hpp"
 #include "common/asio_types.hpp"
-#include "common/buf/multi_buffer.hpp"
-
+#include "common/multi_buffer.hpp"
+#include <algorithm>
 #include <array>
 #include <cstddef>
-#include <algorithm>
-#include <span>
-#include <optional>
 #include <cstdint>
-#include <memory_resource>
+#include <optional>
+#include <span>
 #include <vector>
-
 
 namespace common {
 
@@ -21,10 +18,7 @@ class ConstBufferSpanBuilder {
 public:
     static_assert(StackCapacity > 0);
 
-    // Spilled descriptors live in `resource`; none named means the process layer.
     ConstBufferSpanBuilder() noexcept = default;
-    explicit ConstBufferSpanBuilder(std::pmr::memory_resource* resource) noexcept
-        : resource_(memory::ResourceOrProcess(resource)) {}
 
     void Append(net::const_buffer buffer) {
         if (buffer.size() == 0) {
@@ -42,7 +36,6 @@ public:
         const size_t available = spill_
             ? spill_->capacity() - spill_->size() : StackCapacity - count_;
         size_t additional = buffers.size();
-        // Existing capacity also guarantees borrowed descriptors cannot move.
         if (additional > available) {
             additional = 0;
             for (const auto& buffer : buffers) {
@@ -51,7 +44,6 @@ public:
         }
         if (additional == 0) return;
         if (additional > available) {
-            // A borrowed subspan must follow the descriptors if spill storage moves.
             const auto current = Span();
             const auto source = reinterpret_cast<uintptr_t>(buffers.data());
             const auto base = reinterpret_cast<uintptr_t>(current.data());
@@ -65,26 +57,13 @@ public:
         }
     }
 
-    void AppendMultiBuffer(const buf::MultiBuffer& mb) {
-        const size_t available = spill_
-            ? spill_->capacity() - spill_->size() : StackCapacity - count_;
-        // Count exact non-empty descriptors only if the slot upper bound would grow storage.
-        if (mb.size() > available) {
-            size_t non_empty = 0;
-            for (const auto* buffer : mb) {
-                if (buffer && !buffer->IsEmpty()) ++non_empty;
-            }
-            if (non_empty == 0) return;
-            if (non_empty > available) EnsureSpillCapacity(non_empty);
-        }
-        for (const auto* buffer : mb) {
-            if (!buffer) continue;
-            const auto bytes = buffer->Bytes();
-            if (!bytes.empty())
-                AppendPrepared(net::const_buffer(bytes.data(), bytes.size()));
+    void AppendMultiBuffer(const MultiBuffer& mb) {
+        const auto bytes = mb.FrontSpan();
+        if (!bytes.empty()) {
+            Append(net::const_buffer(bytes.data(), bytes.size()));
         }
     }
-    void AppendMultiBuffer(const buf::MultiBuffer&&) = delete;
+    void AppendMultiBuffer(const MultiBuffer&&) = delete;
 
     void Clear() noexcept {
         spill_.reset();
@@ -108,30 +87,25 @@ public:
     std::span<const net::const_buffer> Span() const&& = delete;
 
 private:
-    // Batch callers reserve the entire append before borrowing the destination.
     void AppendPrepared(net::const_buffer buffer) {
         if (spill_) spill_->push_back(buffer);
         else stack_[count_++] = buffer;
     }
 
     void EnsureSpillCapacity(size_t additional) {
+        CheckTestAllocationFault();
         const bool preparing = !spill_;
-        if (preparing) spill_.emplace(resource_);
-        // Keep the inline prefix visible until the spill is populated.
+        if (preparing) spill_.emplace();
         try {
             const size_t used = size();
             const size_t maximum = spill_->max_size();
-            if (additional > maximum - used)
-                throw std::length_error("buffer span size overflow");
-            const size_t required = used + additional;
-            if (required > spill_->capacity()) {
-                const size_t capacity = std::max(StackCapacity, spill_->capacity());
-                const size_t grown = capacity > maximum / 2 ? maximum : capacity * 2;
-                spill_->reserve(std::max(required, grown));
-            }
+            if (additional > maximum - used) throw std::bad_alloc();
+            const size_t needed = used + additional;
+            const size_t current = spill_->capacity();
+            const size_t doubled = current <= maximum / 2 ? current * 2 : maximum;
+            spill_->reserve(std::max({needed, StackCapacity * 2, doubled}));
             if (preparing) {
-                spill_->insert(spill_->end(), stack_.begin(),
-                    stack_.begin() + static_cast<std::ptrdiff_t>(count_));
+                spill_->insert(spill_->end(), stack_.begin(), stack_.begin() + count_);
                 count_ = 0;
             }
         } catch (...) {
@@ -140,9 +114,8 @@ private:
         }
     }
 
-    std::pmr::memory_resource* resource_ = memory::process_resource();
     std::array<net::const_buffer, StackCapacity> stack_;
-    std::optional<std::pmr::vector<net::const_buffer>> spill_;
+    std::optional<std::vector<net::const_buffer>> spill_;
     size_t count_ = 0;
 };
 

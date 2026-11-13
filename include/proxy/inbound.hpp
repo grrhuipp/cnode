@@ -3,7 +3,7 @@
 #include "app/relay.hpp"
 #include "common/asio_types.hpp"
 #include "common/error.hpp"
-#include "common/buf/multi_buffer.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/hash.hpp"
 #include "common/target_address.hpp"
 #include <openssl/mem.h>
@@ -13,7 +13,6 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
-#include <memory_resource>
 #include <memory>
 #include <optional>
 #include <span>
@@ -24,6 +23,8 @@ namespace app {
 
 class ConnectionLimiter;
 struct ConnectionFamily;
+struct ReceiverSettings;
+class ProtocolSettings;
 
 }  // namespace app
 namespace transport {
@@ -37,22 +38,13 @@ struct TimeoutsConfig;
 
 }  // namespace infra
 
-namespace session {
+namespace common {
 struct Context;
-}
-
-namespace proxyman::inbound {
-struct ReceiverSettings;
 }
 
 namespace routing {
 class Dispatcher;
 }
-
-namespace proxyman::inbound {
-class ProtocolSettings;
-}
-
 // Native datagram response view. Borrowed bytes and target are valid only
 // during encoding; a queued response must own its resulting payload.
 namespace proxy {
@@ -66,7 +58,7 @@ struct UDPPacketView {
 class InboundDatagramResponse {
 public:
     virtual ~InboundDatagramResponse() noexcept = default;
-    [[nodiscard]] virtual buf::MultiBuffer Encode(UDPPacketView packet) = 0;
+    [[nodiscard]] virtual common::MultiBuffer Encode(UDPPacketView packet) = 0;
 };
 
 
@@ -136,7 +128,7 @@ struct InboundDatagramAssociationPolicy {
 struct InboundDatagramAssociationKey {
     InboundDatagramOwner owner;
     uint64_t session_id;
-    const proxyman::inbound::ProtocolSettings* configuration;
+    const app::ProtocolSettings* configuration;
     [[nodiscard]] bool operator==(const InboundDatagramAssociationKey& other) const noexcept {
         return session_id == other.session_id && configuration == other.configuration &&
             owner.Same(other.owner);
@@ -155,7 +147,7 @@ struct InboundDatagramAssociationKeyHash {
 
 // One index per listener on its receiving Worker. Entries borrow the state
 // owned by a live association row; detached/prepared rows carry null entries.
-using InboundDatagramAssociationIndex = std::pmr::unordered_map<
+using InboundDatagramAssociationIndex = std::unordered_map<
     InboundDatagramAssociationKey, InboundDatagramAssociation*,
     InboundDatagramAssociationKeyHash>;
 
@@ -163,14 +155,14 @@ struct InboundDatagramRequest {
     std::string_view tag;
     std::span<const uint8_t> payload;
     const InboundDatagramAssociationIndex* associations = nullptr;
-    const proxyman::inbound::ProtocolSettings* configuration = nullptr;
+    const app::ProtocolSettings* configuration = nullptr;
     uint32_t worker_id = 0;
     udp::endpoint client_endpoint;
 };
 
 struct InboundDatagramResult {
     common::TargetAddress target;
-    buf::MultiBuffer payload;
+    common::MultiBuffer payload;
     std::optional<common::ForwardedMetadata> forwarded;
     // Absent means that the normalized client endpoint identifies the session.
     std::optional<uint64_t> session_id;
@@ -192,8 +184,8 @@ struct InboundDatagramResult {
 // 职责：协议解析、认证和 dispatcher handoff，不涉及传输层（TLS/WS 由 proxyman inbound 负责）。
 //
 // 协议实现示例：
-//   - VMessInbound: Process 解析 AEAD 头后提交 session::Context 给 dispatcher
-//   - TrojanInbound: Process 解析 SHA224+目标后提交 session::Context 给 dispatcher
+//   - VMessInbound: Process 解析 AEAD 头后提交 common::Context 给 dispatcher
+//   - TrojanInbound: Process 解析 SHA224+目标后提交 common::Context 给 dispatcher
 // ============================================================================
 class Inbound {
 public:
@@ -210,9 +202,9 @@ public:
     virtual net::awaitable<app::RelayResult> Process(
         std::unique_ptr<transport::AsyncStream> stream,
         routing::Dispatcher& dispatcher,
-        const proxyman::inbound::ReceiverSettings& receiver,
+        const app::ReceiverSettings& receiver,
         net::io_context& io_context,
-        session::Context& ctx,
+        common::Context& ctx,
         const infra::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout) = 0;
 

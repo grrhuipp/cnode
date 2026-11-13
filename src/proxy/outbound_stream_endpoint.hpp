@@ -4,16 +4,17 @@
 // 端点基类见 proxy/outbound_endpoint_base.hpp。
 
 #include "app/dns/dns.hpp"
+#include "app/relay.hpp"
+#include "proxy/outbound_endpoint_base.hpp"
 #include "common/target_address.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
 #include "transport/failure.hpp"
 #include "transport/link.hpp"
-#include "transport/internet/datagram_socket.hpp"
-#include "transport/internet/outbound_target_builder.hpp"
-#include "transport/internet/stream_settings.hpp"
-#include "transport/internet/transport_security.hpp"
-
+#include "transport/datagram_socket.hpp"
+#include "transport/outbound_target_builder.hpp"
+#include "transport/stream_settings.hpp"
+#include "transport/transport_security.hpp"
 #include <asio/as_tuple.hpp>
 #include <asio/experimental/awaitable_operators.hpp>
 #include <asio/experimental/channel.hpp>
@@ -33,34 +34,51 @@ namespace proxy {
 // Cold-path result for a proxy protocol with a next hop: the validated server
 // and the Handler's sender settings (sendThrough is applied by proxyman).
 struct PreparedNextHop {
-    transport::internet::OutboundServer server;
-    transport::internet::OutboundSenderSettings sender;
+    transport::OutboundServer server;
+    transport::OutboundSenderSettings sender;
 };
 
 // The one application of a protocol's stream defaults (TLS requirement,
 // fallback SNI, ALPN) to the source streamSettings. Without an explicit
 // fallback server name the next hop's address is used.
-[[nodiscard]] inline transport::internet::StreamSettings PrepareOutboundStream(
+[[nodiscard]] inline transport::StreamSettings PrepareOutboundStream(
     const infra::OutboundSourceConfig& source,
-    const transport::internet::OutboundServer& server,
-    transport::internet::OutboundStreamDefaults defaults) {
+    const transport::OutboundServer& server,
+    transport::OutboundStreamDefaults defaults) {
     if (defaults.fallback_server_name.empty()) {
         defaults.fallback_server_name = server.address;
     }
-    auto settings = transport::internet::NormalizeOutboundStreamSettings(source.stream_settings, defaults);
-    transport::internet::TransportSecurity::Prepare(settings, transport::internet::StreamEndpointRole::Outbound);
+    auto settings = transport::NormalizeOutboundStreamSettings(source.stream_settings, defaults);
+    transport::TransportSecurity::Prepare(settings, transport::StreamEndpointRole::Outbound);
     return settings;
 }
 
 [[nodiscard]] inline PreparedNextHop PrepareNextHop(
     const infra::OutboundSourceConfig& source,
-    const transport::internet::OutboundServer& server,
-    const transport::internet::OutboundStreamDefaults& defaults) {
+    const transport::OutboundServer& server,
+    const transport::OutboundStreamDefaults& defaults) {
     return PreparedNextHop{
         .server = server,
         .sender = {.stream_settings = PrepareOutboundStream(source, server, defaults),
                    .send_through = {}},
     };
+}
+
+inline void ApplyOutboundRelayTimeouts(
+    transport::AsyncStream& stream,
+    const app::RelayConfig& relay_config) {
+    stream.SetIdleTimeout(relay_config.idle_timeout);
+    stream.SetReadTimeout(std::chrono::seconds(0));
+    stream.SetWriteTimeout(relay_config.write_timeout);
+    stream.ClearPhaseDeadline();
+}
+
+inline void ApplyOutboundDatagramTimeouts(
+    OutboundDatagramEndpointBase& endpoint,
+    const app::RelayConfig& relay_config) {
+    auto& socket = endpoint.RelayControl();
+    socket.SetIdleTimeout(relay_config.idle_timeout);
+    socket.SetWriteTimeout(relay_config.write_timeout);
 }
 
 
@@ -69,10 +87,10 @@ struct PreparedNextHop {
 // owned by its logical write until DNS and socket I/O have both finished.
 // The transport knows only the resulting IP endpoint, never DNS or routing.
 inline net::awaitable<tl::expected<udp::endpoint, common::ErrorCode>> ResolveUdpEndpoint(
-    app::dns::DNS& dns,
+    app::DNS& dns,
     const common::TargetAddress& target,
-    transport::internet::DatagramSocket& socket,
-    const transport::internet::DatagramSocket::WriteOperation& write) {
+    transport::DatagramSocket& socket,
+    const transport::DatagramSocket::WriteOperation& write) {
     const auto parent_cancellation = co_await net::this_coro::cancellation_state;
     if (write.Cancelled()) co_return tl::unexpected(write.CancellationReason());
     if (parent_cancellation.cancelled() != net::cancellation_type::none)

@@ -13,14 +13,14 @@
 
 // DNS 公开契约：配置、结果与 DNSWorker/DNS 客户端。缓存、上游数据报交换与
 // 在途合并是 DNSWorker 私有实现，见 src/app/dns/dns_internal.hpp。
-namespace app::dns {
+namespace app {
 
-struct Config {
+struct DnsConfig {
     std::vector<udp::endpoint> servers;
-    uint32_t timeout_sec = defaults::kDnsTimeout;
-    size_t cache_size = defaults::kDnsCacheSize;
-    uint32_t min_ttl = defaults::kDnsMinTTL;
-    uint32_t max_ttl = defaults::kDnsMaxTTL;
+    uint32_t timeout_sec = common::kDnsTimeout;
+    size_t cache_size = common::kDnsCacheSize;
+    uint32_t min_ttl = common::kDnsMinTTL;
+    uint32_t max_ttl = common::kDnsMaxTTL;
 };
 
 struct DnsCacheStats {
@@ -33,7 +33,7 @@ struct DnsCacheStats {
 struct DnsResult : common::ResultStatus {
     std::vector<net::ip::address> addresses;
     bool from_cache = false;
-    uint32_t ttl = defaults::kDnsMinTTL;
+    uint32_t ttl = common::kDnsMinTTL;
 
     [[nodiscard]] bool Ok() const noexcept {
         return common::ResultStatus::Ok() && !addresses.empty();
@@ -47,7 +47,7 @@ struct DnsResult : common::ResultStatus {
 class DNSWorker final {
 public:
     DNSWorker(net::io_context& main_context,
-              const Config& config, size_t mailbox_capacity);
+              const DnsConfig& config, size_t mailbox_capacity);
     ~DNSWorker();
 
     DNSWorker(const DNSWorker&) = delete;
@@ -76,10 +76,12 @@ public:
     DNS& operator=(const DNS&) = delete;
 
     // Copies domain at task creation. The DNSWorker must outlive the task.
-    net::awaitable<DnsResult> Resolve(std::string_view domain);
+    net::awaitable<DnsResult> Resolve(std::string_view domain) {
+        return worker_.Resolve(std::string(domain));
+    }
 
 private:
     DNSWorker& worker_;
 };
 
-}  // namespace app::dns
+}  // namespace app

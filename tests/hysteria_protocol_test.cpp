@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/internet/hysteria/hysteria_wire.hpp"
-
+#include "transport/hysteria/hysteria_wire.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -10,13 +9,13 @@
 #include <string_view>
 #include <vector>
 
-using ::transport::internet::hysteria::EncodeUdpMessage;
-using ::transport::internet::hysteria::ParseUdpMessage;
-using ::transport::internet::hysteria::ParseV1ClientHello;
-using ::transport::internet::hysteria::ParseV1Request;
-using ::transport::internet::hysteria::ParseV2TcpRequest;
-using ::transport::internet::hysteria::UdpMessage;
-using ::transport::internet::hysteria::Version;
+using ::transport::EncodeUdpMessage;
+using ::transport::ParseUdpMessage;
+using ::transport::ParseV1ClientHello;
+using ::transport::ParseV1Request;
+using ::transport::ParseV2TcpRequest;
+using UdpMessage = ::transport::HysteriaUdpMessage;
+using Version = ::transport::HysteriaVersion;
 
 namespace {
 
@@ -151,7 +150,7 @@ TEST_F(HysteriaProtocol, V2FragmentCountAndIndexRemainValidated) {
         wire[7] = count;
         const auto parsed = ParseUdpMessage(Version::V2, wire);
         ASSERT_FALSE(parsed);
-        EXPECT_EQ(parsed.error(), ::transport::internet::hysteria::ProtocolError::Invalid);
+        EXPECT_EQ(parsed.error(), ::transport::ProtocolError::Invalid);
         const UdpMessage message{.session_id = 7, .packet_id = 0x1234,
             .fragment_id = 255, .fragment_count = count,
             .target = ::common::TargetAddress("example.com", 53), .payload = payload};
@@ -163,7 +162,7 @@ TEST_F(HysteriaProtocol, V2SinglePacketRequiresTargetRegardlessOfFragmentId) {
     const std::vector<uint8_t> wire{0, 0, 0, 7, 0x12, 0x34, 255, 1, 0, 'x'};
     const auto parsed = ParseUdpMessage(Version::V2, wire);
     ASSERT_FALSE(parsed);
-    EXPECT_EQ(parsed.error(), ::transport::internet::hysteria::ProtocolError::Invalid);
+    EXPECT_EQ(parsed.error(), ::transport::ProtocolError::Invalid);
     const std::vector<uint8_t> payload{'x'};
     const UdpMessage message{.session_id = 7, .packet_id = 0x1234,
         .fragment_id = 255, .fragment_count = 1, .target = {}, .payload = payload};
@@ -171,8 +170,8 @@ TEST_F(HysteriaProtocol, V2SinglePacketRequiresTargetRegardlessOfFragmentId) {
 }
 
 TEST_F(HysteriaProtocol, UdpPreservesEmptyAndMaximumPayloadsAcrossAddressForms) {
-    using ::transport::internet::hysteria::kMaxUdpPayloadLength;
-    using ::transport::internet::hysteria::UdpMessageHeaderSize;
+    using ::transport::kMaxUdpPayloadLength;
+    using ::transport::UdpMessageHeaderSize;
     const auto domain = std::string(63, 'a') + "." + std::string(63, 'b') +
         "." + std::string(63, 'c') + "." + std::string(61, 'd');
     const std::array targets{
@@ -202,18 +201,18 @@ TEST_F(HysteriaProtocol, UdpPreservesEmptyAndMaximumPayloadsAcrossAddressForms) 
             const auto rejected = EncodeUdpMessage(version, oversized);
             ASSERT_FALSE(rejected);
             EXPECT_EQ(rejected.error(),
-                ::transport::internet::hysteria::ProtocolError::Invalid);
+                ::transport::ProtocolError::Invalid);
         }
     }
 }
 
 TEST_F(HysteriaProtocol, HandshakeResponsesKeepTheirWireEncoding) {
-    using namespace ::transport::internet::hysteria;
-    const std::pmr::vector<uint8_t> hello({
-        1, 1, 2, 3, 4, 5, 6, 7, 8, 8, 7, 6, 5, 4, 3, 2, 1, 0, 2, 'o', 'k'}, memory::process_resource());
+    using namespace ::transport;
+    const std::vector<uint8_t> hello{
+        1, 1, 2, 3, 4, 5, 6, 7, 8, 8, 7, 6, 5, 4, 3, 2, 1, 0, 2, 'o', 'k'};
     EXPECT_EQ(EncodeV1ServerHello(
         true, 0x0102030405060708ULL, 0x0807060504030201ULL, "ok"), hello);
-    const std::pmr::vector<uint8_t> response({0, 0x12, 0x34, 0x56, 0x78, 0, 2, 'n', 'o'}, memory::process_resource());
+    const std::vector<uint8_t> response{0, 0x12, 0x34, 0x56, 0x78, 0, 2, 'n', 'o'};
     EXPECT_EQ(EncodeV1Response(false, 0x12345678, "no"), response);
 }
 

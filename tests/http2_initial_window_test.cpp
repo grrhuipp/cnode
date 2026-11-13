@@ -1,12 +1,12 @@
 #include <gtest/gtest.h>
 #include "infra/config.hpp"
-#include "transport/internet/http2_session.hpp"
+#include "transport/http2_session.hpp"
 #include <string>
 #include <string_view>
 
 namespace {
 auto Parse(std::string_view body) {
-    const auto parsed = ::json::parse(body);
+    const auto parsed = ::infra::parse(body);
     return ::infra::ParseHttp2InitialWindow(parsed.as_object());
 }
 
@@ -23,7 +23,7 @@ TEST_P(Http2InitialWindowValue, PreservesConfiguredWindowAndEncodesSettings) {
     ASSERT_TRUE(result.has_value());
     ASSERT_TRUE(result->has_value());
     EXPECT_EQ(**result, value);
-    const auto setting = ::transport::internet::EncodeInitialWindowSetting(value);
+    const auto setting = ::transport::EncodeInitialWindowSetting(value);
     ASSERT_EQ(setting.size(), 6u);
     EXPECT_EQ(setting[0], 0);
     EXPECT_EQ(setting[1], 4);

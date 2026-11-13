@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "service/controller/node_transaction.hpp"
-
+#include "controller/node_transaction.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -22,7 +21,7 @@ namespace {
 namespace net = ::net;
 using namespace ::controller;
 using ::api::NodeInfo;
-using ::proxyman::inbound::UserSet;
+using ::app::UserSet;
 
 std::string Tag(const NodeInfo& config) {
     return config.NodeType + ':' + std::to_string(config.Port);
@@ -36,19 +35,19 @@ std::shared_ptr<const NodeSnapshot> Snapshot(uint16_t port, size_t version = 1) 
     snapshot->users = std::make_shared<const std::vector<::api::UserInfo>>(version);
     snapshot->users_etag = "users-" + std::to_string(version);
     snapshot->config_etag = "config-" + std::to_string(version);
-    snapshot->rules = std::make_shared<const std::vector<::rule::DetectRule>>(version);
-    ::transport::internet::StreamSettings stream;
+    snapshot->rules = std::make_shared<const std::vector<::common::DetectRule>>(version);
+    ::transport::StreamSettings stream;
     stream.ws.path = snapshot->config.Path;
     snapshot->inbound = std::make_shared<const ::app::PreparedInbound>(::app::PreparedInbound{
         .binding = {.port = port, .protocol = snapshot->config.NodeType, .tag = snapshot->tag, .listen = {}},
-        .receiver = ::proxyman::inbound::MakeReceiverSettings(
+        .receiver = ::app::MakeReceiverSettings(
             snapshot->tag, {}, snapshot->config.NodeType, std::move(stream), {},
-            ::transport::internet::ProxyProtocolMode::Auto, ::routing::RouteWithFallback(snapshot->tag), {}),
+            ::transport::ProxyProtocolMode::Auto, ::routing::RouteWithFallback(snapshot->tag), {}),
         .build_request = {},
         .users = std::make_shared<const UserSet>(
-            ::proxyman::inbound::PreparedVmessUsers(version)),
+            ::app::PreparedVmessUsers(version)),
     });
-    auto outbound = std::make_shared<::proxyman::outbound::PreparedOutboundConfig>();
+    auto outbound = std::make_shared<::app::PreparedOutboundConfig>();
     outbound->tag = snapshot->tag;
     snapshot->outbound = std::move(outbound);
     return snapshot;
@@ -58,7 +57,7 @@ std::shared_ptr<const NodeSnapshot> Snapshot(uint16_t port, size_t version = 1) 
 void ReplaceUsers(NodeSnapshot& snapshot, size_t count) {
     auto inbound = std::make_shared<::app::PreparedInbound>(*snapshot.inbound);
     inbound->users = std::make_shared<const UserSet>(
-        ::proxyman::inbound::PreparedVmessUsers(count));
+        ::app::PreparedVmessUsers(count));
     snapshot.inbound = std::move(inbound);
 }
 
@@ -145,7 +144,7 @@ struct Runtime {
             resources[tag].version = inbound.receiver.stream_settings.ws.path;
         });
     }
-    net::awaitable<void> AddOutbound(const ::proxyman::outbound::PreparedOutboundConfig& outbound) {
+    net::awaitable<void> AddOutbound(const ::app::PreparedOutboundConfig& outbound) {
         ++operations_started;
         co_await net::post(net::use_awaitable);
         const auto& tag = outbound.tag;
@@ -153,7 +152,7 @@ struct Runtime {
     }
     net::awaitable<void> UpdateRules(
         const std::string& tag,
-        std::shared_ptr<const std::vector<::rule::DetectRule>> rules) {
+        std::shared_ptr<const std::vector<::common::DetectRule>> rules) {
         ++operations_started;
         co_await net::post(net::use_awaitable);
         Step("rules:" + tag, [&] { resources[tag].rules = rules ? rules->size() : 0; });
@@ -232,7 +231,7 @@ TEST(NodeTransaction, RefreshPublishesUsersAndRulesWithoutReplacingListener) {
     refresh->users = std::make_shared<const std::vector<::api::UserInfo>>(2);
     ReplaceUsers(*refresh, 2);
     refresh->users_etag = "users-2";
-    refresh->rules = std::make_shared<const std::vector<::rule::DetectRule>>(2);
+    refresh->rules = std::make_shared<const std::vector<::common::DetectRule>>(2);
     ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, refresh)));
     EXPECT_EQ(state.committed, refresh);
     EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
@@ -271,7 +270,7 @@ TEST_P(SelectiveNodeRefresh, RetainsUnchangedResourcesAndCommitsOnlyOnSuccess) {
         next->config_etag = "config-2";
     }
     if (test.payload == RefreshPayload::Rules) {
-        next->rules = std::make_shared<const std::vector<::rule::DetectRule>>(test.count);
+        next->rules = std::make_shared<const std::vector<::common::DetectRule>>(test.count);
     }
     // Unchanged resources must remain usable even when their update path fails.
     if (test.payload != RefreshPayload::Users) {
@@ -376,7 +375,7 @@ TEST(NodeTransaction, FailedRefreshCompensationForcesRebuild) {
     auto next = std::make_shared<NodeSnapshot>(*old);
     next->users = std::make_shared<const std::vector<::api::UserInfo>>(2);
     ReplaceUsers(*next, 2);
-    next->rules = std::make_shared<const std::vector<::rule::DetectRule>>(2);
+    next->rules = std::make_shared<const std::vector<::common::DetectRule>>(2);
     Seed(runtime, state, old);
     runtime.faults = {{"users:" + old->tag, 1, true}, {"rules:" + old->tag, 2, false}};
     EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, next)));

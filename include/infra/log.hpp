@@ -12,6 +12,10 @@
 #include <utility>
 
 
+namespace common {
+struct Context;
+}  // namespace common
+
 namespace infra {
 
 enum class LogLevel {
@@ -84,36 +88,17 @@ public:
         std::string message,
         std::source_location location = std::source_location::current());
 
-    template <typename Context>
     static void WriteConnection(
         LogLevel level,
-        const Context& context,
-        std::string message,
-        std::source_location location = std::source_location::current()) {
-        ConnectionLogContext log_context;
-        if constexpr (std::is_integral_v<Context>) {
-            log_context.conn_id = static_cast<uint64_t>(context);
-        } else {
-            log_context.conn_id = context.conn_id;
-        }
-        if constexpr (requires { std::string(context.inbound.tag); }) {
-            log_context.inbound_tag = std::string(context.inbound.tag);
-        }
-        if constexpr (requires { static_cast<int64_t>(context.inbound.user_id); }) {
-            if (context.inbound.user_id > 0) {
-                log_context.user_id = static_cast<int64_t>(context.inbound.user_id);
-            }
-        }
-        if constexpr (requires { std::string_view(context.outbound.tag); }) {
-            const std::string_view outbound = context.outbound.tag;
-            if (outbound != log_context.inbound_tag) log_context.outbound_tag = outbound;
-        }
-        WriteConnection(
-            level,
-            std::move(log_context),
-            std::move(message),
-            location);
-    }
+        uint64_t conn_id,
+        std::string_view message,
+        std::source_location location = std::source_location::current());
+
+    static void WriteConnection(
+        LogLevel level,
+        const common::Context& ctx,
+        std::string_view message,
+        std::source_location location = std::source_location::current());
 
     static void WriteConsole(
         LogLevel level,
