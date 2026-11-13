@@ -30,7 +30,6 @@
 #include <asio/ip/v6_only.hpp>
 #include <unordered_map>
 #include <sys/socket.h>
-#include <array>
 #include <algorithm>
 #include <charconv>
 #include <chrono>

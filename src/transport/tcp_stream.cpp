@@ -366,37 +366,7 @@ bool TcpStream::DrainWriteAvailable(
 }
 
 net::awaitable<void> TcpStream::WriteMultiBuffer(common::MultiBuffer mb) {
-    if (mb.byte_size() == 0) {
-        mb.clear();
-        co_return;
-    }
-    if (!impl_->socket.is_open() || impl_->HasFlag(kWriteShutdown)) {
-        mb.clear();
-        throw IoSystemError(io_error::broken_pipe);
-    }
-    try {
-        const auto bytes = mb.FrontSpan();
-        if (bytes.empty()) {
-            mb.clear();
-            co_return;
-        }
-        const net::const_buffer single(bytes.data(), bytes.size());
-        std::span<const net::const_buffer> buffers(&single, 1);
-        impl_->timeouts.CheckCanBeginWrite();
-        const auto cancellation = co_await net::this_coro::cancellation_state;
-        const bool deferred = IsWriteCancellationDeferred();
-        size_t offset = 0;
-        if (DrainWriteAvailable(
-                buffers, offset, Cancellation().Stopped(), deferred, cancellation.cancelled())) {
-            mb.clear();
-            co_return;
-        }
-        co_await WriteBuffersFrom(buffers, offset, true);
-    } catch (...) {
-        mb.clear();
-        throw;
-    }
-    mb.clear();
+    return WriteBuffersFrom({}, 0, false, std::move(mb), true);
 }
 
 net::awaitable<void> TcpStream::WriteBuffers(
@@ -407,13 +377,31 @@ net::awaitable<void> TcpStream::WriteBuffers(
 // `blocked`: the caller's nonblocking attempt just hit EAGAIN without
 // suspending since, so go straight to the writable wait.
 net::awaitable<void> TcpStream::WriteBuffersFrom(
-    std::span<const net::const_buffer> buffers, std::size_t offset, bool blocked) {
+    std::span<const net::const_buffer> buffers,
+    std::size_t offset,
+    bool blocked,
+    common::MultiBuffer owned,
+    bool is_multi_buffer) {
+    struct ClearOwned {
+        common::MultiBuffer& mb;
+        ~ClearOwned() noexcept { mb.clear(); }
+    } clear_guard{owned};
+    if (is_multi_buffer && owned.byte_size() == 0) {
+        co_return;
+    }
     if (!impl_->socket.is_open() || impl_->HasFlag(kWriteShutdown)) {
         throw IoSystemError(io_error::broken_pipe);
     }
-
-    while (!buffers.empty() && buffers.front().size() == 0) buffers = buffers.subspan(1);
-    if (buffers.empty()) co_return;
+    net::const_buffer single_owned;
+    if (is_multi_buffer) {
+        const auto bytes = owned.FrontSpan();
+        if (bytes.empty()) co_return;
+        single_owned = net::buffer(bytes.data(), bytes.size());
+        buffers = {&single_owned, 1};
+    } else {
+        while (!buffers.empty() && buffers.front().size() == 0) buffers = buffers.subspan(1);
+        if (buffers.empty()) co_return;
+    }
     impl_->timeouts.CheckCanBeginWrite();
     const auto cancellation = co_await net::this_coro::cancellation_state;
     const bool deferred = IsWriteCancellationDeferred();

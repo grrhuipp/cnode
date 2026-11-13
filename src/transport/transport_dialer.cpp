@@ -284,24 +284,22 @@ __attribute__((weak)) net::awaitable<DialResult> DialOutboundTransport(
     net::io_context& io_context,
     common::Context& ctx,
     const OutboundTransportTarget& target) {
-
-
     const auto candidates = target.Candidates();
-    DialResult result;
     if (candidates.empty() || target.stream_settings == nullptr) {
-        result = DialResult::Fail(
-            common::ErrorCode::INVALID_ARGUMENT, "invalid outbound transport target");
-    } else if (IsXHttpSplitOutbound(target)) {
-        result = co_await DialXHttpSplitOutboundTransport(io_context, ctx, target);
-    } else if (candidates.size() == 1) {
-        result = co_await DialAndBuildSingleCandidate(
-            io_context, ctx, target, candidates.front());
-    } else {
-        result = co_await DialAndBuildCandidatesSequential(
-            io_context, ctx, target, candidates);
+        return []() -> net::awaitable<DialResult> {
+            co_return DialResult::Fail(
+                common::ErrorCode::INVALID_ARGUMENT, "invalid outbound transport target");
+        }();
     }
-
-    co_return result;
+    if (IsXHttpSplitOutbound(target)) {
+        return DialXHttpSplitOutboundTransport(io_context, ctx, target);
+    }
+    if (candidates.size() == 1) {
+        return DialAndBuildSingleCandidate(
+            io_context, ctx, target, candidates.front());
+    }
+    return DialAndBuildCandidatesSequential(
+        io_context, ctx, target, candidates);
 }
 
 std::string_view ResolveOutboundTlsServerName(

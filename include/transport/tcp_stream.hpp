@@ -109,7 +109,11 @@ protected:
 
 private:
     net::awaitable<void> WriteBuffersFrom(
-        std::span<const net::const_buffer> buffers, std::size_t offset, bool blocked);
+        std::span<const net::const_buffer> buffers,
+        std::size_t offset,
+        bool blocked,
+        common::MultiBuffer owned = {},
+        bool is_multi_buffer = false);
     friend class TlsStream;
     [[nodiscard]] bool CanRead() const noexcept;
     [[nodiscard]] bool CanWrite() const noexcept;

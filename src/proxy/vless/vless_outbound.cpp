@@ -68,6 +68,23 @@ public:
         ::common::MultiBufferBatch first_payload) override;
 
 private:
+    ::net::awaitable<::proxy::OutboundProcessResult> ProcessPlain(
+        ::common::Context& ctx,
+        ::transport::Link inbound,
+        ::transport::OutboundDialer& dialer,
+        const ::infra::TimeoutsConfig& timeouts,
+        ::app::StatsShard& stats,
+        const ::app::RelayConfig& relay_config,
+        ::common::MultiBufferBatch first_payload);
+    ::net::awaitable<::proxy::OutboundProcessResult> ProcessEncrypted(
+        ::common::Context& ctx,
+        ::transport::Link inbound,
+        ::transport::OutboundDialer& dialer,
+        const ::infra::TimeoutsConfig& timeouts,
+        ::app::StatsShard& stats,
+        const ::app::RelayConfig& relay_config,
+        ::common::MultiBufferBatch first_payload);
+
     std::shared_ptr<const ::proxy::VlessOutboundConfig> config_;
     std::optional<::proxy::VlessEncryptionClientTicketCache> encryption_tickets_;
 };
@@ -418,6 +435,59 @@ struct VlessClientTicketLease {
     ::proxy::VlessEncryptionTicketRejection rejection;
 };
 
+net::awaitable<tl::expected<std::unique_ptr<transport::AsyncStream>, common::ErrorCode>>
+DialAndSendPlainVlessHandshake(
+    common::Context& ctx,
+    transport::OutboundDialer& dialer,
+    const VlessOutboundConfig& config,
+    bool is_udp,
+    bool use_vision,
+    bool use_xudp,
+    bool use_packet_addr,
+    std::chrono::seconds handshake_timeout) {
+    auto dialed = co_await dialer.Dial(ctx, config.server);
+    if (!dialed) {
+        co_return tl::unexpected(dialed.error());
+    }
+    auto stream = std::move(*dialed);
+    stream->SetIdleTimeout(handshake_timeout);
+    transport::PhaseDeadlineToken outbound_protocol_deadline =
+        stream->StartPhaseDeadline(handshake_timeout);
+
+    std::array<uint8_t, ::proxy::kVlessMaxRequestHeaderSize> header_buf{};
+    const common::TargetAddress packet_magic_target = use_packet_addr
+        ? common::TargetAddress(::proxy::kPacketAddrMagicAddress, 0)
+        : common::TargetAddress{};
+    const common::TargetAddress& request_target =
+        use_packet_addr ? packet_magic_target : ctx.outbound.target;
+    const size_t header_len = ::proxy::EncodeRequestHeaderTo(
+        config.uuid_bytes,
+        use_xudp
+            ? ::proxy::VlessCommand::MUX
+            : (is_udp ? ::proxy::VlessCommand::UDP : ::proxy::VlessCommand::TCP),
+        request_target,
+        header_buf.data(),
+        header_buf.size(),
+        use_vision ? std::string_view(config.flow) : std::string_view{},
+        dialer.ForwardedMetadata(ctx));
+    if (header_len == 0) {
+        stream->CloseAbortive();
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
+    }
+    try {
+        co_await WriteVlessBytes(
+            *stream, std::span<const uint8_t>(header_buf.data(), header_len));
+    } catch (...) {
+        OPENSSL_cleanse(header_buf.data(), header_len);
+        const common::ErrorCode classified = proxy::ClassifyOutboundHandshakeException(
+            *stream, outbound_protocol_deadline);
+        stream->CloseAbortive();
+        co_return tl::unexpected(classified);
+    }
+    OPENSSL_cleanse(header_buf.data(), header_len);
+    co_return stream;
+}
+
 net::awaitable<tl::expected<::proxy::VlessActiveIo, common::ErrorCode>>
 SendVlessHandshake(
     transport::AsyncStream& stream,
@@ -532,25 +602,85 @@ VlessOutboundHandler::Process(
     const app::RelayConfig& relay_config,
     common::MultiBufferBatch first_payload) {
     if (!inbound.Valid()) {
-        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
+        return []() -> net::awaitable<OutboundProcessResult> {
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
+        }();
     }
     if (!config_->flow.empty() && ctx.content.network != common::Network::TCP) {
-        co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
+        return []() -> net::awaitable<OutboundProcessResult> {
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
+        }();
     }
-
-    const auto& target = ctx.outbound.target;
-    auto dialed = co_await dialer.Dial(ctx, config_->server);
-    if (!dialed) {
-        co_return tl::unexpected(dialed.error());
+    if (!config_->encryption) {
+        return ProcessPlain(
+            ctx, inbound, dialer, timeouts, stats, relay_config, std::move(first_payload));
     }
-    auto stream = std::move(*dialed);
+    return ProcessEncrypted(
+        ctx, inbound, dialer, timeouts, stats, relay_config, std::move(first_payload));
+}
 
-    auto fail_abortive = [&](common::ErrorCode error) {
-        if (stream) {
-            stream->CloseAbortive();
+net::awaitable<OutboundProcessResult>
+VlessOutboundHandler::ProcessPlain(
+    common::Context& ctx,
+    transport::Link inbound,
+    transport::OutboundDialer& dialer,
+    const infra::TimeoutsConfig& timeouts,
+    app::StatsShard& stats,
+    const app::RelayConfig& relay_config,
+    common::MultiBufferBatch first_payload) {
+    const bool is_udp = ctx.content.network == common::Network::UDP;
+    const bool use_vision = !config_->flow.empty();
+    const bool use_xudp = is_udp && config_->packet_xudp;
+    const bool use_packet_addr = is_udp && config_->packet_addr;
+
+    std::unique_ptr<transport::AsyncStream> stream;
+    {
+        auto dialed = co_await DialAndSendPlainVlessHandshake(
+            ctx, dialer, *config_, is_udp, use_vision, use_xudp,
+            use_packet_addr, timeouts.HandshakeTimeout());
+        if (!dialed) {
+            co_return tl::unexpected(dialed.error());
         }
-        return tl::unexpected(error);
-    };
+        stream = std::move(*dialed);
+    }
+    proxy::ApplyOutboundRelayTimeouts(*stream, relay_config);
+    proxy::BufferedStreamReader protocol_reader(*stream);
+    const auto& target = ctx.outbound.target;
+
+    if (use_xudp) {
+        VlessMuxUdpEndpoint target_endpoint(
+            *stream, protocol_reader, *stream, target, dialer.ForwardedMetadata(ctx));
+        co_return co_await app::DoRelayLink(
+            dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
+            target_endpoint, ctx, stats, relay_config, std::move(first_payload));
+    }
+
+    VlessOutboundEndpoint target_endpoint(
+        *stream, protocol_reader, *stream, is_udp, target,
+        use_packet_addr, use_vision, config_->uuid_bytes);
+    co_return co_await app::DoRelayLink(
+        dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
+        target_endpoint, ctx, stats, relay_config, std::move(first_payload));
+}
+
+net::awaitable<OutboundProcessResult>
+VlessOutboundHandler::ProcessEncrypted(
+    common::Context& ctx,
+    transport::Link inbound,
+    transport::OutboundDialer& dialer,
+    const infra::TimeoutsConfig& timeouts,
+    app::StatsShard& stats,
+    const app::RelayConfig& relay_config,
+    common::MultiBufferBatch first_payload) {
+    const auto& target = ctx.outbound.target;
+    std::unique_ptr<transport::AsyncStream> stream;
+    {
+        auto dialed = co_await dialer.Dial(ctx, config_->server);
+        if (!dialed) {
+            co_return tl::unexpected(dialed.error());
+        }
+        stream = std::move(*dialed);
+    }
 
     const bool is_udp = ctx.content.network == common::Network::UDP;
     const bool use_vision = !config_->flow.empty();
@@ -562,24 +692,24 @@ VlessOutboundHandler::Process(
     proxy::BufferedStreamReader* active_reader = &protocol_reader;
     transport::MultiBufferWriter* active_writer = &protocol_writer;
     std::optional<::proxy::VlessEncryptedIo> encrypted_io;
-
-    auto handshake = co_await SendVlessHandshake(
+    {
+        auto handshake = co_await SendVlessHandshake(
             *stream, *config_, tickets, target,
             is_udp, use_vision, use_xudp, use_packet_addr,
             timeouts.HandshakeTimeout(), protocol_reader, protocol_writer,
             encrypted_io, dialer, ctx);
-    if (!handshake) co_return fail_abortive(handshake.error());
-    active_reader = handshake->reader;
-    active_writer = handshake->writer;
+        if (!handshake) {
+            stream->CloseAbortive();
+            co_return tl::unexpected(handshake.error());
+        }
+        active_reader = handshake->reader;
+        active_writer = handshake->writer;
+    }
     proxy::ApplyOutboundRelayTimeouts(*stream, relay_config);
 
     if (use_xudp) {
         VlessMuxUdpEndpoint target_endpoint(
-            *stream,
-            *active_reader,
-            *active_writer,
-            target,
-            dialer.ForwardedMetadata(ctx));
+            *stream, *active_reader, *active_writer, target, dialer.ForwardedMetadata(ctx));
         auto res = co_await app::DoRelayLink(
             dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
             target_endpoint, ctx, stats, relay_config, std::move(first_payload));
@@ -590,14 +720,8 @@ VlessOutboundHandler::Process(
     }
 
     VlessOutboundEndpoint target_endpoint(
-        *stream,
-        *active_reader,
-        *active_writer,
-        is_udp,
-        target,
-        use_packet_addr,
-        use_vision,
-        config_->uuid_bytes);
+        *stream, *active_reader, *active_writer, is_udp, target,
+        use_packet_addr, use_vision, config_->uuid_bytes);
     auto res = co_await app::DoRelayLink(
         dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
         target_endpoint, ctx, stats, relay_config, std::move(first_payload));

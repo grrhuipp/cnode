@@ -31,6 +31,21 @@ public:
         common::MultiBufferBatch first_payload) override;
 
 private:
+    net::awaitable<OutboundProcessResult> ProcessUdp(
+        common::Context& ctx,
+        transport::Link inbound,
+        transport::OutboundDialer& dialer,
+        app::StatsShard& stats,
+        const app::RelayConfig& relay_config,
+        common::MultiBufferBatch first_payload);
+    net::awaitable<OutboundProcessResult> ProcessTcp(
+        common::Context& ctx,
+        transport::Link inbound,
+        transport::OutboundDialer& dialer,
+        app::StatsShard& stats,
+        const app::RelayConfig& relay_config,
+        common::MultiBufferBatch first_payload);
+
     DomainStrategy domain_strategy_;
     std::optional<common::TargetAddress> redirect_target_;
 };
@@ -74,26 +89,46 @@ net::awaitable<OutboundProcessResult> FreedomOutbound::Process(
     const app::RelayConfig& relay_config,
     common::MultiBufferBatch first_payload) {
     if (!inbound.Valid()) {
-        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
+        return []() -> net::awaitable<OutboundProcessResult> {
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
+        }();
     }
+    if (ctx.content.network == common::Network::UDP) {
+        return ProcessUdp(ctx, inbound, dialer, stats, relay_config, std::move(first_payload));
+    }
+    return ProcessTcp(ctx, inbound, dialer, stats, relay_config, std::move(first_payload));
+}
 
+net::awaitable<OutboundProcessResult> FreedomOutbound::ProcessUdp(
+    common::Context& ctx,
+    transport::Link inbound,
+    transport::OutboundDialer& dialer,
+    app::StatsShard& stats,
+    const app::RelayConfig& relay_config,
+    common::MultiBufferBatch first_payload) {
     // UDP 数据面：dispatcher.Dispatch -> outbound.Process -> DoRelayLink。
     // 不做 redirect（保持 UDP 逐包目标语义）；嗅探首包作为普通上行交给转发。
-    if (ctx.content.network == common::Network::UDP) {
-        const auto& target = ctx.outbound.target;
-        std::optional<FreedomUdpRequest> endpoint;
-        if (auto opened = dialer.OpenDatagram(ctx, transport::OutboundDialer::DatagramRemote{
-                .address = target.IsDomain() ? std::nullopt : target.resolved_addr,
-                .family_hint = target.IsDomain() ? target.resolved_addr : std::nullopt,
-                .family_policy = FamilyPolicy(domain_strategy_),
-            }, endpoint); !opened) {
-            co_return tl::unexpected(opened.error());
-        }
-        proxy::ApplyOutboundDatagramTimeouts(*endpoint, relay_config);
-        co_return co_await app::DoRelayLink(dialer.IoContext(), *inbound.reader, *inbound.writer,
-            inbound.control, *endpoint, ctx, stats, relay_config, std::move(first_payload));
+    const auto& target = ctx.outbound.target;
+    std::optional<FreedomUdpRequest> endpoint;
+    if (auto opened = dialer.OpenDatagram(ctx, transport::OutboundDialer::DatagramRemote{
+            .address = target.IsDomain() ? std::nullopt : target.resolved_addr,
+            .family_hint = target.IsDomain() ? target.resolved_addr : std::nullopt,
+            .family_policy = FamilyPolicy(domain_strategy_),
+        }, endpoint); !opened) {
+        co_return tl::unexpected(opened.error());
     }
+    proxy::ApplyOutboundDatagramTimeouts(*endpoint, relay_config);
+    co_return co_await app::DoRelayLink(dialer.IoContext(), *inbound.reader, *inbound.writer,
+        inbound.control, *endpoint, ctx, stats, relay_config, std::move(first_payload));
+}
 
+net::awaitable<OutboundProcessResult> FreedomOutbound::ProcessTcp(
+    common::Context& ctx,
+    transport::Link inbound,
+    transport::OutboundDialer& dialer,
+    app::StatsShard& stats,
+    const app::RelayConfig& relay_config,
+    common::MultiBufferBatch first_payload) {
     // redirect：替换目标地址（Xray freedom redirect 语义）
     if (redirect_target_) {
         LOG_CONN_DEBUG(ctx, "redirect {} -> {}",
@@ -101,11 +136,14 @@ net::awaitable<OutboundProcessResult> FreedomOutbound::Process(
         ctx.outbound.target = *redirect_target_;
     }
 
-    auto dialed = co_await dialer.Dial(ctx, ctx.outbound.target, FamilyPolicy(domain_strategy_));
-    if (!dialed) {
-        co_return tl::unexpected(dialed.error());
+    std::unique_ptr<transport::AsyncStream> stream;
+    {
+        auto dialed = co_await dialer.Dial(ctx, ctx.outbound.target, FamilyPolicy(domain_strategy_));
+        if (!dialed) {
+            co_return tl::unexpected(dialed.error());
+        }
+        stream = std::move(*dialed);
     }
-    auto stream = std::move(*dialed);
     proxy::ApplyOutboundRelayTimeouts(*stream, relay_config);
     co_return co_await app::DoRelayLink(
         dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,

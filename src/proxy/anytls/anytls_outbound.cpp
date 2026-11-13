@@ -664,6 +664,13 @@ public:
         }
     }
 
+    net::awaitable<tl::expected<Lease, common::ErrorCode>> AcquireOrDial(
+        common::Context& ctx,
+        transport::OutboundDialer& dialer,
+        const infra::AnyTlsSettings& settings,
+        std::shared_ptr<const AnyTlsPaddingScheme>& padding,
+        const infra::TimeoutsConfig& timeouts);
+
     void Retire() noexcept {
         retired_ = true;
         Cancel();
@@ -962,6 +969,41 @@ AnyTlsOutboundHandler::~AnyTlsOutboundHandler() noexcept {
     if (pool_) pool_->Retire();
 }
 
+net::awaitable<tl::expected<AnyTlsOutboundHandler::SessionPool::Lease, common::ErrorCode>>
+AnyTlsOutboundHandler::SessionPool::AcquireOrDial(
+    common::Context& ctx,
+    transport::OutboundDialer& dialer,
+    const infra::AnyTlsSettings& settings,
+    std::shared_ptr<const AnyTlsPaddingScheme>& padding,
+    const infra::TimeoutsConfig& timeouts) {
+    const auto ordered_bind = dialer.SelectOrderedBind(ctx);
+    auto opening_scheme = padding;
+    auto transport_lease = ordered_bind
+        ? AcquireIf([&](const ClientSession& physical) {
+            const auto& remote = physical.remote_endpoint;
+            const auto& local = physical.local_endpoint;
+            if (!remote || !local) return false;
+            const auto& selected = remote->address().is_v6()
+                ? ordered_bind->v6 : ordered_bind->v4;
+            return !selected.address ||
+                common::NormalizeAddress(local->address()) == *selected.address;
+        })
+        : Acquire();
+    if (transport_lease.Get()) {
+        co_return transport_lease;
+    }
+    auto dialed = co_await DialPhysicalSession(dialer, settings,
+        ordered_bind ? &*ordered_bind : nullptr, timeouts.HandshakeTimeout(),
+        *opening_scheme, ctx);
+    if (!dialed) {
+        co_return tl::unexpected(dialed.error());
+    }
+    auto session = std::make_shared<ClientSession>(
+        dialer.IoContext(), std::move(*dialed), padding,
+        std::move(opening_scheme));
+    co_return Adopt(session);
+}
+
 net::awaitable<OutboundProcessResult> AnyTlsOutboundHandler::Process(
     common::Context& ctx,
     transport::Link inbound,
@@ -973,43 +1015,22 @@ net::awaitable<OutboundProcessResult> AnyTlsOutboundHandler::Process(
     if (!inbound.Valid()) {
         co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
-    const auto ordered_bind = dialer.SelectOrderedBind(ctx);
-    std::shared_ptr<const AnyTlsPaddingScheme> opening_scheme;
     SessionPool::Lease transport_lease;
     std::shared_ptr<ClientSession> session;
     bool reusable = false;
     std::exception_ptr failure;
     OutboundProcessResult result = tl::unexpected(common::ErrorCode::INTERNAL);
     try {
-        opening_scheme = padding_;
-        transport_lease = ordered_bind
-            ? pool_->AcquireIf([&](const ClientSession& physical) {
-                const auto& remote = physical.remote_endpoint;
-                const auto& local = physical.local_endpoint;
-                if (!remote || !local) return false;
-                const auto& selected = remote->address().is_v6()
-                    ? ordered_bind->v6 : ordered_bind->v4;
-                return !selected.address ||
-                    common::NormalizeAddress(local->address()) == *selected.address;
-            })
-            : pool_->Acquire();
-        session = transport_lease.Get();
-        if (!session) {
-            auto dialed = co_await DialPhysicalSession(dialer, *settings_,
-                ordered_bind ? &*ordered_bind : nullptr, timeouts.HandshakeTimeout(),
-                *opening_scheme, ctx);
-            if (!dialed) {
-                result = tl::unexpected(dialed.error());
-            } else {
-                session = std::make_shared<ClientSession>(
-                    dialer.IoContext(), std::move(*dialed), padding_,
-                    std::move(opening_scheme));
-                transport_lease = pool_->Adopt(session);
+        auto acquired = co_await pool_->AcquireOrDial(ctx, dialer, *settings_, padding_, timeouts);
+        if (!acquired) {
+            result = tl::unexpected(acquired.error());
+        } else {
+            transport_lease = std::move(*acquired);
+            session = transport_lease.Get();
+            if (session) {
+                result = co_await ProcessSession(ctx, inbound, dialer, timeouts, stats, relay_config,
+                    std::move(first_payload), session, reusable);
             }
-        }
-        if (session) {
-            result = co_await ProcessSession(ctx, inbound, dialer, timeouts, stats, relay_config,
-                std::move(first_payload), session, reusable);
         }
     } catch (...) {
         failure = std::current_exception();
