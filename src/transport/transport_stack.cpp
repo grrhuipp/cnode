@@ -197,28 +197,32 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
             // never restart it when another record/fragment arrives.
             RealityClientHelloReader reader;
             common::MultiBuffer pending;
+            size_t consumed = 0;
             try {
                 while (reader.State() == RealityClientHelloReader::Status::Reading) {
-                    if (pending.empty()) {
-                        pending = co_await tcp->ReadMultiBuffer();
-                        if (pending.empty()) {
+                    if (consumed == pending.byte_size()) {
+                        auto next = co_await tcp->ReadMultiBuffer();
+                        if (next.empty()) {
                             co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
                         }
+                        pending.AppendAndCoalesce(std::move(next));
                     }
-                    const auto front = pending.FrontSpan();
-                    const size_t take = std::min(front.size(), reader.ReadSize());
-                    reader.Append(front.first(take));
-                    pending.DropPrefixBytes(take);
+                    consumed += reader.ConsumeHandshake(
+                        pending.FrontSpan().subspan(consumed));
+                }
+                if (reader.State() == RealityClientHelloReader::Status::Complete) {
+                    reality_conn_state = VerifyRealityClientHello(
+                        reader.TakeHello(), *ctx);
+                }
+                if (!reality_conn_state) {
+                    const auto wire = pending.FrontSpan().first(consumed);
+                    initial_bytes.assign(wire.begin(), wire.end());
+                    (void)pending.DropPrefixBytes(consumed);
                 }
                 tcp->PrependReadMultiBuffer(std::move(pending));
             } catch (...) {
                 co_return tl::unexpected(common::ErrorCode::TLS_HANDSHAKE_FAILED);
             }
-            if (reader.State() == RealityClientHelloReader::Status::Complete) {
-                reality_conn_state = VerifyRealityClientHello(
-                    reader.TakeHello(), *ctx);
-            }
-            initial_bytes = reader.TakeWire();
         }
         if (!reality_conn_state) {
             LOG_CONN_DEBUG(conn_id,
@@ -233,8 +237,6 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
                 std::move(initial_bytes));
             co_return std::unique_ptr<AsyncStream>{};
         }
-        tcp->PrependReadBytes(initial_bytes);
-        std::vector<uint8_t>{}.swap(initial_bytes);
     }
     std::unique_ptr<TlsStream> tls;
     if (reality_conn_state) {

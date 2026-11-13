@@ -129,10 +129,14 @@ public:
             : std::min<size_t>(remaining_, 1024);
     }
     void Append(std::span<const uint8_t> bytes);
+    // Consumes up to the end of the ClientHello from already-received bytes
+    // without copying wire records into `wire_`; returns consumed byte count.
+    [[nodiscard]] size_t ConsumeHandshake(std::span<const uint8_t> available);
     [[nodiscard]] std::span<const uint8_t> Hello() const noexcept { return hello_; }
     [[nodiscard]] std::vector<uint8_t> TakeHello() noexcept { return std::move(hello_); }
     [[nodiscard]] std::vector<uint8_t> TakeWire() noexcept { return std::move(wire_); }
 private:
+    void AppendPayload(std::span<const uint8_t> bytes);
     std::array<uint8_t, 5> header_{};
     size_t header_size_ = 0;
     size_t remaining_ = 0;

@@ -44,6 +44,23 @@ void RealityClientHelloReader::Append(std::span<const uint8_t> bytes) {
         return;
     }
     wire_.insert(wire_.end(), bytes.begin(), bytes.end());
+    AppendPayload(bytes);
+}
+
+size_t RealityClientHelloReader::ConsumeHandshake(std::span<const uint8_t> available) {
+    size_t consumed = 0;
+    while (!available.empty() && status_ == Status::Reading) {
+        const size_t step = header_size_ < header_.size()
+            ? std::min(available.size(), header_.size() - header_size_)
+            : std::min(available.size(), remaining_);
+        AppendPayload(available.first(step));
+        available = available.subspan(step);
+        consumed += step;
+    }
+    return consumed;
+}
+
+void RealityClientHelloReader::AppendPayload(std::span<const uint8_t> bytes) {
     if (header_size_ < header_.size()) {
         std::copy(bytes.begin(), bytes.end(), header_.begin() + header_size_);
         header_size_ += bytes.size();
@@ -60,6 +77,9 @@ void RealityClientHelloReader::Append(std::span<const uint8_t> bytes) {
         return;
     }
     remaining_ -= bytes.size();
+    if (hello_.capacity() < hello_.size() + bytes.size()) {
+        hello_.reserve(hello_.size() + bytes.size());
+    }
     if (hello_.size() < 4) {
         const size_t header_bytes = std::min(bytes.size(), 4 - hello_.size());
         hello_.insert(hello_.end(), bytes.begin(), bytes.begin() + header_bytes);

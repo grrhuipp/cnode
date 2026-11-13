@@ -196,12 +196,21 @@ private:
 };
 
 net::awaitable<PanelHttpResponse> WriteRequestAndReadResponse(
-    std::unique_ptr<transport::AsyncStream> stream, std::string_view request) {
+    std::unique_ptr<transport::AsyncStream> stream, std::string request) {
     constexpr size_t kMaxBodySize = 64 * 1024 * 1024;
     constexpr size_t kMaxLineSize = 64 * 1024;
     constexpr size_t kMaxHeaderSize = 256 * 1024;
-    if (!co_await transport::WriteFullToStream(*stream, request))
-        co_return PanelHttpResponse{.status = -1, .body = "HTTP request write failed"};
+    if (!request.empty()) {
+        const net::const_buffer request_buf(request.data(), request.size());
+        try {
+            co_await stream->WriteBuffers(
+                std::span<const net::const_buffer>{&request_buf, 1});
+        } catch (...) {
+            std::string{}.swap(request);
+            co_return PanelHttpResponse{.status = -1, .body = "HTTP request write failed"};
+        }
+    }
+    std::string{}.swap(request);
     auto response = co_await transport::ReadHttp1ResponseHead(*stream,
         {.max_head_bytes = kMaxHeaderSize, .max_line_bytes = kMaxLineSize});
     if (!response)
@@ -312,8 +321,8 @@ private:
     // 失败也无法证明面板未处理请求（流量上报是累加的），因此不换地址重发。
     template <typename Stream>
     net::awaitable<PanelHttpResponse>
-    ConnectAndExchange(std::span<const tcp::endpoint> endpoints,
-                       std::string_view request);
+    ConnectAndExchange(std::vector<tcp::endpoint> endpoints,
+                       std::string request);
 
     template <typename FetchResult>
     net::awaitable<tl::expected<PanelHttpResponse, FetchResult>>
@@ -444,15 +453,17 @@ APIClient::HttpExchange(HttpMethod method,
     std::string{}.swap(if_none_match);
 
     if (url_parts_.use_ssl) {
-        co_return co_await ConnectAndExchange<ssl::stream<tcp::socket>>(endpoints, request);
+        co_return co_await ConnectAndExchange<ssl::stream<tcp::socket>>(
+            std::move(endpoints), std::move(request));
     }
-    co_return co_await ConnectAndExchange<tcp::socket>(endpoints, request);
+    co_return co_await ConnectAndExchange<tcp::socket>(
+        std::move(endpoints), std::move(request));
 }
 
 template <typename Stream>
 net::awaitable<PanelHttpResponse>
-APIClient::ConnectAndExchange(std::span<const tcp::endpoint> endpoints,
-                              std::string_view request) {
+APIClient::ConnectAndExchange(std::vector<tcp::endpoint> endpoints,
+                              std::string request) {
     constexpr bool kTls = !std::is_same_v<Stream, tcp::socket>;
     constexpr std::string_view kScheme = kTls ? "HTTPS" : "HTTP";
     const auto cancellation = co_await net::this_coro::cancellation_state;
@@ -497,7 +508,9 @@ APIClient::ConnectAndExchange(std::span<const tcp::endpoint> endpoints,
             continue;
         }
 
-        co_return co_await WriteRequestAndReadResponse(std::move(stream), request);
+        std::vector<tcp::endpoint>{}.swap(endpoints);
+        std::string{}.swap(last_error);
+        co_return co_await WriteRequestAndReadResponse(std::move(stream), std::move(request));
     }
     co_return PanelHttpResponse{
         .status = -1,
