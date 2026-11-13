@@ -1255,18 +1255,25 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
 
     RecordExtractedRealIp(request->head.Text(), cfg.real_ip_header, transport_metadata);
 
-    std::string response;
-    response.reserve(96 + cfg.headers.size() * 32);
-    response.append("HTTP/1.1 200 OK\r\n");
-    response.append("Cache-Control: no-store\r\n");
-    for (const auto& [key, value] : cfg.headers) {
-        if (!key.empty()) {
-            AppendHeaderLine(response, key, value);
+    constexpr std::string_view kDefaultOkResponse =
+        "HTTP/1.1 200 OK\r\n"
+        "Cache-Control: no-store\r\n\r\n";
+    bool wrote = false;
+    if (cfg.headers.empty()) {
+        wrote = co_await WriteFullToStream(*stream, kDefaultOkResponse);
+    } else {
+        std::string response;
+        response.reserve(96 + cfg.headers.size() * 32);
+        response.append("HTTP/1.1 200 OK\r\nCache-Control: no-store\r\n");
+        for (const auto& [key, value] : cfg.headers) {
+            if (!key.empty()) {
+                AppendHeaderLine(response, key, value);
+            }
         }
+        response.append("\r\n");
+        wrote = co_await WriteFullToStream(*stream, response);
     }
-    response.append("\r\n");
-
-    if (!co_await WriteFullToStream(*stream, response)) {
+    if (!wrote) {
         LOG_CONN_DEBUG(conn_id, "HTTP server failed to send 200 response");
         co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
@@ -1414,13 +1421,21 @@ net::awaitable<TransportBuildResult> DoWsServerHandshake(
     RecordExtractedRealIp(text, ws_cfg.real_ip_header, transport_metadata);
 
     const auto ws_accept = EncodeWsAccept(ws_key);
-    std::string response;
-    response.reserve(kSwitchingProtocolsResponse.size() + 32 + ws_accept.size());
-    response.append(kSwitchingProtocolsFields);
-    response.append("Sec-WebSocket-Accept: ");
-    response.append(ws_accept.data(), ws_accept.size());
-    response.append("\r\n\r\n");
-    if (!co_await WriteFullToStream(*stream, response)) {
+    constexpr std::string_view kAcceptPrefix = "Sec-WebSocket-Accept: ";
+    constexpr std::string_view kHeaderEnd = "\r\n\r\n";
+    std::array<char,
+               kSwitchingProtocolsFields.size() + kAcceptPrefix.size() + 28 + kHeaderEnd.size()>
+        response{};
+    size_t pos = 0;
+    std::memcpy(response.data() + pos, kSwitchingProtocolsFields.data(), kSwitchingProtocolsFields.size());
+    pos += kSwitchingProtocolsFields.size();
+    std::memcpy(response.data() + pos, kAcceptPrefix.data(), kAcceptPrefix.size());
+    pos += kAcceptPrefix.size();
+    std::memcpy(response.data() + pos, ws_accept.data(), ws_accept.size());
+    pos += ws_accept.size();
+    std::memcpy(response.data() + pos, kHeaderEnd.data(), kHeaderEnd.size());
+    pos += kHeaderEnd.size();
+    if (!co_await WriteFullToStream(*stream, std::string_view(response.data(), pos))) {
         LOG_CONN_DEBUG(conn_id, "WebSocket server failed to send 101 response");
         co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }

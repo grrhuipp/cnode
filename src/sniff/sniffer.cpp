@@ -627,7 +627,7 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
 
     // Released on return: no plaintext is held while waiting for the next datagram.
     std::array<uint8_t, 1536> stack_decrypted;
-    bssl::ScopedEVP_CIPHER_CTX cipher_ctx;
+    bssl::UniquePtr<EVP_CIPHER_CTX> cipher_ctx;
     std::vector<uint8_t> heap_decrypted;
     std::span<const uint8_t> decrypted;
     size_t offset = 0;
@@ -699,6 +699,10 @@ SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
                 !HkdfExpandLabel(client_secret, spec->iv_label, iv_)) return fail();
         }
 
+        if (!cipher_ctx) {
+            cipher_ctx.reset(EVP_CIPHER_CTX_new());
+            if (!cipher_ctx) return fail();
+        }
         std::array<uint8_t, 16> mask{};
         const std::span<const uint8_t, 16> sample(remaining.data() + hdr_len + 4, 16);
         if (!AesEcbEncrypt(cipher_ctx.get(), hp_key_, sample, mask)) return fail();

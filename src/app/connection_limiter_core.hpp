@@ -133,16 +133,37 @@ public:
     }
 
     [[nodiscard]] RejectReason CheckIPBan(
-        const AuthCredentialKey& ban_key, uint64_t now = NowSeconds()) const noexcept {
+        const AuthCredentialKey& ban_key, uint64_t now) const noexcept {
         if (!TracksAuthBan()) return RejectReason::NONE;
         return ip_failures_->Check(ban_key, cfg_.ip_ban, now, RejectReason::IP_BANNED);
     }
 
+    [[nodiscard]] RejectReason CheckIPBan(
+        const AuthCredentialKey& ban_key) const noexcept {
+        if (!TracksAuthBan()) return RejectReason::NONE;
+        return ip_failures_->Check(ban_key, cfg_.ip_ban, NowSeconds(), RejectReason::IP_BANNED);
+    }
+
     [[nodiscard]] RejectReason TryAcceptIP(
         uint64_t ip_hash, const std::optional<AuthCredentialKey>& ban_key,
-        uint64_t now = NowSeconds()) noexcept {
+        uint64_t now) noexcept {
         if (ban_key) {
             const auto reason = CheckIPBan(*ban_key, now);
+            if (reason != RejectReason::NONE) return reason;
+        }
+        if (!TracksIpConnections()) return RejectReason::NONE;
+        auto* slot = FindOrCreateConnection(ip_hash);
+        if (!slot) return RejectReason::TRACKING_CAPACITY;
+        if (slot->conns >= cfg_.max_conn_per_ip)
+            return RejectReason::MAX_CONNECTIONS_PER_IP;
+        ++slot->conns;
+        return RejectReason::NONE;
+    }
+
+    [[nodiscard]] RejectReason TryAcceptIP(
+        uint64_t ip_hash, const std::optional<AuthCredentialKey>& ban_key) noexcept {
+        if (ban_key) {
+            const auto reason = CheckIPBan(*ban_key);
             if (reason != RejectReason::NONE) return reason;
         }
         if (!TracksIpConnections()) return RejectReason::NONE;

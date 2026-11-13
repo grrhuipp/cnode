@@ -556,12 +556,8 @@ main() {
         fi
         update_geodata || exit 1
         install_cnode
-        if [ "$WAS_ACTIVE" -eq 1 ]; then
-            if [ "$GEODATA_UPDATED" -eq 1 ] || [ "${BINARY_UPDATED:-0}" -eq 1 ] || [ "${CONFIG_UPDATED:-0}" -eq 1 ]; then
-                systemctl restart "$SERVICE_NAME" || exit 1
-            else
-                systemctl start "$SERVICE_NAME" || exit 1
-            fi
+        if [ "$WAS_ACTIVE" -eq 1 ] && { [ "$GEODATA_UPDATED" -eq 1 ] || [ "${BINARY_UPDATED:-0}" -eq 1 ] || [ "${CONFIG_UPDATED:-0}" -eq 1 ]; }; then
+            systemctl restart "$SERVICE_NAME" || exit 1
         fi
         exit 0
     fi

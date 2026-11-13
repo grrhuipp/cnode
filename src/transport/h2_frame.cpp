@@ -78,11 +78,8 @@ net::awaitable<void> WriteH2FrameBuffers(
     }
 
     std::array<uint8_t, kHttp2FrameHeaderSize> header{};
-    common::StoreU24BE(header.data(), static_cast<uint32_t>(payload_len));
-    header[3] = static_cast<uint8_t>(type);
-    header[4] = flags;
-    common::StoreU32BE(header.data() + 5, stream_id & 0x7fff'ffffu);
-
+    EncodeH2FrameHeader(
+        header.data(), static_cast<uint32_t>(payload_len), type, flags, stream_id);
     std::array<net::const_buffer, 8> all{};
     size_t count = 0;
     all[count++] = net::buffer(header);

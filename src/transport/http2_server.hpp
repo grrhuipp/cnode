@@ -309,6 +309,8 @@ public:
         uint32_t stream_id,
         std::span<const uint8_t> payload = {});
 
+    net::awaitable<bool> WriteInitialPreface(uint32_t initial_window);
+
     net::awaitable<bool> WriteGrpcMessageSerialized(
         uint32_t stream_id,
         std::span<const uint8_t> data);

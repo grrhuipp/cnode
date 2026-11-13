@@ -14,9 +14,6 @@
 #include <utility>
 #include <vector>
 
-namespace geo {
-class GeoDatabase;
-}
 namespace common {
 
 struct OnlineDevice;
@@ -36,7 +33,6 @@ struct StatsShard;
 struct WorkerRuntimeConfig {
     infra::TimeoutsConfig timeouts;
     infra::LimitsConfig limits;
-    infra::RoutingConfig routing;
     std::vector<PreparedOutboundConfig> outbounds;
     std::shared_ptr<const app::Router> router;
     uint32_t workers = 0;
@@ -59,8 +55,7 @@ public:
     Worker(uint32_t id, net::io_context& io_context,
            const WorkerRuntimeConfig& runtime_config, StatsShard& stats,
            app::DNSWorker& dns_worker,
-           std::shared_ptr<GroupCoordinator> coordinator,
-           geo::GeoDatabase* geo_database = nullptr);
+           std::shared_ptr<GroupCoordinator> coordinator);
     ~Worker();
 
     // 停机收尾前供运行时 owner 取得协调器；StopRuntime 完成后释放。

@@ -381,8 +381,7 @@ UdpIngress::ClientSession::WriteMultiBuffer(common::MultiBuffer mb) {
             "UDP client reply contains missing or mixed endpoints");
     }
 
-    const common::ContiguousBufferView payload(mb);
-    if (!reply_.Send(proxy::UDPPacketView{*datagram.target, payload.Bytes()}, reply_endpoint_)) {
+    if (!reply_.Send(proxy::UDPPacketView{*datagram.target, mb.FrontSpan()}, reply_endpoint_)) {
         mb.clear();
         throw IoSystemError(
             io_error::fault, "UDP client reply was rejected");

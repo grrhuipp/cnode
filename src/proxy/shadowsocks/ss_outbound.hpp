@@ -82,8 +82,7 @@ public:
         while (true) {
             auto packet = co_await read.Receive();
             if (!server_endpoint_ || packet.source != *server_endpoint_) continue;
-            const common::ContiguousBufferView view(packet.payload);
-            const auto bytes = view.Bytes();
+            const auto bytes = packet.payload.FrontSpan();
             auto decoded = ss2022_state_
                 ? proxy::Decode2022UdpResponsePacket(bytes.data(), bytes.size(), *ss2022_state_)
                 : proxy::DecodeUdpPacketWithKey(bytes.data(), bytes.size(), master_key_.span(),
@@ -106,14 +105,12 @@ public:
             server_endpoint_ = *server;
         }
         if (write.Cancelled()) throw transport::LinkError(write.CancellationReason());
-        const common::ContiguousBufferView view(payload);
-        const auto bytes = view.Bytes();
+        const auto bytes = payload.FrontSpan();
         const size_t encoded_len = EncodedPacketSize(*datagram->target, bytes);
         const size_t maximum = server_endpoint_->address().is_v6() ? 65527 : 65507;
         if (encoded_len == 0 || encoded_len > maximum)
             throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
-        common::ContiguousWriteBuffer encoded;
-        uint8_t* dst = encoded.Prepare(encoded_len);
+        uint8_t* dst = encode_scratch_.Prepare(encoded_len);
         if (EncodePacketTo(*datagram->target, bytes, dst, encoded_len) != encoded_len)
             throw transport::LinkError(common::ErrorCode::INTERNAL);
         const std::array<net::const_buffer, 1> buffers{net::buffer(dst, encoded_len)};
@@ -143,6 +140,7 @@ private:
     const std::span<const proxy::KeyBytes> psk_chain_;
     std::optional<common::ForwardedMetadata> forwarded_;
     std::optional<proxy::Ss2022UdpSessionState> ss2022_state_;
+    common::ContiguousWriteBuffer encode_scratch_;
 };
 
 // A complete, validated credential value. Preparation never drops a chain link

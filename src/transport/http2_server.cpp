@@ -626,6 +626,35 @@ net::awaitable<bool> Http2ServerSession::WriteFrameSerialized(
     co_return true;
 }
 
+net::awaitable<bool> Http2ServerSession::WriteInitialPreface(uint32_t initial_window) {
+    auto write_lease = write_gate_.TryAcquire();
+    if (!write_lease) write_lease = co_await write_gate_.Acquire();
+    if (!write_lease || !ConnectionWritable()) {
+        co_return false;
+    }
+    std::array<uint8_t, kHttp2FrameHeaderSize + 12 + 13> frames{};
+    EncodeH2FrameHeader(frames.data(), 12, H2FrameType::SETTINGS, 0, 0);
+    const auto initial_window_setting = EncodeInitialWindowSetting(initial_window);
+    std::memcpy(frames.data() + kHttp2FrameHeaderSize,
+                initial_window_setting.data(),
+                initial_window_setting.size());
+    frames[kHttp2FrameHeaderSize + 6] = 0;
+    frames[kHttp2FrameHeaderSize + 7] = 3; // SETTINGS_MAX_CONCURRENT_STREAMS
+    common::StoreU32BE(frames.data() + kHttp2FrameHeaderSize + 8, kHttp2MaxConcurrentStreams);
+    EncodeWindowUpdateFrame(
+        frames.data() + kHttp2FrameHeaderSize + 12,
+        0,
+        kHttp2ConnectionReceiveWindow - H2SendWindow::kDefault);
+    const net::const_buffer buf = net::buffer(frames);
+    try {
+        co_await stream_->WriteBuffers(std::span<const net::const_buffer>(&buf, 1));
+        co_return true;
+    } catch (...) {
+        stream_->CloseAbortive();
+        throw;
+    }
+}
+
 net::awaitable<bool> Http2ServerSession::WriteGrpcMessageSerialized(
     uint32_t stream_id,
     std::span<const uint8_t> data) {
@@ -1303,20 +1332,7 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     auto session = std::make_shared<Http2ServerSession>(
         coordinator, io_context, std::move(stream), std::move(stream_handler), payload_codec,
         conn_id, http_config, xhttp_config, grpc_config, initial_window);
-    const auto initial_window_setting = EncodeInitialWindowSetting(initial_window);
-    std::array<uint8_t, 12> settings{};
-    std::copy(initial_window_setting.begin(), initial_window_setting.end(), settings.begin());
-    settings[6] = 0;
-    settings[7] = 3; // SETTINGS_MAX_CONCURRENT_STREAMS
-    common::StoreU32BE(settings.data() + 8, kHttp2MaxConcurrentStreams);
-    if (!co_await session->WriteFrameSerialized(H2FrameType::SETTINGS, 0, 0, settings)) {
-        co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
-    }
-    std::array<uint8_t, 4> connection_credit{};
-    common::StoreU32BE(connection_credit.data(),
-               kHttp2ConnectionReceiveWindow - H2SendWindow::kDefault);
-    if (!co_await session->WriteFrameSerialized(
-            H2FrameType::WINDOW_UPDATE, 0, 0, connection_credit)) {
+    if (!co_await session->WriteInitialPreface(initial_window)) {
         co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
     }
     co_await session->Run();

@@ -3,12 +3,10 @@
 #include "app/prepared_inbound.hpp"
 #include "app/rate_limiter.hpp"
 #include "common/awaitable_task_group.hpp"
-#include "proxy/inbound_admission.hpp"
 #include "app/stats.hpp"
 #include "common/allocator.hpp"
 #include "common/session.hpp"
 #include "common/rule.hpp"
-#include "common/multi_buffer.hpp"
 #include "common/ip_address.hpp"
 #include "common/hash.hpp"
 #include "infra/log.hpp"
@@ -35,7 +33,6 @@
 #include <charconv>
 #include <chrono>
 #include <cstring>
-#include <atomic>
 #include <memory>
 #include <optional>
 #include <span>
@@ -289,15 +286,13 @@ struct app::Worker::RuntimeState {
     RuntimeState(net::io_context& io_context,
                  const app::WorkerRuntimeConfig& runtime_config,
                  app::StatsShard& stats_ref,
-                 app::DNSWorker& dns_worker,
-                 geo::GeoDatabase* geo_database_ref)
+                 app::DNSWorker& dns_worker)
         : io_context(io_context)
         , startup_config(std::make_unique<app::WorkerRuntimeConfig>(runtime_config))
         , timeouts(runtime_config.timeouts)
         , initial_user_view(app::UserStore::PrepareWorkerView(
               app::UserStore::CaptureSnapshot()))
         , stats(stats_ref)
-        , geo_database(geo_database_ref)
         , request_load(runtime_config.pressure_threshold,
                        runtime_config.pressure_idle_timeout)
         , dns_worker(dns_worker)
@@ -318,7 +313,6 @@ struct app::Worker::RuntimeState {
     const infra::TimeoutsConfig timeouts;
     app::UserStore::WorkerView initial_user_view;
     app::StatsShard& stats;
-    geo::GeoDatabase* geo_database = nullptr;
     app::RequestLoadState request_load;
     app::DNSWorker& dns_worker;
     app::DNS dns;
@@ -374,12 +368,11 @@ std::string BuildListenerKey(std::string_view tag, std::string_view listen, uint
 Worker::Worker(uint32_t id, net::io_context& io_context,
                const WorkerRuntimeConfig& runtime_config, StatsShard& stats,
                app::DNSWorker& dns_worker,
-               std::shared_ptr<GroupCoordinator> coordinator,
-               geo::GeoDatabase* geo_database)
+               std::shared_ptr<GroupCoordinator> coordinator)
     : id_(id)
     , io_context_(io_context)
     , runtime_(std::make_unique<RuntimeState>(
-          io_context, runtime_config, stats, dns_worker, geo_database))
+          io_context, runtime_config, stats, dns_worker))
     , mailbox_(std::make_unique<WorkerMailbox>(
           runtime_->io_context,
           common::kWorkerMailboxCapacity))
@@ -574,7 +567,7 @@ void Worker::RuntimeState::Start(Worker& worker) {
     inbound_handlers = std::make_unique<InboundHandlerRegistry>(*admission);
     router = config->router
         ? config->router
-        : std::make_shared<const app::Router>(config->routing, geo_database);
+        : std::make_shared<const app::Router>(infra::RoutingConfig{}, nullptr);
     LOG_DEBUG("router initialized worker={} rules={}",
               worker.id_, router->RuleCount());
     outbound_tasks = std::make_unique<common::ResidentTaskGroup>(io_context.get_executor());

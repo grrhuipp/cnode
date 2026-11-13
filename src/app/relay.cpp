@@ -7,7 +7,6 @@
 
 #include <asio/as_tuple.hpp>
 #include <asio/experimental/awaitable_operators.hpp>
-#include <asio/experimental/channel.hpp>
 #include <asio/use_awaitable.hpp>
 #include <memory>
 #include <algorithm>
@@ -128,7 +127,7 @@ void FlushRelayStats(StatsShard& stats, LocalStatsAccumulator& acc) {
     acc.Reset();
 }
 
-enum class RelayPhase { Transferring, HalfClosed, Completing, Stopping, Joined };
+enum class RelayPhase { Transferring, HalfClosed, Completing, Stopping };
 
 struct RelayDirectionState {
     bool eof = false;
@@ -174,6 +173,108 @@ struct RelayState {
     common::SignalChannel wake;
 };
 
+struct CancellationContext {
+    struct Subscription final : transport::CancellationSubscription {
+        explicit Subscription(CancellationContext& owner) noexcept : owner(owner) {}
+        CancellationContext& owner;
+    private:
+        void OnCancellation(transport::Cancellation cancellation) noexcept override {
+            owner.Stop(cancellation.reason);
+        }
+    };
+    transport::AsyncStream* client;
+    RelayTargetAdapter& target;
+    RelayState& state;
+    RelayRateLimits* limits;
+    bool notifying = false;
+    Subscription client_cancel{*this};
+    Subscription target_cancel{*this};
+
+    CancellationContext(transport::AsyncStream* client, RelayTargetAdapter& target,
+                        RelayState& state, RelayRateLimits* limits)
+        : client(client), target(target), state(state), limits(limits) {}
+
+    bool ConsumeTimeout() {
+        const bool target_timeout = target.consume_timeouts(target.target);
+        const bool client_timeout = client && ConsumeTimeoutSignals(*client);
+        return target_timeout || client_timeout;
+    }
+    void Stop(common::ErrorCode reason) noexcept {
+        if (notifying) return;
+        notifying = true;
+        if (ConsumeTimeout()) reason = common::ErrorCode::RELAY_TIMEOUT;
+        state.Stop(reason);
+        if (limits) CancelRelayRateWaits(*limits);
+        if (client) CancelIfSupported(*client);
+        target.cancel(target.target);
+        notifying = false;
+    }
+};
+
+net::awaitable<void> ShutdownRelaySides(
+    net::io_context& io_context,
+    transport::MultiBufferWriter& client_writer,
+    transport::AsyncStream* client_control,
+    RelayTargetAdapter& target,
+    RelayState& state,
+    CancellationContext& cancellation) {
+    using namespace net::experimental::awaitable_operators;
+    bool client_shutdown_timed_out = false;
+    auto shutdown_client_once = [&]() -> net::awaitable<void> {
+        if (state.down.write_shutdown) co_return;
+        try {
+            if (client_control) co_await ShutdownWriteForClose(client_writer, *client_control);
+            else co_await ShutdownWriteForClose(client_writer, client_writer);
+        } catch (const transport::WriteClosed&) {
+        } catch (...) {
+            const auto error = transport::ClassifyFailure(
+                std::current_exception(), common::ErrorCode::RELAY_WRITE_FAILED);
+            state.Stop((client_shutdown_timed_out || cancellation.ConsumeTimeout())
+                           ? common::ErrorCode::RELAY_TIMEOUT
+                           : error);
+        }
+    };
+    auto shutdown_target_once = [&]() -> net::awaitable<void> {
+        if (state.up.write_shutdown) co_return;
+        try {
+            co_await target.shutdown_write(target.target, false);
+        } catch (const transport::WriteClosed&) {
+        } catch (...) {
+            const auto error = transport::ClassifyFailure(
+                std::current_exception(), common::ErrorCode::RELAY_WRITE_FAILED);
+            state.Stop((client_shutdown_timed_out || cancellation.ConsumeTimeout())
+                           ? common::ErrorCode::RELAY_TIMEOUT
+                           : error);
+        }
+    };
+    auto shutdown_client = [&]() -> net::awaitable<void> {
+        if (!client_control && !state.down.write_shutdown) {
+            transport::AsyncDelay delay(io_context);
+            auto wait_grace = [&]() -> net::awaitable<void> {
+                co_await delay.WaitFor(kRelayCloseGraceTimeout);
+                const auto cancellation_state = co_await net::this_coro::cancellation_state;
+                if (cancellation_state.cancelled() == net::cancellation_type::none) {
+                    client_shutdown_timed_out = true;
+                }
+            };
+            (void)co_await (shutdown_client_once() || wait_grace());
+            if (client_shutdown_timed_out) {
+                state.Stop(common::ErrorCode::RELAY_TIMEOUT);
+            }
+            co_return;
+        }
+        co_await shutdown_client_once();
+    };
+    try {
+        co_await (shutdown_client() && shutdown_target_once());
+    } catch (...) {
+        const auto error = transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL);
+        state.Stop((client_shutdown_timed_out || cancellation.ConsumeTimeout())
+                       ? common::ErrorCode::RELAY_TIMEOUT
+                       : error);
+    }
+}
+
 }  // namespace
 
 net::awaitable<RelayResult> DoRelayLinkImpl(
@@ -193,43 +294,7 @@ net::awaitable<RelayResult> DoRelayLinkImpl(
     ctx.traffic.bytes_up = ctx.traffic.bytes_down = 0;
     const auto parent_cancellation = co_await net::this_coro::cancellation_state;
 
-    struct CancellationContext {
-        struct Subscription final : transport::CancellationSubscription {
-            explicit Subscription(CancellationContext& owner) noexcept : owner(owner) {}
-            CancellationContext& owner;
-        private:
-            void OnCancellation(transport::Cancellation cancellation) noexcept override {
-                owner.Stop(cancellation.reason);
-            }
-        };
-        transport::AsyncStream* client;
-        RelayTargetAdapter& target;
-        RelayState& state;
-        RelayRateLimits* limits;
-        bool notifying = false;
-        Subscription client_cancel{*this};
-        Subscription target_cancel{*this};
-
-        CancellationContext(transport::AsyncStream* client, RelayTargetAdapter& target,
-                            RelayState& state, RelayRateLimits* limits)
-            : client(client), target(target), state(state), limits(limits) {}
-
-        bool ConsumeTimeout() {
-            const bool target_timeout = target.consume_timeouts(target.target);
-            const bool client_timeout = client && ConsumeTimeoutSignals(*client);
-            return target_timeout || client_timeout;
-        }
-        void Stop(common::ErrorCode reason) noexcept {
-            if (notifying) return;
-            notifying = true;
-            if (ConsumeTimeout()) reason = common::ErrorCode::RELAY_TIMEOUT;
-            state.Stop(reason);
-            if (limits) CancelRelayRateWaits(*limits);
-            if (client) CancelIfSupported(*client);
-            target.cancel(target.target);
-            notifying = false;
-        }
-    } cancellation(client_control, target, state, limits.get());
+    CancellationContext cancellation(client_control, target, state, limits.get());
     cancellation.client_cancel.Resubscribe(client_reader.Cancellation());
     cancellation.target_cancel.Resubscribe(*target.cancellation);
 
@@ -348,65 +413,12 @@ net::awaitable<RelayResult> DoRelayLinkImpl(
     }
     if (parent_cancellation.cancelled() != net::cancellation_type::none && state.reason == common::ErrorCode::OK)
         state.Stop(common::ErrorCode::CANCELLED);
-    state.phase = RelayPhase::Joined;
     if (client_control) client_control->ClearPhaseDeadline();
     target.clear_phase_deadline(target.target);
 
     if (state.reason == common::ErrorCode::OK) {
-        bool client_shutdown_timed_out = false;
-        auto shutdown_client_once = [&]() -> net::awaitable<void> {
-            if (state.down.write_shutdown) co_return;
-            try {
-                if (client_control) co_await ShutdownWriteForClose(client_writer, *client_control);
-                else co_await ShutdownWriteForClose(client_writer, client_writer);
-            } catch (const transport::WriteClosed&) {
-            } catch (...) {
-                const auto error = transport::ClassifyFailure(
-                    std::current_exception(), common::ErrorCode::RELAY_WRITE_FAILED);
-                state.Stop((client_shutdown_timed_out || cancellation.ConsumeTimeout())
-                               ? common::ErrorCode::RELAY_TIMEOUT
-                               : error);
-            }
-        };
-        auto shutdown_target_once = [&]() -> net::awaitable<void> {
-            if (state.up.write_shutdown) co_return;
-            try {
-                co_await target.shutdown_write(target.target, false);
-            } catch (const transport::WriteClosed&) {
-            } catch (...) {
-                const auto error = transport::ClassifyFailure(
-                    std::current_exception(), common::ErrorCode::RELAY_WRITE_FAILED);
-                state.Stop((client_shutdown_timed_out || cancellation.ConsumeTimeout())
-                               ? common::ErrorCode::RELAY_TIMEOUT
-                               : error);
-            }
-        };
-        auto shutdown_client = [&]() -> net::awaitable<void> {
-            if (!client_control && !state.down.write_shutdown) {
-                transport::AsyncDelay delay(io_context);
-                auto wait_grace = [&]() -> net::awaitable<void> {
-                    co_await delay.WaitFor(kRelayCloseGraceTimeout);
-                    const auto cancellation_state = co_await net::this_coro::cancellation_state;
-                    if (cancellation_state.cancelled() == net::cancellation_type::none) {
-                        client_shutdown_timed_out = true;
-                    }
-                };
-                (void)co_await (shutdown_client_once() || wait_grace());
-                if (client_shutdown_timed_out) {
-                    state.Stop(common::ErrorCode::RELAY_TIMEOUT);
-                }
-                co_return;
-            }
-            co_await shutdown_client_once();
-        };
-        try {
-            co_await (shutdown_client() && shutdown_target_once());
-        } catch (...) {
-            const auto error = transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL);
-            state.Stop((client_shutdown_timed_out || cancellation.ConsumeTimeout())
-                           ? common::ErrorCode::RELAY_TIMEOUT
-                           : error);
-        }
+        co_await ShutdownRelaySides(
+            io_context, client_writer, client_control, target, state, cancellation);
     }
     cancellation.client_cancel.Unsubscribe();
     cancellation.target_cancel.Unsubscribe();

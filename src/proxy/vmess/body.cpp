@@ -155,8 +155,7 @@ void BodyEncoder::Encode(const common::MultiBuffer& payload, common::MultiBuffer
     if (PacketMode() &&
         (payload.byte_size() != 0 || common::InspectUdpDatagram(payload).Valid())) {
         ValidatePacketSize(payload.byte_size());
-        const common::ContiguousBufferView packet(payload);
-        EncodeChunk(packet.Bytes(), out);
+        EncodeChunk(payload.FrontSpan(), out);
         return;
     }
     if (payload.byte_size() == 0) {

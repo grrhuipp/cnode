@@ -93,11 +93,18 @@ std::optional<net::awaitable<ConnectionLimiter::Admission>> ConnectionLimiter::T
 net::awaitable<ConnectionLimiter::Admission> ConnectionLimiter::ReservePhysical(
     std::string_view tag, std::string_view ip, bool check_ban) {
     const auto ban_key = check_ban ? core_->ComputeIpBanKey(tag, ip) : std::nullopt;
+    if (!core_->TracksGlobalConnections()) {
+        return coordinator_->PostCall(
+            [self = shared_from_this(), ban_key]() {
+                const auto reason = ban_key
+                    ? self->core_->CheckIPBan(*ban_key)
+                    : RejectReason::NONE;
+                return Admission{reason, Reservation{}};
+            });
+    }
     auto node = std::make_unique<Return>();
     node->owner = shared_from_this();
-    if (core_->TracksGlobalConnections()) {
-        node->family = std::make_shared<Family>();
-    }
+    node->family = std::make_shared<Family>();
     node->physical = true;
     auto reservation = Reservation(std::move(node));
     return coordinator_->PostCall(

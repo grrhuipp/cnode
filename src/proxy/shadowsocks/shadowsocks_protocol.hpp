@@ -242,20 +242,13 @@ inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
     const size_t wire_size = ciphertext.byte_size();
     if (wire_size < SsAeadCipher::kTagSize) return false;
     const size_t payload_len = wire_size - SsAeadCipher::kTagSize;
-    if (auto block = ciphertext.TakeFrontIfLen(wire_size)) {
-        if (wire_size > common::Buffer::kSize) common::CheckTestAllocationFault();
-        auto bytes = block->Bytes();
-        if (!cipher.Decrypt(nonce.data(), bytes.data(), bytes.size(), bytes.data())) return false;
-        block->end -= SsAeadCipher::kTagSize;
-        if (payload_len != 0) output.push_back(std::move(block));
-        return true;
-    }
-    common::ContiguousWriteBuffer plaintext;
-    auto* bytes = plaintext.Prepare(wire_size);
-    ciphertext.CopyPrefixTo({bytes, wire_size});
-    ciphertext.clear();
-    if (!cipher.Decrypt(nonce.data(), bytes, wire_size, bytes)) return false;
-    if (payload_len != 0) plaintext.AppendTo(payload_len, output);
+    auto block = ciphertext.TakeFrontIfLen(wire_size);
+    if (!block) return false;
+    if (wire_size > common::Buffer::kSize) common::CheckTestAllocationFault();
+    auto bytes = block->Bytes();
+    if (!cipher.Decrypt(nonce.data(), bytes.data(), bytes.size(), bytes.data())) return false;
+    block->end -= SsAeadCipher::kTagSize;
+    if (payload_len != 0) output.push_back(std::move(block));
     return true;
 }
 

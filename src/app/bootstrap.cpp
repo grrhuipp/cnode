@@ -341,7 +341,7 @@ std::vector<PreparedOutboundConfig> PrepareStartupOutbounds(
 
 WorkerRuntimeConfig MakeWorkerRuntimeConfig(
     const infra::Config& config,
-    infra::RoutingConfig routing,
+    const infra::RoutingConfig& routing,
     std::vector<PreparedOutboundConfig> outbounds,
     geo::GeoDatabase* geo_database) {
     WorkerRuntimeConfig runtime_config;
@@ -389,7 +389,6 @@ void SetupPanels(net::io_context& main_ctx,
 [[nodiscard]] WorkerPool CreateWorkerPool(
     const WorkerRuntimeConfig& runtime_config,
     ShardedStats& stats,
-    geo::GeoDatabase* geo_database,
     app::DNSWorker& dns_worker,
     net::io_context& control_io) {
     WorkerPool pool;
@@ -408,7 +407,7 @@ void SetupPanels(net::io_context& main_ctx,
         auto& worker_stats = stats.GetShard(i);
         pool.workers.push_back(std::make_unique<Worker>(
             i, *pool.io_contexts[i], runtime_config, worker_stats, dns_worker,
-            coordinator, geo_database));
+            coordinator));
     }
 
     return pool;
@@ -435,7 +434,7 @@ void SetupPanels(net::io_context& main_ctx,
     env.geo_database = LoadGeoDatabase(config);
     env.stats = std::make_unique<ShardedStats>(config.workers);
     const WorkerRuntimeConfig worker_runtime_config =
-        MakeWorkerRuntimeConfig(config, std::move(config.routing), std::move(outbounds),
+        MakeWorkerRuntimeConfig(config, config.routing, std::move(outbounds),
                                 env.geo_database.get());
     // Every source and protocol payload is prepared before one RCU publication
     // through the core shared with panel nodes. Workers do not exist yet: each
@@ -457,8 +456,7 @@ void SetupPanels(net::io_context& main_ctx,
     }
     try {
         env.worker_pool = CreateWorkerPool(
-            worker_runtime_config, *env.stats, env.geo_database.get(), *env.dns_worker,
-            *env.main_ctx);
+            worker_runtime_config, *env.stats, *env.dns_worker, *env.main_ctx);
         env.controller = std::make_unique<controller::Controller>(
             *env.main_ctx, env.worker_pool.workers);
 

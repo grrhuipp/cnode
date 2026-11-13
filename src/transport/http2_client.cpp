@@ -738,25 +738,49 @@ net::awaitable<bool> SendHttp2ClientRequest(AsyncStream& stream,
                                             uint32_t conn_window,
                                             std::span<const uint8_t> header_block,
                                             bool end_stream) {
-    if (!co_await WriteFullToStream(stream, kHttp2ClientPreface)) {
+    if (header_block.size() > 0x00ff'ffffu) {
+        throw IoSystemError(io_error::message_size, "HTTP/2 frame payload too large");
+    }
+    std::array<uint8_t, 24 + 9 + 6 + 13 + 9> prefix{};
+    size_t pos = 0;
+    std::memcpy(prefix.data(), kHttp2ClientPreface.data(), kHttp2ClientPreface.size());
+    pos += kHttp2ClientPreface.size();
+
+    const auto settings = EncodeInitialWindowSetting(initial_window);
+    EncodeH2FrameHeader(
+        prefix.data() + pos, static_cast<uint32_t>(settings.size()), H2FrameType::SETTINGS, 0, 0);
+    pos += kHttp2FrameHeaderSize;
+    std::memcpy(prefix.data() + pos, settings.data(), settings.size());
+    pos += settings.size();
+
+    if (conn_window > H2SendWindow::kDefault) {
+        EncodeWindowUpdateFrame(
+            prefix.data() + pos, 0, conn_window - static_cast<uint32_t>(H2SendWindow::kDefault));
+        pos += 13;
+    }
+
+    const uint8_t header_flags = static_cast<uint8_t>(
+        kFlagEndHeaders | (end_stream ? kFlagEndStream : 0));
+    EncodeH2FrameHeader(
+        prefix.data() + pos,
+        static_cast<uint32_t>(header_block.size()),
+        H2FrameType::HEADERS,
+        header_flags,
+        1);
+    pos += kHttp2FrameHeaderSize;
+
+    const std::array<net::const_buffer, 2> buffers{
+        net::buffer(prefix.data(), pos),
+        net::buffer(header_block.data(), header_block.size()),
+    };
+    try {
+        co_await stream.WriteBuffers(
+            std::span<const net::const_buffer>(buffers.data(), header_block.empty() ? 1 : 2));
+        co_return true;
+    } catch (...) {
+        stream.CloseAbortive();
         co_return false;
     }
-    const auto settings = EncodeInitialWindowSetting(initial_window);
-    co_await WriteH2Frame(stream, H2FrameType::SETTINGS, 0, 0, settings);
-    if (conn_window > H2SendWindow::kDefault) {
-        std::array<uint8_t, 4> connection_credit{};
-        common::StoreU32BE(connection_credit.data(),
-                   conn_window - static_cast<uint32_t>(H2SendWindow::kDefault));
-        co_await WriteH2Frame(
-            stream, H2FrameType::WINDOW_UPDATE, 0, 0, connection_credit);
-    }
-    co_await WriteH2Frame(
-        stream,
-        H2FrameType::HEADERS,
-        static_cast<uint8_t>(kFlagEndHeaders | (end_stream ? kFlagEndStream : 0)),
-        1,
-        header_block);
-    co_return true;
 }
 
 net::awaitable<TransportBuildResult> OpenHttp2ClientStream(
