@@ -1,10 +1,10 @@
 #pragma once
 
 #include "common/target_address.hpp"
-#include "proxy/freedom/domain_strategy.hpp"
-#include "proxy/shadowsocks/cipher.hpp"
-#include "proxy/uot/version.hpp"
-#include "proxy/vmess/security.hpp"
+#include "proxy/domain_strategy.hpp"
+#include "proxy/ss_cipher.hpp"
+#include "proxy/uot_version.hpp"
+#include "proxy/vmess_security.hpp"
 #include "transport/outbound_server.hpp"
 #include <array>
 #include <chrono>

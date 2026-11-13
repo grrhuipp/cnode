@@ -18,7 +18,7 @@
 #include "proxy/vmess/body.hpp"
 #include "proxy/vmess/vmess_crypto.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/hysteria/hysteria_wire.hpp"
+#include "transport/hysteria_wire.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/use_future.hpp>

@@ -1,5 +1,5 @@
 #pragma once
-#include "proxy/uot/version.hpp"
+#include "proxy/uot_version.hpp"
 
 #include "common/asio_types.hpp"
 #include "app/relay.hpp"

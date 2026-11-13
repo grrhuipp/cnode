@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "allocation_hook.hpp"
-#include "app/dns/dns_internal.hpp"
+#include "app/dns_internal.hpp"
 #include "app/worker_mailbox.hpp"
 #include "common/allocator.hpp"
 

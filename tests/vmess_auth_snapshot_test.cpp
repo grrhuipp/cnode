@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "app/proxyman/user_store.hpp"
+#include "app/user_store.hpp"
 #include "proxy/vmess/body.hpp"
 #include "proxy/vmess/vmess_crypto.hpp"
 #include <chrono>

@@ -1,9 +1,9 @@
 #include <gtest/gtest.h>
 
-#include "app/dns/dns.hpp"
+#include "app/dns.hpp"
 #include "app/relay.hpp"
 #include "app/prepared_inbound.hpp"
-#include "app/proxyman/inbound_handler.hpp"
+#include "app/inbound_handler.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common/clock.hpp"
-#include "common/string_hash.hpp"
+#include "common/hash.hpp"
 
 #include <array>
 #include <cstddef>

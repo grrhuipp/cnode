@@ -1,14 +1,14 @@
 #include <stdexcept>
 #include <gtest/gtest.h>
 
-#include "app/worker/udp_ingress.hpp"
+#include "app/udp_ingress.hpp"
 #include "udp_ingress_fixture.hpp"
 #include "worker_coordinator_fixture.hpp"
 #include "proxy/shadowsocks/ss_inbound.hpp"
 #include "proxy/shadowsocks/ss_udp.hpp"
 #include "app/relay.hpp"
 
-#include "app/proxyman/inbound_handler.hpp"
+#include "app/inbound_handler.hpp"
 #include "app/stats.hpp"
 #include "common/user_online_tracker.hpp"
 #include "common/session.hpp"

@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "app/proxyman/inbound_handler.hpp"
+#include "app/inbound_handler.hpp"
 #include "app/relay.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/group_coordinator.hpp"

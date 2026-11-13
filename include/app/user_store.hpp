@@ -1,6 +1,6 @@
 #pragma once
 
-#include "common/string_hash.hpp"
+#include "common/hash.hpp"
 #include "common/target_address.hpp"
 #include <openssl/mem.h>
 

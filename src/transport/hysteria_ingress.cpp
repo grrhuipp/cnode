@@ -1,12 +1,12 @@
-#include "transport/hysteria/hysteria_ingress.hpp"
-#include "transport/hysteria/hysteria_connection.hpp"
+#include "transport/hysteria_ingress.hpp"
+#include "transport/hysteria_connection.hpp"
 #include "transport/tls_stream.hpp"
-#include "transport/failure.hpp"
+#include "transport/link.hpp"
 #include <linux/filter.h>
 #include <sys/socket.h>
 #include "common/scoped_cleanse.hpp"
 
-#include "app/proxyman/user_store.hpp"
+#include "app/user_store.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/group_coordinator.hpp"
 #include "app/stats.hpp"
@@ -16,7 +16,7 @@
 #include "common/allocator.hpp"
 #include "common/session.hpp"
 #include "common/user_online_tracker.hpp"
-#include "common/string_hash.hpp"
+#include "common/hash.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
 #include "transport/transport_stack.hpp"

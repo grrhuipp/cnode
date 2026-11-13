@@ -12,7 +12,7 @@
 #include <vector>
 
 // DNS 公开契约：配置、结果与 DNSWorker/DNS 客户端。缓存、上游数据报交换与
-// 在途合并是 DNSWorker 私有实现，见 src/app/dns/dns_internal.hpp。
+// 在途合并是 DNSWorker 私有实现，见 src/app/dns_internal.hpp。
 namespace app {
 
 struct DnsConfig {

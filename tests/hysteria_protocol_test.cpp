@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/hysteria/hysteria_wire.hpp"
+#include "transport/hysteria_wire.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>

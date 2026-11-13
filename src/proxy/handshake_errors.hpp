@@ -3,7 +3,7 @@
 #include "common/asio_types.hpp"
 #include "common/error.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/failure.hpp"
+#include "transport/link.hpp"
 
 #include <tl/expected.hpp>
 

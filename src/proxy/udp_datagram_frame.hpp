@@ -65,10 +65,13 @@ inline net::awaitable<void> WriteFramedDatagram(
     transport::MultiBufferWriter& writer,
     std::span<const uint8_t> header,
     const common::MultiBuffer& payload) {
-    common::ConstBufferSpanBuilder<2> framed;
-    framed.Append(net::buffer(header.data(), header.size()));
-    framed.AppendMultiBuffer(payload);
-    co_await writer.WriteBuffers(framed.Span());
+    std::array<net::const_buffer, 2> framed;
+    size_t count = 0;
+    if (!header.empty()) framed[count++] = net::buffer(header.data(), header.size());
+    if (const auto bytes = payload.FrontSpan(); !bytes.empty()) {
+        framed[count++] = net::buffer(bytes.data(), bytes.size());
+    }
+    co_await writer.WriteBuffers({framed.data(), count});
 }
 
 inline net::awaitable<void> WriteFramedDatagram(

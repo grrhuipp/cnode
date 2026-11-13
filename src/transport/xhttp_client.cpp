@@ -447,10 +447,9 @@ public:
             TouchDownlinkActivity();
             co_return;
         }
-        common::ConstBufferSpanBuilder<16> payloads;
-        payloads.AppendMultiBuffer(mb);
-        if (!payloads.empty()) {
-            co_await OpenUploadLocked(payloads.Span());
+        if (const auto bytes = mb.FrontSpan(); !bytes.empty()) {
+            const net::const_buffer payload(bytes.data(), bytes.size());
+            co_await OpenUploadLocked({&payload, 1});
             TouchDownlinkActivity();
         }
     }
@@ -625,10 +624,16 @@ private:
     // poisons the stream, since the deferred bytes are gone with it.
     net::awaitable<void> OpenUploadLocked(std::span<const net::const_buffer> payload) {
         const common::MultiBuffer initial = std::move(pending_initial_);
-        common::ConstBufferSpanBuilder<16> initial_payload;
-        initial_payload.AppendMultiBuffer(initial);
-        initial_payload.AppendBuffers(payload);
-        if (initial_payload.empty()) co_return;
+        common::ConstBufferSpanBuilder<4> combined;
+        std::span<const net::const_buffer> request_payload = payload;
+        if (const auto prefix = initial.FrontSpan(); !prefix.empty()) {
+            combined.Append(net::buffer(prefix.data(), prefix.size()));
+            combined.AppendBuffers(payload);
+            request_payload = combined.Span();
+        } else if (!HasNonEmptyBuffer(payload)) {
+            co_return;
+        }
+        if (request_payload.empty()) co_return;
 
         upload_failed_ = true;
         upload_opening_ = true;
@@ -638,7 +643,7 @@ private:
         } opening_scope{upload_opening_};
 
         upload_ = co_await DialAndBuildUploadRequest(
-            upload_path_, XHttpClientRequestKind::StreamUp, initial_payload.Span());
+            upload_path_, XHttpClientRequestKind::StreamUp, request_payload);
         upload_->ClearPhaseDeadline();
         upload_->SetIdleTimeout(std::chrono::seconds(0));
         upload_->SetWriteTimeout(write_timeout_);

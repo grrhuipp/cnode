@@ -1,7 +1,7 @@
 #pragma once
 
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
-#include "common/initial_payload.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/target_address.hpp"
 
 namespace proxy {

@@ -1,7 +1,6 @@
 #include "transport/datagram_socket.hpp"
 
 #include "transport/connection_timeouts.hpp"
-#include "common/const_buffer_span.hpp"
 #include "transport/link.hpp"
 
 #include <asio/as_tuple.hpp>

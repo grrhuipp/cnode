@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "app/proxyman/user_store.hpp"
+#include "app/user_store.hpp"
 #include <stdexcept>
 
 namespace {

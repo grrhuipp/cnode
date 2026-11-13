@@ -455,19 +455,17 @@ net::awaitable<void> BaseWsStream::WriteMultiBuffer(common::MultiBuffer buffers)
         throw IoSystemError(io_error::fault, "WebSocket mask generation failed");
     const auto header = EncodeFrameHeader(size, Opcode::BINARY, is_client_, mask);
     try {
-        common::ConstBufferSpanBuilder<16> output;
-        output.Append(net::buffer(header.bytes.data(), header.size));
-        size_t offset = 0;
-        for (auto* buffer : buffers) {
-            if (!buffer || buffer->IsEmpty()) continue;
+        std::array<net::const_buffer, 2> output;
+        size_t count = 0;
+        output[count++] = net::buffer(header.bytes.data(), header.size);
+        if (auto* buffer = buffers.back(); buffer && !buffer->IsEmpty()) {
             auto bytes = buffer->Bytes();
             if (is_client_) {
-                MaskData(bytes.data(), bytes.size(), mask, offset);
-                offset += bytes.size();
+                MaskData(bytes.data(), bytes.size(), mask, 0);
             }
-            output.Append(net::buffer(bytes.data(), bytes.size()));
+            output[count++] = net::buffer(bytes.data(), bytes.size());
         }
-        co_await inner_->WriteBuffers(output.Span());
+        co_await inner_->WriteBuffers({output.data(), count});
     } catch (...) {
         CloseAbortive();
         throw;

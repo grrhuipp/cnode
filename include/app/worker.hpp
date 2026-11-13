@@ -1,8 +1,8 @@
 #pragma once
 
 #include "app/worker_mailbox.hpp"
-#include "app/proxyman/user_store.hpp"
-#include "app/proxyman/outbound_handler.hpp"
+#include "app/user_store.hpp"
+#include "app/outbound_handler.hpp"
 #include "infra/config_types.hpp"
 #include "common/asio_types.hpp"
 #include "transport/timeout_scheduler.hpp"

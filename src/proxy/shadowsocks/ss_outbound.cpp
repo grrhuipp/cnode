@@ -31,8 +31,8 @@ private:
 #include "proxy/handshake_errors.hpp"
 #include "proxy/outbound_stream_endpoint.hpp"
 #include "app/relay.hpp"
-#include "app/proxyman/outbound_handler.hpp"
-#include "app/dns/dns.hpp"
+#include "app/outbound_handler.hpp"
+#include "app/dns.hpp"
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"
 #include "transport/link.hpp"
@@ -460,7 +460,7 @@ class ShadowsocksOutboundEndpoint final : public proxy::OutboundStreamEndpointBa
 public:
     struct PendingResponseState {
         proxy::SsCipherInfo cipher_info;
-        proxy::KeyBytes master_key;
+        const proxy::KeyBytes& master_key;
         proxy::KeyBytes request_salt;
 
         PendingResponseState(const proxy::SsCipherInfo& info,
@@ -501,18 +501,12 @@ public:
         return request_writer_.AsyncShutdownWrite();
     }
 
-    operator transport::AsyncStream&() noexcept {
-        return stream_;
-    }
-
 private:
     net::awaitable<common::MultiBuffer> ReadInitialMultiBuffer() {
         if (auto* pending = std::get_if<PendingResponseState>(&response_state_)) {
             auto reader_result = co_await proxy::ReadTCPResponse(
                 pending->cipher_info, pending->master_key, pending->request_salt, stream_);
             if (!reader_result) {
-                OPENSSL_cleanse(pending->master_key.bytes.data(), pending->master_key.bytes.size());
-                pending->master_key.size = 0;
                 OPENSSL_cleanse(pending->request_salt.bytes.data(), pending->request_salt.bytes.size());
                 pending->request_salt.size = 0;
                 throw transport::LinkError(reader_result.error());

@@ -5,15 +5,8 @@
 #include "common/session.hpp"
 #include "common/multi_buffer.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/failure.hpp"
 #include "app/stats.hpp"
-#include "infra/log.hpp"
-#include "transport/async_delay.hpp"
 
-#include <asio/experimental/awaitable_operators.hpp>
-#include <asio/experimental/channel.hpp>
-#include <asio/as_tuple.hpp>
-#include <asio/use_awaitable.hpp>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -44,27 +37,7 @@ struct RelayResult : common::ResultStatus {
 };
 
 
-inline constexpr uint64_t kRelayStatsFlushBytes = 64 * 1024;
 inline constexpr auto kRelayCloseGraceTimeout = std::chrono::seconds(1);
-
-// 两个方向的令牌桶与等待事件；只为限速转发分配，不限速的转发帧不携带它。
-// 全部状态与订阅存活到两个方向和看门狗汇合之后。定义见 src/app/relay.cpp。
-struct RelayRateLimits;
-struct RelayRateLimitsDelete {
-    void operator()(RelayRateLimits* limits) const noexcept;
-};
-using RelayRateLimitsPtr = std::unique_ptr<RelayRateLimits, RelayRateLimitsDelete>;
-
-// rate 为 0（不限速）时返回空指针。
-RelayRateLimitsPtr AllocateRelayRateLimits(net::io_context& io, uint64_t rate);
-void CancelRelayRateWaits(RelayRateLimits& limits) noexcept;
-// 预留本方向的字节额度并返回需要等待的时长；为零时调用方不得发起等待，
-// 预算内的包不承担等待协程。
-[[nodiscard]] std::chrono::milliseconds ReserveRelayBytes(
-    RelayRateLimits& limits, bool upload, size_t bytes) noexcept;
-// 每个方向同一时刻至多一个等待；取消经 CancelRelayRateWaits 投递。
-[[nodiscard]] net::awaitable<void> WaitRelayRate(
-    RelayRateLimits& limits, bool upload, std::chrono::milliseconds delay);
 
 template <typename Endpoint>
 decltype(auto) RelayControlOf(Endpoint& endpoint) noexcept {
@@ -183,8 +156,6 @@ bool WriteShutdownClosesLink(const Writer& writer) noexcept {
     else return false;
 }
 
-void FlushRelayStats(StatsShard& stats, LocalStatsAccumulator& acc);
-
 template <typename Control>
 bool ConsumeTimeoutSignals(Control& raw_control) {
     auto& control = RelayControlOf(raw_control);
@@ -230,32 +201,6 @@ net::awaitable<RelayResult> DoRelayLinkImpl(
     StatsShard& stats,
     const RelayConfig& config,
     common::MultiBufferBatch initial_payload);
-enum class RelayPhase { Transferring, HalfClosed, Completing, Stopping, Joined };
-struct RelayDirectionState {
-    bool eof = false;
-    bool write_shutdown = false;
-};
-
-struct RelayState {
-    explicit RelayState(net::io_context& io);
-
-    void Mark(bool client_side) noexcept;
-    void Stop(common::ErrorCode error) noexcept;
-    void Complete() noexcept;
-    bool Ending() const noexcept {
-        return phase == RelayPhase::Completing || phase == RelayPhase::Stopping;
-    }
-
-    RelayPhase phase = RelayPhase::Transferring;
-    common::ErrorCode reason = common::ErrorCode::OK;
-    bool close_side_known = false;
-    bool client_closed_first = false;
-    bool local_failure = false;
-    RelayDirectionState up;
-    RelayDirectionState down;
-    common::SignalChannel wake;
-};
-
 // A null client control denotes split/logical input. It changes only the
 // available transport controls, never EOF, error, accounting or join semantics.
 // The reader cancellation source and the joined watchdog cover this case too.

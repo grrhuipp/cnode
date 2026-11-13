@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "app/router/router.hpp"
+#include "app/router.hpp"
 #include "common/session.hpp"
 #include "infra/config_types.hpp"
 

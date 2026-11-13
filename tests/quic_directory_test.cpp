@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/hysteria/hysteria_ingress.hpp"
+#include "transport/hysteria_ingress.hpp"
 #include "common/asio_types.hpp"
 
 #include <openssl/rand.h>

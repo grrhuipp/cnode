@@ -1,16 +1,13 @@
 #pragma once
 
-#include "app/proxyman/inbound_handler.hpp"
-#include "app/datagram_session_environment.hpp"
+#include "app/inbound_handler.hpp"
 #include "common/allocator.hpp"
 #include "common/multi_buffer.hpp"
-#include "common/const_buffer_span.hpp"
 #include "common/error.hpp"
 #include "common/hash.hpp"
 #include "common/ip_address.hpp"
 #include "common/session.hpp"
 #include "common/user_online_tracker.hpp"
-#include "common/string_hash.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
@@ -352,7 +349,7 @@ public:
         udp::endpoint endpoint;
         common::MultiBuffer payload;
         UdpResourceBudget::PayloadReservation reservation;
-        common::ConstBufferSpanBuilder<1> send_buffers;
+        net::const_buffer send_buffer;
 
         [[nodiscard]] std::span<const net::const_buffer> SendBuffers() const noexcept;
     };

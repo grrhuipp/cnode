@@ -11,10 +11,10 @@
 #include "routing/dispatcher.hpp"
 #include "proxy/vmess/body.hpp"
 #include "proxy/vmess/vmess_crypto.hpp"
-#include "app/proxyman/inbound_handler.hpp"
+#include "app/inbound_handler.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
-#include "common/initial_payload.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/session.hpp"
 
 #include <cstring>

@@ -8,7 +8,7 @@
 // ============================================================================
 
 #include "common/asio_types.hpp"
-#include "common/string_hash.hpp"
+#include "common/hash.hpp"
 
 #include <compare>
 #include <cstddef>

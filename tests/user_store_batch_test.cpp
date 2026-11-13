@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "allocation_hook.hpp"
-#include "app/proxyman/user_store.hpp"
+#include "app/user_store.hpp"
 #include <array>
 #include <new>
 

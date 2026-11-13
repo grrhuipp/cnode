@@ -227,4 +227,22 @@ struct Link {
     }
 };
 
+
+// 异常 → ErrorCode 的唯一分类入口。LinkError 保留跨读写边界携带的应用错误码，
+// 系统 I/O 错误经 MapAsioError 映射（operation_aborted → CANCELLED），分配失败归为
+// RESOURCE_EXHAUSTED；其余异常由调用方按所处阶段给出 unknown。
+[[nodiscard]] inline common::ErrorCode ClassifyFailure(
+    std::exception_ptr failure, common::ErrorCode unknown) noexcept {
+    try {
+        std::rethrow_exception(failure);
+    } catch (const LinkError& error) {
+        return error.code();
+    } catch (const IoSystemError& error) {
+        return common::MapAsioError(error.code());
+    } catch (const std::bad_alloc&) {
+        return common::ErrorCode::RESOURCE_EXHAUSTED;
+    } catch (...) {
+        return unknown;
+    }
+}
 }  // namespace transport

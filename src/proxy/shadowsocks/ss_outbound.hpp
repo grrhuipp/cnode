@@ -4,9 +4,8 @@
 #include "proxy/outbound_endpoint_base.hpp"
 #include "app/relay.hpp"
 #include "proxy/uot/uot.hpp"
-#include "app/proxyman/user_store.hpp"
+#include "app/user_store.hpp"
 #include "common/multi_buffer.hpp"
-#include "common/initial_payload.hpp"
 #include "common/user_online_tracker.hpp"
 #include "common/target_address.hpp"
 #include <openssl/mem.h>

@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "transport/hysteria/hysteria_ingress.hpp"
+#include "transport/hysteria_ingress.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>

@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "app/dispatcher/default_dispatcher.hpp"
+#include "app/default_dispatcher.hpp"
 #include <stdexcept>
 #include <utility>
 

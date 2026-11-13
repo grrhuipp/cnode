@@ -3,13 +3,12 @@
 // 出站冷路径的下一跳与 streamSettings 准备，以及原生 UDP 出站的目标解析。
 // 端点基类见 proxy/outbound_endpoint_base.hpp。
 
-#include "app/dns/dns.hpp"
+#include "app/dns.hpp"
 #include "app/relay.hpp"
 #include "proxy/outbound_endpoint_base.hpp"
 #include "common/target_address.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
-#include "transport/failure.hpp"
 #include "transport/link.hpp"
 #include "transport/datagram_socket.hpp"
 #include "transport/outbound_target_builder.hpp"

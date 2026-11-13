@@ -1,4 +1,4 @@
-#include "app/proxyman/inbound_handler.hpp"
+#include "app/inbound_handler.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "common/allocator.hpp"

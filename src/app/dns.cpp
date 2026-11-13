@@ -1,4 +1,4 @@
-#include "app/dns/dns_internal.hpp"
+#include "app/dns_internal.hpp"
 #include "app/worker_mailbox.hpp"
 #include "common/byte_reader.hpp"
 #include "common/domain_name.hpp"

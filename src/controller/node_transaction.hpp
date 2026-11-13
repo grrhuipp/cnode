@@ -2,7 +2,7 @@
 
 #include "api/api.hpp"
 #include "app/prepared_inbound.hpp"
-#include "app/proxyman/outbound_handler.hpp"
+#include "app/outbound_handler.hpp"
 #include "app/stats.hpp"
 #include "common/user_online_tracker.hpp"
 #include "common/constants.hpp"

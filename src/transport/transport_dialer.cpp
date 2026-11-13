@@ -1,6 +1,6 @@
 #include "transport/outbound_target_builder.hpp"
 
-#include "app/dns/dns.hpp"
+#include "app/dns.hpp"
 #include "common/ip_address.hpp"
 #include "infra/log.hpp"
 #include "transport/tcp_stream.hpp"

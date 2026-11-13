@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "common/initial_payload.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/length_prefixed_packet_buffer.hpp"
 #include <array>
 #include <limits>

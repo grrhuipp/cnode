@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "proxy/shadowsocks/ss_outbound.hpp"
-#include "app/dns/dns.hpp"
+#include "app/dns.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/steady_timer.hpp>

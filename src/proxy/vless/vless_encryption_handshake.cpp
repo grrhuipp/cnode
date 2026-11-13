@@ -938,11 +938,11 @@ RunVlessEncryptionClientHandshake(
     co_await WriteVlessBytes(raw_writer, *padding);
     padding.reset();
 
-    std::array<uint8_t, kVlessEncryptionEncryptedServerPfsPublicSize>
-        encrypted_server_public{};
+    auto encrypted_server_public = std::make_unique_for_overwrite<
+        std::array<uint8_t, kVlessEncryptionEncryptedServerPfsPublicSize>>();
     if (!co_await raw_reader.ReadExact(
-            encrypted_server_public.data(),
-            encrypted_server_public.size())) {
+            encrypted_server_public->data(),
+            encrypted_server_public->size())) {
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Truncated);
     }
     std::array<uint8_t, kVlessEncryptionEncryptedTicketSize>
@@ -957,9 +957,10 @@ RunVlessEncryptionClientHandshake(
         *pfs,
         nfs->iv,
         nfs->nfs_key,
-        encrypted_server_public,
+        *encrypted_server_public,
         encrypted_ticket,
         cipher);
+    encrypted_server_public.reset();
     if (!server_open) {
         pfs.reset();
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
@@ -1040,16 +1041,17 @@ net::awaitable<VlessEncryptionHandshakeResult> CompleteServerPfs(
     proxy::BufferedStreamReader& raw_reader, transport::MultiBufferWriter& raw_writer,
     const VlessEncryptionConfig& config, const VlessEncryptionServerNfsOpenResult& nfs,
     VlessEncryptionAead& nfs_aead, VlessEncryptionAeadCipher cipher) {
-    std::array<uint8_t, kVlessEncryptionEncryptedClientPfsPublicSize>
-        encrypted_client_public{};
+    auto encrypted_client_public = std::make_unique_for_overwrite<
+        std::array<uint8_t, kVlessEncryptionEncryptedClientPfsPublicSize>>();
     if (!co_await raw_reader.ReadExact(
-            encrypted_client_public.data(),
-            encrypted_client_public.size())) {
+            encrypted_client_public->data(),
+            encrypted_client_public->size())) {
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Truncated);
     }
 
     auto client_public = OpenEncryptedClientPfsPublic(
-        nfs_aead, encrypted_client_public);
+        nfs_aead, *encrypted_client_public);
+    encrypted_client_public.reset();
     if (!client_public) {
         co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     }

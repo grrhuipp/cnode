@@ -1,6 +1,15 @@
 #include "app/relay.hpp"
 #include "app/token_bucket.hpp"
 
+#include "infra/log.hpp"
+#include "transport/async_delay.hpp"
+#include "transport/link.hpp"
+
+#include <asio/as_tuple.hpp>
+#include <asio/experimental/awaitable_operators.hpp>
+#include <asio/experimental/channel.hpp>
+#include <asio/use_awaitable.hpp>
+#include <memory>
 #include <algorithm>
 #include <limits>
 
@@ -79,6 +88,10 @@ std::chrono::milliseconds TokenBucket::DelayFrom(int64_t now) const noexcept {
         delay, std::numeric_limits<int64_t>::max()))};
 }
 
+namespace {
+
+constexpr uint64_t kRelayStatsFlushBytes = 64 * 1024;
+
 struct RelayRateLimits {
     TokenBucket up;
     TokenBucket down;
@@ -89,13 +102,9 @@ struct RelayRateLimits {
         : up(rate), down(rate), up_wait(io), down_wait(io) {}
 };
 
-void RelayRateLimitsDelete::operator()(RelayRateLimits* limits) const noexcept {
-    delete limits;
-}
-
-RelayRateLimitsPtr AllocateRelayRateLimits(net::io_context& io, uint64_t rate) {
-    if (rate == 0) return {};
-    return RelayRateLimitsPtr(new RelayRateLimits(io, rate));
+std::unique_ptr<RelayRateLimits> AllocateRelayRateLimits(net::io_context& io, uint64_t rate) {
+    if (rate == 0) return nullptr;
+    return std::make_unique<RelayRateLimits>(io, rate);
 }
 
 void CancelRelayRateWaits(RelayRateLimits& limits) noexcept {
@@ -103,12 +112,12 @@ void CancelRelayRateWaits(RelayRateLimits& limits) noexcept {
     limits.down_wait.Cancel();
 }
 
-std::chrono::milliseconds ReserveRelayBytes(
+[[nodiscard]] std::chrono::milliseconds ReserveRelayBytes(
     RelayRateLimits& limits, bool upload, size_t bytes) noexcept {
     return (upload ? limits.up : limits.down).Consume(bytes);
 }
 
-net::awaitable<void> WaitRelayRate(
+[[nodiscard]] net::awaitable<void> WaitRelayRate(
     RelayRateLimits& limits, bool upload, std::chrono::milliseconds delay) {
     return (upload ? limits.up_wait : limits.down_wait).WaitFor(delay);
 }
@@ -119,29 +128,53 @@ void FlushRelayStats(StatsShard& stats, LocalStatsAccumulator& acc) {
     acc.Reset();
 }
 
-RelayState::RelayState(net::io_context& io)
-    : wake(net::any_io_executor(io.get_executor()), 1) {}
+enum class RelayPhase { Transferring, HalfClosed, Completing, Stopping, Joined };
 
-void RelayState::Mark(bool client_side) noexcept {
-    if (!close_side_known && !local_failure) {
-        close_side_known = true;
-        client_closed_first = client_side;
+struct RelayDirectionState {
+    bool eof = false;
+    bool write_shutdown = false;
+};
+
+struct RelayState {
+    explicit RelayState(net::io_context& io)
+        : wake(net::any_io_executor(io.get_executor()), 1) {}
+
+    void Mark(bool client_side) noexcept {
+        if (!close_side_known && !local_failure) {
+            close_side_known = true;
+            client_closed_first = client_side;
+        }
     }
-}
 
-void RelayState::Stop(common::ErrorCode error) noexcept {
-    if (reason == common::ErrorCode::OK || (reason == common::ErrorCode::CANCELLED && error != common::ErrorCode::CANCELLED))
-        reason = error;
-    phase = RelayPhase::Stopping;
-    wake.close();
-}
+    void Stop(common::ErrorCode error) noexcept {
+        if (reason == common::ErrorCode::OK ||
+            (reason == common::ErrorCode::CANCELLED && error != common::ErrorCode::CANCELLED))
+            reason = error;
+        phase = RelayPhase::Stopping;
+        wake.close();
+    }
 
-void RelayState::Complete() noexcept {
-    if (reason != common::ErrorCode::OK) return;
-    phase = RelayPhase::Completing;
-    wake.close();
-}
+    void Complete() noexcept {
+        if (reason != common::ErrorCode::OK) return;
+        phase = RelayPhase::Completing;
+        wake.close();
+    }
 
+    [[nodiscard]] bool Ending() const noexcept {
+        return phase == RelayPhase::Completing || phase == RelayPhase::Stopping;
+    }
+
+    RelayPhase phase = RelayPhase::Transferring;
+    common::ErrorCode reason = common::ErrorCode::OK;
+    bool close_side_known = false;
+    bool client_closed_first = false;
+    bool local_failure = false;
+    RelayDirectionState up;
+    RelayDirectionState down;
+    common::SignalChannel wake;
+};
+
+}  // namespace
 
 net::awaitable<RelayResult> DoRelayLinkImpl(
     net::io_context& io_context,

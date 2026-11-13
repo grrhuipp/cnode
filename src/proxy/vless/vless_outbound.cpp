@@ -7,10 +7,9 @@
 #include "proxy/vless/vless_encryption.hpp"
 #include "proxy/handshake_errors.hpp"
 #include "proxy/outbound_stream_endpoint.hpp"
-#include "app/dns/dns.hpp"
-#include "app/proxyman/outbound_handler.hpp"
+#include "app/dns.hpp"
+#include "app/outbound_handler.hpp"
 #include "app/relay.hpp"
-#include "common/const_buffer_span.hpp"
 #include "common/asio_types.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/length_prefixed_packet_buffer.hpp"
@@ -77,7 +76,7 @@ public:
 
 private:
     std::shared_ptr<const ::proxy::VlessOutboundConfig> config_;
-    std::shared_ptr<::proxy::VlessEncryptionClientTicketCache> encryption_tickets_;
+    std::optional<::proxy::VlessEncryptionClientTicketCache> encryption_tickets_;
 };
 
 namespace {
@@ -315,9 +314,10 @@ public:
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
         const auto datagram = proxy::RequireUdpDatagram(mb, &udp_target_);
         if (!datagram) co_return;
-        common::ConstBufferSpanBuilder<1> payload;
-        payload.AppendMultiBuffer(mb);
-        co_await WriteDatagram(*datagram->target, payload.Span());
+        const auto bytes = mb.FrontSpan();
+        const net::const_buffer payload(bytes.data(), bytes.size());
+        co_await WriteDatagram(*datagram->target,
+                               {&payload, bytes.empty() ? size_t{0} : size_t{1}});
     }
 
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
@@ -381,8 +381,8 @@ private:
 // 此对象先于 encrypted_io 构造，且禁止移动，保证延迟读端的借用有效。
 struct VlessClientTicketLease {
     explicit VlessClientTicketLease(
-        std::shared_ptr<::proxy::VlessEncryptionClientTicketCache> cache)
-        : cache(std::move(cache)) {}
+        ::proxy::VlessEncryptionClientTicketCache* cache) noexcept
+        : cache(cache) {}
 
     VlessClientTicketLease(const VlessClientTicketLease&) = delete;
     VlessClientTicketLease& operator=(const VlessClientTicketLease&) = delete;
@@ -414,7 +414,7 @@ struct VlessClientTicketLease {
         }
     }
 
-    std::shared_ptr<::proxy::VlessEncryptionClientTicketCache> cache;
+    ::proxy::VlessEncryptionClientTicketCache* cache = nullptr;
     std::array<uint8_t, ::proxy::kVlessEncryptionTicketSize> identity{};
     ::proxy::VlessEncryptionTicketRejection rejection;
 };
@@ -518,8 +518,8 @@ VlessOutboundHandler::VlessOutboundHandler(
     std::shared_ptr<const VlessOutboundConfig> config)
     : config_(std::move(config))
     , encryption_tickets_(config_->encryption
-          ? std::make_shared<::proxy::VlessEncryptionClientTicketCache>()
-          : nullptr) {}
+          ? std::optional<::proxy::VlessEncryptionClientTicketCache>(std::in_place)
+          : std::nullopt) {}
 
 VlessOutboundHandler::~VlessOutboundHandler() = default;
 
@@ -557,7 +557,7 @@ VlessOutboundHandler::Process(
     const bool use_vision = !config_->flow.empty();
     const bool use_xudp = is_udp && config_->packet_xudp;
     const bool use_packet_addr = is_udp && config_->packet_addr;
-    VlessClientTicketLease tickets(encryption_tickets_);
+    VlessClientTicketLease tickets(encryption_tickets_ ? &*encryption_tickets_ : nullptr);
     proxy::BufferedStreamReader protocol_reader(*stream);
     transport::MultiBufferWriter& protocol_writer = *stream;
     proxy::BufferedStreamReader* active_reader = &protocol_reader;

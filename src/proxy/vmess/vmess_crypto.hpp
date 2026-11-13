@@ -1,12 +1,12 @@
 #pragma once
-#include "proxy/vmess/security.hpp"
+#include "proxy/vmess_security.hpp"
 // vmess_crypto.hpp — VMess 协议类型与密码学原语
 //
 // 职责：协议常量/枚举/请求结构体、底层加密函数、密钥派生（KDF）、哈希、AuthID 生成。
 // 底层 OpenSSL 失败属于系统故障，统一以异常上报，不返回未初始化输出。
 // ============================================================================
 
-#include "app/proxyman/user_store.hpp"
+#include "app/user_store.hpp"
 #include "proxy/aead.hpp"
 #include "common/hash.hpp"
 #include "common/multi_buffer.hpp"

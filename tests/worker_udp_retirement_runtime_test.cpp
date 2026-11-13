@@ -1,10 +1,10 @@
 #include <gtest/gtest.h>
 
-#include "app/dns/dns.hpp"
+#include "app/dns.hpp"
 #include "app/relay.hpp"
 #include "app/prepared_inbound.hpp"
-#include "app/proxyman/inbound_handler.hpp"
-#include "app/proxyman/outbound_handler.hpp"
+#include "app/inbound_handler.hpp"
+#include "app/outbound_handler.hpp"
 #include "app/stats.hpp"
 #include "app/worker.hpp"
 #include "worker_coordinator_fixture.hpp"

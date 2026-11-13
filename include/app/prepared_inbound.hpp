@@ -1,7 +1,7 @@
 #pragma once
 
-#include "app/proxyman/inbound_handler.hpp"
-#include "app/proxyman/user_store.hpp"
+#include "app/inbound_handler.hpp"
+#include "app/user_store.hpp"
 #include "common/asio_types.hpp"
 #include "transport/inbound_listen.hpp"
 #include <cstdint>

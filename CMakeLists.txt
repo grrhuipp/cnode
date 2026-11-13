@@ -100,8 +100,8 @@ set(CNODE_CORE_SOURCES
     src/transport/transport_dialer.cpp
     src/transport/outbound_bind.cpp
     src/transport/xhttp_client.cpp
-    src/transport/hysteria/hysteria_ingress.cpp
-    src/transport/hysteria/hysteria_wire.cpp
+    src/transport/hysteria_ingress.cpp
+    src/transport/hysteria_wire.cpp
     src/transport/proxy_protocol.cpp
 
     # Common
@@ -115,20 +115,20 @@ set(CNODE_CORE_SOURCES
     src/sniff/sniffer.cpp
 
     # App, DNS, Router, Controller, API
-    src/app/dns/dns.cpp
-    src/app/dispatcher/default_dispatcher.cpp
+    src/app/dns.cpp
+    src/app/default_dispatcher.cpp
     src/app/session_tracking.cpp
     src/app/rate_limiter.cpp
     src/app/relay.cpp
-    src/app/proxyman/inbound_handler.cpp
-    src/app/worker/udp_ingress.cpp
-    src/app/proxyman/user_store.cpp
-    src/app/proxyman/outbound_handler.cpp
+    src/app/inbound_handler.cpp
+    src/app/udp_ingress.cpp
+    src/app/user_store.cpp
+    src/app/outbound_handler.cpp
     src/app/worker.cpp
     src/app/group_coordinator.cpp
     src/app/prepared_inbound.cpp
     src/app/bootstrap.cpp
-    src/app/router/router.cpp
+    src/app/router.cpp
     src/controller/controller.cpp
     src/controller/traffic_journal.cpp
     src/api/v2board.cpp

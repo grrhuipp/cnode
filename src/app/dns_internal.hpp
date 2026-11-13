@@ -1,9 +1,9 @@
 #pragma once
 
 // DNSWorker 的私有实现：上游 socket、在途请求与缓存只属于主控执行器上的
-// DNSWorker（src/app/dns/dns.cpp）。只有 dns.cpp 与直接验证这些组件的测试包含本头。
+// DNSWorker（src/app/dns.cpp）。只有 dns.cpp 与直接验证这些组件的测试包含本头。
 
-#include "app/dns/dns.hpp"
+#include "app/dns.hpp"
 #include "common/allocator.hpp"
 #include "common/ascii.hpp"
 #include "common/awaitable_task_group.hpp"

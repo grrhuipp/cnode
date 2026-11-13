@@ -1,12 +1,12 @@
 #include <gtest/gtest.h>
 
-#include "app/dispatcher/default_dispatcher.hpp"
-#include "app/dns/dns.hpp"
+#include "app/default_dispatcher.hpp"
+#include "app/dns.hpp"
 #include "app/relay.hpp"
-#include "app/proxyman/inbound_handler.hpp"
+#include "app/inbound_handler.hpp"
 #include "common/allocator.hpp"
 #include "common/rule.hpp"
-#include "app/proxyman/outbound_handler.hpp"
+#include "app/outbound_handler.hpp"
 #include "app/stats.hpp"
 #include "routing/router.hpp"
 #include "infra/config_types.hpp"

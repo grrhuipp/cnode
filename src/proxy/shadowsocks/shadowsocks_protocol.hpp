@@ -1,7 +1,7 @@
 #pragma once
 #include "proxy/handshake_errors.hpp"
-#include "proxy/shadowsocks/cipher.hpp"
-#include "app/proxyman/user_store.hpp"
+#include "proxy/ss_cipher.hpp"
+#include "app/user_store.hpp"
 #include "common/length_prefixed_packet_buffer.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/asio_types.hpp"

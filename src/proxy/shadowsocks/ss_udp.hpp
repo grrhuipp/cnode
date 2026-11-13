@@ -1,6 +1,6 @@
 #pragma once
 
-#include "app/proxyman/user_store.hpp"
+#include "app/user_store.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/target_address.hpp"
 #include "proxy/inbound.hpp"

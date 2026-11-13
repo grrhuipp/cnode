@@ -4,7 +4,7 @@
 #include "proxy/vmess/vmess_crypto.hpp"
 #include "proxy/vmess/body.hpp"
 #include "transport/tcp_stream.hpp"
-#include "app/proxyman/user_store.hpp"
+#include "app/user_store.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>

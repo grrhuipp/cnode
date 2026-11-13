@@ -2,7 +2,7 @@
 
 #include "api/request_task.hpp"
 #include "api/api.hpp"
-#include "app/dns/dns.hpp"
+#include "app/dns.hpp"
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>

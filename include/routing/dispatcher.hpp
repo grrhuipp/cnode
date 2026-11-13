@@ -4,9 +4,8 @@
 #include "app/relay.hpp"
 #include "common/domain_name.hpp"
 #include "common/error.hpp"
-#include "common/initial_payload.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/constants.hpp"
-#include "routing/sniffed_protocol.hpp"
 #include "transport/link.hpp"
 
 #include <cstdint>
@@ -25,6 +24,21 @@
 // 解析为位集；字段之间没有派生状态，任意构造结果即可直接进入热路径。
 // ============================================================================
 namespace routing {
+
+// 可嗅探协议名到位的唯一映射：嗅探 destOverride 与路由规则的 protocol 条件共用
+// 同一张表，配置边界一次换算成位集，热路径只做位运算。
+inline constexpr uint8_t kSniffedTls = 1u << 0;
+inline constexpr uint8_t kSniffedHttp = 1u << 1;
+inline constexpr uint8_t kSniffedQuic = 1u << 2;
+inline constexpr uint8_t kSniffedBitTorrent = 1u << 3;
+
+[[nodiscard]] constexpr uint8_t SniffedProtocolBit(std::string_view protocol) noexcept {
+    if (protocol == common::kTls) return kSniffedTls;
+    if (protocol == common::kHttp) return kSniffedHttp;
+    if (protocol == common::kQuic) return kSniffedQuic;
+    if (protocol == common::kBitTorrent) return kSniffedBitTorrent;
+    return 0;
+}
 
 struct SniffConfig {
     bool enabled = true;

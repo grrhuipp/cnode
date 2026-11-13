@@ -1,10 +1,10 @@
 #include <gtest/gtest.h>
 
-#include "app/proxyman/inbound_handler.hpp"
+#include "app/inbound_handler.hpp"
 #include "app/relay.hpp"
 #include "app/stats.hpp"
-#include "app/proxyman/user_store.hpp"
-#include "app/proxyman/outbound_handler.hpp"
+#include "app/user_store.hpp"
+#include "app/outbound_handler.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "transport/hysteria/hysteria_ingress.hpp"
+#include "transport/hysteria_ingress.hpp"
 #include "transport/timeout_scheduler.hpp"
 #include "transport/transport_build_result.hpp"
 #include <nghttp3/nghttp3.h>

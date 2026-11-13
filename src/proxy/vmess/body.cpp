@@ -1,18 +1,16 @@
 #include "proxy/vmess/body.hpp"
 #include "proxy/buffered_stream_reader.hpp"
 #include "proxy/vmess/session_history.hpp"
-#include "transport/failure.hpp"
 #include "common/scoped_cleanse.hpp"
 
-#include "app/proxyman/user_store.hpp"
+#include "app/user_store.hpp"
 #include "app/group_coordinator.hpp"
 #include "common/address_codec.hpp"
-#include "common/const_buffer_span.hpp"
 #include "common/asio_types.hpp"
 #include "common/byte_reader.hpp"
 #include "common/error.hpp"
 #include "common/user_online_tracker.hpp"
-#include "common/string_hash.hpp"
+#include "common/hash.hpp"
 #include "infra/log.hpp"
 #include "transport/link.hpp"
 
@@ -232,10 +230,13 @@ net::awaitable<void> BodyEncoder::WriteFirstEncodedChunks(
     std::span<const uint8_t> first_header,
     bool& header_sent) {
     header_sent = true;
-    common::ConstBufferSpanBuilder<2> framed;
-    framed.Append(net::buffer(first_header.data(), first_header.size()));
-    framed.AppendMultiBuffer(chunks);
-    co_await stream.WriteBuffers(framed.Span());
+    std::array<net::const_buffer, 2> framed;
+    size_t count = 0;
+    if (!first_header.empty()) framed[count++] = net::buffer(first_header.data(), first_header.size());
+    if (const auto bytes = chunks.FrontSpan(); !bytes.empty()) {
+        framed[count++] = net::buffer(bytes.data(), bytes.size());
+    }
+    co_await stream.WriteBuffers({framed.data(), count});
     chunks.clear();
 }
 
@@ -322,13 +323,14 @@ net::awaitable<void> BodyEncoder::WriteEOF(
         const size_t eof_len = EncodeEndTo(eof_chunk);
         if (eof_len == 0) co_return;
         frame_generated = true;
-        common::ConstBufferSpanBuilder<2> buffers;
+        std::array<net::const_buffer, 2> buffers;
+        size_t count = 0;
         if (header_sent && !*header_sent) {
             *header_sent = true;
-            buffers.Append(net::buffer(first_header.data(), first_header.size()));
+            if (!first_header.empty()) buffers[count++] = net::buffer(first_header.data(), first_header.size());
         }
-        buffers.Append(net::buffer(eof_chunk.data(), eof_len));
-        co_await stream.WriteBuffers(buffers.Span());
+        buffers[count++] = net::buffer(eof_chunk.data(), eof_len);
+        co_await stream.WriteBuffers({buffers.data(), count});
     } catch (const transport::WriteClosed&) {
         Finish();
         throw;

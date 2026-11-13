@@ -1,4 +1,4 @@
-#include "transport/hysteria/hysteria_wire.hpp"
+#include "transport/hysteria_wire.hpp"
 
 #include "common/byte_reader.hpp"
 

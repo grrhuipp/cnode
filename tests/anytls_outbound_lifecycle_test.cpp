@@ -3,7 +3,7 @@
 #include "allocation_hook.hpp"
 #include "proxy/anytls/anytls_codec.hpp"
 #include "app/relay.hpp"
-#include "app/dns/dns.hpp"
+#include "app/dns.hpp"
 #include "app/stats.hpp"
 #include "app/group_coordinator.hpp"
 #include "common/session.hpp"

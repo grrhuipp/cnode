@@ -1,14 +1,14 @@
-#include "app/worker/udp_ingress.hpp"
+#include "app/udp_ingress.hpp"
 #include "app/relay.hpp"
-#include "app/proxyman/inbound_handler.hpp"
+#include "app/inbound_handler.hpp"
 #include "common/awaitable_task_group.hpp"
 #include "proxy/inbound_admission.hpp"
 
-#include "common/initial_payload.hpp"
+#include "common/multi_buffer.hpp"
 #include "common/ip_address.hpp"
 #include "common/session.hpp"
 #include "common/allocator.hpp"
-#include "common/string_hash.hpp"
+#include "common/hash.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
@@ -193,7 +193,9 @@ void UdpAssociationReclaimer::Repair(std::size_t index) noexcept {
 
 std::span<const net::const_buffer>
 UdpIngress::PendingUdpReply::SendBuffers() const noexcept {
-    return send_buffers.Span();
+    return send_buffer.size() == 0
+        ? std::span<const net::const_buffer>{}
+        : std::span<const net::const_buffer>(&send_buffer, 1);
 }
 
 namespace {
@@ -395,12 +397,10 @@ std::optional<UdpIngress::PendingUdpReply> UdpIngress::BeginReplySend(
     if (last_reply_id_ == std::numeric_limits<uint64_t>::max())
         throw IoSystemError(io_error::no_buffer_space, "UDP reply send generation exhausted");
 
-    // Describe the payload while it is still queued: a scatter spill is the
-    // only fallible step, so failure leaves the queue untouched. Ordinary
-    // packets move straight into their sender's frame without a heap node.
     auto& front = queue.pending.front();
+    const auto front_bytes = front.payload.FrontSpan();
     std::optional<PendingUdpReply> packet{std::in_place};
-    packet->send_buffers.AppendMultiBuffer(front.payload);
+    packet->send_buffer = net::buffer(front_bytes.data(), front_bytes.size());
     packet->id = ++last_reply_id_;
     packet->endpoint = std::move(front.endpoint);
     packet->payload = std::move(front.payload);

@@ -16,10 +16,10 @@
 #include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
-#include "app/proxyman/inbound_handler.hpp"
+#include "app/inbound_handler.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/timeout_scheduler.hpp"
-#include "app/proxyman/user_store.hpp"
+#include "app/user_store.hpp"
 #include "common/address_codec.hpp"
 #include "common/allocator.hpp"
 

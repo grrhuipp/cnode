@@ -8,7 +8,7 @@
 #include "proxy/handshake_errors.hpp"
 #include "proxy/uot/uot.hpp"
 #include "transport/async_write_gate.hpp"
-#include "app/dns/dns.hpp"
+#include "app/dns.hpp"
 #include "app/relay.hpp"
 #include "app/stats.hpp"
 #include "common/ip_address.hpp"
@@ -16,10 +16,10 @@
 #include "infra/log.hpp"
 #include "common/error.hpp"
 #include "infra/config_types.hpp"
-#include "app/proxyman/outbound_handler.hpp"
+#include "app/outbound_handler.hpp"
 #include "transport/outbound_target_builder.hpp"
 #include "transport/timeout_scheduler.hpp"
-#include "transport/failure.hpp"
+#include "transport/link.hpp"
 #include "common/scoped_cleanse.hpp"
 
 #include <asio/experimental/channel.hpp>

@@ -1,5 +1,4 @@
 #include "transport/async_stream.hpp"
-#include "common/const_buffer_span.hpp"
 #include "transport/tcp_stream.hpp"
 #include <new>
 
@@ -58,10 +57,10 @@ net::awaitable<void> AsyncStream::WriteMultiBuffer(common::MultiBuffer mb) {
         mb.clear();
         co_return;
     }
-    common::ConstBufferSpanBuilder<1> buffers;
-    buffers.AppendMultiBuffer(mb);
+    const auto bytes = mb.FrontSpan();
+    const net::const_buffer buffer(bytes.data(), bytes.size());
     try {
-        co_await WriteBuffers(buffers.Span());
+        co_await WriteBuffers({&buffer, 1});
     } catch (...) {
         mb.clear();
         throw;

@@ -1,6 +1,6 @@
 #include "common/user_online_tracker.hpp"
 
-#include "common/string_hash.hpp"
+#include "common/hash.hpp"
 #include "common/allocator.hpp"
 #include "app/group_coordinator.hpp"
 

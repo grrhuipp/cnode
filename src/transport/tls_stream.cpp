@@ -4,7 +4,6 @@
 #include "transport/tls_context.hpp"
 #include "transport/async_write_gate.hpp"
 #include "transport/stream_settings.hpp"
-#include "common/const_buffer_span.hpp"
 #include "infra/log.hpp"
 #include "common/unsafe.hpp"
 #include <openssl/bio.h>
@@ -528,11 +527,12 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
             common::MultiBuffer& mb;
             ~ClearOwned() noexcept { mb.clear(); }
         } clear_owned{owned};
-        common::ConstBufferSpanBuilder<1> owned_spans;
+        net::const_buffer owned_buffer;
         if (!owned.empty()) {
-            if (owned.byte_size() == 0) co_return;
-            owned_spans.AppendMultiBuffer(owned);
-            buffers = owned_spans.Span();
+            const auto bytes = owned.FrontSpan();
+            if (bytes.empty()) co_return;
+            owned_buffer = net::buffer(bytes.data(), bytes.size());
+            buffers = {&owned_buffer, 1};
         }
         ActiveDirection active(write_active);
         try {

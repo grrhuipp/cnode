@@ -2,8 +2,8 @@
 
 #include "proxy/anytls/anytls_codec.hpp"
 #include "app/relay.hpp"
-#include "app/proxyman/inbound_handler.hpp"
-#include "app/proxyman/user_store.hpp"
+#include "app/inbound_handler.hpp"
+#include "app/user_store.hpp"
 #include "app/stats.hpp"
 #include "app/group_coordinator.hpp"
 #include "common/allocator.hpp"

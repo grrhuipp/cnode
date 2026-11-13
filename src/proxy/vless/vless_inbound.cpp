@@ -9,14 +9,13 @@
 #include "proxy/vless/vless_codec.hpp"
 #include "proxy/vless/vless_encryption.hpp"
 #include "app/worker_mailbox.hpp"
-#include "app/proxyman/inbound_handler.hpp"
-#include "app/proxyman/user_store.hpp"
+#include "app/inbound_handler.hpp"
+#include "app/user_store.hpp"
 #include "common/const_buffer_span.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/error.hpp"
-#include "common/initial_payload.hpp"
 #include "common/session.hpp"
 #include "common/constants.hpp"
 #include "routing/dispatcher.hpp"
@@ -77,10 +76,13 @@ private:
             co_return;
         }
         header_sent_ = true;
-        common::ConstBufferSpanBuilder<2> out;
-        out.Append(HeaderBuffer());
-        out.AppendMultiBuffer(mb);
-        co_await dst_.WriteBuffers(out.Span());
+        std::array<net::const_buffer, 2> out;
+        size_t count = 0;
+        if (const auto hdr = HeaderBuffer(); hdr.size() != 0) out[count++] = hdr;
+        if (const auto bytes = mb.FrontSpan(); !bytes.empty()) {
+            out[count++] = net::buffer(bytes.data(), bytes.size());
+        }
+        co_await dst_.WriteBuffers({out.data(), count});
         mb.clear();
     }
 

@@ -1,5 +1,4 @@
 #include "transport/tcp_stream.hpp"
-#include "common/const_buffer_span.hpp"
 #include "transport/timeout_scheduler.hpp"
 #include "transport/connection_timeouts.hpp"
 
@@ -375,15 +374,14 @@ net::awaitable<void> TcpStream::WriteMultiBuffer(common::MultiBuffer mb) {
         mb.clear();
         throw IoSystemError(io_error::broken_pipe);
     }
-    common::ConstBufferSpanBuilder<1> builder;
     try {
-        builder.AppendMultiBuffer(mb);
-        auto buffers = builder.Span();
-        while (!buffers.empty() && buffers.front().size() == 0) buffers = buffers.subspan(1);
-        if (buffers.empty()) {
+        const auto bytes = mb.FrontSpan();
+        if (bytes.empty()) {
             mb.clear();
             co_return;
         }
+        const net::const_buffer single(bytes.data(), bytes.size());
+        std::span<const net::const_buffer> buffers(&single, 1);
         impl_->timeouts.CheckCanBeginWrite();
         const auto cancellation = co_await net::this_coro::cancellation_state;
         const bool deferred = IsWriteCancellationDeferred();

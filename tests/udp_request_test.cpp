@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "proxy/freedom/freedom_udp.hpp"
-#include "app/dns/dns.hpp"
+#include "app/dns.hpp"
 #include "app/relay.hpp"
 #include "transport/async_stream.hpp"
 

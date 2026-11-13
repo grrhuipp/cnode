@@ -1,9 +1,9 @@
 #pragma once
 
 #include "common/user_online_tracker.hpp"
-#include "common/string_hash.hpp"
+#include "common/hash.hpp"
 #include "app/rate_limiter.hpp"
-#include "app/proxyman/user_store.hpp"
+#include "app/user_store.hpp"
 #include "app/request_load.hpp"
 #include "app/stats.hpp"
 #include "routing/dispatcher.hpp"
@@ -14,7 +14,6 @@
 #include "transport/quic_listener.hpp"
 #include "transport/stream_settings.hpp"
 #include "transport/transport_security.hpp"
-#include "app/datagram_session_environment.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <memory>
@@ -116,6 +115,18 @@ struct AdmissionEnvironment final {
     app::ConnectionLimiter& limiter;
     common::UserOnlineTracker& online_users;
     app::StatsShard& stats;
+};
+
+class InboundHandler;
+
+// 原生 UDP 与 QUIC 入口共同借用的 Worker 本地能力，不携带接收器配置。
+struct DatagramSessionEnvironment final {
+    infra::TimeoutsConfig timeouts;
+    routing::Dispatcher* dispatcher = nullptr;
+    const AdmissionEnvironment* admission = nullptr;
+    RequestLoadState* request_load = nullptr;
+    std::shared_ptr<InboundHandler> handler{};
+    std::shared_ptr<const BuildRequest> prepared{};
 };
 
 struct InboundProtocolTraits final {

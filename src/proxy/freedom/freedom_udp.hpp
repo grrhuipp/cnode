@@ -4,7 +4,7 @@
 // （tests/udp_request_test.cpp）使用；测试需要直接构造端点，因此放在私有头
 // 而不是 .cpp 内。
 
-#include "app/dns/dns.hpp"
+#include "app/dns.hpp"
 #include "common/length_prefixed_packet_buffer.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/error.hpp"

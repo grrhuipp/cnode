@@ -1,7 +1,7 @@
-#include "app/proxyman/outbound_handler.hpp"
+#include "app/outbound_handler.hpp"
 #include "app/relay.hpp"
 
-#include "app/dns/dns.hpp"
+#include "app/dns.hpp"
 #include "common/allocator.hpp"
 #include <map>
 #include <stdexcept>

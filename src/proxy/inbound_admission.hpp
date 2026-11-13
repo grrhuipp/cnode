@@ -2,8 +2,8 @@
 
 #include "common/error.hpp"
 #include "app/relay.hpp"
-#include "app/proxyman/inbound_handler.hpp"
-#include "app/proxyman/user_store.hpp"
+#include "app/inbound_handler.hpp"
+#include "app/user_store.hpp"
 #include "app/rate_limiter.hpp"
 #include "app/stats.hpp"
 #include "common/asio_types.hpp"
@@ -13,7 +13,7 @@
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/failure.hpp"
+#include "transport/link.hpp"
 
 #include <cstdint>
 #include <exception>

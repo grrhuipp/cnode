@@ -7,14 +7,13 @@
 #include "common/address_codec.hpp"
 #include "common/allocator.hpp"
 #include "common/multi_buffer.hpp"
-#include "common/const_buffer_span.hpp"
 #include "common/byte_reader.hpp"
 #include "common/session.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/failure.hpp"
+#include "transport/link.hpp"
 
 #include <asio/as_tuple.hpp>
 
@@ -964,11 +963,14 @@ private:
                     co_return true;
                 }
 
-                common::ConstBufferSpanBuilder<2> framed;
-                framed.Append(net::const_buffer(write_frame.data(), header_len));
-                framed.AppendMultiBuffer(reply.payload);
+                std::array<net::const_buffer, 2> framed;
+                size_t count = 0;
+                if (header_len != 0) framed[count++] = net::const_buffer(write_frame.data(), header_len);
+                if (const auto bytes = reply.payload.FrontSpan(); !bytes.empty()) {
+                    framed[count++] = net::const_buffer(bytes.data(), bytes.size());
+                }
                 try {
-                    co_await client_link.writer->WriteBuffers(framed.Span());
+                    co_await client_link.writer->WriteBuffers({framed.data(), count});
                     reply.payload.clear();
                     parent_ctx.traffic.bytes_down += frame_size;
                     result.bytes_down += frame_size;

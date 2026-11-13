@@ -1,7 +1,7 @@
 #pragma once
 
 #include "transport/quic_listener.hpp"
-#include "app/datagram_session_environment.hpp"
+#include "app/inbound_handler.hpp"
 #include "app/rate_limiter.hpp"
 #include "common/allocator.hpp"
 #include "common/multi_buffer.hpp"
@@ -9,12 +9,10 @@
 #include "common/session.hpp"
 #include "common/user_online_tracker.hpp"
 #include "common/asio_types.hpp"
-#include "common/string_hash.hpp"
 
 #include "common/target_address.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/hysteria/hysteria_wire.hpp"
-#include "transport/hysteria/hysteria_settings.hpp"
+#include "transport/hysteria_wire.hpp"
 #include <asio/steady_timer.hpp>
 
 #include <algorithm>
@@ -46,6 +44,19 @@ namespace transport {
 class InboundTransportStreamHandler;
 class SslContext;
 
+
+// 准备期的协议快照，供注册表和 QUIC 入口共享；不暴露 QUIC 库或监听器实现。
+class HysteriaSettings final : public app::ProtocolSettings {
+public:
+    HysteriaVersion version = HysteriaVersion::V2;
+    uint64_t upload_bytes_per_second = 0;
+    uint64_t download_bytes_per_second = 0;
+};
+
+[[nodiscard]] inline const HysteriaSettings* GetSettings(
+    const app::BuildRequest& request) noexcept {
+    return dynamic_cast<const HysteriaSettings*>(request.settings.get());
+}
 inline constexpr size_t kServerConnectionIdLength = 18;
 inline constexpr uint8_t kServerCidMagic0 = 0xa5;
 inline constexpr uint8_t kServerCidMagic1 = 0x5a;

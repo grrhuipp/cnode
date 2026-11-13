@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common/asio_types.hpp"
-#include "common/string_hash.hpp"
+#include "common/hash.hpp"
 
 #include <cstddef>
 #include <cstdint>

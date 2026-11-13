@@ -2,11 +2,11 @@
 #include <gtest/gtest.h>
 
 #include "allocation_hook.hpp"
-#include "app/worker/udp_ingress.hpp"
+#include "app/udp_ingress.hpp"
 #include "udp_ingress_fixture.hpp"
 #include "worker_coordinator_fixture.hpp"
 #include "app/relay.hpp"
-#include "app/proxyman/inbound_handler.hpp"
+#include "app/inbound_handler.hpp"
 #include "app/stats.hpp"
 #include "common/user_online_tracker.hpp"
 #include "routing/dispatcher.hpp"

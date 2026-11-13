@@ -3,7 +3,7 @@
 #include "common/constants.hpp"
 #include "infra/config.hpp"
 #include "transport/http_headers.hpp"
-#include "app/dns/dns.hpp"
+#include "app/dns.hpp"
 #include "infra/json.hpp"
 #include "infra/log.hpp"
 #include "api/panel_wire.hpp"
@@ -232,14 +232,14 @@ net::awaitable<PanelHttpResponse> WriteRequestAndReadResponse(
          .max_trailer_bytes = kMaxHeaderSize - response->header_bytes,
          .count_trailer_terminator = true,
          .reject_trailing_read_ahead = result.status != 204 && result.status != 304});
-    std::array<char, 8192> block;
     for (;;) {
-        const auto n = co_await body->AsyncRead(net::buffer(block));
-        if (n == 0) break;
-        if (n > kMaxBodySize - result.body.size())
+        auto chunk = co_await body->ReadMultiBuffer();
+        const auto bytes = chunk.FrontSpan();
+        if (bytes.empty()) break;
+        if (bytes.size() > kMaxBodySize - result.body.size())
             co_return PanelHttpResponse{.status = -1, .body = "HTTP body too large"};
         // Grow for bytes actually received, never for a declared length.
-        result.body.append(block.data(), n);
+        result.body.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     }
     // A completed response survives cancellation of best-effort TLS cleanup.
     try { co_await body->AsyncShutdownWrite(); } catch (const std::exception&) {}

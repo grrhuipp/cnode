@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "app/proxyman/user_store.hpp"
+#include "app/user_store.hpp"
 #include "common/address_codec.hpp"
 #include "common/multi_buffer.hpp"
 #include "proxy/trojan/trojan_codec.hpp"
