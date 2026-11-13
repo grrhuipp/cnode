@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -59,5 +60,6 @@ private:
 
 [[nodiscard]] std::optional<AnyTlsPaddingScheme> ParseAnyTlsPaddingScheme(std::string_view raw);
 [[nodiscard]] const std::shared_ptr<const AnyTlsPaddingScheme>& DefaultAnyTlsPaddingScheme();
+[[nodiscard]] std::array<uint8_t, 32> HashAnyTlsPassword(std::string_view password) noexcept;
 
 } // namespace proxy

@@ -2,7 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
-
+#include <optional>
+#include <string_view>
 namespace proxy {
 
 enum class SsCipherType : uint8_t {
@@ -19,5 +20,8 @@ struct SsCipherInfo {
     size_t key_size;
     size_t salt_size;
 };
+
+// 根据方法名获取密码参数（不区分大小写），含 AEAD 与 2022-blake3 方法。
+[[nodiscard]] std::optional<SsCipherInfo> ParseCipherMethod(std::string_view method);
 
 }  // namespace proxy

@@ -33,8 +33,6 @@ namespace proxy {
 // 密码类型
 // ============================================================================
 
-// 根据方法名获取密码参数（不区分大小写），含 AEAD 与 2022-blake3 方法。
-[[nodiscard]] std::optional<SsCipherInfo> ParseCipherMethod(std::string_view method);
 [[nodiscard]] bool Is2022Cipher(SsCipherType type) noexcept;
 [[nodiscard]] bool Is2022AesCipher(SsCipherType type) noexcept;
 [[nodiscard]] SsCipherType BaseCipherType(SsCipherType type) noexcept;

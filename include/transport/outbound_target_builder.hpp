@@ -42,23 +42,6 @@ struct OutboundSenderSettings {
 };
 
 
-// The one validator for a configured next hop: a non-empty IP literal or DNS
-// hostname and a non-zero port.
-[[nodiscard]] inline tl::expected<OutboundServer, std::string_view> MakeOutboundServer(
-    std::string address, uint16_t port) {
-    if (address.empty()) return tl::unexpected(std::string_view("server address is required"));
-    if (port == 0) return tl::unexpected(std::string_view("server port is required"));
-    auto literal = common::ParseLiteral(address);
-    if (!literal && !common::IsValidDnsHostname(address, common::TrailingDotPolicy::Allow)) {
-        return tl::unexpected(std::string_view(
-            "server address must be an IP literal or DNS hostname"));
-    }
-    return OutboundServer{
-        .address = std::move(address),
-        .literal_address = literal,
-        .port = port,
-    };
-}
 
 // 单个候选拨号地址
 struct OutboundDialCandidate {

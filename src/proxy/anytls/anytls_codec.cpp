@@ -7,6 +7,7 @@
 #include "transport/async_stream.hpp"
 
 #include <openssl/evp.h>
+#include <openssl/sha.h>
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -18,6 +19,11 @@
 
 namespace proxy {
 
+std::array<uint8_t, 32> HashAnyTlsPassword(std::string_view password) noexcept {
+    std::array<uint8_t, 32> out{};
+    SHA256(reinterpret_cast<const uint8_t*>(password.data()), password.size(), out.data());
+    return out;
+}
 
 namespace {
 

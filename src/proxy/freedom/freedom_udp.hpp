@@ -5,7 +5,6 @@
 // 而不是 .cpp 内。
 
 #include "app/dns.hpp"
-#include "common/length_prefixed_packet_buffer.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/error.hpp"
 #include "common/ip_address.hpp"

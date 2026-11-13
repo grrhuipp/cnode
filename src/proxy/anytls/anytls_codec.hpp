@@ -42,13 +42,6 @@ struct AdmissionEnvironment;
 }  // namespace app
 namespace proxy {
 
-[[nodiscard]] inline std::array<uint8_t, 32> HashAnyTlsPassword(std::string_view password) noexcept {
-    std::array<uint8_t, 32> out{};
-    unsigned int out_len = 0;
-    EVP_Digest(password.data(), password.size(), out.data(), &out_len,
-               EVP_sha256(), nullptr);
-    return out;
-}
 
 inline constexpr uint8_t kCmdWaste = 0;
 inline constexpr uint8_t kCmdSYN = 1;
