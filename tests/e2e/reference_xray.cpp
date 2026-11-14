@@ -1,4 +1,5 @@
 #include "reference_support.hpp"
+#include "udp_wire.hpp"
 
 namespace cnode::e2e::reference {
 namespace {
@@ -160,6 +161,83 @@ INSTANTIATE_TEST_SUITE_P(BothDirections, VisionReference,
             std::array{"Plain", "Tls12", "Tls13"}[std::get<1>(info.param)];
     }));
 
+// Xray carries Vision UDP as XUDP inside Mux.Cool (proxy/vless outbound and
+// inbound XRV handling); both cnode sides must speak it to real Xray.
+class VisionUdpReference : public testing::TestWithParam<bool> {};
+TEST_P(VisionUdpReference, XudpDatagramsRoundTripThroughVision) {
+    const bool xray_client = GetParam();
+    VerifyXray(CNODE_REFERENCE_XRAY);
+    BinaryGuard binaries{Binary(), CNODE_REFERENCE_XRAY};
+    TempDir root;
+    const std::array<std::string, 3> datagrams{"u", Pattern(512), Pattern(1200)};
+    auto echo = Socket::BindUdp();
+    std::thread echo_thread([&] {
+        for (size_t i = 0; i != datagrams.size(); ++i) {
+            const auto packet = udp::Receive(echo, 10s);
+            udp::Reply(echo, packet, packet.payload);
+        }
+    });
+    auto server_reservation = Socket::ReserveTcp(), front_reservation = Socket::ReserveTcp();
+    const auto server_port = server_reservation.Port(), front_port = front_reservation.Port();
+    Json xray;
+    const Json user = {{"id", UserId}, {"encryption", "none"}, {"flow", "xtls-rprx-vision"}};
+    if (xray_client) {
+        auto inbound = VlessInbound(server_port);
+        inbound["settings"]["clients"][0]["flow"] = "xtls-rprx-vision";
+        inbound["streamSettings"] = TlsSettings(true);
+        Configure(root.Path(), inbound, Freedom(), 4);
+        auto outbound = XrayOutbound(server_port, user);
+        outbound["streamSettings"] = {{"network", "tcp"}, {"security", "tls"}, {"tlsSettings", {
+            {"serverName", "localhost"}, {"certificates", Json::array({{{"usage", "verify"},
+            {"certificateFile", (SourceRoot() / "tests/fixtures/anytls-pool/cert.pem").string()}}})}}}};
+        auto socks = SocksInbound(front_port);
+        socks["settings"]["udp"] = true;
+        socks["settings"]["ip"] = "127.0.0.1";
+        xray = {{"inbounds", Json::array({socks})}, {"outbounds", Json::array({outbound})}};
+    } else {
+        Configure(root.Path(), VlessInbound(front_port), {{"protocol", "vless"}, {"settings", {
+            {"address", "127.0.0.1"}, {"port", server_port}, {"id", UserId}, {"encryption", "none"},
+            {"flow", "xtls-rprx-vision"}}}, {"streamSettings", TlsSettings(false)}}, 4);
+        auto inbound = VlessInbound(server_port);
+        inbound["settings"]["clients"][0]["flow"] = "xtls-rprx-vision";
+        inbound["streamSettings"] = TlsSettings(true);
+        xray = {{"inbounds", Json::array({inbound})}, {"outbounds", Json::array({Freedom(true)})}};
+    }
+    WriteJson(root.Path(), "xray.json", xray);
+    (xray_client ? front_reservation : server_reservation).Close();
+    Child reference({CNODE_REFERENCE_XRAY, "run", "-config", (root.Path() / "xray.json").string()}, root.Path() / "xray.log");
+    reference.WaitForLog("started");
+    Child cnode({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "cnode.log");
+    auto control = Connect(front_port);
+    if (xray_client) {
+        const auto relay_port = Socks(control, 0, 3);
+        auto client = Socket::BindUdp();
+        const auto header = std::string(3, '\0') + SocksAddress(echo.Port());
+        for (const auto& datagram : datagrams) {
+            client.SendTo(header + datagram, relay_port);
+            const auto reply = udp::Receive(client, 5s).payload;
+            ASSERT_GE(reply.size(), header.size());
+            EXPECT_EQ(reply.substr(header.size()), datagram);
+        }
+    } else {
+        control.Write(VlessRequest(echo.Port(), {}, 2));
+        bool response_header = true;
+        for (const auto& datagram : datagrams) {
+            control.Write(BigEndian(datagram.size(), 2) + datagram);
+            if (std::exchange(response_header, false)) {
+                EXPECT_EQ(control.ReadExact(2), std::string("\0\0", 2));
+            }
+            const auto size = static_cast<size_t>(ReadBigEndian(control.ReadExact(2)));
+            EXPECT_EQ(control.ReadExact(size), datagram);
+        }
+    }
+    echo_thread.join();
+    EXPECT_TRUE(cnode.Running()); EXPECT_TRUE(reference.Running());
+    binaries.Check();
+}
+INSTANTIATE_TEST_SUITE_P(BothDirections, VisionUdpReference, testing::Bool(),
+    [](const auto& info) { return std::string(info.param ? "XrayClient" : "XrayServer"); });
+
 std::pair<std::string, std::string> EncryptionKeys(std::string_view mode) {
     const auto keys = Command({CNODE_REFERENCE_XRAY, "vlessenc"});
     auto key = [&](std::string_view name) {
@@ -246,12 +324,17 @@ TEST_P(EncryptionReference, CrossWorkerTicketsReplayAndHandshakeBoundaries) {
         } else if (kind == "timeout") EXPECT_TRUE(peer_logs.find("timeout") != std::string::npos || peer_logs.find("timed out") != std::string::npos);
         else EXPECT_NE(peer_logs.find("encryption handshake " + kind), std::string::npos) << peer_logs;
     }
-    const std::regex tickets("ticket lookup owner=(\\d+) receiver=(\\d+) accepted=(true|false)");
+    // One full handshake issues the ticket; every later lookup names the
+    // Worker that received it, so owner != receiver proves cross-Worker use.
+    std::smatch issued;
+    ASSERT_TRUE(std::regex_search(logs, issued, std::regex("ticket issued worker=(\\d+) stored=true")));
+    const auto owner = issued[1].str();
+    const std::regex tickets("ticket lookup worker=(\\d+) accepted=(true|false)");
     size_t accepted = 0, rejected = 0, cross_accepts = 0, same_rejects = 0, cross_rejects = 0;
     std::set<std::string> receivers;
     for (auto it = std::sregex_iterator(logs.begin(), logs.end(), tickets); it != std::sregex_iterator(); ++it) {
-        const bool same = (*it)[1].str() == (*it)[2].str();
-        if ((*it)[3] == "true") { ++accepted; receivers.insert((*it)[2]); cross_accepts += !same; }
+        const bool same = (*it)[1].str() == owner;
+        if ((*it)[2] == "true") { ++accepted; receivers.insert((*it)[1]); cross_accepts += !same; }
         else { ++rejected; same_rejects += same; cross_rejects += !same; }
     }
     EXPECT_EQ(accepted, 16); EXPECT_EQ(rejected, 64); EXPECT_GE(receivers.size(), 2u);

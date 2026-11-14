@@ -39,6 +39,9 @@ struct VlessOutboundConfig {
     std::array<uint8_t, 16> uuid_bytes{};
     std::shared_ptr<const proxy::VlessEncryptionConfig> encryption;
     std::string flow;
+    // Xray "xtls-rprx-vision-udp443": wire flow stays plain Vision; only the
+    // local UDP/443 rejection is lifted.
+    bool vision_udp443 = false;
     bool packet_xudp = true;
     bool packet_addr = false;
 
@@ -269,13 +272,17 @@ private:
 
 class VlessMuxUdpEndpoint final : public proxy::OutboundStreamEndpointBase {
 public:
+    // `header_reader` owns the VLESS response header; `body_reader` yields the
+    // Mux.Cool stream after it (the same reader, or Vision layered on top).
     VlessMuxUdpEndpoint(transport::AsyncStream& control,
-                        proxy::BufferedStreamReader& reader,
+                        proxy::BufferedStreamReader& header_reader,
+                        transport::MultiBufferReader& body_reader,
                         transport::MultiBufferWriter& writer,
                         const common::TargetAddress& udp_target,
                         common::ForwardedMetadataView forwarded) noexcept
         : OutboundStreamEndpointBase(control)
-        , reader_(reader)
+        , header_reader_(header_reader)
+        , body_reader_(body_reader)
         , writer_(writer)
         , udp_target_(udp_target)
         , forwarded_(forwarded) {}
@@ -289,7 +296,7 @@ public:
         }
         if (!response_header_.complete) {
             co_await ReadVlessResponseHeader(
-                reader_, response_header_, "VLESS mux response header read failed");
+                header_reader_, response_header_, "VLESS mux response header read failed");
         }
 
         while (true) {
@@ -346,7 +353,7 @@ public:
                 co_return payload;
             }
 
-            common::MultiBuffer raw = co_await reader_.ReadMultiBuffer();
+            common::MultiBuffer raw = co_await body_reader_.ReadMultiBuffer();
             if (raw.byte_size() == 0) {
                 co_await common::ThrowIfCancelledOnEof();
                 if (pending_.byte_size() != 0) {
@@ -426,7 +433,8 @@ private:
         return header_len;
     }
 
-    proxy::BufferedStreamReader& reader_;
+    proxy::BufferedStreamReader& header_reader_;
+    transport::MultiBufferReader& body_reader_;
     transport::MultiBufferWriter& writer_;
     const common::TargetAddress& udp_target_;
     common::ForwardedMetadataView forwarded_;
@@ -642,15 +650,29 @@ RelayVlessFramedOutbound(
     transport::MultiBufferWriter& active_writer,
     const VlessOutboundConfig& config,
     bool is_udp,
+    bool use_vision,
     bool use_xudp,
     bool use_packet_addr,
     app::StatsShard& stats,
     const app::RelayConfig& relay_config,
     common::MultiBufferBatch first_payload) {
     const auto& target = ctx.outbound.target;
+    if (use_xudp && use_vision) {
+        // Xray outbound: Vision UDP becomes XUDP Mux.Cool framed inside Vision.
+        ::proxy::VisionTrafficState traffic;
+        ::proxy::VisionReader vision_reader(active_reader, config.uuid_bytes, traffic);
+        ::proxy::VisionWriter vision_writer(active_writer, config.uuid_bytes, traffic);
+        VlessMuxUdpEndpoint target_endpoint(
+            stream, active_reader, vision_reader, vision_writer, target,
+            dialer.ForwardedMetadata(ctx));
+        co_return co_await app::DoRelayLink(
+            dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
+            target_endpoint, ctx, stats, relay_config, std::move(first_payload));
+    }
     if (use_xudp) {
         VlessMuxUdpEndpoint target_endpoint(
-            stream, active_reader, active_writer, target, dialer.ForwardedMetadata(ctx));
+            stream, active_reader, active_reader, active_writer, target,
+            dialer.ForwardedMetadata(ctx));
         co_return co_await app::DoRelayLink(
             dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
             target_endpoint, ctx, stats, relay_config, std::move(first_payload));
@@ -693,10 +715,16 @@ VlessOutboundHandler::Process(
             co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         }();
     }
-    if (!config_->flow.empty() && ctx.content.network != common::Network::TCP) {
-        return []() -> net::awaitable<OutboundProcessResult> {
-            co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
-        }();
+    if (!config_->flow.empty()) {
+        const auto network = ctx.content.network;
+        const bool rejected_udp443 = network == common::Network::UDP &&
+            ctx.outbound.target.port == 443 && !config_->vision_udp443;
+        if ((network != common::Network::TCP && network != common::Network::UDP) ||
+            rejected_udp443) {
+            return []() -> net::awaitable<OutboundProcessResult> {
+                co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
+            }();
+        }
     }
     if (!config_->encryption) {
         return ProcessPlain(
@@ -717,8 +745,8 @@ VlessOutboundHandler::ProcessPlain(
     common::MultiBufferBatch first_payload) {
     const bool is_udp = ctx.content.network == common::Network::UDP;
     const bool use_vision = !config_->flow.empty();
-    const bool use_xudp = is_udp && config_->packet_xudp;
-    const bool use_packet_addr = is_udp && config_->packet_addr;
+    const bool use_xudp = is_udp && (config_->packet_xudp || use_vision);
+    const bool use_packet_addr = is_udp && config_->packet_addr && !use_vision;
 
     std::unique_ptr<transport::AsyncStream> stream;
     {
@@ -735,7 +763,7 @@ VlessOutboundHandler::ProcessPlain(
     if (is_udp || use_vision) {
         co_return co_await RelayVlessFramedOutbound(
             ctx, inbound, dialer, *stream, protocol_reader, *stream,
-            *config_, is_udp, use_xudp, use_packet_addr,
+            *config_, is_udp, use_vision, use_xudp, use_packet_addr,
             stats, relay_config, std::move(first_payload));
     }
     VlessTcpOutboundEndpoint target_endpoint(*stream, protocol_reader, *stream);
@@ -765,8 +793,8 @@ VlessOutboundHandler::ProcessEncrypted(
 
     const bool is_udp = ctx.content.network == common::Network::UDP;
     const bool use_vision = !config_->flow.empty();
-    const bool use_xudp = is_udp && config_->packet_xudp;
-    const bool use_packet_addr = is_udp && config_->packet_addr;
+    const bool use_xudp = is_udp && (config_->packet_xudp || use_vision);
+    const bool use_packet_addr = is_udp && config_->packet_addr && !use_vision;
     VlessClientTicketLease tickets(encryption_tickets_ ? &*encryption_tickets_ : nullptr);
     proxy::BufferedStreamReader protocol_reader(*stream);
     transport::MultiBufferWriter& protocol_writer = *stream;
@@ -792,7 +820,7 @@ VlessOutboundHandler::ProcessEncrypted(
     if (is_udp || use_vision) {
         res = co_await RelayVlessFramedOutbound(
             ctx, inbound, dialer, *stream, *active_reader, *active_writer,
-            *config_, is_udp, use_xudp, use_packet_addr,
+            *config_, is_udp, use_vision, use_xudp, use_packet_addr,
             stats, relay_config, std::move(first_payload));
     } else {
         VlessTcpOutboundEndpoint target_endpoint(*stream, *active_reader, *active_writer);
@@ -816,7 +844,10 @@ const bool kVlessRegistered = (::app::RegisterProxy(
         if (!settings) return std::nullopt;
         ::proxy::VlessOutboundConfig vless_config;
         vless_config.uuid_bytes = settings->id;
-        vless_config.flow = settings->flow;
+        constexpr std::string_view kVisionUdp443Flow = "xtls-rprx-vision-udp443";
+        vless_config.vision_udp443 = settings->flow == kVisionUdp443Flow;
+        vless_config.flow = vless_config.vision_udp443
+            ? std::string(::proxy::kVisionFlow) : settings->flow;
         vless_config.encryption = settings->encryption;
         vless_config.packet_xudp = settings->packet_encoding == ::infra::PacketEncoding::Xudp;
         vless_config.packet_addr = settings->packet_encoding == ::infra::PacketEncoding::PacketAddr;

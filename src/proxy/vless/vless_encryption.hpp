@@ -690,7 +690,8 @@ RunVlessEncryptionServerHandshake(
     proxy::BufferedStreamReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
     const std::shared_ptr<const VlessEncryptionConfig>& config,
-    std::string_view inbound_tag);
+    std::string_view inbound_tag,
+    uint32_t worker_id);
 
 // Directory entries carry only routing/lifetime metadata. PFS secrets and the
 // mutable replay set are accessed exclusively on the ticket owner's domain.

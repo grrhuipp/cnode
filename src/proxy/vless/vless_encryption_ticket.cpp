@@ -1,6 +1,5 @@
 #include "proxy/vless/vless_encryption.hpp"
 #include "app/group_coordinator.hpp"
-#include "infra/log.hpp"
 
 #include <blake3.h>
 
@@ -212,10 +211,7 @@ net::awaitable<std::optional<Resumed>> LookupVlessTicket(
          ticket, nfs = std::move(nfs)]() -> std::optional<Resumed> {
             auto* store = net::use_service<TicketDirectoryService>(
                 coordinator.Services()).Find(config.get(), tag);
-            auto result = store ? store->Lookup(ticket, nfs, Clock::now()) : std::nullopt;
-            LOG_NET_DEBUG("inbound '{}' ticket lookup accepted={}",
-                          tag, result.has_value());
-            return result;
+            return store ? store->Lookup(ticket, nfs, Clock::now()) : std::nullopt;
         });
 }
 }  // namespace proxy

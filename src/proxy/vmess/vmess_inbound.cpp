@@ -212,7 +212,8 @@ proxy::VmessInboundHandler::Process(
             ctx,
             environment_.stats,
             timeouts,
-            pressure_idle_timeout);
+            pressure_idle_timeout,
+            proxy::MuxAllowedNetwork::Any);
     }
 
     co_return co_await dispatcher.Dispatch(

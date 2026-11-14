@@ -45,6 +45,10 @@ namespace proxy {
 // environment: each child takes logical admission under the physical family;
 // a refused child closes with OptionError without affecting its parent.
 // ============================================================================
+// Xray session.AllowedNetwork for a Mux.Cool parent: Vision carries only XUDP
+// sub-sessions, so a TCP NEW frame breaks the whole parent connection.
+enum class MuxAllowedNetwork : uint8_t { Any, Udp };
+
 net::awaitable<app::RelayResult> ServeMuxInbound(
     net::io_context& io_context,
     transport::Link client_link,
@@ -55,6 +59,7 @@ net::awaitable<app::RelayResult> ServeMuxInbound(
     common::Context& parent_ctx,
     app::StatsShard& stats,
     const infra::TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout);
+    uint32_t pressure_idle_timeout,
+    MuxAllowedNetwork allowed_network);
 
 }  // namespace proxy

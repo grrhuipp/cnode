@@ -273,7 +273,8 @@ net::awaitable<app::RelayResult> RunMux(std::unique_ptr<transport::AsyncStream> 
     net::io_context& io, const app::AdmissionEnvironment& environment,
     common::Context& context, app::StatsShard& stats, const infra::TimeoutsConfig& timeouts) {
     co_return co_await proxy::ServeMuxInbound(io, {stream.get(), stream.get(), stream.get()},
-        *stream, dispatcher, receiver.dispatch_policy, environment, context, stats, timeouts, 0);
+        *stream, dispatcher, receiver.dispatch_policy, environment, context, stats, timeouts, 0,
+        proxy::MuxAllowedNetwork::Any);
 }
 
 void RunCase(int mode, bool blocked_writes, bool mux) {

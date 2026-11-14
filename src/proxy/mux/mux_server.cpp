@@ -810,10 +810,11 @@ public:
         transport::AsyncStream& client_control, routing::Dispatcher& dispatcher,
         const routing::DispatchPolicy& policy, const app::AdmissionEnvironment& environment,
         common::Context& parent_ctx, app::StatsShard& stats, const infra::TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout)
+        uint32_t pressure_idle_timeout, MuxAllowedNetwork allowed_network)
         : io_context(io_context), client_link(client_link), client_control(client_control),
           dispatcher(dispatcher), policy(policy), environment(environment), parent_ctx(parent_ctx),
           stats(stats), timeouts(timeouts), pressure_idle_timeout(pressure_idle_timeout),
+          allowed_network(allowed_network),
           main_signal(net::any_io_executor(io_context.get_executor()), 1),
           reply_queue(main_signal), client_reads(io_context, main_signal),
           parent_conn_id(parent_ctx.conn_id) {}
@@ -1129,6 +1130,14 @@ private:
                 // ----------------------------------------------------------------
                 case common::SessionStatus::NEW: {
                     const bool is_udp = hdr.network == common::NetworkType::UDP;
+                    if (!is_udp && allowed_network == MuxAllowedNetwork::Udp) {
+                        LOG_CONN_WARN(parent_ctx,
+                            "mux NEW sid={} carries TCP where only UDP is allowed",
+                            hdr.session_id);
+                        result.error = common::ErrorCode::PROTOCOL_UNSUPPORTED;
+                        running = false;
+                        break;
+                    }
                     // A reused ID or a sub-session beyond the budget is refused
                     // with an error END; the refused frame's payload is dropped.
                     const bool duplicate_sid = sub_sessions.contains(hdr.session_id);
@@ -1338,6 +1347,7 @@ private:
     app::StatsShard& stats;
     const infra::TimeoutsConfig& timeouts;
     uint32_t pressure_idle_timeout;
+    MuxAllowedNetwork allowed_network;
     common::SignalChannel main_signal;
     ReplyQueueState reply_queue;
     ClientReadQueueState client_reads;
@@ -1362,11 +1372,12 @@ net::awaitable<app::RelayResult> ServeMuxInbound(
     common::Context& parent_ctx,
     app::StatsShard& stats,
     const infra::TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout)
+    uint32_t pressure_idle_timeout,
+    MuxAllowedNetwork allowed_network)
 {
     try {
         MuxServerSession session(io_context, client_link, client_control, dispatcher, policy,
-            environment, parent_ctx, stats, timeouts, pressure_idle_timeout);
+            environment, parent_ctx, stats, timeouts, pressure_idle_timeout, allowed_network);
         co_return co_await session.Run();
     } catch (...) {
         stats.OnError();

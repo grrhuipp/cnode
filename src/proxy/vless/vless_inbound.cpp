@@ -203,7 +203,8 @@ CompleteVlessInboundHandshake(
                     protocol_reader,
                     protocol_writer,
                     decryption,
-                    tag);
+                    tag,
+                    ctx.worker_id);
             if (!runtime) {
                 if (proxy::ConsumeStreamReadTimeout(stream)) {
                     LOG_CONN_WARN(ctx, "encryption handshake timed out from {}:{}",
@@ -298,8 +299,10 @@ CompleteVlessInboundHandshake(
     if (request.flow.empty() && ::proxy::IsVisionFlow(user_info->flow)) {
         co_return tl::unexpected(std::move(bound).Reject("missing required flow", common::ErrorCode::PROTOCOL_UNSUPPORTED));
     }
-    if (use_vision && request.command != ::proxy::VlessCommand::TCP) {
-        co_return tl::unexpected(std::move(bound).Reject("flow only supports TCP", common::ErrorCode::PROTOCOL_UNSUPPORTED));
+    // Xray carries Vision UDP as XUDP inside Mux.Cool; a bare UDP command is
+    // never produced by a Vision client.
+    if (use_vision && request.command == ::proxy::VlessCommand::UDP) {
+        co_return tl::unexpected(std::move(bound).Reject("flow does not support UDP", common::ErrorCode::PROTOCOL_UNSUPPORTED));
     }
     if (use_vision &&
         (!(receiver.stream_settings.IsTlsLike() || decryption != nullptr) ||
@@ -316,8 +319,9 @@ CompleteVlessInboundHandshake(
 
     if (issued_ticket) {
         try {
-            (void)co_await ::proxy::AuthenticateVlessTicket(
+            const bool stored = co_await ::proxy::AuthenticateVlessTicket(
                 environment.coordinator, decryption, tag, std::move(*issued_ticket), request.uuid);
+            LOG_NET_DEBUG("inbound '{}' ticket issued worker={} stored={}", tag, ctx.worker_id, stored);
         } catch (...) {
             co_return tl::unexpected(proxy::ClassifyInboundHandshakeException(std::current_exception()));
         }
@@ -396,6 +400,36 @@ net::awaitable<app::RelayResult> DispatchVlessVision(
         timeouts);
 }
 
+net::awaitable<app::RelayResult> DispatchVlessVisionMux(
+    std::unique_ptr<transport::AsyncStream> stream,
+    proxy::BufferedStreamReader& active_reader,
+    transport::MultiBufferWriter& active_writer,
+    std::array<uint8_t, 16> request_uuid,
+    routing::Dispatcher& dispatcher,
+    const app::ReceiverSettings& receiver,
+    net::io_context& io_context,
+    common::Context& ctx,
+    const app::AdmissionEnvironment& environment,
+    const infra::TimeoutsConfig& timeouts,
+    uint32_t pressure_idle_timeout) {
+    ::proxy::VisionTrafficState traffic;
+    ::proxy::VisionReader vision_reader(active_reader, request_uuid, traffic);
+    ::proxy::VisionWriter vision_writer(active_writer, request_uuid, traffic);
+    OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
+    co_return co_await proxy::ServeMuxInbound(
+        io_context,
+        transport::Link{&vision_reader, &vision_writer},
+        *stream,
+        dispatcher,
+        receiver.dispatch_policy,
+        environment,
+        ctx,
+        environment.stats,
+        timeouts,
+        pressure_idle_timeout,
+        proxy::MuxAllowedNetwork::Udp);
+}
+
 struct VlessSessionMeta {
     bool packet_addr_udp = false;
     bool use_vision = false;
@@ -415,6 +449,20 @@ net::awaitable<app::RelayResult> DispatchVlessSession(
     const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
     if (ctx.content.network == common::Network::MUX) {
+        if (meta.use_vision) {
+            return DispatchVlessVisionMux(
+                std::move(stream),
+                active_reader,
+                response_writer,
+                request_uuid,
+                dispatcher,
+                receiver,
+                io_context,
+                ctx,
+                environment,
+                timeouts,
+                pressure_idle_timeout);
+        }
         return proxy::ServeMuxInbound(
             io_context,
             transport::Link{&active_reader, &response_writer},
@@ -425,7 +473,8 @@ net::awaitable<app::RelayResult> DispatchVlessSession(
             ctx,
             environment.stats,
             timeouts,
-            pressure_idle_timeout);
+            pressure_idle_timeout,
+            proxy::MuxAllowedNetwork::Any);
     }
     if (ctx.content.network == common::Network::UDP) {
         return DispatchVlessUdp(

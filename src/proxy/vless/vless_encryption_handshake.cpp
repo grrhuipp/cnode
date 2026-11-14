@@ -1,5 +1,6 @@
 #include "proxy/vless/vless_encryption.hpp"
 #include "common/scoped_cleanse.hpp"
+#include "infra/log.hpp"
 
 #include <blake3.h>
 #include <openssl/rand.h>
@@ -1017,7 +1018,7 @@ net::awaitable<VlessEncryptionHandshakeResult> ResumeServerTicket(
     app::GroupCoordinator& coordinator,
     proxy::BufferedStreamReader& raw_reader, transport::MultiBufferWriter& raw_writer,
     const std::shared_ptr<const VlessEncryptionConfig>& namespace_config,
-    std::string_view inbound_tag, const VlessEncryptionServerNfsOpenResult& nfs,
+    std::string_view inbound_tag, uint32_t worker_id, const VlessEncryptionServerNfsOpenResult& nfs,
     VlessEncryptionAead& nfs_aead, VlessEncryptionAeadCipher cipher) {
     const auto& config = *namespace_config;
         std::array<uint8_t, kVlessEncryptionEncryptedTicketSize>
@@ -1037,6 +1038,8 @@ net::awaitable<VlessEncryptionHandshakeResult> ResumeServerTicket(
 
         auto pfs_key = co_await LookupVlessTicket(
             coordinator, namespace_config, inbound_tag, *ticket, nfs.nfs_key);
+        LOG_NET_DEBUG("inbound '{}' ticket lookup worker={} accepted={}",
+                      inbound_tag, worker_id, pfs_key.has_value());
         if (!pfs_key) {
             co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
         }
@@ -1145,7 +1148,7 @@ RunVlessEncryptionServerHandshake(
     proxy::BufferedStreamReader& raw_reader,
     transport::MultiBufferWriter& raw_writer,
     const std::shared_ptr<const VlessEncryptionConfig>& namespace_config,
-    std::string_view inbound_tag) {
+    std::string_view inbound_tag, uint32_t worker_id) {
     if (!namespace_config) co_return tl::unexpected(VlessEncryptionHandshakeFailure::Rejected);
     const auto& config = *namespace_config;
     const auto relays_len = VlessEncryptionRelaysLength(config);
@@ -1207,7 +1210,7 @@ RunVlessEncryptionServerHandshake(
 
     if (*client_pfs_length == kVlessEncryptionEncryptedTicketSize) {
         co_return co_await ResumeServerTicket(coordinator, raw_reader, raw_writer, namespace_config,
-            inbound_tag, *nfs, *nfs_aead, cipher);
+            inbound_tag, worker_id, *nfs, *nfs_aead, cipher);
     }
     co_return co_await CompleteServerPfs(raw_reader, raw_writer, config, *nfs, *nfs_aead, cipher);
 }
