@@ -168,7 +168,6 @@ ReadVlessRequestHeader(proxy::BufferedStreamReader& active_reader,
 
 struct VlessHandshakeOutcome {
     common::UserOnlineSessionGuard user_session;
-    common::Network net = common::Network::TCP;
     bool packet_addr_udp = false;
     bool use_vision = false;
     std::array<uint8_t, 16> request_uuid{};
@@ -326,7 +325,6 @@ CompleteVlessInboundHandshake(
 
     co_return VlessHandshakeOutcome{
         .user_session = std::move(*user_session),
-        .net = net,
         .packet_addr_udp = packet_addr_udp,
         .use_vision = use_vision,
         .request_uuid = use_vision ? request.uuid : std::array<uint8_t, 16>{},
@@ -399,7 +397,6 @@ net::awaitable<app::RelayResult> DispatchVlessVision(
 }
 
 struct VlessSessionMeta {
-    common::Network net = common::Network::TCP;
     bool packet_addr_udp = false;
     bool use_vision = false;
 };
@@ -417,7 +414,7 @@ net::awaitable<app::RelayResult> DispatchVlessSession(
     const app::AdmissionEnvironment& environment,
     const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
-    if (meta.net == common::Network::MUX) {
+    if (ctx.content.network == common::Network::MUX) {
         return proxy::ServeMuxInbound(
             io_context,
             transport::Link{&active_reader, &response_writer},
@@ -430,7 +427,7 @@ net::awaitable<app::RelayResult> DispatchVlessSession(
             timeouts,
             pressure_idle_timeout);
     }
-    if (meta.net == common::Network::UDP) {
+    if (ctx.content.network == common::Network::UDP) {
         return DispatchVlessUdp(
             std::move(stream),
             active_reader,
@@ -564,7 +561,6 @@ proxy::VlessInboundHandler::ProcessPlain(
         }
         user_session = std::move(handshake->user_session);
         meta = {
-            .net = handshake->net,
             .packet_addr_udp = handshake->packet_addr_udp,
             .use_vision = handshake->use_vision,
         };
@@ -625,7 +621,6 @@ proxy::VlessInboundHandler::ProcessEncrypted(
         active_writer = handshake->active.writer;
         user_session = std::move(handshake->user_session);
         meta = {
-            .net = handshake->net,
             .packet_addr_udp = handshake->packet_addr_udp,
             .use_vision = handshake->use_vision,
         };

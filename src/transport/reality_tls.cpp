@@ -77,8 +77,11 @@ void RealityClientHelloReader::AppendPayload(std::span<const uint8_t> bytes) {
         return;
     }
     remaining_ -= bytes.size();
-    if (hello_.capacity() < hello_.size() + bytes.size()) {
-        hello_.reserve(hello_.size() + bytes.size());
+    const size_t required = hello_.size() + bytes.size();
+    if (required > hello_.capacity()) {
+        hello_.reserve(std::min(
+            kMaxHelloSize,
+            std::max(required, std::max<size_t>(256, hello_.capacity() * 2))));
     }
     if (hello_.size() < 4) {
         const size_t header_bytes = std::min(bytes.size(), 4 - hello_.size());

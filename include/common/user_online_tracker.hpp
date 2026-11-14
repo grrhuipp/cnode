@@ -72,6 +72,10 @@ public:
 private:
     friend class UserOnlineSessionGuard;
     struct DeviceReservation;
+    struct DeviceReservationDeleter {
+        void operator()(DeviceReservation* node) const noexcept;
+    };
+    using ReservationPtr = std::unique_ptr<DeviceReservation, DeviceReservationDeleter>;
     using DeviceIpMap =
         std::unordered_map<std::string,
                            uint32_t,
@@ -119,7 +123,7 @@ private:
     void Reset() noexcept;
 
     UserOnlineTracker* tracker_ = nullptr;
-    std::shared_ptr<UserOnlineTracker::DeviceReservation> quota_reservation_;
+    UserOnlineTracker::ReservationPtr quota_reservation_;
 };
 
 }  // namespace common

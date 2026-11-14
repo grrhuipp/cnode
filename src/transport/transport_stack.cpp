@@ -85,7 +85,7 @@ net::awaitable<void> RunRealityFallbackProxy(
     const InboundFallbackContext& fallback,
     std::unique_ptr<TcpStream> client_tcp,
     const RealityConfig& reality,
-    std::vector<uint8_t> initial_bytes) {
+    common::MultiBuffer initial_wire) {
     common::Context& ctx = fallback.ctx;
     const infra::TimeoutsConfig& timeouts = fallback.timeouts;
 
@@ -114,6 +114,7 @@ net::awaitable<void> RunRealityFallbackProxy(
     }
 
     if (!dest_stream || !client_tcp->IsOpen()) {
+        initial_wire.clear();
         if (dest_stream) dest_stream->CloseAbortive();
         client_tcp->CloseAbortive();
         co_return;
@@ -131,9 +132,17 @@ net::awaitable<void> RunRealityFallbackProxy(
             client_tcp->LocalEndpoint(),
             proxy_header);
         first_ok = first.AppendSpan(std::span<const uint8_t>(proxy_header.data(), proxy_header_len));
+        if (first_ok) {
+            try {
+                initial_wire.MoveTo(first);
+            } catch (...) {
+                first_ok = false;
+            }
+        }
+        initial_wire.clear();
+    } else {
+        first = std::move(initial_wire);
     }
-    first_ok = first_ok && first.AppendSpan(initial_bytes);
-    std::vector<uint8_t>{}.swap(initial_bytes);
     if (!first_ok) {
         dest_stream->CloseAbortive();
         client_tcp->CloseAbortive();
@@ -191,7 +200,7 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
             LOG_CONN_ERROR(conn_id, "REALITY dest fallback requires an inbound fallback context");
             co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
         }
-        std::vector<uint8_t> initial_bytes;
+        common::MultiBuffer fallback_wire;
         {
             // The caller's absolute phase deadline covers sniffing and SSL_accept;
             // never restart it when another record/fragment arrives.
@@ -214,10 +223,9 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
                     reality_conn_state = VerifyRealityClientHello(
                         reader.TakeHello(), *ctx);
                 }
-                if (!reality_conn_state) {
-                    const auto wire = pending.FrontSpan().first(consumed);
-                    initial_bytes.assign(wire.begin(), wire.end());
-                    (void)pending.DropPrefixBytes(consumed);
+                if (!reality_conn_state &&
+                    !pending.MovePrefixTo(fallback_wire, consumed)) {
+                    co_return tl::unexpected(common::ErrorCode::TLS_HANDSHAKE_FAILED);
                 }
                 tcp->PrependReadMultiBuffer(std::move(pending));
             } catch (...) {
@@ -234,7 +242,7 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
                 *fallback,
                 std::move(tcp),
                 s.reality,
-                std::move(initial_bytes));
+                std::move(fallback_wire));
             co_return std::unique_ptr<AsyncStream>{};
         }
     }

@@ -239,16 +239,12 @@ BeginInboundAuthentication(const AdmissionEnvironment& environment, common::Cont
 AuthenticateAndAdmit(InboundAuthentication authentication, const common::UserProfile* matched,
                      std::string_view mismatch_reason, std::optional<InboundRequestTarget> request) {
     if (!matched) {
-        auto rejection = authentication.RejectCredential(mismatch_reason);
-        mismatch_reason = {};
-        request.reset();
-        co_return tl::unexpected(co_await std::move(rejection));
+        return [](InboundAuthentication auth, std::string_view reason)
+            -> net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>> {
+            co_return tl::unexpected(co_await auth.RejectCredential(reason));
+        }(std::move(authentication), mismatch_reason);
     }
-    auto bound = std::move(authentication).Bind(*matched, std::move(request));
-    matched = nullptr;
-    mismatch_reason = {};
-    request.reset();
-    co_return co_await std::move(bound).Admit();
+    return std::move(authentication).Bind(*matched, std::move(request)).Admit();
 }
 
 struct NativeAssociationAdmission {

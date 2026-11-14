@@ -507,22 +507,12 @@ ReadAnyTlsFrameHeader(transport::AsyncStream& stream) {
 net::awaitable<tl::expected<std::string, common::ErrorCode>>
 ReadFrameText(transport::AsyncStream& stream, uint16_t length) {
     std::string text(length, '\0');
-    size_t filled = 0;
-    while (filled < length) {
-        size_t n = 0;
-        try {
-            n = co_await stream.AsyncRead(
-                net::buffer(text.data() + filled, length - filled));
-        } catch (const IoSystemError& error) {
-            co_return tl::unexpected(
-                proxy::ClassifyExactReadException(stream, error, true));
-        } catch (const std::bad_alloc&) {
-            co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
-        }
-        if (n == 0) {
-            co_return tl::unexpected(proxy::ClassifyExactReadEof(stream, true));
-        }
-        filled += n;
+    auto read = co_await proxy::ReadHandshakeExact(
+        stream,
+        std::span<uint8_t>(reinterpret_cast<uint8_t*>(text.data()), length),
+        proxy::HandshakeProgress::Started);
+    if (!read) {
+        co_return tl::unexpected(read.error());
     }
     co_return text;
 }

@@ -99,7 +99,9 @@ struct DeviceQuotaService final : net::execution_context::service {
     std::shared_ptr<DeviceQuota> quota;
 };
 
-struct DeviceReturn final : app::GroupCoordinator::ReservedOperation {
+} // namespace
+
+struct UserOnlineTracker::DeviceReservation final : app::GroupCoordinator::ReservedOperation {
     app::GroupCoordinator* coordinator = nullptr;
     std::shared_ptr<DeviceQuota> quota;
     std::string tag;
@@ -109,29 +111,28 @@ struct DeviceReturn final : app::GroupCoordinator::ReservedOperation {
     void Invoke() noexcept { quota->Release(tag, user, ip); }
 };
 
-} // namespace
-
-struct UserOnlineTracker::DeviceReservation {
-    std::unique_ptr<DeviceReturn> node;
-    ~DeviceReservation() {
-        if (node && node->admitted) {
-            auto* coordinator = node->coordinator;
-            coordinator->PostReserved(std::move(node));
-        }
+void UserOnlineTracker::DeviceReservationDeleter::operator()(
+    DeviceReservation* node) const noexcept {
+    if (!node) return;
+    if (node->admitted) {
+        auto* coordinator = node->coordinator;
+        coordinator->PostReserved(std::unique_ptr<DeviceReservation>(node));
+        return;
     }
-};
-
+    delete node;
+}
 
 void UserOnlineSessionGuard::Reset() noexcept {
     if (auto* tracker = std::exchange(tracker_, nullptr)) {
-        if (quota_reservation_ && quota_reservation_->node) {
-            const auto& node = *quota_reservation_->node;
-            tracker->OnUserDisconnected(node.tag, node.user, node.ip);
+        if (quota_reservation_) {
+            tracker->OnUserDisconnected(
+                quota_reservation_->tag,
+                quota_reservation_->user,
+                quota_reservation_->ip);
         }
     }
     quota_reservation_.reset();
 }
-
 
 net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConnectSession(
     std::string_view tag,
@@ -142,29 +143,30 @@ net::awaitable<std::optional<UserOnlineSessionGuard>> UserOnlineTracker::TryConn
         co_return std::optional<UserOnlineSessionGuard>(std::in_place);
     }
     const auto uid = static_cast<uint64_t>(user_id);
-    std::optional<UserOnlineSessionGuard> guard(std::in_place);
-    auto reservation = std::make_shared<DeviceReservation>();
-    reservation->node = std::make_unique<DeviceReturn>();
-    auto& node = *reservation->node;
-    node.coordinator = &coordinator_;
-    node.tag.assign(tag);
-    node.ip.assign(client_ip);
-    node.user = uid;
-    guard->quota_reservation_ = reservation;
-    const bool admitted = co_await coordinator_.PostCall(
-        [reservation, device_limit] {
-            auto& node = *reservation->node;
-            node.quota = net::use_service<DeviceQuotaService>(
-                node.coordinator->Services()).quota;
+    ReservationPtr reservation(new DeviceReservation());
+    reservation->coordinator = &coordinator_;
+    reservation->tag.assign(tag);
+    reservation->ip.assign(client_ip);
+    reservation->user = uid;
+    reservation = co_await coordinator_.PostCall(
+        [reservation = std::move(reservation), device_limit]() mutable -> ReservationPtr {
+            reservation->quota = net::use_service<DeviceQuotaService>(
+                reservation->coordinator->Services()).quota;
             if (!AcquireDeviceCount(
-                    node.quota->devices, node.tag, node.user, node.ip, device_limit)) {
-                return false;
+                    reservation->quota->devices,
+                    reservation->tag,
+                    reservation->user,
+                    reservation->ip,
+                    device_limit)) {
+                return nullptr;
             }
-            node.admitted = true;
-            return true;
+            reservation->admitted = true;
+            return std::move(reservation);
         });
-    if (!admitted) co_return std::nullopt;
-    (void)AcquireDeviceCount(devices_, node.tag, uid, node.ip, 0);
+    if (!reservation) co_return std::nullopt;
+    (void)AcquireDeviceCount(devices_, reservation->tag, uid, reservation->ip, 0);
+    std::optional<UserOnlineSessionGuard> guard(std::in_place);
+    guard->quota_reservation_ = std::move(reservation);
     guard->Arm(*this);
     co_return std::move(guard);
 }
