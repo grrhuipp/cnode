@@ -140,21 +140,10 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
         else SSL_set_connect_state(ssl.get());
         Resubscribe(tcp->Cancellation());
     }
-    Impl(std::unique_ptr<TcpStream> inner, SSL* existing_ssl)
-        : tcp(std::move(inner))
-        , ssl(existing_ssl, SSL_free) {
-        if (!tcp || !ssl) throw std::invalid_argument("TlsStream restore requires valid TcpStream and SSL");
-        BIO* bio = SSL_get_rbio(ssl.get());
-        if (!bio) throw std::logic_error("TlsStream restore missing SSL BIO");
-        BIO_set_data(bio, this);
-        Resubscribe(tcp->Cancellation());
-    }
 
     ~Impl() {
         Unsubscribe();
     }
-
-    void DetachSubscription() noexcept { Unsubscribe(); }
 
     void OnCancellation(transport::Cancellation event) noexcept override {
         ++cancel_epoch;
@@ -654,76 +643,6 @@ TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, const SslContext& ctx, bo
     : impl_(std::make_unique<Impl>(std::move(inner), ctx, is_server))
     , is_server_(is_server) {}
 
-TlsStream::TlsStream(std::unique_ptr<TcpStream> inner, SSL* existing_ssl, bool is_server)
-    : impl_(std::make_unique<Impl>(std::move(inner), existing_ssl))
-    , is_server_(is_server)
-    , handshake_done_(true) {}
-
-DetachedTlsState::~DetachedTlsState() noexcept {
-    if (ssl) SSL_free(ssl);
-}
-
-DetachedTlsState::DetachedTlsState(DetachedTlsState&& other) noexcept
-    : tcp(std::move(other.tcp))
-    , ssl(std::exchange(other.ssl, nullptr))
-    , is_server(other.is_server)
-    , plaintext_prefix(std::move(other.plaintext_prefix)) {}
-
-DetachedTlsState& DetachedTlsState::operator=(DetachedTlsState&& other) noexcept {
-    if (this != &other) {
-        if (ssl) SSL_free(ssl);
-        tcp = std::move(other.tcp);
-        ssl = std::exchange(other.ssl, nullptr);
-        is_server = other.is_server;
-        plaintext_prefix = std::move(other.plaintext_prefix);
-    }
-    return *this;
-}
-
-std::optional<DetachedTlsState> TlsStream::DetachForHandoff(
-    common::MultiBuffer plaintext_prefix) {
-    if (!handshake_done_ || impl_->handshaking || impl_->read_active ||
-        impl_->write_active || impl_->invocation || !impl_->tcp ||
-        !impl_->tcp->IsOpen()) {
-        return std::nullopt;
-    }
-    DetachedTlsState state;
-    state.is_server = is_server_;
-    if (impl_->prepended_plaintext) {
-        if (plaintext_prefix.empty()) {
-            plaintext_prefix = std::move(impl_->prepended_plaintext->data);
-        } else {
-            impl_->prepended_plaintext->data.MoveTo(plaintext_prefix);
-        }
-        impl_->prepended_plaintext.reset();
-    }
-    state.plaintext_prefix = std::move(plaintext_prefix);
-    auto detached_tcp = impl_->tcp->DetachForHandoff();
-    if (!detached_tcp) return std::nullopt;
-    state.tcp = std::move(*detached_tcp);
-    impl_->DetachSubscription();
-    if (BIO* bio = SSL_get_rbio(impl_->ssl.get())) {
-        BIO_set_data(bio, nullptr);
-    }
-    state.ssl = impl_->ssl.release();
-    NotifyClosed();
-    shutdown_initiated_ = true;
-    return state;
-}
-
-std::unique_ptr<TlsStream> TlsStream::RestoreFromHandoff(
-    net::io_context& io_context, DetachedTlsState state) {
-    if (!state.ssl || state.tcp.fd < 0) return nullptr;
-    auto tcp = TcpStream::RestoreFromHandoff(io_context, std::move(state.tcp));
-    if (!tcp) return nullptr;
-    SSL* ssl = std::exchange(state.ssl, nullptr);
-    std::unique_ptr<TlsStream> stream(
-        new TlsStream(std::move(tcp), ssl, state.is_server));
-    if (!state.plaintext_prefix.empty()) {
-        stream->PrependReadMultiBuffer(std::move(state.plaintext_prefix));
-    }
-    return stream;
-}
 TlsStream::~TlsStream() = default;
 
 // impl_, its TcpStream and its SSL exist from construction until destruction.

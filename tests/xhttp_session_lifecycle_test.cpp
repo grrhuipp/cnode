@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include "transport/xhttp_session.hpp"
+#include "transport/xhttp_upload_relay.hpp"
 #include "transport/tcp_stream.hpp"
 #include "app/group_coordinator.hpp"
 
@@ -12,6 +13,8 @@
 #include <asio/write.hpp>
 #include <asio/executor_work_guard.hpp>
 #include <asio/read.hpp>
+#include <asio/detached.hpp>
+#include <asio/steady_timer.hpp>
 #include <asio/use_future.hpp>
 #include <thread>
 #include <array>
@@ -23,6 +26,7 @@
 #include <list>
 #include <map>
 #include <stdexcept>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -63,13 +67,18 @@ void RunTableScenario(Scenario scenario) {
     if (failure) std::rethrow_exception(failure);
 }
 
-// Single-Worker table checks: every resolution here is local.
+// Single-Worker table checks. Open is a downlink; Join and Upload resolve an
+// upload, which here never waits: the session exists or its id ended.
 net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
     app::GroupCoordinator& coordinator, net::io_context& io,
     std::string_view session_namespace, std::string_view session_id,
     XHttpSessionAccess access) {
-    co_return (co_await ResolveXHttpSession(
-        coordinator, io, session_namespace, session_id, access)).session;
+    if (access == XHttpSessionAccess::Open) {
+        co_return co_await OpenXHttpDownlinkSession(coordinator, io, session_namespace, session_id);
+    }
+    ::transport::CancellationSource request;
+    co_return (co_await ResolveXHttpUploadTarget(
+        coordinator, io, session_namespace, session_id, access, request)).session;
 }
 
 net::awaitable<void> NamespaceAndRetirement(app::GroupCoordinator& coordinator, net::io_context& io) {
@@ -110,7 +119,7 @@ net::awaitable<void> FullTableReclaimsOnEvents(app::GroupCoordinator& coordinato
     EXPECT_TRUE(bool(next)) << "close did not free active capacity while session remained referenced";
     EXPECT_FALSE((co_await GetXHttpPacketSession(coordinator, io, "capacity", "0", XHttpSessionAccess::Upload))) << "capacity pressure discarded a recent tombstone";
     active.back().reset();
-    auto after_destroy = co_await GetXHttpPacketSession(coordinator, io, "capacity", "after-destroy", XHttpSessionAccess::Upload);
+    auto after_destroy = co_await GetXHttpPacketSession(coordinator, io, "capacity", "after-destroy", XHttpSessionAccess::Open);
     EXPECT_TRUE(bool(after_destroy)) << "destruction did not free active capacity";
     active[1]->CloseInput();
     auto after_eof = co_await GetXHttpPacketSession(coordinator, io, "capacity", "after-eof", XHttpSessionAccess::Open);
@@ -126,8 +135,31 @@ net::awaitable<void> BoundedReplayWindow(app::GroupCoordinator& coordinator, net
     }
     EXPECT_FALSE((co_await GetXHttpPacketSession(coordinator, io, "replay", "1", XHttpSessionAccess::Upload))) << "recent tombstone was evicted too early";
     EXPECT_FALSE((co_await GetXHttpPacketSession(coordinator, io, "replay", "1024", XHttpSessionAccess::Upload))) << "newest tombstone was evicted";
-    auto oldest = co_await GetXHttpPacketSession(coordinator, io, "replay", "0", XHttpSessionAccess::Upload);
-    EXPECT_TRUE(bool(oldest)) << "oldest tombstone was not bounded by FIFO eviction";
+    // An evicted id is unknown again: its upload waits for a downlink instead
+    // of being refused, and the downlink's session then takes it.
+    ::transport::CancellationSource request;
+    std::optional<XHttpUploadTarget> oldest;
+    net::co_spawn(io, [&]() -> net::awaitable<void> {
+        oldest = co_await ResolveXHttpUploadTarget(
+            coordinator, io, "replay", "0", XHttpSessionAccess::Upload, request);
+    }, net::detached);
+    net::steady_timer pause(io);
+    pause.expires_after(20ms);
+    co_await pause.async_wait(net::use_awaitable);
+    EXPECT_FALSE(oldest) << "upload for an evicted id did not wait for its downlink";
+    auto downlink = co_await GetXHttpPacketSession(coordinator, io, "replay", "0", XHttpSessionAccess::Open);
+    for (int n = 0; n != 100 && !oldest; ++n) {
+        pause.expires_after(5ms);
+        co_await pause.async_wait(net::use_awaitable);
+    }
+    EXPECT_TRUE(oldest && oldest->session && oldest->session == downlink)
+        << "oldest tombstone was not bounded by FIFO eviction";
+    // The spawned resolution borrows this frame; end it before returning.
+    request.Stop();
+    while (!oldest) {
+        pause.expires_after(1ms);
+        co_await pause.async_wait(net::use_awaitable);
+    }
 }
 
 net::awaitable<void> DomainsJoinBySession(app::GroupCoordinator& coordinator, net::io_context& io) {
@@ -264,9 +296,9 @@ TEST(XhttpSessionLifecycle, UploadResponseDrainPreservesWritesAndJoinsReaderOnCl
 }
 
 // A session's requests arrive on connections accepted by different Workers.
-// The connection that reaches a non-owner moves whole to the owner, which
-// serves it with a handler adopted there; sinks never cross threads.
-TEST(XhttpSessionLifecycle, CrossWorkerRequestMovesConnectionToSessionOwner) {
+// The downlink's Worker owns the session; an upload accepted elsewhere is
+// read there and relayed, so sinks and sessions never cross threads.
+TEST(XhttpSessionLifecycle, CrossWorkerUploadReachesDownlinkSession) {
     net::io_context control;
     auto worker0 = std::make_unique<net::io_context>();
     auto worker1 = std::make_unique<net::io_context>();
@@ -276,6 +308,8 @@ TEST(XhttpSessionLifecycle, CrossWorkerRequestMovesConnectionToSessionOwner) {
     auto coordinator = std::make_shared<::app::GroupCoordinator>(control);
     coordinator->RegisterWorker();
     coordinator->RegisterWorker();
+    const std::array<net::io_context*, 2> workers{worker0.get(), worker1.get()};
+    InstallXHttpUploadRelay(workers);
 
     std::promise<std::thread::id> started_0, started_1;
     std::thread thread_c([&] { control.run(); });
@@ -290,54 +324,57 @@ TEST(XhttpSessionLifecycle, CrossWorkerRequestMovesConnectionToSessionOwner) {
         worker1.reset();
     });
     std::map<net::io_context*, std::thread::id> threads{
-        {worker0.get(), started_0.get_future().get()},
-        {worker1.get(), started_1.get_future().get()},
+        {workers[0], started_0.get_future().get()},
+        {workers[1], started_1.get_future().get()},
     };
 
     struct Delivery {
         std::thread::id thread;
         std::string bytes;
     };
-    struct MovingSink final : ::transport::InboundTransportStreamHandler {
-        MovingSink(std::thread::id thread,
-                   const std::map<net::io_context*, std::thread::id>& threads,
-                   std::promise<Delivery>& delivery)
-            : thread(thread), threads(threads), delivery(delivery) {}
-        ~MovingSink() noexcept override {
+    struct WorkerSink final : ::transport::InboundTransportStreamHandler {
+        WorkerSink(std::thread::id thread, std::promise<Delivery>& delivery)
+            : thread(thread), delivery(delivery) {}
+        ~WorkerSink() noexcept override {
             EXPECT_EQ(std::this_thread::get_id(), thread);
         }
         net::awaitable<void> OnInboundTransportStream(
             std::unique_ptr<::transport::AsyncStream> stream,
             ::transport::InboundTransportMetadata) override {
-            std::array<char, 5> buffer{};
-            const size_t n = co_await stream->AsyncRead(net::buffer(buffer));
+            std::string bytes;
+            std::array<char, 16> buffer{};
+            while (bytes.size() < 5) {
+                const size_t n = co_await stream->AsyncRead(net::buffer(buffer));
+                if (n == 0) break;
+                bytes.append(buffer.data(), n);
+            }
             stream->Close();
-            delivery.set_value({std::this_thread::get_id(), std::string(buffer.data(), n)});
-        }
-        std::shared_ptr<::transport::InboundTransportStreamHandler> AdoptOn(
-            net::io_context& owner) const override {
-            EXPECT_EQ(std::this_thread::get_id(), threads.at(&owner));
-            return std::make_shared<MovingSink>(threads.at(&owner), threads, delivery);
+            delivery.set_value({std::this_thread::get_id(), std::move(bytes)});
         }
         std::thread::id thread;
-        const std::map<net::io_context*, std::thread::id>& threads;
         std::promise<Delivery>& delivery;
     };
 
-    ::transport::StreamSettings settings;
-    settings.network_mode = ::transport::NetworkMode::XHttp;
-    settings.xhttp.path = "/fixture";
-    settings.xhttp.mode = ::transport::XHttpMode::PacketUp;
-    settings = ::transport::NormalizeStreamSettings(settings);
-    settings.xhttp.session_namespace = "cross-worker-move";
+    const auto settings_for = [](::transport::XHttpMode mode) {
+        ::transport::StreamSettings settings;
+        settings.network_mode = ::transport::NetworkMode::XHttp;
+        settings.xhttp.path = "/fixture";
+        settings.xhttp.mode = mode;
+        settings = ::transport::NormalizeStreamSettings(settings);
+        settings.xhttp.session_namespace = "cross-worker-relay";
+        return settings;
+    };
+    const auto packet_up = settings_for(::transport::XHttpMode::PacketUp);
+    const auto stream_up = settings_for(::transport::XHttpMode::StreamUp);
 
     ::tcp::acceptor acceptor(control, {net::ip::address_v4::loopback(), 0});
     const auto endpoint = acceptor.local_endpoint();
     const auto serve = [&](net::io_context& io, ::tcp::socket socket,
+                           const ::transport::StreamSettings& settings,
                            std::promise<Delivery>& delivery) {
         return net::co_spawn(io,
             [&, socket = std::move(socket)]() mutable -> net::awaitable<int> {
-                auto sink = std::make_shared<MovingSink>(threads.at(&io), threads, delivery);
+                auto sink = std::make_shared<WorkerSink>(threads.at(&io), delivery);
                 auto built = co_await ::transport::BuildInboundTransport(*coordinator, io,
                     std::make_unique<::transport::TcpStream>(std::move(socket)),
                     settings, nullptr, 0, std::move(sink));
@@ -345,28 +382,19 @@ TEST(XhttpSessionLifecycle, CrossWorkerRequestMovesConnectionToSessionOwner) {
                 co_return *built ? -1 : 0;
             }, net::use_future);
     };
-    const auto wait_owner = [&](const std::string& session_id) {
-        for (int attempt = 0; attempt != 300; ++attempt) {
-            auto owner = net::co_spawn(control, ::transport::FindXHttpSessionOwner(
-                *coordinator, settings.xhttp.session_namespace, session_id),
-                net::use_future).get();
-            if (owner) return owner;
-            std::this_thread::sleep_for(10ms);
-        }
-        return static_cast<net::io_context*>(nullptr);
-    };
 
     // Sinks may outlive a failed round; their promises outlive the scenario.
     std::list<std::promise<Delivery>> deliveries;
     std::exception_ptr scenario_failure;
     try {
     for (int round = 0; round < 8; ++round) {
-        const std::string session_id = "s-" + std::to_string(round);
-        // Even rounds: the upload on Worker 1 owns the session and the
-        // downlink moves there. Odd rounds: the reverse.
+        const bool streaming = round >= 4;
+        // Even rounds: the upload arrives first and waits for its downlink.
         const bool upload_first = round % 2 == 0;
-        auto& upload_io = *worker1;
-        auto& downlink_io = *worker0;
+        const auto& settings = streaming ? stream_up : packet_up;
+        const std::string session_id = "s-" + std::to_string(round);
+        auto& upload_io = *workers[1];
+        auto& downlink_io = *workers[0];
         auto& delivery = deliveries.emplace_back();
         auto delivered = delivery.get_future();
 
@@ -376,28 +404,29 @@ TEST(XhttpSessionLifecycle, CrossWorkerRequestMovesConnectionToSessionOwner) {
         ::tcp::socket client_down(control), server_down(downlink_io);
         client_down.connect(endpoint);
         acceptor.accept(server_down);
-        auto up_built = serve(upload_io, std::move(server_up), delivery);
-        auto down_built = serve(downlink_io, std::move(server_down), delivery);
+        auto up_built = serve(upload_io, std::move(server_up), settings, delivery);
+        auto down_built = serve(downlink_io, std::move(server_down), settings, delivery);
 
-        const std::string post =
-            "POST /fixture/" + session_id + "/0 HTTP/1.1\r\n"
-            "Host: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+        const std::string post = streaming
+            ? "POST /fixture/" + session_id + " HTTP/1.1\r\nHost: localhost\r\n"
+              "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+            : "POST /fixture/" + session_id + "/0 HTTP/1.1\r\n"
+              "Host: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
         const std::string get =
             "GET /fixture/" + session_id + " HTTP/1.1\r\nHost: localhost\r\n\r\n";
         net::write(upload_first ? client_up : client_down,
                    net::buffer(upload_first ? post : get));
-        auto* owner = wait_owner(session_id);
-        EXPECT_EQ(owner, upload_first ? &upload_io : &downlink_io);
+        std::this_thread::sleep_for(20ms);
         net::write(upload_first ? client_down : client_up,
                    net::buffer(upload_first ? get : post));
 
         if (delivered.wait_for(5s) != std::future_status::ready) {
-            ADD_FAILURE() << "no logical stream reached the session owner in round " << round;
+            ADD_FAILURE() << "upload did not reach its downlink session in round " << round;
             break;
         }
         const auto received = delivered.get();
-        EXPECT_EQ(received.bytes, "hello");
-        EXPECT_EQ(received.thread, threads.at(owner));
+        EXPECT_EQ(received.bytes, "hello") << "round " << round;
+        EXPECT_EQ(received.thread, threads.at(&downlink_io)) << "round " << round;
         const auto response = Receive(client_up);
         EXPECT_TRUE(response.starts_with("HTTP/1.1 200"))
             << "round " << round << " upload response: " << response;
@@ -415,6 +444,12 @@ TEST(XhttpSessionLifecycle, CrossWorkerRequestMovesConnectionToSessionOwner) {
         co_await coordinator->Finalize();
     }, net::use_future);
     stop_future.get();
+    for (auto* worker : workers) {
+        net::co_spawn(*worker, [worker]() -> net::awaitable<void> {
+            StopXHttpUploadRelay(*worker);
+            co_return;
+        }, net::use_future).get();
+    }
     coordinator.reset();
     work_0.reset();
     work_1.reset();

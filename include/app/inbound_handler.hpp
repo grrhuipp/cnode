@@ -119,37 +119,15 @@ struct AdmissionEnvironment final {
 
 class InboundHandler;
 
-// Worker 本地能力：原生 UDP、QUIC 入口，以及从其他 Worker 迁入的 XHTTP 连接共同借用，
-// 不携带接收器配置。
-struct InboundSessionEnvironment final {
+// 原生 UDP 与 QUIC 入口共同借用的 Worker 本地能力，不携带接收器配置。
+struct DatagramSessionEnvironment final {
     infra::TimeoutsConfig timeouts;
     routing::Dispatcher* dispatcher = nullptr;
     const AdmissionEnvironment* admission = nullptr;
     RequestLoadState* request_load = nullptr;
     std::shared_ptr<InboundHandler> handler{};
     std::shared_ptr<const BuildRequest> prepared{};
-    uint32_t worker_id = 0;
 };
-
-// The inbounds a Worker runs, as connections moving in from other Workers see
-// them. The Worker implements it; the inbound layer cannot depend on Workers.
-class WorkerInbounds {
-public:
-    // On the Worker's thread; null when it does not run `tag` or is stopping.
-    [[nodiscard]] virtual const InboundSessionEnvironment* FindInbound(
-        std::string_view tag) const noexcept = 0;
-
-protected:
-    ~WorkerInbounds() = default;
-};
-
-// Binds the Worker running `io_context` while it exists: before that thread
-// starts, and unbinds (null) on it.
-void BindWorkerInbounds(net::io_context& io_context, const WorkerInbounds* inbounds);
-
-// FindInbound of the Worker running `io_context`, on its thread.
-[[nodiscard]] const InboundSessionEnvironment* FindWorkerInbound(
-    net::io_context& io_context, std::string_view tag) noexcept;
 
 struct InboundProtocolTraits final {
     bool mailbox_email_defaults_to_tag = false;
@@ -179,7 +157,7 @@ struct ProxyRegistration {
         const BuildRequest& req) = nullptr;
     std::unique_ptr<transport::QuicListener> (*create_quic_listener)(
         uint32_t worker_id, uint32_t worker_count, net::io_context& io,
-        app::InboundSessionEnvironment environment) = nullptr;
+        app::DatagramSessionEnvironment environment) = nullptr;
 
     // Parse protocol-specific source fields on the cold path into the closed
     // immutable settings variant.
@@ -210,7 +188,7 @@ void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
 [[nodiscard]] InboundProtocolTraits RegisteredProtocolTraits(std::string_view protocol);
 [[nodiscard]] std::unique_ptr<transport::QuicListener> NewQuicListener(
     std::string_view protocol, uint32_t worker_id, uint32_t worker_count,
-    net::io_context& io, app::InboundSessionEnvironment environment);
+    net::io_context& io, app::DatagramSessionEnvironment environment);
 
 [[nodiscard]] std::optional<BuildRequest> PrepareBuildRequest(
     std::string_view protocol,

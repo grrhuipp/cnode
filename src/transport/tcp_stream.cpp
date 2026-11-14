@@ -159,25 +159,6 @@ struct TcpStream::Impl {
     uint8_t flags = 0;
 };
 
-DetachedTcpState::~DetachedTcpState() noexcept {
-    if (fd >= 0) ::close(fd);
-}
-
-DetachedTcpState::DetachedTcpState(DetachedTcpState&& other) noexcept
-    : fd(std::exchange(other.fd, -1))
-    , protocol(other.protocol)
-    , pending_bytes(std::move(other.pending_bytes)) {}
-
-DetachedTcpState& DetachedTcpState::operator=(DetachedTcpState&& other) noexcept {
-    if (this != &other) {
-        if (fd >= 0) ::close(fd);
-        fd = std::exchange(other.fd, -1);
-        protocol = other.protocol;
-        pending_bytes = std::move(other.pending_bytes);
-    }
-    return *this;
-}
-
 // ============================================================================
 // TcpStream 实现
 // ============================================================================
@@ -653,50 +634,6 @@ void TcpStream::PrependReadMultiBuffer(common::MultiBuffer&& mb) {
     // MoveTo reserves before transferring; allocation failure preserves old data.
     impl_->pending_data.MoveTo(mb);
     impl_->pending_data = std::move(mb);
-}
-
-std::optional<DetachedTcpState> TcpStream::DetachForHandoff(
-    common::MultiBuffer prefix) {
-    if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
-        return std::nullopt;
-    }
-    DetachedTcpState state;
-    if (!impl_->pending_data.empty()) {
-        if (prefix.empty()) {
-            prefix = std::move(impl_->pending_data);
-        } else {
-            impl_->pending_data.MoveTo(prefix);
-        }
-    }
-    ReleasePendingData();
-    state.pending_bytes = std::move(prefix);
-    IoErrorCode ec;
-    const auto local_ep = impl_->socket.local_endpoint(ec);
-    if (ec) return std::nullopt;
-    state.protocol = local_ep.protocol();
-    impl_->MarkCancelled();
-    impl_->timeouts.Stop();
-    state.fd = impl_->socket.release(ec);
-    if (ec || state.fd < 0) return std::nullopt;
-    NotifyClosed();
-    impl_->SetFlag(kReadShutdown);
-    impl_->SetFlag(kWriteShutdown);
-    return state;
-}
-
-std::unique_ptr<TcpStream> TcpStream::RestoreFromHandoff(
-    net::io_context& io_context, DetachedTcpState state) {
-    if (state.fd < 0) return nullptr;
-    tcp::socket socket(io_context);
-    IoErrorCode ec;
-    socket.assign(state.protocol, state.fd, ec);
-    if (ec) return nullptr;
-    state.fd = -1;
-    auto stream = std::make_unique<TcpStream>(std::move(socket));
-    if (!state.pending_bytes.empty()) {
-        stream->PrependReadMultiBuffer(std::move(state.pending_bytes));
-    }
-    return stream;
 }
 
 void TcpStream::SetAbortiveClose(bool enable) noexcept {

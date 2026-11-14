@@ -213,7 +213,7 @@ app::ProxyRegistration Registration() {
     registration.traits = {.mailbox_email_defaults_to_tag = true, .requires_tls = true};
     registration.create_quic_listener = [](
         uint32_t worker_id, uint32_t worker_count, net::io_context& io,
-        app::InboundSessionEnvironment environment) -> std::unique_ptr<transport::QuicListener> {
+        app::DatagramSessionEnvironment environment) -> std::unique_ptr<transport::QuicListener> {
         return std::make_unique<transport::HysteriaIngress>(worker_id, worker_count, io, std::move(environment));
     };
     registration.create_tcp_handler = &CreateInbound;

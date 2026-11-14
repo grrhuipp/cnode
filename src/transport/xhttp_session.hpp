@@ -3,9 +3,8 @@
 #include "common/allocator.hpp"
 #include "common/multi_buffer.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/tcp_stream.hpp"
-#include "transport/tls_stream.hpp"
 #include "transport/transport_stack.hpp"
+#include "transport/xhttp_upload_relay.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -15,8 +14,6 @@
 #include <string_view>
 #include <utility>
 #include <map>
-#include <optional>
-#include <variant>
 #include <string>
 
 #include "transport/http2_session.hpp"
@@ -285,23 +282,6 @@ public:
     }
     void Release(size_t bytes) noexcept { packet_queue_.Release(bytes); }
 
-    // One admitted packet-up body. Holds an upload slot and the budget it has
-    // reserved until Commit hands the payload to the session queue.
-    class Upload final : private transport::CancellationSubscription {
-    public:
-        Upload(XHttpPacketUpSession& session, AsyncStream& stream);
-        ~Upload() noexcept;
-        net::awaitable<size_t> Read(common::MultiBuffer& payload, size_t limit);
-        bool Commit(uint64_t seq, common::MultiBuffer payload);
-
-    private:
-        void OnCancellation(transport::Cancellation cancellation) noexcept override;
-
-        XHttpPacketUpSession& session_;
-        AsyncStream& stream_;
-        size_t reserved_ = 0;
-    };
-
     [[nodiscard]] bool AttachStream(std::unique_ptr<AsyncStream> stream);
     [[nodiscard]] bool CanAttachStream() const noexcept {
         return AcceptingInput() && stream_input_.Empty();
@@ -331,7 +311,17 @@ public:
 
 private:
     friend class XHttpSessionTable;
+    friend class XHttpPacketUpload;
+    friend class XHttpUploadRelay;
     void Retire() noexcept;
+    // The relay names this session by `token` until it retires.
+    void AttachRelay(XHttpUploadRelay& relay, uint64_t token) noexcept {
+        relay_ = &relay;
+        relay_token_ = token;
+    }
+    void DetachRelay() noexcept { relay_ = nullptr; }
+    XHttpUploadRelay* relay_ = nullptr;
+    uint64_t relay_token_ = 0;
     // Stable table entry; detached on retirement or table destruction.
     XHttpSessionTableEntry* table_entry_ = nullptr;
     // Counts a read in flight on the attached stream-up upload so Close can
@@ -425,61 +415,69 @@ enum class XHttpSessionAccess : uint8_t {
     Upload,
 };
 
-// Where a request of a session is served: the owner Worker, and the live
-// session when the caller is that owner. The first request of a session, of
-// any kind, makes its Worker the owner (as Xray upserts on any request).
-// A null owner rejects the request; a packet upload whose id already ended
-// stays on the caller without a session, so HTTP/1 can answer 404 and keep
-// its connection.
-struct XHttpSessionResolution {
-    net::io_context* owner = nullptr;
-    std::shared_ptr<XHttpPacketUpSession> session;
-};
-
 // Configuration namespace + id select a session on the Worker's session table.
 // Retirement is allocation-free and reserves its own metadata queue node;
 // the next lookup drains events, never scans the live table.
 // Limits: 1024 live entries per Worker, 65536 live directory records per group,
 // and the most recent 1024 ended ids in each bounded FIFO replay window.
-[[nodiscard]] net::awaitable<XHttpSessionResolution> ResolveXHttpSession(
+//
+// The downlink's Worker owns the session, so downlink bytes never cross
+// Workers. Null when the tables are full or another Worker already owns a
+// live session of this id.
+[[nodiscard]] net::awaitable<std::shared_ptr<XHttpPacketUpSession>> OpenXHttpDownlinkSession(
+    app::GroupCoordinator& coordinator,
+    net::io_context& io_context,
+    std::string_view session_namespace,
+    std::string_view session_id);
+
+// Where an upload goes: its session on this Worker, or the relay toward the
+// Worker owning it. Empty when the id is unknown to every Worker or ended:
+// HTTP 404 for a packet.
+struct XHttpUploadTarget {
+    std::shared_ptr<XHttpPacketUpSession> session;
+    XHttpUploadRelay* relay = nullptr;
+    size_t owner = 0;
+    uint64_t token = 0;
+
+    [[nodiscard]] explicit operator bool() const noexcept { return session || relay; }
+};
+
+// An upload reaching the directory before its downlink waits for the
+// downlink's Worker to claim the session, until `cancellation` fires.
+[[nodiscard]] net::awaitable<XHttpUploadTarget> ResolveXHttpUploadTarget(
     app::GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::string_view session_namespace,
     std::string_view session_id,
-    XHttpSessionAccess access);
+    XHttpSessionAccess access,
+    CancellationSource& cancellation);
 
-// Read-only: the Worker owning the live session, or null. Never starts one.
-[[nodiscard]] net::awaitable<net::io_context*> FindXHttpSessionOwner(
-    app::GroupCoordinator& coordinator,
-    std::string_view session_namespace,
-    std::string_view session_id);
+// One packet-up body bound for its session. On the session's Worker it reads
+// under the session payload budget; on another under the relay budget toward
+// the session's Worker, waiting while that budget is spent.
+class XHttpPacketUpload final : private CancellationSubscription {
+public:
+    // Throws no_buffer_space when the local session admits no more uploads.
+    XHttpPacketUpload(const XHttpUploadTarget& target, AsyncStream& stream);
+    ~XHttpPacketUpload() noexcept;
+    XHttpPacketUpload(const XHttpPacketUpload&) = delete;
+    XHttpPacketUpload& operator=(const XHttpPacketUpload&) = delete;
 
-// Workers share nothing, so every connection carrying a request of a session
-// is served by the session's owner Worker. A server connection moves there
-// whole (fd, TLS state, and the bytes read so far) at a point where none of
-// its I/O, timers or responses are in flight: before an HTTP/1 request is
-// answered, or before the HTTP/2 server preface. Bytes never cross Workers
-// after that; an established HTTP/2 connection refuses foreign streams instead.
-struct DetachedXHttpStream {
-    std::variant<DetachedTcpState, DetachedTlsState> state;
-};
+    net::awaitable<size_t> Read(common::MultiBuffer& payload, size_t limit);
+    net::awaitable<XHttpCommit> Commit(uint64_t seq, common::MultiBuffer payload);
 
-// `replay` is read again first once restored. Null when the stream has I/O in
-// flight or is not a plain TCP or TLS connection; the stream is then intact.
-[[nodiscard]] std::optional<DetachedXHttpStream> DetachXHttpStream(
-    AsyncStream& stream, common::MultiBuffer replay);
-[[nodiscard]] std::unique_ptr<AsyncStream> RestoreXHttpStream(
-    net::io_context& io_context, DetachedXHttpStream detached);
+private:
+    void OnCancellation(Cancellation cancellation) noexcept override;
+    // Adds `bytes` to this upload's reservation; false when the local session
+    // budget is spent. A remote reservation waits instead.
+    net::awaitable<bool> Reserve(size_t bytes);
 
-struct XHttpConnectionMove {
-    // The connection came to this Worker for its current request, which is
-    // served here even if its session moved on meanwhile; only later
-    // requests may move it again, so a connection never ping-pongs.
-    bool pinned = false;
-    // Filled by a server that detached the connection for `owner`; its
-    // caller resumes serving it there.
-    net::io_context* owner = nullptr;
-    std::optional<DetachedXHttpStream> detached;
+    XHttpPacketUpSession* session_ = nullptr;
+    XHttpUploadRelay* relay_ = nullptr;
+    size_t owner_ = 0;
+    uint64_t token_ = 0;
+    AsyncStream& stream_;
+    size_t reserved_ = 0;
 };
 
 // Teardown joins upload-response readers before releasing their Worker's
@@ -514,8 +512,7 @@ struct XHttpRefererScratch {
     uint64_t conn_id,
     InboundTransportMetadata* transport_metadata,
     std::span<const uint8_t> initial,
-    const std::shared_ptr<InboundTransportStreamHandler>& stream_handler,
-    XHttpConnectionMove* move);
+    const std::shared_ptr<InboundTransportStreamHandler>& stream_handler);
 
 [[nodiscard]] net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
     std::unique_ptr<AsyncStream> stream,

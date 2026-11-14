@@ -305,7 +305,6 @@ net::awaitable<TransportBuildResult> ConnectOutboundSecurity(
 
 // HTTP/2 prior knowledge is recognized by the full client preface; anything
 // else is served as HTTP/1 with the sniffed bytes as the start of the request.
-// `move` (XHTTP only) lets the connection move to another Worker.
 net::awaitable<TransportBuildResult> DoHttpServerHandshake(
     app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
@@ -314,8 +313,7 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
     uint64_t conn_id,
     InboundTransportMetadata* transport_metadata,
-    const XHttpConfig* xhttp_config,
-    XHttpConnectionMove* move) {
+    const XHttpConfig* xhttp_config) {
 
     std::array<uint8_t, kHttp2ClientPreface.size()> first{};
     size_t total = 0;
@@ -340,8 +338,7 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
             xhttp_config,
             io_context,
             std::move(stream_handler),
-            conn_id,
-            move);
+            conn_id);
     }
 
     const std::span<const uint8_t> initial(first.data(), total);
@@ -353,80 +350,10 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
             conn_id,
             transport_metadata,
             initial,
-            stream_handler,
-            move);
+            stream_handler);
     }
     co_return co_await DoHttp1ServerHandshake(
         std::move(stream), *cfg, conn_id, transport_metadata, initial);
-}
-
-struct MovedXHttpConnection {
-    tl::expected<void, common::ErrorCode> served;
-    XHttpConnectionMove next;
-};
-
-// Runs on `owner`, which serves the moved connection as if it had accepted it,
-// with a handler of the same inbound. The origin handler, and the `xhttp`
-// settings it holds, stay valid: the accepting Worker awaits this call.
-net::awaitable<MovedXHttpConnection> ServeMovedXHttpConnection(
-    app::GroupCoordinator& coordinator,
-    net::io_context& owner,
-    DetachedXHttpStream detached,
-    const XHttpConfig& xhttp,
-    const InboundTransportStreamHandler& origin_handler,
-    uint64_t conn_id) {
-    MovedXHttpConnection moved{.served = {}, .next = {.pinned = true}};
-    auto stream = RestoreXHttpStream(owner, std::move(detached));
-    if (!stream) {
-        moved.served = tl::unexpected(common::ErrorCode::SOCKET_READ_FAILED);
-        co_return moved;
-    }
-    auto handler = origin_handler.AdoptOn(owner);
-    if (!handler) {
-        LOG_CONN_DEBUG(conn_id, "XHTTP connection reached a Worker without its inbound");
-        stream->CloseAbortive();
-        moved.served = tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
-        co_return moved;
-    }
-    handler->OnInboundTransportRequest(*stream);
-    InboundTransportMetadata metadata;
-    auto built = co_await DoHttpServerHandshake(coordinator, std::move(stream), nullptr,
-        owner, handler, conn_id, &metadata, &xhttp, &moved.next);
-    if (!built) {
-        moved.served = tl::unexpected(built.error());
-    } else if (*built) {
-        // Servers with a handler deliver every stream to it.
-        (*built)->CloseAbortive();
-        moved.served = tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-    co_return moved;
-}
-
-// The connection is served here until a request names a session another
-// Worker owns, then by that Worker, possibly several in turn. This frame stays
-// on the accepting Worker and keeps the physical admission all along.
-net::awaitable<TransportBuildResult> ServeXHttpServerConnection(
-    app::GroupCoordinator& coordinator,
-    std::unique_ptr<AsyncStream> stream,
-    const XHttpConfig& xhttp,
-    net::io_context& io_context,
-    std::shared_ptr<InboundTransportStreamHandler> stream_handler,
-    uint64_t conn_id,
-    InboundTransportMetadata* metadata) {
-    XHttpConnectionMove move;
-    auto result = co_await DoHttpServerHandshake(coordinator, std::move(stream), nullptr,
-        io_context, stream_handler, conn_id, metadata, &xhttp,
-        stream_handler ? &move : nullptr);
-    while (move.detached) {
-        auto& owner = *move.owner;
-        auto moved = co_await net::co_spawn(owner,
-            ServeMovedXHttpConnection(coordinator, owner, std::move(*move.detached),
-                xhttp, *stream_handler, conn_id),
-            net::use_awaitable);
-        if (!moved.served) co_return tl::unexpected(moved.served.error());
-        move = std::move(moved.next);
-    }
-    co_return result;
 }
 
 net::awaitable<TransportBuildResult> DoXHttp2PacketUpClientRequest(
@@ -543,7 +470,6 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
             std::move(stream_handler),
             conn_id,
             metadata,
-            nullptr,
             nullptr);
         if (!http_result) {
             LogLayerFailure(conn_id, "HTTP server handshake", http_result.error());
@@ -554,9 +480,9 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
 
     // 4. XHTTP 层（服务端：H2 stream-one 或 H1 packet-up）
     if (s.IsXHttp()) {
-        auto xhttp_result = co_await ServeXHttpServerConnection(
-            coordinator, std::move(stream), s.xhttp, io_context,
-            std::move(stream_handler), conn_id, metadata);
+        auto xhttp_result = co_await DoHttpServerHandshake(
+            coordinator, std::move(stream), nullptr, io_context,
+            std::move(stream_handler), conn_id, metadata, &s.xhttp);
         if (!xhttp_result) {
             LogLayerFailure(conn_id, "XHTTP server handshake", xhttp_result.error());
             co_return tl::unexpected(xhttp_result.error());

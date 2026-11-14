@@ -33,19 +33,9 @@ public:
     virtual net::awaitable<void> OnInboundTransportStream(
         std::unique_ptr<AsyncStream> stream, InboundTransportMetadata metadata) = 0;
     virtual void OnInboundTransportReady(AsyncStream&) {}
-    // A persistent HTTP/1 connection began its next request, or a connection
-    // arrived from another Worker; either gets a fresh transport handshake
-    // budget, which OnInboundTransportReady ends.
+    // A persistent HTTP/1 connection began its next request, which gets a
+    // fresh transport handshake budget; OnInboundTransportReady ends it.
     virtual void OnInboundTransportRequest(AsyncStream&) {}
-    // Runs on `owner`'s thread while the connection this handler serves is
-    // moving there and this handler's own Worker awaits the move: a handler
-    // of the same inbound on `owner`, under the same physical admission.
-    // Null when `owner` does not run that inbound; the connection then ends.
-    [[nodiscard]] virtual std::shared_ptr<InboundTransportStreamHandler> AdoptOn(
-        net::io_context& owner) const {
-        (void)owner;
-        return nullptr;
-    }
 };
 
 // REALITY dest fallback stays in the transport layer (as in Xray) but reuses

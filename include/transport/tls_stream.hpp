@@ -17,19 +17,6 @@ struct RealityServerConnState;
 struct RealityConfig;
 struct TlsConfig;
 class AutoSignContextRenewal;
-struct DetachedTlsState {
-    DetachedTcpState tcp;
-    SSL* ssl = nullptr;
-    bool is_server = true;
-    common::MultiBuffer plaintext_prefix;
-
-    DetachedTlsState() noexcept = default;
-    ~DetachedTlsState() noexcept;
-    DetachedTlsState(DetachedTlsState&& other) noexcept;
-    DetachedTlsState& operator=(DetachedTlsState&& other) noexcept;
-    DetachedTlsState(const DetachedTlsState&) = delete;
-    DetachedTlsState& operator=(const DetachedTlsState&) = delete;
-};
 // ============================================================================
 // OpenSSL 上下文管理（RAII）
 // ============================================================================
@@ -134,17 +121,12 @@ public:
     // then read the raw TCP stream without touching the independent writer.
     [[nodiscard]] bool EnableRawRead() noexcept override;
 
-    [[nodiscard]] std::optional<DetachedTlsState> DetachForHandoff(
-        common::MultiBuffer plaintext_prefix = {});
-    [[nodiscard]] static std::unique_ptr<TlsStream> RestoreFromHandoff(
-        net::io_context& io_context, DetachedTlsState state);
 protected:
     TcpStream* BaseTcpStream() override;
     const TcpStream* BaseTcpStream() const override;
 
 private:
     struct Impl;
-    TlsStream(std::unique_ptr<TcpStream> inner, SSL* existing_ssl, bool is_server);
 
     net::awaitable<std::size_t> AsyncReadSlow(net::mutable_buffer buf);
     net::awaitable<common::MultiBuffer> ReadMultiBufferSlow();

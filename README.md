@@ -106,7 +106,7 @@ Inbound Handler::Process
   -> Relay（TCP / UDP / Mux）
 ```
 
-每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口；连接与有状态会话一生固定在创建它的 Worker 上。Hysteria2 QUIC 连接通过内核态 CID 分流固定到原 Worker，客户端路径迁移后仍由原 Worker 服务；Hysteria2 只提供配置的服务端 UDP 端口，不实现端口跳跃。XHTTP 会话由收到其首个请求的 Worker 持有；同一会话的请求落到其他 Worker 的连接上时，HTTP/1.1 连接在该请求应答前、HTTP/2 连接在首个请求时整体迁到持有会话的 Worker，已在服务其他请求的 HTTP/2 连接则以 GOAWAY 加 REFUSED_STREAM 让客户端在新连接上重试。主线程运行唯一主控事件循环，承载面板同步、监控、DNS 与全局准入。
+每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口；连接与有状态会话一生固定在创建它的 Worker 上。Hysteria2 QUIC 连接通过内核态 CID 分流固定到原 Worker，客户端路径迁移后仍由原 Worker 服务；Hysteria2 只提供配置的服务端 UDP 端口，不实现端口跳跃。XHTTP 会话归下行（GET）所在的 Worker，下行数据不跨 Worker；同一会话的上传无论落在哪个 Worker 的哪条连接上，都在该 Worker 完成解析，再经 Worker 间无锁 SPSC 队列交给会话，连接本身不迁移。主线程运行唯一主控事件循环，承载面板同步、监控、DNS 与全局准入。
 
 一个已认证 UDP association 只保留协议认证、重放保护和回包路径；Dispatcher 按原始目标拆分独立路由子流。普通 UDP 以完整目标为键，QUIC 以目标、版本和 Initial DCID 为键并跟踪后续 CID；每个子流独立嗅探、选路、出站、统计和访问日志。回包始终恢复该子流的原始目标，因此不同 FakeIP 即使解析到同一真实 IP，也不会共用路由或回包地址。
 
@@ -304,7 +304,7 @@ geosite.dat
 - 嗅探：TCP 复制至多 4 KiB 前缀；UDP QUIC 嗅探总窗口 200 ms、最多 64 个数据报、累计 64 KiB。
 - HTTP/2（gRPC、h2、XHTTP 服务端）：每连接最多 250 个并发流（与 Go net/http 即 Xray 服务端相同），超额 REFUSED_STREAM；已关闭流仍在收尾的请求另计，每连接最多 1000 个；流窗口 4 MiB、连接窗口 8 MiB。gRPC 单条消息正文最多 4 MiB。
 - 面板 HTTP：每行最多 64 KiB，响应头（含临时响应及 trailer）累计最多 256 KiB，解码后响应体最多 64 MiB；这些预算不扩大普通代理传输的限制。
-- XHTTP：每个 session 排队数据与并发上传共用 4 MiB 预算，最多 1024 个排队包、64 个在途上传。
+- XHTTP：每个 session 排队数据与并发上传共用 4 MiB 预算，最多 1024 个排队包、64 个在途上传。跨 Worker 上传：每对 Worker 之间已读取但会话尚未接收的 packet-up 数据最多 16 MiB，每个 stream-up 上传最多 1 MiB 在途；先于下行到达的上传在请求握手期限内等待下行。
 - Mux：每连接最多 1,024 个子会话；未转发客户端数据共享 4 MiB 预算，降至 2 MiB 后恢复读取（与 Xray 相同的队头阻塞语义）。
 - AnyTLS 入站：每个 Session 最多 128 条未结束子流，子流从 SYN 起受 `timeouts.handshake` 绝对期限约束；每条子流接收队列最多 65,535 字节有效数据。
 - 原生 UDP：每 Worker 最多 4096 个出站 UDP socket、4096 个存活入站 association、8192 份排队数据报、64 MiB 排队缓冲；满额拒绝新请求，不驱逐已有请求。每个逻辑 UDP 请求独占一个出站 socket，源端口在请求期间不变。上行半关闭后在 `downlinkOnly` 窗口内继续收包。

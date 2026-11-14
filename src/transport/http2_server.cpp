@@ -808,27 +808,53 @@ net::awaitable<void> Http2ServerSession::FlushReceiveCredit() {
     credit_flush_running_ = false;
 }
 
-net::awaitable<void> Http2ServerSession::RunPacketUpload(
-    std::unique_ptr<AsyncStream> stream,
-    std::shared_ptr<XHttpPacketUpSession> session, uint64_t seq) {
+net::awaitable<void> Http2ServerSession::RunUpload(
+    std::shared_ptr<Http2ServerSubStreamState> sub,
+    XHttpRequestMeta::Kind kind,
+    std::string session_id,
+    uint64_t seq) {
     RequestScope active(active_requests_);
+    std::unique_ptr<AsyncStream> upload = std::make_unique<Http2ServerSubStream>(sub);
     try {
-        XHttpPacketUpSession::Upload upload(*session, *stream);
-        common::MultiBuffer payload;
-        // The HTTP/2 stream is exactly one POST body; only the session budget bounds it.
-        while (co_await upload.Read(payload, std::numeric_limits<size_t>::max()) != 0) {
+        auto target = co_await ResolveXHttpUploadTarget(coordinator_, io_context_,
+            xhttp_config_->session_namespace, session_id,
+            kind == XHttpRequestMeta::Kind::PacketUp
+                ? XHttpSessionAccess::Upload : XHttpSessionAccess::Open,
+            upload->Cancellation());
+        if (!target) throw IoSystemError(io_error::not_found);
+        if (target.session) sub->SetUploadBudget(target.session);
+        if (kind == XHttpRequestMeta::Kind::PacketUp) {
+            XHttpPacketUpload packet(target, *upload);
+            common::MultiBuffer payload;
+            // The HTTP/2 stream is exactly one POST body; only the upload budget bounds it.
+            while (co_await packet.Read(payload, std::numeric_limits<size_t>::max()) != 0) {
+            }
+            if (co_await packet.Commit(seq, std::move(payload)) != XHttpCommit::Committed)
+                throw IoSystemError(io_error::no_buffer_space);
+            if (target.session && !target.session->DownlinkAttached() &&
+                !co_await target.session->AwaitDownlink(upload->Cancellation())) {
+                throw IoSystemError(io_error::timed_out);
+            }
+            target = XHttpUploadTarget{};
+            co_await upload->AsyncShutdownWrite();
+            upload->Close();
+            co_return;
         }
-        if (!upload.Commit(seq, std::move(payload)))
-            throw IoSystemError(io_error::no_buffer_space);
-        if (!session->DownlinkAttached() &&
-            !co_await session->AwaitDownlink(stream->Cancellation())) {
-            throw IoSystemError(io_error::timed_out);
+        LOG_CONN_DEBUG(conn_id_, "XHTTP server H2 stream-up upload ready session={} remote={}",
+                      PublicHttpTargetForLog(session_id), target.session == nullptr);
+        if (!target.session) {
+            co_await target.relay->PumpStream(target.owner, target.token, *upload);
+            upload->Close();
+            co_return;
         }
-        session.reset();
-        co_await stream->AsyncShutdownWrite();
-        stream->Close();
+        if (!target.session->AttachStream(std::move(upload))) {
+            LOG_CONN_DEBUG(conn_id_, "XHTTP server rejected concurrent H2 stream-up session={}",
+                          PublicHttpTargetForLog(session_id));
+            co_return;
+        }
+        co_await Http2ServerSubStreamState::JoinOwner(std::move(sub), std::move(target.session));
     } catch (...) {
-        stream->CloseAbortive();
+        if (upload) upload->CloseAbortive();
     }
 }
 
@@ -912,20 +938,6 @@ net::awaitable<bool> Http2ServerSession::FailConnection(H2Error error) {
     (void)co_await WriteFrameSerialized(H2FrameType::GOAWAY, 0, 0, payload);
     CancelAll();
     co_return false;
-}
-
-net::awaitable<bool> Http2ServerSession::RefuseForeignStream(uint32_t stream_id) {
-    if (!draining_) {
-        draining_ = true;
-        LOG_CONN_DEBUG(conn_id_,
-            "XHTTP server H2 stream_id={} belongs to another Worker; draining connection",
-            stream_id);
-        const auto payload = EncodeGoaway(stream_id, H2Error::NoError);
-        if (!co_await WriteFrameSerialized(H2FrameType::GOAWAY, 0, 0, payload)) {
-            co_return false;
-        }
-    }
-    co_return co_await ResetStream(stream_id, H2Error::RefusedStream);
 }
 
 net::awaitable<bool> Http2ServerSession::DispatchFrame(H2Frame frame) {
@@ -1101,9 +1113,6 @@ net::awaitable<bool> Http2ServerSession::ReceiveHeaders(H2Frame frame) {
         // PROTOCOL_ERROR; the connection and its other streams continue.
         co_return co_await ResetStream(stream_id, H2Error::Protocol);
     }
-    if (draining_) {
-        co_return co_await ResetStream(stream_id, H2Error::RefusedStream);
-    }
     if (streams_.size() >= kHttp2MaxConcurrentStreams ||
         active_requests_ >= kHttp2MaxActiveRequests) {
         co_return co_await ResetStream(stream_id, H2Error::RefusedStream);
@@ -1177,16 +1186,10 @@ net::awaitable<bool> Http2ServerSession::RouteXHttpRequest(
         request.method);
     if (!XHttpKindAllowed(meta.kind, *xhttp_config_))
         co_return co_await ResetStream(stream_id, H2Error::Protocol);
-    XHttpSessionResolution resolution;
-    if (meta.kind != XHttpRequestMeta::Kind::StreamOne &&
-        meta.kind != XHttpRequestMeta::Kind::Unknown) {
-        resolution = co_await ResolveXHttpSession(coordinator_,
-            io_context_, xhttp_config_->session_namespace, meta.session_id,
-            meta.kind == XHttpRequestMeta::Kind::PacketUp
-                ? XHttpSessionAccess::Upload : XHttpSessionAccess::Open);
-        if (resolution.owner && resolution.owner != &io_context_) {
-            co_return co_await RefuseForeignStream(stream_id);
-        }
+    std::shared_ptr<XHttpPacketUpSession> downlink_session;
+    if (meta.kind == XHttpRequestMeta::Kind::PacketDown) {
+        downlink_session = co_await OpenXHttpDownlinkSession(coordinator_, io_context_,
+            xhttp_config_->session_namespace, meta.session_id);
     }
     switch (meta.kind) {
     case XHttpRequestMeta::Kind::StreamOne: {
@@ -1199,7 +1202,7 @@ net::awaitable<bool> Http2ServerSession::RouteXHttpRequest(
         co_return true;
     }
     case XHttpRequestMeta::Kind::PacketDown: {
-        auto xsession = std::move(resolution.session);
+        auto xsession = std::move(downlink_session);
         if (!xsession) co_return co_await ResetStream(stream_id, H2Error::Protocol);
         XHttpDownlinkClaim claim(*xsession);
         if (!claim) co_return co_await ResetStream(stream_id, H2Error::Protocol);
@@ -1214,68 +1217,16 @@ net::awaitable<bool> Http2ServerSession::RouteXHttpRequest(
         DeliverRequest(std::move(sub), std::move(xsession), std::move(request.metadata));
         co_return true;
     }
-    case XHttpRequestMeta::Kind::StreamUp: {
-        auto xsession = std::move(resolution.session);
-        if (!xsession) {
-            co_return co_await ResetStream(stream_id, H2Error::Protocol);
-        }
-        if (!xsession->CanAttachStream()) {
-            LOG_CONN_DEBUG(conn_id_,
-                "XHTTP server rejected concurrent H2 stream-up session={}",
-                meta.session_id);
-            constexpr std::array<uint8_t, 1> kBadRequestStatus{
-                0x80 | kHpackStaticStatusBadRequest};
-            const bool ok = co_await WriteFrameSerialized(
-                H2FrameType::HEADERS, kFlagEndHeaders | kFlagEndStream,
-                stream_id, kBadRequestStatus);
-            RemoveStream(stream_id);
-            co_return ok;
-        }
-        bool accepting = true;
-        struct StreamUpGuard {
-            XHttpPacketUpSession* session;
-            bool& active;
-            ~StreamUpGuard() {
-                if (active && session->CanAttachStream()) session->Close();
-            }
-        } guard{xsession.get(), accepting};
-        if (!co_await AcceptStream(stream_id, end_stream, *sub)) {
-            co_return false;
-        }
-        accepting = false;
-        LOG_CONN_DEBUG(conn_id_, "XHTTP server H2 stream-up upload ready session={} stream_id={}",
-                      meta.session_id,
-                      stream_id);
-        sub->SetUploadBudget(xsession);
-        auto upload = std::make_unique<Http2ServerSubStream>(sub);
-        if (!xsession->AttachStream(std::move(upload))) {
-            LOG_CONN_DEBUG(conn_id_,
-                "XHTTP server rejected concurrent H2 stream-up session={}",
-                meta.session_id);
-            co_return co_await ResetStream(stream_id, H2Error::Protocol);
-        }
-        auto* raw_xsession = xsession.get();
-        try {
-            Spawn(Http2ServerSubStreamState::JoinOwner(std::move(sub), std::move(xsession)));
-        } catch (...) {
-            raw_xsession->Close();
-            throw;
-        }
-        co_return true;
-    }
+    case XHttpRequestMeta::Kind::StreamUp:
     case XHttpRequestMeta::Kind::PacketUp: {
-        auto xsession = std::move(resolution.session);
-        if (!xsession) {
-            co_return co_await ResetStream(stream_id, H2Error::Protocol);
-        }
+        // Finding the session may wait for its downlink, which can follow on
+        // this very connection: never in the frame reader.
         if (!co_await AcceptStream(stream_id, end_stream, *sub)) {
             co_return false;
         }
-        sub->SetUploadBudget(xsession);
-        auto upload = std::make_unique<Http2ServerSubStream>(std::move(sub));
         bool spawn_failed = false;
         try {
-            Spawn(RunPacketUpload(std::move(upload), std::move(xsession), meta.seq));
+            Spawn(RunUpload(std::move(sub), meta.kind, std::string(meta.session_id), meta.seq));
         } catch (...) {
             spawn_failed = true;
         }
@@ -1375,89 +1326,6 @@ net::awaitable<void> WriteHttp2ServerPreface(AsyncStream& stream, uint32_t initi
     }
 }
 
-// Control frames a client may send ahead of its first request (RFC 9113 3.4).
-constexpr size_t kHttp2FramesBeforeFirstRequest = 16;
-
-struct Http2FirstRequest {
-    // Every frame read, re-encoded in arrival order for replay.
-    common::MultiBuffer frames;
-    // Worker owning the session the request names; null for none.
-    net::io_context* owner = nullptr;
-};
-
-void AppendH2Frame(common::MultiBuffer& out, const H2Frame& frame) {
-    const auto payload = frame.Payload();
-    std::array<uint8_t, kHttp2FrameHeaderSize> header{};
-    EncodeH2FrameHeader(header.data(), static_cast<uint32_t>(payload.size()),
-                        frame.type, frame.flags, frame.stream_id);
-    if (!out.AppendSpan(header) || !out.AppendSpan(payload)) throw std::bad_alloc();
-}
-
-// Control frames the serving session would take without a connection error
-// (RFC 9113 6.5, 6.7, 6.9). A faulty one ends the peek so that it is reported.
-bool AcceptsHttp2ControlFrame(const H2Frame& frame) {
-    const auto payload = frame.Payload();
-    switch (frame.type) {
-    case H2FrameType::SETTINGS:
-        if ((frame.flags & kFlagAck) != 0) return frame.stream_id == 0 && payload.empty();
-        return frame.stream_id == 0 && payload.size() % 6 == 0 &&
-            PeerInitialWindowSetting(payload).has_value();
-    case H2FrameType::PING:
-        return frame.stream_id == 0 && payload.size() == 8;
-    case H2FrameType::WINDOW_UPDATE:
-        return frame.stream_id == 0 && WindowUpdateIncrement(frame).has_value();
-    case H2FrameType::PRIORITY:
-        return frame.stream_id != 0 && payload.size() == 5;
-    default:
-        return false;
-    }
-}
-
-// Reads the client's frames through its first request. PING is stateless and
-// answered here; every other frame is answered by the Worker that serves the
-// connection, on replay. A header block continued in CONTINUATION frames is
-// served where it arrived.
-net::awaitable<Http2FirstRequest> PeekHttp2FirstRequest(
-    app::GroupCoordinator& coordinator, AsyncStream& stream, const XHttpConfig& cfg) {
-    Http2FirstRequest first;
-    for (size_t read = 0; read < kHttp2FramesBeforeFirstRequest; ++read) {
-        auto frame = co_await ReadH2Frame(stream);
-        if (!frame) break;
-        if (frame->type != H2FrameType::HEADERS && AcceptsHttp2ControlFrame(*frame)) {
-            if (frame->type != H2FrameType::PING) {
-                AppendH2Frame(first.frames, *frame);
-            } else if ((frame->flags & kFlagAck) == 0) {
-                const auto payload = frame->Payload();
-                const net::const_buffer buffer(payload.data(), payload.size());
-                co_await WriteH2FrameBuffers(stream, H2FrameType::PING, kFlagAck, 0,
-                    std::span<const net::const_buffer>(&buffer, 1));
-            }
-            continue;
-        }
-        AppendH2Frame(first.frames, *frame);
-        if (frame->type != H2FrameType::HEADERS || frame->stream_id == 0 ||
-            (frame->flags & kFlagEndHeaders) == 0) {
-            break;
-        }
-        // The connection's first header block: the serving session's own
-        // decoder starts from the same empty dynamic table.
-        HpackDecoder decoder;
-        const auto request = TryParseSingleH2RequestHeaders(decoder, *frame, {}, false);
-        if (!request || !*request) break;
-        const auto meta = ParseXHttpRequestMeta(
-            cfg.normalized_path, (*request)->path, (*request)->method);
-        if (meta.kind == XHttpRequestMeta::Kind::StreamOne ||
-            meta.kind == XHttpRequestMeta::Kind::Unknown ||
-            !XHttpKindAllowed(meta.kind, cfg)) {
-            break;
-        }
-        first.owner = co_await FindXHttpSessionOwner(
-            coordinator, cfg.session_namespace, meta.session_id);
-        break;
-    }
-    co_return first;
-}
-
 net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
@@ -1469,8 +1337,7 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     const HttpConfig* http_config,
     const XHttpConfig* xhttp_config,
     const GrpcConfig* grpc_config,
-    bool read_client_preface,
-    XHttpConnectionMove* move) {
+    bool read_client_preface) {
     if (read_client_preface) {
         std::array<uint8_t, kHttp2ClientPreface.size()> preface{};
         size_t done = 0;
@@ -1492,30 +1359,7 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     // SETTINGS is a receiver-selected limit, not a promise to allocate an
     // arbitrarily large configured window.
     initial_window = std::min<uint32_t>(initial_window, kHttp2MaxQueuedStreamBytes);
-    // A connection moves only after its server preface, which every Worker
-    // writes identically; the Worker it moved to continues from there.
-    if (!move || !move->pinned) {
-        co_await WriteHttp2ServerPreface(*stream, initial_window);
-    }
-    if (move && !move->pinned && xhttp_config) {
-        auto first = co_await PeekHttp2FirstRequest(coordinator, *stream, *xhttp_config);
-        if (first.owner && first.owner != &io_context) {
-            common::MultiBuffer replay;
-            if (!replay.AppendSpan(std::span<const uint8_t>(
-                    reinterpret_cast<const uint8_t*>(kHttp2ClientPreface.data()),
-                    kHttp2ClientPreface.size()))) {
-                throw std::bad_alloc();
-            }
-            first.frames.MoveTo(replay);
-            auto detached = DetachXHttpStream(*stream, std::move(replay));
-            if (!detached) co_return tl::unexpected(common::ErrorCode::SOCKET_READ_FAILED);
-            LOG_CONN_DEBUG(conn_id, "XHTTP server H2 connection moves to session owner");
-            move->owner = first.owner;
-            move->detached = std::move(*detached);
-            co_return std::unique_ptr<AsyncStream>{};
-        }
-        if (!first.frames.empty()) stream->PrependReadMultiBuffer(std::move(first.frames));
-    }
+    co_await WriteHttp2ServerPreface(*stream, initial_window);
     auto session = std::make_shared<Http2ServerSession>(
         coordinator, io_context, std::move(stream), std::move(stream_handler), payload_codec,
         conn_id, http_config, xhttp_config, grpc_config, initial_window);
@@ -1542,8 +1386,7 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
         nullptr,
         nullptr,
         &cfg,
-        true,
-        nullptr);
+        true);
 }
 
 net::awaitable<TransportBuildResult> RunHttp2ServerSession(
@@ -1553,8 +1396,7 @@ net::awaitable<TransportBuildResult> RunHttp2ServerSession(
     const XHttpConfig* xhttp_cfg,
     net::io_context& io_context,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
-    uint64_t conn_id,
-    XHttpConnectionMove* move) {
+    uint64_t conn_id) {
     const uint32_t initial_window = (cfg && cfg->initial_window_size)
         ? *cfg->initial_window_size : kDefaultInitialWindow;
     return StartHttp2ServerSession(coordinator,
@@ -1567,8 +1409,7 @@ net::awaitable<TransportBuildResult> RunHttp2ServerSession(
         cfg,
         xhttp_cfg,
         nullptr,
-        false,
-        move);
+        false);
 }
 
 }  // namespace transport

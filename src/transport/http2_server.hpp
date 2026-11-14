@@ -336,9 +336,13 @@ private:
         return ConnectionWritable() && streams_.contains(stream_id);
     }
 
-    net::awaitable<void> RunPacketUpload(
-        std::unique_ptr<AsyncStream> stream,
-        std::shared_ptr<XHttpPacketUpSession> session, uint64_t seq);
+    // Finds the session of an upload stream, waiting for its downlink if
+    // need be, and feeds it there or to the relay toward its Worker.
+    net::awaitable<void> RunUpload(
+        std::shared_ptr<Http2ServerSubStreamState> sub,
+        XHttpRequestMeta::Kind kind,
+        std::string session_id,
+        uint64_t seq);
 
     net::awaitable<void> RunRequest(
         std::unique_ptr<AsyncStream> stream, InboundTransportMetadata metadata);
@@ -357,11 +361,6 @@ private:
     net::awaitable<bool> ResetStream(uint32_t stream_id, H2Error error);
     net::awaitable<void> SendReceiveBudgetReset(uint32_t stream_id);
     net::awaitable<bool> FailConnection(H2Error error);
-    // RFC 9113 6.8, 8.7: the stream's session is served by another Worker.
-    // GOAWAY (NO_ERROR) ends new streams here and REFUSED_STREAM marks this
-    // one unprocessed, so the client retries it on a new connection, which
-    // moves to the owner before its first request. Accepted streams finish.
-    net::awaitable<bool> RefuseForeignStream(uint32_t stream_id);
 
     [[nodiscard]] bool IsKnownClientStream(uint32_t stream_id) const noexcept {
         return stream_id != 0 && (stream_id & 1u) != 0 && stream_id <= last_remote_stream_id_;
@@ -419,8 +418,6 @@ private:
     uint32_t consumed_connection_credit_ = 0;
     size_t receive_memory_ = 0;
     bool local_settings_acked_ = false;
-    // GOAWAY sent: every later stream is refused.
-    bool draining_ = false;
     bool credit_flush_running_ = false;
 };
 }  // namespace transport

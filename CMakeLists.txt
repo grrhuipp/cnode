@@ -92,6 +92,7 @@ set(CNODE_CORE_SOURCES
     src/transport/ws_stream.cpp
     src/transport/http1_handshake.cpp
     src/transport/xhttp_session.cpp
+    src/transport/xhttp_upload_relay.cpp
     src/transport/h2_frame.cpp
     src/transport/http2_client.cpp
     src/transport/http2_server.cpp

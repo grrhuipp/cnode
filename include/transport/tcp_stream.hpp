@@ -14,19 +14,6 @@
 
 namespace transport {
 
-struct DetachedTcpState {
-    int fd = -1;
-    tcp::endpoint::protocol_type protocol = tcp::v4();
-    common::MultiBuffer pending_bytes;
-
-    DetachedTcpState() noexcept = default;
-    ~DetachedTcpState() noexcept;
-    DetachedTcpState(DetachedTcpState&& other) noexcept;
-    DetachedTcpState& operator=(DetachedTcpState&& other) noexcept;
-    DetachedTcpState(const DetachedTcpState&) = delete;
-    DetachedTcpState& operator=(const DetachedTcpState&) = delete;
-};
-
 
 // ============================================================================
 // TcpStream - TCP 流实现
@@ -64,10 +51,6 @@ public:
     // Only for this byte layer; a TLS owner must retain plaintext at its own layer.
     void PrependReadBytes(std::span<const uint8_t> data) override;
     void PrependReadMultiBuffer(common::MultiBuffer&& mb) override;
-    [[nodiscard]] std::optional<DetachedTcpState> DetachForHandoff(
-        common::MultiBuffer prefix = {});
-    [[nodiscard]] static std::unique_ptr<TcpStream> RestoreFromHandoff(
-        net::io_context& io_context, DetachedTcpState state);
 
     // ── 超时控制 & 端点查询（仅 TcpStream 实现，非虚）─────────────────────────
     tcp::socket::executor_type GetExecutor() noexcept;

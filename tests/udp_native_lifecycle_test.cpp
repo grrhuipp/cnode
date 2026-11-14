@@ -238,7 +238,7 @@ TEST_F(UdpNativeLifecycleTest, RetiredSocketJobsCannotAffectReplacementIdentity)
     DrainNativeJobs drain{io, ingress, dispatcher};
     ::infra::TimeoutsConfig timeouts;
     auto receiver = MakeReceiver();
-    const ::app::InboundSessionEnvironment environment{
+    const ::app::DatagramSessionEnvironment environment{
         .timeouts = timeouts, .dispatcher = &dispatcher,
         .admission = &admission, .request_load = &request_load};
     constexpr std::array<uint8_t, 1> packet{0x62};
@@ -332,7 +332,7 @@ TEST_F(UdpNativeLifecycleTest, UplinkRefreshDelaysNaturalExpiryUntilIdle) {
     ::infra::TimeoutsConfig timeouts;
     timeouts.idle = 1;
     auto receiver = MakeReceiver();
-    const ::app::InboundSessionEnvironment environment{
+    const ::app::DatagramSessionEnvironment environment{
         .timeouts = timeouts, .dispatcher = &dispatcher,
         .admission = &admission, .request_load = &request_load};
     constexpr std::array<uint8_t, 1> packet{0x62};
@@ -751,7 +751,7 @@ protected:
     Ingress::SocketPtr socket;
     ::infra::TimeoutsConfig timeouts;
     ::app::ReceiverSettings receiver = MakeReceiver();
-    const ::app::InboundSessionEnvironment environment{
+    const ::app::DatagramSessionEnvironment environment{
         .timeouts = timeouts, .dispatcher = &dispatcher,
         .admission = &admission, .request_load = &request_load};
     const std::array<uint8_t, 1> datagram{0x62};

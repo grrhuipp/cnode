@@ -189,7 +189,7 @@ struct DatagramSource {
     void Send(UdpSocketFixtures& sockets, Ingress& ingress, ::net::io_context& io, std::string_view,
               ::udp::socket* sock, uint16_t client_port,
               std::span<const uint8_t> packet, const ::infra::TimeoutsConfig& timeouts) {
-        const ::app::InboundSessionEnvironment environment{
+        const ::app::DatagramSessionEnvironment environment{
             .timeouts = timeouts, .dispatcher = &dispatcher,
             .admission = &admission, .request_load = &request_load};
         ingress.ProcessDatagram(::app::UdpDatagramContext{

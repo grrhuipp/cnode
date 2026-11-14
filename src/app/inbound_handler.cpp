@@ -80,35 +80,8 @@ void CountEscapedInboundFailure(const common::Context& ctx, app::StatsShard& sta
     stats.OnError();
 }
 
-// Reaches the Worker running an io_context from that io_context, so a
-// connection moving in from another Worker finds its inbound there.
-class WorkerInboundsBinding final : public net::execution_context::service {
-public:
-    using key_type = WorkerInboundsBinding;
-    static net::execution_context::id id;
-    explicit WorkerInboundsBinding(net::execution_context& context)
-        : net::execution_context::service(context) {}
-    // Written before the Worker's thread starts and cleared on it.
-    const WorkerInbounds* inbounds = nullptr;
-
-private:
-    void shutdown() override {}
-};
-
-net::execution_context::id WorkerInboundsBinding::id;
 
 }  // namespace
-
-void BindWorkerInbounds(net::io_context& io_context, const WorkerInbounds* inbounds) {
-    net::use_service<WorkerInboundsBinding>(io_context).inbounds = inbounds;
-}
-
-const InboundSessionEnvironment* FindWorkerInbound(
-    net::io_context& io_context, std::string_view tag) noexcept {
-    if (!net::has_service<WorkerInboundsBinding>(io_context)) return nullptr;
-    const auto* inbounds = net::use_service<WorkerInboundsBinding>(io_context).inbounds;
-    return inbounds ? inbounds->FindInbound(tag) : nullptr;
-}
 
 class InboundHandler::LogicalTransportStreamSink final
     : public transport::InboundTransportStreamHandler {
@@ -152,22 +125,6 @@ public:
     void OnInboundTransportRequest(transport::AsyncStream& stream) override {
         stream.SetIdleTimeout(timeouts_.HandshakeTimeout());
         (void)stream.StartPhaseDeadline(timeouts_.HandshakeTimeout());
-    }
-
-    // Runs on `owner`'s thread; reads only this sink's immutable state, which
-    // its Worker keeps alive while awaiting the move.
-    std::shared_ptr<transport::InboundTransportStreamHandler> AdoptOn(
-        net::io_context& owner) const override {
-        const auto* environment = FindWorkerInbound(owner, handler_->Tag());
-        if (!environment || !environment->handler) return nullptr;
-        // base_ctx_ already holds the identity this sink serves under.
-        auto sink = std::make_shared<LogicalTransportStreamSink>(
-            environment->handler, owner, *environment->dispatcher,
-            environment->admission->stats, *environment->request_load,
-            environment->timeouts, base_ctx_, true, base_ctx_.inbound.connection_family);
-        // Child ids come from the owner Worker's sequence.
-        sink->base_ctx_.worker_id = environment->worker_id;
-        return sink;
     }
 
     net::awaitable<void> OnInboundTransportStream(
@@ -500,7 +457,7 @@ InboundProtocolTraits RegisteredProtocolTraits(std::string_view protocol) {
 
 std::unique_ptr<transport::QuicListener> NewQuicListener(
     std::string_view protocol, uint32_t worker_id, uint32_t worker_count,
-    net::io_context& io, app::InboundSessionEnvironment environment) {
+    net::io_context& io, app::DatagramSessionEnvironment environment) {
     const auto* registration = FindRegistration(protocol);
     if (!registration || !registration->create_quic_listener) return nullptr;
     if (worker_count == 0 || worker_id >= worker_count)

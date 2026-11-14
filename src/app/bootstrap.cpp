@@ -22,6 +22,7 @@
 #include "controller/controller.hpp"
 #include "transport/timeout_scheduler.hpp"
 #include "transport/tls_stream.hpp"
+#include "transport/xhttp_upload_relay.hpp"
 #include <asio/co_spawn.hpp>
 #include <asio/executor_work_guard.hpp>
 #include <asio/post.hpp>
@@ -409,6 +410,10 @@ void SetupPanels(net::io_context& main_ctx,
             i, *pool.io_contexts[i], runtime_config, worker_stats, dns_worker,
             coordinator));
     }
+    std::vector<net::io_context*> contexts;
+    contexts.reserve(workers);
+    for (auto& context : pool.io_contexts) contexts.push_back(context.get());
+    transport::InstallXHttpUploadRelay(contexts);
 
     return pool;
 }

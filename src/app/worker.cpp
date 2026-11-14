@@ -113,7 +113,7 @@ struct app::Worker::ListenerSlot {
     // Registry owns active slots; listener frames lease retired slots until
     // their native close completions finish. No per-request slot leases.
     std::shared_ptr<app::InboundHandler> handler;
-    app::InboundSessionEnvironment session_environment;
+    app::DatagramSessionEnvironment datagram_environment;
     std::vector<std::shared_ptr<tcp::acceptor>> tcp_acceptors;
     RetirableIngress<app::UdpIngress> udp;
     RetirableIngress<transport::QuicListener> quic;
@@ -283,14 +283,12 @@ private:
 
 // Worker-owned listeners, configuration publication and admission ledgers.
 // Every TCP, QUIC and native UDP request dispatches within its session domain.
-struct app::Worker::RuntimeState final : app::WorkerInbounds {
-    RuntimeState(app::Worker& worker,
-                 net::io_context& io_context,
+struct app::Worker::RuntimeState {
+    RuntimeState(net::io_context& io_context,
                  const app::WorkerRuntimeConfig& runtime_config,
                  app::StatsShard& stats_ref,
                  app::DNSWorker& dns_worker)
         : io_context(io_context)
-        , stop_requested(worker.stop_requested_)
         , startup_config(std::make_unique<app::WorkerRuntimeConfig>(runtime_config))
         , timeouts(runtime_config.timeouts)
         , initial_user_view(app::UserStore::PrepareWorkerView(
@@ -300,29 +298,16 @@ struct app::Worker::RuntimeState final : app::WorkerInbounds {
                        runtime_config.pressure_idle_timeout)
         , dns_worker(dns_worker)
         , dns(dns_worker)
-        , listener_state(std::make_unique<ListenerState>(io_context)) {
-        app::BindWorkerInbounds(io_context, this);
-    }
+        , listener_state(std::make_unique<ListenerState>(io_context))
+        {}
 
     ~RuntimeState() {
-        app::BindWorkerInbounds(io_context, nullptr);
         if (udp_association_reclaimer) udp_association_reclaimer->Stop();
-    }
-
-    // This Worker's thread only; null once stopping.
-    const app::InboundSessionEnvironment* FindInbound(
-        std::string_view tag) const noexcept override {
-        if (stop_requested.load(std::memory_order_acquire)) return nullptr;
-        const auto& slots = listener_state->listener_slots;
-        const auto slot = slots.find(tag);
-        if (slot == slots.end() || !slot->second->handler) return nullptr;
-        return &slot->second->session_environment;
     }
 
     void Start(app::Worker& worker);
 
     net::io_context& io_context;
-    const std::atomic<bool>& stop_requested;
     // Prepared control-plane data is consumed once, never retained by requests
     // or copied to mirror the manager's live handler set.
     std::unique_ptr<const app::WorkerRuntimeConfig> startup_config;
@@ -388,7 +373,7 @@ Worker::Worker(uint32_t id, net::io_context& io_context,
     : id_(id)
     , io_context_(io_context)
     , runtime_(std::make_unique<RuntimeState>(
-          *this, io_context, runtime_config, stats, dns_worker))
+          io_context, runtime_config, stats, dns_worker))
     , mailbox_(std::make_unique<WorkerMailbox>(
           runtime_->io_context,
           common::kWorkerMailboxCapacity))
@@ -537,6 +522,8 @@ net::awaitable<void> Worker::StopRuntimeTask() {
         runtime_->outbound_tasks->Tasks().Cancel();
         co_await runtime_->outbound_tasks->AsyncJoin();
     }
+    // Every connection of this Worker has ended; its relay endpoint stops.
+    transport::StopXHttpUploadRelay(io_context_);
     co_await transport::JoinXHttpClientTasks(io_context_);
     co_await transport::TimeoutScheduler::AsyncReleaseForIoContext(io_context_);
     runtime_.reset();
@@ -973,14 +960,13 @@ bool Worker::RegisterInbound(
         return false;
     }
     slot_it->second->handler = registered;
-    slot_it->second->session_environment = app::InboundSessionEnvironment{
+    slot_it->second->datagram_environment = app::DatagramSessionEnvironment{
         .timeouts = runtime_->timeouts,
         .dispatcher = runtime_->dispatcher.get(),
         .admission = &*runtime_->admission,
         .request_load = &runtime_->request_load,
         .handler = registered,
         .prepared = std::move(prepared),
-        .worker_id = id_,
     };
     return true;
 }
@@ -1024,7 +1010,7 @@ net::awaitable<void> Worker::UnregisterListenerTask(std::string tag) {
     if (auto slot_it = runtime_->listener_state->listener_slots.find(tag);
             slot_it != runtime_->listener_state->listener_slots.end()) {
         slot_it->second->handler.reset();
-        slot_it->second->session_environment = {};
+        slot_it->second->datagram_environment = {};
         if (!slot_it->second->tcp_binding && !slot_it->second->udp_binding &&
             slot_it->second->udp.Empty() && slot_it->second->quic.Empty()) {
             runtime_->listener_state->listener_slots.erase(slot_it);
@@ -1160,14 +1146,14 @@ net::awaitable<bool> Worker::ListenerState::StartQuicListening(
     }
     const auto slot_it = listener_slots.find(binding.tag);
     if (slot_it == listener_slots.end() || !slot_it->second->handler ||
-        !slot_it->second->session_environment.prepared) {
+        !slot_it->second->datagram_environment.prepared) {
         LOG_ERROR("QUIC listener unavailable worker={} tag={} > missing prepared inbound",
                   worker.id_, binding.tag);
         co_return false;
     }
     auto replacement = NewQuicListener(
         binding.protocol, worker.id_, worker.group_coordinator_->WorkerCount(),
-        worker.runtime_->io_context, slot_it->second->session_environment);
+        worker.runtime_->io_context, slot_it->second->datagram_environment);
     if (!replacement) co_return false;
 
     size_t bound = 0;
@@ -1416,7 +1402,7 @@ net::awaitable<void> Worker::ListenerState::UdpReceiveLoop(
             .receiver = receiver,
             .io_context = worker.runtime_->io_context,
             .worker_id = worker.id_,
-            .environment = listener_slot->session_environment,
+            .environment = listener_slot->datagram_environment,
         });
     };
     return transport::RunUdpReceiveLoop(

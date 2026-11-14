@@ -147,7 +147,7 @@ TEST_P(InvalidInboundRegistration, RejectsIncompleteRegistration) {
             break;
         case InvalidInbound::OrphanQuicFactory:
             registration.create_quic_listener = [](uint32_t, uint32_t, ::net::io_context&,
-                ::app::InboundSessionEnvironment) -> std::unique_ptr<::transport::QuicListener> {
+                ::app::DatagramSessionEnvironment) -> std::unique_ptr<::transport::QuicListener> {
                 return {};
             };
             break;
@@ -203,7 +203,7 @@ TEST(ProtocolRegistration, PreservesRegisteredTraitsAndQuicFactoryCapability) {
     registration.datagram_transport = DatagramTransport::Quic;
     registration.traits = {.mailbox_email_defaults_to_tag = true, .requires_tls = true};
     registration.create_quic_listener = [](uint32_t, uint32_t, ::net::io_context&,
-        ::app::InboundSessionEnvironment) -> std::unique_ptr<::transport::QuicListener> {
+        ::app::DatagramSessionEnvironment) -> std::unique_ptr<::transport::QuicListener> {
         return {};
     };
     EXPECT_NO_THROW(RegisterProxy("lifecycle-quic-traits", registration));
