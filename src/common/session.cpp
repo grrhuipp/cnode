@@ -62,6 +62,25 @@ std::string FormatAccessLog(const Context& ctx,
             target_host = "unknown";
         }
     }
+    const TargetAddress* sniff_target = nullptr;
+    if (!ctx.content.protocol.empty()) {
+        if (ctx.outbound.route_target.IsValid()) {
+            sniff_target = &ctx.outbound.route_target;
+        } else if (ctx.outbound.original_target.IsValid() && t.IsValid()) {
+            sniff_target = &t;
+        }
+    }
+    std::optional<AddressText> sniff_host_storage;
+    std::string_view sniff_host;
+    if (sniff_target) {
+        sniff_host = sniff_target->host;
+        if (sniff_host.empty()) {
+            sniff_host_storage.emplace(
+                NormalizeAddress(*sniff_target->resolved_addr));
+            sniff_host = sniff_host_storage->View();
+        }
+    }
+
 
     const std::string_view in_tag = ctx.inbound.tag;
     const std::string_view out_tag = ctx.outbound.tag;
@@ -76,7 +95,8 @@ std::string FormatAccessLog(const Context& ctx,
         origin_host = origin_host_storage->View();
     }
     std::string access;
-    access.reserve(224 + src_host.size() + target_host.size() +
+    access.reserve(240 + src_host.size() + target_host.size() +
+                   sniff_host.size() + ctx.content.protocol.size() +
                    in_tag.size() + out_tag.size() +
                    ctx.inbound.user_email.size() +
                    origin_host.size() + ctx.inbound.origin_tag.size() +
@@ -106,6 +126,14 @@ std::string FormatAccessLog(const Context& ctx,
             access.append(out_tag);
         }
         access.push_back(']');
+    }
+    if (!ctx.content.protocol.empty()) {
+        access.append(" sniff:").append(ctx.content.protocol);
+        if (sniff_target) {
+            access.push_back('|');
+            AppendEndpointForLog(
+                access, sniff_host, sniff_target->port);
+        }
     }
     std::array<char, 20> uid_buffer{};
     std::string_view uid;

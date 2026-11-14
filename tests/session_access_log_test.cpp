@@ -32,6 +32,48 @@ TEST_F(SessionAccessLog, ReportsEndpointsRouteVerifiedIdentityAndActualLocalAddr
     EXPECT_NE(access.find(" sendThrough:2602:2b5:20:111::abcd"), std::string::npos);
 }
 
+TEST_F(SessionAccessLog, ReportsRouteOnlySniffProtocolAndTarget) {
+    ctx.content.network = ::common::Network::UDP;
+    ctx.content.protocol = "quic";
+    ctx.outbound.target =
+        ::common::TargetAddress(::net::ip::make_address("198.18.1.96"), 443);
+    ctx.outbound.route_target =
+        ::common::TargetAddress("chatgpt.com", 443);
+
+    const auto access = ::common::FormatAccessLog(ctx);
+
+    EXPECT_NE(
+        access.find(
+            "accepted udp:198.18.1.96:443 "
+            "[panel/hj-anytls/1041/anytls/55911 -> direct] "
+            "sniff:quic|chatgpt.com:443 user:714443"),
+        std::string::npos);
+}
+
+TEST_F(SessionAccessLog, ReportsSniffTargetAfterDestinationOverride) {
+    ctx.content.protocol = "tls";
+    ctx.outbound.original_target =
+        ::common::TargetAddress(::net::ip::make_address("198.18.1.96"), 443);
+    ctx.outbound.target = ::common::TargetAddress("chatgpt.com", 443);
+
+    const auto access = ::common::FormatAccessLog(ctx);
+
+    EXPECT_NE(
+        access.find("sniff:tls|chatgpt.com:443 user:714443"),
+        std::string::npos);
+}
+
+TEST_F(SessionAccessLog, ReportsRecognizedProtocolWithoutDestinationOverride) {
+    ctx.content.protocol = "bittorrent";
+
+    const auto access = ::common::FormatAccessLog(ctx);
+
+    EXPECT_NE(
+        access.find("sniff:bittorrent user:714443"),
+        std::string::npos);
+    EXPECT_EQ(access.find("sniff:bittorrent|"), std::string::npos);
+}
+
 TEST_F(SessionAccessLog, ForwardedOriginDoesNotReplaceVerifiedLocalIdentity) {
     ctx.inbound.ApplyForwardedMetadata(::common::ForwardedMetadata{
         .user_id = 1001,

@@ -345,11 +345,12 @@ time="2026-11-05T12:30:00+08:00" level=info msg="Panel status: state=ready inbou
 
 `Panel status` 每 60 秒输出一次，`state` 取 `connecting / ready / degraded / missing / unavailable`，含义见 [`docs/local_logging.md`](docs/local_logging.md#4-文件和后端)。`info` 级别周期资源日志按 `Runtime activity / memory / traffic / DNS cache`、`Process descriptors`、`Worker activity / UDP resources / UDP traffic`、`Panel node totals` 分行输出；FD 采样不可用时显示 `unknown`。
 
-**访问文件**：只记录访问事实，不带日志级别。接受为 `accepted`，认证、配额与策略拒绝为 `rejected` 并说明原因。`user:` 是数字 UID，`email:` 是用户标识（与 UID 相同时不重复）；收到上游 `passthrough` 元数据时追加 `origin:<ip>|<tag>|<uid>|<email>`；`sendThrough:` 是实际连接的本地地址。认证前不记录候选用户。
+**访问文件**：只记录访问事实，不带日志级别。接受为 `accepted`，认证、配额与策略拒绝为 `rejected` 并说明原因。嗅探成功时追加 `sniff:<protocol>`；嗅探目标参与路由或替换实际目标时写为 `sniff:<protocol>|<host>:<port>`。`user:` 是数字 UID，`email:` 是用户标识（与 UID 相同时不重复）；收到上游 `passthrough` 元数据时追加 `origin:<ip>|<tag>|<uid>|<email>`；`sendThrough:` 是实际连接的本地地址。认证前不记录候选用户。
 
 ```text
 2026/11/05 12:30:01.123456 from 192.0.2.10:52000 accepted tcp:example.com:443 [vless-in -> direct] user:123 email:user@example.com sendThrough:198.51.100.2
-2026/11/05 12:30:02.123456 from 192.0.2.10:52001 rejected authentication failed: no matching user [vless-in]
+2026/11/05 12:30:01.234567 from 192.0.2.11:52001 accepted udp:198.18.1.96:443 [ss-in -> us] sniff:quic|chatgpt.com:443 user:124
+2026/11/05 12:30:02.123456 from 192.0.2.10:52002 rejected authentication failed: no matching user [vless-in]
 ```
 
 **错误文件**：受 `loglevel` 控制的诊断，时间精确到微秒。连接记录带完整 64 位连接 ID、组件、已有路由与已确认 UID。
