@@ -19,6 +19,7 @@ class OutboundHandler;
 class OutboundHandlerRegistry;
 class SessionTrackingState;
 class RequestLoadState;
+class UdpFlowDispatcher;
 class DNS;
 
 enum class SelectionSource : uint8_t {
@@ -103,6 +104,7 @@ private:
         StatsShard& stats,
         const infra::TimeoutsConfig& timeouts,
         uint32_t pressure_idle_timeout,
+        bool split_udp_association,
         RelayResult& result,
         common::ErrorCode& cancellation_reason);
     [[nodiscard]] OutboundSelection SelectRoute(
@@ -116,6 +118,8 @@ private:
         const routing::DispatchPolicy& policy,
         std::optional<OutboundSelection> initial_selection);
 
+
+    friend class UdpFlowDispatcher;
     const routing::Router& router_;
     const OutboundHandlerRegistry& outbound_handlers_;
     common::DetectRulePolicy& request_policy_;

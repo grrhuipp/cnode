@@ -268,6 +268,21 @@ public:
         if (group_) group_->Cancel();
     }
 
+    // Stop accepting new children but let started work reach its protocol
+    // boundary. The children remain bounded by their own I/O deadlines.
+    net::awaitable<void> AsyncDrain() {
+        co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+        Drain();
+        if (!join_) co_return;
+        while (!join_->done) {
+            IoErrorCode ignored;
+            co_await join_->wake.async_wait(net::redirect_error(net::use_awaitable, ignored));
+        }
+        if (join_->failure && !IsOperationCancelled(join_->failure)) {
+            std::rethrow_exception(join_->failure);
+        }
+    }
+
     // A join is never abandoned halfway: caller cancellation is ignored.
     net::awaitable<void> AsyncJoin() {
         co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
@@ -289,6 +304,13 @@ private:
         auto group = std::make_shared<GroupState>(executor_, Completion{join});
         join_ = std::move(join);
         group_ = std::move(group);
+    }
+
+    void Drain() {
+        if (closed_) return;
+        closed_ = true;
+        stopping_ = true;
+        if (group_) group_->Finish();  // releases the launch sentinel
     }
 
     void Close() {

@@ -60,6 +60,13 @@ net::awaitable<void> Wait(net::steady_timer& timer, Counts& counts,
         co_await cleanup.async_wait(net::use_awaitable);
     }
 }
+net::awaitable<void> FinishNormally(
+    net::steady_timer& timer, bool& completed) {
+    IoErrorCode error;
+    co_await timer.async_wait(net::redirect_error(net::use_awaitable, error));
+    completed = !error;
+}
+
 
 net::awaitable<void> AddChild(::common::AwaitableTaskGroup& group,
                               net::steady_timer& timer, Counts& counts) {
@@ -419,6 +426,26 @@ TEST(AwaitableTaskGroup, ResidentJoinCancelsChildrenAndClosesAdmission) {
     }
     EXPECT_TRUE(joined && rejected && counts.active == 0 && counts.finished == 2) << "resident join must cancel, join and close admission";
 }
+TEST(AwaitableTaskGroup, ResidentDrainWaitsWithoutCancellingChildren) {
+    net::io_context io;
+    net::steady_timer gate(io);
+    gate.expires_after(std::chrono::milliseconds(15));
+    ::common::ResidentTaskGroup resident(io.get_executor());
+    bool child_completed = false;
+    bool drained = false;
+
+    resident.Spawn(FinishNormally(gate, child_completed));
+    net::co_spawn(io, resident.AsyncDrain(), [&](std::exception_ptr error) {
+        drained = !error;
+    });
+    io.poll();
+    EXPECT_FALSE(drained);
+    io.run();
+
+    EXPECT_TRUE(child_completed);
+    EXPECT_TRUE(drained);
+}
+
 
 void CheckAllocation(std::size_t) { async_allocation_test::Check(); }
 }  // namespace

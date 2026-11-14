@@ -116,6 +116,7 @@ set(CNODE_CORE_SOURCES
     # App, DNS, Router, Controller, API
     src/app/dns.cpp
     src/app/default_dispatcher.cpp
+    src/app/udp_flow_dispatcher.cpp
     src/app/session_tracking.cpp
     src/app/rate_limiter.cpp
     src/app/relay.cpp

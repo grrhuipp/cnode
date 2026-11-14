@@ -1,9 +1,10 @@
 #pragma once
 
 #include "common/target_address.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdint>
-#include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -22,6 +23,40 @@ struct SniffResult {
     std::string domain;             // 嗅探到的域名
     uint16_t port = 0;              // 嗅探到的端口（HTTP 可能有）
 };
+
+struct QuicConnectionId {
+    std::array<uint8_t, 20> bytes{};
+    uint8_t size = 0;
+
+    [[nodiscard]] bool operator==(const QuicConnectionId& other) const noexcept {
+        if (size > bytes.size() || other.size > other.bytes.size() ||
+            size != other.size) {
+            return false;
+        }
+        return std::equal(bytes.begin(), bytes.begin() + size, other.bytes.begin());
+    }
+};
+
+enum class QuicLongPacketType : uint8_t {
+    Initial,
+    ZeroRtt,
+    Handshake,
+    Retry,
+    VersionNegotiation,
+};
+
+struct QuicLongHeader {
+    uint32_t version = 0;
+    QuicLongPacketType type = QuicLongPacketType::VersionNegotiation;
+    QuicConnectionId destination;
+    QuicConnectionId source;
+};
+
+// Parses only the invariant long-header fields needed to keep routed UDP flows
+// separate. Payload authentication and ClientHello parsing remain QuicSniffer's
+// responsibility.
+[[nodiscard]] std::optional<QuicLongHeader> InspectQuicLongHeader(
+    std::span<const uint8_t> data) noexcept;
 
 // TLS 嗅探（从 ClientHello SNI 扩展中提取域名）
 [[nodiscard]] SniffResult SniffTls(std::span<const uint8_t> data);

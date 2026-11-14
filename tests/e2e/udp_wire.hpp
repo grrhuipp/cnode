@@ -229,8 +229,13 @@ public:
         }
         server_session = header.substr(0, 8); server_packet_id = id;
     }
+    void SetTarget(uint16_t destination, std::string_view host) {
+        target_ = SocksAddress(destination, host);
+    }
     void Finish() { if (!native_) socket->ShutdownWrite(); }
-    void ExpectEof() { if (!native_) Require(socket->Read(1, 2s).empty(), "unexpected trailing response"); }
+    void ExpectEof(Milliseconds timeout = 2s) {
+        if (!native_) Require(socket->Read(1, timeout).empty(), "unexpected trailing response");
+    }
     std::shared_ptr<Socket> socket;
     const std::string session = BigEndian(0x00123456789abcdeULL, 8);
     std::string server_session;
@@ -271,6 +276,10 @@ inline std::string QuicVarint(size_t value) {
     Require(value < 16384, "QUIC varint too large");
     return BigEndian(value < 64 ? value : value | 0x4000, value < 64 ? 1 : 2);
 }
+inline std::string QuicServerConnectionId() {
+    return std::string("\x11\x12\x13\x14\x15\x16\x17\x18", 8);
+}
+
 inline std::array<std::string, 2> QuicInitials() {
     auto extension = [](unsigned kind, std::string_view data) { return BigEndian(kind, 2) + BigEndian(data.size(), 2) + std::string(data); };
     using namespace std::string_literals;
@@ -293,7 +302,9 @@ inline std::array<std::string, 2> QuicInitials() {
     std::array<std::string, 2> packets;
     for (size_t number = 0; number < 2; ++number) {
         auto fragment = number == 0 ? hello.substr(0, 1000) : hello.substr(1000);
-        auto prefix = "\xc1\0\0\0\1"s + BigEndian(dcid.size(), 1) + dcid + "\0\0"s;
+        auto scid = QuicServerConnectionId();
+        auto prefix = "\xc1\0\0\0\1"s + BigEndian(dcid.size(), 1) + dcid +
+            BigEndian(scid.size(), 1) + scid + "\0"s;
         auto header = prefix + QuicVarint(1250 - prefix.size() - 2);
         size_t pn_offset = header.size();
         header += BigEndian(number, 2);

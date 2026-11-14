@@ -39,7 +39,14 @@ public:
         if (this->value.protocol == "shadowsocks") outbound["settings"] = SsSettings(peer.Port(), this->value.mode == "dns_timeout" ? "udp-sink.test" : "127.0.0.1");
         Json outbounds = Json::array({outbound});
         Json routing = {{"rules", Json::array({{{"type", "field"}, {"inboundTag", Json::array({"udp-probe"})}, {"outboundTag", "udp-out"}}})}};
-        if (IsQuic()) {
+        if (TargetSplit()) {
+            outbounds.push_back({{"tag", "fallback-out"}, {"protocol", "shadowsocks"},
+                {"settings", SsSettings(fallback.Port())}});
+            routing = {{"domainStrategy", "AsIs"}, {"rules", Json::array({
+                {{"type", "field"}, {"ip", Json::array({"198.18.0.1/32"})}, {"outboundTag", "udp-out"}},
+                {{"type", "field"}, {"ip", Json::array({"198.18.0.2/32"})}, {"outboundTag", "fallback-out"}},
+                {{"type", "field"}, {"inboundTag", Json::array({"udp-probe"})}, {"outboundTag", "fallback-out"}}})}};
+        } else if (IsQuic()) {
             inbound["sniffing"]["routeOnly"] = true;
             inbound["sniffing"]["destOverride"] = Json::array({"quic"});
             outbounds.push_back({{"tag", "fallback-out"}, {"protocol", "shadowsocks"}, {"settings", SsSettings(fallback.Port())}});
@@ -59,6 +66,7 @@ public:
         return {{"servers", Json::array({{{"address", address}, {"port", port}, {"method", "aes-128-gcm"}, {"password", "secret"}}})}};
     }
     bool Native() const { return value.mode.starts_with("native_"); }
+    bool TargetSplit() const { return value.mode == "native_target_split"; }
     bool IsQuic() const { return value.mode.find("quic_") != std::string::npos; }
     bool Sniffing() const { return IsQuic() || value.mode.find("sniff_") != std::string::npos; }
     bool Handoff() const { return value.mode == "native_ss2022_isolation"; }
@@ -265,22 +273,55 @@ void ExerciseDns(RelayRun& run) {
     EXPECT_FALSE(Readable(run.peer.Fd(), 100ms));
 }
 
+void ExerciseTargetSplit(RelayRun& run) {
+    Client client(run.port, 443, true, false, "198.18.0.1", run.value.cipher);
+    auto exchange = [&](Socket& endpoint, std::string_view host,
+                        std::string_view request) {
+        client.SetTarget(443, host);
+        client.Send(request);
+        auto packet = Receive(endpoint);
+        const auto plain = LegacyDecrypt(packet.payload);
+        EXPECT_EQ(plain, SocksAddress(443, host) + std::string(request));
+        Reply(endpoint, packet, LegacyEncrypt(plain));
+        client.Expect(request);
+        return packet;
+    };
+
+    const auto first = exchange(run.peer, "198.18.0.1", "fake-one");
+    const auto second = exchange(run.fallback, "198.18.0.2", "fake-two");
+    const auto again = exchange(run.peer, "198.18.0.1", "fake-one-again");
+    EXPECT_TRUE(first.SameEndpoint(again));
+    EXPECT_FALSE(first.SameEndpoint(second));
+    EXPECT_FALSE(Readable(run.peer.Fd(), 100ms));
+    EXPECT_FALSE(Readable(run.fallback.Fd(), 100ms));
+
+}
+
 void ExerciseQuic(RelayRun& run, Client& client) {
     auto packets = QuicInitials();
-    const bool complete = run.value.mode.ends_with("_fragmented");
+    const bool interrupted = run.value.mode.ends_with("_interrupted");
+    const bool complete =
+        run.value.mode.ends_with("_fragmented") || interrupted;
     auto& selected = complete ? run.peer : run.fallback;
-    auto& rejected = complete ? run.fallback : run.peer;
     std::vector<std::string> expected{packets[0]};
     auto started = std::chrono::steady_clock::now();
     client.Send(packets[0]);
     if (run.value.mode.ends_with("_missing")) {
         run.Echo(selected, packets[0]); client.Expect(packets[0], 1s);
         EXPECT_LT(std::chrono::steady_clock::now() - started, 1s);
+    } else if (interrupted) {
+        std::this_thread::sleep_for(20ms);
+        client.Send("non-QUIC-between-CRYPTO-fragments");
+        expected.push_back(packets[1]);
+        client.Send(packets[1]);
+        for (const auto& packet : packets) {
+            run.Echo(selected, packet);
+            client.Expect(packet, 1s);
+        }
     } else {
         std::this_thread::sleep_for(20ms);
         auto next = packets[1];
         if (run.value.mode.ends_with("_invalid")) next.back() ^= 1;
-        else if (run.value.mode.ends_with("_interrupted")) next = "non-QUIC-between-CRYPTO-fragments";
         expected.push_back(next);
         auto terminal = std::chrono::steady_clock::now();
         client.Send(next);
@@ -289,16 +330,54 @@ void ExerciseQuic(RelayRun& run, Client& client) {
         run.Echo(selected, next); client.Expect(next, 1s);
     }
     if (!complete) {
-        expected.push_back(packets[1]); client.Send(packets[1]); run.Echo(selected, packets[1]); client.Expect(packets[1], 1s);
+        expected.push_back(packets[1]);
+        client.Send(packets[1]);
+        run.Echo(selected, packets[1]);
+        client.Expect(packets[1], 1s);
     }
-    for (const auto& packet : {LargePacket(), std::string("after-QUIC-sniff")}) {
-        expected.push_back(packet); client.Send(packet); run.Echo(selected, packet); client.Expect(packet, 1s);
-    }
+    const auto short_packet =
+        std::string(1, '\x40') + QuicServerConnectionId() + "short-after-initial";
+    expected.push_back(short_packet);
+    client.Send(short_packet);
+    run.Echo(selected, short_packet);
+    client.Expect(short_packet, 1s);
+
+    const std::string ordinary = std::string(1, '\0') + "ordinary-after-QUIC";
+    expected.push_back(ordinary);
+    client.Send(ordinary);
+    run.Echo(run.fallback, ordinary);
+    client.Expect(ordinary, 1s);
     client.Finish(); client.ExpectEof();
     EXPECT_EQ(run.observed, expected);
-    EXPECT_FALSE(Readable(rejected.Fd(), 100ms));
-    EXPECT_FALSE(Readable(selected.Fd(), 100ms));
+    EXPECT_FALSE(Readable(run.peer.Fd(), 100ms));
+    EXPECT_FALSE(Readable(run.fallback.Fd(), 100ms));
     EXPECT_FALSE(Readable(run.dns.Fd(), 100ms));
+}
+
+void ExerciseQuicAfterPlain(RelayRun& run, Client& client) {
+    const std::string plain = "plain-before-QUIC";
+    client.Send(plain);
+    run.Echo(run.fallback, plain);
+    client.Expect(plain, 1s);
+
+    auto packets = QuicInitials();
+    client.Send(packets[0]);
+    client.Send(packets[1]);
+    for (const auto& packet : packets) {
+        run.Echo(run.peer, packet);
+        client.Expect(packet, 1s);
+    }
+    const auto short_packet =
+        std::string(1, '\x40') + QuicServerConnectionId() + "new-connection";
+    client.Send(short_packet);
+    run.Echo(run.peer, short_packet);
+    client.Expect(short_packet, 1s);
+    client.Finish();
+    client.ExpectEof(4s);
+    EXPECT_EQ(run.observed, (std::vector<std::string>{
+        plain, packets[0], packets[1], short_packet}));
+    EXPECT_FALSE(Readable(run.peer.Fd(), 100ms));
+    EXPECT_FALSE(Readable(run.fallback.Fd(), 100ms));
 }
 
 class UdpRelay : public testing::TestWithParam<Case> {};
@@ -306,11 +385,16 @@ TEST_P(UdpRelay, PreservesProtocolDatagramsAndAssociationLifetime) {
     const auto& item = GetParam();
     SCOPED_TRACE(item.protocol + "/" + item.mode + "/" + item.cipher);
     RelayRun run(item);
+    if (run.TargetSplit()) { ExerciseTargetSplit(run); return; }
     if (run.EmptyDatagrams()) { ExerciseEmptyDatagrams(run); return; }
     if (run.Handoff()) { ExerciseHandoff(run); return; }
     if (run.IsIsolation()) { ExerciseIsolation(run); return; }
     if (item.mode == "dns_timeout" || item.mode == "shared_cancel") { ExerciseDns(run); return; }
     Client client(run.port, run.Destination(), run.Native());
+    if (item.mode.ends_with("_after_plain")) {
+        ExerciseQuicAfterPlain(run, client);
+        return;
+    }
     if (run.IsQuic()) { ExerciseQuic(run, client); return; }
     std::vector<std::string> expected;
     if (run.Sniffing()) {
@@ -348,9 +432,13 @@ std::vector<Case> Cases() {
             result.push_back({protocol, "native_empty_datagrams", cipher});
     for (const auto* cipher : {"", "aes", "chacha"})
         result.push_back({"shadowsocks", "native_empty_short_domain", cipher});
+    for (const auto* cipher : {"", "aes", "chacha"})
+        result.push_back({"shadowsocks", "native_target_split", cipher});
     for (const auto* prefix : {"quic_", "native_quic_"})
         for (const auto* suffix : {"fragmented", "missing", "interrupted", "invalid"})
             result.push_back({"shadowsocks", std::string(prefix) + suffix, {}});
+    for (const auto* prefix : {"quic_", "native_quic_"})
+        result.push_back({"shadowsocks", std::string(prefix) + "after_plain", {}});
     return result;
 }
 INSTANTIATE_TEST_SUITE_P(ProtocolAndOutboundMatrix, UdpRelay, testing::ValuesIn(Cases()),

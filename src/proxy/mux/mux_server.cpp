@@ -821,7 +821,6 @@ public:
     MuxServerSession& operator=(const MuxServerSession&) = delete;
     net::awaitable<app::RelayResult> Run() {
         try {
-    LOG_ACCESS(common::FormatAccessLog(parent_ctx));
     if (!client_link.Valid()) {
         client_control.CloseAbortive();
         result.error = common::ErrorCode::PROTOCOL_DECODE_FAILED;

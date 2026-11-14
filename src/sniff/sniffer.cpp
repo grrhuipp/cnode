@@ -435,6 +435,61 @@ bool AesGcmDecrypt(bssl::ScopedEVP_AEAD_CTX& aead_ctx,
 
 }  // namespace
 
+std::optional<QuicLongHeader> InspectQuicLongHeader(
+    std::span<const uint8_t> data) noexcept {
+    if (data.size() < 7 || (data[0] & 0x80) == 0) {
+        return std::nullopt;
+    }
+
+    common::ByteReader header(data);
+    const uint8_t first = header.ReadU8();
+    QuicLongHeader result;
+    result.version = header.ReadU32BE();
+
+    const uint8_t destination_size = header.ReadU8();
+    const auto destination = header.ReadBytes(destination_size);
+    if (!header.Ok() || destination_size > result.destination.bytes.size()) {
+        return std::nullopt;
+    }
+    const uint8_t source_size = header.ReadU8();
+    const auto source = header.ReadBytes(source_size);
+    if (!header.Ok() || source_size > result.source.bytes.size()) {
+        return std::nullopt;
+    }
+
+    result.destination.size = destination_size;
+    std::copy(destination.begin(), destination.end(), result.destination.bytes.begin());
+    result.source.size = source_size;
+    std::copy(source.begin(), source.end(), result.source.bytes.begin());
+
+    if (result.version == 0) {
+        result.type = QuicLongPacketType::VersionNegotiation;
+        return result;
+    }
+    const auto* version = LookupVersion(result.version);
+    if (!version || (first & 0x40) == 0) {
+        return std::nullopt;
+    }
+    const uint8_t packet_type = static_cast<uint8_t>((first >> 4) & 3);
+    const uint8_t relative_type =
+        static_cast<uint8_t>((packet_type - version->type_initial) & 3);
+    switch (relative_type) {
+        case 0:
+            result.type = QuicLongPacketType::Initial;
+            break;
+        case 1:
+            result.type = QuicLongPacketType::ZeroRtt;
+            break;
+        case 2:
+            result.type = QuicLongPacketType::Handshake;
+            break;
+        case 3:
+            result.type = QuicLongPacketType::Retry;
+            break;
+    }
+    return result;
+}
+
 SniffResult SniffTls(std::span<const uint8_t> data) {
     SniffResult result;
     common::ByteReader reader(data);

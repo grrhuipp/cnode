@@ -178,6 +178,47 @@ protected:
     }
 };
 
+TEST_F(QuicSnifferCases, LongHeaderIdentityExposesVersionAndConnectionIds) {
+    const auto packet = Protect(Crypto(hello));
+    const auto header = ::sniff::InspectQuicLongHeader(packet);
+    ASSERT_TRUE(header);
+    EXPECT_EQ(header->version, 1u);
+    EXPECT_EQ(header->type, ::sniff::QuicLongPacketType::Initial);
+    ASSERT_EQ(header->destination.size, 8);
+    EXPECT_TRUE(std::equal(
+        header->destination.bytes.begin(),
+        header->destination.bytes.begin() + 8,
+        packet.begin() + 6));
+    EXPECT_EQ(header->source.size, 0);
+}
+
+TEST_F(QuicSnifferCases, LongHeaderIdentityRecognizesRetryLayouts) {
+    const Bytes version_one{
+        0xf0, 0, 0, 0, 1,
+        2, 0xaa, 0xbb,
+        3, 0x11, 0x12, 0x13,
+    };
+    const auto first = ::sniff::InspectQuicLongHeader(version_one);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first->type, ::sniff::QuicLongPacketType::Retry);
+    EXPECT_EQ(first->destination.size, 2);
+    EXPECT_EQ(first->source.size, 3);
+
+    const Bytes version_two{
+        0xc0, 0x6b, 0x33, 0x43, 0xcf,
+        1, 0xaa,
+        2, 0x21, 0x22,
+    };
+    const auto second = ::sniff::InspectQuicLongHeader(version_two);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(second->type, ::sniff::QuicLongPacketType::Retry);
+    EXPECT_EQ(second->destination.size, 1);
+    EXPECT_EQ(second->source.size, 2);
+
+    EXPECT_FALSE(::sniff::InspectQuicLongHeader(
+        Bytes{0xc0, 0, 0, 0, 1, 21}));
+}
+
 TEST_F(QuicSnifferCases, SupportedVersionsExtractDomain) {
     for (uint32_t version : {uint32_t{1}, uint32_t{0x6b3343cf}, uint32_t{0xff00001d}}) {
         ::sniff::QuicSniffer parser;

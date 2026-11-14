@@ -108,6 +108,8 @@ Inbound Handler::Process
 
 每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口；连接与有状态会话一生固定在创建它的 Worker 上。Hysteria2 QUIC 连接通过内核态 CID 分流固定到原 Worker，客户端路径迁移后仍由原 Worker 服务；Hysteria2 只提供配置的服务端 UDP 端口，不实现端口跳跃。主线程运行唯一主控事件循环，承载面板同步、监控、DNS 与全局准入。
 
+一个已认证 UDP association 只保留协议认证、重放保护和回包路径；Dispatcher 按原始目标拆分独立路由子流。普通 UDP 以完整目标为键，QUIC 以目标、版本和 Initial DCID 为键并跟踪后续 CID；每个子流独立嗅探、选路、出站、统计和访问日志。回包始终恢复该子流的原始目标，因此不同 FakeIP 即使解析到同一真实 IP，也不会共用路由或回包地址。
+
 控制面从面板拉取节点、用户和规则，归一化为不可变运行时快照后原子发布到各 Worker。用户或规则的局部更新保留未变更的监听和资源，成功应用后才确认同步验证器；失败保留最后提交的配置。分层职责与边界规则见 [`AGENTS.md`](AGENTS.md)。
 
 ## 部署
@@ -306,6 +308,7 @@ geosite.dat
 - Mux：每连接最多 1,024 个子会话；未转发客户端数据共享 4 MiB 预算，降至 2 MiB 后恢复读取（与 Xray 相同的队头阻塞语义）。
 - AnyTLS 入站：每个 Session 最多 128 条未结束子流，子流从 SYN 起受 `timeouts.handshake` 绝对期限约束；每条子流接收队列最多 65,535 字节有效数据。
 - 原生 UDP：每 Worker 最多 4096 个出站 UDP socket、4096 个存活入站 association、8192 份排队数据报、64 MiB 排队缓冲；满额拒绝新请求，不驱逐已有请求。每个逻辑 UDP 请求独占一个出站 socket，源端口在请求期间不变。上行半关闭后在 `downlinkOnly` 窗口内继续收包。
+- UDP 路由子流：每个 association 最多保留 64 个目标、64 个路由子流和 512 个 QUIC CID alias；每个子流最多排队 64 个数据报或 1 MiB，association 子流队列合计最多 4 MiB。
 - Hysteria UDP 分片重组：5 秒无新片或 15 秒整体期限即丢弃该轮分片，不关闭会话。Hysteria v1 服务端使用 BBR v2 拥塞控制，与官方 v1 客户端线协议互通，但带宽控制行为不是 Brutal。
 - VMess 重放窗口 180 秒，最多 65,536 项，满时拒绝新记录。
 - SS2022 TCP 按 [SIP022 §3.1.5](https://shadowsocks.org/doc/sip022.html#_3-1-5-replay-protection) 记录已认证请求的 salt：进程级去重，保留 65 秒，最多 262,144 项；满时拒绝新记录，不提前淘汰未过期项。重放或跟踪容量拒绝不计入认证失败封禁。

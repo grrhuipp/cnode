@@ -1,4 +1,5 @@
 #include "app/default_dispatcher.hpp"
+#include "app/udp_flow_dispatcher.hpp"
 #include "app/relay.hpp"
 
 
@@ -389,7 +390,7 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
             [&, exec = std::move(exec),
              task = DispatchPreparedLink(
                  io_context, policy, std::move(inbound), inbound_link,
-                 first_packet, ctx, stats, timeouts, pressure_idle_timeout,
+                 first_packet, ctx, stats, timeouts, pressure_idle_timeout, true,
                  result, cancellation_reason)](auto handler) mutable {
                 cancellation.BindParent(net::get_associated_cancellation_slot(handler));
                 net::co_spawn(
@@ -430,6 +431,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     StatsShard& stats,
     const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout,
+    bool split_udp_association,
     RelayResult& result,
     common::ErrorCode& cancellation_reason) {
     const bool has_protocol_link = inbound_link.Valid();
@@ -459,6 +461,15 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
 
     LOG_CONN_DEBUG(ctx, "protocol authenticated target={} email={}",
                    ctx.outbound.target, ctx.inbound.user_email);
+
+    if (split_udp_association &&
+        ctx.content.network == common::Network::UDP) {
+        co_await UdpFlowDispatcher::Run(
+            *this, io_context, policy, std::move(inbound), inbound_link,
+            std::move(first_packet), ctx, stats, timeouts,
+            pressure_idle_timeout, result, cancellation_reason);
+        co_return;
+    }
 
     common::MultiBufferBatch outbound_first_payload;
     const auto sniff_cancellation = co_await net::this_coro::cancellation_state;
