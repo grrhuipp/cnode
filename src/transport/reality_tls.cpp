@@ -1373,7 +1373,15 @@ std::unique_ptr<SslContext> SslContext::CreateClientReality(
         !ConfigureRealityClientKeyExchange(ctx, reality.fingerprint)) {
         return nullptr;
     }
-    if (!ConfigureTlsClientAlpn(ctx, tls_config.alpn)) {
+    // Every supported fingerprint is a browser, whose ClientHello offers
+    // h2 and http/1.1 (uTLS presets as Xray sends them). Without it the dest
+    // answers a ClientHello no browser sends, and a dest whose
+    // EncryptedExtensions then omit ALPN is shorter than the REALITY
+    // server's own, which then fails the handshake.
+    static const std::array<std::string, 2> kBrowserAlpn{"h2", "http/1.1"};
+    if (!ConfigureTlsClientAlpn(
+            ctx, tls_config.alpn.empty() ? std::span<const std::string>(kBrowserAlpn)
+                                         : std::span<const std::string>(tls_config.alpn))) {
         LOG_ERROR("invalid REALITY client ALPN policy");
         return nullptr;
     }

@@ -57,6 +57,29 @@ Json ClientOutbound(uint16_t destination, std::string_view fingerprint = "chrome
         {"streamSettings", {{"network", "tcp"}, {"security", "reality"}, {"realitySettings", settings}}}};
 }
 
+// The body of extension `type` in a ClientHello handshake message, if present.
+std::optional<std::string> ClientHelloExtension(std::string_view hello, uint16_t type) {
+    CBS message, body, session_id, ciphers, compression, extensions;
+    uint8_t message_type = 0;
+    CBS_init(&message, reinterpret_cast<const uint8_t*>(hello.data()), hello.size());
+    Require(CBS_get_u8(&message, &message_type) && message_type == 1 &&
+            CBS_get_u24_length_prefixed(&message, &body) &&
+            CBS_skip(&body, 2 + 32) && CBS_get_u8_length_prefixed(&body, &session_id) &&
+            CBS_get_u16_length_prefixed(&body, &ciphers) &&
+            CBS_get_u8_length_prefixed(&body, &compression) &&
+            CBS_get_u16_length_prefixed(&body, &extensions), "ClientHello layout");
+    while (CBS_len(&extensions) != 0) {
+        uint16_t extension_type = 0;
+        CBS extension;
+        Require(CBS_get_u16(&extensions, &extension_type) &&
+                CBS_get_u16_length_prefixed(&extensions, &extension), "ClientHello extension");
+        if (extension_type == type) {
+            return std::string(reinterpret_cast<const char*>(CBS_data(&extension)), CBS_len(&extension));
+        }
+    }
+    return std::nullopt;
+}
+
 class RealityAuthentication : public testing::TestWithParam<std::string> {};
 TEST_P(RealityAuthentication, FragmentedClientHelloPreservesAuthentication) {
     const auto mode = GetParam();
@@ -119,6 +142,11 @@ TEST_P(RealityAuthentication, FragmentedClientHelloPreservesAuthentication) {
         << "a rejected ML-DSA key must never open the target connection";
     proxy.Join();
     EXPECT_TRUE(proxy.fragmented.load());
+    // Browsers, and Xray's uTLS presets, offer h2 and http/1.1. A REALITY
+    // server pads its own EncryptedExtensions to the dest's; without ALPN a
+    // dest that sends no extensions back fails every handshake.
+    EXPECT_EQ(ClientHelloExtension(proxy.client_hello, 16),
+              std::optional<std::string>(std::string("\x00\x0c\x02h2\x08http/1.1", 14)));
 }
 INSTANTIATE_TEST_SUITE_P(FingerprintsAndPostQuantum, RealityAuthentication,
                         testing::Values("chrome", "firefox", "safari", "ios", "android",

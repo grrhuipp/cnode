@@ -193,6 +193,7 @@ public:
             offset += part.size();
         }
         Require(offset == body.size(), "incomplete fragmented ClientHello");
+        client_hello = body;
         fragmented = true;
         const auto deadline = std::chrono::steady_clock::now() + 15s;
         while (!stop_.load() && std::chrono::steady_clock::now() < deadline) {
@@ -216,6 +217,8 @@ public:
     uint16_t Port() const { return listener_.Port(); }
     void Join() { stop_ = true; thread_.Join(); }
     std::atomic<bool> fragmented{false};
+    // The ClientHello handshake message; read after Join().
+    std::string client_hello;
 private:
     Socket listener_;
     std::atomic<bool> stop_{false};
