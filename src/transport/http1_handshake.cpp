@@ -108,11 +108,38 @@ public:
     }
 
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
+        struct ClearOwned {
+            common::MultiBuffer& mb;
+            ~ClearOwned() noexcept { mb.clear(); }
+        } clear_owned{mb};
         if (closed_ || write_closed_) {
-            mb.clear();
             throw IoSystemError(io_error::operation_aborted, "http1 body write closed");
         }
-        return WriteBody({}, std::move(mb));
+        const auto bytes = mb.FrontSpan();
+        if (bytes.empty()) {
+            co_return;
+        }
+        if (!write_chunked_) {
+            try {
+                co_await inner_->WriteMultiBuffer(std::move(mb));
+            } catch (...) {
+                CloseAbortive();
+                throw;
+            }
+            co_return;
+        }
+        const net::const_buffer single(bytes.data(), bytes.size());
+        Http1ChunkPrefixBuffer prefix{};
+        common::ConstBufferSpanBuilder<4> chunk_buffers;
+        if (!AppendHttp1Chunk(chunk_buffers, prefix, {&single, 1}, bytes.size())) {
+            throw IoSystemError(io_error::fault, "http1 chunk size encode failed");
+        }
+        try {
+            co_await inner_->WriteBuffers(chunk_buffers.Span());
+        } catch (...) {
+            CloseAbortive();
+            throw;
+        }
     }
 
     net::awaitable<void> WriteBuffers(
@@ -120,7 +147,36 @@ public:
         if (closed_ || write_closed_) {
             throw IoSystemError(io_error::operation_aborted, "http1 body write closed");
         }
-        return WriteBody(buffers);
+        size_t len = 0;
+        for (const auto& buffer : buffers) {
+            if (buffer.size() > std::numeric_limits<size_t>::max() - len) {
+                throw IoSystemError(io_error::message_size, "http1 chunk size overflow");
+            }
+            len += buffer.size();
+        }
+        if (len == 0) {
+            co_return;
+        }
+        if (!write_chunked_) {
+            try {
+                co_await inner_->WriteBuffers(buffers);
+            } catch (...) {
+                CloseAbortive();
+                throw;
+            }
+            co_return;
+        }
+        Http1ChunkPrefixBuffer prefix{};
+        common::ConstBufferSpanBuilder<16> chunk_buffers;
+        if (!AppendHttp1Chunk(chunk_buffers, prefix, buffers, len)) {
+            throw IoSystemError(io_error::fault, "http1 chunk size encode failed");
+        }
+        try {
+            co_await inner_->WriteBuffers(chunk_buffers.Span());
+        } catch (...) {
+            CloseAbortive();
+            throw;
+        }
     }
 
     void ShutdownRead() override {
@@ -207,76 +263,6 @@ protected:
     }
 
 private:
-    net::awaitable<void> WriteBody(
-        std::span<const net::const_buffer> buffers,
-        common::MultiBuffer owned = {}) {
-        struct ClearOwned {
-            common::MultiBuffer& mb;
-            ~ClearOwned() noexcept { mb.clear(); }
-        } clear_owned{owned};
-        if (closed_ || write_closed_) {
-            throw IoSystemError(io_error::operation_aborted, "http1 body write closed");
-        }
-        if (!owned.empty()) {
-            const auto bytes = owned.FrontSpan();
-            if (bytes.empty()) {
-                co_return;
-            }
-            if (!write_chunked_) {
-                try {
-                    co_await inner_->WriteMultiBuffer(std::move(owned));
-                } catch (...) {
-                    CloseAbortive();
-                    throw;
-                }
-                co_return;
-            }
-            const net::const_buffer single(bytes.data(), bytes.size());
-            Http1ChunkPrefixBuffer prefix{};
-            common::ConstBufferSpanBuilder<4> chunk_buffers;
-            if (!AppendHttp1Chunk(chunk_buffers, prefix, {&single, 1}, bytes.size())) {
-                throw IoSystemError(io_error::fault, "http1 chunk size encode failed");
-            }
-            try {
-                co_await inner_->WriteBuffers(chunk_buffers.Span());
-            } catch (...) {
-                CloseAbortive();
-                throw;
-            }
-            co_return;
-        }
-        size_t len = 0;
-        for (const auto& buffer : buffers) {
-            if (buffer.size() > std::numeric_limits<size_t>::max() - len) {
-                throw IoSystemError(io_error::message_size, "http1 chunk size overflow");
-            }
-            len += buffer.size();
-        }
-        if (len == 0) {
-            co_return;
-        }
-        if (!write_chunked_) {
-            try {
-                co_await inner_->WriteBuffers(buffers);
-            } catch (...) {
-                CloseAbortive();
-                throw;
-            }
-            co_return;
-        }
-        Http1ChunkPrefixBuffer prefix{};
-        common::ConstBufferSpanBuilder<16> chunk_buffers;
-        if (!AppendHttp1Chunk(chunk_buffers, prefix, buffers, len)) {
-            throw IoSystemError(io_error::fault, "http1 chunk size encode failed");
-        }
-        try {
-            co_await inner_->WriteBuffers(chunk_buffers.Span());
-        } catch (...) {
-            CloseAbortive();
-            throw;
-        }
-    }
-
     net::awaitable<common::MultiBuffer> ReadFramedOrUntilCloseMultiBuffer() {
         if (closed_ || read_closed_) {
             co_return common::MultiBuffer{};
@@ -305,6 +291,17 @@ private:
             chunk_remaining_ -= pending_.byte_size();
             if (chunk_remaining_ == 0) chunk_terminator_pending_ = true;
             co_return std::move(pending_);
+        }
+        if (pending_.byte_size() == chunk_remaining_ + 2) {
+            const auto bytes = pending_.FrontSpan();
+            if (bytes[chunk_remaining_] == '\r' &&
+                bytes[chunk_remaining_ + 1] == '\n') {
+                ChargeBodyRead(chunk_remaining_);
+                pending_.FrontBuffer()->end -= 2;
+                chunk_remaining_ = 0;
+                chunk_terminator_pending_ = false;
+                co_return std::move(pending_);
+            }
         }
         const size_t n = std::min(pending_.byte_size(), chunk_remaining_);
         common::MultiBuffer payload;
@@ -398,33 +395,6 @@ private:
 
     // Parser state belongs to the stream, not a suspended read. A sniff read
     // can be cancelled after consuming part of a size line or chunk terminator.
-    net::awaitable<bool> ReadLine() {
-        const size_t wire_limit = max_line_bytes_ + 2;
-        while (line_.size() < wire_limit) {
-            if (pending_.byte_size() == 0) {
-                pending_ = co_await inner_->ReadMultiBuffer();
-                if (pending_.byte_size() == 0) co_return false;
-            }
-            const auto bytes = pending_.FrontSpan();
-            const auto end = std::find(bytes.begin(), bytes.end(), uint8_t{'\n'});
-            const bool finished = end != bytes.end();
-            const size_t count = end == bytes.end() ? bytes.size()
-                : static_cast<size_t>(end - bytes.begin()) + 1;
-            if (count > wire_limit - line_.size()) co_return false;
-            line_.append(reinterpret_cast<const char*>(bytes.data()), count);
-            pending_.DropPrefixBytes(count);
-            pending_.ReleaseIfIdle();
-            if (finished) {
-                if (line_.size() < 2 || line_[line_.size() - 2] != '\r')
-                    co_return false;
-                line_.resize(line_.size() - 2);
-                if (line_.size() > max_line_bytes_) co_return false;
-                co_return true;
-            }
-        }
-        co_return false;
-    }
-
     void ResetLine() noexcept {
         std::string{}.swap(line_);
     }
@@ -445,6 +415,7 @@ private:
         if (closed_ || read_closed_) {
             co_return false;
         }
+        const size_t wire_limit = max_line_bytes_ + 2;
         while (chunk_remaining_ == 0) {
             if (chunk_terminator_pending_) {
                 constexpr std::array<uint8_t, 2> terminator{'\r', '\n'};
@@ -470,7 +441,31 @@ private:
                 chunk_terminator_bytes_ = 0;
                 chunk_terminator_pending_ = false;
             }
-            if (!co_await ReadLine()) {
+            bool line_ok = false;
+            while (line_.size() < wire_limit) {
+                if (pending_.byte_size() == 0) {
+                    pending_ = co_await inner_->ReadMultiBuffer();
+                    if (pending_.byte_size() == 0) break;
+                }
+                const auto bytes = pending_.FrontSpan();
+                const auto end = std::find(bytes.begin(), bytes.end(), uint8_t{'\n'});
+                const bool finished = end != bytes.end();
+                const size_t count = finished
+                    ? static_cast<size_t>(end - bytes.begin()) + 1
+                    : bytes.size();
+                if (count > wire_limit - line_.size()) break;
+                line_.append(reinterpret_cast<const char*>(bytes.data()), count);
+                pending_.DropPrefixBytes(count);
+                pending_.ReleaseIfIdle();
+                if (finished) {
+                    if (line_.size() >= 2 && line_[line_.size() - 2] == '\r') {
+                        line_.resize(line_.size() - 2);
+                        line_ok = line_.size() <= max_line_bytes_;
+                    }
+                    break;
+                }
+            }
+            if (!line_ok) {
                 if (closed_ || read_closed_) co_return false;
                 FailBodyRead("incomplete HTTP/1 chunk-size or trailer line");
             }

@@ -1358,13 +1358,18 @@ void HysteriaConnection::ExpireUdpFragments(ngtcp2_tstamp now) noexcept {
     }
 }
 
+namespace {
+constexpr size_t UdpBufferBlocks(size_t total_bytes) noexcept {
+    return total_bytes == 0 ? 1 : 1 + (total_bytes - 1) / common::Buffer::kSize;
+}
+}  // namespace
+
 bool UdpSessionStream::CanAcceptBytes(size_t total_bytes) const noexcept {
     if (closed_ || cancelled_) return false;
     // Datagrams cannot share a block. Count rounded capacity before allocating,
     // without subtracting an externally sized payload from the byte budget.
-    const size_t buffer_count = total_bytes == 0
-        ? 1 : 1 + (total_bytes - 1) / common::Buffer::kSize;
-    return buffer_count <= kMaxQueuedBytes / common::Buffer::kSize - queued_buffer_count_;
+    return UdpBufferBlocks(total_bytes) <=
+           kMaxQueuedBytes / common::Buffer::kSize - queued_buffer_count_;
 }
 
 bool UdpSessionStream::PushMultiBuffer(
@@ -1372,10 +1377,8 @@ bool UdpSessionStream::PushMultiBuffer(
     const size_t total_bytes = packet.byte_size();
     if (!CanAcceptBytes(total_bytes)) return false;
     if (!common::SetUdpTarget(packet, target)) return false;
-    const size_t buffer_count = total_bytes == 0
-        ? 1 : 1 + (total_bytes - 1) / common::Buffer::kSize;
     input_.push_back(std::move(packet));
-    queued_buffer_count_ += buffer_count;
+    queued_buffer_count_ += UdpBufferBlocks(total_bytes);
     WakeReader();
     return true;
 }
@@ -1489,12 +1492,9 @@ void HysteriaConnection::DeliverUdpPacket(
         return;
     }
     if (core_->udp_sessions.size() >= kMaxUdpSessions) return;
-    auto session = std::make_unique<UdpSessionStream>(
-        Reactor(), session_id, weak_from_this());
-    if (!session->Push(target, payload)) return;
-    core_->udp_sessions.emplace(session_id, session.get());
-    SpawnOwned(DeliverStream(std::move(session),
-        InboundTransportMetadata{.real_ip = {}, .udp_session_target = target}));
+    common::MultiBuffer packet;
+    if (!packet.AppendSpan(payload)) return;
+    DeliverUdpMultiBuffer(session_id, target, std::move(packet));
 }
 
 bool HysteriaConnection::TrySendImmediateDatagram(
@@ -2168,9 +2168,7 @@ net::awaitable<common::MultiBuffer> UdpSessionStream::ReadMultiBuffer() {
         if (!input_.empty()) {
             auto packet = std::move(input_.front());
             input_.pop_front();
-            const size_t packet_blocks =
-                packet.byte_size() == 0 ? 1 : 1 + (packet.byte_size() - 1) / common::Buffer::kSize;
-            queued_buffer_count_ -= packet_blocks;
+            queued_buffer_count_ -= UdpBufferBlocks(packet.byte_size());
             co_return packet;
         }
         if (closed_) co_return common::MultiBuffer{};

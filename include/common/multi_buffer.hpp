@@ -409,14 +409,14 @@ private:
         const bool existing_nonempty = !buf_->IsEmpty();
         bool next_mixed = buf_->mixed_udp_ || src_mixed_udp;
         bool next_untagged = buf_->udp_untagged_ || (existing_nonempty && !existing_has_udp);
-        std::optional<TargetAddress> next_udp = buf_->udp_;
+        bool adopt_src_udp = false;
 
         if (src_udp) {
             if (next_untagged) {
                 next_mixed = true;
-            } else if (!next_udp) {
-                next_udp = *src_udp;
-            } else if (!next_udp->SameEndpoint(*src_udp)) {
+            } else if (!existing_has_udp) {
+                adopt_src_udp = true;
+            } else if (!buf_->udp_->SameEndpoint(*src_udp)) {
                 next_mixed = true;
             }
         } else if (src_untagged_nonempty) {
@@ -424,22 +424,26 @@ private:
         }
 
         if (buf_->Available() >= bytes.size()) {
+            if (adopt_src_udp) {
+                buf_->udp_ = *src_udp;
+            }
             if (!bytes.empty()) {
                 std::memmove(buf_->Tail().data(), bytes.data(), bytes.size());
                 buf_->Produce(bytes.size());
             }
-            buf_->udp_ = std::move(next_udp);
             buf_->mixed_udp_ = next_mixed;
             buf_->udp_untagged_ = next_untagged;
             return;
         }
         if (buf_->Available() + buf_->start >= bytes.size()) {
+            if (adopt_src_udp) {
+                buf_->udp_ = *src_udp;
+            }
             buf_->CompactToFront();
             if (!bytes.empty()) {
                 std::memmove(buf_->Tail().data(), bytes.data(), bytes.size());
                 buf_->Produce(bytes.size());
             }
-            buf_->udp_ = std::move(next_udp);
             buf_->mixed_udp_ = next_mixed;
             buf_->udp_untagged_ = next_untagged;
             return;
@@ -463,7 +467,11 @@ private:
             std::memcpy(grown->Tail().data(), bytes.data(), bytes.size());
             grown->Produce(bytes.size());
         }
-        grown->udp_ = std::move(next_udp);
+        if (adopt_src_udp) {
+            grown->udp_ = *src_udp;
+        } else {
+            grown->udp_ = std::move(buf_->udp_);
+        }
         grown->mixed_udp_ = next_mixed;
         grown->udp_untagged_ = next_untagged;
         Buffer::Free(buf_);

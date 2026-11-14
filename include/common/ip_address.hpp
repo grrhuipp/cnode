@@ -26,9 +26,21 @@ namespace common {
 // Fixed storage also prevents C-string APIs from truncating embedded NULs.
 [[nodiscard]] inline std::optional<net::ip::address> ParseLiteral(
     std::string_view text) noexcept {
-    if (text.empty() || text.find('\0') != std::string_view::npos) return std::nullopt;
+    auto is_hex_or_colon = [](unsigned char c) noexcept {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+               (c >= 'A' && c <= 'F') || c == ':';
+    };
+    if (text.size() < 2 || !is_hex_or_colon(static_cast<unsigned char>(text.front())) ||
+        !is_hex_or_colon(static_cast<unsigned char>(text.back()))) {
+        return std::nullopt;
+    }
 
     auto parse_v4 = [](std::string_view value) -> std::optional<net::ip::address_v4::bytes_type> {
+        if (value.size() < 7 || value.size() > 15 ||
+            value.front() < '0' || value.front() > '9' ||
+            value.back() < '0' || value.back() > '9') {
+            return std::nullopt;
+        }
         net::ip::address_v4::bytes_type bytes{};
         size_t start = 0;
         for (size_t i = 0; i < bytes.size(); ++i) {
@@ -137,24 +149,23 @@ public:
     AddressText(const AddressText&) = delete;
     AddressText& operator=(const AddressText&) = delete;
     explicit AddressText(const net::ip::address& address) {
-        const bool ipv6 = address.is_v6();
-        in6_addr native_v6{};
-        in_addr native_v4{};
-        if (ipv6) {
-            const auto bytes = address.to_v6().to_bytes();
-            std::memcpy(&native_v6, bytes.data(), bytes.size());
-        } else {
+        if (!address.is_v6()) {
             const auto bytes = address.to_v4().to_bytes();
-            std::memcpy(&native_v4, bytes.data(), bytes.size());
+            char* ptr = text_.data();
+            for (size_t i = 0; i < bytes.size(); ++i) {
+                if (i != 0) *ptr++ = '.';
+                ptr = std::to_chars(ptr, text_.data() + text_.size(), bytes[i]).ptr;
+            }
+            size_ = static_cast<size_t>(ptr - text_.data());
+            return;
         }
-        const auto* result = ipv6
-            ? ::inet_ntop(AF_INET6, &native_v6, text_.data(), text_.size())
-            : ::inet_ntop(AF_INET, &native_v4, text_.data(), text_.size());
-        if (!result) {
+        in6_addr native_v6{};
+        const auto bytes = address.to_v6().to_bytes();
+        std::memcpy(&native_v6, bytes.data(), bytes.size());
+        if (!::inet_ntop(AF_INET6, &native_v6, text_.data(), text_.size())) {
             throw std::system_error(errno, std::system_category(), "inet_ntop");
         }
         size_ = std::char_traits<char>::length(text_.data());
-        if (!ipv6) return;
         const auto v6 = address.to_v6();
         if (v6.scope_id() == 0) return;
         text_[size_++] = '%';

@@ -156,12 +156,11 @@ void BaseWsStream::ValidateClose() {
         ProtocolFailure("WebSocket invalid Close reason");
 }
 
-net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
+bool BaseWsStream::TryAdvanceDataFrameFromPending() {
     while (!closed_ && !read_closed_ && !peer_closed_cleanly_) {
         switch (read_stage_) {
             case ReadStage::Header: {
-                while (!TryFillHeaderFromPending())
-                    if (!co_await EnsurePendingData()) co_return false;
+                if (!TryFillHeaderFromPending()) return false;
                 // No extensions are negotiated. RFC 6455 §§5.2–5.5 require
                 // rejecting reserved bits/opcodes, wrong mask direction and
                 // fragmented or oversized control frames before their body.
@@ -198,8 +197,7 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
                 break;
             }
             case ReadStage::Length: {
-                while (!TryFillHeaderFromPending())
-                    if (!co_await EnsurePendingData()) co_return false;
+                if (!TryFillHeaderFromPending()) return false;
                 const uint64_t length = header_required_ == 4
                     ? common::LoadU16BE(header_.data() + 2)
                     : common::LoadU64BE(header_.data() + 2);
@@ -214,8 +212,7 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
                 break;
             }
             case ReadStage::Mask: {
-                while (!TryFillHeaderFromPending())
-                    if (!co_await EnsurePendingData()) co_return false;
+                if (!TryFillHeaderFromPending()) return false;
                 if (frame_masked_)
                     std::memcpy(frame_mask_key_.data(),
                                 header_.data() + header_required_ - 4, 4);
@@ -225,7 +222,7 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
                 if ((static_cast<uint8_t>(frame_opcode_) & 0x08) != 0) {
                     control_used_ = 0;
                     read_stage_ = ReadStage::Control;
-                    break;
+                    return false;
                 }
                 if (frame_opcode_ == Opcode::CONTINUATION) {
                     if (!fragmented_)
@@ -241,54 +238,70 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
                 break;
             }
             case ReadStage::Payload:
-                if (frame_payload_remaining_ != 0) co_return true;
+                if (frame_payload_remaining_ != 0) return true;
                 FinishDataFrame();
                 break;
-            case ReadStage::Control: {
-                while (frame_payload_remaining_ != 0) {
-                    if (!HasPendingBytes() && !co_await EnsurePendingData()) co_return false;
-                    const size_t n = pending_data_.ConsumePrefixTo(
-                        std::span<uint8_t>(control_payload_.data() + control_used_,
-                                           static_cast<size_t>(frame_payload_remaining_)));
-                    pending_data_.ReleaseIfIdle();
-                    if (n == 0) co_return false;
-                    if (frame_masked_)
-                        MaskData(control_payload_.data() + control_used_, n,
-                                     frame_mask_key_.data(), control_used_);
-                    control_used_ += n;
-                    frame_payload_remaining_ -= n;
-                }
-                const auto payload = std::span<const uint8_t>(
-                    control_payload_.data(), control_used_);
-                if (frame_opcode_ == Opcode::CLOSE) {
-                    ValidateClose();
-                    if (fragmented_)
-                        ProtocolFailure("WebSocket Close during fragmented message");
-                    peer_closed_cleanly_ = true;
-                    try {
-                        co_await WriteControlFrame(Opcode::CLOSE, payload);
-                    } catch (const IoSystemError& e) {
-                        if (e.code() == io_error::operation_aborted) throw;
-                        Close();
-                    }
-                    co_return false;
-                }
-                if (frame_opcode_ == Opcode::PING)
-                    co_await WriteControlFrame(Opcode::PONG, payload);
-                read_stage_ = ReadStage::Header;
-                break;
-            }
+            case ReadStage::Control:
+                return false;
         }
+    }
+    return false;
+}
+
+net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
+    while (!closed_ && !read_closed_ && !peer_closed_cleanly_) {
+        if (TryAdvanceDataFrameFromPending()) co_return true;
+        if (read_stage_ != ReadStage::Control) {
+            if (!co_await EnsurePendingData()) co_return false;
+            continue;
+        }
+        while (frame_payload_remaining_ != 0) {
+            if (!HasPendingBytes() && !co_await EnsurePendingData()) co_return false;
+            const size_t n = pending_data_.ConsumePrefixTo(
+                std::span<uint8_t>(control_payload_.data() + control_used_,
+                                   static_cast<size_t>(frame_payload_remaining_)));
+            pending_data_.ReleaseIfIdle();
+            if (n == 0) co_return false;
+            if (frame_masked_)
+                MaskData(control_payload_.data() + control_used_, n,
+                             frame_mask_key_.data(), control_used_);
+            control_used_ += n;
+            frame_payload_remaining_ -= n;
+        }
+        const auto payload = std::span<const uint8_t>(
+            control_payload_.data(), control_used_);
+        if (frame_opcode_ == Opcode::CLOSE) {
+            ValidateClose();
+            if (fragmented_)
+                ProtocolFailure("WebSocket Close during fragmented message");
+            peer_closed_cleanly_ = true;
+            try {
+                co_await WriteControlFrame(Opcode::CLOSE, payload);
+            } catch (const IoSystemError& e) {
+                if (e.code() == io_error::operation_aborted) throw;
+                Close();
+            }
+            co_return false;
+        }
+        if (frame_opcode_ == Opcode::PING)
+            co_await WriteControlFrame(Opcode::PONG, payload);
+        read_stage_ = ReadStage::Header;
     }
     co_return false;
 }
 
 net::awaitable<size_t> BaseWsStream::AsyncRead(net::mutable_buffer buffer) {
     if (buffer.size() == 0) co_return 0;
-    if (!(read_stage_ == ReadStage::Payload && frame_payload_remaining_ != 0 &&
-          !closed_ && !read_closed_ && !peer_closed_cleanly_) &&
-        !co_await PrepareNextDataFrame()) {
-        co_return 0;
+    if (!TryAdvanceDataFrameFromPending()) {
+        if (!closed_ && !read_closed_ && !peer_closed_cleanly_ &&
+            read_stage_ != ReadStage::Control) {
+            if (!co_await EnsurePendingData()) co_return 0;
+            if (!TryAdvanceDataFrameFromPending() && !co_await PrepareNextDataFrame()) {
+                co_return 0;
+            }
+        } else if (!co_await PrepareNextDataFrame()) {
+            co_return 0;
+        }
     }
     const size_t size = static_cast<size_t>(std::min<uint64_t>(
         buffer.size(), frame_payload_remaining_));
@@ -305,10 +318,16 @@ net::awaitable<size_t> BaseWsStream::AsyncRead(net::mutable_buffer buffer) {
 }
 
 net::awaitable<common::MultiBuffer> BaseWsStream::ReadMultiBuffer() {
-    if (!(read_stage_ == ReadStage::Payload && frame_payload_remaining_ != 0 &&
-          !closed_ && !read_closed_ && !peer_closed_cleanly_) &&
-        !co_await PrepareNextDataFrame()) {
-        co_return common::MultiBuffer{};
+    if (!TryAdvanceDataFrameFromPending()) {
+        if (!closed_ && !read_closed_ && !peer_closed_cleanly_ &&
+            read_stage_ != ReadStage::Control) {
+            if (!co_await EnsurePendingData()) co_return common::MultiBuffer{};
+            if (!TryAdvanceDataFrameFromPending() && !co_await PrepareNextDataFrame()) {
+                co_return common::MultiBuffer{};
+            }
+        } else if (!co_await PrepareNextDataFrame()) {
+            co_return common::MultiBuffer{};
+        }
     }
     if (!HasPendingBytes() && !co_await EnsurePendingData()) co_return common::MultiBuffer{};
     if (const auto* front = pending_data_.FrontBuffer();
@@ -393,16 +412,13 @@ net::awaitable<void> BaseWsStream::WriteDataFrame(
             co_await inner_->WriteBuffers(output.Span());
         } else {
             if (header.size + size <= kInlineWsClientFrameCapacity) {
-                if (!client_inline_frame_) {
-                    client_inline_frame_ =
-                        std::make_unique_for_overwrite<std::array<uint8_t, kInlineWsClientFrameCapacity>>();
-                }
+                std::array<uint8_t, kInlineWsClientFrameCapacity> inline_frame;
                 const size_t frame_len = EncodeInlineMaskedWsFrame(
-                    client_inline_frame_->data(),
+                    inline_frame.data(),
                     std::span<const uint8_t>(header.bytes.data(), header.size),
                     buffers,
                     mask);
-                const net::const_buffer output(client_inline_frame_->data(), frame_len);
+                const net::const_buffer output(inline_frame.data(), frame_len);
                 co_await inner_->WriteBuffers({&output, 1});
             } else {
                 common::BufferGuard scratch{common::Buffer::New()};

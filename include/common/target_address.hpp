@@ -154,12 +154,12 @@ struct TargetAddress {
 
 private:
 
-    void InitFromHost(std::string_view h) {
+    bool TryInitLiteral(std::string_view h) noexcept {
         type = AddressType::Invalid;
         resolved_addr.reset();
         host.clear();
         if (h.empty()) {
-            return;
+            return true;
         }
         if (auto literal = ParseLiteral(h)) {
             const auto addr = NormalizeAddress(*literal);
@@ -170,10 +170,16 @@ private:
                 type = AddressType::IPv6;
                 resolved_addr = addr;
             }
+            return true;
+        }
+        return false;
+    }
+
+    void InitFromHost(std::string_view h) {
+        if (TryInitLiteral(h)) {
             return;
         }
-        if (IsValidDnsHostname(
-                h, TrailingDotPolicy::Allow)) {
+        if (IsValidDnsHostname(h, TrailingDotPolicy::Allow)) {
             host.assign(h);
             NormalizeDnsHostnameInPlace(host);
             type = AddressType::Domain;
@@ -181,21 +187,7 @@ private:
     }
 
     void InitFromOwnedHost(std::string&& h) {
-        type = AddressType::Invalid;
-        resolved_addr.reset();
-        host.clear();
-        if (h.empty()) {
-            return;
-        }
-        if (auto literal = ParseLiteral(h)) {
-            const auto addr = NormalizeAddress(*literal);
-            if (addr.is_v4()) {
-                type = AddressType::IPv4;
-                resolved_addr = addr;
-            } else if (addr.is_v6()) {
-                type = AddressType::IPv6;
-                resolved_addr = addr;
-            }
+        if (TryInitLiteral(h)) {
             return;
         }
         if (IsValidDnsHostname(h, TrailingDotPolicy::Allow)) {

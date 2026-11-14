@@ -673,7 +673,9 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
         .client_endpoint = datagram.client_endpoint,
     });
     if (!decoded) {
-        if (decoded.error() == common::ErrorCode::PROTOCOL_AUTH_FAILED) {
+        if (decoded.error() == common::ErrorCode::PROTOCOL_AUTH_FAILED &&
+            (::infra::Log::ShouldLog(::infra::LogLevel::WARN) ||
+             ::infra::Log::IsInitialized())) {
             // Datagram sources are socket peers, never PROXY protocol clients,
             // so a credential failure is logged without feeding the ban table.
             const auto normalized_client_addr =

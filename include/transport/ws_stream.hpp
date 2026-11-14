@@ -159,6 +159,7 @@ private:
     void CheckWritable() const;
     [[nodiscard]] bool HasPendingBytes() noexcept;
     [[nodiscard]] bool TryFillHeaderFromPending() noexcept;
+    [[nodiscard]] bool TryAdvanceDataFrameFromPending();
     net::awaitable<bool> EnsurePendingData();
     net::awaitable<bool> PrepareNextDataFrame();
     void ConsumePayloadBytes(std::span<uint8_t> bytes);
@@ -194,7 +195,6 @@ private:
     bool write_closed_ = false;
     bool closed_ = false;
     WriteGate write_gate_;
-    std::unique_ptr<std::array<uint8_t, 512>> client_inline_frame_;
 };
 
 }  // namespace transport

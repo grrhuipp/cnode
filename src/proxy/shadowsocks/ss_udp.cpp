@@ -15,7 +15,6 @@
 #include <cstring>
 #include <limits>
 #include <span>
-#include <vector>
 
 namespace proxy {
 
@@ -208,64 +207,49 @@ struct Parsed2022Body {
 
 struct PlaintextScratch {
     common::BufferGuard pooled;
-    std::vector<uint8_t> large;
     size_t len = 0;
 
     ~PlaintextScratch() noexcept {
         if (pooled) {
             OPENSSL_cleanse(pooled->Tail().data(), len);
         }
-        if (!large.empty()) {
-            OPENSSL_cleanse(large.data(), large.size());
-        }
     }
 
-    [[nodiscard]] uint8_t* Prepare(size_t size) {
+    [[nodiscard]] uint8_t* Prepare(size_t size) noexcept {
         len = size;
-        if (size <= common::Buffer::kSize) {
+        if (!pooled || pooled->capacity < size) {
+            pooled = common::BufferGuard{common::Buffer::New(size)};
             if (!pooled) {
-                pooled = common::BufferGuard{common::Buffer::New()};
-                if (!pooled) {
-                    return nullptr;
-                }
-            } else {
-                pooled->Reset();
+                len = 0;
+                return nullptr;
             }
-            return pooled->Tail().data();
+        } else {
+            pooled->Reset();
         }
-        pooled.reset();
-        large.resize(size);
-        return large.data();
+        return pooled->Tail().data();
     }
 
     [[nodiscard]] std::span<const uint8_t> Span() const noexcept {
-        if (pooled) {
-            return {pooled->Tail().data(), len};
-        }
-        return {large.data(), len};
+        return pooled
+            ? std::span<const uint8_t>(pooled->Tail().data(), len)
+            : std::span<const uint8_t>{};
     }
 
-    [[nodiscard]] bool MoveSuffixTo(size_t offset, common::MultiBuffer& out) {
-        if (offset > len) {
+    [[nodiscard]] bool MoveSuffixTo(size_t offset,
+                                    const common::TargetAddress& target,
+                                    common::MultiBuffer& out) {
+        if (!pooled || offset > len) {
             return false;
         }
-        const size_t payload_len = len - offset;
-        if (pooled) {
-            if (offset != 0) {
-                OPENSSL_cleanse(pooled->Tail().data(), offset);
-            }
-            pooled->Produce(static_cast<uint32_t>(len));
-            pooled->Advance(static_cast<uint32_t>(offset));
-            try {
-                out.push_back(std::move(pooled));
-                len = 0;
-                return true;
-            } catch (...) {
-                return false;
-            }
+        if (offset != 0) {
+            OPENSSL_cleanse(pooled->Tail().data(), offset);
         }
-        return out.AppendSpan(
-            std::span<const uint8_t>(large.data() + offset, payload_len));
+        pooled->Produce(len);
+        pooled->Advance(offset);
+        pooled->SetUDP(target);
+        out = common::MultiBuffer{std::move(pooled)};
+        len = 0;
+        return true;
     }
 };
 
@@ -290,8 +274,7 @@ struct PlaintextScratch {
     result.user_index = user_index;
     const auto full = scratch.Span();
     const size_t payload_offset = static_cast<size_t>(parsed.payload.data() - full.data());
-    if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
-        !common::SetUdpTarget(result.payload, result.target)) {
+    if (!scratch.MoveSuffixTo(payload_offset, result.target, result.payload)) {
         return std::nullopt;
     }
     return result;
@@ -913,8 +896,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
         result.user_index = i;
 
         const size_t payload_offset = std::min(addr.consumed, plaintext_len);
-        if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
-            !common::SetUdpTarget(result.payload, result.target)) {
+        if (!scratch.MoveSuffixTo(payload_offset, result.target, result.payload)) {
             return std::nullopt;
         }
 
@@ -1012,8 +994,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
     result.target = std::move(addr.target);
 
     const size_t payload_offset = std::min(addr.consumed, plaintext_len);
-    if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
-        !common::SetUdpTarget(result.payload, result.target)) {
+    if (!scratch.MoveSuffixTo(payload_offset, result.target, result.payload)) {
         return std::nullopt;
     }
     return result;
@@ -1178,8 +1159,7 @@ std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     result.target = std::move(parsed->target);
     const size_t payload_offset = static_cast<size_t>(
         parsed->payload.data() - scratch.Span().data());
-    if (!scratch.MoveSuffixTo(payload_offset, result.payload) ||
-        !common::SetUdpTarget(result.payload, result.target)) {
+    if (!scratch.MoveSuffixTo(payload_offset, result.target, result.payload)) {
         return std::nullopt;
     }
     return result;
