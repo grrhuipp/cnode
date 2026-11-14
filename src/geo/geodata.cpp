@@ -75,6 +75,8 @@ void CidrSet::InsertBits(Trie& trie, std::span<const uint8_t> network, uint8_t p
         node = next;
     }
     trie[node].terminal = true;
+    trie[node].children[0] = -1;
+    trie[node].children[1] = -1;
 }
 
 bool CidrSet::MatchBits(const Trie& trie, std::span<const uint8_t> address) noexcept {
@@ -109,7 +111,7 @@ void DomainRuleSet::AddFull(std::string_view domain) {
     if (lower.empty()) {
         return;
     }
-    full_.insert(std::move(lower));
+    domains_[std::move(lower)] |= kMatchFull;
 }
 
 void DomainRuleSet::AddSuffix(std::string_view suffix) {
@@ -121,36 +123,18 @@ void DomainRuleSet::AddSuffix(std::string_view suffix) {
     if (lower.empty()) {
         return;
     }
-    const auto new_node = [this] {
-        suffix_nodes_.push_back(SuffixNode{});
-    };
-    if (suffix_nodes_.empty()) {
-        new_node();
-    }
-    uint32_t node = 0;
-    for (auto it = lower.rbegin(); it != lower.rend(); ++it) {
-        const char ch = *it;
-        auto& children = suffix_nodes_[node].children;
-        const auto child = std::ranges::lower_bound(children, ch, {}, &SuffixChild::ch);
-        if (child != children.end() && child->ch == ch) {
-            node = child->node_index;
-            continue;
-        }
-        const auto position = child - children.begin();
-        const auto next = static_cast<uint32_t>(suffix_nodes_.size());
-        new_node();  // 使 children 引用失效，下面重新取。
-        auto& refreshed = suffix_nodes_[node].children;
-        refreshed.insert(refreshed.begin() + position, SuffixChild{ch, next});
-        node = next;
-    }
-    suffix_nodes_[node].terminal = true;
+    domains_[std::move(lower)] |= (kMatchFull | kMatchSuffix);
+    has_suffix_ = true;
 }
 
 void DomainRuleSet::AddKeyword(std::string_view keyword) {
     if (keyword.empty()) {
         return;
     }
-    common::LowerAsciiInPlace(keywords_.emplace_back(keyword));
+    std::string lower = common::LowerAscii(keyword);
+    if (std::ranges::find(keywords_, lower) == keywords_.end()) {
+        keywords_.push_back(std::move(lower));
+    }
 }
 
 void DomainRuleSet::AddRegex(const std::string& pattern) {
@@ -164,7 +148,7 @@ bool DomainRuleSet::Match(std::string_view domain) const {
     }
 
     return WithLowerAscii(domain, [this](std::string_view lower_domain) {
-        if (full_.contains(lower_domain) || MatchSuffix(lower_domain)) {
+        if (MatchDomain(lower_domain)) {
             return true;
         }
         for (const auto& keyword : keywords_) {
@@ -181,23 +165,22 @@ bool DomainRuleSet::Match(std::string_view domain) const {
     });
 }
 
-bool DomainRuleSet::MatchSuffix(std::string_view lower_domain) const noexcept {
-    if (suffix_nodes_.empty()) {
+bool DomainRuleSet::MatchDomain(std::string_view lower_domain) const noexcept {
+    if (domains_.empty()) {
         return false;
     }
-    uint32_t node = 0;
-    for (auto it = lower_domain.rbegin(); it != lower_domain.rend(); ++it) {
-        const auto& children = suffix_nodes_[node].children;
-        const auto child = std::ranges::lower_bound(children, *it, {}, &SuffixChild::ch);
-        if (child == children.end() || child->ch != *it) {
-            return false;
-        }
-        node = child->node_index;
-        if (suffix_nodes_[node].terminal) {
-            const auto next = std::next(it);
-            if (next == lower_domain.rend() || *next == '.') {
-                return true;
-            }
+    if (domains_.contains(lower_domain)) {
+        return true;
+    }
+    if (!has_suffix_) {
+        return false;
+    }
+    for (size_t dot = lower_domain.find('.');
+         dot != std::string_view::npos;
+         dot = lower_domain.find('.', dot + 1)) {
+        const auto it = domains_.find(lower_domain.substr(dot + 1));
+        if (it != domains_.end() && (it->second & kMatchSuffix) != 0) {
+            return true;
         }
     }
     return false;

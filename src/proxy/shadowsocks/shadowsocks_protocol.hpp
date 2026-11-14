@@ -198,11 +198,7 @@ inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
         throw std::length_error("Shadowsocks encrypted stream overflow");
     }
     const size_t total_wire = remaining + chunks * kChunkWireOverhead;
-    common::BufferGuard out{common::Buffer::New(total_wire)};
-    if (!out) {
-        throw std::bad_alloc();
-    }
-    uint8_t* dst = out->Tail().data();
+    uint8_t* dst = out_mb.PrepareAppend(total_wire);
     size_t written = 0;
     while (remaining > 0) {
         const size_t chunk_size = std::min(remaining, kStreamChunkPayloadSize);
@@ -232,8 +228,7 @@ inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
         data += chunk_size;
         remaining -= chunk_size;
     }
-    out->Produce(written);
-    out_mb.push_back(std::move(out));
+    out_mb.CommitAppend(written);
 }
 
 // BoringSSL authenticates one complete record. Reuse a single input block in
@@ -360,9 +355,9 @@ private:
     common::MultiBuffer DecodePending() {
         for (;;) {
             if (!length_) {
-                std::array<uint8_t, 2 + SsAeadCipher::kTagSize> header{};
-                if (ciphertext_.byte_size() < header.size()) return {};
-                ciphertext_.CopyPrefixTo(header);
+                constexpr size_t kHeaderSize = 2 + SsAeadCipher::kTagSize;
+                const auto header = ciphertext_.PrefixSpan(kHeaderSize);
+                if (header.empty()) return {};
                 std::array<uint8_t, 2> plain{};
                 const auto nonce = MakeNonce(nonce_);
                 if (!cipher_.Decrypt(nonce.data(), header.data(), header.size(), plain.data()))
@@ -371,7 +366,7 @@ private:
                 if (length > max_payload_)
                     throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
                 length_ = length;
-                ciphertext_.DropPrefixBytes(header.size());
+                ciphertext_.DropPrefixBytes(kHeaderSize);
                 ++nonce_;
             }
             const size_t payload_len = *length_;

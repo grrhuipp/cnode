@@ -43,11 +43,9 @@ public:
         , key_size_(other.key_size_)
         , pending_handshake_(std::move(other.pending_handshake_))
         , write_cipher_(std::move(other.write_cipher_))
-        , pending_prefix_(std::move(other.pending_prefix_))
         , write_nonce_(other.write_nonce_)
         , write_init_(other.write_init_)
         , write_finished_(other.write_finished_)
-        , skip_first_bytes_(other.skip_first_bytes_)
         , stream_(std::exchange(other.stream_, nullptr)) {
         other.ClearHandshakeKeys();
     }
@@ -58,12 +56,9 @@ public:
             cipher_type_ = other.cipher_type_;
             key_size_ = other.key_size_;
             pending_handshake_ = std::move(other.pending_handshake_);
-            write_cipher_ = std::move(other.write_cipher_);
-            pending_prefix_ = std::move(other.pending_prefix_);
             write_nonce_ = other.write_nonce_;
             write_init_ = other.write_init_;
             write_finished_ = other.write_finished_;
-            skip_first_bytes_ = other.skip_first_bytes_;
             stream_ = std::exchange(other.stream_, nullptr);
             other.ClearHandshakeKeys();
         }
@@ -112,20 +107,20 @@ private:
         common::MultiBuffer owned = {});
 
 
-    bool InitResponseCipher();
+    bool InitResponseCipher(common::MultiBuffer& out_mb);
 
-    bool InitResponseCipher2022(std::span<const net::const_buffer> buffers);
+    bool InitResponseCipher2022(
+        std::span<const net::const_buffer> buffers,
+        common::MultiBuffer& out_mb,
+        size_t& skip_first_bytes);
 
-    bool AppendFirstResponsePayload(std::span<const net::const_buffer> buffers, size_t want);
     SsCipherType cipher_type_;
     uint8_t key_size_ = 0;
     std::optional<PendingHandshake> pending_handshake_;
     std::optional<SsAeadCipher> write_cipher_;
-    common::MultiBuffer pending_prefix_;
     uint64_t write_nonce_ = 0;
     bool write_init_ = false;
     bool write_finished_ = false;
-    size_t skip_first_bytes_ = 0;
     transport::AsyncStream* stream_ = nullptr;
 };
 

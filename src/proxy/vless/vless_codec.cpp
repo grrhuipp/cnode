@@ -579,10 +579,7 @@ bool VlessUdpFramer::Next(VlessFramedUdpPacket& out) {
         break;
     }
     if (packet_addr_) {
-        std::array<uint8_t, 19> address{};
-        const size_t copied = payload.CopyPrefixTo(address);
-        auto header = DecodePacketAddrHeader(
-            std::span<const uint8_t>(address.data(), copied));
+        auto header = DecodePacketAddrHeader(payload.FrontSpan());
         if (!header || !header->target.IsValid()) {
             pending_.Fail();
             throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);

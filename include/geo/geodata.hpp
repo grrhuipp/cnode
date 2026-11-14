@@ -11,7 +11,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace geo {
@@ -62,26 +61,20 @@ public:
 
     [[nodiscard]] bool Match(std::string_view domain) const;
     [[nodiscard]] bool Empty() const noexcept {
-        return full_.empty() && suffix_nodes_.empty() && keywords_.empty() &&
-               regexes_.empty();
+        return domains_.empty() && keywords_.empty() && regexes_.empty();
     }
 
 private:
-    struct SuffixChild {
-        char ch;
-        uint32_t node_index;
-    };
-    struct SuffixNode {
-        std::vector<SuffixChild> children;
-        bool terminal = false;
-    };
+    static constexpr uint8_t kMatchFull = 1u << 0;
+    static constexpr uint8_t kMatchSuffix = 1u << 1;
 
-    [[nodiscard]] bool MatchSuffix(std::string_view lower_domain) const noexcept;
+    [[nodiscard]] bool MatchDomain(std::string_view lower_domain) const noexcept;
 
-    std::unordered_set<std::string, common::TransparentStringHash, common::TransparentStringEq> full_;
-    std::vector<SuffixNode> suffix_nodes_;
+    std::unordered_map<std::string, uint8_t, common::TransparentStringHash, common::TransparentStringEq>
+        domains_;
     std::vector<std::string> keywords_;
     std::vector<std::regex> regexes_;
+    bool has_suffix_ = false;
 };
 
 // ============================================================================
