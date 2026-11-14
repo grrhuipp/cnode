@@ -878,7 +878,12 @@ void HysteriaConnection::Flush() {
                 Close();
                 return;
             }
-            if (accepted_datagram) core_->datagrams.pop_front();
+            if (accepted_datagram) {
+                core_->datagrams.pop_front();
+                // Woken senders retry on their own turn of the event loop.
+                for (auto* waiter : datagram_waiters_) waiter->WakeWriter();
+                datagram_waiters_.clear();
+            }
             if (written == 0) return;
             auto* output_socket = OutputSocket(write_path.path);
             auto output_remote = EndpointFromAddress(write_path.path.remote);
@@ -984,6 +989,8 @@ void HysteriaConnection::Close() noexcept {
             session->Detach();
         }
         core_->datagrams.clear();
+        for (auto* waiter : datagram_waiters_) waiter->WakeWriter();
+        datagram_waiters_.clear();
         core_->h3_requests.clear();
         listener_->DissociateAll(*this);
     }
@@ -1547,33 +1554,36 @@ bool HysteriaConnection::TrySendImmediateDatagram(
     return accepted_datagram != 0;
 }
 
-bool HysteriaConnection::SendUdpMessage(
+HysteriaUdpSend HysteriaConnection::SendUdpMessage(
     uint32_t session_id, const common::TargetAddress& target,
     std::span<const uint8_t> payload) {
+    constexpr auto kDropped = HysteriaUdpSend::Dropped;
     if (closed_ || !target.IsValid() ||
-        payload.size() > kMaxUdpPayloadLength) return false;
-    if (!core_ || !core_->quic) return false;
+        payload.size() > kMaxUdpPayloadLength) return kDropped;
+    if (!core_ || !core_->quic) return kDropped;
     const auto* parameters = ngtcp2_conn_get_remote_transport_params2(core_->quic);
-    if (!parameters) return false;
+    if (!parameters) return kDropped;
     const auto frame_budget = std::min<uint64_t>(
         parameters->max_datagram_frame_size, kMaxUdpMessageSize + kUdpDatagramFrameOverhead);
-    if (frame_budget < 2) return false;
+    if (frame_budget < 2) return kDropped;
     // 消息至多 1100B；LEN 在 63B 边界由一字节增为两字节。
     const auto message_budget = static_cast<size_t>(
         frame_budget <= 65 ? frame_budget - 2 : frame_budget - kUdpDatagramFrameOverhead);
     const auto version = listener_->version;
     std::optional<common::AddressText> address_storage;
     const auto text = PrepareUdpTargetText(version, target, address_storage);
-    if (!text) return false;
+    if (!text) return kDropped;
     const auto header_size = UdpTargetHeaderSize(version, *text);
-    if (!header_size || *header_size > message_budget) return false;
+    if (!header_size || *header_size > message_budget) return kDropped;
     const size_t fragment_payload = message_budget - *header_size;
-    if (!payload.empty() && fragment_payload == 0) return false;
+    if (!payload.empty() && fragment_payload == 0) return kDropped;
     const size_t fragments = payload.empty()
         ? 1 : 1 + (payload.size() - 1) / fragment_payload;
-    if (fragments > std::numeric_limits<uint8_t>::max()) return false;
+    if (fragments > std::numeric_limits<uint8_t>::max()) return kDropped;
+    // The queue drains as congestion control lets datagrams out; a sender
+    // waits for it, as quic-go's SendDatagram blocks on a full queue.
     if (core_->datagrams.size() >= kMaxQueuedDatagrams ||
-        fragments > kMaxQueuedDatagrams - core_->datagrams.size()) return false;
+        fragments > kMaxQueuedDatagrams - core_->datagrams.size()) return HysteriaUdpSend::Full;
     const size_t initial_datagrams = core_->datagrams.size();
     HysteriaUdpMessage message{
         .session_id = session_id,
@@ -1583,27 +1593,27 @@ bool HysteriaConnection::SendUdpMessage(
         .payload = {},
     };
     // The first fragment always carries the target.
-    if (text->host.empty()) return false;
+    if (text->host.empty()) return kDropped;
     if (fragments == 1 && core_->datagrams.empty()) {
         message.fragment_id = 0;
         message.payload = payload;
         // Valid TargetAddress host <= 254B, so V1 header <= 268B and V2 <= 272B.
         constexpr size_t kMaxUdpTargetHeaderBufSize = 280;
         std::array<uint8_t, kMaxUdpTargetHeaderBufSize> header_buf;
-        if (*header_size > header_buf.size()) return false;
+        if (*header_size > header_buf.size()) return kDropped;
         const auto hdr_len = EncodeUdpFragmentHeader(
             version, message, *text,
             std::span<uint8_t>(header_buf.data(), *header_size));
-        if (!hdr_len) return false;
+        if (!hdr_len) return kDropped;
         const std::span<const uint8_t> header_span(header_buf.data(), *hdr_len);
         if (TrySendImmediateDatagram(header_span, payload)) {
             if (!closed_ &&
                 (core_->http || core_->next_output_stream >= 0 || !core_->datagrams.empty())) {
                 Flush();
             }
-            return true;
+            return HysteriaUdpSend::Sent;
         }
-        if (closed_) return true;
+        if (closed_) return kDropped;
         std::vector<uint8_t> queued(*hdr_len + payload.size());
         std::memcpy(queued.data(), header_span.data(), header_span.size());
         if (!payload.empty()) {
@@ -1611,7 +1621,7 @@ bool HysteriaConnection::SendUdpMessage(
         }
         core_->datagrams.push_back(std::move(queued));
         Flush();
-        return true;
+        return HysteriaUdpSend::Sent;
     }
     try {
         for (size_t index = 0; index < fragments; ++index) {
@@ -1623,7 +1633,7 @@ bool HysteriaConnection::SendUdpMessage(
             if (!encoded) {
                 while (core_->datagrams.size() > initial_datagrams)
                     core_->datagrams.pop_back();
-                return false;
+                return kDropped;
             }
             core_->datagrams.push_back(std::move(*encoded));
         }
@@ -1633,7 +1643,18 @@ bool HysteriaConnection::SendUdpMessage(
         throw;
     }
     Flush();
-    return true;
+    return HysteriaUdpSend::Sent;
+}
+
+void HysteriaConnection::AwaitDatagramRoom(UdpSessionStream& session) {
+    if (std::find(datagram_waiters_.begin(), datagram_waiters_.end(), &session) ==
+        datagram_waiters_.end()) {
+        datagram_waiters_.push_back(&session);
+    }
+}
+
+void HysteriaConnection::ForgetDatagramWaiter(UdpSessionStream& session) noexcept {
+    std::erase(datagram_waiters_, &session);
 }
 
 void HysteriaConnection::CloseUdpSession(uint32_t session_id) noexcept {
@@ -2135,6 +2156,7 @@ UdpSessionStream::UdpSessionStream(
     : session_id_(session_id)
     , owner_(std::move(owner))
     , signal_(io_context.get_executor(), 1)
+    , room_signal_(io_context.get_executor(), 1)
     , deadline_(io_context, *this) {}
 
 UdpSessionStream::~UdpSessionStream() noexcept {
@@ -2188,15 +2210,33 @@ net::awaitable<void> UdpSessionStream::WriteMultiBuffer(common::MultiBuffer pack
         packet.clear();
         throw transport::LinkError(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
-    auto owner = owner_.lock();
-    if (closed_ || !owner) {
-        packet.clear();
-        throw transport::LinkError(common::ErrorCode::CONNECTION_CLOSED);
+    // A reply waits for room in the connection's datagram queue, as with
+    // quic-go's SendDatagram, instead of being lost; meanwhile the outbound
+    // socket's kernel buffer holds the burst.
+    for (;;) {
+        auto owner = owner_.lock();
+        if (closed_ || cancelled_ || !owner) {
+            packet.clear();
+            throw transport::LinkError(common::ErrorCode::CONNECTION_CLOSED);
+        }
+        if (owner->SendUdpMessage(session_id_, *datagram.target,
+                                  datagram.single_buffer->Bytes()) != HysteriaUdpSend::Full) {
+            break;
+        }
+        owner->AwaitDatagramRoom(*this);
+        owner.reset();
+        auto [error] = co_await room_signal_.async_receive(net::as_tuple(net::use_awaitable));
+        if (error) {
+            if (auto current = owner_.lock()) current->ForgetDatagramWaiter(*this);
+            packet.clear();
+            throw IoSystemError(net::error::operation_aborted, "Hysteria UDP reply cancelled");
+        }
     }
-    const bool sent = owner->SendUdpMessage(
-        session_id_, *datagram.target, datagram.single_buffer->Bytes());
     packet.clear();
-    if (!sent) throw transport::LinkError(common::ErrorCode::RESOURCE_EXHAUSTED);
+}
+
+void UdpSessionStream::WakeWriter() noexcept {
+    (void)room_signal_.try_send(IoErrorCode{});
 }
 
 void UdpSessionStream::Cancel() noexcept {
@@ -2206,6 +2246,7 @@ void UdpSessionStream::Cancel() noexcept {
     input_.clear();
     queued_buffer_count_ = 0;
     WakeReader();
+    WakeWriter();
     NotifyCancellation();
 }
 
@@ -2216,8 +2257,11 @@ void UdpSessionStream::Close() {
     input_.clear();
     queued_buffer_count_ = 0;
     WakeReader();
-    if (auto owner = std::exchange(owner_, {}).lock())
+    WakeWriter();
+    if (auto owner = std::exchange(owner_, {}).lock()) {
+        owner->ForgetDatagramWaiter(*this);
         owner->CloseUdpSession(session_id_);
+    }
     NotifyClosed();
 }
 

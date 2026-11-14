@@ -1011,7 +1011,7 @@ TEST_F(UdpSocketOwnerTest, SameSessionIdIsIsolatedByAuthenticatedOwner) {
     EXPECT_EQ(association_stats.associations, 0) << "UDP association cleanup retained resource stats";
 }
 
-TEST_F(UdpSocketOwnerTest, InputOverflowReportsNoBufferSpaceInsteadOfEof) {
+TEST_F(UdpSocketOwnerTest, InputOverflowDropsTheDatagramAndKeepsTheSession) {
     ::app::UdpIngress::ClientSession overflow_session(io_context,
         {},
         reply_endpoint_a,
@@ -1027,21 +1027,29 @@ TEST_F(UdpSocketOwnerTest, InputOverflowReportsNoBufferSpaceInsteadOfEof) {
         oversized_bytes += n;
         oversized_input.push_back(std::move(buffer));
     }
-    EXPECT_FALSE(overflow_session.Push(callback_source, std::move(oversized_input))) << "oversized UDP input did not terminate its session";
-    EXPECT_TRUE(overflow_session.Closed()) << "oversized UDP input did not terminate its session";
-    bool overflow_reported = false;
+    const auto before = udp_budget.GetUsage();
+    EXPECT_FALSE(overflow_session.Push(callback_source, std::move(oversized_input)))
+        << "UDP input beyond the queue bound was accepted";
+    EXPECT_FALSE(overflow_session.Closed()) << "one lost datagram ended its UDP session";
+    EXPECT_EQ(udp_budget.GetUsage().datagrams, before.datagrams) << "dropped UDP input kept a reservation";
+
+    ::common::MultiBuffer next;
+    ASSERT_TRUE(next.AppendSpan(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>("next"), 4)));
+    EXPECT_TRUE(overflow_session.Push(callback_source, std::move(next)))
+        << "the session took no datagram after one was dropped";
+    std::string delivered;
     ::net::co_spawn(
         io_context,
         overflow_session.ReadMultiBuffer(),
-        [&](std::exception_ptr error, ::common::MultiBuffer) {
-            try {
-                if (error) std::rethrow_exception(error);
-            } catch (const ::IoSystemError& e) {
-                overflow_reported = e.code() == ::io_error::no_buffer_space;
+        [&](std::exception_ptr error, ::common::MultiBuffer payload) {
+            if (!error && !payload.empty()) {
+                const auto bytes = payload.FrontSpan();
+                delivered.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
             }
         });
     io_context.poll();
-    EXPECT_TRUE(overflow_reported) << "UDP input overflow was exposed as a clean EOF";
+    EXPECT_EQ(delivered, "next");
+    overflow_session.Close();
     io_context.restart();
 }
 

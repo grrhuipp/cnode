@@ -20,6 +20,7 @@
 namespace transport {
 namespace {
 constexpr std::size_t kMaxActiveSockets = 4096;
+constexpr int kDatagramReceiveBuffer = 1024 * 1024;
 constexpr std::size_t kMaxReceiveBuffers = 8;
 constexpr std::size_t kMaxDatagramBytes = kMaxReceiveBuffers * common::Buffer::kSize;
 constexpr std::size_t kMaxUdpPayloadV4 = 65507;
@@ -134,6 +135,11 @@ struct DatagramSocket::Impl final {
         }
         socket.bind(udp::endpoint(bind_address, 0), ec);
         if (ec) throw IoSystemError(ec);
+        // A reply burst lands in the kernel while the Worker serves other
+        // work; the default buffer holds under a hundred full-size packets.
+        // Best effort: the kernel caps it at net.core.rmem_max.
+        socket.set_option(net::socket_base::receive_buffer_size(kDatagramReceiveBuffer), ec);
+        ec.clear();
         // Receive() takes a datagram synchronously after readiness; a stale
         // readiness must report would_block instead of blocking the Worker.
         socket.non_blocking(true, ec);

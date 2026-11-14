@@ -725,9 +725,8 @@ public:
         case ReplyAdmission::InvalidTarget:
             throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
         case ReplyAdmission::Full:
-            throw IoSystemError(
-                io_error::no_buffer_space,
-                "Mux UDP reply queue full");
+            // Lost like any datagram; the sub-session goes on.
+            co_return;
         }
     }
 
@@ -740,8 +739,9 @@ public:
 private:
     enum class ReplyAdmission : uint8_t { Queued, MixedEndpoints, InvalidTarget, Full };
 
-    // Queues one reply datagram; an empty one is consumed. A full reply
-    // queue ends this sub-session.
+    // Queues one reply datagram; an empty one is consumed. A reply beyond
+    // the connection's UDP budget is dropped, as UDP may; the sub-session
+    // stays.
     ReplyAdmission Enqueue(common::MultiBuffer mb) {
         const auto datagram = common::InspectUdpDatagram(mb);
         if (datagram.status == common::UdpDatagramStatus::Empty) {
@@ -758,7 +758,7 @@ private:
                 LOG_CONN_DEBUG(parent_conn_id_,
                     "UDP reply queue full, dropped {} packets", dropped);
             }
-            Cancel();
+            mb.clear();
             return ReplyAdmission::Full;
         }
         MuxReply reply;

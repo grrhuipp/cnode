@@ -307,8 +307,8 @@ geosite.dat
 - XHTTP：每个 session 排队数据与并发上传共用 4 MiB 预算，最多 1024 个排队包、64 个在途上传。跨 Worker 上传：每对 Worker 之间已读取但会话尚未接收的 packet-up 数据最多 16 MiB，每个 stream-up 上传最多 1 MiB 在途；先于下行到达的上传在请求握手期限内等待下行。
 - Mux：每连接最多 1,024 个子会话；未转发客户端数据共享 4 MiB 预算，降至 2 MiB 后恢复读取（与 Xray 相同的队头阻塞语义）。
 - AnyTLS 入站：每个 Session 最多 128 条未结束子流，子流从 SYN 起受 `timeouts.handshake` 绝对期限约束；每条子流接收队列最多 65,535 字节有效数据。
-- 原生 UDP：每 Worker 最多 4096 个出站 UDP socket、4096 个存活入站 association、8192 份排队数据报、64 MiB 排队缓冲；满额拒绝新请求，不驱逐已有请求。每个逻辑 UDP 请求独占一个出站 socket，源端口在请求期间不变。上行半关闭后在 `downlinkOnly` 窗口内继续收包。
-- UDP 路由子流：每个 association 最多保留 64 个目标、64 个路由子流和 512 个 QUIC CID alias；每个子流最多排队 64 个数据报或 1 MiB，association 子流队列合计最多 4 MiB。
+- 原生 UDP：每 Worker 最多 4096 个出站 UDP socket、4096 个存活入站 association、8192 份排队数据报、64 MiB 排队缓冲；满额拒绝新请求，不驱逐已有请求。每个逻辑 UDP 请求独占一个出站 socket，源端口在请求期间不变。上行半关闭后在 `downlinkOnly` 窗口内继续收包。每个 association 最多排队 256 个上行数据报（512 KiB），超出的数据报丢弃，association 不因此结束；监听 socket 的回包队列满时，回包等待而不丢弃，由出站 socket 的内核缓冲吸收突发。监听与出站 UDP socket 分别请求 4 MiB 与 1 MiB 内核接收缓冲（受 `net.core.rmem_max` 限制）。
+- UDP 路由子流：每个 association 最多保留 64 个目标、64 个路由子流和 512 个 QUIC CID alias；每个子流最多排队 64 个数据报或 1 MiB，association 子流队列合计最多 4 MiB。队列满时暂停读取该 association 的上游（与 Xray 的 pipe 一致），经 TCP 承载的 UDP 由传输层背压，不丢包，子流也不结束。Mux 连接的 UDP 回包超出 4 MiB 预算时丢弃该数据报，子会话继续。
 - Hysteria UDP 分片重组：5 秒无新片或 15 秒整体期限即丢弃该轮分片，不关闭会话。Hysteria v1 服务端使用 BBR v2 拥塞控制，与官方 v1 客户端线协议互通，但带宽控制行为不是 Brutal。
 - VMess 重放窗口 180 秒，最多 65,536 项，满时拒绝新记录。
 - SS2022 TCP 按 [SIP022 §3.1.5](https://shadowsocks.org/doc/sip022.html#_3-1-5-replay-protection) 记录已认证请求的 salt：进程级去重，保留 65 秒，最多 262,144 项；满时拒绝新记录，不提前淘汰未过期项。重放或跟踪容量拒绝不计入认证失败封禁。

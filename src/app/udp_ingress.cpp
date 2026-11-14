@@ -281,8 +281,45 @@ template <class Function>
     return ScopeExit<Function>(std::move(function));
 }
 
+// Upper bound of what a protocol adds around a reply's payload (SS2022:
+// headers, padding and the longest address).
+constexpr size_t kReplyEncodingOverhead = 512;
+
+// Waits on a session's channel until signalled or `cancellation` fires.
+struct ReplyRoomWait final : transport::CancellationSubscription {
+    explicit ReplyRoomWait(common::SignalChannel& signal) noexcept : signal(signal) {}
+    common::SignalChannel& signal;
+    bool cancelled = false;
+
+private:
+    void OnCancellation(transport::Cancellation) noexcept override {
+        cancelled = true;
+        (void)signal.try_send(IoErrorCode{});
+    }
+};
 
 }  // namespace
+
+bool UdpIngress::HasReplyRoom(const SocketState& socket, size_t bytes) const noexcept {
+    return !WouldOverflowUdpQueue(socket.pending.size(), socket.queued_bytes, bytes);
+}
+
+net::awaitable<bool> UdpIngress::AwaitReplyRoom(SocketState& socket, ClientSession& session) {
+    socket.reply_waiters.push_back(&session);
+    struct Leave {
+        SocketState& socket;
+        ClientSession* session;
+        ~Leave() { std::erase(socket.reply_waiters, session); }
+    } leave{socket, &session};
+    ReplyRoomWait watch(session.reply_room_signal_);
+    watch.Resubscribe(session.cancellation_);
+    if (!watch.cancelled && !session.Closed()) {
+        auto [error] = co_await session.reply_room_signal_.async_receive(
+            net::as_tuple(net::use_awaitable));
+        if (error) co_return false;
+    }
+    co_return !watch.cancelled && !session.Closed() && OwnsSocket(socket);
+}
 
 bool UdpIngress::ReplyRoute::Send(proxy::UDPPacketView packet, const udp::endpoint& endpoint) {
     auto payload = response->Encode(packet);
@@ -301,6 +338,7 @@ UdpIngress::ClientSession::ClientSession(
     : association_(std::move(association))
     , budget_(&budget)
     , reader_signal_(io_context, 1)
+    , reply_room_signal_(io_context, 1)
     , reply_(std::move(reply))
     , reply_endpoint_(std::move(reply_endpoint))
     , session_owner_(std::move(session_owner))
@@ -341,10 +379,11 @@ bool UdpIngress::ClientSession::Push(
         payload.clear();
         return false;
     }
+    // A burst beyond the queue loses datagrams, as UDP may; the session and
+    // its outbound stay.
     if (WouldOverflowUdpQueue(
             input_queue_.size(), queued_bytes_, payload_size)) {
         payload.clear();
-        CloseWithError(common::ErrorCode::RESOURCE_EXHAUSTED);
         return false;
     }
 
@@ -416,11 +455,17 @@ UdpIngress::ClientSession::WriteMultiBuffer(common::MultiBuffer mb) {
             "UDP client reply contains missing or mixed endpoints");
     }
 
-    if (!reply_.Send(proxy::UDPPacketView{*datagram.target, mb.FrontSpan()}, reply_endpoint_)) {
-        mb.clear();
-        throw IoSystemError(
-            io_error::fault, "UDP client reply was rejected");
+    // The socket's reply queue is shared by its sessions: a burst waits for
+    // room, holding back this session's outbound, rather than being lost.
+    while (!reply_.owner->HasReplyRoom(
+               *reply_.socket, datagram.payload_size + kReplyEncodingOverhead)) {
+        if (!co_await reply_.owner->AwaitReplyRoom(*reply_.socket, *this)) {
+            mb.clear();
+            throw IoSystemError(io_error::operation_aborted, "UDP client reply path closed");
+        }
     }
+    // An encoding or queueing failure loses this datagram only.
+    (void)reply_.Send(proxy::UDPPacketView{*datagram.target, mb.FrontSpan()}, reply_endpoint_);
     mb.clear();
     co_return;
 }
@@ -442,6 +487,7 @@ std::optional<UdpIngress::PendingUdpReply> UdpIngress::BeginReplySend(
     const size_t payload_size = front.payload_size;
     queue.queued_bytes -= payload_size;
     queue.pending.pop_front();
+    for (auto* waiter : queue.reply_waiters) (void)waiter->reply_room_signal_.try_send(IoErrorCode{});
     queue.active_id = packet->id;
     queue.active_payload_size = payload_size;
     return packet;
@@ -1299,6 +1345,7 @@ void UdpIngress::ClearReplyQueue(SocketState& socket) noexcept {
     socket.queued_bytes = 0;
     socket.active_id = 0;
     socket.active_payload_size = 0;
+    for (auto* waiter : socket.reply_waiters) (void)waiter->reply_room_signal_.try_send(IoErrorCode{});
 }
 
 bool UdpIngress::SendReply(const SocketStatePtr& socket, udp::endpoint endpoint,

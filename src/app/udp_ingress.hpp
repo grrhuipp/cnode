@@ -415,6 +415,12 @@ public:
         SocketState& socket,
         uint64_t completed_id);
     void ClearReplyQueue(SocketState& socket) noexcept;
+    // Whether the socket's reply queue takes `bytes` more now.
+    [[nodiscard]] bool HasReplyRoom(const SocketState& socket, size_t bytes) const noexcept;
+    // A session's reply waits here for the socket's queue instead of being
+    // lost: the wait holds back its outbound, whose kernel buffer absorbs
+    // the burst. False once the session is cancelled or closed.
+    [[nodiscard]] net::awaitable<bool> AwaitReplyRoom(SocketState& socket, ClientSession& session);
     [[nodiscard]] bool SendReply(const SocketStatePtr& socket, udp::endpoint endpoint,
                                  common::MultiBuffer payload, uint32_t worker_id);
 
@@ -556,6 +562,8 @@ struct UdpSocketState final : std::enable_shared_from_this<UdpSocketState> {
     uint64_t active_id = 0;
     size_t active_payload_size = 0;
     bool sender_running = false;
+    // Sessions waiting for room in `pending`; woken whenever it shrinks.
+    std::vector<UdpIngress::ClientSession*> reply_waiters;
 };
 
 class UdpIngress::ClientSession final
@@ -624,6 +632,7 @@ private:
     UdpResourceBudget::AssociationLease association_;
     UdpResourceBudget* budget_;
     common::SignalChannel reader_signal_;
+    common::SignalChannel reply_room_signal_;
     ReplyRoute reply_;
     udp::endpoint reply_endpoint_;
     common::RingDeque<QueuedInput> input_queue_;

@@ -72,9 +72,15 @@ struct XudpKeyHash {
 // A bounded queue of single-Buffer datagrams.
 class DatagramQueue {
 public:
+    [[nodiscard]] static size_t Charge(const common::MultiBuffer& datagram) noexcept {
+        return std::max<size_t>(datagram.byte_size(), common::Buffer::kSize);
+    }
+    [[nodiscard]] bool HasRoom(const common::MultiBuffer& datagram) const noexcept {
+        return queue_.size() < kMaxQueuedDatagrams && Charge(datagram) <= kMaxQueuedBytes - bytes_;
+    }
     [[nodiscard]] bool Push(common::MultiBuffer datagram) {
-        const size_t bytes = std::max<size_t>(datagram.byte_size(), common::Buffer::kSize);
-        if (queue_.size() >= kMaxQueuedDatagrams || bytes > kMaxQueuedBytes - bytes_) return false;
+        if (!HasRoom(datagram)) return false;
+        const size_t bytes = Charge(datagram);
         queue_.push_back(std::move(datagram));
         bytes_ += bytes;
         return true;
@@ -83,7 +89,7 @@ public:
         if (queue_.empty()) return false;
         datagram = std::move(queue_.front());
         queue_.pop_front();
-        bytes_ -= std::min(bytes_, std::max<size_t>(datagram.byte_size(), common::Buffer::kSize));
+        bytes_ -= std::min(bytes_, Charge(datagram));
         return true;
     }
     [[nodiscard]] bool Empty() const noexcept { return queue_.empty(); }
@@ -147,6 +153,11 @@ public:
     void AttachRemote(uint32_t from, uint32_t slot, uint32_t generation);
     void DetachRemote(uint32_t from, uint32_t slot, uint32_t generation) noexcept;
     void PushUplink(common::MultiBuffer datagram) noexcept;
+    // A local carrier waits here instead of losing datagrams to a full
+    // flow queue: the wait holds back its Mux connection. False once the
+    // flow closed or `carrier` (the sub-session's) was cancelled.
+    [[nodiscard]] net::awaitable<bool> AwaitUplinkRoom(
+        const common::MultiBuffer& datagram, transport::CancellationSource& carrier);
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override;
@@ -172,6 +183,7 @@ private:
     void Unattached() noexcept;
     void Deliver(common::MultiBuffer datagram) noexcept;
     void WakeReader() noexcept { (void)reader_signal_.try_send(IoErrorCode{}); }
+    void WakeCarrier() noexcept { (void)room_signal_.try_send(IoErrorCode{}); }
 
     net::io_context& io_context_;
     routing::Dispatcher& dispatcher_;
@@ -184,6 +196,7 @@ private:
     XudpRelay* relay_;
     XudpSessionTable& table_;
     common::SignalChannel reader_signal_;
+    common::SignalChannel room_signal_;
     transport::CancellationSource cancellation_;
     DatagramQueue uplink_;
     // Replies held while no sub-session is attached.
@@ -283,7 +296,8 @@ XudpSession::XudpSession(const XudpDispatchEnvironment& environment,
     , key_(key)
     , relay_(relay)
     , table_(table)
-    , reader_signal_(environment.io_context, 1) {
+    , reader_signal_(environment.io_context, 1)
+    , room_signal_(environment.io_context, 1) {
     ctx_.InitSubstreamFrom(sub_ctx);
     BindInboundRequestTarget(ctx_, InboundRequestTarget{
         common::Network::UDP, sub_ctx.outbound.target, std::nullopt});
@@ -319,6 +333,7 @@ void XudpSession::Close() noexcept {
     uplink_.Clear();
     parked_.Clear();
     WakeReader();
+    WakeCarrier();
     ReleaseAttachment();
     TimeoutEvent::Cancel();
     table_.Erase(key_, this);
@@ -381,6 +396,17 @@ void XudpSession::DetachRemote(uint32_t from, uint32_t slot, uint32_t generation
     Unattached();
 }
 
+net::awaitable<bool> XudpSession::AwaitUplinkRoom(
+    const common::MultiBuffer& datagram, transport::CancellationSource& carrier) {
+    ChannelWait watch(room_signal_);
+    watch.Resubscribe(carrier);
+    while (!closed_ && !watch.cancelled && !uplink_.HasRoom(datagram)) {
+        auto [error] = co_await room_signal_.async_receive(net::as_tuple(net::use_awaitable));
+        if (error) co_return false;
+    }
+    co_return !closed_ && !watch.cancelled;
+}
+
 void XudpSession::PushUplink(common::MultiBuffer datagram) noexcept {
     if (closed_) return;
     try {
@@ -408,7 +434,10 @@ void XudpSession::Deliver(common::MultiBuffer datagram) noexcept {
 net::awaitable<common::MultiBuffer> XudpSession::ReadMultiBuffer() {
     for (;;) {
         common::MultiBuffer datagram;
-        if (uplink_.Pop(datagram)) co_return datagram;
+        if (uplink_.Pop(datagram)) {
+            WakeCarrier();
+            co_return datagram;
+        }
         if (closed_) co_return common::MultiBuffer{};
         auto [error] = co_await reader_signal_.async_receive(net::as_tuple(net::use_awaitable));
         if (error) throw IoSystemError(io_error::operation_aborted, "XUDP flow input cancelled");
@@ -668,6 +697,7 @@ net::awaitable<void> CarryLocal(std::shared_ptr<XudpSession> flow, XudpClient& c
         for (;;) {
             auto datagram = co_await uplink.ReadMultiBuffer();
             if (datagram.empty()) break;
+            if (!co_await flow->AwaitUplinkRoom(datagram, uplink.Cancellation())) break;
             flow->PushUplink(std::move(datagram));
         }
     } catch (...) {

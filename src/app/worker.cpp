@@ -652,6 +652,14 @@ bool Worker::ListenerState::OpenAndBindUdpSocket(
         socket.bind(endpoint, error);
     }
     if (!error) {
+        // Every client of the listener shares this kernel queue; the
+        // default holds under a hundred full-size packets. Best effort:
+        // the kernel caps it at net.core.rmem_max.
+        constexpr int kListenerReceiveBuffer = 4 * 1024 * 1024;
+        IoErrorCode ignored;
+        socket.set_option(net::socket_base::receive_buffer_size(kListenerReceiveBuffer), ignored);
+    }
+    if (!error) {
         return true;
     }
     if (dual_stack) {

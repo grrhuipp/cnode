@@ -177,6 +177,15 @@ private:
     bool closed_ = false;
 };
 
+// Outcome of handing one UDP message to the QUIC connection.
+enum class HysteriaUdpSend : uint8_t {
+    Sent,
+    // The connection's datagram queue is full: wait for room and retry.
+    Full,
+    // The message cannot be sent at all and is dropped.
+    Dropped,
+};
+
 // One Hysteria UDP session handed to the inbound handler. Every read yields
 // one reassembled datagram tagged with its target; every write sends one
 // datagram to the target it carries. Byte-stream I/O is not supported.
@@ -195,6 +204,8 @@ public:
     [[nodiscard]] bool Push(const common::TargetAddress& target, std::span<const uint8_t> payload);
     [[nodiscard]] bool PushMultiBuffer(const common::TargetAddress& target, common::MultiBuffer packet);
     void Detach() noexcept;
+    // The connection drained datagrams: a reply waiting for room retries.
+    void WakeWriter() noexcept;
 
     transport::EofAction ReadEofAction() const noexcept override {
         return transport::EofAction::WaitForPeer;
@@ -218,6 +229,7 @@ private:
     uint32_t session_id_;
     std::weak_ptr<HysteriaConnection> owner_;
     common::SignalChannel signal_;
+    common::SignalChannel room_signal_;
     common::RingDeque<common::MultiBuffer> input_;
     size_t queued_buffer_count_ = 0;
     bool cancelled_ = false;

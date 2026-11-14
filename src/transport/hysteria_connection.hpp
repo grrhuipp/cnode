@@ -39,8 +39,11 @@ public:
     void ConsumeStream(int64_t stream_id, size_t bytes) noexcept;
     void ShutdownStreamWrite(int64_t stream_id) noexcept;
     void CancelStream(int64_t stream_id) noexcept;
-    [[nodiscard]] bool SendUdpMessage(uint32_t session_id, const common::TargetAddress& target,
-                                      std::span<const uint8_t> payload);
+    [[nodiscard]] HysteriaUdpSend SendUdpMessage(uint32_t session_id, const common::TargetAddress& target,
+                                                 std::span<const uint8_t> payload);
+    // `session` waits for the datagram queue to drain; woken once it does.
+    void AwaitDatagramRoom(UdpSessionStream& session);
+    void ForgetDatagramWaiter(UdpSessionStream& session) noexcept;
     void CloseUdpSession(uint32_t session_id) noexcept;
 private:
     friend class HysteriaIngress;
@@ -194,6 +197,8 @@ private:
     bool stats_open_ = false;
     bool in_ngtcp2_callback_ = false;
     bool closed_ = false;
+    // UDP sessions whose replies wait for room in the datagram queue.
+    std::vector<UdpSessionStream*> datagram_waiters_;
 };
 
 }  // namespace transport

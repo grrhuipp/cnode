@@ -168,7 +168,10 @@ public:
     UdpRouteFlow(const UdpRouteFlow&) = delete;
     UdpRouteFlow& operator=(const UdpRouteFlow&) = delete;
 
-    [[nodiscard]] bool Push(common::MultiBuffer payload);
+    enum class PushResult : uint8_t { Queued, Full, Closed };
+    // Full leaves `payload` with the caller, who waits for room: a full
+    // queue holds back the association's reader instead of losing data.
+    [[nodiscard]] PushResult Push(common::MultiBuffer& payload);
     void FinishInput() noexcept;
     void Close(common::ErrorCode error) noexcept;
 
@@ -360,6 +363,7 @@ public:
         failed_ = error == common::ErrorCode::OK
             ? common::ErrorCode::INTERNAL : error;
         write_gate_.Cancel();
+        WakeRoomWaiter();
         if (parent_.reader) {
             parent_.reader->Cancellation().CancelPending(failed_);
         }
@@ -410,11 +414,34 @@ public:
     void AddQueuedBytes(size_t bytes) noexcept { total_queued_bytes_ += bytes; }
     void RemoveQueuedBytes(size_t bytes) noexcept {
         total_queued_bytes_ -= std::min(total_queued_bytes_, bytes);
+        WakeRoomWaiter();
     }
     [[nodiscard]] bool CanQueue(size_t bytes) const noexcept {
         return bytes <= kMaxAssociationQueuedBytes -
             std::min(total_queued_bytes_, kMaxAssociationQueuedBytes);
     }
+
+    // The association reader, its datagram held back by a full queue:
+    // waits until a flow takes or drops queued data, the association fails,
+    // or the parent reader is cancelled. True when it may retry.
+    net::awaitable<bool> AwaitRoom() {
+        struct CancelWait final : transport::CancellationSubscription {
+            explicit CancelWait(common::SignalChannel& signal) noexcept : signal(signal) {}
+            common::SignalChannel& signal;
+            bool cancelled = false;
+
+        private:
+            void OnCancellation(transport::Cancellation) noexcept override {
+                cancelled = true;
+                (void)signal.try_send(IoErrorCode{});
+            }
+        } watch{room_signal_};
+        if (parent_.reader) watch.Resubscribe(parent_.reader->Cancellation());
+        if (watch.cancelled || failed_ != common::ErrorCode::OK) co_return false;
+        auto [error] = co_await room_signal_.async_receive(net::as_tuple(net::use_awaitable));
+        co_return !error && !watch.cancelled && failed_ == common::ErrorCode::OK;
+    }
+    void WakeRoomWaiter() noexcept { (void)room_signal_.try_send(IoErrorCode{}); }
 
     void Reject(
         const common::TargetAddress& target,
@@ -557,6 +584,7 @@ private:
     net::io_context& io_context_;
     bool terminate_on_flow_error_ = false;
     transport::AsyncWriteGate write_gate_;
+    common::SignalChannel room_signal_{io_context_.get_executor(), 1};
     std::unordered_map<
         common::TargetAddress,
         std::unique_ptr<UdpTargetState>,
@@ -588,20 +616,22 @@ UdpRouteFlow::~UdpRouteFlow() noexcept {
     if (!queue_.empty()) owner.RemoveQueuedBytes(queued_bytes_);
 }
 
-bool UdpRouteFlow::Push(common::MultiBuffer payload) {
+UdpRouteFlow::PushResult UdpRouteFlow::Push(common::MultiBuffer& payload) {
+    if (closed_) {
+        payload.clear();
+        return PushResult::Closed;
+    }
     const size_t bytes = payload.byte_size();
-    if (closed_ || queue_.size() >= kMaxFlowQueuedDatagrams ||
+    if (queue_.size() >= kMaxFlowQueuedDatagrams ||
         bytes > kMaxFlowQueuedBytes - std::min(queued_bytes_, kMaxFlowQueuedBytes) ||
         !owner.CanQueue(bytes)) {
-        payload.clear();
-        if (!closed_) Close(common::ErrorCode::RESOURCE_EXHAUSTED);
-        return false;
+        return PushResult::Full;
     }
     queue_.push_back(QueuedDatagram{std::move(payload), bytes});
     queued_bytes_ += bytes;
     owner.AddQueuedBytes(bytes);
     WakeReader();
-    return true;
+    return PushResult::Queued;
 }
 
 void UdpRouteFlow::FinishInput() noexcept {
@@ -734,7 +764,9 @@ net::awaitable<void> UdpFlowDispatcher::Run(
             &flow->Cancellation());
     };
 
-    auto process = [&](common::MultiBuffer packet) {
+    // True when the datagram is held back by a full queue and must be
+    // offered again once there is room.
+    auto process = [&](common::MultiBuffer& packet) -> bool {
         auto datagram = common::InspectUdpDatagram(packet);
         if (datagram.status == common::UdpDatagramStatus::MissingTarget &&
             parent_context.outbound.target.IsValid() &&
@@ -756,22 +788,33 @@ net::awaitable<void> UdpFlowDispatcher::Run(
                     ? "UDP route flow capacity" : "ambiguous UDP route flow",
                 quic);
             packet.clear();
-            return;
+            return false;
         }
-        if (!resolved.flow->Push(std::move(packet))) {
-            state->Reject(
-                *datagram.target, "UDP route flow queue full", quic);
-            return;
-        }
+        const auto pushed = resolved.flow->Push(packet);
         if (resolved.created) spawn_flow(resolved.flow);
+        // A flow already ending takes no more datagrams; the next one for
+        // its target starts a new flow once it is gone.
+        return pushed == UdpRouteFlow::PushResult::Full;
+    };
+    // Like the pipes of Xray's dispatcher, a full flow queue blocks the
+    // association's reader: stream-carried UDP then waits in its transport,
+    // and the flow never ends for a burst.
+    auto offer = [&](common::MultiBuffer packet) -> net::awaitable<void> {
+        while (process(packet)) {
+            if (!co_await state->AwaitRoom()) {
+                packet.clear();
+                throw transport::LinkError(state->Failure() != common::ErrorCode::OK
+                    ? state->Failure() : common::ErrorCode::CANCELLED);
+            }
+        }
     };
 
     try {
-        if (!initial.empty() || initial.HasUDP()) process(std::move(initial));
+        if (!initial.empty() || initial.HasUDP()) co_await offer(std::move(initial));
         for (;;) {
             auto packet = co_await parent_link.reader->ReadMultiBuffer();
             if (packet.empty() && !packet.HasUDP()) break;
-            process(std::move(packet));
+            co_await offer(std::move(packet));
             if (state->Failure() != common::ErrorCode::OK) {
                 throw transport::LinkError(state->Failure());
             }
