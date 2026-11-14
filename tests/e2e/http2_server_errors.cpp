@@ -7,7 +7,7 @@ std::vector<ErrorCase> ErrorCases() {
     std::vector<ErrorCase> result;
     for (const std::string network : {"grpc", "h2", "xhttp"}) for (bool tls : {false, true}) {
         for (const std::string mode : {"backpressure", "capacity", "malformed-pseudo", "malformed-host", "initial-end", "reset-empty", "reset-long", "reset-zero", "reset-idle", "early-reset", "early-settings", "early-ping", "early-hpack"}) result.push_back({network, tls, mode});
-        if (network == "xhttp") for (const std::string mode : {"packet-reset", "packet-capacity", "packet-tiny", "packet-large"}) result.push_back({network, tls, mode});
+        if (network == "xhttp") for (const std::string mode : {"packet-reset", "packet-capacity", "packet-tiny", "packet-large", "packet-missing", "stream-conflict"}) result.push_back({network, tls, mode});
     }
     return result;
 }
@@ -34,7 +34,7 @@ TEST_P(Http2ServerErrors, BoundedStreamsRecoverWithoutCorruptingSharedConnection
         for (;;) { auto bytes = socket.Read(); if (bytes.empty()) break; socket.Write(bytes); }
     });
     auto has_tag = [&](char tag) { std::lock_guard lock(mutex); return tags.contains(tag); };
-    Node node; node.Setup(network, tls, mode.starts_with("packet-") ? "packet-up" : "stream-one"); node.Start();
+    Node node; node.Setup(network, tls, mode.starts_with("packet-") ? "packet-up" : mode.starts_with("stream-") ? "stream-up" : "stream-one"); node.Start();
     auto connect_peer = [&] {
         auto peer = std::make_unique<Peer>(node.port, tls, network);
         peer->Wait([&] { return peer->Has(4, 0); }, 3s);
@@ -75,6 +75,24 @@ TEST_P(Http2ServerErrors, BoundedStreamsRecoverWithoutCorruptingSharedConnection
         EXPECT_TRUE(has_tag('R')); EXPECT_FALSE(has_tag('V'));
         peer.Reset(1); peer.Packet(11, "sibling", 1, Echo); peer.Message(5, Response + Echo); peer.Ping("split-ok");
         peer.Down(13, "recovered"); peer.Packet(15, "recovered", 0, VlessRequest(target.Port(), "N")); peer.Message(13, Response); EXPECT_FALSE(has_tag('V'));
+    } else if (mode == "packet-missing") {
+        // An upload is answered only once its session is found: one for an
+        // ended session is a stream error with no response headers.
+        peer.Down(1, "ended"); peer.Packet(3, "ended", 0, VlessRequest(target.Port(), "S")); peer.Message(1, Response); peer.Committed(3);
+        peer.Reset(1); peer.Ping("ended!!!");
+        peer.wire.Write(Frame(1, 5, 5, Headers(network, tls, "/fixture/ended/1")));
+        peer.Wait([&] { return peer.Has(3, 5); });
+        EXPECT_FALSE(peer.Has(1, 5)); EXPECT_EQ(peer.Bodies(3, 5), std::vector<std::string>{BigEndian(1, 4)});
+        peer.Down(7, "after"); peer.Packet(9, "after", 0, VlessRequest(target.Port(), "N")); peer.Message(7, Response); peer.Committed(9);
+    } else if (mode == "stream-conflict") {
+        // A second stream-up for one session is answered 400; the first keeps streaming.
+        peer.Down(1, "single"); peer.wire.Write(Frame(1, 4, 3, Headers(network, tls, "/fixture/single")));
+        peer.Send(3, VlessRequest(target.Port(), "S")); peer.Message(1, Response);
+        peer.wire.Write(Frame(1, 4, 5, Headers(network, tls, "/fixture/single")));
+        peer.Wait([&] { return peer.Ended(5); });
+        EXPECT_EQ(peer.Bodies(1, 5), std::vector<std::string>{std::string(1, static_cast<char>(0x80 | 12))});
+        EXPECT_FALSE(peer.Has(3, 5));
+        peer.Send(3, Echo); peer.Message(1, Response + Echo); peer.Ping("conflict");
     } else if (mode.starts_with("early-") || mode.starts_with("reset-")) {
         uint32_t code = 1;
         if (!mode.starts_with("early-")) {

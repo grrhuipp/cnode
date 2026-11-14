@@ -337,8 +337,11 @@ private:
     }
 
     // Finds the session of an upload stream, waiting for its downlink if
-    // need be, and feeds it there or to the relay toward its Worker.
+    // need be, answers the stream, and feeds the session or the relay
+    // toward its Worker.
     net::awaitable<void> RunUpload(
+        uint32_t stream_id,
+        bool end_stream,
         std::shared_ptr<Http2ServerSubStreamState> sub,
         XHttpRequestMeta::Kind kind,
         std::string session_id,

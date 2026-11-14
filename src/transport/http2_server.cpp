@@ -809,20 +809,50 @@ net::awaitable<void> Http2ServerSession::FlushReceiveCredit() {
 }
 
 net::awaitable<void> Http2ServerSession::RunUpload(
+    uint32_t stream_id,
+    bool end_stream,
     std::shared_ptr<Http2ServerSubStreamState> sub,
     XHttpRequestMeta::Kind kind,
     std::string session_id,
     uint64_t seq) {
     RequestScope active(active_requests_);
-    std::unique_ptr<AsyncStream> upload = std::make_unique<Http2ServerSubStream>(sub);
+    XHttpUploadTarget target;
     try {
-        auto target = co_await ResolveXHttpUploadTarget(coordinator_, io_context_,
+        target = co_await ResolveXHttpUploadTarget(coordinator_, io_context_,
             xhttp_config_->session_namespace, session_id,
             kind == XHttpRequestMeta::Kind::PacketUp
                 ? XHttpSessionAccess::Upload : XHttpSessionAccess::Open,
-            upload->Cancellation());
-        if (!target) throw IoSystemError(io_error::not_found);
-        if (target.session) sub->SetUploadBudget(target.session);
+            sub->Cancellation());
+    } catch (const IoSystemError&) {
+        target = XHttpUploadTarget{};
+    }
+    // Nothing is answered before the session is found: a missing session is
+    // a stream error and a second stream-up a 400, as for a local session.
+    if (!target) {
+        if (StreamWritable(stream_id)) (void)co_await ResetStream(stream_id, H2Error::Protocol);
+        co_return;
+    }
+    if (kind == XHttpRequestMeta::Kind::StreamUp && target.session &&
+        !target.session->CanAttachStream()) {
+        LOG_CONN_DEBUG(conn_id_, "XHTTP server rejected concurrent H2 stream-up session={}",
+                      PublicHttpTargetForLog(session_id));
+        constexpr std::array<uint8_t, 1> kBadRequestStatus{0x80 | kHpackStaticStatusBadRequest};
+        (void)co_await WriteFrameSerialized(
+            H2FrameType::HEADERS, kFlagEndHeaders | kFlagEndStream, stream_id, kBadRequestStatus);
+        RemoveStream(stream_id);
+        co_return;
+    }
+    if (!co_await AcceptStream(stream_id, end_stream, *sub)) {
+        // The stream-up this session waited for will not come.
+        if (kind == XHttpRequestMeta::Kind::StreamUp && target.session &&
+            target.session->CanAttachStream()) {
+            target.session->Close();
+        }
+        co_return;
+    }
+    if (target.session) sub->SetUploadBudget(target.session);
+    std::unique_ptr<AsyncStream> upload = std::make_unique<Http2ServerSubStream>(sub);
+    try {
         if (kind == XHttpRequestMeta::Kind::PacketUp) {
             XHttpPacketUpload packet(target, *upload);
             common::MultiBuffer payload;
@@ -840,16 +870,14 @@ net::awaitable<void> Http2ServerSession::RunUpload(
             upload->Close();
             co_return;
         }
-        LOG_CONN_DEBUG(conn_id_, "XHTTP server H2 stream-up upload ready session={} remote={}",
-                      PublicHttpTargetForLog(session_id), target.session == nullptr);
+        LOG_CONN_DEBUG(conn_id_, "XHTTP server H2 stream-up upload ready session={} stream_id={} remote={}",
+                      PublicHttpTargetForLog(session_id), stream_id, target.session == nullptr);
         if (!target.session) {
             co_await target.relay->PumpStream(target.owner, target.token, *upload);
             upload->Close();
             co_return;
         }
         if (!target.session->AttachStream(std::move(upload))) {
-            LOG_CONN_DEBUG(conn_id_, "XHTTP server rejected concurrent H2 stream-up session={}",
-                          PublicHttpTargetForLog(session_id));
             co_return;
         }
         co_await Http2ServerSubStreamState::JoinOwner(std::move(sub), std::move(target.session));
@@ -1220,13 +1248,12 @@ net::awaitable<bool> Http2ServerSession::RouteXHttpRequest(
     case XHttpRequestMeta::Kind::StreamUp:
     case XHttpRequestMeta::Kind::PacketUp: {
         // Finding the session may wait for its downlink, which can follow on
-        // this very connection: never in the frame reader.
-        if (!co_await AcceptStream(stream_id, end_stream, *sub)) {
-            co_return false;
-        }
+        // this very connection: never in the frame reader. The stream is
+        // answered once its session is known.
         bool spawn_failed = false;
         try {
-            Spawn(RunUpload(std::move(sub), meta.kind, std::string(meta.session_id), meta.seq));
+            Spawn(RunUpload(stream_id, end_stream, std::move(sub), meta.kind,
+                std::string(meta.session_id), meta.seq));
         } catch (...) {
             spawn_failed = true;
         }
