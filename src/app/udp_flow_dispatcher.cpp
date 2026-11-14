@@ -780,6 +780,11 @@ net::awaitable<void> UdpFlowDispatcher::Run(
         failure = std::current_exception();
     }
 
+    // Children borrow this frame's dispatcher, policy, stats and timeouts.
+    // A cancelled parent would otherwise throw at the join's co_await and
+    // return while children still run, so the join must not observe it.
+    const bool previous_throw_setting = co_await net::this_coro::throw_if_cancelled();
+    co_await net::this_coro::throw_if_cancelled(false);
     try {
         if (failure) {
             state->CloseAll(transport::ClassifyFailure(
@@ -792,6 +797,7 @@ net::awaitable<void> UdpFlowDispatcher::Run(
     } catch (...) {
         if (!failure) failure = std::current_exception();
     }
+    co_await net::this_coro::throw_if_cancelled(previous_throw_setting);
     state->Deactivate();
 
     if (failure) std::rethrow_exception(failure);

@@ -270,11 +270,21 @@ public:
 
     // Stop accepting new children but let started work reach its protocol
     // boundary. The children remain bounded by their own I/O deadlines.
+    // Caller cancellation turns the drain into a join: children are cancelled
+    // and the wait still resumes only after each actual completion.
     net::awaitable<void> AsyncDrain() {
-        co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
         Drain();
         if (!join_) co_return;
+        bool children_cancelled = false;
         while (!join_->done) {
+            if (!children_cancelled &&
+                (co_await net::this_coro::cancellation_state).cancelled() !=
+                    net::cancellation_type::none) {
+                children_cancelled = true;
+                co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+                if (group_) group_->Cancel();
+                continue;
+            }
             IoErrorCode ignored;
             co_await join_->wake.async_wait(net::redirect_error(net::use_awaitable, ignored));
         }

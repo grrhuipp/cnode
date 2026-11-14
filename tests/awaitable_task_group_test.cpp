@@ -445,6 +445,28 @@ TEST(AwaitableTaskGroup, ResidentDrainWaitsWithoutCancellingChildren) {
     EXPECT_TRUE(child_completed);
     EXPECT_TRUE(drained);
 }
+TEST(AwaitableTaskGroup, ResidentDrainCancelledByCallerCancelsAndJoinsChildren) {
+    net::io_context io;
+    net::steady_timer gate(io);
+    gate.expires_after(std::chrono::hours(1));
+    ::common::ResidentTaskGroup resident(io.get_executor());
+    net::cancellation_signal caller;
+    bool child_completed = true;
+    bool drained = false;
+
+    resident.Spawn(FinishNormally(gate, child_completed));
+    net::co_spawn(io, resident.AsyncDrain(),
+        net::bind_cancellation_slot(caller.slot(), [&](std::exception_ptr error) {
+            drained = !error;
+        }));
+    io.poll();
+    EXPECT_FALSE(drained);
+    caller.emit(net::cancellation_type::terminal);
+    io.run_for(std::chrono::seconds(1));
+
+    EXPECT_FALSE(child_completed);
+    EXPECT_TRUE(drained);
+}
 
 
 void CheckAllocation(std::size_t) { async_allocation_test::Check(); }

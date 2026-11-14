@@ -2,20 +2,20 @@
 #include "udp_wire.hpp"
 
 #include <bitset>
+#include <map>
 
 namespace cnode::e2e::quic {
 namespace {
 std::string UdpWire(uint32_t session, uint16_t packet, uint8_t fragment,
                     uint8_t count, std::string_view target, std::string_view payload) {
-    if (target.size() >= 64) throw std::runtime_error("UDP fixture target budget");
     return BigEndian(session, 4) + BigEndian(packet, 2) + static_cast<char>(fragment) +
-        static_cast<char>(count) + static_cast<char>(target.size()) +
+        static_cast<char>(count) + udp::QuicVarint(target.size()) +
         std::string(target) + std::string(payload);
 }
 
 class QuicUdpFrameBudget : public ::testing::TestWithParam<uint64_t> {};
 
-TEST_P(QuicUdpFrameBudget, DownlinkPreservesSourcesWithinPeerFrameBudget) {
+TEST_P(QuicUdpFrameBudget, DownlinkRestoresFlowTargetWithinPeerFrameBudget) {
     TempDir root;
     auto next_hop = Socket::BindUdp();
     auto reservation = Socket::BindUdp();
@@ -32,8 +32,13 @@ TEST_P(QuicUdpFrameBudget, DownlinkPreservesSourcesWithinPeerFrameBudget) {
     const auto host = std::string(63, 'a') + "." + std::string(63, 'b') + "." +
         std::string(63, 'c') + "." + std::string(61, 'd');
     constexpr uint32_t session = 0x11223344;
-    const auto request_header = SocksAddress(53);
-    std::optional<udp::Datagram> origin;
+    // Every reply source is the request's flow target, never the responder's
+    // address, so the target length sets the per-fragment header budget.
+    auto target_text = [](std::string_view host) {
+        const bool ipv6 = host.find(':') != std::string_view::npos;
+        return (ipv6 ? "[" + std::string(host) + "]" : std::string(host)) + ":54321";
+    };
+    std::map<std::string, udp::Datagram, std::less<>> origins;
     auto read_reply = [&](uint32_t expected_session, std::string_view expected_source) {
         std::array<std::string, 256> parts;
         std::bitset<256> received;
@@ -65,53 +70,45 @@ TEST_P(QuicUdpFrameBudget, DownlinkPreservesSourcesWithinPeerFrameBudget) {
         for (size_t fragment = 0; fragment < count; ++fragment) result += parts[fragment];
         return result;
     };
-    auto exchange = [&](std::string_view request, std::string_view response, std::string_view response_host) {
-        peer.SendDatagram(UdpWire(session, 7, 0, 1, "127.0.0.1:53", request));
+    auto send_request = [&](uint32_t session_id, std::string_view target_host, std::string_view request) {
+        const auto target = target_text(target_host);
+        peer.SendDatagram(UdpWire(session_id, 7, 0, 1, target, request));
         auto packet = udp::Receive(next_hop);
-        Require(udp::LegacyDecrypt(packet.payload) == request_header + std::string(request),
+        Require(udp::LegacyDecrypt(packet.payload) == SocksAddress(54321, target_host) + std::string(request),
             "HY2 to SS changed target or payload");
-        if (origin) Require(origin->SameEndpoint(packet), "HY2 session replaced its SS socket");
-        else {
-            origin.emplace();
-            origin->address = packet.address;
-            origin->address_size = packet.address_size;
+        auto [origin, created] = origins.try_emplace(std::to_string(session_id) + '/' + target);
+        if (created) {
+            origin->second.address = packet.address;
+            origin->second.address_size = packet.address_size;
+        } else {
+            Require(origin->second.SameEndpoint(packet), "HY2 flow replaced its SS socket");
         }
-        udp::Reply(next_hop, packet,
-            udp::LegacyEncrypt(SocksAddress(54321, response_host) + std::string(response)));
-        const bool ipv6 = response_host.find(':') != std::string_view::npos;
-        std::string expected_source;
-        expected_source.reserve(response_host.size() + 8);
-        if (ipv6) expected_source.push_back('[');
-        expected_source.append(response_host);
-        if (ipv6) expected_source.push_back(']');
-        expected_source.append(":54321");
-        EXPECT_EQ(read_reply(session, expected_source), response);
+        return packet;
     };
-    const std::string_view reply_host = frame_limit == 18 ? std::string_view("a") : std::string_view(host);
+    auto reply_from_other_source = [&](const udp::Datagram& packet, std::string_view response) {
+        udp::Reply(next_hop, packet,
+            udp::LegacyEncrypt(SocksAddress(9, "127.0.0.2") + std::string(response)));
+    };
+    auto exchange = [&](std::string_view target_host, std::string_view request, std::string_view response) {
+        reply_from_other_source(send_request(session, target_host, request), response);
+        EXPECT_EQ(read_reply(session, target_text(target_host)), response);
+    };
+    const std::string_view long_host = frame_limit == 18 ? std::string_view("a") : std::string_view(host);
     const auto response = frame_limit == 18 || frame_limit == 272
         ? std::string{} : udp::Sequence(frame_limit == 273 ? 128 : 3200);
-    exchange("first-response", response, reply_host);
-    if (!response.empty()) exchange("empty-response", {}, reply_host);
-    exchange("after-first-response", frame_limit == 18 ? std::string_view{} : "still-usable",
-        frame_limit == 18 ? "b" : "127.0.0.1");
-    if (frame_limit >= 272) exchange("ipv6-source", udp::Sequence(1300), "2001:db8::1234");
+    exchange(long_host, "first-response", response);
+    if (!response.empty()) exchange(long_host, "empty-response", {});
+    exchange(frame_limit == 18 ? "b" : "127.0.0.1", "after-first-response",
+        frame_limit == 18 ? std::string_view{} : "still-usable");
+    if (frame_limit >= 272) exchange("2001:db8::1234", "ipv6-target", udp::Sequence(1300));
     if (frame_limit <= 273) {
-        peer.SendDatagram(UdpWire(session, 7, 0, 1, "127.0.0.1:53", "unrepresentable-response"));
-        auto rejected = udp::Receive(next_hop);
-        Require(udp::LegacyDecrypt(rejected.payload) == request_header + "unrepresentable-response",
-            "unrepresentable reply lost its request context");
-        udp::Reply(next_hop, rejected, udp::LegacyEncrypt(SocksAddress(54321, reply_host) +
-            udp::Sequence(frame_limit == 273 ? 257 : 1)));
+        reply_from_other_source(send_request(session, long_host, "unrepresentable-response"),
+            udp::Sequence(frame_limit == 273 ? 257 : 1));
         constexpr auto sibling = session + 1;
-        peer.SendDatagram(UdpWire(sibling, 7, 0, 1, "127.0.0.1:53", "sibling-request"));
-        auto sibling_packet = udp::Receive(next_hop);
-        Require(udp::LegacyDecrypt(sibling_packet.payload) == request_header + "sibling-request",
-            "sibling request did not survive the oversized reply");
         const std::string_view sibling_host = frame_limit == 18 ? "c" : "127.0.0.1";
         const std::string_view sibling_reply = frame_limit == 18 ? "" : "sibling-usable";
-        udp::Reply(next_hop, sibling_packet,
-            udp::LegacyEncrypt(SocksAddress(54321, sibling_host) + std::string(sibling_reply)));
-        EXPECT_EQ(read_reply(sibling, std::string(sibling_host) + ":54321"), sibling_reply);
+        reply_from_other_source(send_request(sibling, sibling_host, "sibling-request"), sibling_reply);
+        EXPECT_EQ(read_reply(sibling, target_text(sibling_host)), sibling_reply);
     }
     EXPECT_FALSE(peer.Closed());
     EXPECT_EQ(server.Stop(), 0);
