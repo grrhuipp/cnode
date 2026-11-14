@@ -1,5 +1,7 @@
 #include "transport/http2_server.hpp"
 
+#include <limits>
+
 namespace transport {
 // The release signal lives in this frame and is published only while it
 // exists. ReleaseOwner sets owner_released_ before signalling, and nothing
@@ -842,7 +844,8 @@ net::awaitable<void> Http2ServerSession::RunPacketUpload(
     try {
         XHttpPacketUpSession::Upload upload(*session, *stream);
         common::MultiBuffer payload;
-        while (co_await upload.Read(payload, common::Buffer::kSize) != 0) {
+        // The HTTP/2 stream is exactly one POST body; only the session budget bounds it.
+        while (co_await upload.Read(payload, std::numeric_limits<size_t>::max()) != 0) {
         }
         if (!upload.Commit(seq, std::move(payload)))
             throw IoSystemError(io_error::no_buffer_space);

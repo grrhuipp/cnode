@@ -1035,10 +1035,18 @@ net::awaitable<size_t> XHttpPacketUpSession::Upload::Read(
     if (!first || first->IsEmpty()) {
         co_return 0;
     }
+    // `limit` is a body boundary only for a shared HTTP/1.1 connection; a
+    // logical stream carries exactly one body and cannot take bytes back.
     const size_t n = std::min<size_t>(limit, first->Len());
     if (n < first->Len()) {
         stream_.PrependReadBytes(first->Bytes().subspan(n));
         first->end = first->start + static_cast<uint32_t>(n);
+    }
+    if (n > reserved_) {
+        if (!session_.Reserve(n - reserved_)) {
+            throw IoSystemError(io_error::no_buffer_space, "xhttp payload budget exhausted");
+        }
+        reserved_ = n;
     }
     payload.push_back(std::move(first));
     co_return n;

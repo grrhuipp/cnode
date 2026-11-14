@@ -7,7 +7,7 @@ std::vector<ErrorCase> ErrorCases() {
     std::vector<ErrorCase> result;
     for (const std::string network : {"grpc", "h2", "xhttp"}) for (bool tls : {false, true}) {
         for (const std::string mode : {"backpressure", "capacity", "malformed-pseudo", "malformed-host", "initial-end", "reset-empty", "reset-long", "reset-zero", "reset-idle", "early-reset", "early-settings", "early-ping", "early-hpack"}) result.push_back({network, tls, mode});
-        if (network == "xhttp") for (const std::string mode : {"packet-reset", "packet-capacity", "packet-tiny"}) result.push_back({network, tls, mode});
+        if (network == "xhttp") for (const std::string mode : {"packet-reset", "packet-capacity", "packet-tiny", "packet-large"}) result.push_back({network, tls, mode});
     }
     return result;
 }
@@ -42,7 +42,13 @@ TEST_P(Http2ServerErrors, BoundedStreamsRecoverWithoutCorruptingSharedConnection
         return peer;
     };
     auto owner = connect_peer(); auto& peer = *owner;
-    if (mode == "packet-capacity") {
+    if (mode == "packet-large") {
+        // Xray fills each packet-up POST with maximal DATA frames: one frame
+        // larger than a Buffer cannot be handed back to the logical stream.
+        peer.Down(1, "large"); const auto payload = Pattern(16000);
+        peer.Packet(3, "large", 0, VlessRequest(target.Port(), "L") + payload); peer.Committed(3);
+        peer.Message(1, Response + payload);
+    } else if (mode == "packet-capacity") {
         peer.Down(1, "capacity"); peer.Packet(3, "capacity", 0, VlessRequest(target.Port(), "S")); peer.Message(1, Response); peer.Committed(3);
         for (uint32_t sid = 5, sequence = 1; sid < 133; sid += 2, ++sequence) peer.Packet(sid, "capacity", sequence, "q", false);
         peer.Ping("uploads!"); peer.Packet(133, "capacity", 65, "x", false); peer.Wait([&] { return peer.Has(3, 133); });
