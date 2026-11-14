@@ -242,8 +242,7 @@ void BodyEncoder::EncodeStream(std::span<const uint8_t> bytes, common::MultiBuff
         if (chunks > (std::numeric_limits<size_t>::max() - bytes.size()) / max_chunk_overhead) {
             throw std::length_error("VMess encoded stream overflow");
         }
-        common::ContiguousWriteBuffer encoded;
-        uint8_t* dst = encoded.Prepare(bytes.size() + chunks * max_chunk_overhead);
+        uint8_t* dst = out.PrepareAppend(bytes.size() + chunks * max_chunk_overhead);
         size_t written = 0;
         while (!bytes.empty()) {
             const size_t chunk_size = std::min(bytes.size(), stream_chunk_size_);
@@ -251,7 +250,7 @@ void BodyEncoder::EncodeStream(std::span<const uint8_t> bytes, common::MultiBuff
                 bytes.first(chunk_size), length_size, cipher_.NextPaddingSize(), dst + written);
             bytes = bytes.subspan(chunk_size);
         }
-        encoded.AppendTo(written, out);
+        out.CommitAppend(written);
     } catch (...) {
         Abort();
         throw;
@@ -426,9 +425,8 @@ void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, common::MultiBuffe
     const size_t length_size = cipher_.LengthSize();
     const size_t capacity = length_size + bytes.size() + cipher_.Overhead() + padding;
 
-    common::ContiguousWriteBuffer encoded;
-    uint8_t* dst = encoded.Prepare(capacity);
-    encoded.AppendTo(SealChunkTo(bytes, length_size, padding, dst), out);
+    uint8_t* dst = out.PrepareAppend(capacity);
+    out.CommitAppend(SealChunkTo(bytes, length_size, padding, dst));
 } catch (...) {
     Abort();
     throw;

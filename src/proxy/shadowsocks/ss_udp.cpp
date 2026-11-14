@@ -1259,25 +1259,20 @@ common::MultiBuffer proxy::UdpResponse::Encode(UDPPacketView packet) {
         return {};
     }
 
-    common::ContiguousWriteBuffer encoded;
-    uint8_t* dst = encoded.TryPrepare(encoded_len);
-    if (!dst) {
+    common::BufferGuard encoded{common::Buffer::New(encoded_len)};
+    if (!encoded) {
         return {};
     }
     const size_t written = EncodePacketWithAddrSize(
         packet.target,
         addr_size,
         packet.data,
-        dst,
+        encoded->Tail().data(),
         encoded_len);
     if (written != encoded_len) {
         return {};
     }
-
-    common::MultiBuffer payload;
-    if (!encoded.TryAppendTo(written, payload)) {
-        return {};
-    }
-    return payload;
+    encoded->Produce(written);
+    return common::MultiBuffer{std::move(encoded)};
 }
 }  // namespace proxy

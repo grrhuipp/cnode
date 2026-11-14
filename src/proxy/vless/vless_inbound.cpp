@@ -257,6 +257,7 @@ CompleteVlessInboundHandshake(
         co_return tl::unexpected(parsed_request.error());
     }
     auto& request = *parsed_request;
+    common::ScopedCleanse cleanse_request_uuid{request.uuid};
     const auto credential = co_await authentication.VerifyCredential({proxy::KeyedInboundProtocol::Vless, request.uuid});
     if (credential != common::ErrorCode::OK) co_return tl::unexpected(credential);
     auto user_info = app::UserStore::FindVlessUser(tag, request.uuid);
@@ -328,7 +329,7 @@ CompleteVlessInboundHandshake(
         .net = net,
         .packet_addr_udp = packet_addr_udp,
         .use_vision = use_vision,
-        .request_uuid = request.uuid,
+        .request_uuid = use_vision ? request.uuid : std::array<uint8_t, 16>{},
         .active = {active_reader, active_writer},
     };
 }
@@ -408,7 +409,7 @@ net::awaitable<app::RelayResult> DispatchVlessSession(
     proxy::BufferedStreamReader& active_reader,
     transport::MultiBufferWriter& response_writer,
     VlessSessionMeta meta,
-    std::array<uint8_t, 16> request_uuid,
+    const std::array<uint8_t, 16>& request_uuid,
     routing::Dispatcher& dispatcher,
     const app::ReceiverSettings& receiver,
     net::io_context& io_context,
@@ -417,7 +418,6 @@ net::awaitable<app::RelayResult> DispatchVlessSession(
     const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
     if (meta.net == common::Network::MUX) {
-        OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
         return proxy::ServeMuxInbound(
             io_context,
             transport::Link{&active_reader, &response_writer},
@@ -431,7 +431,6 @@ net::awaitable<app::RelayResult> DispatchVlessSession(
             pressure_idle_timeout);
     }
     if (meta.net == common::Network::UDP) {
-        OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
         return DispatchVlessUdp(
             std::move(stream),
             active_reader,
@@ -457,7 +456,6 @@ net::awaitable<app::RelayResult> DispatchVlessSession(
             environment,
             timeouts);
     }
-    OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
     return dispatcher.Dispatch(
         io_context,
         receiver.dispatch_policy,
@@ -550,6 +548,7 @@ proxy::VlessInboundHandler::ProcessPlain(
     common::UserOnlineSessionGuard user_session;
     VlessSessionMeta meta;
     std::array<uint8_t, 16> request_uuid{};
+    common::ScopedCleanse cleanse_uuid{request_uuid};
     {
         auto handshake = co_await CompleteVlessInboundHandshake(
             *stream,
@@ -571,18 +570,16 @@ proxy::VlessInboundHandler::ProcessPlain(
         };
         if (meta.use_vision) {
             request_uuid = handshake->request_uuid;
+            OPENSSL_cleanse(handshake->request_uuid.data(), handshake->request_uuid.size());
         }
-        OPENSSL_cleanse(handshake->request_uuid.data(), handshake->request_uuid.size());
     }
     VlessResponseHeaderWriter response_writer(*stream);
-    const auto uuid = request_uuid;
-    OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
     co_return co_await DispatchVlessSession(
         std::move(stream),
         protocol_reader,
         response_writer,
         meta,
-        uuid,
+        request_uuid,
         dispatcher,
         receiver,
         io_context,
@@ -610,6 +607,7 @@ proxy::VlessInboundHandler::ProcessEncrypted(
     common::UserOnlineSessionGuard user_session;
     VlessSessionMeta meta;
     std::array<uint8_t, 16> request_uuid{};
+    common::ScopedCleanse cleanse_uuid{request_uuid};
     {
         auto handshake = co_await CompleteVlessInboundHandshake(
             *stream,
@@ -633,18 +631,16 @@ proxy::VlessInboundHandler::ProcessEncrypted(
         };
         if (meta.use_vision) {
             request_uuid = handshake->request_uuid;
+            OPENSSL_cleanse(handshake->request_uuid.data(), handshake->request_uuid.size());
         }
-        OPENSSL_cleanse(handshake->request_uuid.data(), handshake->request_uuid.size());
     }
     VlessResponseHeaderWriter response_writer(*active_writer);
-    const auto uuid = request_uuid;
-    OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
     co_return co_await DispatchVlessSession(
         std::move(stream),
         *active_reader,
         response_writer,
         meta,
-        uuid,
+        request_uuid,
         dispatcher,
         receiver,
         io_context,

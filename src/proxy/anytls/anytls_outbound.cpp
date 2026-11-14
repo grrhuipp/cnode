@@ -302,13 +302,6 @@ struct AnyTlsOutboundHandler::ClientSession {
         }
     }
 
-    // 填充分支把方案内的记录借给跨挂起点的写协程，读循环可能同时替换 scheme_，
-    // 因此只在该包有填充记录时持有快照；无填充分支在调用内同步消费方案。
-    std::shared_ptr<const AnyTlsPaddingScheme> SchemeGuardFor(uint32_t packet_index) const noexcept {
-        if (scheme_->RecordFor(packet_index).empty()) return {};
-        return scheme_;
-    }
-
     net::awaitable<tl::expected<void, common::ErrorCode>>
     WriteOpenPacket(std::span<const uint8_t> packet) {
         auto write_lease = write_gate.TryAcquire();

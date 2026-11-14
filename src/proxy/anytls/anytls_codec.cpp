@@ -168,28 +168,58 @@ tl::expected<void, common::ErrorCode> FrameBatch::Encode(
     return {};
 }
 
+namespace {
+
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteSlicesWithPadding(transport::AsyncStream& stream,
+                       std::span<const PaddingRecord> record_rules,
+                       std::span<const net::const_buffer> buffers);
+
+template <typename Payload>
+net::awaitable<tl::expected<void, common::ErrorCode>>
+WriteEncodedFrameBatch(transport::AsyncStream& stream,
+                       std::span<const PaddingRecord> records,
+                       uint8_t cmd,
+                       uint32_t sid,
+                       Payload payload) {
+    constexpr bool kOwnsMultiBuffer = std::is_same_v<Payload, common::MultiBuffer>;
+    struct ClearGuard {
+        Payload& p;
+        ~ClearGuard() noexcept {
+            if constexpr (kOwnsMultiBuffer) {
+                p.clear();
+            }
+        }
+    } clear_guard{payload};
+
+    FrameBatch batch;
+    auto encoded = batch.Encode(cmd, sid, payload);
+    if (!encoded) {
+        co_return encoded;
+    }
+    const auto framed = batch.Buffers();
+    if (framed.empty()) {
+        co_return tl::expected<void, common::ErrorCode>{};
+    }
+    if (records.empty()) {
+        try {
+            co_await stream.WriteBuffers(framed);
+        } catch (const IoSystemError& e) {
+            co_return tl::unexpected(common::MapAsioError(e.code()));
+        }
+        co_return tl::expected<void, common::ErrorCode>{};
+    }
+    co_return co_await WriteSlicesWithPadding(stream, records, framed);
+}
+
+}  // namespace
+
 net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteMultiBufferAsFrameBatch(transport::AsyncStream& stream,
                              uint8_t cmd,
                              uint32_t sid,
                              common::MultiBuffer mb) {
-    FrameBatch batch;
-    auto encoded = batch.Encode(cmd, sid, mb);
-    if (!encoded) {
-        mb.clear();
-        co_return encoded;
-    }
-    const auto buffers = batch.Buffers();
-    if (!buffers.empty()) {
-        try {
-            co_await stream.WriteBuffers(buffers);
-        } catch (const IoSystemError& e) {
-            mb.clear();
-            co_return tl::unexpected(common::MapAsioError(e.code()));
-        }
-    }
-    mb.clear();
-    co_return tl::expected<void, common::ErrorCode>{};
+    return WriteEncodedFrameBatch(stream, {}, cmd, sid, std::move(mb));
 }
 
 net::awaitable<tl::expected<void, common::ErrorCode>>
@@ -197,20 +227,7 @@ WriteBuffersAsFrameBatch(transport::AsyncStream& stream,
                          uint8_t cmd,
                          uint32_t sid,
                          std::span<const net::const_buffer> buffers) {
-    FrameBatch batch;
-    auto encoded = batch.Encode(cmd, sid, buffers);
-    if (!encoded) {
-        co_return encoded;
-    }
-    const auto framed = batch.Buffers();
-    if (!framed.empty()) {
-        try {
-            co_await stream.WriteBuffers(framed);
-        } catch (const IoSystemError& e) {
-            co_return tl::unexpected(common::MapAsioError(e.code()));
-        }
-    }
-    co_return tl::expected<void, common::ErrorCode>{};
+    return WriteEncodedFrameBatch(stream, {}, cmd, sid, buffers);
 }
 
 tl::expected<PeerSettings, common::ErrorCode> ParsePeerSettings(std::string_view text) {
@@ -283,16 +300,14 @@ tl::expected<void, common::ErrorCode> OpenPacketBuffer::AppendFrame(
 
 net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteAll(transport::AsyncStream& stream, std::span<const uint8_t> data) {
-    while (!data.empty()) {
-        try {
-            const auto n = co_await stream.AsyncWrite(net::buffer(data.data(), data.size()));
-            if (n == 0) {
-                co_return tl::unexpected(common::ErrorCode::SOCKET_WRITE_FAILED);
-            }
-            data = data.subspan(n);
-        } catch (const IoSystemError& e) {
-            co_return tl::unexpected(common::MapAsioError(e.code()));
-        }
+    if (data.empty()) {
+        co_return tl::expected<void, common::ErrorCode>{};
+    }
+    const net::const_buffer buffer(data.data(), data.size());
+    try {
+        co_await stream.WriteBuffers(std::span<const net::const_buffer>(&buffer, 1));
+    } catch (const IoSystemError& e) {
+        co_return tl::unexpected(common::MapAsioError(e.code()));
     }
     co_return tl::expected<void, common::ErrorCode>{};
 }
@@ -316,7 +331,9 @@ WriteFrame(transport::AsyncStream& stream, uint8_t cmd, uint32_t sid, std::span<
     co_return tl::expected<void, common::ErrorCode>{};
 }
 
-static net::awaitable<tl::expected<void, common::ErrorCode>>
+namespace {
+
+net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteSlicesWithPadding(transport::AsyncStream& stream,
                        std::span<const PaddingRecord> record_rules,
                        std::span<const net::const_buffer> buffers) {
@@ -415,6 +432,8 @@ WriteSlicesWithPadding(transport::AsyncStream& stream,
     co_return tl::expected<void, common::ErrorCode>{};
 }
 
+}  // namespace
+
 net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteAnyTlsPacketWithPadding(transport::AsyncStream& stream,
                              std::span<const PaddingRecord> record_rules,
@@ -435,23 +454,6 @@ WriteAnyTlsPacketWithPadding(transport::AsyncStream& stream,
         stream, record_rules, std::span<const net::const_buffer>(&single, 1));
 }
 
-static net::awaitable<tl::expected<void, common::ErrorCode>>
-WritePaddedMultiBufferFrames(transport::AsyncStream& stream,
-                             std::span<const PaddingRecord> records,
-                             uint8_t cmd,
-                             uint32_t sid,
-                             common::MultiBuffer mb) {
-    FrameBatch batch;
-    auto encoded = batch.Encode(cmd, sid, mb);
-    if (!encoded) {
-        mb.clear();
-        co_return encoded;
-    }
-    auto res = co_await WriteSlicesWithPadding(stream, records, batch.Buffers());
-    mb.clear();
-    co_return res;
-}
-
 net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteAnyTlsMultiBufferAsFramesWithPadding(transport::AsyncStream& stream,
                                     const AnyTlsPaddingScheme& scheme,
@@ -459,25 +461,8 @@ WriteAnyTlsMultiBufferAsFramesWithPadding(transport::AsyncStream& stream,
                                     uint8_t cmd,
                                     uint32_t sid,
                                     common::MultiBuffer mb) {
-    const auto records = scheme.RecordFor(packet_index);
-    if (records.empty()) {
-        return WriteMultiBufferAsFrameBatch(stream, cmd, sid, std::move(mb));
-    }
-    return WritePaddedMultiBufferFrames(stream, records, cmd, sid, std::move(mb));
-}
-
-static net::awaitable<tl::expected<void, common::ErrorCode>>
-WritePaddedBufferFrames(transport::AsyncStream& stream,
-                        std::span<const PaddingRecord> records,
-                        uint8_t cmd,
-                        uint32_t sid,
-                        std::span<const net::const_buffer> buffers) {
-    FrameBatch batch;
-    auto encoded = batch.Encode(cmd, sid, buffers);
-    if (!encoded) {
-        co_return encoded;
-    }
-    co_return co_await WriteSlicesWithPadding(stream, records, batch.Buffers());
+    return WriteEncodedFrameBatch(
+        stream, scheme.RecordFor(packet_index), cmd, sid, std::move(mb));
 }
 
 net::awaitable<tl::expected<void, common::ErrorCode>>
@@ -487,11 +472,8 @@ WriteAnyTlsBuffersAsFramesWithPadding(transport::AsyncStream& stream,
                                 uint8_t cmd,
                                 uint32_t sid,
                                 std::span<const net::const_buffer> buffers) {
-    const auto records = scheme.RecordFor(packet_index);
-    if (records.empty()) {
-        return WriteBuffersAsFrameBatch(stream, cmd, sid, buffers);
-    }
-    return WritePaddedBufferFrames(stream, records, cmd, sid, buffers);
+    return WriteEncodedFrameBatch(
+        stream, scheme.RecordFor(packet_index), cmd, sid, buffers);
 }
 
 net::awaitable<tl::expected<AnyTlsFrameHeader, common::ErrorCode>>
