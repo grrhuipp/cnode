@@ -262,10 +262,10 @@ geosite.dat
 - WebSocket 与 HTTPUpgrade 入站按 URL 路径精确匹配配置（包括 `/`），查询字符串不参与路径匹配；Host 比较前去除首尾空白。
 - TLS 证书可写 `tlsSettings.certificates[].certificateFile`/`keyFile`，或 `tlsSettings.certFile`/`keyFile`；这些文件、`tlsSettings.caFile` 与面板 `tlsCert`/`tlsKey` 在加载配置时读入，文件缺失、为空或超过 1 MiB 时拒绝加载；证书更新需重新加载配置。autosign 只为配置的名称签发证书并在到期前自动更新。
 - XHTTP `mode` 只接受 `auto`（或省略）、`packet-up`、`stream-up`、`stream-one`。
-- REALITY 服务端支持 `dest`、`xver`（0/1/2）、`serverNames`、`shortIds`、`privateKey`、`minClientVer`、`maxClientVer`、`maxTimeDiff`、`mldsa65Seed`；客户端支持 `serverName`、`publicKey`、`shortId`、`fingerprint`（`chrome`/`firefox`/`safari`/`ios`/`android`/`edge`/`360`/`qq`/`random`）、`spiderX`、`mldsa65Verify`。`show`、`type`、`masterKeyLog` 会被拒绝。未认证连接透明回落到 `dest`，使用 `timeouts.dial`、`connIdle`、`write`、`uplinkOnly`、`downlinkOnly`。V2Board `tls=2` 节点自动同步为 REALITY。
-- 出站 `settings` 的每层对象均拒绝未知键。Trojan/Shadowsocks 可用扁平服务器字段或单元素 `servers` 数组；VLESS/VMess 可用扁平字段或单元素 `vnext` 数组及其中的单元素 `users` 数组，不能混用两种结构。
+- REALITY 服务端支持 `dest`、`xver`（0/1/2）、`serverNames`、`shortIds`、`privateKey`、`minClientVer`、`maxClientVer`、`maxTimeDiff`、`mldsa65Seed`；客户端支持 `serverName`、`publicKey`、`shortId`、`fingerprint`（`chrome`/`firefox`/`safari`/`ios`/`android`/`edge`/`360`/`qq`/`random`）、`spiderX`、`mldsa65Verify`。`show`、`type`、`masterKeyLog` 等其他字段不生效，按未知字段忽略。未认证连接透明回落到 `dest`，使用 `timeouts.dial`、`connIdle`、`write`、`uplinkOnly`、`downlinkOnly`。V2Board `tls=2` 节点自动同步为 REALITY。
+- 出站 `settings` 各层对象中的未知键按配置总则忽略。Trojan/Shadowsocks 可用扁平服务器字段或单元素 `servers` 数组；VLESS/VMess 可用扁平字段或单元素 `vnext` 数组及其中的单元素 `users` 数组；使用嵌套结构时只读取嵌套对象，同层扁平字段不作回退。
 - Trojan 出站 `serverName` 与 `tlsSettings.serverName` 使用相同取值规则：非空时必须是 IP 或 DNS 主机名，不能填写端口或路径。非法值在配置加载时拒绝，`allowInsecure` 不跳过名称校验。
-- VLESS 出站身份字段为 `id`，支持 UUID 或 1–30 字节自定义 ID，并按 [Xray 的 UUIDv5 映射](https://xtls.github.io/config/outbounds/vless.html#outboundconfigurationobject)处理。Vision flow 要求 TCP 搭配 TLS、REALITY 或 VLESS Encryption。`packetEncoding` 接受 `none`、`packetaddr`、`xudp`（默认）；[PacketAddr 与 XUDP](https://sing-box.sagernet.org/configuration/outbound/vless/#packet_encoding)分别对应 V2Ray 5+ 与 Xray 的 UDP 封装。
+- VLESS 出站身份字段为 `id`，支持 UUID 或 1–30 字节自定义 ID，并按 [Xray 的 UUIDv5 映射](https://xtls.github.io/config/outbounds/vless.html#outboundconfigurationobject)处理。Vision flow 要求 TCP 搭配 TLS、REALITY 或 VLESS Encryption；与 Xray 一致，Vision 下的 UDP 一律以 XUDP 承载，默认拒绝 UDP/443，`xtls-rprx-vision-udp443` 仅放开该限制。`packetEncoding` 接受 `none`、`packetaddr`、`xudp`（默认）；[PacketAddr 与 XUDP](https://sing-box.sagernet.org/configuration/outbound/vless/#packet_encoding)分别对应 V2Ray 5+ 与 Xray 的 UDP 封装。
 - VMess 出站 `security` 接受 `auto`、`aes-128-gcm`、`chacha20-poly1305`、`none`、`zero`；`alterId` 仅接受 `0`。Shadowsocks 与 Trojan 的凭据字段为 `password`。
 - Shadowsocks 出站省略 `method` 时使用 `aes-256-gcm`；SS2022 每段 PSK 必须符合方法密钥长度，身份链只支持 AES 方法。`"uot": true` 开启 UoT（默认 v2），`"uotVersion": 1` 选择 v1，也可写 `"uot": {"enabled": true, "version": 2}`。Shadowsocks 与 AnyTLS 入站自动识别 UoT v1/v2。
 - AnyTLS 出站：`idleSessionCheckInterval` 默认 30 秒，`idleSessionTimeout` 默认 60 秒，`minIdleSession` 默认 0。AnyTLS 入站通过 `settings.clients` 与 `settings.paddingScheme` 配置，padding 方案归一化后最多 65,535 字节，无效方案拒绝加载。
@@ -291,7 +291,7 @@ geosite.dat
 ```
 
 - IPBan 按入站标签和 PROXY protocol 提供的非空客户端 IP 计数；直连 socket IP、HTTP 转发头不参与。启用后在传输握手前拒绝已封禁 IP，不踢掉已有连接。三个数值字段均为正整数，即使关闭也拒绝非法值。
-- **失败凭据限制固定开启，不可配置**：同一入站、同一认证信息跨 IP 累计，60 秒内 10 次失败后拒绝 180 秒。支持 VLESS、Trojan、AnyTLS 和 Hysteria v1/v2；VMess、Shadowsocks 只使用可选 IPBan。配置 `limits.credentialBan` 会报错。
+- **失败凭据限制固定开启，不可配置**：同一入站、同一认证信息跨 IP 累计，60 秒内 10 次失败后拒绝 180 秒。支持 VLESS、Trojan、AnyTLS 和 Hysteria v1/v2；VMess、Shadowsocks 只使用可选 IPBan。`limits.credentialBan` 不是配置项，按未知字段忽略。
 - 计数在所有 Worker 间共享，仅保存在内存，重启清空；认证成功不清零，封禁期间不续期。每种规则最多跟踪 16,384 个键，满时拒绝未知键。凭据原文不写入日志。
 
 ## 资源上限与运行语义
@@ -302,7 +302,7 @@ geosite.dat
 - 限速：每个转发方向按 bytes/s 独立限速，初始额度一秒流量，空闲最多积累两秒。
 - TCP keepalive：空闲 60 秒后开始探测，间隔 10 秒，共 6 次。
 - 嗅探：TCP 复制至多 4 KiB 前缀；UDP QUIC 嗅探总窗口 200 ms、最多 64 个数据报、累计 64 KiB。
-- HTTP/2（gRPC、h2、XHTTP 服务端）：每连接最多 256 个并发流，超额 REFUSED_STREAM；流窗口 4 MiB、连接窗口 8 MiB。gRPC 单条消息正文最多 4 MiB。
+- HTTP/2（gRPC、h2、XHTTP 服务端）：每连接最多 256 个并发流，超额 REFUSED_STREAM；已关闭流仍在收尾的请求另计，每连接最多 1024 个；流窗口 4 MiB、连接窗口 8 MiB。gRPC 单条消息正文最多 4 MiB。
 - 面板 HTTP：每行最多 64 KiB，响应头（含临时响应及 trailer）累计最多 256 KiB，解码后响应体最多 64 MiB；这些预算不扩大普通代理传输的限制。
 - XHTTP：每个 session 排队数据与并发上传共用 4 MiB 预算，最多 1024 个排队包、64 个在途上传。
 - Mux：每连接最多 1,024 个子会话；未转发客户端数据共享 4 MiB 预算，降至 2 MiB 后恢复读取（与 Xray 相同的队头阻塞语义）。
