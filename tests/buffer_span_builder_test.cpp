@@ -115,6 +115,17 @@ TEST(BufferSpanBuilder, AppendingExternalBuffersPreservesOrderAndSkipsEmptyViews
     for (const auto& buffer : builder.Span()) EXPECT_EQ(buffer.size(), 1u);
 }
 
+// A Vision frame list for a 64 KiB write appends dozens of descriptors one at
+// a time; spilled storage must grow geometrically, not on every append.
+TEST(BufferSpanBuilder, ManySingleAppendsAfterSpillPreserveOrder) {
+    std::string text(256, '\0');
+    for (size_t i = 0; i != text.size(); ++i) text[i] = static_cast<char>(i);
+    ::common::ConstBufferSpanBuilder<3> builder;
+    for (size_t i = 0; i != text.size(); ++i) builder.Append(::net::buffer(text.data() + i, 1));
+    ASSERT_EQ(builder.size(), text.size());
+    EXPECT_EQ(Flatten(builder.Span()), text);
+}
+
 TEST(BufferSpanBuilder, FailedSpillPreservesBorrowedDescriptorsAndCanRetry) {
     const std::string text = "abc";
     for (const bool already_spilled : {false, true}) {

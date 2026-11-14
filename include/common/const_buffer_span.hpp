@@ -93,6 +93,8 @@ private:
     }
 
     void EnsureSpillCapacity(size_t additional) {
+        // Amortized geometric growth: only a full spill reallocates.
+        if (spill_ && additional <= spill_->capacity() - spill_->size()) return;
         CheckTestAllocationFault();
         const bool preparing = !spill_;
         if (preparing) spill_.emplace();
