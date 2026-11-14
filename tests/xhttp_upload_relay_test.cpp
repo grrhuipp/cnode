@@ -30,16 +30,16 @@ struct WorkerPair {
 
     WorkerPair() {
         const std::array<net::io_context*, 2> workers{&session_io, &upload_io};
-        InstallXHttpUploadRelay(workers);
+        common::InstallWorkerMesh<XHttpUploadRelay>(workers);
     }
     ~WorkerPair() {
-        StopXHttpUploadRelay(session_io);
-        StopXHttpUploadRelay(upload_io);
+        common::StopWorkerMesh<XHttpUploadRelay>(session_io);
+        common::StopWorkerMesh<XHttpUploadRelay>(upload_io);
         Poll();
     }
 
-    XHttpUploadRelay& SessionRelay() { return *FindXHttpUploadRelay(session_io); }
-    XHttpUploadRelay& UploadRelay() { return *FindXHttpUploadRelay(upload_io); }
+    XHttpUploadRelay& SessionRelay() { return *common::FindWorkerMesh<XHttpUploadRelay>(session_io); }
+    XHttpUploadRelay& UploadRelay() { return *common::FindWorkerMesh<XHttpUploadRelay>(upload_io); }
     // Relay index of the session Worker, as seen from the upload Worker.
     size_t SessionEndpoint() { return *UploadRelay().EndpointOf(session_io); }
 

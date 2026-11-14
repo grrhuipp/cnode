@@ -123,10 +123,12 @@ set(CNODE_CORE_SOURCES
     src/app/relay.cpp
     src/app/inbound_handler.cpp
     src/app/udp_ingress.cpp
+    src/app/udp_session_relay.cpp
     src/app/user_store.cpp
     src/app/outbound_handler.cpp
     src/app/worker.cpp
     src/app/group_coordinator.cpp
+    src/app/session_owner_directory.cpp
     src/app/prepared_inbound.cpp
     src/app/bootstrap.cpp
     src/app/router.cpp
@@ -136,6 +138,7 @@ set(CNODE_CORE_SOURCES
 
     # Proxy
     src/proxy/mux/mux_server.cpp
+    src/proxy/mux/xudp.cpp
     src/proxy/vmess/vmess_crypto.cpp
     src/proxy/vmess/body.cpp
     src/proxy/vmess/vmess_inbound.cpp

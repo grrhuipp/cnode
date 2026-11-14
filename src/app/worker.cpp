@@ -14,6 +14,8 @@
 #include "infra/log.hpp"
 #include "app/user_store.hpp"
 #include "app/udp_ingress.hpp"
+#include "app/udp_session_relay.hpp"
+#include "proxy/mux/xudp.hpp"
 #include "app/dns.hpp"
 #include "transport/datagram_socket.hpp"
 #include "transport/tcp_stream.hpp"
@@ -467,6 +469,8 @@ net::awaitable<void> Worker::DrainRuntimeTask() {
         IoErrorCode ec;
         co_await listeners.changed.async_wait(net::redirect_error(net::use_awaitable, ec));
     }
+    // XUDP flows outlive the connections that started them.
+    co_await proxy::JoinXudpSessions(io_context_);
 }
 
 net::awaitable<void> Worker::AsyncDrain() {
@@ -502,6 +506,7 @@ void Worker::BeginStopOnWorker() noexcept {
         if (task->stream) task->stream->Cancel();
         task->signal.emit(net::cancellation_type::all);
     }
+    proxy::StopXudpSessions(io_context_);
 }
 
 net::awaitable<void> Worker::StopRuntimeTask() {
@@ -522,8 +527,11 @@ net::awaitable<void> Worker::StopRuntimeTask() {
         runtime_->outbound_tasks->Tasks().Cancel();
         co_await runtime_->outbound_tasks->AsyncJoin();
     }
-    // Every connection of this Worker has ended; its relay endpoint stops.
-    transport::StopXHttpUploadRelay(io_context_);
+    // Every connection and listener of this Worker has ended; its relay
+    // endpoints stop.
+    common::StopWorkerMesh<transport::XHttpUploadRelay>(io_context_);
+    common::StopWorkerMesh<UdpSessionRelay>(io_context_);
+    common::StopWorkerMesh<proxy::XudpRelay>(io_context_);
     co_await transport::JoinXHttpClientTasks(io_context_);
     co_await transport::TimeoutScheduler::AsyncReleaseForIoContext(io_context_);
     runtime_.reset();

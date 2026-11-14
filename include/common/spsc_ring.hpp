@@ -1,9 +1,8 @@
 #pragma once
 
-#include <array>
 #include <atomic>
 #include <cstddef>
-#include <new>
+#include <cstring>
 #include <type_traits>
 
 namespace common {
@@ -14,7 +13,8 @@ namespace common {
 // its own cache line and rereads it only when the ring looks full or empty.
 // A slot is published by the release store of tail_ and acquired by the
 // consumer's acquire load; it is handed back by the release store of head_.
-// Indexes grow monotonically, so there is no ABA and no CAS.
+// Indexes grow monotonically, so there is no ABA and no CAS. Slots are raw
+// storage written only by TryPush: pages of an unused ring stay untouched.
 template <typename T, size_t Capacity>
     requires std::is_trivially_copyable_v<T> && (Capacity >= 2) &&
              ((Capacity & (Capacity - 1)) == 0)
@@ -26,7 +26,7 @@ public:
             producer_.cached_head = consumer_.head.load(std::memory_order_acquire);
             if (tail - producer_.cached_head == Capacity) return false;
         }
-        slots_[tail & (Capacity - 1)] = value;
+        std::memcpy(Slot(tail), &value, sizeof(T));
         producer_.tail.store(tail + 1, std::memory_order_release);
         return true;
     }
@@ -37,7 +37,7 @@ public:
             consumer_.cached_tail = producer_.tail.load(std::memory_order_acquire);
             if (head == consumer_.cached_tail) return false;
         }
-        value = slots_[head & (Capacity - 1)];
+        std::memcpy(&value, Slot(head), sizeof(T));
         consumer_.head.store(head + 1, std::memory_order_release);
         return true;
     }
@@ -66,9 +66,13 @@ private:
         size_t cached_tail = 0;
     };
 
+    [[nodiscard]] std::byte* Slot(size_t index) noexcept {
+        return slots_ + (index & (Capacity - 1)) * sizeof(T);
+    }
+
     ProducerSide producer_;
     ConsumerSide consumer_;
-    alignas(kLine) std::array<T, Capacity> slots_{};
+    alignas(kLine) alignas(T) std::byte slots_[Capacity * sizeof(T)];
 };
 
 }  // namespace common

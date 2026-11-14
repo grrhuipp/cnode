@@ -65,6 +65,9 @@ struct FrameHeader {
 
     std::optional<ForwardedMetadata> forwarded;
 
+    // XUDP Global ID of a UDP NEW frame; an all-zero ID reads as absent.
+    std::optional<std::array<uint8_t, 8>> global_id;
+
     // 载荷
     bool     has_data  = false;
     uint16_t data_len  = 0;

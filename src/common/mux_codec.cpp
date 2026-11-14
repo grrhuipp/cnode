@@ -3,6 +3,7 @@
 #include "common/multi_buffer.hpp"
 #include "common/byte_reader.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <utility>
 namespace common {
@@ -73,9 +74,14 @@ constexpr size_t kMaxFrameMetadataBytes = 4 + 1 + kMaxEncodedAddressSize + 8;
 
         if (out.status == SessionStatus::NEW &&
             out.network == NetworkType::UDP && meta.Remaining() == 8) {
-            if (!meta.Skip(8)) {
+            const auto bytes = meta.ReadBytes(8);
+            if (bytes.size() != 8) {
                 return false;
             }
+            std::array<uint8_t, 8> global_id{};
+            std::copy(bytes.begin(), bytes.end(), global_id.begin());
+            // Xray common/mux: "MUST ignore empty Global ID".
+            if (global_id != std::array<uint8_t, 8>{}) out.global_id = global_id;
         }
     }
 

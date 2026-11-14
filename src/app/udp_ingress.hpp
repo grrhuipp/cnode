@@ -1,6 +1,7 @@
 #pragma once
 
 #include "app/inbound_handler.hpp"
+#include "app/session_owner_directory.hpp"
 #include "common/allocator.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/error.hpp"
@@ -45,6 +46,7 @@ namespace app {
 struct ReceiverSettings;
 
 class UdpIngress;
+class UdpSessionRelay;
 struct UdpSocketState;
 using UdpSocketStatePtr = std::shared_ptr<UdpSocketState>;
 
@@ -315,6 +317,8 @@ public:
         const UdpHandoffIdentity& key,
         std::shared_ptr<const PreparedInboundSettings> configuration,
         const proxy::InboundDatagramAssociationPolicy& policy);
+    // The record of `key`, if any; never creates one.
+    [[nodiscard]] UdpHandoffRecord* Find(const UdpHandoffIdentity& key) const noexcept;
 private:
     std::unordered_map<UdpHandoffIdentity, std::shared_ptr<UdpHandoffRecord>,
                        UdpHandoffIdentityHash> records_;
@@ -391,6 +395,14 @@ public:
 
     void ProcessDatagram(const UdpDatagramContext& datagram);
 
+    // ---- Sessions shared across Workers (UdpSessionRelay) -----------------
+    // A datagram that another Worker received for a session this Worker runs.
+    void ReceiveRelayedDatagram(uint32_t from, uint64_t token, uint64_t packet_id,
+                                const udp::endpoint& client,
+                                common::MultiBuffer payload) noexcept;
+    // Session `token` of `owner` ended: stop forwarding to it.
+    void ForgetRemoteRoute(uint32_t owner, uint64_t token) noexcept;
+
     [[nodiscard]] ReplyEnqueueResult EnqueueReply(
         const SocketStatePtr& socket,
         udp::endpoint endpoint,
@@ -440,6 +452,25 @@ private:
         proxy::InboundDatagramResult decoded,
         std::chrono::steady_clock::time_point now,
         std::shared_ptr<UdpHandoffRecord> record = {});
+
+    // A datagram of a replay-protected protocol session, run by this Worker.
+    void DeliverSessionDatagram(const UdpDatagramContext& datagram,
+        const UdpHandoffIdentity& identity, proxy::InboundDatagramResult decoded,
+        std::chrono::steady_clock::time_point now);
+    // With other Workers present: forwards a datagram of a session another
+    // Worker runs, or queues it while the directory decides who runs it.
+    // False when this Worker runs the session.
+    [[nodiscard]] bool RouteSessionDatagram(const UdpDatagramContext& datagram,
+        const UdpHandoffIdentity& identity, proxy::InboundDatagramResult& decoded);
+    struct PendingSessionClaim;
+    void StartSessionClaim(const UdpDatagramContext& datagram,
+        const UdpHandoffIdentity& identity, proxy::InboundDatagramResult& decoded);
+    net::awaitable<void> RunSessionClaim(UdpHandoffIdentity identity,
+        SessionOwnerKey key, uint64_t token, GroupCoordinator& coordinator);
+    void ResolveSessionClaim(const UdpHandoffIdentity& identity, SessionClaim claim);
+    void AddRemoteRoute(const UdpHandoffIdentity& identity, SessionOwner owner);
+    void EraseRemoteRoutes(const SocketState& socket) noexcept;
+    void ReleaseOwnedSession(ClientSession& session) noexcept;
     void RegisterNativeJob(const ClientSessionPtr& session);
     void DetachNativeJob(ClientSession& session) noexcept;
     static net::awaitable<void> SendUdpReplies(
@@ -447,6 +478,9 @@ private:
     friend struct UdpSocketState;
     enum class State : uint8_t { Running, Stopping, Drained };
 
+    [[nodiscard]] bool Busy() const noexcept {
+        return outstanding_jobs_ != 0 || reply_senders_ != 0 || session_claims_ != 0;
+    }
     void NotifyCompletion() noexcept;
     void Link(UdpClientSession& row, SocketState& socket,
               const ClientSessionKey& client_key, std::chrono::seconds idle_timeout) noexcept;
@@ -464,6 +498,30 @@ private:
     net::io_context& io_context_;
     common::SignalChannel completion_signal_;
     UdpHandoffDirectory handoff_directory_;
+    // Null with a single Worker: every session then runs where it arrives.
+    UdpSessionRelay* relay_ = nullptr;
+    struct RemoteRoute {
+        SessionOwner owner;
+    };
+    struct RouteKeyHash {
+        [[nodiscard]] size_t operator()(const std::pair<uint32_t, uint64_t>& key) const noexcept {
+            return static_cast<size_t>(common::Mix64(key.second ^ (uint64_t{key.first} << 56)));
+        }
+    };
+    // Sessions other Workers run, with the reverse index their Gone uses.
+    std::unordered_map<UdpHandoffIdentity, RemoteRoute, UdpHandoffIdentityHash> remote_routes_;
+    std::unordered_map<std::pair<uint32_t, uint64_t>, UdpHandoffIdentity, RouteKeyHash>
+        remote_route_keys_;
+    std::unordered_map<UdpHandoffIdentity, std::unique_ptr<PendingSessionClaim>,
+                       UdpHandoffIdentityHash> pending_claims_;
+    // Tokens naming this Worker's sessions: a claim still pending, or the
+    // session it started.
+    struct OwnedToken {
+        PendingSessionClaim* pending = nullptr;
+        std::weak_ptr<ClientSession> session;
+    };
+    std::unordered_map<uint64_t, OwnedToken> owned_tokens_;
+    size_t session_claims_ = 0;
     ClientSession* jobs_ = nullptr;
     size_t outstanding_jobs_ = 0;
     size_t reply_senders_ = 0;
@@ -487,6 +545,9 @@ struct UdpSocketState final : std::enable_shared_from_this<UdpSocketState> {
     UdpIngress* owner = nullptr;
     UdpIngress::SocketPtr socket;
     std::optional<tcp::endpoint> local_endpoint;
+    // As bound, wildcard included: with the listener tag's configuration it
+    // names this listener on every Worker.
+    udp::endpoint bound_endpoint;
     proxy::InboundDatagramAssociationIndex associations;
     std::unordered_map<ClientSessionKey, UdpIngress::UdpClientSession,
                        ClientSessionKeyHash> sessions;
@@ -582,6 +643,12 @@ private:
     // The row hook naming this session as its live link; cleared on unlink.
     UdpAssociationHook* association_hook_ = nullptr;
     std::shared_ptr<UdpHandoffRecord> handoff_record_;
+    // Set while other Workers may forward to this session: the token they
+    // name it by, the directory entry that told them, and every Worker that
+    // did forward, each of which learns when the session ends.
+    uint64_t relay_token_ = 0;
+    SessionOwnership ownership_;
+    std::vector<uint32_t> relay_sources_;
 };
 
 

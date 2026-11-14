@@ -1467,7 +1467,7 @@ net::awaitable<std::shared_ptr<XHttpPacketUpSession>> OpenXHttpDownlinkSession(
     std::string_view session_namespace,
     std::string_view session_id) {
     auto& table = net::use_service<XHttpSessionTable>(io_context);
-    auto* relay = FindXHttpUploadRelay(io_context);
+    auto* relay = common::FindWorkerMesh<XHttpUploadRelay>(io_context);
     for (;;) {
         // Reserved before the directory publishes it: an upload on another
         // Worker may send under this token before the session below exists.
@@ -1525,10 +1525,11 @@ net::awaitable<XHttpUploadTarget> ResolveXHttpUploadTarget(
                 io_context, session_namespace, session_id, access, claim.record)};
         }
         if (claim.owner) {
-            auto* relay = FindXHttpUploadRelay(io_context);
+            auto* relay = common::FindWorkerMesh<XHttpUploadRelay>(io_context);
             const auto owner = relay ? relay->EndpointOf(*claim.owner) : std::nullopt;
             if (!owner) co_return XHttpUploadTarget{};
-            co_return XHttpUploadTarget{.relay = relay, .owner = *owner, .token = claim.token};
+            co_return XHttpUploadTarget{
+                .session = nullptr, .relay = relay, .owner = *owner, .token = claim.token};
         }
         if (!claim.wait_owner) co_return XHttpUploadTarget{};
         if (!co_await AwaitXHttpSessionOwner(coordinator, std::move(claim), cancellation)) {

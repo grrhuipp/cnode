@@ -309,7 +309,7 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadReachesDownlinkSession) {
     coordinator->RegisterWorker();
     coordinator->RegisterWorker();
     const std::array<net::io_context*, 2> workers{worker0.get(), worker1.get()};
-    InstallXHttpUploadRelay(workers);
+    common::InstallWorkerMesh<XHttpUploadRelay>(workers);
 
     std::promise<std::thread::id> started_0, started_1;
     std::thread thread_c([&] { control.run(); });
@@ -446,7 +446,7 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadReachesDownlinkSession) {
     stop_future.get();
     for (auto* worker : workers) {
         net::co_spawn(*worker, [worker]() -> net::awaitable<void> {
-            StopXHttpUploadRelay(*worker);
+            common::StopWorkerMesh<XHttpUploadRelay>(*worker);
             co_return;
         }, net::use_future).get();
     }

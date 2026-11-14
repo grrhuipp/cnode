@@ -2,6 +2,7 @@
 
 #include "common/asio_types.hpp"
 #include "common/multi_buffer.hpp"
+#include "common/worker_mesh.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/link.hpp"
 
@@ -9,12 +10,10 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <span>
 
 namespace transport {
 
 class XHttpPacketUpSession;
-struct XHttpRelayMesh;
 
 // Outcome of handing a packet-up body to its session.
 enum class XHttpCommit : uint8_t {
@@ -25,14 +24,45 @@ enum class XHttpCommit : uint8_t {
     Rejected,
 };
 
+enum class XHttpRelayKind : uint8_t {
+    // Upload Worker -> session Worker.
+    Packet,
+    StreamOpen,
+    StreamData,
+    StreamEnd,
+    StreamAbort,
+    // Session Worker -> upload Worker.
+    PacketDone,
+    StreamCredit,
+    StreamClosed,
+};
+
+// `payload` is an owned Buffer while in flight.
+struct XHttpRelayMessage {
+    XHttpRelayKind kind = XHttpRelayKind::Packet;
+    XHttpCommit commit = XHttpCommit::Missing;
+    uint32_t slot = 0;
+    uint32_t generation = 0;
+    // Session token (Packet, StreamOpen).
+    uint64_t session = 0;
+    // Packet sequence (Packet) or returned stream bytes (StreamCredit).
+    uint64_t value = 0;
+    common::Buffer* payload = nullptr;
+};
+
+inline void ReleaseWorkerMessage(XHttpRelayMessage& message) noexcept {
+    common::Buffer::Free(std::exchange(message.payload, nullptr));
+}
+
 // One Worker's end of the XHTTP upload relay. Workers share nothing but the
 // bounded lock-free SPSC rings of the mesh: an upload received on one Worker
 // reaches its session on another as messages that transfer buffer ownership.
 // Every member runs on the owning io_context's thread.
 class XHttpUploadRelay final {
 public:
-    XHttpUploadRelay(net::io_context& io_context,
-                     std::shared_ptr<XHttpRelayMesh> mesh, size_t index);
+    using Mesh = common::WorkerMesh<XHttpRelayMessage, 256>;
+
+    XHttpUploadRelay(net::io_context& io_context, std::shared_ptr<Mesh> mesh, size_t index);
     ~XHttpUploadRelay();
     XHttpUploadRelay(const XHttpUploadRelay&) = delete;
     XHttpUploadRelay& operator=(const XHttpUploadRelay&) = delete;
@@ -85,15 +115,4 @@ private:
 
     std::unique_ptr<State> state_;
 };
-
-// Connects the io_contexts of all Workers. Call once, before they run; with
-// fewer than two Workers there is nothing to relay and nothing is installed.
-void InstallXHttpUploadRelay(std::span<net::io_context* const> workers);
-
-// The relay endpoint of `io_context`, or null when none is installed.
-[[nodiscard]] XHttpUploadRelay* FindXHttpUploadRelay(net::io_context& io_context) noexcept;
-
-// Stops the relay endpoint of `io_context`, if any, on its own thread.
-void StopXHttpUploadRelay(net::io_context& io_context) noexcept;
-
 }  // namespace transport

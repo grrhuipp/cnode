@@ -142,7 +142,29 @@ TEST_P(MuxGlobalId, AcceptsExactlyEightBytesOfGlobalIdMetadata) {
         const auto decoded = Decode(wire, split);
         ASSERT_TRUE(decoded);
         EXPECT_EQ(decoded->frame_size, GetParam() == 8 ? wire.size() : 0u);
+        if (GetParam() == 8) {
+            std::array<uint8_t, 8> expected;
+            expected.fill(0x42);
+            EXPECT_EQ(decoded->global_id, expected);
+        }
     }
+}
+
+// Xray common/mux: "MUST ignore empty Global ID".
+TEST(MuxEmptyGlobalId, IsAbsent) {
+    std::array<uint8_t, common::kMaxFrameHeaderBytes> header{};
+    const auto count = common::EncodeNewHeaderTo(header, 7, common::NetworkType::UDP,
+        common::TargetAddress("example.com", 53), 0, false);
+    ASSERT_GE(count, 2u);
+    std::vector<uint8_t> wire(header.begin(), header.begin() + count);
+    const auto meta = (size_t(wire[0]) << 8 | wire[1]) + 8;
+    wire.insert(wire.end(), 8, 0);
+    wire[0] = static_cast<uint8_t>(meta >> 8);
+    wire[1] = static_cast<uint8_t>(meta);
+    const auto decoded = Decode(wire, wire.size());
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->frame_size, wire.size());
+    EXPECT_FALSE(decoded->global_id);
 }
 INSTANTIATE_TEST_SUITE_P(Lengths, MuxGlobalId, testing::Values(size_t(8), size_t(9)));
 }  // namespace

@@ -2,21 +2,13 @@
 
 #include "common/allocator.hpp"
 #include "common/error.hpp"
-#include "common/spsc_ring.hpp"
 #include "transport/xhttp_session.hpp"
 
 #include <asio/as_tuple.hpp>
-#include <asio/post.hpp>
-#include <asio/posix/stream_descriptor.hpp>
 #include <asio/this_coro.hpp>
-#include <sys/eventfd.h>
-#include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
-#include <cerrno>
 #include <deque>
-#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -24,33 +16,9 @@
 namespace transport {
 namespace {
 
-enum class RelayKind : uint8_t {
-    // Upload Worker -> session Worker.
-    Packet,
-    StreamOpen,
-    StreamData,
-    StreamEnd,
-    StreamAbort,
-    // Session Worker -> upload Worker.
-    PacketDone,
-    StreamCredit,
-    StreamClosed,
-};
+using RelayKind = XHttpRelayKind;
+using RelayMessage = XHttpRelayMessage;
 
-// Plain value crossing threads; `payload` is an owned Buffer while in flight.
-struct RelayMessage {
-    RelayKind kind = RelayKind::Packet;
-    XHttpCommit commit = XHttpCommit::Missing;
-    uint32_t slot = 0;
-    uint32_t generation = 0;
-    // Session token (Packet, StreamOpen).
-    uint64_t session = 0;
-    // Packet sequence (Packet) or returned stream bytes (StreamCredit).
-    uint64_t value = 0;
-    common::Buffer* payload = nullptr;
-};
-
-constexpr size_t kRingSlots = 256;
 // Packet bytes one Worker may have read toward one other Worker that its
 // session has not yet taken; bounded like a session's own payload budget.
 constexpr size_t kPacketBudget = 4 * XHttpPacketQueue::kMaxQueuedBytes;
@@ -58,13 +26,11 @@ constexpr size_t kPacketBudget = 4 * XHttpPacketQueue::kMaxQueuedBytes;
 constexpr int64_t kStreamWindow = 1024 * 1024;
 // Stream bytes consumed before the session Worker returns them as credit.
 constexpr size_t kCreditBatch = 64 * 1024;
-// Messages handled per wake before other handlers of the Worker run.
-constexpr size_t kDrainBatch = 512;
 // Concurrent uploads from one Worker toward one other Worker.
 constexpr size_t kMaxUploadSlots = 64 * 1024;
 
 void FreePayload(RelayMessage& message) noexcept {
-    common::Buffer::Free(std::exchange(message.payload, nullptr));
+    ReleaseWorkerMessage(message);
 }
 
 uint64_t StreamKey(uint32_t slot, uint32_t generation) noexcept {
@@ -72,86 +38,6 @@ uint64_t StreamKey(uint32_t slot, uint32_t generation) noexcept {
 }
 
 }  // namespace
-
-// Rings and doorbells shared by all relay endpoints; each endpoint holds a
-// reference, so producers never touch a ring or eventfd that is gone.
-struct XHttpRelayMesh {
-    struct alignas(64) Door {
-        int fd = -1;
-        // Set by the consumer before it sleeps; a producer that clears it
-        // writes the eventfd. Cleared means a drain is pending or running.
-        std::atomic<bool> armed{true};
-        // The endpoint stopped consuming; messages toward it are dropped.
-        std::atomic<bool> closed{false};
-    };
-    struct alignas(64) Lane {
-        common::SpscRing<RelayMessage, kRingSlots> ring;
-        // Set by the producer when its backlog found the ring full; the
-        // consumer rings the producer after making room.
-        std::atomic<bool> space_wanted{false};
-    };
-
-    explicit XHttpRelayMesh(std::span<net::io_context* const> workers)
-        : contexts(workers.begin(), workers.end())
-        , doors(std::make_unique<Door[]>(workers.size()))
-        , lanes(std::make_unique<Lane[]>(workers.size() * workers.size())) {
-        for (size_t i = 0; i < contexts.size(); ++i) {
-            doors[i].fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-            if (doors[i].fd < 0) {
-                const int error = errno;
-                CloseDoors();
-                throw IoSystemError(IoErrorCode(error, std::system_category()));
-            }
-        }
-    }
-
-    ~XHttpRelayMesh() {
-        // Every endpoint is gone: nothing produces or consumes any more.
-        for (size_t i = 0; i < contexts.size() * contexts.size(); ++i) {
-            RelayMessage message;
-            while (lanes[i].ring.TryPop(message)) FreePayload(message);
-        }
-        CloseDoors();
-    }
-
-    XHttpRelayMesh(const XHttpRelayMesh&) = delete;
-    XHttpRelayMesh& operator=(const XHttpRelayMesh&) = delete;
-
-    [[nodiscard]] Lane& Between(size_t from, size_t to) noexcept {
-        return lanes[from * contexts.size() + to];
-    }
-
-    // After publishing toward `to`: the seq_cst fence orders the publication
-    // before reading `armed`, pairing with the consumer's fence between
-    // setting `armed` and its final check of the rings.
-    void Ring(size_t to) noexcept {
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        auto& door = doors[to];
-        if (!door.armed.load(std::memory_order_relaxed) ||
-            !door.armed.exchange(false, std::memory_order_acq_rel)) {
-            return;
-        }
-        const uint64_t one = 1;
-        ssize_t written;
-        do { written = ::write(door.fd, &one, sizeof(one)); }
-        while (written < 0 && errno == EINTR);
-        // EAGAIN: the counter is saturated, so the eventfd is readable anyway.
-        if (written < 0 && errno != EAGAIN) {
-            common::FailRuntime("xhttp-upload-relay", "cannot ring Worker doorbell");
-        }
-    }
-
-    void CloseDoors() noexcept {
-        for (size_t i = 0; i < contexts.size(); ++i) {
-            if (doors[i].fd >= 0) ::close(std::exchange(doors[i].fd, -1));
-        }
-    }
-
-    std::vector<net::io_context*> contexts;
-    std::unique_ptr<Door[]> doors;
-    std::unique_ptr<Lane[]> lanes;
-};
-
 class XHttpRemoteUploadStream;
 
 struct XHttpUploadRelay::State {
@@ -174,8 +60,6 @@ struct XHttpUploadRelay::State {
     };
 
     struct Link {
-        // Messages that found the ring toward this peer full.
-        common::RingDeque<RelayMessage> backlog;
         // Upload side toward this peer. A deque keeps slot addresses stable.
         std::deque<UploadSlot> slots;
         std::vector<uint32_t> free_slots;
@@ -194,128 +78,27 @@ struct XHttpUploadRelay::State {
         common::RingDeque<std::pair<size_t, RelayMessage>> parked;
     };
 
-    State(XHttpUploadRelay& relay, net::io_context& io,
-          std::shared_ptr<XHttpRelayMesh> mesh, size_t index)
-        : relay(relay), io(io), mesh(std::move(mesh)), index(index), door(io)
-        , links(this->mesh->contexts.size()) {
-        IoErrorCode error;
-        door.assign(this->mesh->doors[index].fd, error);
-        if (error) throw IoSystemError(error);
-    }
+    using Endpoint = common::WorkerMeshEndpoint<State, RelayMessage, 256>;
 
-    ~State() {
-        // The mesh owns the eventfd; it outlives this endpoint.
-        if (door.is_open()) {
-            IoErrorCode error;
-            door.cancel(error);
-            (void)door.release();
-        }
-    }
+    State(net::io_context& io, std::shared_ptr<Mesh> mesh, size_t index)
+        : io(io), links(mesh->Size()), endpoint(*this, io, std::move(mesh), index) {}
 
-    void Arm() {
-        if (stopping) return;
-        door.async_wait(net::posix::stream_descriptor::wait_read, [this](IoErrorCode error) {
-            if (error || stopping) return;
-            uint64_t count;
-            while (::read(door.native_handle(), &count, sizeof(count)) > 0) {}
-            Drain();
-        });
-    }
-
-    [[nodiscard]] bool AnyIncoming() noexcept {
-        for (size_t from = 0; from < links.size(); ++from) {
-            if (from != index && !mesh->Between(from, index).ring.Empty()) return true;
-        }
-        return false;
-    }
-
-    [[nodiscard]] bool AnyFlushable() noexcept {
-        for (size_t to = 0; to < links.size(); ++to) {
-            if (!links[to].backlog.empty() && mesh->Between(index, to).ring.HasRoom()) return true;
-        }
-        return false;
-    }
-
-    // Handles every incoming message, then sleeps on the doorbell. A full
-    // batch yields to the Worker's other handlers and continues later.
-    void Drain() {
-        size_t handled = 0;
-        for (;;) {
-            bool any = false;
-            for (size_t from = 0; from < links.size(); ++from) {
-                if (from == index) continue;
-                auto& lane = mesh->Between(from, index);
-                RelayMessage message;
-                bool popped = false;
-                while (handled < kDrainBatch && lane.ring.TryPop(message)) {
-                    popped = true;
-                    ++handled;
-                    Dispatch(from, message);
-                }
-                if (!popped) continue;
-                any = true;
-                // Pairs with the producer's fence between setting
-                // space_wanted and rechecking for room.
-                std::atomic_thread_fence(std::memory_order_seq_cst);
-                if (lane.space_wanted.load(std::memory_order_relaxed) &&
-                    lane.space_wanted.exchange(false, std::memory_order_acq_rel)) {
-                    mesh->Ring(from);
-                }
-            }
-            for (size_t to = 0; to < links.size(); ++to) {
-                if (!links[to].backlog.empty()) Flush(to);
-            }
-            if (stopping) return;
-            if (handled >= kDrainBatch) {
-                net::post(io, [this] { Drain(); });
-                return;
-            }
-            if (any) continue;
-            auto& armed = mesh->doors[index].armed;
-            armed.store(true, std::memory_order_seq_cst);
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            if (!AnyIncoming() && !AnyFlushable()) break;
-            // Work raced in; a producer may also have rung, which only adds
-            // one spurious wake.
-            armed.store(false, std::memory_order_relaxed);
-        }
-        Arm();
-    }
-
-    void Post(size_t to, RelayMessage message) {
-        if (stopping || mesh->doors[to].closed.load(std::memory_order_acquire)) {
-            FreePayload(message);
-            return;
-        }
-        auto& link = links[to];
-        if (link.backlog.empty() && mesh->Between(index, to).ring.TryPush(message)) {
-            mesh->Ring(to);
-            return;
-        }
+    void Receive(size_t from, RelayMessage& message) noexcept {
         try {
-            link.backlog.push_back(message);
+            Dispatch(from, message);
         } catch (...) {
-            FreePayload(message);
-            throw;
+            // Allocation failure: the message is dropped like one toward a
+            // stopped Worker; its waiter keeps waiting until cancelled.
         }
-        Flush(to);
     }
 
-    void Flush(size_t to) noexcept {
-        auto& link = links[to];
-        auto& lane = mesh->Between(index, to);
-        bool pushed = false;
-        for (;;) {
-            while (!link.backlog.empty() && lane.ring.TryPush(link.backlog.front())) {
-                link.backlog.pop_front();
-                pushed = true;
-            }
-            if (link.backlog.empty()) break;
-            lane.space_wanted.store(true, std::memory_order_relaxed);
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            if (!lane.ring.HasRoom()) break;
-        }
-        if (pushed) mesh->Ring(to);
+    void Post(size_t to, RelayMessage message) { endpoint.Post(to, message); }
+
+    // Takes the message into `parked`; the caller's copy no longer owns it.
+    static void Park(common::RingDeque<std::pair<size_t, RelayMessage>>& parked,
+                     size_t from, RelayMessage& message) {
+        parked.push_back({from, message});
+        message.payload = nullptr;
     }
 
     void Dispatch(size_t from, RelayMessage& message);
@@ -329,7 +112,7 @@ struct XHttpUploadRelay::State {
         const auto found = sessions.find(message.session);
         if (found == sessions.end()) return {nullptr, false};
         if (!found->second.session) {
-            found->second.parked.push_back({from, message});
+            Park(found->second.parked, from, message);
             return {nullptr, true};
         }
         return {found->second.session, false};
@@ -375,15 +158,12 @@ struct XHttpUploadRelay::State {
         for (auto* waiter : link.budget_waiters) (void)waiter->try_send(IoErrorCode{});
     }
 
-    XHttpUploadRelay& relay;
     net::io_context& io;
-    std::shared_ptr<XHttpRelayMesh> mesh;
-    size_t index;
-    net::posix::stream_descriptor door;
-    bool stopping = false;
     std::vector<Link> links;
     std::unordered_map<uint64_t, SessionEntry> sessions;
     uint64_t next_token = 0;
+    // Last: destroyed first, before the state its receiver touches.
+    Endpoint endpoint;
 };
 
 // Session-side end of one stream-up upload received on another Worker. The
@@ -536,7 +316,7 @@ void XHttpUploadRelay::State::Dispatch(size_t from, RelayMessage& message) {
         if (const auto parked = link.parked_streams.find(key); parked != link.parked_streams.end()) {
             const auto entry = sessions.find(parked->second);
             if (entry != sessions.end() && !entry->second.session) {
-                entry->second.parked.push_back({from, message});
+                Park(entry->second.parked, from, message);
                 return;
             }
             link.parked_streams.erase(parked);
@@ -661,54 +441,18 @@ net::awaitable<bool> WaitOnce(common::SignalChannel& wake, SlotWait& watch,
 
 }  // namespace
 
-// Holds the relay endpoint of one io_context, whose shutdown stops the relay
-// before any of its objects are destroyed.
-class XHttpUploadRelayHost final : public net::execution_context::service {
-public:
-    static net::execution_context::id id;
-    // Required by lookup through use_service, which follows has_service.
-    explicit XHttpUploadRelayHost(net::execution_context& context)
-        : net::execution_context::service(context) {}
-    XHttpUploadRelayHost(net::execution_context& context, std::unique_ptr<XHttpUploadRelay> relay)
-        : net::execution_context::service(context), relay(std::move(relay)) {}
-
-    std::unique_ptr<XHttpUploadRelay> relay;
-
-private:
-    void shutdown() override {
-        if (relay) relay->Shutdown();
-    }
-};
-
-net::execution_context::id XHttpUploadRelayHost::id;
-
 XHttpUploadRelay::XHttpUploadRelay(net::io_context& io_context,
-                                   std::shared_ptr<XHttpRelayMesh> mesh, size_t index)
-    : state_(std::make_unique<State>(*this, io_context, std::move(mesh), index)) {
-    net::post(state_->io, [state = state_.get()] { state->Arm(); });
-}
+                                   std::shared_ptr<Mesh> mesh, size_t index)
+    : state_(std::make_unique<State>(io_context, std::move(mesh), index)) {}
 
 XHttpUploadRelay::~XHttpUploadRelay() = default;
-void XHttpUploadRelay::Stop() noexcept {
-    auto& state = *state_;
-    if (state.stopping) return;
-    state.stopping = true;
-    state.mesh->doors[state.index].closed.store(true, std::memory_order_release);
-    IoErrorCode error;
-    state.door.cancel(error);
-}
+
+void XHttpUploadRelay::Stop() noexcept { state_->endpoint.Stop(); }
 
 void XHttpUploadRelay::Shutdown() noexcept {
     auto& state = *state_;
-    state.stopping = true;
-    IoErrorCode error;
-    state.door.cancel(error);
-    (void)state.door.release();
+    state.endpoint.Shutdown();
     for (auto& link : state.links) {
-        while (!link.backlog.empty()) {
-            FreePayload(link.backlog.front());
-            link.backlog.pop_front();
-        }
         for (auto& [key, stream] : link.streams) {
             (void)key;
             stream->Detach();
@@ -727,11 +471,7 @@ void XHttpUploadRelay::Shutdown() noexcept {
 }
 
 std::optional<size_t> XHttpUploadRelay::EndpointOf(const net::io_context& owner) const noexcept {
-    const auto& contexts = state_->mesh->contexts;
-    for (size_t i = 0; i < contexts.size(); ++i) {
-        if (contexts[i] == &owner) return i;
-    }
-    return std::nullopt;
+    return state_->endpoint.IndexOf(owner);
 }
 
 uint64_t XHttpUploadRelay::ReserveSessionToken() {
@@ -749,7 +489,8 @@ void XHttpUploadRelay::BindSession(uint64_t token, XHttpPacketUpSession& session
     while (!parked.empty()) {
         auto [from, message] = parked.front();
         parked.pop_front();
-        state_->Dispatch(from, message);
+        state_->Receive(from, message);
+        FreePayload(message);
     }
 }
 
@@ -764,11 +505,8 @@ void XHttpUploadRelay::ReleaseSessionToken(uint64_t token) noexcept {
     while (!parked.empty()) {
         auto [from, message] = parked.front();
         parked.pop_front();
-        try {
-            state.Dispatch(from, message);
-        } catch (...) {
-            FreePayload(message);
-        }
+        state.Receive(from, message);
+        FreePayload(message);
     }
 }
 
@@ -901,24 +639,6 @@ net::awaitable<void> XHttpUploadRelay::PumpStream(
         send(RelayKind::StreamAbort);
         throw;
     }
-}
-
-void InstallXHttpUploadRelay(std::span<net::io_context* const> workers) {
-    if (workers.size() < 2) return;
-    auto mesh = std::make_shared<XHttpRelayMesh>(workers);
-    for (size_t i = 0; i < workers.size(); ++i) {
-        (void)net::make_service<XHttpUploadRelayHost>(
-            *workers[i], std::make_unique<XHttpUploadRelay>(*workers[i], mesh, i));
-    }
-}
-
-XHttpUploadRelay* FindXHttpUploadRelay(net::io_context& io_context) noexcept {
-    if (!net::has_service<XHttpUploadRelayHost>(io_context)) return nullptr;
-    return net::use_service<XHttpUploadRelayHost>(io_context).relay.get();
-}
-
-void StopXHttpUploadRelay(net::io_context& io_context) noexcept {
-    if (auto* relay = FindXHttpUploadRelay(io_context)) relay->Stop();
 }
 
 }  // namespace transport

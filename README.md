@@ -106,7 +106,7 @@ Inbound Handler::Process
   -> Relay（TCP / UDP / Mux）
 ```
 
-每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口；连接与有状态会话一生固定在创建它的 Worker 上。Hysteria2 QUIC 连接通过内核态 CID 分流固定到原 Worker，客户端路径迁移后仍由原 Worker 服务；Hysteria2 只提供配置的服务端 UDP 端口，不实现端口跳跃。XHTTP 会话归下行（GET）所在的 Worker，下行数据不跨 Worker；同一会话的上传无论落在哪个 Worker 的哪条连接上，都在该 Worker 完成解析，再经 Worker 间无锁 SPSC 队列交给会话，连接本身不迁移。主线程运行唯一主控事件循环，承载面板同步、监控、DNS 与全局准入。
+每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口；连接与有状态会话一生固定在创建它的 Worker 上。Hysteria2 QUIC 连接通过内核态 CID 分流固定到原 Worker，客户端路径迁移后仍由原 Worker 服务；Hysteria2 只提供配置的服务端 UDP 端口，不实现端口跳跃。XHTTP 会话归下行（GET）所在的 Worker，下行数据不跨 Worker；同一会话的上传无论落在哪个 Worker 的哪条连接上，都在该 Worker 完成解析，再经 Worker 间无锁 SPSC 队列交给会话，连接本身不迁移。SS2022 UDP 会话与 XUDP 流（Global ID 非零的 Mux UDP 子会话）归创建它的 Worker：客户端 NAT 重绑定后，或换一条连接续用同一 Global ID 时，数据报无论落到哪个 Worker 都在当地解密，再经 SPSC 队列交给原 Worker，出站 socket 与回包来源端口保持不变。主线程运行唯一主控事件循环，承载面板同步、监控、DNS 与全局准入。
 
 一个已认证 UDP association 只保留协议认证、重放保护和回包路径；Dispatcher 按原始目标拆分独立路由子流。普通 UDP 以完整目标为键，QUIC 以目标、版本和 Initial DCID 为键并跟踪后续 CID；每个子流独立嗅探、选路、出站、统计和访问日志。回包始终恢复该子流的原始目标，因此不同 FakeIP 即使解析到同一真实 IP，也不会共用路由或回包地址。
 
@@ -312,6 +312,7 @@ geosite.dat
 - Hysteria UDP 分片重组：5 秒无新片或 15 秒整体期限即丢弃该轮分片，不关闭会话。Hysteria v1 服务端使用 BBR v2 拥塞控制，与官方 v1 客户端线协议互通，但带宽控制行为不是 Brutal。
 - VMess 重放窗口 180 秒，最多 65,536 项，满时拒绝新记录。
 - SS2022 TCP 按 [SIP022 §3.1.5](https://shadowsocks.org/doc/sip022.html#_3-1-5-replay-protection) 记录已认证请求的 salt：进程级去重，保留 65 秒，最多 262,144 项；满时拒绝新记录，不提前淘汰未过期项。重放或跟踪容量拒绝不计入认证失败封禁。
+- XUDP：Global ID 按入站及其报告的用户身份（ID、email）区分；没有子会话承载的流保留 1 分钟后结束，期间回包最多暂存 256 个（512 KiB）。每个 Worker 最多 16,384 个流，超出时子会话按普通 Mux UDP 处理。跨 Worker 转交的数据报在对端暂不可收时最多排队 1,024 个，超出丢弃。
 - TLS 读取以 `close_notify` 为正常结束，未收到关闭通知的断开按截断错误处理。
 
 ### 流量上报

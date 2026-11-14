@@ -14,6 +14,7 @@
 #include "infra/log.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/link.hpp"
+#include "proxy/mux/xudp.hpp"
 
 #include <asio/as_tuple.hpp>
 
@@ -674,7 +675,7 @@ void ReplyQueueState::WakeWaitingWriters() noexcept {
     }
 }
 
-class UdpSubState final : public MuxSubSession {
+class UdpSubState final : public MuxSubSession, public XudpClient {
 public:
     UdpSubState(
         net::io_context& io_context,
@@ -707,31 +708,49 @@ public:
 
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
         if (cancelled_ || !reply_queue_.running) {
-            mb.clear();
             throw IoSystemError(
                 io_error::operation_aborted,
                 "Mux UDP reply path closed");
         }
         if (EndSent()) {
-            mb.clear();
             throw transport::WriteClosed{};
         }
-
-        const auto datagram = common::InspectUdpDatagram(mb);
-        if (datagram.status == common::UdpDatagramStatus::Empty) {
-            mb.clear();
+        switch (Enqueue(std::move(mb))) {
+        case ReplyAdmission::Queued:
             co_return;
-        }
-        if (!datagram.Valid()) {
-            mb.clear();
+        case ReplyAdmission::MixedEndpoints:
             throw IoSystemError(
                 io_error::invalid_argument,
                 "Mux UDP reply contains missing or mixed endpoints");
+        case ReplyAdmission::InvalidTarget:
+            throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
+        case ReplyAdmission::Full:
+            throw IoSystemError(
+                io_error::no_buffer_space,
+                "Mux UDP reply queue full");
         }
+    }
+
+    // XUDP: a reply of the flow this sub-session carries.
+    bool DeliverReply(common::MultiBuffer mb) {
+        if (cancelled_ || !reply_queue_.running || EndSent()) return false;
+        return Enqueue(std::move(mb)) == ReplyAdmission::Queued;
+    }
+
+private:
+    enum class ReplyAdmission : uint8_t { Queued, MixedEndpoints, InvalidTarget, Full };
+
+    // Queues one reply datagram; an empty one is consumed. A full reply
+    // queue ends this sub-session.
+    ReplyAdmission Enqueue(common::MultiBuffer mb) {
+        const auto datagram = common::InspectUdpDatagram(mb);
+        if (datagram.status == common::UdpDatagramStatus::Empty) {
+            return ReplyAdmission::Queued;
+        }
+        if (!datagram.Valid()) return ReplyAdmission::MixedEndpoints;
         if (!datagram.target->IsValid() ||
             datagram.payload_size > std::numeric_limits<uint16_t>::max()) {
-            mb.clear();
-            throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
+            return ReplyAdmission::InvalidTarget;
         }
         if (!reply_queue_.CanPushUdp(datagram.payload_size)) {
             const uint64_t dropped = ++reply_queue_.udp_dropped;
@@ -739,13 +758,9 @@ public:
                 LOG_CONN_DEBUG(parent_conn_id_,
                     "UDP reply queue full, dropped {} packets", dropped);
             }
-            mb.clear();
             Cancel();
-            throw IoSystemError(
-                io_error::no_buffer_space,
-                "Mux UDP reply queue full");
+            return ReplyAdmission::Full;
         }
-
         MuxReply reply;
         reply.session_id = session_id_;
         reply.is_end = false;
@@ -753,10 +768,8 @@ public:
         mb.MoveTo(reply.payload);
         reply_queue_.PushUdpPrepared(
             std::move(reply), datagram.payload_size + kMuxReplyOverhead);
-        co_return;
+        return ReplyAdmission::Queued;
     }
-
-private:
 
     uint64_t parent_conn_id_ = 0;
     common::TargetAddress default_target_;
@@ -770,7 +783,8 @@ net::awaitable<void> RunSubDispatch(
     MuxSubSession* sub,
     app::StatsShard& stats,
     const infra::TimeoutsConfig& timeouts,
-    SubLoopLease sub_loop)
+    SubLoopLease sub_loop,
+    std::optional<XudpGlobalId> global_id)
 {
     (void)sub_loop;
     transport::Link link{
@@ -779,6 +793,14 @@ net::awaitable<void> RunSubDispatch(
     };
 
     try {
+        // A flow that outlives this sub-session dispatches by itself; the
+        // sub-session only carries its datagrams.
+        if (global_id && co_await RunXudpSubSession(
+                XudpDispatchEnvironment{io_context, dispatcher, policy, environment, stats, timeouts},
+                sub->ctx, *global_id, static_cast<UdpSubState&>(*sub), *sub)) {
+            sub->MarkDispatchDone();
+            co_return;
+        }
         // Held for the child's lifetime; a refusal ends only this child.
         proxy::InboundSubstreamAdmission admission(stats);
         if (!co_await admission.Admit(environment, sub->ctx)) {
@@ -803,6 +825,15 @@ net::awaitable<void> RunSubDispatch(
 }
 
 }  // namespace
+
+bool XudpClient::PushReply(common::MultiBuffer datagram) {
+    return static_cast<UdpSubState&>(*this).DeliverReply(std::move(datagram));
+}
+
+void XudpClient::Release() noexcept {
+    static_cast<UdpSubState&>(*this).Cancel();
+}
+
 namespace {
 class MuxServerSession final {
 public:
@@ -1209,7 +1240,8 @@ private:
                                 sub_ptr,
                                 stats,
                                 timeouts,
-                                SubLoopLease{reply_queue}));
+                                SubLoopLease{reply_queue},
+                                is_udp ? hdr.global_id : std::nullopt));
                     } catch (...) {
                         sub_ptr->Cancel();
                         sub_ptr->MarkDispatchDone();

@@ -27,7 +27,9 @@ public:
             inbound["settings"] = {{"method", "aes-128-gcm"}, {"clients", Json::array({{{"password", "secret"}}})}};
             if (isolated) inbound["settings"]["clients"].push_back({{"password", "second-secret"}});
         }
-        Json config = {{"workers", 1}, {"timeouts", {{"write", 1}, {"connIdle", 30}, {"downlinkOnly", 1}}},
+        // Rebinding moves a session's datagrams between SO_REUSEPORT
+        // sockets: with four Workers most new paths reach another Worker.
+        Json config = {{"workers", Handoff() ? 4 : 1}, {"timeouts", {{"write", 1}, {"connIdle", 30}, {"downlinkOnly", 1}}},
             {"dns", {{"servers", Json::array({std::string(IsQuic() ? "127.0.0.1:" : "127.77.0.2:") + std::to_string(dns.Port())})}, {"timeout", 10}}},
             {"log", {{"logDir", (root.Path() / "logs").string()}}}};
         if (Native() && !this->value.cipher.empty()) {

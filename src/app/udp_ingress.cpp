@@ -1,5 +1,6 @@
 #include "app/udp_ingress.hpp"
 #include "app/relay.hpp"
+#include "app/udp_session_relay.hpp"
 #include "app/inbound_handler.hpp"
 #include "app/request_load.hpp"
 #include "common/awaitable_task_group.hpp"
@@ -14,6 +15,8 @@
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
 #include "transport/async_stream.hpp"
+
+#include <openssl/sha.h>
 
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -206,6 +209,37 @@ using proxy::NativeAssociationAdmission;
 
 constexpr size_t kMaxQueuedUdpDatagrams = 256;
 constexpr size_t kMaxQueuedUdpBytes = 512 * 1024;
+// Sessions whose owner the directory is deciding, and datagrams each holds
+// meanwhile: one coordinator round trip.
+constexpr size_t kMaxPendingSessionClaims = 4096;
+constexpr size_t kMaxPendingClaimDatagrams = 32;
+// Sessions of other Workers this ingress forwards to.
+constexpr size_t kMaxRemoteRoutes = 64 * 1024;
+
+// Names a replay-protected session process-wide: the listener (its prepared
+// configuration and bound endpoint, the same on every Worker) and the
+// authenticated session key.
+[[nodiscard]] SessionOwnerKey NativeSessionOwnerKey(
+    const UdpSocketState& socket, const ClientSessionKey& client) noexcept {
+    constexpr std::string_view kNamespace = "cnode/native-udp-session";
+    const auto configuration = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(client.configuration));
+    const auto bound = PackedUdpEndpoint::From(socket.bound_endpoint);
+    const uint64_t session_id = client.session_id.value_or(0);
+    SHA256_CTX context;
+    SHA256_Init(&context);
+    SHA256_Update(&context, kNamespace.data(), kNamespace.size());
+    SHA256_Update(&context, &configuration, sizeof(configuration));
+    SHA256_Update(&context, bound.address.data(), bound.address.size());
+    SHA256_Update(&context, &bound.port, sizeof(bound.port));
+    SHA256_Update(&context, &bound.v6, sizeof(bound.v6));
+    SHA256_Update(&context, &client.owner.size, sizeof(client.owner.size));
+    SHA256_Update(&context, client.owner.bytes.data(), client.owner.size);
+    SHA256_Update(&context, &session_id, sizeof(session_id));
+    SessionOwnerKey key;
+    SHA256_Final(key.data(), &context);
+    return key;
+}
 
 
 [[nodiscard]] bool WouldOverflowUdpQueue(
@@ -449,6 +483,7 @@ void UdpIngress::ClientSession::CloseWithError(common::ErrorCode error) noexcept
     }
     closed_ = true;
     terminal_error_ = error;
+    if (relay_token_ && reply_.owner) reply_.owner->ReleaseOwnedSession(*this);
     // Closure is the row's reclaim event. Re-arm before cancellation callbacks
     // can re-enter the ingress and unlink the row.
     if (auto* hook = association_hook_) {
@@ -472,10 +507,11 @@ UdpIngress::UdpIngress(
     , reclaimer_(reclaimer)
     , budget_(budget)
     , io_context_(io_context)
-    , completion_signal_(io_context, 1) {}
+    , completion_signal_(io_context, 1)
+    , relay_(common::FindWorkerMesh<UdpSessionRelay>(io_context)) {}
 
 UdpIngress::~UdpIngress() noexcept {
-    if (outstanding_jobs_ != 0 || reply_senders_ != 0) {
+    if (Busy()) {
         common::FailRuntime("udp-ingress", "destroyed with native dispatch jobs outstanding");
     }
     RequestStop();
@@ -526,6 +562,14 @@ void UdpIngress::RequestStop() noexcept {
     }
 
     CloseMatchingJobs([](const ClientSession&) noexcept { return true; });
+    // Claims still in flight resolve to nothing once stopping.
+    if (relay_) {
+        for (const auto& [token, owned] : owned_tokens_) {
+            (void)owned;
+            relay_->ReleaseToken(token);
+        }
+    }
+    owned_tokens_.clear();
     NotifyCompletion();
 }
 
@@ -541,11 +585,11 @@ net::awaitable<void> UdpIngress::AsyncJoin() {
             ~ReleaseObserver() { --observers; }
         } release{join_observers_};
         try {
-            while (outstanding_jobs_ != 0 || reply_senders_ != 0) {
+            while (Busy()) {
                 auto [ec] = co_await completion_signal_.async_receive(
                     net::as_tuple(asio::bind_cancellation_slot(
                         asio::cancellation_slot{}, net::use_awaitable)));
-                if (ec && (outstanding_jobs_ != 0 || reply_senders_ != 0))
+                if (ec && Busy())
                     throw IoSystemError(ec, "UDP native dispatch join failed");
             }
             if (state_ == State::Stopping)
@@ -712,38 +756,340 @@ void UdpIngress::ProcessDatagram(const UdpDatagramContext& datagram) {
             return;
         }
         if (!decoded->user) return;
-        UdpHandoffIdentity identity{
+        const UdpHandoffIdentity identity{
             &socket,
             ClientSessionKey{decoded->session_owner, decoded->session_id, {},
                              prepared->settings.get()}};
-        auto record = handoff_directory_.Claim(
-            identity, prepared->settings, *decoded->association_policy);
-        if (!record) return;
-        record->socket_pin = socket.shared_from_this();
-        auto release_claim = MakeScopeExit([record]() noexcept {
-            record->association->claimed = false;
-        });
-        if (auto session = record->session.lock()) {
-            if (session->Closed() ||
-                !record->association->Check(*decoded->packet_id, datagram.worker_id,
-                    datagram.client_endpoint, proxy::InboundDatagramCheck::Commit)) {
-                return;
-            }
-            session->UpdateReplyEndpoint(datagram.client_endpoint);
-            if (auto* hook = session->association_hook_) {
-                hook->last_active = now;
-            }
-            (void)session->Push(decoded->target, std::move(decoded->payload));
-            return;
-        }
-        if (!record->association->Check(*decoded->packet_id, datagram.worker_id,
-                datagram.client_endpoint, proxy::InboundDatagramCheck::Commit)) {
-            return;
-        }
-        ProcessDecoded(datagram, std::move(*decoded), now, std::move(record));
+        if (relay_ && RouteSessionDatagram(datagram, identity, *decoded)) return;
+        DeliverSessionDatagram(datagram, identity, std::move(*decoded), now);
         return;
     }
     ProcessDecoded(datagram, std::move(*decoded), now);
+}
+
+void UdpIngress::DeliverSessionDatagram(const UdpDatagramContext& datagram,
+    const UdpHandoffIdentity& identity, proxy::InboundDatagramResult decoded,
+    std::chrono::steady_clock::time_point now) {
+    auto record = handoff_directory_.Claim(
+        identity, datagram.environment.prepared->settings, *decoded.association_policy);
+    if (!record) return;
+    record->socket_pin = datagram.socket->shared_from_this();
+    auto release_claim = MakeScopeExit([record]() noexcept {
+        record->association->claimed = false;
+    });
+    if (auto session = record->session.lock()) {
+        if (session->Closed() ||
+            !record->association->Check(*decoded.packet_id, datagram.worker_id,
+                datagram.client_endpoint, proxy::InboundDatagramCheck::Commit)) {
+            return;
+        }
+        session->UpdateReplyEndpoint(datagram.client_endpoint);
+        if (auto* hook = session->association_hook_) {
+            hook->last_active = now;
+        }
+        (void)session->Push(decoded.target, std::move(decoded.payload));
+        return;
+    }
+    if (!record->association->Check(*decoded.packet_id, datagram.worker_id,
+            datagram.client_endpoint, proxy::InboundDatagramCheck::Commit)) {
+        return;
+    }
+    ProcessDecoded(datagram, std::move(decoded), now, std::move(record));
+}
+
+// What a claim holds while the coordinator decides which Worker runs the
+// session: the datagrams that arrived meanwhile, and what creating the
+// session here needs once the synchronous decode views are gone.
+struct UdpIngress::PendingSessionClaim {
+    struct Datagram {
+        udp::endpoint client;
+        uint64_t packet_id = 0;
+        common::TargetAddress target;
+        common::MultiBuffer payload;
+        std::optional<common::ForwardedMetadata> forwarded;
+        // The Worker that received it.
+        uint32_t source = 0;
+    };
+
+    SocketStatePtr socket;
+    DatagramSessionEnvironment environment;
+    const proxy::InboundDatagramAssociationPolicy* policy = nullptr;
+    common::UserProfile profile;
+    uint32_t worker_id = 0;
+    uint64_t token = 0;
+    common::RingDeque<Datagram> datagrams;
+
+    void Queue(Datagram datagram) {
+        if (datagrams.size() < kMaxPendingClaimDatagrams) datagrams.push_back(std::move(datagram));
+    }
+};
+
+bool UdpIngress::RouteSessionDatagram(const UdpDatagramContext& datagram,
+    const UdpHandoffIdentity& identity, proxy::InboundDatagramResult& decoded) {
+    // A session this Worker runs takes its datagrams here.
+    if (const auto* record = handoff_directory_.Find(identity)) {
+        if (const auto session = record->session.lock(); session && !session->Closed()) {
+            return false;
+        }
+    }
+    if (const auto route = remote_routes_.find(identity); route != remote_routes_.end()) {
+        if (common::SetUdpTarget(decoded.payload, decoded.target)) {
+            relay_->Forward(route->second.owner.worker, route->second.owner.token,
+                            *decoded.packet_id, datagram.client_endpoint,
+                            std::move(decoded.payload));
+        }
+        return true;
+    }
+    if (const auto pending = pending_claims_.find(identity); pending != pending_claims_.end()) {
+        pending->second->Queue(PendingSessionClaim::Datagram{
+            .client = datagram.client_endpoint, .packet_id = *decoded.packet_id,
+            .target = std::move(decoded.target), .payload = std::move(decoded.payload),
+            .forwarded = std::move(decoded.forwarded), .source = relay_->Index()});
+        return true;
+    }
+    StartSessionClaim(datagram, identity, decoded);
+    return true;
+}
+
+void UdpIngress::StartSessionClaim(const UdpDatagramContext& datagram,
+    const UdpHandoffIdentity& identity, proxy::InboundDatagramResult& decoded) {
+    if (pending_claims_.size() >= kMaxPendingSessionClaims || !datagram.environment.admission) {
+        return;
+    }
+    auto claim = std::make_unique<PendingSessionClaim>();
+    claim->socket = datagram.socket->shared_from_this();
+    claim->environment = datagram.environment;
+    claim->policy = decoded.association_policy;
+    claim->profile = *decoded.user;
+    claim->worker_id = datagram.worker_id;
+    claim->Queue(PendingSessionClaim::Datagram{
+        .client = datagram.client_endpoint, .packet_id = *decoded.packet_id,
+        .target = std::move(decoded.target), .payload = std::move(decoded.payload),
+        .forwarded = std::move(decoded.forwarded), .source = relay_->Index()});
+    const auto key = NativeSessionOwnerKey(*datagram.socket, identity.client);
+    auto& coordinator = datagram.environment.admission->coordinator;
+    const auto [entry, inserted] = pending_claims_.try_emplace(identity, std::move(claim));
+    if (!inserted) return;
+    auto& pending = *entry->second;
+    // Other Workers may learn this token from the directory before the claim
+    // returns here; their datagrams then join the queue above.
+    pending.token = relay_->ReserveToken(*this);
+    try {
+        owned_tokens_.try_emplace(pending.token, OwnedToken{.pending = &pending, .session = {}});
+        ++session_claims_;
+        try {
+            net::co_spawn(io_context_,
+                RunSessionClaim(identity, key, pending.token, coordinator),
+                [this](std::exception_ptr) {
+                    --session_claims_;
+                    NotifyCompletion();
+                });
+        } catch (...) {
+            --session_claims_;
+            throw;
+        }
+    } catch (...) {
+        owned_tokens_.erase(pending.token);
+        relay_->ReleaseToken(pending.token);
+        pending_claims_.erase(entry);
+        throw;
+    }
+}
+
+net::awaitable<void> UdpIngress::RunSessionClaim(UdpHandoffIdentity identity,
+    SessionOwnerKey key, uint64_t token, GroupCoordinator& coordinator) {
+    SessionClaim claim;
+    try {
+        claim = co_await ClaimSessionOwner(coordinator, key, SessionOwner{relay_->Index(), token});
+    } catch (...) {
+        // Without the directory the session cannot be shared: it runs here,
+        // unannounced, as with a single Worker.
+        claim = SessionClaim{.owner = SessionOwner{relay_->Index(), token}, .ownership = {}};
+    }
+    ResolveSessionClaim(identity, std::move(claim));
+}
+
+void UdpIngress::ResolveSessionClaim(const UdpHandoffIdentity& identity, SessionClaim claim) {
+    const auto found = pending_claims_.find(identity);
+    if (found == pending_claims_.end()) return;
+    auto pending = std::move(found->second);
+    pending_claims_.erase(found);
+    common::MaybeShrinkHashContainer(pending_claims_);
+    const uint64_t token = pending->token;
+    const bool owned_here = claim.owner.worker == relay_->Index();
+    const auto release_token = [&]() noexcept {
+        owned_tokens_.erase(token);
+        relay_->ReleaseToken(token);
+    };
+    if (state_ != State::Running || !OwnsSocket(*pending->socket)) {
+        release_token();
+        return;
+    }
+    if (!owned_here) {
+        // Nobody learned this token: the directory named another owner.
+        release_token();
+        AddRemoteRoute(identity, claim.owner);
+        while (!pending->datagrams.empty()) {
+            auto datagram = std::move(pending->datagrams.front());
+            pending->datagrams.pop_front();
+            if (!common::SetUdpTarget(datagram.payload, datagram.target)) continue;
+            relay_->Forward(claim.owner.worker, claim.owner.token, datagram.packet_id,
+                            datagram.client, std::move(datagram.payload));
+        }
+        return;
+    }
+    const auto* receiver = pending->environment.handler
+        ? &pending->environment.handler->ReceiverSettings() : nullptr;
+    if (!receiver || !pending->environment.prepared || !pending->environment.prepared->settings) {
+        release_token();
+        return;
+    }
+    std::shared_ptr<ClientSession> session;
+    while (!pending->datagrams.empty()) {
+        auto datagram = std::move(pending->datagrams.front());
+        pending->datagrams.pop_front();
+        const UdpDatagramContext context{
+            .socket = pending->socket.get(),
+            .client_endpoint = datagram.client,
+            .payload = {},
+            .receiver = receiver,
+            .io_context = io_context_,
+            .worker_id = pending->worker_id,
+            .environment = pending->environment,
+        };
+        DeliverSessionDatagram(context, identity, proxy::InboundDatagramResult{
+            .target = std::move(datagram.target),
+            .payload = std::move(datagram.payload),
+            .forwarded = std::move(datagram.forwarded),
+            .session_id = identity.client.session_id,
+            .session_owner = identity.client.owner,
+            .packet_id = datagram.packet_id,
+            .association_policy = pending->policy,
+            .user = &pending->profile,
+        }, std::chrono::steady_clock::now());
+        if (!session) {
+            const auto* record = handoff_directory_.Find(identity);
+            session = record ? record->session.lock() : nullptr;
+            if (!session || session->Closed()) {
+                // Creation failed: datagrams of other Workers draw a Gone.
+                session.reset();
+                release_token();
+                return;
+            }
+            if (claim.ownership) {
+                session->relay_token_ = token;
+                session->ownership_ = std::move(claim.ownership);
+                owned_tokens_.insert_or_assign(token, OwnedToken{.pending = nullptr, .session = session});
+            } else {
+                // The directory was full: the session runs here unannounced.
+                release_token();
+            }
+        }
+        if (datagram.source != relay_->Index() && session->relay_token_ &&
+            std::find(session->relay_sources_.begin(), session->relay_sources_.end(),
+                      datagram.source) == session->relay_sources_.end()) {
+            session->relay_sources_.push_back(datagram.source);
+        }
+    }
+    if (!session) release_token();
+}
+
+void UdpIngress::ReceiveRelayedDatagram(uint32_t from, uint64_t token, uint64_t packet_id,
+                                        const udp::endpoint& client,
+                                        common::MultiBuffer payload) noexcept {
+    const auto found = owned_tokens_.find(token);
+    if (found == owned_tokens_.end()) {
+        relay_->SendGone(from, token);
+        return;
+    }
+    const auto datagram = common::InspectUdpDatagram(payload);
+    if (!datagram.Valid()) return;
+    try {
+        common::TargetAddress target = *datagram.target;
+        if (auto* pending = found->second.pending) {
+            pending->Queue(PendingSessionClaim::Datagram{
+                .client = client, .packet_id = packet_id, .target = std::move(target),
+                .payload = std::move(payload), .forwarded = std::nullopt, .source = from});
+            return;
+        }
+        const auto session = found->second.session.lock();
+        if (!session || session->Closed() || !session->handoff_record_) {
+            relay_->SendGone(from, token);
+            return;
+        }
+        // The path rule of the association treats this Worker's socket as
+        // the path, whichever Worker received the datagram.
+        if (!session->handoff_record_->association->Check(packet_id, session->reply_.worker_id,
+                client, proxy::InboundDatagramCheck::Commit)) {
+            return;
+        }
+        if (auto* hook = session->association_hook_) {
+            hook->last_active = std::chrono::steady_clock::now();
+        }
+        session->UpdateReplyEndpoint(client);
+        if (std::find(session->relay_sources_.begin(), session->relay_sources_.end(), from) ==
+            session->relay_sources_.end()) {
+            session->relay_sources_.push_back(from);
+        }
+        (void)session->Push(target, std::move(payload));
+    } catch (...) {
+        // Allocation failure drops the datagram.
+    }
+}
+
+void UdpIngress::AddRemoteRoute(const UdpHandoffIdentity& identity, SessionOwner owner) {
+    if (const auto existing = remote_routes_.find(identity); existing != remote_routes_.end()) {
+        const std::pair<uint32_t, uint64_t> old_key{
+            existing->second.owner.worker, existing->second.owner.token};
+        remote_route_keys_.erase(old_key);
+        relay_->RemoveRoute(old_key.first, old_key.second);
+        remote_routes_.erase(existing);
+    }
+    // Without room the datagrams of this session each claim again.
+    if (remote_routes_.size() >= kMaxRemoteRoutes) return;
+    const std::pair<uint32_t, uint64_t> key{owner.worker, owner.token};
+    relay_->AddRoute(owner.worker, owner.token, *this);
+    try {
+        remote_route_keys_.try_emplace(key, identity);
+        remote_routes_.try_emplace(identity, RemoteRoute{owner});
+    } catch (...) {
+        remote_route_keys_.erase(key);
+        relay_->RemoveRoute(owner.worker, owner.token);
+        throw;
+    }
+}
+
+void UdpIngress::ForgetRemoteRoute(uint32_t owner, uint64_t token) noexcept {
+    const auto found = remote_route_keys_.find({owner, token});
+    if (found == remote_route_keys_.end()) return;
+    remote_routes_.erase(found->second);
+    remote_route_keys_.erase(found);
+    common::MaybeShrinkHashContainer(remote_routes_);
+    common::MaybeShrinkHashContainer(remote_route_keys_);
+}
+
+void UdpIngress::EraseRemoteRoutes(const SocketState& socket) noexcept {
+    for (auto route = remote_routes_.begin(); route != remote_routes_.end();) {
+        if (route->first.socket != &socket) {
+            ++route;
+            continue;
+        }
+        const std::pair<uint32_t, uint64_t> key{route->second.owner.worker,
+                                                route->second.owner.token};
+        remote_route_keys_.erase(key);
+        if (relay_) relay_->RemoveRoute(key.first, key.second);
+        route = remote_routes_.erase(route);
+    }
+}
+
+void UdpIngress::ReleaseOwnedSession(ClientSession& session) noexcept {
+    const uint64_t token = std::exchange(session.relay_token_, 0);
+    session.ownership_.Release();
+    if (!relay_) return;
+    owned_tokens_.erase(token);
+    relay_->ReleaseToken(token);
+    for (const uint32_t source : session.relay_sources_) relay_->SendGone(source, token);
+    session.relay_sources_.clear();
 }
 
 void UdpIngress::ProcessDecoded(const UdpDatagramContext& datagram,
@@ -1008,7 +1354,7 @@ net::awaitable<void> UdpIngress::SendUdpReplies(
 }
 
 void UdpIngress::NotifyCompletion() noexcept {
-    if (outstanding_jobs_ != 0 || reply_senders_ != 0) return;
+    if (Busy()) return;
     if (state_ == State::Stopping) state_ = State::Drained;
     if (join_observers_ == 0) return;
     try {
@@ -1107,6 +1453,7 @@ UdpIngress::SocketStatePtr UdpIngress::AttachSocket(SocketPtr socket) {
     const auto local = state->socket->local_endpoint(ec);
     if (!ec && !local.address().is_unspecified())
         state->local_endpoint.emplace(common::NormalizeAddress(local.address()), local.port());
+    if (!ec) state->bound_endpoint = local;
     sockets_.emplace(state.get(), state);
     return state;
 }
@@ -1128,6 +1475,7 @@ void UdpIngress::CloseSocket(SocketState& socket) noexcept {
     socket.socket->cancel(ec);
     socket.socket->close(ec);
     CleanupClientSessions(socket);
+    EraseRemoteRoutes(socket);
     CloseMatchingJobs([&socket](const ClientSession& job) noexcept {
         return job.reply_.socket.get() == &socket;
     });
@@ -1158,6 +1506,11 @@ void UdpIngress::CloseMatchingJobs(Pred&& match) noexcept {
         auto session = std::move(current->notification_pin_);
         if (session) session->Close();
     }
+}
+
+UdpHandoffRecord* UdpHandoffDirectory::Find(const UdpHandoffIdentity& key) const noexcept {
+    const auto found = records_.find(key);
+    return found == records_.end() ? nullptr : found->second.get();
 }
 
 std::shared_ptr<UdpHandoffRecord> UdpHandoffDirectory::Claim(

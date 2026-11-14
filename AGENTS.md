@@ -73,7 +73,7 @@ flowchart TD
 
 - **HY2/QUIC**：各 Worker 在同一 UDP 端口 `SO_REUSEPORT` 监听；服务端 SCID 含 `worker_id`，`SO_ATTACH_REUSEPORT_CBPF` 按 Short Header DCID 投递至 Origin Worker，Long Header 握手按四元组哈希分流。RFC 9000 迁移/NAT 重绑定后仍由 Origin Worker 验证路径并用本地监听 socket 回包，零跨线程交互。每个 HY2 入站只支持固定 UDP 端口，不支持端口集合/范围、跳跃周期或自动防火墙重定向；外部 DNAT 可能隐藏原始目标端口，不得声称能仅凭收包识别或禁止客户端端口跳跃。
 - **XHTTP Split-HTTP**：会话所在 Worker 独占会话、路由、出站和 relay；其他 Worker 收到的同会话请求经 SPSC 队列与之交互。连接不迁移，不合组活跃 HTTP/2 会话。
-- **原生 UDP**：关联及其原生 socket、UDP-over-TCP 隧道/池流由接受并创建它的 Worker 本地独占，对齐 Xray-core/Shadowsocks-rust 的 Share-Nothing 模型；不得迁移出站。
+- **原生 UDP 与 XUDP**：关联、出站及 UDP-over-TCP 隧道/池流由创建它的 Worker 本地独占；SS2022 会话、XUDP Global ID 流的归属 Worker 由协调器目录登记，其他 Worker 收到的同会话数据报经 SPSC 队列交给它。出站不迁移。
 
 ## C++ 状态、解析与异步生命周期
 
