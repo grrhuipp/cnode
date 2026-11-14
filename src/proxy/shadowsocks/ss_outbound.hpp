@@ -110,11 +110,13 @@ public:
         const size_t maximum = server_endpoint_->address().is_v6() ? 65527 : 65507;
         if (encoded_len == 0 || encoded_len > maximum)
             throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
-        uint8_t* dst = encode_scratch_.Prepare(encoded_len);
-        if (EncodePacketTo(*datagram->target, bytes, dst, encoded_len) != encoded_len)
+        common::BufferGuard encoded{common::Buffer::New(encoded_len)};
+        if (!encoded) throw std::bad_alloc();
+        if (EncodePacketTo(*datagram->target, bytes, encoded->Tail().data(), encoded_len) != encoded_len)
             throw transport::LinkError(common::ErrorCode::INTERNAL);
-        const std::array<net::const_buffer, 1> buffers{net::buffer(dst, encoded_len)};
-        co_await write.SendTo(*server_endpoint_, buffers);
+        encoded->Produce(encoded_len);
+        payload.clear();
+        co_await write.SendTo(*server_endpoint_, common::MultiBuffer{std::move(encoded)});
     }
 private:
     size_t EncodedPacketSize(const common::TargetAddress& target, std::span<const uint8_t> payload) {
@@ -140,7 +142,6 @@ private:
     const std::span<const proxy::KeyBytes> psk_chain_;
     std::optional<common::ForwardedMetadata> forwarded_;
     std::optional<proxy::Ss2022UdpSessionState> ss2022_state_;
-    common::ContiguousWriteBuffer encode_scratch_;
 };
 
 // A complete, validated credential value. Preparation never drops a chain link

@@ -25,8 +25,8 @@ public:
         : OutboundDatagramEndpointBase(io, bind_address), dns_(dns) {}
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
+        auto read = socket_.StartRead();
         for (;;) {
-            auto read = socket_.StartRead();
             auto packet = co_await read.Receive();
             if (packet.source.port() == 0) {
                 continue;

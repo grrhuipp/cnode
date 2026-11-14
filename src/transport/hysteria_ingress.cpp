@@ -2074,11 +2074,28 @@ net::awaitable<void> QuicStream::WriteMultiBuffer(common::MultiBuffer payload) {
 net::awaitable<void> QuicStream::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
     if (closed_) return WriteMultiBuffer({});
-    common::MultiBuffer payload;
+    size_t total_bytes = 0;
     for (const auto& buffer : buffers) {
-        const auto bytes = std::span(
-            static_cast<const uint8_t*>(buffer.data()), buffer.size());
-        if (!payload.AppendSpan(bytes)) {
+        if (buffer.size() > std::numeric_limits<size_t>::max() - total_bytes) {
+            return [](common::MultiBuffer) -> net::awaitable<void> {
+                throw std::bad_alloc();
+                co_return;
+            }({});
+        }
+        total_bytes += buffer.size();
+    }
+    common::MultiBuffer payload;
+    if (total_bytes != 0) {
+        try {
+            uint8_t* dst = payload.PrepareAppend(total_bytes);
+            size_t written = 0;
+            for (const auto& buffer : buffers) {
+                if (buffer.size() == 0) continue;
+                std::memcpy(dst + written, buffer.data(), buffer.size());
+                written += buffer.size();
+            }
+            payload.CommitAppend(written);
+        } catch (const std::bad_alloc&) {
             return [](common::MultiBuffer) -> net::awaitable<void> {
                 throw std::bad_alloc();
                 co_return;

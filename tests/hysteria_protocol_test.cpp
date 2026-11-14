@@ -208,12 +208,20 @@ TEST_F(HysteriaProtocol, UdpPreservesEmptyAndMaximumPayloadsAcrossAddressForms) 
 
 TEST_F(HysteriaProtocol, HandshakeResponsesKeepTheirWireEncoding) {
     using namespace ::transport;
-    const std::vector<uint8_t> hello{
+    const std::array<uint8_t, 21> expected_hello{
         1, 1, 2, 3, 4, 5, 6, 7, 8, 8, 7, 6, 5, 4, 3, 2, 1, 0, 2, 'o', 'k'};
-    EXPECT_EQ(EncodeV1ServerHello(
-        true, 0x0102030405060708ULL, 0x0807060504030201ULL, "ok"), hello);
-    const std::vector<uint8_t> response{0, 0x12, 0x34, 0x56, 0x78, 0, 2, 'n', 'o'};
-    EXPECT_EQ(EncodeV1Response(false, 0x12345678, "no"), response);
+    std::array<uint8_t, 32> hello{};
+    const size_t hello_size = EncodeV1ServerHelloTo(
+        hello, true, 0x0102030405060708ULL, 0x0807060504030201ULL, "ok");
+    ASSERT_EQ(hello_size, expected_hello.size());
+    EXPECT_TRUE(std::ranges::equal(std::span(hello).first(hello_size), expected_hello));
+
+    const std::array<uint8_t, 9> expected_response{
+        0, 0x12, 0x34, 0x56, 0x78, 0, 2, 'n', 'o'};
+    std::array<uint8_t, 16> response{};
+    const size_t response_size = EncodeV1ResponseTo(response, false, 0x12345678, "no");
+    ASSERT_EQ(response_size, expected_response.size());
+    EXPECT_TRUE(std::ranges::equal(std::span(response).first(response_size), expected_response));
 }
 
 }  // namespace

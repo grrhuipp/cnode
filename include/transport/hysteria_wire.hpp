@@ -76,9 +76,6 @@ ParseV1ClientHello(std::span<const uint8_t> input);
 size_t EncodeV1ServerHelloTo(
     std::span<uint8_t> out, bool accepted, uint64_t send_bps,
     uint64_t receive_bps, std::string_view message) noexcept;
-[[nodiscard]] std::vector<uint8_t>
-EncodeV1ServerHello(bool accepted, uint64_t send_bps, uint64_t receive_bps,
-                    std::string_view message);
 
 [[nodiscard]] tl::expected<V1Request, ProtocolError>
 ParseV1Request(std::span<const uint8_t> input);
@@ -86,8 +83,6 @@ ParseV1Request(std::span<const uint8_t> input);
 size_t EncodeV1ResponseTo(
     std::span<uint8_t> out, bool accepted, uint32_t udp_session_id,
     std::string_view message) noexcept;
-[[nodiscard]] std::vector<uint8_t>
-EncodeV1Response(bool accepted, uint32_t udp_session_id, std::string_view message);
 
 [[nodiscard]] tl::expected<V2TcpRequest, ProtocolError>
 ParseV2TcpRequest(std::span<const uint8_t> input);
