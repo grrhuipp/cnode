@@ -16,6 +16,11 @@ inline constexpr size_t kHttp2FrameHeaderSize = 9;
 inline constexpr size_t kHttp2MaxFramePayload = 16 * 1024;
 inline constexpr size_t kHttp2MaxHeaderBlockSize = 64 * 1024;
 inline constexpr size_t kHttp2MaxConcurrentStreams = 256;
+// RFC 9113 5.1.2 counts only open/half-closed streams, so a compliant client
+// reopens as soon as a stream closes while its request work still unwinds.
+// Bound that lingering work separately, at the 4x advertised streams Go
+// x/net/http2 tolerates before treating resets as abuse (CVE-2023-44487).
+inline constexpr size_t kHttp2MaxActiveRequests = 4 * kHttp2MaxConcurrentStreams;
 // RFC 9113 5.2.2: keep reading control frames when a consumer stalls.
 // One stream cannot occupy the whole connection window. Allocation budgets
 // also cover tiny-frame capacity amplification and the gRPC assembly buffer.

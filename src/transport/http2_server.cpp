@@ -1117,7 +1117,7 @@ net::awaitable<bool> Http2ServerSession::ReceiveHeaders(H2Frame frame) {
         co_return co_await ResetStream(stream_id, H2Error::Protocol);
     }
     if (streams_.size() >= kHttp2MaxConcurrentStreams ||
-        active_requests_ >= kHttp2MaxConcurrentStreams) {
+        active_requests_ >= kHttp2MaxActiveRequests) {
         co_return co_await ResetStream(stream_id, H2Error::RefusedStream);
     }
     if (payload_codec_ == H2PayloadCodec::RawData && !xhttp_config_ && http_config_) {
