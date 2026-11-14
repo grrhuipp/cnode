@@ -234,7 +234,7 @@ public:
     using SocketPtr = std::shared_ptr<udp::socket>;
 
     HysteriaIngress(uint32_t worker_id, uint32_t worker_count, net::io_context& io_context,
-                   app::DatagramSessionEnvironment environment);
+                   app::InboundSessionEnvironment environment);
     ~HysteriaIngress() noexcept;
 
     HysteriaIngress(const HysteriaIngress&) = delete;
@@ -265,7 +265,7 @@ private:
                        std::span<const uint8_t> packet);
     net::awaitable<void> SendLoop(std::shared_ptr<HysteriaSocketState> socket);
 
-    app::DatagramSessionEnvironment environment;
+    app::InboundSessionEnvironment environment;
     std::unordered_map<HysteriaConnection*, std::shared_ptr<HysteriaConnection>> sessions;
     uint32_t worker_id;
     uint32_t worker_count;

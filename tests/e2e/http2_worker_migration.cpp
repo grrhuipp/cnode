@@ -50,6 +50,39 @@ TEST_P(Http2WorkerMigration, SourceIndependentSessionsMergeAndDetachWithActiveRe
             for (auto& exchange : exchanges) exchange->Join();
         }
         node.child->Signal(SIGTERM); EXPECT_EQ(node.child->Wait(8s), 0);
+    } else if (mode == "h2-move") {
+        // The downlink's Worker owns the session. A fresh HTTP/2 connection
+        // whose first request uploads to it moves there before its server
+        // preface, whichever Worker accepted it.
+        Peer down(node.port, tls, "xhttp", "127.0.0.7");
+        down.Down(1, "moving");
+        std::string expected(2, '\0');
+        for (unsigned sequence = 0; sequence < 8; ++sequence) {
+            const auto payload = "moved-" + std::to_string(sequence);
+            Peer upload(node.port, tls, "xhttp", "127.0.0." + std::to_string(20 + sequence));
+            upload.Packet(1, "moving", sequence, sequence ? payload : VlessRequest(target.Port(), payload));
+            upload.Committed(1);
+            EXPECT_FALSE(upload.goaway);
+            expected += payload; down.Message(1, expected);
+        }
+        // An established connection refuses a stream of a session another
+        // Worker owns: GOAWAY (NO_ERROR) then REFUSED_STREAM, so the client
+        // retries it on a new connection; its own stream keeps working.
+        unsigned refused = 0;
+        for (unsigned i = 0; i < 8; ++i) {
+            Peer other(node.port, tls, "xhttp", "127.0.0." + std::to_string(40 + i));
+            other.Down(1, "other-" + std::to_string(i));
+            other.wire.Write(Frame(1, 5, 3, Headers("xhttp", tls, "/fixture/moving/" + std::to_string(8 + i))));
+            other.Wait([&] { return other.Terminal(3); });
+            if (!other.Has(3, 3)) continue;
+            ++refused;
+            EXPECT_EQ(other.Bodies(3, 3), std::vector<std::string>{BigEndian(7, 4)});
+            EXPECT_EQ(other.Bodies(7, 0), std::vector<std::string>{BigEndian(3, 4) + BigEndian(0, 4)});
+            other.Ping("drained!");
+            EXPECT_FALSE(other.closed);
+        }
+        EXPECT_GT(refused, 0U) << "every connection landed on the owner Worker";
+        node.child->Signal(SIGTERM); EXPECT_EQ(node.child->Wait(8s), 0);
     } else {
         ASSERT_NE(extra, node.port);
         Peer first(node.port, tls, "xhttp", "127.0.0.7"), second(extra, tls, "xhttp", "127.0.0.8");
@@ -65,6 +98,6 @@ TEST_P(Http2WorkerMigration, SourceIndependentSessionsMergeAndDetachWithActiveRe
     target.Join();
 }
 INSTANTIATE_TEST_SUITE_P(FourWorkersTcpTls, Http2WorkerMigration, testing::Combine(testing::Bool(), testing::Values(
-    std::string("packet-up"), std::string("stream-up"), std::string("isolation"))));
+    std::string("packet-up"), std::string("stream-up"), std::string("isolation"), std::string("h2-move"))));
 } // namespace
 } // namespace cnode::e2e::http2

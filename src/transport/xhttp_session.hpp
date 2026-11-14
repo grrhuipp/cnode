@@ -3,6 +3,8 @@
 #include "common/allocator.hpp"
 #include "common/multi_buffer.hpp"
 #include "transport/async_stream.hpp"
+#include "transport/tcp_stream.hpp"
+#include "transport/tls_stream.hpp"
 #include "transport/transport_stack.hpp"
 #include <algorithm>
 #include <cstddef>
@@ -13,6 +15,8 @@
 #include <string_view>
 #include <utility>
 #include <map>
+#include <optional>
+#include <variant>
 #include <string>
 
 #include "transport/http2_session.hpp"
@@ -417,8 +421,19 @@ enum class XHttpSessionAccess : uint8_t {
     // Joins, or starts a session, replacing one whose id already ended.
     Open,
     // Joins, or starts a session for an id absent from the bounded replay
-    // window; an HTTP/1 upload may arrive before its downlink.
+    // window; an upload may arrive before its downlink.
     Upload,
+};
+
+// Where a request of a session is served: the owner Worker, and the live
+// session when the caller is that owner. The first request of a session, of
+// any kind, makes its Worker the owner (as Xray upserts on any request).
+// A null owner rejects the request; a packet upload whose id already ended
+// stays on the caller without a session, so HTTP/1 can answer 404 and keep
+// its connection.
+struct XHttpSessionResolution {
+    net::io_context* owner = nullptr;
+    std::shared_ptr<XHttpPacketUpSession> session;
 };
 
 // Configuration namespace + id select a session on the Worker's session table.
@@ -426,20 +441,46 @@ enum class XHttpSessionAccess : uint8_t {
 // the next lookup drains events, never scans the live table.
 // Limits: 1024 live entries per Worker, 65536 live directory records per group,
 // and the most recent 1024 ended ids in each bounded FIFO replay window.
-[[nodiscard]] net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
+[[nodiscard]] net::awaitable<XHttpSessionResolution> ResolveXHttpSession(
     app::GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::string_view session_namespace,
     std::string_view session_id,
     XHttpSessionAccess access);
 
-// Owner-thread fast path for Join/Upload when the session already lives on
-// this Worker's local table (steady-state HTTP/2 and persistent HTTP/1.1
-// packet-up uploads), avoiding two lookup coroutine frames per packet.
-[[nodiscard]] std::shared_ptr<XHttpPacketUpSession> TryGetLocalXHttpPacketSession(
-    net::io_context& io_context,
+// Read-only: the Worker owning the live session, or null. Never starts one.
+[[nodiscard]] net::awaitable<net::io_context*> FindXHttpSessionOwner(
+    app::GroupCoordinator& coordinator,
     std::string_view session_namespace,
     std::string_view session_id);
+
+// Workers share nothing, so every connection carrying a request of a session
+// is served by the session's owner Worker. A server connection moves there
+// whole (fd, TLS state, and the bytes read so far) at a point where none of
+// its I/O, timers or responses are in flight: before an HTTP/1 request is
+// answered, or before the HTTP/2 server preface. Bytes never cross Workers
+// after that; an established HTTP/2 connection refuses foreign streams instead.
+struct DetachedXHttpStream {
+    std::variant<DetachedTcpState, DetachedTlsState> state;
+};
+
+// `replay` is read again first once restored. Null when the stream has I/O in
+// flight or is not a plain TCP or TLS connection; the stream is then intact.
+[[nodiscard]] std::optional<DetachedXHttpStream> DetachXHttpStream(
+    AsyncStream& stream, common::MultiBuffer replay);
+[[nodiscard]] std::unique_ptr<AsyncStream> RestoreXHttpStream(
+    net::io_context& io_context, DetachedXHttpStream detached);
+
+struct XHttpConnectionMove {
+    // The connection came to this Worker for its current request, which is
+    // served here even if its session moved on meanwhile; only later
+    // requests may move it again, so a connection never ping-pongs.
+    bool pinned = false;
+    // Filled by a server that detached the connection for `owner`; its
+    // caller resumes serving it there.
+    net::io_context* owner = nullptr;
+    std::optional<DetachedXHttpStream> detached;
+};
 
 // Teardown joins upload-response readers before releasing their Worker's
 // transport hosts. Standalone callers pass their io_context.
@@ -473,7 +514,8 @@ struct XHttpRefererScratch {
     uint64_t conn_id,
     InboundTransportMetadata* transport_metadata,
     std::span<const uint8_t> initial,
-    const std::shared_ptr<InboundTransportStreamHandler>& stream_handler);
+    const std::shared_ptr<InboundTransportStreamHandler>& stream_handler,
+    XHttpConnectionMove* move);
 
 [[nodiscard]] net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(
     std::unique_ptr<AsyncStream> stream,

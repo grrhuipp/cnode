@@ -72,7 +72,7 @@ flowchart TD
 跨四元组/物理连接的同会话流量只能在入口归集，用户态不转交业务载荷：
 
 - **HY2/QUIC**：各 Worker 在同一 UDP 端口 `SO_REUSEPORT` 监听；服务端 SCID 含 `worker_id`，`SO_ATTACH_REUSEPORT_CBPF` 按 Short Header DCID 投递至 Origin Worker，Long Header 握手按四元组哈希分流。RFC 9000 迁移/NAT 重绑定后仍由 Origin Worker 验证路径并用本地监听 socket 回包，零跨线程交互。每个 HY2 入站只支持固定 UDP 端口，不支持端口集合/范围、跳跃周期或自动防火墙重定向；外部 DNAT 可能隐藏原始目标端口，不得声称能仅凭收包识别或禁止客户端端口跳跃。
-- **XHTTP Split-HTTP**：下行 `GET` 的 Origin Worker 独占完整会话、路由、出站和 relay。异 Worker 收到同 `session_id` 的 `stream-up`/`packet-up` 时，只读首个 HTTP 请求头；在无在途 I/O、出站和定时器的静止边界，单次提取入站 `fd`、TLS 状态及预读字节，经有界控制邮箱交 Origin Worker `assign`。此后所有请求/字节均在原 Worker 本地读写，禁止跨 Worker 投递业务缓冲或合组活跃 HTTP/2 会话。
+- **XHTTP Split-HTTP**：收到会话首个请求（任意种类，同 Xray 按任意请求建会话）的 Origin Worker 独占完整会话、路由、出站和 relay。异 Worker 连接上的同 `session_id` 请求只读到请求头（HTTP/2 为服务端前言后首个 HEADERS），在无在途 I/O、应答和定时器的静止边界，单次提取入站 `fd`、TLS 状态及已读字节交 Origin Worker，由其以同 tag 入站重建 handler 后从头服务；接受连接的 Worker 挂起等待并保留物理准入。已服务其他流的 HTTP/2 连接不迁移，异 Worker 会话的新流以 GOAWAY(NO_ERROR) + REFUSED_STREAM 拒绝，由客户端在新连接重试。禁止跨 Worker 投递业务缓冲或合组活跃 HTTP/2 会话。
 - **原生 UDP**：关联及其原生 socket、UDP-over-TCP 隧道/池流由接受并创建它的 Worker 本地独占，对齐 Xray-core/Shadowsocks-rust 的 Share-Nothing 模型；不得迁移出站或跨 Worker 转发数据报。
 
 ## C++ 状态、解析与异步生命周期

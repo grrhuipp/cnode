@@ -15,7 +15,8 @@ namespace transport {
 inline constexpr size_t kHttp2FrameHeaderSize = 9;
 inline constexpr size_t kHttp2MaxFramePayload = 16 * 1024;
 inline constexpr size_t kHttp2MaxHeaderBlockSize = 64 * 1024;
-inline constexpr size_t kHttp2MaxConcurrentStreams = 256;
+// The SETTINGS_MAX_CONCURRENT_STREAMS of Go net/http, which serves Xray's XHTTP.
+inline constexpr size_t kHttp2MaxConcurrentStreams = 250;
 // RFC 9113 5.1.2 counts only open/half-closed streams, so a compliant client
 // reopens as soon as a stream closes while its request work still unwinds.
 // Bound that lingering work separately, at the 4x advertised streams Go
@@ -53,6 +54,7 @@ enum class H2FrameType : uint8_t {
 };
 
 enum class H2Error : uint32_t {
+    NoError = 0x0,
     Protocol = 0x1,
     FlowControl = 0x3,
     StreamClosed = 0x5,

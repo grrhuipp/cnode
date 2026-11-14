@@ -121,9 +121,10 @@ TEST_P(Http2ServerErrors, BoundedStreamsRecoverWithoutCorruptingSharedConnection
             peer.Send(1, Echo); peer.Message(1, Response + Echo); peer.Reset(1); peer.Ping("released");
         } else if (mode == "capacity") {
             for (uint32_t sid = 5; sid < 512; sid += 2) peer.wire.Write(Frame(1, 4, sid, Headers(network, tls)));
-            peer.Ping("full256!");
+            peer.Ping("full250!");
             std::set<uint32_t> accepted; for (auto& frame : peer.frames) if (frame.type == 1) accepted.insert(frame.stream);
-            EXPECT_EQ(accepted.size(), 256U);
+            // SETTINGS_MAX_CONCURRENT_STREAMS, as Go net/http advertises.
+            EXPECT_EQ(accepted.size(), 250U);
             auto indexed = Field("x-fixture", "rejected"); indexed[0] = '\x40';
             peer.wire.Write(Frame(1, 4, 513, Headers(network, tls) + indexed));
             peer.Wait([&] { return peer.Has(3, 513); }); EXPECT_EQ(peer.Bodies(3, 513), std::vector<std::string>{BigEndian(7, 4)});

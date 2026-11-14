@@ -9,9 +9,6 @@
 #include "transport/tcp_stream.hpp"
 #include "transport/tls_stream.hpp"
 #include <asio/as_tuple.hpp>
-#include <asio/co_spawn.hpp>
-#include <asio/post.hpp>
-#include <asio/steady_timer.hpp>
 
 #include <array>
 #include <charconv>
@@ -642,34 +639,12 @@ public:
     explicit XHttpSessionDirectory(net::execution_context& context)
         : net::execution_context::service(context) {}
 
-    struct OwnerWaiter final : std::enable_shared_from_this<OwnerWaiter> {
-        net::io_context& io;
-        net::steady_timer timer;
-        std::atomic<bool> notified{false};
-
-        explicit OwnerWaiter(net::io_context& io_context)
-            : io(io_context)
-            , timer(io_context, net::steady_timer::time_point::max()) {}
-
-        void Notify() noexcept {
-            if (notified.exchange(true, std::memory_order_acq_rel)) return;
-            try {
-                net::post(io, [self = shared_from_this()] {
-                    self->timer.cancel();
-                });
-            } catch (...) {}
-        }
-
-        void CancelOnOwner() noexcept {
-            notified.store(true, std::memory_order_release);
-            timer.cancel();
-        }
-    };
-
     struct Record {
         enum class State : uint8_t { Reserved, Live, Retired };
         XHttpSessionDirectory* directory;
         const Key* key = nullptr;
+        // A live record always has its owner: the Worker that served the
+        // session's first request, of any kind (Xray upserts on any request).
         net::io_context* owner = nullptr;
         std::atomic<State> state{State::Reserved};
         Record* incoming_next = nullptr;
@@ -677,8 +652,6 @@ public:
         Record* next = nullptr;
         bool processed = false;
         bool activated = false;
-        std::vector<std::shared_ptr<OwnerWaiter>> owner_waiters;
-
         Record(XHttpSessionDirectory& directory, net::io_context* owner)
             : directory(&directory), owner(owner) {}
         void Retire(bool only_reserved = false) noexcept;
@@ -690,19 +663,11 @@ public:
         bool Retired() const noexcept {
             return state.load(std::memory_order_acquire) == State::Retired;
         }
-        void NotifyOwnerWaiters() noexcept {
-            auto waiters = std::move(owner_waiters);
-            owner_waiters.clear();
-            for (auto& waiter : waiters) {
-                if (waiter) waiter->Notify();
-            }
-        }
     };
 
     struct Claim {
         net::io_context* owner = nullptr;
         std::shared_ptr<Record> record;
-        std::shared_ptr<OwnerWaiter> wait_owner;
         bool reservation = false;
         bool retry = false;
         Claim() = default;
@@ -711,7 +676,6 @@ public:
         Claim(Claim&& other) noexcept
             : owner(std::exchange(other.owner, nullptr)),
               record(std::move(other.record)),
-              wait_owner(std::move(other.wait_owner)),
               reservation(std::exchange(other.reservation, false)),
               retry(other.retry) {}
         Claim(const Claim&) = delete;
@@ -722,27 +686,11 @@ public:
     };
 
     Claim Acquire(std::string_view session_namespace, std::string_view session_id,
-                  XHttpSessionAccess access, net::io_context* current,
-                  bool bind_owner = true) {
+                  XHttpSessionAccess access, net::io_context& current) {
         DrainRetirements();
         auto found = entries_.find(XHttpPacketSessionKeyRef{session_id, session_namespace});
         if (found != entries_.end() && !found->second->Retired()) {
-            auto& record = found->second;
-            if (!record->owner && bind_owner && current) {
-                record->owner = current;
-                record->NotifyOwnerWaiters();
-                return {current, record, true};
-            }
-            if (record->owner) {
-                return {record->owner, record, false};
-            }
-            Claim pending;
-            pending.record = record;
-            if (current) {
-                pending.wait_owner = std::make_shared<OwnerWaiter>(*current);
-                record->owner_waiters.push_back(pending.wait_owner);
-            }
-            return pending;
+            return {found->second->owner, found->second, false};
         }
         if (access == XHttpSessionAccess::Join ||
             (found != entries_.end() && access != XHttpSessionAccess::Open))
@@ -753,8 +701,7 @@ public:
             return claim;
         }
         if (active_ == kMaxActive) return {};
-        auto record = std::make_shared<Record>(
-            *this, bind_owner ? current : nullptr);
+        auto record = std::make_shared<Record>(*this, &current);
         if (found == entries_.end()) {
             found = entries_.try_emplace(
                 Key{std::string(session_id), std::string(session_namespace)}, record).first;
@@ -765,16 +712,15 @@ public:
         }
         record->key = &found->first;
         ++active_;
-        if (!bind_owner) {
-            Claim pending;
-            pending.record = std::move(record);
-            if (current) {
-                pending.wait_owner = std::make_shared<OwnerWaiter>(*current);
-                pending.record->owner_waiters.push_back(pending.wait_owner);
-            }
-            return pending;
-        }
-        return {current, std::move(record), true};
+        return {&current, std::move(record), true};
+    }
+
+    // Read-only: the Worker owning a live session, null when none does.
+    [[nodiscard]] net::io_context* Owner(std::string_view session_namespace,
+                                         std::string_view session_id) const noexcept {
+        const auto found = entries_.find(XHttpPacketSessionKeyRef{session_id, session_namespace});
+        if (found == entries_.end() || found->second->Retired()) return nullptr;
+        return found->second->owner;
     }
 
 private:
@@ -799,7 +745,6 @@ private:
             fifo = record->incoming_next;
             record->processed = true;
             record->owner = nullptr;
-            record->NotifyOwnerWaiters();
             --active_;
             if (!record->activated) {
                 if (auto it = entries_.find(*record->key);
@@ -1199,7 +1144,8 @@ net::awaitable<bool> XHttpPacketUpSession::AwaitDownlink(
             watch.Resubscribe(cancellation);
         }
     }
-    co_return downlink_attached_ && !closed_ && !watch.cancelled;
+    // A downlink that joined and already ended the session still served it.
+    co_return downlink_attached_ && !watch.cancelled;
 }
 
 void XHttpPacketUpSession::CancelPendingOperations() noexcept {
@@ -1368,22 +1314,16 @@ XHttpRequestMeta ParseXHttpRequestMeta(std::string_view base_path,
     return meta;
 }
 
-namespace {
-
-struct DetachedXHttpStream {
-    std::variant<DetachedTcpState, DetachedTlsState> state;
-};
-
 std::optional<DetachedXHttpStream> DetachXHttpStream(
-    AsyncStream& stream, common::MultiBuffer head_bytes) {
+    AsyncStream& stream, common::MultiBuffer replay) {
     if (auto* tls = dynamic_cast<TlsStream*>(&stream)) {
-        if (auto detached = tls->DetachForHandoff(std::move(head_bytes))) {
+        if (auto detached = tls->DetachForHandoff(std::move(replay))) {
             return DetachedXHttpStream{std::move(*detached)};
         }
         return std::nullopt;
     }
     if (auto* tcp = dynamic_cast<TcpStream*>(&stream)) {
-        if (auto detached = tcp->DetachForHandoff(std::move(head_bytes))) {
+        if (auto detached = tcp->DetachForHandoff(std::move(replay))) {
             return DetachedXHttpStream{std::move(*detached)};
         }
         return std::nullopt;
@@ -1402,52 +1342,17 @@ std::unique_ptr<AsyncStream> RestoreXHttpStream(
     return nullptr;
 }
 
-struct XHttpUploadTimeouts {
-    const std::shared_ptr<InboundTransportStreamHandler>* stream_handler = nullptr;
-    std::chrono::seconds handshake_timeout{0};
-    std::chrono::seconds idle_timeout{0};
-    bool active = false;
-
-    void OnRequest(AsyncStream& stream) const {
-        if (stream_handler && *stream_handler) {
-            (*stream_handler)->OnInboundTransportRequest(stream);
-        } else if (active) {
-            stream.SetIdleTimeout(handshake_timeout);
-            (void)stream.StartPhaseDeadline(handshake_timeout);
-        }
-    }
-
-    void OnReady(AsyncStream& stream) const {
-        if (stream_handler && *stream_handler) {
-            (*stream_handler)->OnInboundTransportReady(stream);
-        } else if (active) {
-            if (stream.ConsumePhaseDeadline()) {
-                throw transport::LinkError(common::ErrorCode::TIMEOUT);
-            }
-            stream.ClearPhaseDeadline();
-            stream.SetIdleTimeout(idle_timeout);
-        }
-    }
-};
-
-struct XHttpSessionOwnerResolution {
-    net::io_context* owner = nullptr;
-    std::shared_ptr<XHttpPacketUpSession> session;
-};
-
-net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
+net::awaitable<XHttpSessionResolution> ResolveXHttpSession(
     app::GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::string_view session_namespace,
     std::string_view session_id,
-    XHttpSessionAccess access,
-    bool bind_owner,
-    transport::CancellationSource* cancellation = nullptr) {
+    XHttpSessionAccess access) {
     auto& table = net::use_service<XHttpSessionTable>(io_context);
     if (access != XHttpSessionAccess::Open) {
         if (auto session = table.Get(
                 io_context, session_namespace, session_id, XHttpSessionAccess::Join)) {
-            co_return XHttpSessionOwnerResolution{
+            co_return XHttpSessionResolution{
                 .owner = &io_context,
                 .session = std::move(session),
             };
@@ -1455,90 +1360,40 @@ net::awaitable<XHttpSessionOwnerResolution> ResolveXHttpSessionOwner(
     }
     for (;;) {
         auto claim = co_await coordinator.PostCall(
-            [&coordinator,
-             session_namespace,
-             session_id,
-             access,
-             &io_context,
-             bind_owner] {
+            [&coordinator, session_namespace, session_id, access, &io_context] {
                 return net::use_service<XHttpSessionDirectory>(coordinator.Services()).Acquire(
-                    session_namespace, session_id, access, &io_context, bind_owner);
+                    session_namespace, session_id, access, io_context);
             });
         if (claim.retry) continue;
-        if (claim.owner) {
-            if (claim.owner != &io_context) {
-                co_return XHttpSessionOwnerResolution{
-                    .owner = claim.owner, .session = {}};
-            }
-            if (claim.record && claim.record->Retired()) continue;
-            auto session = table.Get(
-                io_context, session_namespace, session_id, access, claim.record);
-            if (session) claim.reservation = false;
-            co_return XHttpSessionOwnerResolution{
-                .owner = claim.owner,
-                .session = std::move(session),
-            };
-        }
-        if (!claim.wait_owner) {
-            // A rejected packet upload has no live owner to route to. Keep
-            // it on this Worker so HTTP/1 can drain its body and send 404
-            // without closing a persistent connection or creating a session.
-            co_return XHttpSessionOwnerResolution{
+        if (!claim.owner) {
+            co_return XHttpSessionResolution{
                 .owner = access == XHttpSessionAccess::Upload ? &io_context : nullptr,
                 .session = {},
             };
         }
-        struct CancelWait final : transport::CancellationSubscription {
-            std::shared_ptr<XHttpSessionDirectory::OwnerWaiter> waiter;
-            bool cancelled = false;
-            explicit CancelWait(
-                std::shared_ptr<XHttpSessionDirectory::OwnerWaiter> w) noexcept
-                : waiter(std::move(w)) {}
-            void OnCancellation(transport::Cancellation) noexcept override {
-                cancelled = true;
-                if (waiter) waiter->CancelOnOwner();
-            }
-        } cancel_wait{claim.wait_owner};
-        if (cancellation) cancel_wait.Resubscribe(*cancellation);
-        if (cancel_wait.cancelled) co_return XHttpSessionOwnerResolution{};
-        if (!claim.wait_owner->notified.load(std::memory_order_acquire)) {
-            IoErrorCode ec;
-            std::tie(ec) = co_await claim.wait_owner->timer.async_wait(
-                net::as_tuple(net::use_awaitable));
-            (void)ec;
+        if (claim.owner != &io_context) {
+            co_return XHttpSessionResolution{.owner = claim.owner, .session = {}};
         }
-        if (cancel_wait.cancelled ||
-            (co_await net::this_coro::cancellation_state).cancelled() !=
-                net::cancellation_type::none) {
-            co_return XHttpSessionOwnerResolution{};
-        }
+        if (claim.record->Retired()) continue;
+        auto session = table.Get(
+            io_context, session_namespace, session_id, access, claim.record);
+        if (session) claim.reservation = false;
+        co_return XHttpSessionResolution{
+            .owner = claim.owner,
+            .session = std::move(session),
+        };
     }
 }
 
-}  // namespace
-
-std::shared_ptr<XHttpPacketUpSession> TryGetLocalXHttpPacketSession(
-    net::io_context& io_context,
+net::awaitable<net::io_context*> FindXHttpSessionOwner(
+    app::GroupCoordinator& coordinator,
     std::string_view session_namespace,
     std::string_view session_id) {
-    return net::use_service<XHttpSessionTable>(io_context).Get(
-        io_context, session_namespace, session_id, XHttpSessionAccess::Join);
-}
-
-net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
-    app::GroupCoordinator& coordinator,
-    net::io_context& io_context,
-    std::string_view session_namespace,
-    std::string_view session_id,
-    XHttpSessionAccess access) {
-    if (access != XHttpSessionAccess::Open) {
-        if (auto local = TryGetLocalXHttpPacketSession(
-                io_context, session_namespace, session_id)) {
-            co_return local;
-        }
-    }
-    co_return (co_await ResolveXHttpSessionOwner(coordinator,
-        io_context, session_namespace, session_id, access, true)).session;
+    co_return co_await coordinator.PostCall(
+        [&coordinator, session_namespace, session_id] {
+            return net::use_service<XHttpSessionDirectory>(coordinator.Services()).Owner(
+                session_namespace, session_id);
+        });
 }
 
 std::unique_ptr<AsyncStream> MakeXHttpSplitStream(
@@ -1611,12 +1466,6 @@ namespace {
 
 constexpr std::string_view kContinueResponse = "HTTP/1.1 100 Continue\r\n\r\n";
 
-common::ErrorCode OwnerMissError(AsyncStream& stream, XHttpRequestMeta::Kind kind) {
-    if (stream.ConsumePhaseDeadline() || stream.ConsumeIdleTimeout()) return common::ErrorCode::TIMEOUT;
-    return kind == XHttpRequestMeta::Kind::StreamUp
-        ? common::ErrorCode::RESOURCE_EXHAUSTED : common::ErrorCode::NOT_FOUND;
-}
-
 net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest(
     std::unique_ptr<AsyncStream>& stream,
     const XHttpConfig& xhttp_cfg,
@@ -1631,7 +1480,7 @@ net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest
     common::BufferGuard head_storage,
     std::string head_extended_storage,
     std::shared_ptr<XHttpPacketUpSession> session,
-    const XHttpUploadTimeouts& timeouts) {
+    InboundTransportStreamHandler* stream_handler) {
     if (kind == XHttpRequestMeta::Kind::PacketUp) {
         const auto* content_length = std::get_if<Http1BodyContentLength>(&body_framing);
         if (!content_length) {
@@ -1745,7 +1594,7 @@ net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest
         }
         // Between requests the connection idles under the transport idle
         // timeout; each request's handshake budget ends with its response.
-        timeouts.OnReady(*stream);
+        if (stream_handler) stream_handler->OnInboundTransportReady(*stream);
         co_return true;
     }
 
@@ -1776,7 +1625,7 @@ net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest
     }
     auto body = MakeHttp1BodyStream(
         std::move(stream), body_framing, false, std::move(read_ahead));
-    timeouts.OnReady(*body);
+    if (stream_handler) stream_handler->OnInboundTransportReady(*body);
     accepting = false;
     LOG_CONN_DEBUG(conn_id, "XHTTP server stream-up upload ready session={}",
                   PublicHttpTargetForLog(session_id));
@@ -1789,15 +1638,14 @@ net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest
     co_return false;
 }
 
-net::awaitable<tl::expected<void, common::ErrorCode>> HandOffXHttpUpload(
-    app::GroupCoordinator& coordinator,
-    net::io_context* owner, DetachedXHttpStream detached,
-    const XHttpConfig& xhttp_cfg, uint64_t conn_id,
-    XHttpUploadTimeouts timeouts, XHttpRequestMeta::Kind kind,
-    std::string session_id, uint64_t seq, Http1ReadFraming framing,
-    bool expect_100_continue, bool keep_alive);
+XHttpSessionAccess XHttpRequestAccess(XHttpRequestMeta::Kind kind) noexcept {
+    return kind == XHttpRequestMeta::Kind::PacketUp
+        ? XHttpSessionAccess::Upload : XHttpSessionAccess::Open;
+}
 
-net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
+}  // namespace
+
+net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
     app::GroupCoordinator& coordinator,
     net::io_context& io_context,
     std::unique_ptr<AsyncStream> stream,
@@ -1806,13 +1654,12 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
     InboundTransportMetadata* transport_metadata,
     std::span<const uint8_t> initial,
     const std::shared_ptr<InboundTransportStreamHandler>& stream_handler,
-    XHttpUploadTimeouts timeouts,
-    bool start_persistent) {
+    XHttpConnectionMove* move) {
     // RFC 9112 9.3: a packet-up upload leaves its HTTP/1.1 connection open for
     // the client's next, possibly pipelined, request. Every other request kind
     // turns the connection into a long-lived stream and ends the loop.
     std::array<uint8_t, 1> request_start{};
-    for (bool persistent = start_persistent;; persistent = true) {
+    for (bool persistent = false;; persistent = true) {
         if (transport_metadata) transport_metadata->real_ip.clear();
         std::span<const uint8_t> received = initial;
         if (persistent) {
@@ -1827,7 +1674,7 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
             if (n == 0) {
                 co_return std::unique_ptr<AsyncStream>{};
             }
-            timeouts.OnRequest(*stream);
+            if (stream_handler) stream_handler->OnInboundTransportRequest(*stream);
             received = request_start;
         }
         auto received_request = co_await ReadHttp1Request(
@@ -1846,12 +1693,41 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
             co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         if (!XHttpKindAllowed(meta.kind, xhttp_cfg))
             co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
+        XHttpSessionResolution resolution;
+        if (meta.kind != XHttpRequestMeta::Kind::StreamOne) {
+            resolution = co_await ResolveXHttpSession(coordinator, io_context,
+                xhttp_cfg.session_namespace, meta.session_id, XHttpRequestAccess(meta.kind));
+            if (!resolution.owner) {
+                co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
+            }
+            if (resolution.owner != &io_context) {
+                if (!move || (move->pinned && !persistent)) {
+                    LOG_CONN_DEBUG(conn_id, "XHTTP server H1 request of a session owned by another Worker session={}",
+                                  PublicHttpTargetForLog(meta.session_id));
+                    co_return tl::unexpected(common::ErrorCode::NOT_FOUND);
+                }
+                // Nothing of this request is answered yet: the connection
+                // moves to the owner, which reads the request again.
+                common::MultiBuffer replay;
+                if (!replay.AppendSpan(std::span<const uint8_t>(head->bytes, head->size))) {
+                    throw std::bad_alloc();
+                }
+                head->storage = common::BufferGuard{};
+                std::string{}.swap(head->extended_storage);
+                auto detached = DetachXHttpStream(*stream, std::move(replay));
+                if (!detached) co_return tl::unexpected(common::ErrorCode::SOCKET_READ_FAILED);
+                LOG_CONN_DEBUG(conn_id, "XHTTP server H1 connection moves to session owner session={}",
+                              PublicHttpTargetForLog(meta.session_id));
+                move->owner = resolution.owner;
+                move->detached = std::move(*detached);
+                co_return std::unique_ptr<AsyncStream>{};
+            }
+        }
         if (meta.kind == XHttpRequestMeta::Kind::PacketDown) {
             if (!stream_handler) {
                 co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
             }
-            auto session = co_await GetXHttpPacketSession(coordinator, 
-                io_context, xhttp_cfg.session_namespace, meta.session_id, XHttpSessionAccess::Open);
+            auto session = std::move(resolution.session);
             if (!session) {
                 co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
             }
@@ -1889,61 +1765,18 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
             co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         }
 
-
         const bool expect_100_continue =
             HeaderListContainsTokenCI(request, "Expect", "100-continue");
         const bool keep_alive = RequestKeepsConnection(request_line, request);
         if (meta.kind == XHttpRequestMeta::Kind::PacketUp ||
             meta.kind == XHttpRequestMeta::Kind::StreamUp) {
-            const auto access = meta.kind == XHttpRequestMeta::Kind::StreamUp
-                ? XHttpSessionAccess::Open
-                : XHttpSessionAccess::Upload;
-            const bool bind_immediately = !timeouts.active;
-            XHttpSessionOwnerResolution resolution;
-            if (access != XHttpSessionAccess::Open) {
-                if (auto local = TryGetLocalXHttpPacketSession(
-                        io_context, xhttp_cfg.session_namespace, meta.session_id)) {
-                    resolution.owner = &io_context;
-                    resolution.session = std::move(local);
-                }
-            }
-            if (!resolution.owner) {
-                resolution = co_await ResolveXHttpSessionOwner(coordinator,
-                    io_context, xhttp_cfg.session_namespace, meta.session_id,
-                    access, bind_immediately, &stream->Cancellation());
-            }
-            auto* owner_reactor = resolution.owner;
-            if (!owner_reactor)
-                co_return tl::unexpected(OwnerMissError(*stream, meta.kind));
-            if (owner_reactor != &io_context) {
-                std::string session_id(meta.session_id);
-                auto detached = DetachXHttpStream(*stream, head->TakeReadAheadMultiBuffer());
-                head->storage = common::BufferGuard{};
-                std::string{}.swap(head->extended_storage);
-                stream.reset();
-                if (!detached) {
-                    co_return tl::unexpected(common::ErrorCode::SOCKET_READ_FAILED);
-                }
-                auto handed = co_await net::co_spawn(*owner_reactor,
-                    HandOffXHttpUpload(coordinator, owner_reactor, std::move(*detached),
-                        xhttp_cfg, conn_id,
-                        XHttpUploadTimeouts{
-                            .handshake_timeout = timeouts.handshake_timeout,
-                            .idle_timeout = timeouts.idle_timeout,
-                            .active = timeouts.active},
-                        meta.kind, std::move(session_id), meta.seq,
-                        *body_framing, expect_100_continue, keep_alive),
-                    net::use_awaitable);
-                if (!handed) co_return tl::unexpected(handed.error());
-                co_return std::unique_ptr<AsyncStream>{};
-            }
             common::MultiBuffer read_ahead = head->TakeReadAheadMultiBuffer();
             auto upload_result = co_await ExecuteXHttp1UploadRequest(
                 stream, xhttp_cfg, conn_id, meta.kind, meta.session_id, meta.seq,
                 *body_framing, expect_100_continue, keep_alive,
                 std::move(read_ahead), std::move(head->storage),
                 std::move(head->extended_storage),
-                std::move(resolution.session), timeouts);
+                std::move(resolution.session), stream_handler.get());
             if (!upload_result) {
                 co_return tl::unexpected(upload_result.error());
             }
@@ -1976,69 +1809,6 @@ net::awaitable<TransportBuildResult> RunXHttp1ServerHandshake(
         co_await stream_handler->OnInboundTransportStream(std::move(body), std::move(metadata));
         co_return std::unique_ptr<AsyncStream>{};
     }
-}
-
-net::awaitable<tl::expected<void, common::ErrorCode>> HandOffXHttpUpload(
-    app::GroupCoordinator& coordinator,
-    net::io_context* owner, DetachedXHttpStream detached,
-    const XHttpConfig& xhttp_cfg, uint64_t conn_id,
-    XHttpUploadTimeouts timeouts, XHttpRequestMeta::Kind kind,
-    std::string session_id, uint64_t seq, Http1ReadFraming framing,
-    bool expect_100_continue, bool keep_alive) {
-    auto restored = RestoreXHttpStream(*owner, std::move(detached));
-    if (!restored) co_return tl::unexpected(common::ErrorCode::SOCKET_READ_FAILED);
-    timeouts.OnRequest(*restored);
-    const auto access = kind == XHttpRequestMeta::Kind::StreamUp
-        ? XHttpSessionAccess::Open : XHttpSessionAccess::Upload;
-    auto resolution = co_await ResolveXHttpSessionOwner(coordinator, 
-        *owner, xhttp_cfg.session_namespace, session_id, access,
-        !timeouts.active, &restored->Cancellation());
-    if (!resolution.owner) co_return tl::unexpected(OwnerMissError(*restored, kind));
-    auto first = co_await ExecuteXHttp1UploadRequest(
-        restored, xhttp_cfg, conn_id, kind, session_id, seq, framing,
-        expect_100_continue, keep_alive, {}, {}, {}, std::move(resolution.session), timeouts);
-    if (!first) co_return tl::unexpected(first.error());
-    if (!*first) co_return tl::expected<void, common::ErrorCode>{};
-    const std::shared_ptr<InboundTransportStreamHandler> no_handler;
-    auto result = co_await RunXHttp1ServerHandshake(coordinator, 
-        *owner, std::move(restored), xhttp_cfg, conn_id, nullptr,
-        {}, no_handler, timeouts, true);
-    if (!result) co_return tl::unexpected(result.error());
-    if (*result) co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-    co_return tl::expected<void, common::ErrorCode>{};
-}
-
-}  // namespace
-
-net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
-    app::GroupCoordinator& coordinator,
-    net::io_context& io_context,
-    std::unique_ptr<AsyncStream> stream,
-    const XHttpConfig& xhttp_cfg,
-    uint64_t conn_id,
-    InboundTransportMetadata* transport_metadata,
-    std::span<const uint8_t> initial,
-    const std::shared_ptr<InboundTransportStreamHandler>& stream_handler) {
-    return RunXHttp1ServerHandshake(
-        coordinator,
-        io_context,
-        std::move(stream),
-        xhttp_cfg,
-        conn_id,
-        transport_metadata,
-        initial,
-        stream_handler,
-        XHttpUploadTimeouts{
-            .stream_handler = &stream_handler,
-            .handshake_timeout = stream_handler
-                ? stream_handler->TransportHandshakeTimeout()
-                : std::chrono::seconds{0},
-            .idle_timeout = stream_handler
-                ? stream_handler->TransportIdleTimeout()
-                : std::chrono::seconds{0},
-            .active = (stream_handler != nullptr),
-        },
-        false);
 }
 
 net::awaitable<TransportBuildResult> DoXHttp1ClientRequest(

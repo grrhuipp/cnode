@@ -289,7 +289,7 @@ struct UdpDatagramContext {
     net::io_context& io_context;
     uint32_t worker_id = 0;
     // Session environment of the listener that received the datagram.
-    const app::DatagramSessionEnvironment& environment;
+    const app::InboundSessionEnvironment& environment;
 };
 
 // Only authenticated identity and execution ownership metadata live here.

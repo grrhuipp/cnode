@@ -1645,7 +1645,7 @@ void HysteriaConnection::CloseUdpSession(uint32_t session_id) noexcept {
 
 HysteriaIngress::HysteriaIngress(
     uint32_t worker_id_value, uint32_t worker_count_value, net::io_context& io_value,
-    app::DatagramSessionEnvironment environment_value)
+    app::InboundSessionEnvironment environment_value)
     : environment(std::move(environment_value)),
       worker_id(worker_id_value), worker_count(worker_count_value), io(io_value),
       changed(io, std::chrono::steady_clock::time_point::max()) {

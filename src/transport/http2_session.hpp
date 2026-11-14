@@ -16,6 +16,8 @@
 #include <tl/expected.hpp>
 namespace transport {
 
+struct XHttpConnectionMove;
+
 inline constexpr std::string_view kHttp2ClientPreface =
     "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -58,6 +60,8 @@ inline constexpr std::string_view kHttp2ClientPreface =
 
 // h2 / XHTTP server after the caller consumed the client preface. `cfg` and
 // `xhttp_cfg` are borrowed for the whole call; the session never outlives it.
+// With `move`, an XHTTP connection whose first request belongs to a session
+// of another Worker is detached into it instead of being served here.
 [[nodiscard]] net::awaitable<TransportBuildResult> RunHttp2ServerSession(
     app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
@@ -65,7 +69,8 @@ inline constexpr std::string_view kHttp2ClientPreface =
     const XHttpConfig* xhttp_cfg,
     net::io_context& io_context,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
-    uint64_t conn_id);
+    uint64_t conn_id,
+    XHttpConnectionMove* move);
 
 [[nodiscard]] net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
     std::unique_ptr<AsyncStream> stream,

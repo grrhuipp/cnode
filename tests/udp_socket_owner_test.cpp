@@ -196,7 +196,7 @@ protected:
     const ::app::AdmissionEnvironment admission{
         *coordinator.Get(), *limiter, online_users, uplink_stats};
     ::app::RequestLoadState request_load{1024, 0};
-    const ::app::DatagramSessionEnvironment uplink_environment{
+    const ::app::InboundSessionEnvironment uplink_environment{
         .timeouts = {}, .dispatcher = &uplink_dispatcher,
         .admission = &admission, .request_load = &request_load};
     const ::app::ReceiverSettings uplink_receiver{

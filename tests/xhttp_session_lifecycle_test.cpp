@@ -19,6 +19,9 @@
 #include <cstdio>
 #include <exception>
 #include <memory>
+#include <future>
+#include <list>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -58,6 +61,15 @@ void RunTableScenario(Scenario scenario) {
     EXPECT_TRUE(completed_before_cleanup);
     EXPECT_TRUE(done);
     if (failure) std::rethrow_exception(failure);
+}
+
+// Single-Worker table checks: every resolution here is local.
+net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
+    app::GroupCoordinator& coordinator, net::io_context& io,
+    std::string_view session_namespace, std::string_view session_id,
+    XHttpSessionAccess access) {
+    co_return (co_await ResolveXHttpSession(
+        coordinator, io, session_namespace, session_id, access)).session;
 }
 
 net::awaitable<void> NamespaceAndRetirement(app::GroupCoordinator& coordinator, net::io_context& io) {
@@ -251,7 +263,10 @@ TEST(XhttpSessionLifecycle, UploadResponseDrainPreservesWritesAndJoinsReaderOnCl
     if (failure) std::rethrow_exception(failure);
 }
 
-TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetirement) {
+// A session's requests arrive on connections accepted by different Workers.
+// The connection that reaches a non-owner moves whole to the owner, which
+// serves it with a handler adopted there; sinks never cross threads.
+TEST(XhttpSessionLifecycle, CrossWorkerRequestMovesConnectionToSessionOwner) {
     net::io_context control;
     auto worker0 = std::make_unique<net::io_context>();
     auto worker1 = std::make_unique<net::io_context>();
@@ -262,100 +277,132 @@ TEST(XhttpSessionLifecycle, CrossWorkerUploadHandoffKeepsSinkOnOriginUntilRetire
     coordinator->RegisterWorker();
     coordinator->RegisterWorker();
 
+    std::promise<std::thread::id> started_0, started_1;
     std::thread thread_c([&] { control.run(); });
     std::thread thread_0([&] {
+        started_0.set_value(std::this_thread::get_id());
         worker0->run();
         worker0.reset();
     });
     std::thread thread_1([&] {
+        started_1.set_value(std::this_thread::get_id());
         worker1->run();
         worker1.reset();
     });
-
-    struct OriginBoundSink final : ::transport::InboundTransportStreamHandler {
-        explicit OriginBoundSink(std::thread::id owner)
-            : owner_thread(owner), local_tag(128, 'x') {}
-        ~OriginBoundSink() noexcept override {
-            EXPECT_EQ(std::this_thread::get_id(), owner_thread);
-        }
-        net::awaitable<void> OnInboundTransportStream(
-            std::unique_ptr<::transport::AsyncStream> s, ::transport::InboundTransportMetadata) override {
-            logical = std::move(s);
-            co_return;
-        }
-        std::chrono::seconds TransportHandshakeTimeout() const noexcept override { return 5s; }
-        std::chrono::seconds TransportIdleTimeout() const noexcept override { return 10s; }
-        std::thread::id owner_thread;
-        std::string local_tag;
-        std::unique_ptr<::transport::AsyncStream> logical;
+    std::map<net::io_context*, std::thread::id> threads{
+        {worker0.get(), started_0.get_future().get()},
+        {worker1.get(), started_1.get_future().get()},
     };
 
-    ::transport::XHttpConfig xhttp_cfg;
-    xhttp_cfg.path = "/fixture";
-    xhttp_cfg.normalized_path = "/fixture/";
-    xhttp_cfg.mode = ::transport::XHttpMode::PacketUp;
-    xhttp_cfg.session_namespace = "cross-worker-handoff";
+    struct Delivery {
+        std::thread::id thread;
+        std::string bytes;
+    };
+    struct MovingSink final : ::transport::InboundTransportStreamHandler {
+        MovingSink(std::thread::id thread,
+                   const std::map<net::io_context*, std::thread::id>& threads,
+                   std::promise<Delivery>& delivery)
+            : thread(thread), threads(threads), delivery(delivery) {}
+        ~MovingSink() noexcept override {
+            EXPECT_EQ(std::this_thread::get_id(), thread);
+        }
+        net::awaitable<void> OnInboundTransportStream(
+            std::unique_ptr<::transport::AsyncStream> stream,
+            ::transport::InboundTransportMetadata) override {
+            std::array<char, 5> buffer{};
+            const size_t n = co_await stream->AsyncRead(net::buffer(buffer));
+            stream->Close();
+            delivery.set_value({std::this_thread::get_id(), std::string(buffer.data(), n)});
+        }
+        std::shared_ptr<::transport::InboundTransportStreamHandler> AdoptOn(
+            net::io_context& owner) const override {
+            EXPECT_EQ(std::this_thread::get_id(), threads.at(&owner));
+            return std::make_shared<MovingSink>(threads.at(&owner), threads, delivery);
+        }
+        std::thread::id thread;
+        const std::map<net::io_context*, std::thread::id>& threads;
+        std::promise<Delivery>& delivery;
+    };
+
+    ::transport::StreamSettings settings;
+    settings.network_mode = ::transport::NetworkMode::XHttp;
+    settings.xhttp.path = "/fixture";
+    settings.xhttp.mode = ::transport::XHttpMode::PacketUp;
+    settings = ::transport::NormalizeStreamSettings(settings);
+    settings.xhttp.session_namespace = "cross-worker-move";
 
     ::tcp::acceptor acceptor(control, {net::ip::address_v4::loopback(), 0});
     const auto endpoint = acceptor.local_endpoint();
+    const auto serve = [&](net::io_context& io, ::tcp::socket socket,
+                           std::promise<Delivery>& delivery) {
+        return net::co_spawn(io,
+            [&, socket = std::move(socket)]() mutable -> net::awaitable<int> {
+                auto sink = std::make_shared<MovingSink>(threads.at(&io), threads, delivery);
+                auto built = co_await ::transport::BuildInboundTransport(*coordinator, io,
+                    std::make_unique<::transport::TcpStream>(std::move(socket)),
+                    settings, nullptr, 0, std::move(sink));
+                if (!built) co_return static_cast<int>(built.error());
+                co_return *built ? -1 : 0;
+            }, net::use_future);
+    };
+    const auto wait_owner = [&](const std::string& session_id) {
+        for (int attempt = 0; attempt != 300; ++attempt) {
+            auto owner = net::co_spawn(control, ::transport::FindXHttpSessionOwner(
+                *coordinator, settings.xhttp.session_namespace, session_id),
+                net::use_future).get();
+            if (owner) return owner;
+            std::this_thread::sleep_for(10ms);
+        }
+        return static_cast<net::io_context*>(nullptr);
+    };
 
+    // Sinks may outlive a failed round; their promises outlive the scenario.
+    std::list<std::promise<Delivery>> deliveries;
     std::exception_ptr scenario_failure;
     try {
-    for (int round = 0; round < 16; ++round) {
+    for (int round = 0; round < 8; ++round) {
         const std::string session_id = "s-" + std::to_string(round);
-        ::tcp::socket client_up(control), server_up(*worker1);
+        // Even rounds: the upload on Worker 1 owns the session and the
+        // downlink moves there. Odd rounds: the reverse.
+        const bool upload_first = round % 2 == 0;
+        auto& upload_io = *worker1;
+        auto& downlink_io = *worker0;
+        auto& delivery = deliveries.emplace_back();
+        auto delivered = delivery.get_future();
+
+        ::tcp::socket client_up(control), server_up(upload_io);
         client_up.connect(endpoint);
         acceptor.accept(server_up);
-
-        ::tcp::socket client_down(control), server_down(*worker0);
+        ::tcp::socket client_down(control), server_down(downlink_io);
         client_down.connect(endpoint);
         acceptor.accept(server_down);
+        auto up_built = serve(upload_io, std::move(server_up), delivery);
+        auto down_built = serve(downlink_io, std::move(server_down), delivery);
 
-        // Start PacketUp on worker1 before PacketDown arrives on worker0 on even rounds.
-        auto up_future = net::co_spawn(*worker1,
-            [&, sock = std::move(server_up)]() mutable -> net::awaitable<void> {
-                auto sink = std::make_shared<OriginBoundSink>(std::this_thread::get_id());
-                auto res = co_await DoXHttp1ServerHandshake(
-                    *coordinator,                     *worker1, std::make_unique<::transport::TcpStream>(std::move(sock)),
-                    xhttp_cfg, 1, nullptr, {}, sink);
-                EXPECT_TRUE(res.has_value() && !*res) << "packet-up handoff failed";
-            }, net::use_future);
-
-        const std::string post_req =
+        const std::string post =
             "POST /fixture/" + session_id + "/0 HTTP/1.1\r\n"
-            "Host: localhost\r\n"
-            "Content-Length: 5\r\n"
-            "Connection: close\r\n\r\n"
-            "hello";
-        net::write(client_up, net::buffer(post_req));
+            "Host: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+        const std::string get =
+            "GET /fixture/" + session_id + " HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        net::write(upload_first ? client_up : client_down,
+                   net::buffer(upload_first ? post : get));
+        auto* owner = wait_owner(session_id);
+        EXPECT_EQ(owner, upload_first ? &upload_io : &downlink_io);
+        net::write(upload_first ? client_down : client_up,
+                   net::buffer(upload_first ? get : post));
 
-        auto down_future = net::co_spawn(*worker0,
-            [&, sock = std::move(server_down)]() mutable -> net::awaitable<std::string> {
-                auto sink = std::make_shared<OriginBoundSink>(std::this_thread::get_id());
-                auto res = co_await DoXHttp1ServerHandshake(
-                    *coordinator,                     *worker0, std::make_unique<::transport::TcpStream>(std::move(sock)),
-                    xhttp_cfg, 2, nullptr, {}, sink);
-                EXPECT_TRUE(res.has_value() && !*res && sink->logical != nullptr) << "packet-down did not produce logical stream";
-                if (!sink->logical) co_return std::string{};
-                std::array<char, 5> buf{};
-                const size_t n = co_await sink->logical->AsyncRead(net::buffer(buf));
-                EXPECT_EQ(n, 5) << "short read on logical stream";
-                sink->logical->Close();
-                co_return std::string(buf.data(), n);
-            }, net::use_future);
-
-        const std::string get_req =
-            "GET /fixture/" + session_id + " HTTP/1.1\r\n"
-            "Host: localhost\r\n\r\n";
-        net::write(client_down, net::buffer(get_req));
-
-        std::exception_ptr up_error, down_error;
-        std::string received;
-        try { up_future.get(); } catch (...) { up_error = std::current_exception(); }
-        try { received = down_future.get(); } catch (...) { down_error = std::current_exception(); }
-        EXPECT_FALSE(up_error);
-        EXPECT_FALSE(down_error);
-        EXPECT_EQ(received, "hello");
+        if (delivered.wait_for(5s) != std::future_status::ready) {
+            ADD_FAILURE() << "no logical stream reached the session owner in round " << round;
+            break;
+        }
+        const auto received = delivered.get();
+        EXPECT_EQ(received.bytes, "hello");
+        EXPECT_EQ(received.thread, threads.at(owner));
+        const auto response = Receive(client_up);
+        EXPECT_TRUE(response.starts_with("HTTP/1.1 200"))
+            << "round " << round << " upload response: " << response;
+        EXPECT_EQ(up_built.get(), 0) << "round " << round;
+        EXPECT_EQ(down_built.get(), 0) << "round " << round;
     }
     } catch (...) {
         scenario_failure = std::current_exception();
