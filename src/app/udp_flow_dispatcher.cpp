@@ -30,8 +30,10 @@ constexpr size_t kMaxUdpRouteFlows = 64;
 constexpr size_t kMaxUdpRouteTargets = 64;
 constexpr size_t kMaxQuicAliases = 512;
 constexpr size_t kMaxQuicAliasesPerFlow = 8;
-constexpr size_t kMaxFlowQueuedDatagrams = 64;
-constexpr size_t kMaxFlowQueuedBytes = 1024 * 1024;
+// A flow's queue is a link pipe: Xray's default holds 512 KiB per link
+// (features/policy, amd64) and blocks its writer once full.
+constexpr size_t kMaxFlowQueuedDatagrams = 512;
+constexpr size_t kMaxFlowQueuedBytes = 512 * 1024;
 constexpr size_t kMaxAssociationQueuedBytes = 4 * 1024 * 1024;
 
 [[nodiscard]] uint64_t HashTarget(

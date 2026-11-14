@@ -75,7 +75,7 @@ struct MuxReply {
     }
 };
 
-class TcpSubState;
+class MuxSubSession;
 
 struct ReplyQueueState {
     explicit ReplyQueueState(common::SignalChannel& main_signal)
@@ -85,7 +85,10 @@ struct ReplyQueueState {
     size_t udp_queued_bytes = 0;   // UDP 子会话回包字节（含 overhead）
     uint32_t active_sub_loops = 0;
     common::SignalChannel& main_signal_;
-    TcpSubState* waiting_writers_head = nullptr;
+    // Writers waiting for reply room: TCP for the backpressure window, UDP
+    // for the UDP budget (Xray's mux writer blocks the same way).
+    MuxSubSession* waiting_writers_head = nullptr;
+    MuxSubSession* udp_waiting_writers_head = nullptr;
     bool running = true;
     bool tcp_overflowed = false;
     bool tcp_backpressured = false;
@@ -96,9 +99,11 @@ struct ReplyQueueState {
     // watermark, so the aggregate never grows with the sub-session count.
     size_t sub_input_bytes = 0;
 
-    void AddWaitingWriter(TcpSubState* writer) noexcept;
-    void RemoveWaitingWriter(TcpSubState* writer) noexcept;
+    void AddWaitingWriter(MuxSubSession* writer) noexcept;
+    void RemoveWaitingWriter(MuxSubSession* writer) noexcept;
     void WakeWaitingWriters() noexcept;
+    void WakeUdpWaitingWriters() noexcept;
+    static void WakeWriterList(MuxSubSession*& head) noexcept;
 
     bool CanPushUdp(size_t payload_bytes) const noexcept {
         if (payload_bytes > kMuxQueueHighWaterBytes - kMuxReplyOverhead) {
@@ -169,6 +174,7 @@ struct ReplyQueueState {
             tcp_backpressured = false;
             WakeWaitingWriters();
         }
+        if (!was_tcp && udp_waiting_writers_head) WakeUdpWaitingWriters();
         return true;
     }
 
@@ -439,10 +445,45 @@ protected:
         : session_id_(session_id)
         , reply_queue_(reply_queue)
         , is_udp_(is_udp)
-        , input_signal_(net::any_io_executor(io_context.get_executor()), 1) {}
+        , input_signal_(net::any_io_executor(io_context.get_executor()), 1)
+        , output_signal_(net::any_io_executor(io_context.get_executor()), 1) {}
 
     // Called once from Cancel() before queued input is discarded.
-    virtual void OnCancel() noexcept {}
+    virtual void OnCancel() noexcept {
+        reply_queue_.RemoveWaitingWriter(this);
+        WakeOutputWriter();
+    }
+
+    // Waits while `blocked()` holds for this writer's kind of reply room.
+    template <class Blocked>
+    net::awaitable<void> WaitForOutputWindow(Blocked blocked) {
+        struct WaitingWriterGuard {
+            ReplyQueueState& queue;
+            MuxSubSession* writer;
+            WaitingWriterGuard(ReplyQueueState& q, MuxSubSession* w) noexcept
+                : queue(q), writer(w) {
+                queue.AddWaitingWriter(writer);
+            }
+            ~WaitingWriterGuard() noexcept {
+                queue.RemoveWaitingWriter(writer);
+            }
+        };
+        while (!cancelled_ && !EndSent() && reply_queue_.running && blocked()) {
+            WaitingWriterGuard guard(reply_queue_, this);
+            auto [ec] = co_await output_signal_.async_receive(
+                net::as_tuple(net::use_awaitable));
+            if (ec) {
+                break;
+            }
+        }
+    }
+
+    // Wakes the writer waiting in this sub-session, and the one that waits
+    // on its behalf (an XUDP flow), when reply room may have opened.
+    void WakeOutputWriter() noexcept {
+        (void)output_signal_.try_send(IoErrorCode{});
+        if (room_waker_) (void)room_waker_->try_send(IoErrorCode{});
+    }
 
     [[nodiscard]] bool InputClosed() const noexcept {
         return cancelled_ || input_done_;
@@ -492,6 +533,7 @@ protected:
     const bool is_udp_ = false;
     bool input_done_ = false;
     bool cancelled_ = false;
+    common::SignalChannel* room_waker_ = nullptr;
 
 private:
     void WakeInputReader() noexcept {
@@ -499,6 +541,10 @@ private:
     }
 
     common::SignalChannel input_signal_;
+    common::SignalChannel output_signal_;
+    MuxSubSession* next_waiting_writer_ = nullptr;
+    bool waiting_in_reply_queue_ = false;
+    friend struct ReplyQueueState;
     transport::CancellationSource cancellation_;
     common::RingDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
@@ -515,8 +561,7 @@ public:
         net::io_context& io_context,
         uint16_t session_id,
         ReplyQueueState& reply_queue)
-        : MuxSubSession(io_context, session_id, reply_queue, false)
-        , output_signal_(net::any_io_executor(io_context.get_executor()), 1) {}
+        : MuxSubSession(io_context, session_id, reply_queue, false) {}
     ~TcpSubState() noexcept override {
         Cancel();
     }
@@ -541,7 +586,8 @@ public:
 
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
         if (reply_queue_.ShouldBackpressureTcpReads()) {
-            co_await WaitForOutputWindow();
+            co_await WaitForOutputWindow(
+                [this] { return reply_queue_.ShouldBackpressureTcpReads(); });
         }
         if (cancelled_ || !reply_queue_.running) {
             mb.clear();
@@ -597,61 +643,23 @@ public:
         reply_queue_.WakeReplyWriter();
         mb.clear();
     }
-
-private:
-    void OnCancel() noexcept override {
-        reply_queue_.RemoveWaitingWriter(this);
-        WakeOutputWriter();
-    }
-
-    void WakeOutputWriter() noexcept {
-        (void)output_signal_.try_send(IoErrorCode{});
-    }
-
-    net::awaitable<void> WaitForOutputWindow() {
-        struct WaitingWriterGuard {
-            ReplyQueueState& queue;
-            TcpSubState* writer;
-            WaitingWriterGuard(ReplyQueueState& q, TcpSubState* w) noexcept
-                : queue(q), writer(w) {
-                queue.AddWaitingWriter(writer);
-            }
-            ~WaitingWriterGuard() noexcept {
-                queue.RemoveWaitingWriter(writer);
-            }
-        };
-        while (!cancelled_ && !EndSent() && reply_queue_.running &&
-               reply_queue_.ShouldBackpressureTcpReads()) {
-            WaitingWriterGuard guard(reply_queue_, this);
-            auto [ec] = co_await output_signal_.async_receive(
-                net::as_tuple(net::use_awaitable));
-            if (ec) {
-                break;
-            }
-        }
-    }
-
-    friend struct ReplyQueueState;
-
-    common::SignalChannel output_signal_;
-    TcpSubState* next_waiting_writer_ = nullptr;
-    bool waiting_in_reply_queue_ = false;
 };
 
-void ReplyQueueState::AddWaitingWriter(TcpSubState* writer) noexcept {
+void ReplyQueueState::AddWaitingWriter(MuxSubSession* writer) noexcept {
     if (!writer || writer->waiting_in_reply_queue_) {
         return;
     }
+    auto& head = writer->is_udp_ ? udp_waiting_writers_head : waiting_writers_head;
     writer->waiting_in_reply_queue_ = true;
-    writer->next_waiting_writer_ = waiting_writers_head;
-    waiting_writers_head = writer;
+    writer->next_waiting_writer_ = head;
+    head = writer;
 }
 
-void ReplyQueueState::RemoveWaitingWriter(TcpSubState* writer) noexcept {
+void ReplyQueueState::RemoveWaitingWriter(MuxSubSession* writer) noexcept {
     if (!writer || !writer->waiting_in_reply_queue_) {
         return;
     }
-    TcpSubState** cur = &waiting_writers_head;
+    MuxSubSession** cur = writer->is_udp_ ? &udp_waiting_writers_head : &waiting_writers_head;
     while (*cur) {
         if (*cur == writer) {
             *cur = writer->next_waiting_writer_;
@@ -663,16 +671,23 @@ void ReplyQueueState::RemoveWaitingWriter(TcpSubState* writer) noexcept {
     writer->waiting_in_reply_queue_ = false;
 }
 
-void ReplyQueueState::WakeWaitingWriters() noexcept {
-    TcpSubState* cur = waiting_writers_head;
-    waiting_writers_head = nullptr;
+void ReplyQueueState::WakeWriterList(MuxSubSession*& head) noexcept {
+    MuxSubSession* cur = std::exchange(head, nullptr);
     while (cur) {
-        TcpSubState* next = cur->next_waiting_writer_;
+        MuxSubSession* next = cur->next_waiting_writer_;
         cur->next_waiting_writer_ = nullptr;
         cur->waiting_in_reply_queue_ = false;
         cur->WakeOutputWriter();
         cur = next;
     }
+}
+
+void ReplyQueueState::WakeWaitingWriters() noexcept {
+    WakeWriterList(waiting_writers_head);
+}
+
+void ReplyQueueState::WakeUdpWaitingWriters() noexcept {
+    WakeWriterList(udp_waiting_writers_head);
 }
 
 class UdpSubState final : public MuxSubSession, public XudpClient {
@@ -681,10 +696,8 @@ public:
         net::io_context& io_context,
         uint16_t session_id,
         ReplyQueueState& reply_queue,
-        uint64_t parent_conn_id,
         common::TargetAddress default_target)
         : MuxSubSession(io_context, session_id, reply_queue, true)
-        , parent_conn_id_(parent_conn_id)
         , default_target_(std::move(default_target)) {}
 
     ~UdpSubState() noexcept override {
@@ -707,6 +720,13 @@ public:
     }
 
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
+        // Like Xray's mux writer, a reply waits for the connection's UDP
+        // budget; meanwhile the outbound's kernel buffer holds the burst.
+        if (const auto datagram = common::InspectUdpDatagram(mb);
+            datagram.Valid() && datagram.payload_size <= std::numeric_limits<uint16_t>::max()) {
+            const size_t size = datagram.payload_size;
+            co_await WaitForOutputWindow([this, size] { return !reply_queue_.CanPushUdp(size); });
+        }
         if (cancelled_ || !reply_queue_.running) {
             throw IoSystemError(
                 io_error::operation_aborted,
@@ -715,7 +735,7 @@ public:
         if (EndSent()) {
             throw transport::WriteClosed{};
         }
-        switch (Enqueue(std::move(mb))) {
+        switch (Enqueue(mb)) {
         case ReplyAdmission::Queued:
             co_return;
         case ReplyAdmission::MixedEndpoints:
@@ -725,26 +745,46 @@ public:
         case ReplyAdmission::InvalidTarget:
             throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
         case ReplyAdmission::Full:
-            // Lost like any datagram; the sub-session goes on.
+            // The budget refilled while this writer resumed: lost like any
+            // datagram, the sub-session goes on.
+            ++reply_queue_.udp_dropped;
             co_return;
         }
     }
 
-    // XUDP: a reply of the flow this sub-session carries.
-    bool DeliverReply(common::MultiBuffer mb) {
-        if (cancelled_ || !reply_queue_.running || EndSent()) return false;
-        return Enqueue(std::move(mb)) == ReplyAdmission::Queued;
+    // XUDP: a reply of the flow this sub-session carries. Full keeps the
+    // datagram for the flow, which waits for room and offers it again.
+    XudpReplyOffer OfferReply(common::MultiBuffer& mb) {
+        if (cancelled_ || !reply_queue_.running || EndSent()) {
+            mb.clear();
+            return XudpReplyOffer::Gone;
+        }
+        if (Enqueue(mb) == ReplyAdmission::Full) return XudpReplyOffer::Full;
+        mb.clear();
+        return XudpReplyOffer::Queued;
     }
+
+    void AwaitReplyRoom(common::SignalChannel& waker) noexcept {
+        room_waker_ = &waker;
+        reply_queue_.AddWaitingWriter(this);
+    }
+
+    void ForgetReplyRoom() noexcept {
+        reply_queue_.RemoveWaitingWriter(this);
+        room_waker_ = nullptr;
+    }
+
+    void CountDroppedReply() noexcept { ++reply_queue_.udp_dropped; }
 
 private:
     enum class ReplyAdmission : uint8_t { Queued, MixedEndpoints, InvalidTarget, Full };
 
-    // Queues one reply datagram; an empty one is consumed. A reply beyond
-    // the connection's UDP budget is dropped, as UDP may; the sub-session
-    // stays.
-    ReplyAdmission Enqueue(common::MultiBuffer mb) {
+    // Queues one reply datagram; an empty one is consumed. Full leaves it
+    // with the caller.
+    ReplyAdmission Enqueue(common::MultiBuffer& mb) {
         const auto datagram = common::InspectUdpDatagram(mb);
         if (datagram.status == common::UdpDatagramStatus::Empty) {
+            mb.clear();
             return ReplyAdmission::Queued;
         }
         if (!datagram.Valid()) return ReplyAdmission::MixedEndpoints;
@@ -753,12 +793,6 @@ private:
             return ReplyAdmission::InvalidTarget;
         }
         if (!reply_queue_.CanPushUdp(datagram.payload_size)) {
-            const uint64_t dropped = ++reply_queue_.udp_dropped;
-            if (dropped % 100 == 1) {
-                LOG_CONN_DEBUG(parent_conn_id_,
-                    "UDP reply queue full, dropped {} packets", dropped);
-            }
-            mb.clear();
             return ReplyAdmission::Full;
         }
         MuxReply reply;
@@ -771,7 +805,6 @@ private:
         return ReplyAdmission::Queued;
     }
 
-    uint64_t parent_conn_id_ = 0;
     common::TargetAddress default_target_;
 };
 
@@ -827,7 +860,22 @@ net::awaitable<void> RunSubDispatch(
 }  // namespace
 
 bool XudpClient::PushReply(common::MultiBuffer datagram) {
-    return static_cast<UdpSubState&>(*this).DeliverReply(std::move(datagram));
+    auto& self = static_cast<UdpSubState&>(*this);
+    const auto offer = self.OfferReply(datagram);
+    if (offer == XudpReplyOffer::Full) self.CountDroppedReply();
+    return offer == XudpReplyOffer::Queued;
+}
+
+XudpReplyOffer XudpClient::OfferReply(common::MultiBuffer& datagram) {
+    return static_cast<UdpSubState&>(*this).OfferReply(datagram);
+}
+
+void XudpClient::AwaitReplyRoom(common::SignalChannel& waker) noexcept {
+    static_cast<UdpSubState&>(*this).AwaitReplyRoom(waker);
+}
+
+void XudpClient::ForgetReplyRoom() noexcept {
+    static_cast<UdpSubState&>(*this).ForgetReplyRoom();
 }
 
 void XudpClient::Release() noexcept {
@@ -847,8 +895,7 @@ public:
           stats(stats), timeouts(timeouts), pressure_idle_timeout(pressure_idle_timeout),
           allowed_network(allowed_network),
           main_signal(net::any_io_executor(io_context.get_executor()), 1),
-          reply_queue(main_signal), client_reads(io_context, main_signal),
-          parent_conn_id(parent_ctx.conn_id) {}
+          reply_queue(main_signal), client_reads(io_context, main_signal) {}
     MuxServerSession(const MuxServerSession&) = delete;
     MuxServerSession& operator=(const MuxServerSession&) = delete;
     net::awaitable<app::RelayResult> Run() {
@@ -1205,7 +1252,6 @@ private:
                             io_context,
                             sid,
                             reply_queue,
-                            parent_conn_id,
                             hdr.target);
                     } else {
                         LOG_CONN_DEBUG(parent_ctx, "new TCP sid={} -> {}",
@@ -1386,7 +1432,6 @@ private:
     std::unordered_map<uint16_t, std::unique_ptr<MuxSubSession>> sub_sessions;
     common::MultiBuffer frame_buf;
     std::array<uint8_t, 2 + 4 + 1 + common::kMaxBaseEncodedAddressSize + 2> write_frame_{};
-    const uint64_t parent_conn_id;
     bool running = true;
     bool client_input_done = false;
     app::RelayResult result;

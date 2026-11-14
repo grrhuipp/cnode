@@ -41,12 +41,27 @@ inline constexpr auto kXudpExpiry = std::chrono::minutes(1);
 
 using XudpGlobalId = std::array<uint8_t, 8>;
 
+enum class XudpReplyOffer : uint8_t {
+    Queued,
+    // The Mux connection's UDP reply budget is full: the datagram stays
+    // with the caller, who waits for room.
+    Full,
+    // The sub-session ended; the datagram is dropped.
+    Gone,
+};
+
 // The Mux sub-session side of an XUDP attachment on this Worker. Implemented
 // by the Mux server's UDP sub-session.
 class XudpClient {
 public:
-    // Queues one reply datagram toward the client; false once it takes no more.
+    // Queues one reply datagram toward the client, dropping it when the
+    // budget is full; false unless queued.
     bool PushReply(common::MultiBuffer datagram);
+    XudpReplyOffer OfferReply(common::MultiBuffer& datagram);
+    // `waker` is signalled once reply room may have opened or the
+    // sub-session ended; ForgetReplyRoom withdraws it.
+    void AwaitReplyRoom(common::SignalChannel& waker) noexcept;
+    void ForgetReplyRoom() noexcept;
     // The flow left this sub-session (taken over or ended): it ends.
     void Release() noexcept;
 

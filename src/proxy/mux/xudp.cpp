@@ -197,6 +197,8 @@ private:
     XudpSessionTable& table_;
     common::SignalChannel reader_signal_;
     common::SignalChannel room_signal_;
+    // Woken when the attached sub-session may take a held-back reply.
+    common::SignalChannel reply_room_signal_;
     transport::CancellationSource cancellation_;
     DatagramQueue uplink_;
     // Replies held while no sub-session is attached.
@@ -297,7 +299,8 @@ XudpSession::XudpSession(const XudpDispatchEnvironment& environment,
     , relay_(relay)
     , table_(table)
     , reader_signal_(environment.io_context, 1)
-    , room_signal_(environment.io_context, 1) {
+    , room_signal_(environment.io_context, 1)
+    , reply_room_signal_(environment.io_context, 1) {
     ctx_.InitSubstreamFrom(sub_ctx);
     BindInboundRequestTarget(ctx_, InboundRequestTarget{
         common::Network::UDP, sub_ctx.outbound.target, std::nullopt});
@@ -342,7 +345,11 @@ void XudpSession::Close() noexcept {
 }
 
 void XudpSession::ReleaseAttachment() noexcept {
-    if (auto* client = std::exchange(local_, nullptr)) client->Release();
+    if (auto* client = std::exchange(local_, nullptr)) {
+        client->ForgetReplyRoom();
+        client->Release();
+    }
+    (void)reply_room_signal_.try_send(IoErrorCode{});
     if (remote_) {
         const auto remote = *std::exchange(remote_, std::nullopt);
         relay_->ForgetAttachment(remote.from, remote.slot, remote.generation);
@@ -372,7 +379,9 @@ void XudpSession::AttachLocal(XudpClient& client) {
 
 void XudpSession::DetachLocal(XudpClient& client) noexcept {
     if (local_ != &client) return;
+    client.ForgetReplyRoom();
     local_ = nullptr;
+    (void)reply_room_signal_.try_send(IoErrorCode{});
     Unattached();
 }
 
@@ -454,8 +463,23 @@ net::awaitable<void> XudpSession::WriteMultiBuffer(common::MultiBuffer mb) {
         throw IoSystemError(io_error::invalid_argument,
                             "XUDP reply contains missing or mixed endpoints");
     }
-    Deliver(std::move(mb));
-    co_return;
+    // Toward a sub-session of this Worker a reply waits for its Mux
+    // connection's UDP budget, as Xray's XUDP writer blocks; toward another
+    // Worker or while unattached it is relayed or held without waiting.
+    for (;;) {
+        if (closed_) throw IoSystemError(io_error::operation_aborted, "XUDP flow closed");
+        auto* client = local_;
+        if (!client) {
+            Deliver(std::move(mb));
+            co_return;
+        }
+        if (client->OfferReply(mb) != XudpReplyOffer::Full) co_return;
+        client->AwaitReplyRoom(reply_room_signal_);
+        auto [error] = co_await reply_room_signal_.async_receive(net::as_tuple(net::use_awaitable));
+        // A client that left was told to forget this waker before it did.
+        if (local_ == client) client->ForgetReplyRoom();
+        if (error) throw IoSystemError(io_error::operation_aborted, "XUDP reply cancelled");
+    }
 }
 
 // ---------------------------------------------------------------------------
