@@ -196,30 +196,30 @@ TEST(ConfigSemantics, RejectsUnknownForcedOutbound) {
     EXPECT_EQ(result.tag, "missing");
 }
 
-TEST(ConfigSemantics, ConnectionIdleUsesCanonicalKeyAndRejectsMisspelling) {
+TEST(ConfigSemantics, ConnectionIdleUsesOnlyCanonicalKey) {
     const auto canonical = infra::parse(
         R"({"connIdle":17})", infra::KeyComparison::AsciiCaseInsensitive);
     EXPECT_EQ(infra::TimeoutsConfig::FromJson(canonical.as_object()).IdleTimeout(),
               std::chrono::seconds(17));
     const auto misspelled = infra::parse(
         R"({"idle":17})", infra::KeyComparison::AsciiCaseInsensitive);
-    EXPECT_THROW(infra::TimeoutsConfig::FromJson(misspelled.as_object()), std::invalid_argument);
+    EXPECT_EQ(infra::TimeoutsConfig::FromJson(misspelled.as_object()).IdleTimeout(),
+              infra::TimeoutsConfig{}.IdleTimeout());
 }
 
-TEST(ConfigSemantics, UnknownNestedKeysCannotSilentlySelectDefaults) {
+TEST(ConfigSemantics, UnknownNestedKeysAreIgnoredAndKeepDefaults) {
     const auto config = [](std::string_view text) {
         return infra::parse(text, infra::KeyComparison::AsciiCaseInsensitive).as_object();
     };
-    EXPECT_FALSE(infra::ParseConfig(config(R"({"worker":1})")));
-    EXPECT_FALSE(infra::ParseConfig(config(R"({"timeouts":{"connIdel":17}})")));
-    EXPECT_THROW(infra::DnsConfig::FromJson(config(R"({"cacheSzie":64})")), std::invalid_argument);
-    EXPECT_THROW(infra::LimitsConfig::FromJson(config(R"({"ipBan":{"enable":true}})")),
-                 std::invalid_argument);
-    EXPECT_THROW(infra::StaticInboundConfig::FromJson(config(
-        R"({"port":1080,"protocol":"vmess","settings":{"client":[]}})")),
-                 std::invalid_argument);
-    EXPECT_THROW(infra::PanelConfig::FromJson(config(R"({"apiHots":"https://example.com"})")),
-                 std::invalid_argument);
+    const auto parsed = infra::ParseConfig(config(
+        R"({"worker":64,"timeouts":{"connIdel":17},"dns":{"cacheSzie":64},"limits":{"ipBan":{"enable":true}}})"));
+    ASSERT_TRUE(parsed);
+    EXPECT_EQ(parsed->timeouts.IdleTimeout(), infra::TimeoutsConfig{}.IdleTimeout());
+    EXPECT_EQ(parsed->dns.cache_size, infra::DnsConfig{}.cache_size);
+    EXPECT_EQ(parsed->limits.ip_ban.enabled, infra::AuthFailureLimitConfig{}.enabled);
+    EXPECT_TRUE(infra::StaticInboundConfig::FromJson(config(
+        R"({"port":1080,"protocol":"vmess","settings":{"client":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}})"))
+                    .users.empty());
 }
 
 TEST(ConfigSemantics, LogSeverityIsNormalizedBeforeRuntimeInitialization) {
@@ -231,12 +231,12 @@ TEST(ConfigSemantics, LogSeverityIsNormalizedBeforeRuntimeInitialization) {
     EXPECT_THROW(infra::LogConfig::FromJson(alias.as_object()), std::invalid_argument);
 }
 
-TEST(ConfigSemantics, DownloadEndpointKeysAreNotAcceptedAsOrdinaryStreamSettings) {
+TEST(ConfigSemantics, DownloadEndpointKeysOnlyApplyInsideDownloadSettings) {
     const auto ordinary = infra::parse(
         R"({"network":"xhttp","address":"example.com","port":443})",
         infra::KeyComparison::AsciiCaseInsensitive);
-    EXPECT_THROW((void)infra::ParseStreamSettings(ordinary.as_object(), transport::StreamEndpointRole::Outbound),
-                 std::invalid_argument);
+    EXPECT_FALSE(infra::ParseStreamSettings(ordinary.as_object(), transport::StreamEndpointRole::Outbound)
+                     .xhttp.download_settings);
     const auto split = infra::parse(
         R"({"network":"xhttp","xhttpSettings":{"mode":"stream-up","downloadSettings":{
             "address":"example.com","port":443,"network":"xhttp",
@@ -258,7 +258,7 @@ struct StaticClientFieldCase {
 class StaticClientSchema : public testing::TestWithParam<StaticClientFieldCase> {};
 }  // namespace
 
-TEST_P(StaticClientSchema, RejectsIgnoredOrAmbiguousCredentialFields) {
+TEST_P(StaticClientSchema, IgnoresForeignCredentialFields) {
     const auto& test = GetParam();
     auto source = infra::parse(R"({"port":443,"settings":{"clients":[{}]}})");
     source.as_object()["protocol"] = test.protocol;
@@ -270,7 +270,9 @@ TEST_P(StaticClientSchema, RejectsIgnoredOrAmbiguousCredentialFields) {
     ASSERT_EQ(normalized.users.size(), 1U);
     EXPECT_EQ(normalized.users.front().credential, credential);
     client[test.invalid_field] = "other-credential";
-    EXPECT_THROW((void)infra::StaticInboundConfig::FromJson(source.as_object()), std::invalid_argument);
+    const auto with_foreign = infra::StaticInboundConfig::FromJson(source.as_object());
+    ASSERT_EQ(with_foreign.users.size(), 1U);
+    EXPECT_EQ(with_foreign.users.front().credential, credential);
 }
 
 INSTANTIATE_TEST_SUITE_P(

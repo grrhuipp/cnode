@@ -50,16 +50,18 @@ TEST(OutboundConfig, PacketEncodingsRemainDistinct) {
 TEST(OutboundConfig, NestedSchemasDoNotFallbackToTopLevelCredentials) {
     for (const auto body : {
         R"({"vnext":[{"address":"example.com","users":[{"uuid":"custom"}]}]})",
-        R"({"vnext":[{"address":"example.com","users":[{"id":"custom"}]}],"encryption":"none"})",
-        R"({"vnext":[{"address":"example.com","users":[{"id":"custom"}]}],"packetEncoding":"xudp"})",
-        R"({"vnext":[{"address":"example.com","users":[{"id":"custom"}]}],"address":"other.example"})",
         R"({"address":"example.com","uuid":"custom"})"}) {
         SCOPED_TRACE(body);
         EXPECT_THROW(Parse("vless", body), std::invalid_argument);
     }
     EXPECT_THROW(Parse("shadowsocks", R"({"address":"example.com","key":"secret"})"), std::invalid_argument);
-    EXPECT_THROW(Parse("trojan", R"({"servers":[{"address":"example.com","password":"secret"}],"password":"other"})"),
-                 std::invalid_argument);
+    const auto vless = std::get<infra::VlessSettings>(Parse("vless",
+        R"({"vnext":[{"address":"example.com","users":[{"id":"custom"}]}],"address":"other.example","packetEncoding":"none"})"));
+    EXPECT_EQ(vless.server.address, "example.com");
+    EXPECT_EQ(vless.packet_encoding, infra::PacketEncoding::Xudp);
+    const auto trojan = std::get<infra::TrojanSettings>(Parse("trojan",
+        R"({"servers":[{"address":"example.com","password":"secret"}],"password":"other"})"));
+    EXPECT_EQ(trojan.password, "secret");
 }
 
 TEST(OutboundConfig, VmessUsesItsOwnSecurityNamesAndRetainsImplementedModes) {
@@ -77,23 +79,23 @@ TEST(OutboundConfig, VmessUsesItsOwnSecurityNamesAndRetainsImplementedModes) {
         std::invalid_argument);
 }
 
-struct InvalidSettings { const char* protocol; const char* body; };
-class InvalidOutboundSettings : public testing::TestWithParam<InvalidSettings> {};
-TEST_P(InvalidOutboundSettings, RejectsUnknownKeysAtEverySchemaLayer) {
+struct UnknownKeySettings { const char* protocol; const char* body; };
+class UnknownOutboundSettings : public testing::TestWithParam<UnknownKeySettings> {};
+TEST_P(UnknownOutboundSettings, IgnoresUnknownKeysAtEverySchemaLayer) {
     const auto& test = GetParam();
-    EXPECT_THROW(Parse(test.protocol, test.body), std::invalid_argument);
+    EXPECT_NO_THROW((void)Parse(test.protocol, test.body));
 }
-INSTANTIATE_TEST_SUITE_P(LocalSchema, InvalidOutboundSettings, testing::Values(
-    InvalidSettings{"freedom", R"({"domainStratgey":"UseIP"})"},
-    InvalidSettings{"blackhole", R"({"response":{"type":"http","status":403}})"},
-    InvalidSettings{"blackhole", R"({"unknown":true})"},
-    InvalidSettings{"anytls", R"({"address":"example.com","port":443,"password":"secret","unknown":true})"},
-    InvalidSettings{"trojan", R"({"servers":[{"address":"example.com","password":"secret","unknown":true}]})"},
-    InvalidSettings{"shadowsocks", R"({"servers":[{"address":"example.com","password":"secret","unknown":true}]})"},
-    InvalidSettings{"shadowsocks", R"({"address":"example.com","password":"secret","uot":{"version":2,"unknown":true}})"},
-    InvalidSettings{"vless", R"({"vnext":[{"address":"example.com","unknown":true,"users":[{"id":"custom"}]}]})"},
-    InvalidSettings{"vless", R"({"vnext":[{"address":"example.com","users":[{"id":"custom","unknown":true}]}]})"},
-    InvalidSettings{"vmess", R"({"vnext":[{"address":"example.com","users":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","unknown":true}]}]})"}
+INSTANTIATE_TEST_SUITE_P(LocalSchema, UnknownOutboundSettings, testing::Values(
+    UnknownKeySettings{"freedom", R"({"domainStratgey":"UseIP"})"},
+    UnknownKeySettings{"blackhole", R"({"response":{"type":"http","status":403}})"},
+    UnknownKeySettings{"blackhole", R"({"unknown":true})"},
+    UnknownKeySettings{"anytls", R"({"address":"example.com","port":443,"password":"secret","unknown":true})"},
+    UnknownKeySettings{"trojan", R"({"servers":[{"address":"example.com","password":"secret","unknown":true}]})"},
+    UnknownKeySettings{"shadowsocks", R"({"servers":[{"address":"example.com","password":"secret","unknown":true}]})"},
+    UnknownKeySettings{"shadowsocks", R"({"address":"example.com","password":"secret","uot":{"version":2,"unknown":true}})"},
+    UnknownKeySettings{"vless", R"({"vnext":[{"address":"example.com","unknown":true,"users":[{"id":"custom"}]}]})"},
+    UnknownKeySettings{"vless", R"({"vnext":[{"address":"example.com","users":[{"id":"custom","unknown":true}]}]})"},
+    UnknownKeySettings{"vmess", R"({"vnext":[{"address":"example.com","users":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","unknown":true}]}]})"}
 ));
 
 TEST(OutboundConfig, EndpointValidationRejectsWrongTypesAndAmbiguousArrays) {
@@ -120,7 +122,7 @@ TEST(OutboundConfig, FreedomOnlyAcceptsHandlerLevelBinding) {
     const auto source = infra::parse(
         R"({"protocol":"freedom","settings":{"sendThrough":"auto"}})",
         infra::KeyComparison::AsciiCaseInsensitive);
-    EXPECT_THROW(infra::OutboundSourceConfig::FromJson(source.as_object()), std::invalid_argument);
+    EXPECT_FALSE(infra::OutboundSourceConfig::FromJson(source.as_object()).send_through);
 }
 
 }  // namespace

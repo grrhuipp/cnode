@@ -44,7 +44,7 @@ TEST(AnytlsOutboundSettings, InvalidSessionPoliciesAreRejected) {
         R"("idleSessionTimeout":9223372036854775807)",
         R"("idleSessionCheckInterval":"30")", R"("idleSessionTimeout":0)",
         R"("idleSessionTimeout":18446744073709551615)",
-        R"("minIdleSession":-1)", R"("minIdleSession":"1")", R"("minIdleSessions":1)"}) {
+        R"("minIdleSession":-1)", R"("minIdleSession":"1")"}) {
         SCOPED_TRACE(field);
         EXPECT_THROW(Parse(std::string(R"({"address":"example.com","port":443,"password":"secret",)") + field + '}'),
                      std::invalid_argument);

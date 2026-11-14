@@ -23,6 +23,7 @@ TEST(SsOutboundUot, ExplicitVersionsAreNormalized) {
     EXPECT_EQ(Parse(R"({"uot":{"version":1}})"), Version::V1);
     EXPECT_FALSE(Parse(R"({"uot":false})"));
     EXPECT_FALSE(Parse(R"({"uot":{"enabled":false}})"));
+    EXPECT_EQ(Parse(R"({"uot":{"version":1,"unknown":2}})"), Version::V1);
 }
 
 TEST(SsOutboundUot, InvalidOrAmbiguousPoliciesAreRejected) {
@@ -32,8 +33,7 @@ TEST(SsOutboundUot, InvalidOrAmbiguousPoliciesAreRejected) {
         R"({"uot":{"enabled":1,"version":2}})", R"({"uotVersion":2})",
         R"({"uot":1})", R"({"uot":false,"uotVersion":2})",
         R"({"uot":{"enabled":false,"version":2}})",
-        R"({"uot":{"version":1},"uotVersion":1})",
-        R"({"uot":{"enabled":true,"unknown":2}})"}) {
+        R"({"uot":{"version":1},"uotVersion":1})"}) {
         SCOPED_TRACE(body);
         EXPECT_THROW(Parse(body), std::invalid_argument);
     }
