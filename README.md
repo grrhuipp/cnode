@@ -163,6 +163,8 @@ geosite.dat
 
 `config.json` 顶层必须是对象。`inbounds.json`、`outbounds.json` 顶层为对象数组，`routing.json` 顶层为 routing 对象，不接受 `{ "inbounds": [...] }`、`{ "routing": { ... } }` 等外层包装。仓库 `config/*.json.example` 是样例，实际文件名不带 `.example`。
 
+对象中的未知字段会被忽略，以兼容上游新增配置；已支持字段的类型或取值错误、重复字段、非法 JSON 以及错误的顶层结构仍会阻断启动。
+
 推荐部署目录：
 
 ```text

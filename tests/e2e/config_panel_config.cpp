@@ -107,25 +107,38 @@ TEST_P(StaticRouting, DefaultDirectForcedOutboundAndOptInRouting) {
 }
 INSTANTIATE_TEST_SUITE_P(LocalKeyCasing, StaticRouting, testing::Bool());
 
-TEST(ConfigRouting, RejectsInvalidInboundRoutingControls) {
-    const std::vector<Json> overrides = {{{"outboundTag", "missing"}}, {{"outboundTag", ""}},
-        {{"outboundTag", 3}}, {{"routingEnabled", "true"}}, {{"routing_enabled", true}},
+TEST(ConfigRouting, ValidatesKnownAndIgnoresUnknownInboundRoutingControls) {
+    const std::vector<Json> invalid = {{{"outboundTag", "missing"}}, {{"outboundTag", ""}},
+        {{"outboundTag", 3}}, {{"routingEnabled", "true"}}};
+    const std::vector<Json> unknown = {{{"routing_enabled", true}},
         {{"outbound_tag", "chosen"}}, {{"outbound", "chosen"}}};
-    for (const auto& override : overrides) {
+    const auto write_config = [](const std::filesystem::path& directory,
+                                 uint16_t port, const Json& override) {
+        auto inbound = Inbound(port);
+        inbound.update({{"routingEnabled", true}, {"outboundTag", "Chosen"}});
+        inbound.update(override);
+        Configure(directory, inbound, {{"tag", "Chosen"}, {"protocol", "freedom"}});
+        inbound["tag"] = "fin-in";
+        WriteJson(directory, "inbounds.json", Json::array({inbound}));
+        WriteJson(directory, "outbounds.json", Json::array({{{"tag", "Chosen"}, {"protocol", "freedom"}}}));
+        WriteJson(directory, "routing.json", {{"rules", Json::array()}});
+    };
+    for (const auto& override : invalid) {
         SCOPED_TRACE(override.dump());
         TempDir directory;
         auto reservation = Socket::ReserveTcp();
-        auto inbound = Inbound(reservation.Port());
-        inbound.update({{"routingEnabled", true}, {"outboundTag", "Chosen"}});
-        inbound.update(override);
-        Configure(directory.Path(), inbound, {{"tag", "Chosen"}, {"protocol", "freedom"}});
-        // Keep the candidate's controls intact instead of Configure's routing defaults.
-        inbound["tag"] = "fin-in";
-        WriteJson(directory.Path(), "inbounds.json", Json::array({inbound}));
-        WriteJson(directory.Path(), "outbounds.json", Json::array({{{"tag", "Chosen"}, {"protocol", "freedom"}}}));
-        WriteJson(directory.Path(), "routing.json", {{"rules", Json::array()}});
+        write_config(directory.Path(), reservation.Port(), override);
         auto child = Start(directory.Path());
         EXPECT_EQ(child->Wait(), 1) << ReadFile(child->LogPath());
+    }
+    for (const auto& override : unknown) {
+        SCOPED_TRACE(override.dump());
+        TempDir directory;
+        auto reservation = Socket::ReserveTcp();
+        write_config(directory.Path(), reservation.Port(), override);
+        auto child = Start(directory.Path());
+        child->WaitForLog("server started");
+        EXPECT_EQ(child->Stop(), 0);
     }
 }
 } // namespace

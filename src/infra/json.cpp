@@ -704,23 +704,6 @@ bool JsonBoolOr(const object& source, std::string_view key, bool fallback) {
     return RequireJson(ParseJsonBool(source, key)).value_or(fallback);
 }
 
-void RequireJsonKeys(
-    const object& source,
-    std::initializer_list<std::string_view> allowed,
-    std::string_view path,
-    std::initializer_list<std::string_view> additional) {
-    for (const auto& [key, value] : source) {
-        const auto contains = [&key](std::initializer_list<std::string_view> names) {
-            for (const auto name : names) {
-                if (common::EqualsAsciiCI(key, name)) return true;
-            }
-            return false;
-        };
-        if (!contains(allowed) && !contains(additional)) {
-            throw std::invalid_argument(std::format("{}: unknown key '{}'", path, key));
-        }
-    }
-}
 
 JsonPortResult ReadJsonPort(
     const object& source, std::string_view key) noexcept {

@@ -58,7 +58,6 @@ std::optional<proxy::UotVersion> Uot(const object& source) {
     if (!value->is_object()) throw std::invalid_argument("uot must be a boolean or object");
     if (version) throw std::invalid_argument("uot object cannot be combined with uotVersion");
     const auto& object = value->as_object();
-    RequireJsonKeys(object, {"enabled", "version"}, "outbound.settings.uot");
     const bool enabled = JsonBoolOr(object, "enabled", true);
     version = object.if_contains("version");
     if (!enabled) {
@@ -80,21 +79,11 @@ std::chrono::seconds PositiveSeconds(const object& source, std::string_view key,
     return std::chrono::seconds(static_cast<std::chrono::seconds::rep>(*value));
 }
 
-constexpr std::initializer_list<std::string_view> kSsFields{
-    "address", "port", "password", "method", "uot", "uotVersion"};
-constexpr std::initializer_list<std::string_view> kTrojanFields{
-    "address", "port", "password", "serverName", "allowInsecure", "alpn"};
-constexpr std::initializer_list<std::string_view> kVlessFields{
-    "id", "encryption", "flow", "packetEncoding"};
-constexpr std::initializer_list<std::string_view> kVmessFields{
-    "id", "security", "alterId"};
 
 }  // namespace
 
 OutboundSettings ParseOutboundSettings(std::string_view protocol, const object& source) {
     if (protocol == common::kFreedom) {
-        RequireJsonKeys(source, {"domainStrategy", "redirect"},
-                        "outbound.settings");
         FreedomSettings result;
         const auto strategy = proxy::ParseDomainStrategy(
             JsonStringOr(source, "domainStrategy", "AsIs"));
@@ -110,10 +99,8 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const object& 
         return result;
     }
     if (protocol == common::kBlackhole) {
-        RequireJsonKeys(source, {"response"}, "outbound.settings");
         BlackholeSettings result;
         if (const auto* response = RequireJson(ParseJsonObject(source, "response"))) {
-            RequireJsonKeys(*response, {"type"}, "outbound.settings.response");
             const auto type = common::LowerAscii(JsonStringOr(*response, "type", "none"));
             if (type != "none" && type != "http") {
                 throw std::invalid_argument("blackhole response.type must be none or http");
@@ -123,8 +110,6 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const object& 
         return result;
     }
     if (protocol == common::kAnyTLS) {
-        RequireJsonKeys(source, {"address", "port", "password", "idleSessionCheckInterval",
-                                "idleSessionTimeout", "minIdleSession"}, "outbound.settings");
         AnyTlsSettings result;
         result.server = Server(source, 0);
         auto password = Password(source);
@@ -141,10 +126,8 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const object& 
         const bool shadowsocks = protocol == common::kShadowsocks;
         const object* server = &source;
         if (const auto* servers = source.if_contains("servers")) {
-            RequireJsonKeys(source, {"servers"}, "outbound.settings");
             server = &SingleObject(servers, "servers");
         }
-        RequireJsonKeys(*server, shadowsocks ? kSsFields : kTrojanFields, "outbound.settings.server");
         if (shadowsocks) {
             ShadowsocksSettings result;
             result.server = Server(*server, 8388);
@@ -172,15 +155,9 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const object& 
         const bool vless_protocol = protocol == common::kVless;
         const object* server = &source;
         const object* user = &source;
-        const auto fields = vless_protocol ? kVlessFields : kVmessFields;
         if (const auto* vnext = source.if_contains("vnext")) {
-            RequireJsonKeys(source, {"vnext"}, "outbound.settings");
             server = &SingleObject(vnext, "vnext");
-            RequireJsonKeys(*server, {"address", "port", "users"}, "outbound.settings.vnext[0]");
             user = &SingleObject(server->if_contains("users"), "users");
-            RequireJsonKeys(*user, fields, "outbound.settings.vnext[0].users[0]");
-        } else {
-            RequireJsonKeys(source, fields, "outbound.settings", {"address", "port"});
         }
         auto endpoint = Server(*server, 443);
         const auto id = JsonStringOr(*user, "id", "");
