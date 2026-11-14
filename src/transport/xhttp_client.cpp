@@ -245,10 +245,15 @@ protected:
                 in_flight_upload_tcp_->Cancel();
             }
             CancelUpload();
+            // Without a logical source this stream's Cancellation() is the
+            // downlink's physical source, whose detached batch already reaches
+            // every waiter; re-notifying it would re-enter this callback.
+            if (!downlink_ || &downlink_->Cancellation() != &this->Cancellation()) {
+                this->NotifyCancellation(event.reason);
+            }
             if (downlink_) {
                 downlink_cancel_.Resubscribe(downlink_->Cancellation());
             }
-            this->NotifyCancellation(event.reason);
         }
     }
 
@@ -611,8 +616,10 @@ private:
             }
             NotifyClosed(event.reason);
         } else {
+            if (&upload_->Cancellation() != &this->Cancellation()) {
+                this->NotifyCancellation(event.reason);
+            }
             upload_cancel_.Resubscribe(upload_->Cancellation());
-            this->NotifyCancellation(event.reason);
         }
     }
 
