@@ -6,6 +6,15 @@
 namespace cnode::e2e::reference {
 namespace {
 using Clock = std::chrono::steady_clock;
+// RFC 9000 §10.1: an endpoint drops a connection once it stays silent for the smaller of the
+// two advertised max_idle_timeout values. The daemon advertises timeouts.connIdle, set here
+// below both reference clients' defaults (Hysteria 1: 20 s, Hysteria 2: 30 s).
+constexpr std::chrono::seconds QuicIdleTimeout = 15s;
+// How long traffic on a live connection may legitimately take. Loss is repaired on a probe
+// timeout that starts from the measured RTT and doubles on every expiry (RFC 9002 §6.2.1); a
+// scheduling stall of any process on the path inflates that RTT, so only the idle timeout
+// bounds recovery. The margin lets the resulting stream close reach the fixture first.
+constexpr Milliseconds LivenessBound = QuicIdleTimeout + 5s;
 std::string Random(size_t count) {
     std::string result(count, '\0');
     Require(RAND_bytes(reinterpret_cast<unsigned char*>(result.data()), count) == 1, "RAND_bytes failed");
@@ -49,8 +58,8 @@ private:
 };
 class NatRelay {
 public:
-    explicit NatRelay(uint16_t server_port) : front_(Socket::BindUdp()), server_port_(server_port) {
-        paths_.push_back(Socket::BindUdp());
+    explicit NatRelay(uint16_t server_port) : front_(BindRelaySocket()), server_port_(server_port) {
+        paths_.push_back(BindRelaySocket());
         thread_ = std::make_unique<PeerThread>([this] {
             while (!stop_) {
                 std::vector<pollfd> fds{{front_.Fd(), POLLIN, 0}};
@@ -76,7 +85,7 @@ public:
     ~NatRelay() { stop_ = true; }
     uint16_t Port() const { return front_.Port(); }
     size_t Active() const { std::lock_guard lock(mutex_); return active_; }
-    size_t Add() { std::lock_guard lock(mutex_); paths_.push_back(Socket::BindUdp()); return paths_.size() - 1; }
+    size_t Add() { std::lock_guard lock(mutex_); paths_.push_back(BindRelaySocket()); return paths_.size() - 1; }
     uint16_t Switch(size_t index) { std::lock_guard lock(mutex_); active_ = index; return paths_.at(index).Port(); }
     uint16_t PathPort(size_t index) const { std::lock_guard lock(mutex_); return paths_.at(index).Port(); }
     std::string Cid() const { std::lock_guard lock(mutex_); return cid_; }
@@ -88,6 +97,15 @@ public:
     bool BlockedResponse() const { return blocked_response_; }
     void Join() { stop_ = true; thread_->Join(); }
 private:
+    // The relay stands in for a NAT, not for a lossy link. One exchange round bursts more
+    // datagrams per direction than a default SO_RCVBUF holds, so a relay thread waiting for
+    // the CPU would itself drop the tail of a flight. The kernel clamps the request to rmem_max.
+    static Socket BindRelaySocket() {
+        auto socket = Socket::BindUdp();
+        const int bytes = 4 << 20;
+        Require(::setsockopt(socket.Fd(), SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes)) == 0, "relay receive buffer");
+        return socket;
+    }
     Socket front_;
     uint16_t server_port_;
     std::atomic<bool> stop_{false}, blocked_response_{false};
@@ -105,9 +123,9 @@ public:
     explicit ControlStream(Socket socket) : socket_(std::move(socket)), thread_([this] {
         while (!stop_) {
             const auto payload = "independent-session:" + BigEndian(rounds_, 8) + Random(1024);
-            const auto started = Clock::now(); socket_.Write(payload, 2s);
-            Require(socket_.ReadExact(payload.size(), 2s) == payload, "independent session corrupted");
-            Require(Clock::now() - started < 2s, "independent session stalled");
+            const auto started = Clock::now(); socket_.Write(payload, LivenessBound);
+            Require(socket_.ReadExact(payload.size(), LivenessBound) == payload, "independent session corrupted");
+            Require(Clock::now() - started < LivenessBound, "independent session stalled");
             ++rounds_; std::this_thread::sleep_for(10ms);
         }
     }) {}
@@ -209,6 +227,11 @@ TEST_P(HysteriaReference, AuthenticatedCrossWorkerReturnAndFailClosedShutdown) {
         {"port", server_port}, {"settings", {{"upMbps", 100}, {"downMbps", 100},
         {"clients", Json::array({{{"password", "smoke-secret"}}})}}}, {"streamSettings", TlsSettings(true)}}, outbound, 4);
     DebugConfig(root.Path());
+    {
+        auto settings = Json::parse(ReadFile(root.Path() / "config.json"));
+        settings["timeouts"]["connIdle"] = QuicIdleTimeout.count();
+        WriteJson(root.Path(), "config.json", settings);
+    }
     Child server({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "cnode.log");
     NatRelay relay(server_port);
     auto config = [&](std::string_view name, uint16_t remote, uint16_t local) {
@@ -245,7 +268,7 @@ TEST_P(HysteriaReference, AuthenticatedCrossWorkerReturnAndFailClosedShutdown) {
     size_t rounds = 0, upstream_baseline = 0, udp_attempts = 0;
     double longest_exchange_seconds = 0;
     auto exchange = [&] {
-        const auto started = Clock::now(), deadline = started + 1500ms;
+        const auto started = Clock::now(), deadline = started + LivenessBound;
         auto remaining = [&] {
             Require(Clock::now() < deadline, "migration traffic deadline");
             return std::chrono::ceil<Milliseconds>(deadline - Clock::now());
@@ -361,7 +384,7 @@ TEST_P(HysteriaReference, AuthenticatedCrossWorkerReturnAndFailClosedShutdown) {
     ASSERT_GE(receiving_worker, 0) << "no fresh foreign-Worker path for shutdown";
     relay.Block(chosen); relay.Switch(chosen);
     tcp.front().Write(nonce + "interrupted-path-validation");
-    Until([&] { return relay.BlockedResponse(); }, 1500ms);
+    Until([&] { return relay.BlockedResponse(); }, LivenessBound);
     control.Join();
     server.Signal(SIGTERM); EXPECT_EQ(server.Wait(10s), 0);
     tcp.clear(); associations.clear(); udp.clear(); client.Stop(); control_client.Stop();
