@@ -466,6 +466,28 @@ TEST_P(DnsDatagramQueries, CnameChainKeepsOnlyRecordsOnTheChain) {
     Run(run());
 }
 
+// RFC 1034 sets no order between RRsets; 1.1.1.1 shipped this ordering in
+// January 2026. Addresses first, then the chain from its far end.
+TEST_P(DnsDatagramQueries, ReorderedAnswerSectionStillFollowsTheChain) {
+    peer.answer_override = [](const Peer::Query& query) {
+        const bool v6 = AsksAaaa(query);
+        return AnswerWith(query, {
+            Address("end.example", v6, 77, 200),
+            Cname("mid.example", "end.example", 60),
+            Cname("alias.example", "mid.example", 300),
+        });
+    };
+    auto run = [&]() -> net::awaitable<void> {
+        const auto result = co_await dns.Resolve("alias.example");
+        EXPECT_TRUE(result.Ok()) << result.error_msg;
+        const std::vector<net::ip::address> expected{
+            net::ip::make_address("192.0.2.77"), net::ip::make_address("2001:db8::4d")};
+        EXPECT_EQ(result.addresses, expected);
+        EXPECT_EQ(result.ttl, 60u);
+    };
+    Run(run());
+}
+
 TEST_P(DnsDatagramQueries, CnameLoopIsServerFailureAndNotCached) {
     peer.answer_override = [](const Peer::Query& query) {
         const bool v6 = AsksAaaa(query);

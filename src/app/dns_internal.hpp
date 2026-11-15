@@ -108,6 +108,9 @@ public:
         if (capacity_ == 0 || (!result.Ok() && result.error != common::ErrorCode::DNS_NO_RECORD)) {
             return;
         }
+        // RFC 2308 §5: a negative answer without a usable SOA (TTL 0) is not
+        // cached. Any expired-negative metadata stays for a later "recovered".
+        if (!result.Ok() && result.ttl == 0) return;
         const auto existing = entries_.find(domain);
         // 零 TTL 地址只供本次查询使用，不受本地 TTL 下限延长，也不保留载荷。
         if (result.Ok() && result.ttl == 0) {

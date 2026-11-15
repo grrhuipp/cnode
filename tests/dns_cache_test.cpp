@@ -7,6 +7,7 @@
 #include <iostream>
 #include <new>
 #include <stdexcept>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -208,8 +209,15 @@ TEST(DnsCache, NegativeDiagnosticsSummarizeRecoveryExpiryEvictionAndShutdown) {
         EXPECT_EQ(negative_events[0].reason, "NXDOMAIN");
 
         negative.error_msg = "NODATA";
-        negative.ttl = 0;
+        negative.ttl = 0;  // No SOA (RFC 2308 §5): never inserted.
+        cache.Store("uncached.example", negative);
+        EXPECT_FALSE(cache.GetResult("uncached.example"));
+        EXPECT_EQ(cache.GetStats().entries, 1u) << "the uncached negative evicts nothing";
+        EXPECT_EQ(negative_events.size(), 1u);
+
+        negative.ttl = 1;
         cache.Store("expired.example", negative);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
         EXPECT_FALSE(cache.GetResult("expired.example"));
         EXPECT_EQ(cache.GetStats().entries, 0u);
         ASSERT_EQ(negative_events.size(), 2u);

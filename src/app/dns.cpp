@@ -514,82 +514,93 @@ DnsResult DNSWorker::Impl::ParseResponse(
     WireName owner;
     WireName target;
 
-    for (uint16_t i = 0; i < ancount; ++i) {
-        if (!ReadWireName(response, pos, owner) || pos + 10 > response.size()) {
-            result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-            result.error_msg = "DNS answer header truncated";
-            return result;
-        }
-
-        const uint16_t type = common::LoadU16BE(response.data() + pos);
-        if (response[pos + 2] != 0 || response[pos + 3] != 1) {
-            result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-            result.error_msg = "DNS answer class is not IN";
-            return result;
-        }
-        const uint32_t ttl = WireTtl(response.data() + pos + 4);
-        const uint16_t rdlength = common::LoadU16BE(response.data() + pos + 8);
-
-        pos += 10;
-        if (pos + rdlength > response.size()) {
-            result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-            result.error_msg = "DNS answer data truncated";
-            return result;
-        }
-        const size_t rdata_end = pos + rdlength;
-
-        if ((type == TYPE_A && rdlength != 4) ||
-            (type == TYPE_AAAA && rdlength != 16)) {
-            result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-            result.error_msg = std::format("DNS {} record has invalid RDLENGTH {} (expected {})",
-                type == TYPE_A ? "A" : "AAAA", rdlength,
-                type == TYPE_A ? 4 : 16);
-            return result;
-        }
-
-        // RFC 2181 §5.4.1: only records on the chain from QNAME answer the
-        // question; anything else in the section is ignored, not trusted.
-        const WireName& sname = chain[chain_size - 1];
-        if (owner == sname && type == TYPE_CNAME) {
-            size_t target_pos = pos;
-            if (!ReadWireName(response, target_pos, target) || target_pos != rdata_end) {
+    // RFC 1034 sets no order between RRsets: an address may precede the CNAME
+    // that reaches its owner, and chain CNAMEs may appear out of order. Rescan
+    // only when a pass extended the chain yet found no address at its end;
+    // each rescan needs a new hop, so kMaxCnameChain bounds the passes and the
+    // usual in-order answer stays a single pass.
+    const size_t answers_begin = pos;
+    for (;;) {
+        pos = answers_begin;
+        const size_t chain_before = chain_size;
+        for (uint16_t i = 0; i < ancount; ++i) {
+            if (!ReadWireName(response, pos, owner) || pos + 10 > response.size()) {
                 result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-                result.error_msg = "DNS CNAME target malformed";
+                result.error_msg = "DNS answer header truncated";
                 return result;
             }
-            const auto chain_end = chain.begin() + chain_size;
-            if (std::find(chain.begin(), chain_end, target) != chain_end) {
-                result.error = common::ErrorCode::DNS_SERVER_FAILED;
-                result.error_msg = "DNS CNAME chain loops";
+
+            const uint16_t type = common::LoadU16BE(response.data() + pos);
+            if (response[pos + 2] != 0 || response[pos + 3] != 1) {
+                result.error = common::ErrorCode::DNS_FORMAT_ERROR;
+                result.error_msg = "DNS answer class is not IN";
                 return result;
             }
-            if (chain_size == chain.size()) {
-                result.error = common::ErrorCode::DNS_SERVER_FAILED;
-                result.error_msg = "DNS CNAME chain too long";
+            const uint32_t ttl = WireTtl(response.data() + pos + 4);
+            const uint16_t rdlength = common::LoadU16BE(response.data() + pos + 8);
+
+            pos += 10;
+            if (pos + rdlength > response.size()) {
+                result.error = common::ErrorCode::DNS_FORMAT_ERROR;
+                result.error_msg = "DNS answer data truncated";
                 return result;
             }
-            chain[chain_size++] = target;
-            chain_ttl = std::min(chain_ttl, ttl);
-            // An alias owns no other data (RFC 1034 §3.6.2); drop any
-            // addresses that preceded its CNAME.
-            addresses.clear();
-            address_ttl = UINT32_MAX;
-        } else if (owner == sname && type == (query_aaaa ? TYPE_AAAA : TYPE_A)) {
-            // Records past the budget still bound the TTL.
-            address_ttl = std::min(address_ttl, ttl);
-            if (addresses.size() < kMaxAnswerAddresses) {
-                if (query_aaaa) {
-                    net::ip::address_v6::bytes_type bytes;
-                    std::memcpy(bytes.data(), &response[pos], 16);
-                    addresses.emplace_back(net::ip::address_v6(bytes));
-                } else {
-                    net::ip::address_v4::bytes_type bytes;
-                    std::memcpy(bytes.data(), &response[pos], 4);
-                    addresses.emplace_back(net::ip::address_v4(bytes));
+            const size_t rdata_end = pos + rdlength;
+
+            if ((type == TYPE_A && rdlength != 4) ||
+                (type == TYPE_AAAA && rdlength != 16)) {
+                result.error = common::ErrorCode::DNS_FORMAT_ERROR;
+                result.error_msg = std::format("DNS {} record has invalid RDLENGTH {} (expected {})",
+                    type == TYPE_A ? "A" : "AAAA", rdlength,
+                    type == TYPE_A ? 4 : 16);
+                return result;
+            }
+
+            // RFC 2181 §5.4.1: only records on the chain from QNAME answer the
+            // question; anything else in the section is ignored, not trusted.
+            const WireName& sname = chain[chain_size - 1];
+            if (owner == sname && type == TYPE_CNAME) {
+                size_t target_pos = pos;
+                if (!ReadWireName(response, target_pos, target) || target_pos != rdata_end) {
+                    result.error = common::ErrorCode::DNS_FORMAT_ERROR;
+                    result.error_msg = "DNS CNAME target malformed";
+                    return result;
+                }
+                const auto chain_end = chain.begin() + chain_size;
+                if (std::find(chain.begin(), chain_end, target) != chain_end) {
+                    result.error = common::ErrorCode::DNS_SERVER_FAILED;
+                    result.error_msg = "DNS CNAME chain loops";
+                    return result;
+                }
+                if (chain_size == chain.size()) {
+                    result.error = common::ErrorCode::DNS_SERVER_FAILED;
+                    result.error_msg = "DNS CNAME chain too long";
+                    return result;
+                }
+                chain[chain_size++] = target;
+                chain_ttl = std::min(chain_ttl, ttl);
+                // An alias owns no other data (RFC 1034 §3.6.2); drop any
+                // addresses that preceded its CNAME.
+                addresses.clear();
+                address_ttl = UINT32_MAX;
+            } else if (owner == sname && type == (query_aaaa ? TYPE_AAAA : TYPE_A)) {
+                // Records past the budget still bound the TTL.
+                address_ttl = std::min(address_ttl, ttl);
+                if (addresses.size() < kMaxAnswerAddresses) {
+                    if (query_aaaa) {
+                        net::ip::address_v6::bytes_type bytes;
+                        std::memcpy(bytes.data(), &response[pos], 16);
+                        addresses.emplace_back(net::ip::address_v6(bytes));
+                    } else {
+                        net::ip::address_v4::bytes_type bytes;
+                        std::memcpy(bytes.data(), &response[pos], 4);
+                        addresses.emplace_back(net::ip::address_v4(bytes));
+                    }
                 }
             }
+            pos = rdata_end;
         }
-        pos = rdata_end;
+        if (!addresses.empty() || chain_size == chain_before) break;
     }
 
     if (rcode != RCODE_NAME_ERROR && !addresses.empty()) {
