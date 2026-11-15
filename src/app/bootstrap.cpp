@@ -233,15 +233,6 @@ std::optional<infra::Config> LoadConfigFromCli(
     return infra::LoadConfig(config_path);
 }
 
-constexpr std::string_view IoBackendName() noexcept {
-#if defined(CNODE_IO_URING_ENABLED)
-    return "io_uring";
-#else
-    return "epoll";
-#endif
-}
-
-
 struct WorkerPool {
     // Cold construction failure unwinds in reverse declaration order:
     // work guards release first, then Workers destroy every socket/service
@@ -1030,8 +1021,8 @@ int RunFromCommandLine(int argc, char* argv[]) {
                 config.routing.rules.size(),
                 config.panels.size());
     LOG_CONSOLE("Starting cnode v1.0.0: channel={} build={}", BUILD_CHANNEL, BUILD_ID);
-    LOG_CONSOLE("Runtime configured: workers={} io={} accept=SO_REUSEPORT allocator=mimalloc-thread-heap",
-                config.workers, IoBackendName());
+    LOG_CONSOLE("Runtime configured: workers={} io=epoll accept=SO_REUSEPORT allocator=mimalloc-thread-heap",
+                config.workers);
     if (!infra::ValidateConfig(config)) {
         infra::Log::WriteConsole(infra::LogLevel::ERROR, "Invalid configuration");
         infra::Log::Shutdown();

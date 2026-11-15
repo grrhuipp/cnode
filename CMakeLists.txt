@@ -6,10 +6,6 @@ option(BUILD_BENCHMARKS "Configure opt-in benchmarks (requires BUILD_TESTING)" O
 if(BUILD_TESTING)
     list(APPEND VCPKG_MANIFEST_FEATURES tests)
 endif()
-option(CNODE_IO_URING "Use Asio io_uring instead of epoll" OFF)
-if(CNODE_IO_URING)
-    list(APPEND VCPKG_MANIFEST_FEATURES io-uring)
-endif()
 
 project(cnode VERSION 1.0.0 LANGUAGES C CXX)
 
@@ -66,13 +62,6 @@ foreach(directory IN LISTS cnode_queue_includes)
     target_include_directories(cnode_build_options SYSTEM INTERFACE "${directory}/moodycamel")
 endforeach()
 
-if(CNODE_IO_URING)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
-    target_link_libraries(cnode_build_options INTERFACE PkgConfig::LIBURING)
-    target_compile_definitions(cnode_build_options INTERFACE
-        ASIO_HAS_IO_URING ASIO_DISABLE_EPOLL CNODE_IO_URING_ENABLED)
-endif()
 set(CNODE_CORE_SOURCES
     # Infra (logging, config)
     src/infra/log.cpp

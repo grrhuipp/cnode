@@ -20,10 +20,6 @@
     "tests": {
       "description": "Build CTest-managed GoogleTest unit and E2E tests",
       "dependencies": ["gtest", "nlohmann-json", "libsodium"]
-    },
-    "io-uring": {
-      "description": "Build the optional Asio io_uring backend",
-      "dependencies": ["liburing"]
     }
   }
 }

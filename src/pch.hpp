@@ -17,12 +17,6 @@
 #include <asio/experimental/awaitable_operators.hpp>
 #include <asio/experimental/channel.hpp>
 
-// liburing headers expose BLOCK_SIZE as a macro; keep it from breaking
-// third-party C++ headers that use BLOCK_SIZE as an identifier.
-#ifdef BLOCK_SIZE
-#  undef BLOCK_SIZE
-#endif
-
 // ============================================================================
 // 标准库
 // ============================================================================

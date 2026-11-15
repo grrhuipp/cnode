@@ -51,7 +51,7 @@ mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error --
 mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error --parallel -L '^e2e$'
 ```
 
-主程序与测试共用 `build/musl`。若只需要某个测试，可显式构建其 `cnode_*_test` 目标，再用 `mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error -R <名称>` 执行。切回 `mise run build` 会关闭测试注册。可选 io_uring 后端通过 `mise run configure -- -DCNODE_IO_URING=ON` 配置，再执行 `mise exec -- cmake --build build/musl --target cnode`；官方发布仅提供 epoll。
+主程序与测试共用 `build/musl`。若只需要某个测试，可显式构建其 `cnode_*_test` 目标，再用 `mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error -R <名称>` 执行。切回 `mise run build` 会关闭测试注册。
 
 性能基准默认关闭，显式开启后通过独立的 `cnode_benchmarks` 目标和 CTest `benchmark` 标签运行；各基准的测量范围与口径见对应 `tests/*_benchmark.cpp`、`tests/e2e/*_benchmark.cpp` 文件头注释。真实进程基准可用 `CNODE_BENCHMARK_BINARY=/absolute/path/to/cnode` 指定待测二进制。启用基准时，功能回归使用 `-L '^(unit|e2e)$'`。
 
@@ -139,7 +139,7 @@ bash <(curl -sL https://raw.githubusercontent.com/grrhuipp/cnode/main/scripts/cn
 
 ## Release 产物
 
-GitHub Release 仅发布 musl+epoll 全静态二进制及匹配的 `.debug` 符号文件：
+GitHub Release 仅发布 musl 全静态二进制及匹配的 `.debug` 符号文件：
 
 ```text
 cnode-linux-amd64
