@@ -1012,14 +1012,16 @@ XHttpPacketUpload::XHttpPacketUpload(const XHttpUploadTarget& target, AsyncStrea
     }
     if (!session_->AcceptingInput() || !session_->packet_queue_.AcquireUpload())
         throw IoSystemError(io_error::no_buffer_space, "xhttp upload admission exhausted");
+    holds_upload_slot_ = true;
     Resubscribe(session_->Cancellation());
+    stream_end_.Resubscribe(stream_.Cancellation());
 }
 
 XHttpPacketUpload::~XHttpPacketUpload() noexcept {
     Unsubscribe();
     if (session_) {
         session_->Release(reserved_);
-        session_->packet_queue_.ReleaseUpload();
+        ReleaseUploadSlot();
     } else {
         relay_->ReleasePacketBytes(owner_, reserved_);
     }
@@ -1102,6 +1104,19 @@ void XHttpPacketUpload::OnCancellation(common::Cancellation cancellation) noexce
     } else {
         Resubscribe(session_->Cancellation());
         stream_.Cancel();
+    }
+}
+
+void XHttpPacketUpload::ReleaseUploadSlot() noexcept {
+    if (std::exchange(holds_upload_slot_, false)) session_->packet_queue_.ReleaseUpload();
+}
+
+void XHttpPacketUpload::StreamEndWatch::OnCancellation(
+    common::Cancellation cancellation) noexcept {
+    if (cancellation.terminal) {
+        upload.ReleaseUploadSlot();
+    } else {
+        Resubscribe(upload.stream_.Cancellation());
     }
 }
 

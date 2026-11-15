@@ -829,19 +829,22 @@ net::awaitable<void> Http2ServerSession::RunUpload(
     std::unique_ptr<AsyncStream> upload = std::make_unique<Http2ServerSubStream>(sub);
     try {
         if (kind == XHttpRequestMeta::Kind::PacketUp) {
-            XHttpPacketUpload packet(target, *upload);
-            common::MultiBuffer payload;
-            // The HTTP/2 stream is exactly one POST body; only the upload budget bounds it.
-            while (co_await packet.Read(payload, std::numeric_limits<size_t>::max()) != 0) {
-            }
-            const auto commit = packet.Local()
-                ? packet.CommitLocal(seq, std::move(payload))
-                : co_await packet.CommitRemote(seq, std::move(payload));
-            if (commit != XHttpCommit::Committed)
-                throw IoSystemError(io_error::no_buffer_space);
-            if (target.session && !target.session->DownlinkAttached() &&
-                !co_await target.session->AwaitDownlink(upload->Cancellation())) {
-                throw IoSystemError(io_error::timed_out);
+            {
+                // Borrows the session `target` owns: ends before `target` lets go.
+                XHttpPacketUpload packet(target, *upload);
+                common::MultiBuffer payload;
+                // The HTTP/2 stream is exactly one POST body; only the upload budget bounds it.
+                while (co_await packet.Read(payload, std::numeric_limits<size_t>::max()) != 0) {
+                }
+                const auto commit = packet.Local()
+                    ? packet.CommitLocal(seq, std::move(payload))
+                    : co_await packet.CommitRemote(seq, std::move(payload));
+                if (commit != XHttpCommit::Committed)
+                    throw IoSystemError(io_error::no_buffer_space);
+                if (target.session && !target.session->DownlinkAttached() &&
+                    !co_await target.session->AwaitDownlink(upload->Cancellation())) {
+                    throw IoSystemError(io_error::timed_out);
+                }
             }
             target = XHttpUploadTarget{};
             co_await upload->AsyncShutdownWrite();

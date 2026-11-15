@@ -459,7 +459,8 @@ struct XHttpUploadTarget {
 
 // One packet-up body bound for its session. On the session's Worker it reads
 // under the session payload budget; on another under the relay budget toward
-// the session's Worker, waiting while that budget is spent.
+// the session's Worker, waiting while that budget is spent. Borrows the
+// session its target owns: it does not outlive that target.
 class XHttpPacketUpload final : private common::CancellationSubscription {
 public:
     // Throws no_buffer_space when the local session admits no more uploads.
@@ -477,7 +478,21 @@ public:
         uint64_t seq, common::MultiBuffer payload);
 
 private:
+    // Returns the session's upload slot the moment the upload's stream ends
+    // for good, ahead of this upload's coroutine resuming to unwind: the
+    // reader that takes a stream's reset may meet the peer's next upload
+    // first, and that upload must find the slot free. The payload
+    // reservation follows the payload, which that coroutine still holds.
+    struct StreamEndWatch final : common::CancellationSubscription {
+        explicit StreamEndWatch(XHttpPacketUpload& upload) noexcept : upload(upload) {}
+        XHttpPacketUpload& upload;
+
+    private:
+        void OnCancellation(common::Cancellation cancellation) noexcept override;
+    };
+
     void OnCancellation(common::Cancellation cancellation) noexcept override;
+    void ReleaseUploadSlot() noexcept;
     // Adds `bytes` to this upload's reservation without waiting; false while
     // the session or relay budget is spent.
     [[nodiscard]] bool TryReserve(size_t bytes) noexcept;
@@ -490,6 +505,8 @@ private:
     uint64_t token_ = 0;
     AsyncStream& stream_;
     size_t reserved_ = 0;
+    bool holds_upload_slot_ = false;
+    StreamEndWatch stream_end_{*this};
 };
 
 // Teardown joins upload-response readers before releasing their Worker's
