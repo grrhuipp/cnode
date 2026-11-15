@@ -8,6 +8,7 @@
 #include <asio/steady_timer.hpp>
 #include <asio/use_future.hpp>
 #include <array>
+#include <functional>
 #include <list>
 #include <map>
 #include <optional>
@@ -82,6 +83,7 @@ struct Peer {
             return packet;
         }
         packet[3] = refuse ? 0x82 : negative ? 0x83 : 0x80;
+        if ((negative || nodata) && !omit_soa) AppendSoa(packet);
         if (refuse || negative || nodata ||
             (malformed_type != 0 && malformed_type != (v6 ? 28 : 1))) return packet;
         const size_t count = bulk_answers ? bulk_answers : 1;
@@ -109,6 +111,42 @@ struct Peer {
             packet.pop_back();
         }
         return packet;
+    }
+    // Authority-section SOA (RFC 2308 §3). Owner is the parent of QNAME via a
+    // compression pointer, or an unrelated zone; MNAME and RNAME are root.
+    void AppendSoa(std::vector<uint8_t>& packet) const {
+        packet[9] = 1;  // NSCOUNT
+        if (unrelated_soa) {
+            const auto owner = WireNameOf("other.test");
+            packet.insert(packet.end(), owner.begin(), owner.end());
+        } else {
+            packet.insert(packet.end(), {0xc0, static_cast<uint8_t>(12 + 1 + packet[12])});
+        }
+        AppendU16(packet, 6);
+        AppendU16(packet, 1);
+        AppendU32(packet, soa_ttl);
+        AppendU16(packet, 22);
+        packet.insert(packet.end(), {0, 0});
+        for (uint32_t field : {1u, 7200u, 900u, 1209600u, soa_minimum}) AppendU32(packet, field);
+    }
+    static std::vector<uint8_t> WireNameOf(std::string_view name) {
+        std::vector<uint8_t> wire;
+        size_t start = 0;
+        while (start < name.size()) {
+            const size_t dot = std::min(name.find('.', start), name.size());
+            wire.push_back(static_cast<uint8_t>(dot - start));
+            wire.insert(wire.end(), name.begin() + start, name.begin() + dot);
+            start = dot + 1;
+        }
+        wire.push_back(0);
+        return wire;
+    }
+    static void AppendU16(std::vector<uint8_t>& out, uint16_t value) {
+        out.insert(out.end(), {static_cast<uint8_t>(value >> 8), static_cast<uint8_t>(value)});
+    }
+    static void AppendU32(std::vector<uint8_t>& out, uint32_t value) {
+        AppendU16(out, static_cast<uint16_t>(value >> 16));
+        AppendU16(out, static_cast<uint16_t>(value));
     }
     void Receive() {
         socket.async_receive_from(net::buffer(buffer), sender, [&](::IoErrorCode ec, size_t size) {
@@ -142,11 +180,11 @@ struct Peer {
         EXPECT_EQ(group.size(), batch_size) << "all queries must be outstanding together";
         int ordinal = 4;
         for (auto it = group.rbegin(); it != group.rend(); ++it) {
-            auto packet = Answer(*it, ordinal);
-            if (packet.size() > it->udp_limit) {
+            auto packet = answer_override ? answer_override(*it) : Answer(*it, ordinal);
+            if (!ignore_udp_limit && packet.size() > it->udp_limit) {
                 packet.resize(it->question_size);
                 packet[2] |= 0x02;
-                packet[6] = packet[7] = 0;
+                std::fill(packet.begin() + 6, packet.begin() + 12, 0);
             }
             --ordinal;
             if (noise) {
@@ -220,7 +258,10 @@ struct Peer {
     size_t stream_connections = 0, stream_queries = 0, stream_closed = 0, plain_queries = 0;
     bool hold = false, refuse = false, negative = false, nodata = false;
     bool reject_edns = false, reject_without_question = false;
+    bool omit_soa = false, unrelated_soa = false, ignore_udp_limit = false;
     bool noise = false, duplicate_id = false, fault_cache_write = false, stall_stream = false;
+    uint32_t soa_ttl = 900, soa_minimum = 120;
+    std::function<std::vector<uint8_t>(const Query&)> answer_override;
     int malformed_type = 0;
     std::optional<uint32_t> answer_ttl;
     int ttl_type = 0;
@@ -347,6 +388,151 @@ TEST_P(DnsDatagramQueries, QuestionlessEdnsRejectionStillTriggersPlainRetry) {
         EXPECT_EQ(peer.plain_queries, 4u);
     };
     Run(run());
+}
+
+TEST_P(DnsDatagramQueries, OversizedDatagramIsRetriedOverTcp) {
+    peer.ServeStream();
+    peer.bulk_answers = 100;
+    peer.ignore_udp_limit = true;  // Violates the advertised 1232 bytes.
+    auto run = [&]() -> net::awaitable<void> {
+        const auto result = co_await dns.Resolve("oversized.example");
+        EXPECT_TRUE(result.Ok()) << result.error_msg;
+        EXPECT_EQ(result.addresses, BulkAddresses(64));
+        EXPECT_EQ(peer.stream_queries, 4u);
+    };
+    Run(run());
+}
+
+struct Record {
+    std::string owner;
+    uint16_t type;
+    uint32_t ttl;
+    std::vector<uint8_t> rdata;
+};
+Record Cname(std::string owner, std::string_view target, uint32_t ttl) {
+    return {std::move(owner), 5, ttl, Peer::WireNameOf(target)};
+}
+Record Address(std::string owner, bool v6, uint8_t last, uint32_t ttl) {
+    std::vector<uint8_t> rdata;
+    if (v6) {
+        const auto bytes = net::ip::make_address_v6("2001:db8::").to_bytes();
+        rdata.assign(bytes.begin(), bytes.end());
+    } else {
+        rdata = {192, 0, 2, 0};
+    }
+    rdata.back() = last;
+    return {std::move(owner), static_cast<uint16_t>(v6 ? 28 : 1), ttl, std::move(rdata)};
+}
+bool AsksAaaa(const Peer::Query& query) { return query.bytes[query.question_size - 3] == 28; }
+std::vector<uint8_t> AnswerWith(const Peer::Query& query, const std::vector<Record>& records) {
+    std::vector<uint8_t> packet(query.bytes.begin(), query.bytes.begin() + query.question_size);
+    packet[2] = 0x81;
+    packet[3] = 0x80;
+    std::fill(packet.begin() + 6, packet.begin() + 12, 0);
+    packet[7] = static_cast<uint8_t>(records.size());
+    for (const auto& record : records) {
+        const auto owner = Peer::WireNameOf(record.owner);
+        packet.insert(packet.end(), owner.begin(), owner.end());
+        Peer::AppendU16(packet, record.type);
+        Peer::AppendU16(packet, 1);
+        Peer::AppendU32(packet, record.ttl);
+        Peer::AppendU16(packet, static_cast<uint16_t>(record.rdata.size()));
+        packet.insert(packet.end(), record.rdata.begin(), record.rdata.end());
+    }
+    return packet;
+}
+
+// Owner names differ in case from the question (RFC 4343). The address that
+// precedes its owner's CNAME and the record outside the chain are not trusted.
+TEST_P(DnsDatagramQueries, CnameChainKeepsOnlyRecordsOnTheChain) {
+    peer.answer_override = [](const Peer::Query& query) {
+        const bool v6 = AsksAaaa(query);
+        return AnswerWith(query, {
+            Address("ALIAS.example", v6, 9, 300),
+            Cname("alias.EXAMPLE", "Mid.Example", 300),
+            Address("evil.example", v6, 66, 300),
+            Cname("mid.example", "end.example", 50),
+            Address("end.example", v6, 77, 200),
+        });
+    };
+    auto run = [&]() -> net::awaitable<void> {
+        const auto result = co_await dns.Resolve("alias.example");
+        EXPECT_TRUE(result.Ok()) << result.error_msg;
+        const std::vector<net::ip::address> expected{
+            net::ip::make_address("192.0.2.77"), net::ip::make_address("2001:db8::4d")};
+        EXPECT_EQ(result.addresses, expected);
+        EXPECT_EQ(result.ttl, 50u) << "the chain's CNAME TTLs bound the answer";
+    };
+    Run(run());
+}
+
+TEST_P(DnsDatagramQueries, CnameLoopIsServerFailureAndNotCached) {
+    peer.answer_override = [](const Peer::Query& query) {
+        const bool v6 = AsksAaaa(query);
+        return AnswerWith(query, {
+            Cname("loop.example", "back.example", 300),
+            Cname("back.example", "loop.example", 300),
+            Address("loop.example", v6, 1, 300),
+        });
+    };
+    auto run = [&]() -> net::awaitable<void> {
+        const auto first = co_await dns.Resolve("loop.example");
+        EXPECT_EQ(first.error, ::common::ErrorCode::DNS_SERVER_FAILED) << first.error_msg;
+        EXPECT_NE(first.error_msg.find("loops"), std::string::npos) << first.error_msg;
+        const auto second = co_await dns.Resolve("loop.example");
+        EXPECT_FALSE(second.from_cache);
+        EXPECT_EQ(peer.packets, 8u);
+    };
+    Run(run());
+}
+
+TEST_P(DnsDatagramQueries, NegativeAnswerTtlIsSoaMinimumBound) {
+    peer.negative = true;
+    auto run = [&]() -> net::awaitable<void> {
+        const auto first = co_await dns.Resolve("soa.example");
+        EXPECT_EQ(first.error, ::common::ErrorCode::DNS_NO_RECORD);
+        EXPECT_EQ(first.ttl, 120u) << "min(SOA TTL 900, MINIMUM 120)";
+        peer.soa_ttl = 30;
+        const auto cached = co_await dns.Resolve("soa.example");
+        EXPECT_TRUE(cached.from_cache);
+        EXPECT_LE(cached.ttl, 120u);
+        const auto lower = co_await dns.Resolve("soa-ttl.example");
+        EXPECT_EQ(lower.ttl, 30u) << "a SOA TTL below MINIMUM wins";
+    };
+    Run(run());
+}
+
+class DnsNegativeWithoutZoneSoa : public testing::TestWithParam<bool> {};
+TEST_P(DnsNegativeWithoutZoneSoa, IsNotCached) {
+    net::io_context io;
+    Peer peer(io);
+    peer.negative = true;
+    peer.omit_soa = !GetParam();
+    peer.unrelated_soa = GetParam();
+    ::app::DNSWorker worker(io, Config(peer), 8);
+    DNS dns(worker);
+    bool done = false;
+    std::exception_ptr failure;
+    auto run = [&]() -> net::awaitable<void> {
+        const auto first = co_await dns.Resolve("nosoa.example");
+        EXPECT_EQ(first.error, ::common::ErrorCode::DNS_NO_RECORD);
+        EXPECT_EQ(first.ttl, 0u);
+        const auto second = co_await dns.Resolve("nosoa.example");
+        EXPECT_EQ(second.error, ::common::ErrorCode::DNS_NO_RECORD);
+        EXPECT_FALSE(second.from_cache);
+        EXPECT_EQ(peer.packets, 8u);
+    };
+    net::co_spawn(io, run(), [&](std::exception_ptr error) {
+        failure = error;
+        done = true;
+        peer.Stop();
+    });
+    io.run_for(3s);
+    const bool completed_before_cleanup = done;
+    peer.Stop();
+    JoinService(io, worker);
+    EXPECT_TRUE(completed_before_cleanup);
+    if (failure) std::rethrow_exception(failure);
 }
 
 enum class StreamRetryEnd { Deadline, ServiceStop, WaiterCancel };
@@ -838,6 +1024,8 @@ INSTANTIATE_TEST_SUITE_P(Upstreams, DnsMalformedAnswer, testing::Values(
     });
 INSTANTIATE_TEST_SUITE_P(Startup, DnsDatagramStop, testing::Bool(),
     [](const testing::TestParamInfo<bool>& info) { return info.param ? "PendingQuery" : "Unused"; });
+INSTANTIATE_TEST_SUITE_P(Authority, DnsNegativeWithoutZoneSoa, testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) { return info.param ? "UnrelatedSoa" : "NoSoa"; });
 INSTANTIATE_TEST_SUITE_P(Outcome, DnsStalledStreamRetry, testing::Values(
     StreamRetryEnd::Deadline, StreamRetryEnd::ServiceStop, StreamRetryEnd::WaiterCancel),
     [](const testing::TestParamInfo<StreamRetryEnd>& info) {

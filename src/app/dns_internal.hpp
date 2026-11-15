@@ -612,7 +612,9 @@ private:
     transport::TimeoutScheduler& scheduler_;
     common::SignalChannel joined_;
     std::unordered_map<uint16_t, Pending*> pending_;
-    std::array<uint8_t, kDnsUdpPayloadSize> buffer_{};
+    // One octet beyond the advertised payload reveals an oversized datagram,
+    // which the kernel would otherwise truncate silently.
+    std::array<uint8_t, kDnsUdpPayloadSize + 1> buffer_{};
     std::bitset<65536> used_ids_;
     Stream* streams_ = nullptr;
     size_t issued_ = 0;

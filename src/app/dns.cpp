@@ -22,6 +22,7 @@ constexpr uint16_t FLAG_RCODE = 0x000F;
 
 constexpr uint16_t TYPE_A     = 1;
 constexpr uint16_t TYPE_CNAME = 5;
+constexpr uint16_t TYPE_SOA   = 6;
 constexpr uint16_t TYPE_AAAA  = 28;
 constexpr uint16_t TYPE_OPT   = 41;
 constexpr uint8_t RCODE_OK         = 0;
@@ -34,6 +35,9 @@ constexpr size_t kQueryCapacity = 12 + 255 + 4 + kOptRecordSize;
 // Local budget, not a protocol limit: a TCP answer may hold thousands of
 // addresses, which the dedupe, cache entries and per-hit copies must not carry.
 constexpr size_t kMaxAnswerAddresses = 64;
+// CNAME hops followed within one answer; matches the BIND and Unbound
+// default of 11 query restarts.
+constexpr size_t kMaxCnameChain = 11;
 
 
 constexpr size_t kAddressQueryAttempts = 3;
@@ -46,6 +50,75 @@ void AppendUniqueAddresses(
             out.push_back(address);
         }
     }
+}
+
+// Uncompressed, lowercased wire-format name (RFC 4034 §6.2 canonical form),
+// compared octet-wise after case folding as RFC 1035 §2.3.3 / RFC 4343 require.
+struct WireName {
+    std::array<uint8_t, 255> bytes;
+    size_t size = 0;
+
+    [[nodiscard]] bool operator==(const WireName& other) const noexcept {
+        return size == other.size &&
+               std::equal(bytes.begin(), bytes.begin() + size, other.bytes.begin());
+    }
+};
+
+// Same compression rules as UpstreamExchange::SkipWireName: only strictly
+// backward pointers, so traversal is bounded by the packet length.
+[[nodiscard]] bool ReadWireName(std::span<const uint8_t> packet, size_t& offset,
+                                WireName& out) noexcept {
+    size_t current = offset;
+    size_t resume = 0;
+    bool jumped = false;
+    out.size = 0;
+    while (current < packet.size()) {
+        const uint8_t len = packet[current];
+        if (len == 0) {
+            out.bytes[out.size++] = 0;
+            offset = jumped ? resume : current + 1;
+            return true;
+        }
+        if ((len & 0xC0) == 0xC0) {
+            if (current + 1 >= packet.size()) return false;
+            const size_t ptr = common::LoadU16BE(packet.data() + current) & 0x3FFFu;
+            if (ptr < 12 || ptr >= current) return false;
+            if (!jumped) {
+                resume = current + 2;
+                jumped = true;
+            }
+            current = ptr;
+            continue;
+        }
+        if ((len & 0xC0) != 0) return false;
+        if (packet.size() - current <= static_cast<size_t>(len) + 1) return false;
+        // Keep one octet for the root label: whole names are at most 255.
+        if (out.size + len + 1 >= out.bytes.size()) return false;
+        out.bytes[out.size++] = len;
+        for (size_t i = 1; i <= len; ++i) {
+            out.bytes[out.size++] = common::ToLowerAscii(packet[current + i]);
+        }
+        current += static_cast<size_t>(len) + 1;
+    }
+    return false;
+}
+
+// True when zone equals name or is one of its label-aligned ancestors.
+[[nodiscard]] bool IsSameOrAncestor(const WireName& zone, const WireName& name) noexcept {
+    for (size_t offset = 0; offset < name.size; offset += static_cast<size_t>(name.bytes[offset]) + 1) {
+        if (name.size - offset == zone.size &&
+            std::equal(zone.bytes.begin(), zone.bytes.begin() + zone.size, name.bytes.begin() + offset)) {
+            return true;
+        }
+        if (name.bytes[offset] == 0) break;
+    }
+    return false;
+}
+
+// RFC 2181 §8: a TTL with the most significant bit set is treated as zero.
+[[nodiscard]] uint32_t WireTtl(const uint8_t* data) noexcept {
+    const uint32_t ttl = common::LoadU32BE(data);
+    return (ttl & 0x80000000u) != 0 ? 0 : ttl;
 }
 
 }  // namespace
@@ -250,11 +323,17 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
             common::AddressText(endpoint.address()).View(), endpoint.port(),
             common::ErrorCodeToString(a_result.error), a_result.error_msg,
             common::ErrorCodeToString(aaaa_result.error), aaaa_result.error_msg);
+        // A name without either address family is cached for the shorter of
+        // the two negative TTLs (0 when either lacked a SOA).
+        const uint32_t negative_ttl = std::min(a_result.ttl, aaaa_result.ttl);
         last_result = a_result.error == common::ErrorCode::DNS_NO_RECORD && !no_records
             ? std::move(aaaa_result)
             : std::move(a_result);
         last_result.error_msg = std::move(reason);
-        if (no_records) co_return last_result;
+        if (no_records) {
+            last_result.ttl = negative_ttl;
+            co_return last_result;
+        }
     }
 
     co_return last_result;
@@ -282,8 +361,11 @@ net::awaitable<void> DNSWorker::Impl::QueryServer(
         response = co_await server.ExchangeDatagram(
             std::span<uint8_t>(query.data(), query_size), remaining());
     }
+    // A datagram longer than the advertised payload breaks RFC 6891 §6.2.5 and
+    // was cut by the receive buffer; like TC, only TCP can deliver it whole.
     const bool truncated = !response.error && response.bytes.size() >= 4 &&
-        (common::LoadU16BE(response.bytes.data() + 2) & FLAG_TC) != 0;
+        ((common::LoadU16BE(response.bytes.data() + 2) & FLAG_TC) != 0 ||
+         response.bytes.size() > kDnsUdpPayloadSize);
     if (truncated) {
         // RFC 7766 §5: a truncated UDP answer is retried over TCP.
         response = co_await server.ExchangeStream(
@@ -400,7 +482,11 @@ DnsResult DNSWorker::Impl::ParseResponse(
     }
 
     size_t pos = 12;
-    if (!UpstreamExchange::SkipWireName(response, pos) || pos + 4 > response.size()) {
+    // sname walks the CNAME chain from QNAME (RFC 1034 §5.3.3); the echoed
+    // question already matched the query case-insensitively.
+    std::array<WireName, kMaxCnameChain + 1> chain;
+    size_t chain_size = 1;
+    if (!ReadWireName(response, pos, chain[0]) || pos + 4 > response.size()) {
         result.error = common::ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS question section truncated";
         return result;
@@ -414,19 +500,8 @@ DnsResult DNSWorker::Impl::ParseResponse(
     }
     pos += 4;
 
-    if (rcode == RCODE_NAME_ERROR) {
-        result.error = common::ErrorCode::DNS_NO_RECORD;
-        result.error_msg = "NXDOMAIN";
-        return result;
-    }
-
     const uint16_t ancount = common::LoadU16BE(response.data() + 6);
-    if (ancount == 0) {
-        result.error = common::ErrorCode::DNS_NO_RECORD;
-        result.error_msg = "NODATA";
-        return result;
-    }
-
+    const uint16_t nscount = common::LoadU16BE(response.data() + 8);
     if (ancount > (response.size() - pos) / 11) {
         result.error = common::ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS answer count exceeds packet";
@@ -434,10 +509,13 @@ DnsResult DNSWorker::Impl::ParseResponse(
     }
     std::vector<net::ip::address> addresses;
     addresses.reserve(std::min<size_t>(ancount, kMaxAnswerAddresses));
-    uint32_t min_ttl = UINT32_MAX;
+    uint32_t chain_ttl = UINT32_MAX;
+    uint32_t address_ttl = UINT32_MAX;
+    WireName owner;
+    WireName target;
 
     for (uint16_t i = 0; i < ancount; ++i) {
-        if (!UpstreamExchange::SkipWireName(response, pos) || pos + 10 > response.size()) {
+        if (!ReadWireName(response, pos, owner) || pos + 10 > response.size()) {
             result.error = common::ErrorCode::DNS_FORMAT_ERROR;
             result.error_msg = "DNS answer header truncated";
             return result;
@@ -449,9 +527,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
             result.error_msg = "DNS answer class is not IN";
             return result;
         }
-        const uint32_t wire_ttl = common::LoadU32BE(response.data() + pos + 4);
-        // RFC 2181 §8：收到最高位置位的 TTL 时，整个值按零处理。
-        const uint32_t ttl = (wire_ttl & 0x80000000u) != 0 ? 0 : wire_ttl;
+        const uint32_t ttl = WireTtl(response.data() + pos + 4);
         const uint16_t rdlength = common::LoadU16BE(response.data() + pos + 8);
 
         pos += 10;
@@ -460,6 +536,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
             result.error_msg = "DNS answer data truncated";
             return result;
         }
+        const size_t rdata_end = pos + rdlength;
 
         if ((type == TYPE_A && rdlength != 4) ||
             (type == TYPE_AAAA && rdlength != 16)) {
@@ -470,32 +547,102 @@ DnsResult DNSWorker::Impl::ParseResponse(
             return result;
         }
 
-        // Records past the budget are still validated and bound the TTL.
-        const bool keep = addresses.size() < kMaxAnswerAddresses;
-        if (!query_aaaa && type == TYPE_A) {
-            min_ttl = std::min(min_ttl, ttl);
-            net::ip::address_v4::bytes_type bytes;
-            std::memcpy(bytes.data(), &response[pos], 4);
-            if (keep) addresses.emplace_back(net::ip::address_v4(bytes));
-        } else if (query_aaaa && type == TYPE_AAAA) {
-            min_ttl = std::min(min_ttl, ttl);
-            net::ip::address_v6::bytes_type bytes;
-            std::memcpy(bytes.data(), &response[pos], 16);
-            if (keep) addresses.emplace_back(net::ip::address_v6(bytes));
-        } else if (type == TYPE_CNAME) {
-            min_ttl = std::min(min_ttl, ttl);
+        // RFC 2181 §5.4.1: only records on the chain from QNAME answer the
+        // question; anything else in the section is ignored, not trusted.
+        const WireName& sname = chain[chain_size - 1];
+        if (owner == sname && type == TYPE_CNAME) {
+            size_t target_pos = pos;
+            if (!ReadWireName(response, target_pos, target) || target_pos != rdata_end) {
+                result.error = common::ErrorCode::DNS_FORMAT_ERROR;
+                result.error_msg = "DNS CNAME target malformed";
+                return result;
+            }
+            const auto chain_end = chain.begin() + chain_size;
+            if (std::find(chain.begin(), chain_end, target) != chain_end) {
+                result.error = common::ErrorCode::DNS_SERVER_FAILED;
+                result.error_msg = "DNS CNAME chain loops";
+                return result;
+            }
+            if (chain_size == chain.size()) {
+                result.error = common::ErrorCode::DNS_SERVER_FAILED;
+                result.error_msg = "DNS CNAME chain too long";
+                return result;
+            }
+            chain[chain_size++] = target;
+            chain_ttl = std::min(chain_ttl, ttl);
+            // An alias owns no other data (RFC 1034 §3.6.2); drop any
+            // addresses that preceded its CNAME.
+            addresses.clear();
+            address_ttl = UINT32_MAX;
+        } else if (owner == sname && type == (query_aaaa ? TYPE_AAAA : TYPE_A)) {
+            // Records past the budget still bound the TTL.
+            address_ttl = std::min(address_ttl, ttl);
+            if (addresses.size() < kMaxAnswerAddresses) {
+                if (query_aaaa) {
+                    net::ip::address_v6::bytes_type bytes;
+                    std::memcpy(bytes.data(), &response[pos], 16);
+                    addresses.emplace_back(net::ip::address_v6(bytes));
+                } else {
+                    net::ip::address_v4::bytes_type bytes;
+                    std::memcpy(bytes.data(), &response[pos], 4);
+                    addresses.emplace_back(net::ip::address_v4(bytes));
+                }
+            }
         }
-        pos += rdlength;
+        pos = rdata_end;
     }
 
-    if (addresses.empty()) {
-        result.error = common::ErrorCode::DNS_NO_RECORD;
-        result.error_msg = "No supported DNS records in response";
+    if (rcode != RCODE_NAME_ERROR && !addresses.empty()) {
+        result.addresses = std::move(addresses);
+        result.ttl = std::min(chain_ttl, address_ttl);
         return result;
     }
 
-    result.addresses = std::move(addresses);
-    result.ttl = (min_ttl == UINT32_MAX) ? 60 : min_ttl;
+    // Negative answer for the end of the chain (RFC 2308 §2). Its cache TTL is
+    // min(SOA TTL, SOA MINIMUM) from the authority section (§5), also bounded
+    // by the chain; without a SOA it is not cached (TTL 0).
+    if (nscount > (response.size() - pos) / 11) {
+        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
+        result.error_msg = "DNS authority count exceeds packet";
+        return result;
+    }
+    const WireName& sname = chain[chain_size - 1];
+    std::optional<uint32_t> negative_ttl;
+    for (uint16_t i = 0; i < nscount; ++i) {
+        if (!ReadWireName(response, pos, owner) || pos + 10 > response.size()) {
+            result.error = common::ErrorCode::DNS_FORMAT_ERROR;
+            result.error_msg = "DNS authority header truncated";
+            return result;
+        }
+        const uint16_t type = common::LoadU16BE(response.data() + pos);
+        const uint16_t rr_class = common::LoadU16BE(response.data() + pos + 2);
+        const uint32_t ttl = WireTtl(response.data() + pos + 4);
+        const uint16_t rdlength = common::LoadU16BE(response.data() + pos + 8);
+        pos += 10;
+        if (pos + rdlength > response.size()) {
+            result.error = common::ErrorCode::DNS_FORMAT_ERROR;
+            result.error_msg = "DNS authority data truncated";
+            return result;
+        }
+        const size_t rdata_end = pos + rdlength;
+        // The SOA of the zone holding sname: its owner is sname or an ancestor.
+        if (!negative_ttl && type == TYPE_SOA && rr_class == 1 && IsSameOrAncestor(owner, sname)) {
+            size_t fields = pos;
+            if (!UpstreamExchange::SkipWireName(response, fields) ||
+                !UpstreamExchange::SkipWireName(response, fields) ||
+                fields + 20 != rdata_end) {
+                result.error = common::ErrorCode::DNS_FORMAT_ERROR;
+                result.error_msg = "DNS SOA record malformed";
+                return result;
+            }
+            negative_ttl = std::min({ttl, WireTtl(response.data() + rdata_end - 4), chain_ttl});
+        }
+        pos = rdata_end;
+    }
+
+    result.error = common::ErrorCode::DNS_NO_RECORD;
+    result.error_msg = rcode == RCODE_NAME_ERROR ? "NXDOMAIN" : "NODATA";
+    result.ttl = negative_ttl.value_or(0);
     return result;
 }
 
