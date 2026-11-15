@@ -8,6 +8,7 @@
 #include <asio/steady_timer.hpp>
 #include <asio/use_future.hpp>
 #include <array>
+#include <bitset>
 #include <functional>
 #include <list>
 #include <map>
@@ -37,8 +38,24 @@ struct Peer {
         bool plain = false;
     };
     explicit Peer(net::io_context& io, bool ipv6 = false)
-        : socket(io, {ipv6 ? net::ip::address(net::ip::address_v6::loopback()) :
-                     net::ip::address(net::ip::address_v4::loopback()), 0}), foreign(io), acceptor(io) {
+        : socket(io), foreign(io), acceptor(io) {
+        // TCP shares the UDP port number, as a real upstream does. Reserve both
+        // up front: a busy host may already use the TCP twin of a random UDP port.
+        const net::ip::address loopback = ipv6
+            ? net::ip::address(net::ip::address_v6::loopback())
+            : net::ip::address(net::ip::address_v4::loopback());
+        for (int attempt = 0; attempt < 64 && !socket.is_open(); ++attempt) {
+            ::IoErrorCode error;
+            acceptor.open(ipv6 ? ::tcp::v6() : ::tcp::v4());
+            acceptor.bind({loopback, 0});
+            socket.open(ipv6 ? ::udp::v6() : ::udp::v4());
+            socket.bind({loopback, acceptor.local_endpoint().port()}, error);
+            if (error) {
+                socket.close();
+                acceptor.close();
+            }
+        }
+        if (!socket.is_open()) throw std::runtime_error("no free UDP/TCP port pair");
         foreign.open(socket.local_endpoint().protocol());
         Receive();
     }
@@ -46,11 +63,7 @@ struct Peer {
         socket.close(); foreign.close(); acceptor.close();
         for (auto& stream : held_streams) stream.close();
     }
-    // TCP shares the UDP port number, as a real upstream does.
     void ServeStream() {
-        const auto endpoint = socket.local_endpoint();
-        acceptor.open(endpoint.protocol() == ::udp::v6() ? ::tcp::v6() : ::tcp::v4());
-        acceptor.bind({endpoint.address(), endpoint.port()});
         acceptor.listen();
         net::co_spawn(acceptor.get_executor(), AcceptStreams(), net::detached);
     }
@@ -332,10 +345,10 @@ TEST_P(DnsDatagramQueries, ValidatesOutOfOrderAnswersAndCachesCanonicalNames) {
         EXPECT_TRUE(cached.from_cache);
         EXPECT_EQ(cached.addresses, expected);
         EXPECT_EQ(peer.packets, 4u);
+        EXPECT_EQ(peer.ports.size(), 4u) << "RFC 5452 §9.2: each query owns a source port";
         const auto second = co_await dns.Resolve("second.example");
         EXPECT_TRUE(second.Ok());
         EXPECT_EQ(peer.packets, 8u);
-        EXPECT_EQ(peer.ports.size(), 1u);
     };
     Run(run());
 }
@@ -723,7 +736,7 @@ TEST_P(DnsDatagramIsolation, OneRequestEndingDoesNotCancelAnotherQuery) {
         EXPECT_FALSE(errors[0]);
         EXPECT_EQ(answers[0].error, ::common::ErrorCode::DNS_TIMEOUT);
     }
-    EXPECT_EQ(peer.ports.size(), 1) << "concurrent requests must multiplex one socket";
+    EXPECT_EQ(peer.ports.size(), 8u) << "concurrent queries each own a source port";
 }
 
 class DnsSameDomainCancellation : public testing::TestWithParam<size_t> {};
@@ -851,34 +864,6 @@ TEST(DnsDatagram, RefusedUpstreamFallsBackAfterOutstandingQueriesFinish) {
     EXPECT_TRUE(ok);
     EXPECT_EQ(first.packets, 4u);
     EXPECT_EQ(second.packets, 4u);
-}
-
-TEST(DnsDatagram, ExhaustedTransactionIdsRotatePortWithoutReuse) {
-    net::io_context io;
-    Peer peer(io);
-    peer.batch_size = 1;
-    auto transport = std::make_shared<::app::UpstreamExchange>(io, peer.socket.local_endpoint());
-    std::exception_ptr error;
-    bool done = false;
-    auto run = [&]() -> net::awaitable<void> {
-        std::array<uint8_t, 19> query{0,0,1,0,0,1,0,0,0,0,0,0,1,'r',0,0,1,0,1};
-        for (size_t i = 0; i < 65537; ++i) {
-            auto result = co_await transport->ExchangeDatagram(query, 1s);
-            EXPECT_FALSE(result.error);
-            EXPECT_GT(result.bytes.size(), 12u);
-        }
-    };
-    net::co_spawn(io, run(), [&](std::exception_ptr e) { error = e; done = true; peer.Stop(); });
-    io.run_for(12s);
-    const bool completed_before_cleanup = done;
-    peer.Stop();
-    JoinService(io, *transport);
-    EXPECT_TRUE(completed_before_cleanup);
-    EXPECT_TRUE(done);
-    EXPECT_EQ(peer.packets, 65537u);
-    EXPECT_EQ(peer.ports.size(), 2u);
-    EXPECT_FALSE(peer.duplicate_id);
-    if (error) std::rethrow_exception(error);
 }
 
 TEST(DnsDatagram, CacheWriteFailurePreservesAnswerAndLaterWriteRecovers) {
@@ -1054,7 +1039,7 @@ TEST(DnsDatagram, AllocationFailureUnwindsBeforeStopAndJoin) {
     bool failed = false, joined = false;
     std::exception_ptr failure;
     auto run = [&]() -> net::awaitable<void> {
-        // Query registration is the exchange's first process-layer allocation.
+        // Opening the per-query socket is the exchange's first process-layer allocation.
         ::common::reject_next_process_allocation = true;
         try {
             (void)co_await transport->ExchangeDatagram(query, 30s);

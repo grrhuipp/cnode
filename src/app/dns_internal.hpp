@@ -20,7 +20,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bitset>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -224,10 +223,10 @@ private:
 // re-queried over TCP (RFC 7766 §5).
 inline constexpr size_t kDnsUdpPayloadSize = 1232;
 
-// One connected UDP socket per upstream plus short-lived TCP retries for
-// truncated answers, all owned exclusively by the DNS executor. Pending and
-// stream pointers borrow live exchange frames; registration is removed before
-// those frames can leave. No receive operation or timeout belongs to a caller.
+// Upstream exchanges owned exclusively by the DNS executor: a fresh UDP socket
+// per query and short-lived TCP retries for truncated answers. Each in-flight
+// socket lives in its exchange frame and stays linked so RequestStop can close
+// it; unlinking happens before that frame leaves.
 class UpstreamExchange : public std::enable_shared_from_this<UpstreamExchange> {
 public:
     struct Reply {
@@ -236,17 +235,15 @@ public:
     };
 
     UpstreamExchange(net::io_context& io, udp::endpoint endpoint)
-        : socket_(io), endpoint_(endpoint), scheduler_(transport::TimeoutScheduler::ForIoContext(io)),
+        : io_(io), endpoint_(endpoint), scheduler_(transport::TimeoutScheduler::ForIoContext(io)),
           joined_(io) {}
 
     void RequestStop() noexcept {
         if (stopping_) return;
         stopping_ = true;
-        FailAll(io_error::operation_aborted);
-        // Closing completes in-flight TCP operations later; the list stays intact.
-        for (Stream* stream = streams_; stream; stream = stream->next) stream->Abort();
-        IoErrorCode ignored;
-        socket_.close(ignored);
+        // Closing completes in-flight operations later; the lists stay intact.
+        for (auto* exchange = datagrams_; exchange; exchange = exchange->next) exchange->Abort();
+        for (auto* exchange = streams_; exchange; exchange = exchange->next) exchange->Abort();
         NotifyJoined();
     }
 
@@ -257,68 +254,43 @@ public:
         (void)co_await joined_.async_receive(net::as_tuple(net::use_awaitable));
     }
 
-    // Arms timeout as the remaining budget; a non-positive one fails at once.
+    // RFC 5452 §9.2: every query gets its own connected socket, so the kernel
+    // picks an unpredictable ephemeral source port and drops datagrams from any
+    // other address; the random ID adds 16 bits. timeout is the remaining
+    // budget, and a non-positive one fails at once. The caller owns query
+    // until completion, including cancellation unwind.
     net::awaitable<Reply> ExchangeDatagram(std::span<uint8_t> query, std::chrono::milliseconds timeout) {
-        // The caller owns query until completion, including cancellation unwind.
         auto owner = shared_from_this();
-        Reply failure;
+        Reply reply;
         if (stopping_) {
-            failure.error = io_error::operation_aborted;
-            co_return failure;
+            reply.error = io_error::operation_aborted;
+            co_return reply;
         }
         if (timeout <= std::chrono::milliseconds::zero()) {
-            failure.error = io_error::timed_out;
-            co_return failure;
+            reply.error = io_error::timed_out;
+            co_return reply;
         }
         ActiveExchange active(*this);
-        if (issued_ == 65536 && !pending_.empty()) {
-            failure.error = io_error::no_buffer_space;
-            co_return failure;
-        }
-        if (!socket_.is_open() || issued_ == 65536) {
-            // Never recycle an ID on a live socket: a delayed reply could have
-            // the same question. Bind the replacement while the old socket is
-            // still open, ensuring a different source port, then retire it.
-            udp::socket replacement(socket_.get_executor());
-            replacement.open(endpoint_.protocol(), failure.error);
-            if (!failure.error) replacement.connect(endpoint_, failure.error);
-            // Sending a tiny datagram must never block the main/control loop.
-            if (!failure.error) replacement.non_blocking(true, failure.error);
-            if (failure.error) co_return failure;
-            socket_ = std::move(replacement);
-            ++generation_;
-            used_ids_.reset();
-            issued_ = 0;
-        }
-        uint16_t id;
-        // Source ports now persist: unpredictable IDs are essential. Do not
-        // replace this with a counter or a predictable general-purpose PRNG.
-        if (RAND_bytes(reinterpret_cast<uint8_t*>(&id), sizeof(id)) != 1) {
-            failure.error = io_error::fault;
-            co_return failure;
-        }
-        while (used_ids_.test(id)) ++id;
-        common::StoreU16BE(query.data(), id);
-        Pending request(*this, id, query);
         common::CheckTestAllocationFault();
-        pending_.emplace(id, &request);
-        if (!scheduler_.ScheduleAfter(timeout, request)) {
-            pending_.erase(id);
-            failure.error = io_error::operation_aborted;
-            co_return failure;
+        InFlight<udp::socket> exchange(*this, datagrams_);
+        exchange.socket.open(endpoint_.protocol(), reply.error);
+        if (!reply.error) exchange.socket.connect(endpoint_, reply.error);
+        // Reads after a readiness wait must never block the control loop.
+        if (!reply.error) exchange.socket.non_blocking(true, reply.error);
+        if (reply.error) co_return reply;
+        uint16_t id;
+        if (RAND_bytes(reinterpret_cast<uint8_t*>(&id), sizeof(id)) != 1) {
+            reply.error = io_error::fault;
+            co_return reply;
         }
-        used_ids_.set(id);
-        ++issued_;
-        socket_.send(net::buffer(query.data(), query.size()), 0, failure.error);
-        if (failure.error) {
-            used_ids_.reset(id);
-            --issued_;
-            co_return failure;
+        common::StoreU16BE(query.data(), id);
+        if (!scheduler_.ScheduleAfter(timeout, exchange)) {
+            reply.error = io_error::operation_aborted;
+            co_return reply;
         }
-        Receive();
-        (void)co_await request.completion.async_receive(net::as_tuple(net::use_awaitable));
-        if (request.reply.bytes.empty() && !request.reply.error) request.reply.error = io_error::operation_aborted;
-        co_return std::move(request.reply);
+        reply.error = co_await ExchangeOverDatagram(exchange.socket, query, reply.bytes);
+        FinishReply(reply, exchange.timed_out);
+        co_return reply;
     }
 
     // RFC 7766 §5: re-ask a truncated UDP question over TCP on the same
@@ -337,19 +309,14 @@ public:
             co_return reply;
         }
         ActiveExchange active(*this);
-        Stream stream(*this);
-        if (!scheduler_.ScheduleAfter(timeout, stream)) {
+        InFlight<tcp::socket> exchange(*this, streams_);
+        if (!scheduler_.ScheduleAfter(timeout, exchange)) {
             reply.error = io_error::operation_aborted;
             co_return reply;
         }
         reply.error = co_await ExchangeOverStream(
-            stream.socket, tcp::endpoint(endpoint_.address(), endpoint_.port()), query, reply.bytes);
-        // A complete answer wins even if the deadline fired in the same turn.
-        if (reply.error) {
-            if (stream.timed_out) reply.error = io_error::timed_out;
-            else if (stopping_) reply.error = io_error::operation_aborted;
-            reply.bytes.clear();
-        }
+            exchange.socket, tcp::endpoint(endpoint_.address(), endpoint_.port()), query, reply.bytes);
+        FinishReply(reply, exchange.timed_out);
         co_return reply;
     }
 
@@ -409,37 +376,19 @@ private:
     };
 
     void NotifyJoined() noexcept {
-        if (stopping_ && active_ == 0 && !reading_) joined_.close();
+        if (stopping_ && active_ == 0) joined_.close();
     }
 
-    struct Pending final : transport::TimeoutEvent {
-        Pending(UpstreamExchange& owner, uint16_t id, std::span<const uint8_t> query)
-            : owner(owner), id(id), query(query), completion(owner.socket_.get_executor()) {}
-        ~Pending() {
-            Cancel();
-            const auto it = owner.pending_.find(id);
-            if (it != owner.pending_.end() && it->second == this) owner.pending_.erase(it);
-            owner.CancelIdleReceive();
-        }
-        UpstreamExchange& owner;
-        uint16_t id;
-        std::span<const uint8_t> query;
-        common::SignalChannel completion;
-        void OnTimeout() override { owner.Complete(id, io_error::timed_out); }
-        Reply reply;
-    };
-
-    // Lives in the ExchangeStream frame and stays linked so RequestStop can
-    // close its socket; unlinking happens before the frame leaves.
-    struct Stream final : transport::TimeoutEvent {
-        explicit Stream(UpstreamExchange& owner)
-            : owner(owner), socket(owner.socket_.get_executor()), next(owner.streams_) {
+    template <typename Socket>
+    struct InFlight final : transport::TimeoutEvent {
+        InFlight(UpstreamExchange& owner, InFlight*& head)
+            : head(head), socket(owner.io_), next(head) {
             if (next) next->prev = this;
-            owner.streams_ = this;
+            head = this;
         }
-        ~Stream() {
+        ~InFlight() {
             Cancel();
-            if (prev) prev->next = next; else owner.streams_ = next;
+            if (prev) prev->next = next; else head = next;
             if (next) next->prev = prev;
         }
         void Abort() noexcept {
@@ -450,12 +399,50 @@ private:
             timed_out = true;
             Abort();
         }
-        UpstreamExchange& owner;
-        tcp::socket socket;
-        Stream* prev = nullptr;
-        Stream* next = nullptr;
+        InFlight*& head;
+        Socket socket;
+        InFlight* prev = nullptr;
+        InFlight* next = nullptr;
         bool timed_out = false;
     };
+
+    // A complete answer wins even if the deadline fired in the same turn.
+    void FinishReply(Reply& reply, bool timed_out) const noexcept {
+        if (!reply.error) return;
+        if (timed_out) reply.error = io_error::timed_out;
+        else if (stopping_) reply.error = io_error::operation_aborted;
+        reply.bytes.clear();
+    }
+
+    // Waits for readability before sizing the buffer to the queued datagram
+    // (Linux FIONREAD), one octet past the advertised payload so an oversized
+    // reply stays detectable. Datagrams that do not answer this query are
+    // dropped and the wait continues (RFC 5452 §9.1).
+    static net::awaitable<IoErrorCode> ExchangeOverDatagram(
+        udp::socket& socket, std::span<const uint8_t> query, std::vector<uint8_t>& response) {
+        auto [send_error, sent] = co_await socket.async_send(
+            net::buffer(query.data(), query.size()), net::as_tuple(net::use_awaitable));
+        if (send_error) co_return send_error;
+        for (;;) {
+            auto [wait_error] = co_await socket.async_wait(
+                udp::socket::wait_read, net::as_tuple(net::use_awaitable));
+            if (wait_error) co_return wait_error;
+            IoErrorCode error;
+            const size_t queued = socket.available(error);
+            if (error) co_return error;
+            response.resize(std::clamp<size_t>(queued, 1, kDnsUdpPayloadSize + 1));
+            const size_t size = socket.receive(net::buffer(response), 0, error);
+            if (error == io_error::would_block) continue;
+            // ICMP port unreachable surfaces here as connection_refused.
+            if (error) co_return error;
+            response.resize(size);
+            if (size >= 2 && common::LoadU16BE(response.data()) == common::LoadU16BE(query.data()) &&
+                (Matches(response, query) || RejectsEdnsWithoutQuestion(response, query))) {
+                co_return IoErrorCode{};
+            }
+            response = {};  // Hold nothing across the next wait.
+        }
+    }
 
     static net::awaitable<IoErrorCode> ExchangeOverStream(
         tcp::socket& socket, tcp::endpoint endpoint,
@@ -541,90 +528,14 @@ private:
         return false;
     }
 
-    void CancelIdleReceive() {
-        if (reading_ && pending_.empty()) {
-            IoErrorCode ignored;
-            socket_.cancel(ignored);
-        }
-    }
-
-    void Complete(uint16_t id, IoErrorCode error, size_t size = 0) {
-        const auto it = pending_.find(id);
-        if (it == pending_.end()) return;
-        Pending& request = *it->second;
-        pending_.erase(it);
-        scheduler_.Cancel(request);
-        request.reply.error = error;
-        if (size) {
-            try {
-                request.reply.bytes.assign(buffer_.begin(), buffer_.begin() + size);
-            } catch (const std::bad_alloc&) {
-                request.reply.error = io_error::no_memory;
-            }
-        }
-        request.completion.close();
-        CancelIdleReceive();
-    }
-
-    void FailAll(IoErrorCode error) {
-        while (!pending_.empty()) Complete(pending_.begin()->first, error);
-    }
-
-    void Receive() {
-        if (stopping_ || reading_ || pending_.empty()) return;
-        reading_ = true;
-        try {
-            socket_.async_receive(net::buffer(buffer_),
-                [self = shared_from_this(), generation = generation_](IoErrorCode ec, size_t size) {
-                    self->reading_ = false;
-                    if (self->stopping_) {
-                        self->NotifyJoined();
-                        return;
-                    }
-                    if (generation != self->generation_) {
-                        self->Receive();
-                        return;
-                    }
-                    if (!ec && size >= 2) {
-                        const uint16_t id = common::LoadU16BE(self->buffer_.data());
-                        const auto it = self->pending_.find(id);
-                        if (it != self->pending_.end() &&
-                            (Matches(std::span(self->buffer_.data(), size), it->second->query) ||
-                             RejectsEdnsWithoutQuestion(std::span(self->buffer_.data(), size),
-                                                        it->second->query))) {
-                            self->Complete(id, {}, size);
-                        }
-                    } else if (ec && ec != io_error::operation_aborted && ec != io_error::message_size) {
-                        self->FailAll(ec);
-                    }
-                    // An idle cancellation can race a new registration. Re-arm
-                    // only after the old receive has released the shared buffer.
-                    self->Receive();
-                });
-        } catch (const std::bad_alloc&) {
-            reading_ = false;
-            FailAll(io_error::no_memory);
-        } catch (...) {
-            reading_ = false;
-            FailAll(io_error::fault);
-        }
-    }
-
-    udp::socket socket_;
+    net::io_context& io_;
     udp::endpoint endpoint_;
     transport::TimeoutScheduler& scheduler_;
     common::SignalChannel joined_;
-    std::unordered_map<uint16_t, Pending*> pending_;
-    // One octet beyond the advertised payload reveals an oversized datagram,
-    // which the kernel would otherwise truncate silently.
-    std::array<uint8_t, kDnsUdpPayloadSize + 1> buffer_{};
-    std::bitset<65536> used_ids_;
-    Stream* streams_ = nullptr;
-    size_t issued_ = 0;
-    uint64_t generation_ = 0;
+    InFlight<udp::socket>* datagrams_ = nullptr;
+    InFlight<tcp::socket>* streams_ = nullptr;
     size_t active_ = 0;
     bool stopping_ = false;
-    bool reading_ = false;
 };
 
 // Executor-local service ownership: callers subscribe, never own the query.
