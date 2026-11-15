@@ -223,6 +223,8 @@ struct Stream {
 struct Client {
     std::unique_ptr<quic::Peer> peer;
     std::vector<Stream> streams;
+    // Transfer's cursor: streams [0, dispatched) have their command or need none.
+    size_t dispatched = 0;
     Deadline heartbeat = Clock::now() + 2s;
     Deadline next_pump{};
 };
@@ -294,11 +296,31 @@ struct LoadMemory {
     }
 };
 
+// True once QUIC has taken every byte queued on this connection.
+bool Drained(const Client& client) {
+    const auto sent = [&](const Stream& stream) {
+        return client.peer->Submitted(stream.id) == client.peer->Queued(stream.id);
+    };
+    // The upload dispatched last is the usual holdout; test it before the rest.
+    return (client.dispatched == 0 || sent(client.streams[client.dispatched - 1])) &&
+        std::all_of(client.streams.begin(), client.streams.end(), sent);
+}
+
 // All physical sessions and logical streams already exist. Timing includes
 // command dispatch, pumping, byte verification and /proc sampling, and stops
 // only once every target completion marker has been received and checked.
 // Peer retains received bytes: cap total download/connection below its 64 MiB
 // budget, and compare the retained prefix once, not on every packet.
+// `transferring` suppresses a stream's heartbeats, so it has to coincide with
+// the stream's own bytes being on the wire; the daemon's connIdle closes any
+// stream that stays silent, however busy its neighbours are:
+// - One client joins per tick and every tick pumps all clients, so dispatch
+//   alone can outlast connIdle. Completion is observed after every tick,
+//   dispatch included, and ends `transferring` as soon as the marker arrives.
+// - Peer sends a connection's streams strictly in stream order: bytes queued
+//   behind an unsent upload, whether a later stream's payload or a heartbeat,
+//   stay off the wire. A connection is therefore given one upload at a time,
+//   the next one once everything queued on it has been sent.
 double Transfer(Driver& driver, Child& child, bool upload, std::string_view payload,
                 std::string_view command, std::string_view expected, Deadline deadline,
                 LoadMemory* load = nullptr, Milliseconds peer_pump_delay = 0ms) {
@@ -306,30 +328,39 @@ double Transfer(Driver& driver, Child& child, bool upload, std::string_view payl
     for (auto& client : driver.clients)
         for (auto& stream : client.streams) stream.verified = measured && !stream.measured;
     const auto started = Clock::now();
-    for (auto& client : driver.clients) client.next_pump = started + peer_pump_delay;
     for (auto& client : driver.clients) {
-        for (auto& stream : client.streams) {
-            if (stream.verified) continue;
-            stream.transferring = true;
-            client.peer->Send(stream.id, command);
-            if (upload) client.peer->Send(stream.id, payload);
+        client.dispatched = 0;
+        client.next_pump = started + peer_pump_delay;
+    }
+    // Clients [begin, active_end) have joined this transfer.
+    auto active_end = driver.clients.begin();
+    for (;;) {
+        if (active_end != driver.clients.end()) ++active_end;
+        for (auto client = driver.clients.begin(); client != active_end; ++client) {
+            while (client->dispatched != client->streams.size()) {
+                auto& stream = client->streams[client->dispatched];
+                if (!stream.verified) {
+                    if (upload && !Drained(*client)) break;
+                    stream.transferring = true;
+                    client->peer->Send(stream.id, command);
+                    if (upload) client->peer->Send(stream.id, payload);
+                }
+                ++client->dispatched;
+            }
         }
         driver.Tick(deadline, true, false, peer_pump_delay);
-        if (load) load->Sample(child);
-    }
-    for (;;) {
-        driver.Tick(deadline, true, false, peer_pump_delay);
-        bool complete = true;
-        for (auto& client : driver.clients) {
-            for (auto& stream : client.streams) {
+        // A stream not dispatched yet cannot hold the marker: it keeps `complete` false.
+        bool complete = active_end == driver.clients.end();
+        for (auto client = driver.clients.begin(); client != active_end; ++client) {
+            for (auto& stream : client->streams) {
                 if (stream.verified) continue;
-                if (client.peer->Received(stream.id) >= stream.header_bytes + expected.size()) {
-                    Require(client.peer->PayloadEquals(stream.id, expected),
+                if (client->peer->Received(stream.id) >= stream.header_bytes + expected.size()) {
+                    Require(client->peer->PayloadEquals(stream.id, expected),
                         "HY2 client payload or target completion marker mismatch");
                     stream.verified = true;
                     stream.transferring = false;
                 } else {
-                    Require(!client.peer->StreamClosed(stream.id), "HY2 stream closed before completion");
+                    Require(!client->peer->StreamClosed(stream.id), "HY2 stream closed before completion");
                     complete = false;
                 }
             }
