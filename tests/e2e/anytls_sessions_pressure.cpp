@@ -30,6 +30,7 @@ public:
 
 private:
     struct Session {
+        explicit Session(TlsSocket& socket) : tls(socket) {}
         TlsSocket& tls;
         std::map<uint32_t, std::string> bytes;
         std::map<uint32_t, bool> answered;

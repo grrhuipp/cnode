@@ -295,7 +295,11 @@ struct AnyTlsOutboundHandler::ClientSession {
         close_error = error;
         write_gate.Cancel();
         active_sid = 0;
-        if (auto logical = std::exchange(active_stream, {}).lock()) {
+        // A stream the peer already finished owes its reader only the bytes
+        // queued before FIN and no longer depends on this transport: a later
+        // physical failure must not turn its clean EOF into a truncation.
+        if (auto logical = std::exchange(active_stream, {}).lock();
+            logical && !logical->RemoteClosed()) {
             logical->Close(error);
         }
         if (stream) {

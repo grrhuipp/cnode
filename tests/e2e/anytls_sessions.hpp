@@ -10,6 +10,8 @@
 #include <unistd.h>
 #include <mutex>
 #include <map>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <stdexcept>
@@ -307,6 +309,10 @@ struct PanelNode {
         child = std::make_unique<Child>(
             std::vector<std::string>{Binary().string(), "--config-dir", directory.Path().string()},
             directory.Path() / "child.log");
+        // Bootstrap makes the traffic journal directory durable before the runtime starts; those fsyncs are
+        // served by the host filesystem and can take many seconds under concurrent writeback. The ready
+        // marker ends that phase, so only the panel exchange after it keeps a tight bound.
+        child->WaitForLog("server started", 60s);
         Until(
             [&] {
                 Require(child->Running(), "panel node exited");
@@ -457,6 +463,7 @@ public:
 
 private:
     struct Session {
+        explicit Session(TlsSocket& socket) : tls(socket) {}
         TlsSocket& tls;
         std::map<uint32_t, std::string> bytes;
         uint32_t first = 0;
@@ -504,34 +511,39 @@ private:
     const std::string_view expected_;
     TlsContext context_{true};
 };
+// 出站被测节点：cnode 走 VLESS 入站，参考客户端走 SOCKS5；两者都把 request! 发往目标端口 443。
+inline void StartClient(Node& node, uint16_t peer, const std::string& reference) {
+    if (reference.empty()) {
+        Configure(node.directory.Path(), Inbound(node.port, false), Outbound(peer));
+        node.Start();
+    } else
+        node.Start({reference, "-l", "127.0.0.1:" + std::to_string(node.port), "-s",
+                    "127.0.0.1:" + std::to_string(peer), "-p", "secret", "-m", "1"});
+}
+inline Socket ClientApplication(Node& node, bool reference) {
+    auto app = ConnectChild(*node.child, node.port);
+    if (!reference) {
+        app.Write(VlessRequest(443, "request!"));
+        EXPECT_EQ(app.ReadExact(2), std::string("\0\0", 2));
+    } else {
+        app.Write(std::string("\5\1\0", 3));
+        EXPECT_EQ(app.ReadExact(2), std::string("\5\0", 2));
+        app.Write(std::string("\5\1\0", 3) + SocksAddress(443));
+        auto reply = app.ReadExact(4);
+        EXPECT_EQ(reply.substr(0, 2), std::string("\5\0", 2));
+        Require(reply[3] == 1 || reply[3] == 4, "SOCKS address type");
+        app.ReadExact(reply[3] == 1 ? 6 : 18);
+        app.Write("request!");
+    }
+    return app;
+}
 inline void ClientFin(bool remote, std::string reference = {}) {
     const auto expected = remote ? Pattern(256 * 1024) : std::string{};
     ClientFinPeer fin_peer(remote, expected);
     Server peer([&](Socket socket) { fin_peer.Serve(std::move(socket)); });
     Node node;
-    if (reference.empty()) {
-        Configure(node.directory.Path(), Inbound(node.port, false), Outbound(peer.Port()));
-        node.Start();
-    } else
-        node.Start({reference, "-l", "127.0.0.1:" + std::to_string(node.port), "-s",
-                    "127.0.0.1:" + std::to_string(peer.Port()), "-p", "secret", "-m", "1"});
-    auto application = [&] {
-        auto app = ConnectChild(*node.child, node.port);
-        if (reference.empty()) {
-            app.Write(VlessRequest(443, "request!"));
-            EXPECT_EQ(app.ReadExact(2), std::string("\0\0", 2));
-        } else {
-            app.Write(std::string("\5\1\0", 3));
-            EXPECT_EQ(app.ReadExact(2), std::string("\5\0", 2));
-            app.Write(std::string("\5\1\0", 3) + SocksAddress(443));
-            auto reply = app.ReadExact(4);
-            EXPECT_EQ(reply.substr(0, 2), std::string("\5\0", 2));
-            Require(reply[3] == 1 || reply[3] == 4, "SOCKS address type");
-            app.ReadExact(reply[3] == 1 ? 6 : 18);
-            app.Write("request!");
-        }
-        return app;
-    };
+    StartClient(node, peer.Port(), reference);
+    auto application = [&] { return ClientApplication(node, !reference.empty()); };
     auto app = application();
     EXPECT_EQ(app.ReadExact(8), "accepted");
     if (!remote) app.ShutdownWrite();
@@ -548,6 +560,43 @@ inline void ClientFin(bool remote, std::string reference = {}) {
     EXPECT_EQ(fin_peer.connections.load(), 1u);
     EXPECT_EQ(fin_peer.late.load(), 0u);
     EXPECT_EQ(fin_peer.fins.load(), remote ? 0u : 1u);
+    EXPECT_TRUE(node.child->Running());
+    if (reference.empty()) node.Stop();
+    else node.child->Stop();
+    peer.Stop();
+}
+// 对端以载荷 + FIN 结束流后立刻终止物理会话：alert 时先发会话级 Alert，否则直接断开。TCP_CORK 让
+// 这条记录与传输层 FIN 同段到达，被测节点在一次可读事件内连续读到 PSH、FIN 和会话终止：已完整收下
+// 的流仍须把载荷和干净的 EOF 交给应用，随后的请求在新的物理会话上恢复。
+inline void ClientFinThenSessionEnd(bool alert, std::string reference = {}) {
+    std::atomic<unsigned> connections = 0;
+    TlsContext context(true);
+    Server peer([&](Socket socket) {
+        ++connections;
+        TlsSocket tls(std::move(socket), context, true);
+        ReadAnyTlsAuthentication(tls, "secret");
+        tls.Write(AnyTlsFrame(kServerSettings, 0, "v=2"));
+        std::string request;
+        AnyTlsRecord frame;
+        while (Next(tls, frame)) {
+            if (frame.command == kSyn) tls.Write(AnyTlsFrame(kSynAck, frame.stream));
+            if (frame.command != kPush) continue;
+            request += frame.payload;
+            if (request != SocksAddress(443) + "request!") continue;
+            const int cork = 1;
+            Require(::setsockopt(tls.Fd(), IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork)) == 0, "TCP_CORK");
+            tls.Write(AnyTlsFrame(kPush, frame.stream, "accepted") + AnyTlsFrame(kFin, frame.stream) +
+                      (alert ? AnyTlsFrame(kAlert, 0, "session closed") : std::string{}));
+            return;
+        }
+    });
+    Node node;
+    StartClient(node, peer.Port(), reference);
+    for (unsigned session = 1; session <= 2; ++session) {
+        auto app = ClientApplication(node, !reference.empty());
+        EXPECT_EQ(Drain(app), "accepted");
+        EXPECT_EQ(connections.load(), session);
+    }
     EXPECT_TRUE(node.child->Running());
     if (reference.empty()) node.Stop();
     else node.child->Stop();

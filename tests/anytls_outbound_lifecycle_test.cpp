@@ -243,8 +243,10 @@ struct Wire {
                 payload_offset += bytes;
                 if (queue->mode >= 13 && payload_offset == 3 * 65535) Frame(proxy::kCmdHeartRequest, 0);
             }
-            if (queue->mode != 6 && queue->mode != 9) Frame(proxy::kCmdFIN, 1);
-            if (queue->mode == 12) Frame(proxy::kCmdAlert, 0);
+            // A session Alert discards the queue of an unfinished stream (12),
+            // never the bytes of a stream the peer finished before it (7).
+            if (queue->mode != 6 && queue->mode != 9 && queue->mode != 12) Frame(proxy::kCmdFIN, 1);
+            if (queue->mode == 7 || queue->mode == 12) Frame(proxy::kCmdAlert, 0);
         } else if (fail_settings) {
             Frame(proxy::kCmdServerSettings, 0, std::string(1024, 'x'));
             fail_on_header = true;
@@ -792,7 +794,7 @@ void RunQueue(int mode, unsigned seed = 1) {
     queue.mode = mode;
     if (mode >= 13) queue.consumer_gate = std::make_unique<net::steady_timer>(io);
     if (mode == 0) queue.fragments.assign(2048, 1);
-    else if (mode == 1 || mode == 5 || mode == 6 || mode == 9 || mode == 12) queue.fragments = {65535};
+    else if (mode == 1 || mode == 5 || mode == 6 || mode == 7 || mode == 9 || mode == 12) queue.fragments = {65535};
     else if (mode == 10) queue.fragments = {29003};
     else if (mode == 11) queue.fragments.assign(29003, 1);
     else if (mode >= 13) queue.fragments.assign(4, 65535);
@@ -942,7 +944,7 @@ void RunQueue(int mode, unsigned seed = 1) {
         EXPECT_EQ(queue.datagram_sizes, (std::vector<size_t>{9000, 19999}));
     }
 
-    if (mode != 12) {
+    if (mode != 7 && mode != 12) {
         EXPECT_TRUE(queue.snapshot);
     }
     EXPECT_LE(queue.queued_blocks, 16);
@@ -1494,10 +1496,10 @@ INSTANTIATE_TEST_SUITE_P(PhaseAndFault, AnyTlsPhysicalIoFailure,
 class AnyTlsOutboundQueue : public AnyTlsLifecycleTest, public testing::WithParamInterface<int> {};
 TEST_P(AnyTlsOutboundQueue, PreservesBoundariesAndReclaimsBoundedStorageOnCompletionOrStop) { RunQueue(GetParam()); }
 INSTANTIATE_TEST_SUITE_P(Behaviors, AnyTlsOutboundQueue,
-    testing::Values(0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15),
+    testing::Values(0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15),
     ([](const auto& info) {
         constexpr std::array names{"TinyFragments", "WholeFrame", "SparseFragments", "BoundaryFragments",
-            "MaximumTinyFragments", "FullQueueBackpressure", "CancelFullQueue", "Unused", "RandomFragments",
+            "MaximumTinyFragments", "FullQueueBackpressure", "CancelFullQueue", "AlertKeepsFinishedQueue", "RandomFragments",
             "RefillAfterDrain", "CoalescedUdpDatagrams", "FragmentedUdpDatagrams", "AlertDiscardsQueue",
             "SlowConsumerAndHeartResponse", "CancelSlowConsumer", "TimeoutSlowConsumer"};
         return names[info.param];

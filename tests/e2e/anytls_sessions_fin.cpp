@@ -13,6 +13,12 @@ TEST(AnyTlsFin, OutboundRemoteFin) {
 TEST(AnyTlsFin, OutboundLocalEof) {
     ClientFin(false);
 }
+class OutboundSessionEnd : public testing::TestWithParam<bool> {};
+TEST_P(OutboundSessionEnd, RemoteFinDeliversQueuedPayloadAcrossSessionEnd) {
+    ClientFinThenSessionEnd(GetParam());
+}
+INSTANTIATE_TEST_SUITE_P(All, OutboundSessionEnd, testing::Bool(),
+                         [](const auto& info) { return info.param ? "Alert" : "TransportClose"; });
 // 开流即 FIN 测试的上游 AnyTLS 对端：流 2 不回 SYNACK，收到首个 PSH 就回（可选载荷 +）FIN；
 // padding 时在流 1 下发一个需要 30 MiB 以上填充的方案，并统计 FIN 之后的填充字节。
 class OpeningFinPeer {
@@ -36,6 +42,7 @@ public:
 
 private:
     struct Session {
+        explicit Session(TlsSocket& socket) : tls(socket) {}
         TlsSocket& tls;
         std::map<uint32_t, std::string> requests;
         bool fin_sent = false;
