@@ -17,13 +17,18 @@ namespace app {
 namespace {
 
 constexpr uint16_t FLAG_QR    = 0x8000;
+constexpr uint16_t FLAG_TC    = 0x0200;
 constexpr uint16_t FLAG_RCODE = 0x000F;
 
 constexpr uint16_t TYPE_A     = 1;
 constexpr uint16_t TYPE_CNAME = 5;
 constexpr uint16_t TYPE_AAAA  = 28;
+constexpr uint16_t TYPE_OPT   = 41;
 constexpr uint8_t RCODE_OK         = 0;
 constexpr uint8_t RCODE_NAME_ERROR = 3;
+
+// Header, longest wire QNAME, QTYPE/QCLASS and the RFC 6891 OPT record.
+constexpr size_t kQueryCapacity = 12 + 255 + 4 + 11;
 
 
 constexpr size_t kAddressQueryAttempts = 3;
@@ -48,12 +53,12 @@ struct DNSWorker::Impl {
     net::awaitable<DnsResult> ResolveUncached(std::string_view domain);
     net::awaitable<DnsResult> DoResolve(std::string_view domain);
     net::awaitable<void> QueryServer(
-        DatagramExchange& server,
+        UpstreamExchange& server,
         std::string_view domain,
         bool query_aaaa,
         DnsResult& out);
-    // Leaves the ID zero; DatagramExchange writes an unpredictable ID before send.
-    static size_t BuildQueryTo(std::span<uint8_t, 280> query,
+    // Leaves the ID zero; UpstreamExchange writes an unpredictable ID before send.
+    static size_t BuildQueryTo(std::span<uint8_t, kQueryCapacity> query,
                                std::string_view domain,
                                bool query_aaaa) noexcept;
     DnsResult ParseResponse(std::span<const uint8_t> response,
@@ -64,7 +69,7 @@ struct DNSWorker::Impl {
     const DnsConfig config;
     DnsCache cache;
     InflightResolves inflight_resolves;
-    std::vector<std::shared_ptr<DatagramExchange>> upstreams;
+    std::vector<std::shared_ptr<UpstreamExchange>> upstreams;
     WorkerMailbox mailbox;
     bool stopping = false;
 };
@@ -89,7 +94,7 @@ DNSWorker::Impl::Impl(net::io_context& io_context, const DnsConfig& config,
     }
     upstreams.reserve(config.servers.size());
     for (const auto& server : config.servers) {
-        upstreams.push_back(std::make_shared<DatagramExchange>(io_context, server));
+        upstreams.push_back(std::make_shared<UpstreamExchange>(io_context, server));
     }
 }
 
@@ -251,40 +256,45 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
 }
 
 net::awaitable<void> DNSWorker::Impl::QueryServer(
-    DatagramExchange& server,
+    UpstreamExchange& server,
     std::string_view domain,
     bool query_aaaa,
     DnsResult& out) {
-    // BuildQueryTo and Exchange write every byte of [0, query_size).
-    std::array<uint8_t, 280> query;
+    // BuildQueryTo and ExchangeDatagram write every byte of [0, query_size).
+    std::array<uint8_t, kQueryCapacity> query;
     const size_t query_size = BuildQueryTo(query, domain, query_aaaa);
-    auto response = co_await server.Exchange(
-        std::span<uint8_t>(query.data(), query_size),
-        std::chrono::seconds(config.timeout_sec));
+    const auto query_bytes = std::span<uint8_t>(query.data(), query_size);
+    const auto timeout = std::chrono::seconds(config.timeout_sec);
+    auto response = co_await server.ExchangeDatagram(query_bytes, timeout);
+    const bool truncated = !response.error && response.bytes.size() >= 4 &&
+        (common::LoadU16BE(response.bytes.data() + 2) & FLAG_TC) != 0;
+    if (truncated) {
+        // RFC 7766 §5: a truncated UDP answer is retried over TCP.
+        response = co_await server.ExchangeStream(query_bytes, timeout);
+    }
     if (response.error) {
         out.error = response.error == io_error::timed_out ? common::ErrorCode::DNS_TIMEOUT :
             response.error == io_error::operation_aborted ? common::ErrorCode::CANCELLED :
             response.error == io_error::no_buffer_space ? common::ErrorCode::RESOURCE_EXHAUSTED :
             common::ErrorCode::DNS_RESOLVE_FAILED;
-        out.error_msg = response.error.message();
+        out.error_msg = truncated
+            ? std::format("TCP retry of truncated answer: {}", response.error.message())
+            : response.error.message();
         co_return;
     }
     const uint16_t txid = common::LoadU16BE(query.data());
-    out = ParseResponse(
-        std::span<const uint8_t>(response.bytes.data(), response.size),
-        txid,
-        query_aaaa);
+    out = ParseResponse(response.bytes, txid, query_aaaa);
 }
 
 size_t DNSWorker::Impl::BuildQueryTo(
-    std::span<uint8_t, 280> query,
+    std::span<uint8_t, kQueryCapacity> query,
     std::string_view domain,
     bool query_aaaa) noexcept {
     query[2] = 0x01;
     query[3] = 0x00;
-    query[4] = 0x00;
-    query[5] = 0x01;
-    std::memset(query.data() + 6, 0, 6);
+    common::StoreU16BE(query.data() + 4, 1);   // QDCOUNT
+    std::memset(query.data() + 6, 0, 4);       // ANCOUNT, NSCOUNT
+    common::StoreU16BE(query.data() + 10, 1);  // ARCOUNT: OPT
 
     size_t out = 12;
     size_t pos = 0;
@@ -304,7 +314,15 @@ size_t DNSWorker::Impl::BuildQueryTo(
     const uint16_t qtype = query_aaaa ? TYPE_AAAA : TYPE_A;
     common::StoreU16BE(query.data() + out, qtype);
     common::StoreU16BE(query.data() + out + 2, 1);
-    return out + 4;
+    out += 4;
+
+    // RFC 6891 §6.1.2: root owner, CLASS carries the UDP payload size, TTL
+    // carries extended RCODE/version/flags (all zero), empty RDATA.
+    query[out++] = 0x00;
+    common::StoreU16BE(query.data() + out, TYPE_OPT);
+    common::StoreU16BE(query.data() + out + 2, static_cast<uint16_t>(kDnsUdpPayloadSize));
+    std::memset(query.data() + out + 4, 0, 6);
+    return out + 10;
 }
 
 DnsResult DNSWorker::Impl::ParseResponse(
@@ -325,9 +343,15 @@ DnsResult DNSWorker::Impl::ParseResponse(
     }
 
     const uint16_t flags = common::LoadU16BE(response.data() + 2);
-    if (!(flags & FLAG_QR) || (flags & 0x0200)) {
+    if (!(flags & FLAG_QR)) {
         result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-        result.error_msg = "DNS packet is not a complete response";
+        result.error_msg = "DNS packet is not a response";
+        return result;
+    }
+    if (flags & FLAG_TC) {
+        // Only a TCP answer reaches here; UDP truncation was already retried.
+        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
+        result.error_msg = "DNS response is truncated";
         return result;
     }
 
@@ -359,7 +383,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
     }
 
     size_t pos = 12;
-    if (!DatagramExchange::SkipWireName(response, pos) || pos + 4 > response.size()) {
+    if (!UpstreamExchange::SkipWireName(response, pos) || pos + 4 > response.size()) {
         result.error = common::ErrorCode::DNS_FORMAT_ERROR;
         result.error_msg = "DNS question section truncated";
         return result;
@@ -396,7 +420,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
     uint32_t min_ttl = UINT32_MAX;
 
     for (uint16_t i = 0; i < ancount; ++i) {
-        if (!DatagramExchange::SkipWireName(response, pos) || pos + 10 > response.size()) {
+        if (!UpstreamExchange::SkipWireName(response, pos) || pos + 10 > response.size()) {
             result.error = common::ErrorCode::DNS_FORMAT_ERROR;
             result.error_msg = "DNS answer header truncated";
             return result;

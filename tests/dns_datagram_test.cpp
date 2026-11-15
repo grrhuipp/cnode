@@ -12,6 +12,9 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <asio/detached.hpp>
+#include <asio/read.hpp>
+#include <asio/write.hpp>
 
 namespace {
 namespace net = ::net;
@@ -19,15 +22,80 @@ using namespace std::chrono_literals;
 using ::app::DNS;
 using ::app::DnsResult;
 
+// Builds answers from the echoed question only: resolver queries carry an EDNS
+// OPT record after it. Like a real server, a UDP answer larger than the
+// advertised payload (512 without OPT, RFC 6891 §6.2.3) is sent with TC=1.
 struct Peer {
-    struct Query { std::vector<uint8_t> bytes; ::udp::endpoint sender; };
+    struct Query {
+        std::vector<uint8_t> bytes;
+        ::udp::endpoint sender;
+        size_t question_size = 0;
+        size_t udp_limit = 512;
+    };
     explicit Peer(net::io_context& io, bool ipv6 = false)
         : socket(io, {ipv6 ? net::ip::address(net::ip::address_v6::loopback()) :
-                     net::ip::address(net::ip::address_v4::loopback()), 0}), foreign(io) {
+                     net::ip::address(net::ip::address_v4::loopback()), 0}), foreign(io), acceptor(io) {
         foreign.open(socket.local_endpoint().protocol());
         Receive();
     }
-    void Stop() { socket.close(); foreign.close(); }
+    void Stop() {
+        socket.close(); foreign.close(); acceptor.close();
+        for (auto& stream : held_streams) stream.close();
+    }
+    // TCP shares the UDP port number, as a real upstream does.
+    void ServeStream() {
+        const auto endpoint = socket.local_endpoint();
+        acceptor.open(endpoint.protocol() == ::udp::v6() ? ::tcp::v6() : ::tcp::v4());
+        acceptor.bind({endpoint.address(), endpoint.port()});
+        acceptor.listen();
+        net::co_spawn(acceptor.get_executor(), AcceptStreams(), net::detached);
+    }
+    static Query Inspect(std::vector<uint8_t> bytes, ::udp::endpoint sender = {}) {
+        Query query{std::move(bytes), sender};
+        size_t pos = 12;
+        while (pos < query.bytes.size() && query.bytes[pos]) pos += query.bytes[pos] + 1;
+        query.question_size = pos + 1 + 4;
+        const size_t opt = query.question_size;
+        if (query.bytes[11] == 1 && query.bytes.size() >= opt + 11 && query.bytes[opt] == 0 &&
+            query.bytes[opt + 1] == 0 && query.bytes[opt + 2] == 41) {
+            query.udp_limit = std::max<size_t>(512, (query.bytes[opt + 3] << 8) | query.bytes[opt + 4]);
+        }
+        return query;
+    }
+    std::vector<uint8_t> Answer(const Query& query, int ordinal) const {
+        std::vector<uint8_t> packet(query.bytes.begin(), query.bytes.begin() + query.question_size);
+        packet[10] = packet[11] = 0;
+        const bool v6 = packet[packet.size() - 3] == 28;
+        packet[2] = 0x81;
+        packet[3] = refuse ? 0x82 : negative ? 0x83 : 0x80;
+        if (refuse || negative || nodata ||
+            (malformed_type != 0 && malformed_type != (v6 ? 28 : 1))) return packet;
+        const size_t count = bulk_answers ? bulk_answers : 1;
+        packet[6] = static_cast<uint8_t>(count >> 8);
+        packet[7] = static_cast<uint8_t>(count);
+        const uint8_t size = v6 ? 16 : 4;
+        const uint32_t ttl = ttl_type == 0 || ttl_type == (v6 ? 28 : 1)
+            ? answer_ttl.value_or(static_cast<uint32_t>(ordinal * 10)) : 60;
+        for (size_t i = 0; i < count; ++i) {
+            packet.insert(packet.end(), {0xc0, 0x0c, 0, static_cast<uint8_t>(v6 ? 28 : 1),
+                0, 1, static_cast<uint8_t>(ttl >> 24), static_cast<uint8_t>(ttl >> 16),
+                static_cast<uint8_t>(ttl >> 8), static_cast<uint8_t>(ttl), 0, size});
+            if (v6) {
+                auto bytes = net::ip::make_address_v6("2001:db8::1").to_bytes();
+                if (bulk_answers) bytes.back() = static_cast<uint8_t>(i + 1);
+                packet.insert(packet.end(), bytes.begin(), bytes.end());
+            } else if (bulk_answers) {
+                packet.insert(packet.end(), {198, 51, 100, static_cast<uint8_t>(i + 1)});
+            } else {
+                packet.insert(packet.end(), {192, 0, 2, static_cast<uint8_t>(ordinal)});
+            }
+        }
+        if (malformed_type == (v6 ? 28 : 1)) {
+            packet[query.question_size + 11] = static_cast<uint8_t>(size - 1);
+            packet.pop_back();
+        }
+        return packet;
+    }
     void Receive() {
         socket.async_receive_from(net::buffer(buffer), sender, [&](::IoErrorCode ec, size_t size) {
             if (ec) return;
@@ -46,7 +114,7 @@ struct Peer {
                 pos += n;
             }
             auto& group = queries[name];
-            group.push_back({{buffer.begin(), buffer.begin() + size}, sender});
+            group.push_back(Inspect({buffer.begin(), buffer.begin() + size}, sender));
             // A serial resolver cannot satisfy this barrier. It must submit all
             // three A samples and AAAA before any response is made available.
             if (group.size() == batch_size && !hold && name != "timeout.example") Flush(name);
@@ -59,27 +127,11 @@ struct Peer {
         EXPECT_EQ(group.size(), batch_size) << "all queries must be outstanding together";
         int ordinal = 4;
         for (auto it = group.rbegin(); it != group.rend(); ++it) {
-            auto packet = it->bytes;
-            const bool v6 = packet[packet.size() - 3] == 28;
-            packet[2] = 0x81;
-            packet[3] = refuse ? 0x82 : negative ? 0x83 : 0x80;
-            if (!refuse && !negative && !nodata &&
-                (malformed_type == 0 || malformed_type == (v6 ? 28 : 1))) {
-                packet[7] = 1;
-                const uint8_t size = v6 ? 16 : 4;
-                const uint32_t ttl = ttl_type == 0 || ttl_type == (v6 ? 28 : 1)
-                    ? answer_ttl.value_or(static_cast<uint32_t>(ordinal * 10)) : 60;
-                packet.insert(packet.end(), {0xc0, 0x0c, 0, static_cast<uint8_t>(v6 ? 28 : 1),
-                    0, 1, static_cast<uint8_t>(ttl >> 24), static_cast<uint8_t>(ttl >> 16),
-                    static_cast<uint8_t>(ttl >> 8), static_cast<uint8_t>(ttl), 0, size});
-                if (v6) {
-                    const auto bytes = net::ip::make_address_v6("2001:db8::1").to_bytes();
-                    packet.insert(packet.end(), bytes.begin(), bytes.end());
-                } else packet.insert(packet.end(), {192, 0, 2, static_cast<uint8_t>(ordinal)});
-                if (malformed_type == (v6 ? 28 : 1)) {
-                    packet[it->bytes.size() + 11] = static_cast<uint8_t>(size - 1);
-                    packet.pop_back();
-                }
+            auto packet = Answer(*it, ordinal);
+            if (packet.size() > it->udp_limit) {
+                packet.resize(it->question_size);
+                packet[2] |= 0x02;
+                packet[6] = packet[7] = 0;
             }
             --ordinal;
             if (noise) {
@@ -94,7 +146,7 @@ struct Peer {
                 if (!refuse && !negative) wrong.back() = 99;
                 socket.send_to(net::buffer(wrong), it->sender);
                 wrong = packet;
-                wrong[it->bytes.size() - 3] ^= 1; // different QTYPE
+                wrong[it->question_size - 3] ^= 1; // different QTYPE
                 socket.send_to(net::buffer(wrong), it->sender);
                 wrong = packet;
                 wrong[12] = 0xc0; wrong[13] = 12; // compression pointer cycle
@@ -110,15 +162,45 @@ struct Peer {
         // set arrives is its cache write.
         if (fault_cache_write) ::common::reject_next_process_allocation = true;
     }
+    net::awaitable<void> AcceptStreams() {
+        for (;;) {
+            auto [ec, stream] = co_await acceptor.async_accept(net::as_tuple(net::use_awaitable));
+            if (ec) co_return;
+            ++stream_connections;
+            net::co_spawn(acceptor.get_executor(), AnswerStream(std::move(stream)), net::detached);
+        }
+    }
+    net::awaitable<void> AnswerStream(::tcp::socket stream) {
+        std::array<uint8_t, 2> length{};
+        auto [prefix_error, prefix_size] = co_await net::async_read(
+            stream, net::buffer(length), net::as_tuple(net::use_awaitable));
+        if (prefix_error) co_return;
+        std::vector<uint8_t> bytes((length[0] << 8) | length[1]);
+        auto [query_error, query_size] = co_await net::async_read(
+            stream, net::buffer(bytes), net::as_tuple(net::use_awaitable));
+        if (query_error) co_return;
+        ++stream_queries;
+        if (stall_stream) {
+            held_streams.push_back(std::move(stream));
+            co_return;
+        }
+        const auto packet = Answer(Inspect(std::move(bytes)), 4);
+        length = {static_cast<uint8_t>(packet.size() >> 8), static_cast<uint8_t>(packet.size())};
+        const std::array<net::const_buffer, 2> reply{net::buffer(length), net::buffer(packet)};
+        (void)co_await net::async_write(stream, reply, net::as_tuple(net::use_awaitable));
+    }
     ::udp::socket socket, foreign;
+    ::tcp::acceptor acceptor;
+    std::vector<::tcp::socket> held_streams;
     ::udp::endpoint sender;
     std::array<uint8_t, 512> buffer{};
     std::map<std::string, std::vector<Query>> queries;
     std::set<uint16_t> ports;
     std::map<uint16_t, std::bitset<65536>> ids;
-    size_t packets = 0, batch_size = 4;
+    size_t packets = 0, batch_size = 4, bulk_answers = 0;
+    size_t stream_connections = 0, stream_queries = 0;
     bool hold = false, refuse = false, negative = false, nodata = false;
-    bool noise = false, duplicate_id = false, fault_cache_write = false;
+    bool noise = false, duplicate_id = false, fault_cache_write = false, stall_stream = false;
     int malformed_type = 0;
     std::optional<uint32_t> answer_ttl;
     int ttl_type = 0;
@@ -182,6 +264,88 @@ TEST_P(DnsDatagramQueries, ValidatesOutOfOrderAnswersAndCachesCanonicalNames) {
         EXPECT_EQ(peer.ports.size(), 1u);
     };
     Run(run());
+}
+
+std::vector<net::ip::address> BulkAddresses(size_t count) {
+    std::vector<net::ip::address> addresses;
+    for (size_t i = 1; i <= count; ++i) {
+        addresses.push_back(net::ip::address_v4({198, 51, 100, static_cast<uint8_t>(i)}));
+    }
+    for (size_t i = 1; i <= count; ++i) {
+        auto bytes = net::ip::make_address_v6("2001:db8::").to_bytes();
+        bytes.back() = static_cast<uint8_t>(i);
+        addresses.push_back(net::ip::address_v6(bytes));
+    }
+    return addresses;
+}
+
+// 40 AAAA records (1151 bytes) exceed 512 but fit the advertised 1232.
+TEST_P(DnsDatagramQueries, AnswerBeyond512BytesFitsAdvertisedUdpPayload) {
+    peer.bulk_answers = 40;
+    auto run = [&]() -> net::awaitable<void> {
+        const auto result = co_await dns.Resolve("large.example");
+        EXPECT_TRUE(result.Ok()) << result.error_msg;
+        EXPECT_EQ(result.addresses, BulkAddresses(40));
+        EXPECT_EQ(peer.packets, 4u);
+    };
+    Run(run());
+}
+
+TEST_P(DnsDatagramQueries, TruncatedAnswerIsRetriedOverTcp) {
+    peer.ServeStream();
+    peer.bulk_answers = 100;
+    auto run = [&]() -> net::awaitable<void> {
+        const auto result = co_await dns.Resolve("truncated.example");
+        EXPECT_TRUE(result.Ok()) << result.error_msg;
+        EXPECT_EQ(result.addresses, BulkAddresses(100));
+        EXPECT_EQ(peer.packets, 4u);
+        EXPECT_EQ(peer.stream_queries, 4u) << "every truncated answer must be retried over TCP";
+    };
+    Run(run());
+}
+
+class DnsStalledStreamRetry : public testing::TestWithParam<bool> {};
+TEST_P(DnsStalledStreamRetry, EndsAtDeadlineOrServiceStop) {
+    const bool stop = GetParam();
+    net::io_context io;
+    Peer peer(io);
+    peer.ServeStream();
+    peer.bulk_answers = 100;
+    peer.stall_stream = true;
+    ::app::DNSWorker worker(io, Config(peer), 8);
+    std::optional<DnsResult> answer;
+    std::exception_ptr error;
+    net::co_spawn(io, worker.Resolve("stalled.example"), [&](std::exception_ptr e, DnsResult result) {
+        error = e;
+        answer = std::move(result);
+    });
+    net::steady_timer watchdog(io, 4s);
+    bool expired = false;
+    watchdog.async_wait([&](::IoErrorCode ec) {
+        if (!ec) { expired = true; worker.RequestStop(); }
+    });
+    while (peer.stream_queries != 4 && !expired) io.run_one();
+    EXPECT_FALSE(expired) << "truncated answers must reach the upstream over TCP";
+    if (stop) worker.RequestStop();
+    while (!answer && !expired) io.run_one();
+    EXPECT_FALSE(expired);
+    bool joined = false;
+    net::co_spawn(io, worker.AsyncJoin(), [&](std::exception_ptr join_error) {
+        EXPECT_FALSE(join_error);
+        joined = true;
+        watchdog.cancel();
+        peer.Stop();
+    });
+    io.run();
+    EXPECT_TRUE(joined);
+    EXPECT_FALSE(error);
+    ASSERT_TRUE(answer);
+    if (stop) {
+        EXPECT_EQ(answer->error, ::common::ErrorCode::CANCELLED);
+    } else {
+        EXPECT_EQ(answer->error, ::common::ErrorCode::DNS_TIMEOUT);
+        EXPECT_NE(answer->error_msg.find("TCP retry"), std::string::npos) << answer->error_msg;
+    }
 }
 
 TEST_P(DnsDatagramQueries, NxDomainIsCachedWithoutRepeatingUpstreamQueries) {
@@ -383,15 +547,15 @@ TEST(DnsDatagram, ExhaustedTransactionIdsRotatePortWithoutReuse) {
     net::io_context io;
     Peer peer(io);
     peer.batch_size = 1;
-    auto transport = std::make_shared<::app::DatagramExchange>(io, peer.socket.local_endpoint());
+    auto transport = std::make_shared<::app::UpstreamExchange>(io, peer.socket.local_endpoint());
     std::exception_ptr error;
     bool done = false;
     auto run = [&]() -> net::awaitable<void> {
         std::array<uint8_t, 19> query{0,0,1,0,0,1,0,0,0,0,0,0,1,'r',0,0,1,0,1};
         for (size_t i = 0; i < 65537; ++i) {
-            auto result = co_await transport->Exchange(query, 1s);
+            auto result = co_await transport->ExchangeDatagram(query, 1s);
             EXPECT_FALSE(result.error);
-            EXPECT_GT(result.size, 12u);
+            EXPECT_GT(result.bytes.size(), 12u);
         }
     };
     net::co_spawn(io, run(), [&](std::exception_ptr e) { error = e; done = true; peer.Stop(); });
@@ -520,7 +684,7 @@ TEST_P(DnsDatagramStop, JoinsReceiveOwnerAndRejectsNewExchanges) {
     Peer peer(io);
     peer.hold = true;
     peer.batch_size = 1;
-    auto transport = std::make_shared<::app::DatagramExchange>(
+    auto transport = std::make_shared<::app::UpstreamExchange>(
         io, peer.socket.local_endpoint());
     std::weak_ptr weak = transport;
     std::array<uint8_t, 19> query{0,0,1,0,0,1,0,0,0,0,0,0,1,'r',0,0,1,0,1};
@@ -528,8 +692,8 @@ TEST_P(DnsDatagramStop, JoinsReceiveOwnerAndRejectsNewExchanges) {
     std::exception_ptr query_error;
     ::IoErrorCode reply_error;
     if (active) {
-        net::co_spawn(io, transport->Exchange(query, 30s),
-            [&](std::exception_ptr error, ::app::DatagramExchange::Reply reply) {
+        net::co_spawn(io, transport->ExchangeDatagram(query, 30s),
+            [&](std::exception_ptr error, ::app::UpstreamExchange::Reply reply) {
                 query_error = error;
                 reply_error = reply.error;
                 query_done = true;
@@ -548,7 +712,7 @@ TEST_P(DnsDatagramStop, JoinsReceiveOwnerAndRejectsNewExchanges) {
     std::exception_ptr join_error;
     auto stop = [&]() -> net::awaitable<void> {
         co_await transport->AsyncJoin();
-        const auto rejected = co_await transport->Exchange(query, 30s);
+        const auto rejected = co_await transport->ExchangeDatagram(query, 30s);
         EXPECT_EQ(rejected.error, ::io_error::operation_aborted) << "a stopped exchange must not reopen its socket";
         transport.reset();
         EXPECT_TRUE(weak.expired()) << "join must release the actual receive callback's captured owner";
@@ -573,7 +737,7 @@ TEST(DnsDatagram, AllocationFailureUnwindsBeforeStopAndJoin) {
     const auto rejected = ::common::rejected_process_allocations;
     net::io_context io;
     Peer peer(io);
-    auto transport = std::make_shared<::app::DatagramExchange>(
+    auto transport = std::make_shared<::app::UpstreamExchange>(
         io, peer.socket.local_endpoint());
     std::weak_ptr weak = transport;
     std::array<uint8_t, 19> query{0,0,1,0,0,1,0,0,0,0,0,0,1,'r',0,0,1,0,1};
@@ -583,7 +747,7 @@ TEST(DnsDatagram, AllocationFailureUnwindsBeforeStopAndJoin) {
         // Query registration is the exchange's first process-layer allocation.
         ::common::reject_next_process_allocation = true;
         try {
-            (void)co_await transport->Exchange(query, 30s);
+            (void)co_await transport->ExchangeDatagram(query, 30s);
         } catch (const std::bad_alloc&) {
             failed = true;
         }
@@ -622,6 +786,8 @@ INSTANTIATE_TEST_SUITE_P(Upstreams, DnsMalformedAnswer, testing::Values(
     });
 INSTANTIATE_TEST_SUITE_P(Startup, DnsDatagramStop, testing::Bool(),
     [](const testing::TestParamInfo<bool>& info) { return info.param ? "PendingQuery" : "Unused"; });
+INSTANTIATE_TEST_SUITE_P(Outcome, DnsStalledStreamRetry, testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) { return info.param ? "ServiceStop" : "Deadline"; });
 
 struct TtlCase {
     uint32_t wire;

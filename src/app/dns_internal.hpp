@@ -12,8 +12,10 @@
 #include "transport/timeout_scheduler.hpp"
 #include <asio/as_tuple.hpp>
 #include <asio/experimental/channel.hpp>
+#include <asio/read.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
+#include <asio/write.hpp>
 #include <openssl/rand.h>
 
 #include <algorithm>
@@ -31,6 +33,7 @@
 #include <variant>
 #include <list>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <vector>
 
@@ -213,19 +216,23 @@ private:
     uint64_t misses_ = 0;
 };
 
-// One connected UDP socket per upstream, owned exclusively by the DNS executor.
-// Pending pointers borrow live Exchange frames; registration is removed before
+// RFC 6891 requester UDP payload size. 1232 follows DNS Flag Day 2020 / RFC 9715
+// so answers avoid IP fragmentation; larger answers arrive with TC=1 and are
+// re-queried over TCP (RFC 7766 §5).
+inline constexpr size_t kDnsUdpPayloadSize = 1232;
+
+// One connected UDP socket per upstream plus short-lived TCP retries for
+// truncated answers, all owned exclusively by the DNS executor. Pending and
+// stream pointers borrow live exchange frames; registration is removed before
 // those frames can leave. No receive operation or timeout belongs to a caller.
-class DatagramExchange : public std::enable_shared_from_this<DatagramExchange> {
+class UpstreamExchange : public std::enable_shared_from_this<UpstreamExchange> {
 public:
     struct Reply {
-        // Only the first `size` bytes are defined.
-        std::array<uint8_t, 512> bytes;
-        size_t size = 0;
+        std::vector<uint8_t> bytes;
         IoErrorCode error;
     };
 
-    DatagramExchange(net::io_context& io, udp::endpoint endpoint)
+    UpstreamExchange(net::io_context& io, udp::endpoint endpoint)
         : socket_(io), endpoint_(endpoint), scheduler_(transport::TimeoutScheduler::ForIoContext(io)),
           joined_(io) {}
 
@@ -233,6 +240,8 @@ public:
         if (stopping_) return;
         stopping_ = true;
         FailAll(io_error::operation_aborted);
+        // Closing completes in-flight TCP operations later; the list stays intact.
+        for (Stream* stream = streams_; stream; stream = stream->next) stream->Abort();
         IoErrorCode ignored;
         socket_.close(ignored);
         NotifyJoined();
@@ -245,7 +254,7 @@ public:
         (void)co_await joined_.async_receive(net::as_tuple(net::use_awaitable));
     }
 
-    net::awaitable<Reply> Exchange(std::span<uint8_t> query, std::chrono::seconds timeout) {
+    net::awaitable<Reply> ExchangeDatagram(std::span<uint8_t> query, std::chrono::seconds timeout) {
         // The caller owns query until completion, including cancellation unwind.
         auto owner = shared_from_this();
         Reply failure;
@@ -300,8 +309,36 @@ public:
         }
         Receive();
         (void)co_await request.completion.async_receive(net::as_tuple(net::use_awaitable));
-        if (!request.reply.size && !request.reply.error) request.reply.error = io_error::operation_aborted;
+        if (request.reply.bytes.empty() && !request.reply.error) request.reply.error = io_error::operation_aborted;
         co_return std::move(request.reply);
+    }
+
+    // RFC 7766 §5: re-ask a truncated UDP question over TCP on the same
+    // upstream. query already carries the ID of the truncated exchange; the
+    // caller owns it until completion. One deadline bounds connect through the
+    // last response byte.
+    net::awaitable<Reply> ExchangeStream(std::span<const uint8_t> query, std::chrono::seconds timeout) {
+        auto owner = shared_from_this();
+        Reply reply;
+        if (stopping_) {
+            reply.error = io_error::operation_aborted;
+            co_return reply;
+        }
+        ActiveExchange active(*this);
+        Stream stream(*this);
+        if (!scheduler_.ScheduleAfter(timeout, stream)) {
+            reply.error = io_error::operation_aborted;
+            co_return reply;
+        }
+        reply.error = co_await ExchangeOverStream(
+            stream.socket, tcp::endpoint(endpoint_.address(), endpoint_.port()), query, reply.bytes);
+        if (stream.timed_out) {
+            reply.error = io_error::timed_out;
+        } else if (reply.error && stopping_) {
+            reply.error = io_error::operation_aborted;
+        }
+        if (reply.error) reply.bytes.clear();
+        co_return reply;
     }
 
     [[nodiscard]] static bool SkipWireName(std::span<const uint8_t> packet, size_t& offset) noexcept {
@@ -337,14 +374,14 @@ public:
     }
 private:
     struct ActiveExchange {
-        explicit ActiveExchange(DatagramExchange& owner) noexcept : owner(owner) {
+        explicit ActiveExchange(UpstreamExchange& owner) noexcept : owner(owner) {
             ++owner.active_;
         }
         ~ActiveExchange() {
             --owner.active_;
             owner.NotifyJoined();
         }
-        DatagramExchange& owner;
+        UpstreamExchange& owner;
     };
 
     void NotifyJoined() noexcept {
@@ -352,7 +389,7 @@ private:
     }
 
     struct Pending final : transport::TimeoutEvent {
-        Pending(DatagramExchange& owner, uint16_t id, std::span<const uint8_t> query)
+        Pending(UpstreamExchange& owner, uint16_t id, std::span<const uint8_t> query)
             : owner(owner), id(id), query(query), completion(owner.socket_.get_executor()) {}
         ~Pending() {
             Cancel();
@@ -360,7 +397,7 @@ private:
             if (it != owner.pending_.end() && it->second == this) owner.pending_.erase(it);
             owner.CancelIdleReceive();
         }
-        DatagramExchange& owner;
+        UpstreamExchange& owner;
         uint16_t id;
         std::span<const uint8_t> query;
         common::SignalChannel completion;
@@ -368,6 +405,70 @@ private:
         Reply reply;
     };
 
+    // Lives in the ExchangeStream frame and stays linked so RequestStop can
+    // close its socket; unlinking happens before the frame leaves.
+    struct Stream final : transport::TimeoutEvent {
+        explicit Stream(UpstreamExchange& owner)
+            : owner(owner), socket(owner.socket_.get_executor()), next(owner.streams_) {
+            if (next) next->prev = this;
+            owner.streams_ = this;
+        }
+        ~Stream() {
+            Cancel();
+            if (prev) prev->next = next; else owner.streams_ = next;
+            if (next) next->prev = prev;
+        }
+        void Abort() noexcept {
+            IoErrorCode ignored;
+            socket.close(ignored);
+        }
+        void OnTimeout() override {
+            timed_out = true;
+            Abort();
+        }
+        UpstreamExchange& owner;
+        tcp::socket socket;
+        Stream* prev = nullptr;
+        Stream* next = nullptr;
+        bool timed_out = false;
+    };
+
+    static net::awaitable<IoErrorCode> ExchangeOverStream(
+        tcp::socket& socket, tcp::endpoint endpoint,
+        std::span<const uint8_t> query, std::vector<uint8_t>& response) {
+        const auto bad_message = std::make_error_code(std::errc::bad_message);
+        auto [connect_error] = co_await socket.async_connect(endpoint, net::as_tuple(net::use_awaitable));
+        if (connect_error) co_return connect_error;
+        // RFC 1035 §4.2.2: each TCP message carries a two-octet length prefix.
+        std::array<uint8_t, 2> length{};
+        common::StoreU16BE(length.data(), static_cast<uint16_t>(query.size()));
+        const std::array<net::const_buffer, 2> request{
+            net::buffer(length), net::buffer(query.data(), query.size())};
+        auto [write_error, written] = co_await net::async_write(
+            socket, request, net::as_tuple(net::use_awaitable));
+        if (write_error) co_return write_error;
+        auto [prefix_error, prefix_size] = co_await net::async_read(
+            socket, net::buffer(length), net::as_tuple(net::use_awaitable));
+        if (prefix_error) co_return prefix_error;
+        const size_t expected = common::LoadU16BE(length.data());
+        if (expected < 12) co_return bad_message;
+        // Grow with bytes that actually arrived, never by the declared length.
+        response.resize(std::min(expected, kDnsUdpPayloadSize));
+        size_t received = 0;
+        while (received < expected) {
+            if (received == response.size()) response.resize(std::min(expected, response.size() * 2));
+            auto [read_error, read] = co_await socket.async_read_some(
+                net::buffer(response.data() + received, response.size() - received),
+                net::as_tuple(net::use_awaitable));
+            if (read_error) co_return read_error;
+            received += read;
+        }
+        if (common::LoadU16BE(response.data()) != common::LoadU16BE(query.data()) ||
+            !Matches(response, query)) {
+            co_return bad_message;
+        }
+        co_return IoErrorCode{};
+    }
 
     // Match the echoed QNAME/QTYPE/QCLASS, not just the 16-bit transaction ID.
     // Support compressed names with bounded pointer traversal and ASCII folding.
@@ -391,8 +492,10 @@ private:
                 pos + length > packet.size() || expected + length > query.size()) return false;
             if (length == 0) {
                 if (after_name) pos = after_name;
-                return pos + 4 <= packet.size() && expected + 4 == query.size() &&
-                    std::equal(query.begin() + expected, query.end(), packet.begin() + pos);
+                // An EDNS OPT record may follow the query's question.
+                return pos + 4 <= packet.size() && expected + 4 <= query.size() &&
+                    std::equal(query.begin() + expected, query.begin() + expected + 4,
+                               packet.begin() + pos);
             }
             for (size_t i = 0; i < length; ++i) {
                 if (common::ToLowerAscii(packet[pos++]) != common::ToLowerAscii(query[expected++])) return false;
@@ -415,8 +518,13 @@ private:
         pending_.erase(it);
         scheduler_.Cancel(request);
         request.reply.error = error;
-        request.reply.size = size;
-        if (size) std::copy_n(buffer_.begin(), size, request.reply.bytes.begin());
+        if (size) {
+            try {
+                request.reply.bytes.assign(buffer_.begin(), buffer_.begin() + size);
+            } catch (const std::bad_alloc&) {
+                request.reply.error = io_error::no_memory;
+            }
+        }
         request.completion.close();
         CancelIdleReceive();
     }
@@ -468,8 +576,9 @@ private:
     transport::TimeoutScheduler& scheduler_;
     common::SignalChannel joined_;
     std::unordered_map<uint16_t, Pending*> pending_;
-    std::array<uint8_t, 512> buffer_{};
+    std::array<uint8_t, kDnsUdpPayloadSize> buffer_{};
     std::bitset<65536> used_ids_;
+    Stream* streams_ = nullptr;
     size_t issued_ = 0;
     uint64_t generation_ = 0;
     size_t active_ = 0;
