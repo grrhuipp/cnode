@@ -33,6 +33,7 @@
 #include <list>
 #include <string>
 #include <system_error>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -223,6 +224,58 @@ private:
 // re-queried over TCP (RFC 7766 §5).
 inline constexpr size_t kDnsUdpPayloadSize = 1232;
 
+// Uncompressed, lowercased wire-format name (RFC 4034 §6.2 canonical form),
+// compared octet-wise after case folding as RFC 1035 §2.3.3 / RFC 4343 require.
+struct WireName {
+    std::array<uint8_t, 255> bytes;
+    size_t size = 0;
+
+    [[nodiscard]] bool operator==(const WireName& other) const noexcept {
+        return size == other.size &&
+               std::equal(bytes.begin(), bytes.begin() + size, other.bytes.begin());
+    }
+};
+
+// The one DNS name decoder: follows only strictly backward compression
+// pointers, so traversal is bounded by the packet length, and rejects names
+// over 255 octets. On success offset moves past the name as written in place.
+[[nodiscard]] inline bool ReadWireName(std::span<const uint8_t> packet, size_t& offset,
+                                       WireName& out) noexcept {
+    size_t current = offset;
+    size_t resume = 0;
+    bool jumped = false;
+    out.size = 0;
+    while (current < packet.size()) {
+        const uint8_t len = packet[current];
+        if (len == 0) {
+            out.bytes[out.size++] = 0;
+            offset = jumped ? resume : current + 1;
+            return true;
+        }
+        if ((len & 0xC0) == 0xC0) {
+            if (current + 1 >= packet.size()) return false;
+            const size_t ptr = common::LoadU16BE(packet.data() + current) & 0x3FFFu;
+            if (ptr < 12 || ptr >= current) return false;
+            if (!jumped) {
+                resume = current + 2;
+                jumped = true;
+            }
+            current = ptr;
+            continue;
+        }
+        if ((len & 0xC0) != 0) return false;
+        if (packet.size() - current <= static_cast<size_t>(len) + 1) return false;
+        // Keep one octet for the root label: whole names are at most 255.
+        if (out.size + len + 1 >= out.bytes.size()) return false;
+        out.bytes[out.size++] = len;
+        for (size_t i = 1; i <= len; ++i) {
+            out.bytes[out.size++] = common::ToLowerAscii(packet[current + i]);
+        }
+        current += static_cast<size_t>(len) + 1;
+    }
+    return false;
+}
+
 // Upstream exchanges owned exclusively by the DNS executor: a fresh UDP socket
 // per query and short-lived TCP retries for truncated answers. Each in-flight
 // socket lives in its exchange frame and stays linked so RequestStop can close
@@ -254,12 +307,17 @@ public:
         (void)co_await joined_.async_receive(net::as_tuple(net::use_awaitable));
     }
 
-    // RFC 5452 §9.2: every query gets its own connected socket, so the kernel
-    // picks an unpredictable ephemeral source port and drops datagrams from any
-    // other address; the random ID adds 16 bits. timeout is the remaining
-    // budget, and a non-positive one fails at once. The caller owns query
-    // until completion, including cancellation unwind.
-    net::awaitable<Reply> ExchangeDatagram(std::span<uint8_t> query, std::chrono::milliseconds timeout) {
+    // One query over a fresh socket owned by this frame. timeout is the
+    // remaining budget up to the last response byte; a non-positive one fails
+    // at once. The caller owns query until completion, including cancellation.
+    // - udp::socket: RFC 5452 §9.2 — a connected socket per query gets an
+    //   unpredictable ephemeral source port and drops datagrams from any other
+    //   address; a fresh random ID is written into query.
+    // - tcp::socket: RFC 7766 §5 — re-asks a truncated UDP question with the
+    //   ID that query already carries.
+    template <typename Socket>
+    net::awaitable<Reply> Exchange(std::span<uint8_t> query, std::chrono::milliseconds timeout) {
+        constexpr bool kDatagram = std::is_same_v<Socket, udp::socket>;
         auto owner = shared_from_this();
         Reply reply;
         if (stopping_) {
@@ -272,51 +330,36 @@ public:
         }
         ActiveExchange active(*this);
         common::CheckTestAllocationFault();
-        InFlight<udp::socket> exchange(*this, datagrams_);
-        exchange.socket.open(endpoint_.protocol(), reply.error);
-        if (!reply.error) exchange.socket.connect(endpoint_, reply.error);
-        // Reads after a readiness wait must never block the control loop.
-        if (!reply.error) exchange.socket.non_blocking(true, reply.error);
-        if (reply.error) co_return reply;
-        uint16_t id;
-        if (RAND_bytes(reinterpret_cast<uint8_t*>(&id), sizeof(id)) != 1) {
-            reply.error = io_error::fault;
-            co_return reply;
+        InFlight<Socket> exchange(*this, InFlightHead<Socket>());
+        if constexpr (kDatagram) {
+            exchange.socket.open(endpoint_.protocol(), reply.error);
+            if (!reply.error) exchange.socket.connect(endpoint_, reply.error);
+            // Reads after a readiness wait must never block the control loop.
+            if (!reply.error) exchange.socket.non_blocking(true, reply.error);
+            if (reply.error) co_return reply;
+            uint16_t id;
+            if (RAND_bytes(reinterpret_cast<uint8_t*>(&id), sizeof(id)) != 1) {
+                reply.error = io_error::fault;
+                co_return reply;
+            }
+            common::StoreU16BE(query.data(), id);
         }
-        common::StoreU16BE(query.data(), id);
         if (!scheduler_.ScheduleAfter(timeout, exchange)) {
             reply.error = io_error::operation_aborted;
             co_return reply;
         }
-        reply.error = co_await ExchangeOverDatagram(exchange.socket, query, reply.bytes);
-        FinishReply(reply, exchange.timed_out);
-        co_return reply;
-    }
-
-    // RFC 7766 §5: re-ask a truncated UDP question over TCP on the same
-    // upstream. query already carries the ID of the truncated exchange; the
-    // caller owns it until completion. One deadline bounds connect through the
-    // last response byte.
-    net::awaitable<Reply> ExchangeStream(std::span<const uint8_t> query, std::chrono::milliseconds timeout) {
-        auto owner = shared_from_this();
-        Reply reply;
-        if (stopping_) {
-            reply.error = io_error::operation_aborted;
-            co_return reply;
+        if constexpr (kDatagram) {
+            reply.error = co_await ExchangeOverDatagram(exchange.socket, query, reply.bytes);
+        } else {
+            reply.error = co_await ExchangeOverStream(
+                exchange.socket, tcp::endpoint(endpoint_.address(), endpoint_.port()), query, reply.bytes);
         }
-        if (timeout <= std::chrono::milliseconds::zero()) {
-            reply.error = io_error::timed_out;
-            co_return reply;
+        // A complete answer wins even if the deadline fired in the same turn.
+        if (reply.error) {
+            if (exchange.timed_out) reply.error = io_error::timed_out;
+            else if (stopping_) reply.error = io_error::operation_aborted;
+            reply.bytes.clear();
         }
-        ActiveExchange active(*this);
-        InFlight<tcp::socket> exchange(*this, streams_);
-        if (!scheduler_.ScheduleAfter(timeout, exchange)) {
-            reply.error = io_error::operation_aborted;
-            co_return reply;
-        }
-        reply.error = co_await ExchangeOverStream(
-            exchange.socket, tcp::endpoint(endpoint_.address(), endpoint_.port()), query, reply.bytes);
-        FinishReply(reply, exchange.timed_out);
         co_return reply;
     }
 
@@ -329,37 +372,6 @@ public:
                common::LoadU16BE(packet.data() + 10) == 0;
     }
 
-    [[nodiscard]] static bool SkipWireName(std::span<const uint8_t> packet, size_t& offset) noexcept {
-        size_t current_offset = offset;
-        size_t next_offset = 0;
-        size_t wire_len = 0;
-        bool jumped = false;
-        while (current_offset < packet.size()) {
-            const uint8_t len = packet[current_offset];
-            if (len == 0) {
-                if (wire_len + 1 > 255) return false;
-                offset = jumped ? next_offset : current_offset + 1;
-                return true;
-            }
-            if ((len & 0xC0) == 0xC0) {
-                if (current_offset + 1 >= packet.size()) return false;
-                const size_t ptr = common::LoadU16BE(packet.data() + current_offset) & 0x3FFFu;
-                if (ptr < 12 || ptr >= current_offset) return false;
-                if (!jumped) {
-                    next_offset = current_offset + 2;
-                    jumped = true;
-                }
-                current_offset = ptr;
-                continue;
-            }
-            if ((len & 0xC0) != 0) return false;
-            if (packet.size() - current_offset <= static_cast<size_t>(len) + 1) return false;
-            wire_len += static_cast<size_t>(len) + 1;
-            if (wire_len >= 255) return false;
-            current_offset += static_cast<size_t>(len) + 1;
-        }
-        return false;
-    }
 private:
     static constexpr uint8_t kRcodeFormatError = 1;
     static constexpr uint8_t kRcodeNotImplemented = 4;
@@ -406,12 +418,10 @@ private:
         bool timed_out = false;
     };
 
-    // A complete answer wins even if the deadline fired in the same turn.
-    void FinishReply(Reply& reply, bool timed_out) const noexcept {
-        if (!reply.error) return;
-        if (timed_out) reply.error = io_error::timed_out;
-        else if (stopping_) reply.error = io_error::operation_aborted;
-        reply.bytes.clear();
+    template <typename Socket>
+    InFlight<Socket>*& InFlightHead() noexcept {
+        if constexpr (std::is_same_v<Socket, udp::socket>) return datagrams_;
+        else return streams_;
     }
 
     // Waits for readability before sizing the buffer to the queued datagram
@@ -494,38 +504,20 @@ private:
                RejectsEdns(packet);
     }
 
-    // Match the echoed QNAME/QTYPE/QCLASS, not just the 16-bit transaction ID.
-    // Support compressed names with bounded pointer traversal and ASCII folding.
+    // Match QR, opcode and the echoed QNAME/QTYPE/QCLASS, not just the 16-bit
+    // transaction ID. The query may carry an EDNS OPT record after its question.
     static bool Matches(std::span<const uint8_t> packet, std::span<const uint8_t> query) {
         if (packet.size() < 12 || (packet[2] & 0xf8) != 0x80 ||
-            packet[4] != 0 || packet[5] != 1) return false;
-        size_t pos = 12, expected = 12, after_name = 0;
-        for (size_t steps = 0; steps < 256; ++steps) {
-            if (pos >= packet.size() || expected >= query.size()) return false;
-            const auto length = packet[pos++];
-            if ((length & 0xc0) == 0xc0) {
-                if (pos >= packet.size()) return false;
-                const size_t ptr = ((static_cast<size_t>(length) & 0x3f) << 8) | packet[pos];
-                ++pos;
-                if (ptr < 12 || ptr >= pos - 2) return false;
-                if (!after_name) after_name = pos;
-                pos = ptr;
-                continue;
-            }
-            if (length > 63 || length != query[expected++] ||
-                pos + length > packet.size() || expected + length > query.size()) return false;
-            if (length == 0) {
-                if (after_name) pos = after_name;
-                // An EDNS OPT record may follow the query's question.
-                return pos + 4 <= packet.size() && expected + 4 <= query.size() &&
-                    std::equal(query.begin() + expected, query.begin() + expected + 4,
-                               packet.begin() + pos);
-            }
-            for (size_t i = 0; i < length; ++i) {
-                if (common::ToLowerAscii(packet[pos++]) != common::ToLowerAscii(query[expected++])) return false;
-            }
-        }
-        return false;
+            common::LoadU16BE(packet.data() + 4) != 1) return false;
+        size_t answered_end = 12;
+        size_t asked_end = 12;
+        WireName answered;
+        WireName asked;
+        return ReadWireName(packet, answered_end, answered) &&
+               ReadWireName(query, asked_end, asked) && answered == asked &&
+               answered_end + 4 <= packet.size() && asked_end + 4 <= query.size() &&
+               std::equal(query.begin() + asked_end, query.begin() + asked_end + 4,
+                          packet.begin() + answered_end);
     }
 
     net::io_context& io_;

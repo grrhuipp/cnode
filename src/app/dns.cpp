@@ -16,7 +16,6 @@ namespace app {
 
 namespace {
 
-constexpr uint16_t FLAG_QR    = 0x8000;
 constexpr uint16_t FLAG_TC    = 0x0200;
 constexpr uint16_t FLAG_RCODE = 0x000F;
 
@@ -52,55 +51,11 @@ void AppendUniqueAddresses(
     }
 }
 
-// Uncompressed, lowercased wire-format name (RFC 4034 §6.2 canonical form),
-// compared octet-wise after case folding as RFC 1035 §2.3.3 / RFC 4343 require.
-struct WireName {
-    std::array<uint8_t, 255> bytes;
-    size_t size = 0;
-
-    [[nodiscard]] bool operator==(const WireName& other) const noexcept {
-        return size == other.size &&
-               std::equal(bytes.begin(), bytes.begin() + size, other.bytes.begin());
-    }
-};
-
-// Same compression rules as UpstreamExchange::SkipWireName: only strictly
-// backward pointers, so traversal is bounded by the packet length.
-[[nodiscard]] bool ReadWireName(std::span<const uint8_t> packet, size_t& offset,
-                                WireName& out) noexcept {
-    size_t current = offset;
-    size_t resume = 0;
-    bool jumped = false;
-    out.size = 0;
-    while (current < packet.size()) {
-        const uint8_t len = packet[current];
-        if (len == 0) {
-            out.bytes[out.size++] = 0;
-            offset = jumped ? resume : current + 1;
-            return true;
-        }
-        if ((len & 0xC0) == 0xC0) {
-            if (current + 1 >= packet.size()) return false;
-            const size_t ptr = common::LoadU16BE(packet.data() + current) & 0x3FFFu;
-            if (ptr < 12 || ptr >= current) return false;
-            if (!jumped) {
-                resume = current + 2;
-                jumped = true;
-            }
-            current = ptr;
-            continue;
-        }
-        if ((len & 0xC0) != 0) return false;
-        if (packet.size() - current <= static_cast<size_t>(len) + 1) return false;
-        // Keep one octet for the root label: whole names are at most 255.
-        if (out.size + len + 1 >= out.bytes.size()) return false;
-        out.bytes[out.size++] = len;
-        for (size_t i = 1; i <= len; ++i) {
-            out.bytes[out.size++] = common::ToLowerAscii(packet[current + i]);
-        }
-        current += static_cast<size_t>(len) + 1;
-    }
-    return false;
+[[nodiscard]] DnsResult Failed(common::ErrorCode error, std::string message) {
+    DnsResult result;
+    result.error = error;
+    result.error_msg = std::move(message);
+    return result;
 }
 
 // True when zone equals name or is one of its label-aligned ancestors.
@@ -142,9 +97,8 @@ struct DNSWorker::Impl {
     static size_t BuildQueryTo(std::span<uint8_t, kQueryCapacity> query,
                                std::string_view domain,
                                bool query_aaaa) noexcept;
-    DnsResult ParseResponse(std::span<const uint8_t> response,
-                            uint16_t expected_txid,
-                            bool query_aaaa);
+    // Precondition: the exchange matched ID, QR, opcode and the question.
+    static DnsResult ParseResponse(std::span<const uint8_t> response, bool query_aaaa);
 
     net::io_context& io_context;
     const DnsConfig config;
@@ -357,7 +311,7 @@ net::awaitable<void> DNSWorker::Impl::QueryServer(
     bool query_aaaa,
     bool& stream_claimed,
     std::optional<DnsResult>& out) {
-    // BuildQueryTo and ExchangeDatagram write every byte of [0, query_size).
+    // BuildQueryTo and Exchange write every byte of [0, query_size).
     std::array<uint8_t, kQueryCapacity> query;
     size_t query_size = BuildQueryTo(query, domain, query_aaaa);
     // One deadline bounds the datagram, the plain retry and the TCP retry.
@@ -365,13 +319,13 @@ net::awaitable<void> DNSWorker::Impl::QueryServer(
     const auto remaining = [deadline] {
         return std::chrono::ceil<std::chrono::milliseconds>(deadline - common::steady_clock::now());
     };
-    auto response = co_await server.ExchangeDatagram(
+    auto response = co_await server.Exchange<udp::socket>(
         std::span<uint8_t>(query.data(), query_size), remaining());
     if (!response.error && UpstreamExchange::RejectsEdns(response.bytes)) {
         // Ask once more without the extension; the OPT record is last.
         common::StoreU16BE(query.data() + 10, 0);
         query_size -= kOptRecordSize;
-        response = co_await server.ExchangeDatagram(
+        response = co_await server.Exchange<udp::socket>(
             std::span<uint8_t>(query.data(), query_size), remaining());
     }
     // A datagram longer than the advertised payload breaks RFC 6891 §6.2.5 and
@@ -384,8 +338,8 @@ net::awaitable<void> DNSWorker::Impl::QueryServer(
         // family; samples run on one executor, so the first to see TC claims it.
         if (stream_claimed) co_return;
         stream_claimed = true;
-        response = co_await server.ExchangeStream(
-            std::span<const uint8_t>(query.data(), query_size), remaining());
+        response = co_await server.Exchange<tcp::socket>(
+            std::span<uint8_t>(query.data(), query_size), remaining());
     }
     if (response.error) {
         DnsResult& failed = out.emplace();
@@ -398,8 +352,7 @@ net::awaitable<void> DNSWorker::Impl::QueryServer(
             : response.error.message();
         co_return;
     }
-    const uint16_t txid = common::LoadU16BE(query.data());
-    out = ParseResponse(response.bytes, txid, query_aaaa);
+    out = ParseResponse(response.bytes, query_aaaa);
 }
 
 size_t DNSWorker::Impl::BuildQueryTo(
@@ -441,88 +394,38 @@ size_t DNSWorker::Impl::BuildQueryTo(
     return out + kOptRecordSize;
 }
 
-DnsResult DNSWorker::Impl::ParseResponse(
-    std::span<const uint8_t> response, uint16_t expected_txid, bool query_aaaa) {
-    DnsResult result;
-
-    if (response.size() < 12) {
-        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-        result.error_msg = "DNS response too short";
-        return result;
-    }
-
-    const uint16_t txid = common::LoadU16BE(response.data());
-    if (txid != expected_txid) {
-        result.error = common::ErrorCode::DNS_RESOLVE_FAILED;
-        result.error_msg = "DNS transaction ID mismatch";
-        return result;
-    }
-
+DnsResult DNSWorker::Impl::ParseResponse(std::span<const uint8_t> response, bool query_aaaa) {
     const uint16_t flags = common::LoadU16BE(response.data() + 2);
-    if (!(flags & FLAG_QR)) {
-        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-        result.error_msg = "DNS packet is not a response";
-        return result;
-    }
     if (flags & FLAG_TC) {
         // Only a TCP answer reaches here; UDP truncation was already retried.
-        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-        result.error_msg = "DNS response is truncated";
-        return result;
+        return Failed(common::ErrorCode::DNS_FORMAT_ERROR, "DNS response is truncated");
     }
-
     const uint8_t rcode = flags & FLAG_RCODE;
-    if (rcode != RCODE_OK && rcode != RCODE_NAME_ERROR) {
-        switch (rcode) {
-            case 2:
-                result.error = common::ErrorCode::DNS_SERVER_FAILED;
-                result.error_msg = "SERVFAIL";
-                break;
-            case 5:
-                result.error = common::ErrorCode::DNS_REFUSED;
-                result.error_msg = "REFUSED";
-                break;
-            default:
-                result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-                result.error_msg = std::format(
-                    "DNS response error rcode={}", rcode);
-                break;
-        }
-        return result;
+    switch (rcode) {
+        case RCODE_OK:
+        case RCODE_NAME_ERROR:
+            break;
+        case 2:
+            return Failed(common::ErrorCode::DNS_SERVER_FAILED, "SERVFAIL");
+        case 5:
+            return Failed(common::ErrorCode::DNS_REFUSED, "REFUSED");
+        default:
+            return Failed(common::ErrorCode::DNS_FORMAT_ERROR,
+                          std::format("DNS response error rcode={}", rcode));
     }
 
-    const uint16_t qdcount = common::LoadU16BE(response.data() + 4);
-    if (qdcount != 1) {
-        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-        result.error_msg = "DNS question count is not 1";
-        return result;
-    }
-
-    size_t pos = 12;
-    // sname walks the CNAME chain from QNAME (RFC 1034 §5.3.3); the echoed
-    // question already matched the query case-insensitively.
+    // sname walks the CNAME chain from QNAME (RFC 1034 §5.3.3). The question
+    // was already decoded and matched by the exchange, so this cannot fail.
     std::array<WireName, kMaxCnameChain + 1> chain;
     size_t chain_size = 1;
-    if (!ReadWireName(response, pos, chain[0]) || pos + 4 > response.size()) {
-        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-        result.error_msg = "DNS question section truncated";
-        return result;
-    }
-    const uint16_t qtype = common::LoadU16BE(response.data() + pos);
-    const uint16_t qclass = common::LoadU16BE(response.data() + pos + 2);
-    if (qtype != (query_aaaa ? TYPE_AAAA : TYPE_A) || qclass != 1) {
-        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-        result.error_msg = "DNS question section invalid";
-        return result;
-    }
-    pos += 4;
+    size_t pos = 12;
+    (void)ReadWireName(response, pos, chain[0]);
+    pos += 4;  // QTYPE, QCLASS
 
     const uint16_t ancount = common::LoadU16BE(response.data() + 6);
     const uint16_t nscount = common::LoadU16BE(response.data() + 8);
     if (ancount > (response.size() - pos) / 11) {
-        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-        result.error_msg = "DNS answer count exceeds packet";
-        return result;
+        return Failed(common::ErrorCode::DNS_FORMAT_ERROR, "DNS answer count exceeds packet");
     }
     std::vector<net::ip::address> addresses;
     addresses.reserve(std::min<size_t>(ancount, kMaxAnswerAddresses));
@@ -542,35 +445,24 @@ DnsResult DNSWorker::Impl::ParseResponse(
         const size_t chain_before = chain_size;
         for (uint16_t i = 0; i < ancount; ++i) {
             if (!ReadWireName(response, pos, owner) || pos + 10 > response.size()) {
-                result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-                result.error_msg = "DNS answer header truncated";
-                return result;
+                return Failed(common::ErrorCode::DNS_FORMAT_ERROR, "DNS answer header truncated");
             }
-
             const uint16_t type = common::LoadU16BE(response.data() + pos);
-            if (response[pos + 2] != 0 || response[pos + 3] != 1) {
-                result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-                result.error_msg = "DNS answer class is not IN";
-                return result;
+            if (common::LoadU16BE(response.data() + pos + 2) != 1) {
+                return Failed(common::ErrorCode::DNS_FORMAT_ERROR, "DNS answer class is not IN");
             }
             const uint32_t ttl = WireTtl(response.data() + pos + 4);
             const uint16_t rdlength = common::LoadU16BE(response.data() + pos + 8);
-
             pos += 10;
             if (pos + rdlength > response.size()) {
-                result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-                result.error_msg = "DNS answer data truncated";
-                return result;
+                return Failed(common::ErrorCode::DNS_FORMAT_ERROR, "DNS answer data truncated");
             }
             const size_t rdata_end = pos + rdlength;
-
-            if ((type == TYPE_A && rdlength != 4) ||
-                (type == TYPE_AAAA && rdlength != 16)) {
-                result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-                result.error_msg = std::format("DNS {} record has invalid RDLENGTH {} (expected {})",
-                    type == TYPE_A ? "A" : "AAAA", rdlength,
-                    type == TYPE_A ? 4 : 16);
-                return result;
+            if ((type == TYPE_A && rdlength != 4) || (type == TYPE_AAAA && rdlength != 16)) {
+                return Failed(common::ErrorCode::DNS_FORMAT_ERROR,
+                              std::format("DNS {} record has invalid RDLENGTH {} (expected {})",
+                                          type == TYPE_A ? "A" : "AAAA", rdlength,
+                                          type == TYPE_A ? 4 : 16));
             }
 
             // RFC 2181 §5.4.1: only records on the chain from QNAME answer the
@@ -579,20 +471,14 @@ DnsResult DNSWorker::Impl::ParseResponse(
             if (owner == sname && type == TYPE_CNAME) {
                 size_t target_pos = pos;
                 if (!ReadWireName(response, target_pos, target) || target_pos != rdata_end) {
-                    result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-                    result.error_msg = "DNS CNAME target malformed";
-                    return result;
+                    return Failed(common::ErrorCode::DNS_FORMAT_ERROR, "DNS CNAME target malformed");
                 }
                 const auto chain_end = chain.begin() + chain_size;
                 if (std::find(chain.begin(), chain_end, target) != chain_end) {
-                    result.error = common::ErrorCode::DNS_SERVER_FAILED;
-                    result.error_msg = "DNS CNAME chain loops";
-                    return result;
+                    return Failed(common::ErrorCode::DNS_SERVER_FAILED, "DNS CNAME chain loops");
                 }
                 if (chain_size == chain.size()) {
-                    result.error = common::ErrorCode::DNS_SERVER_FAILED;
-                    result.error_msg = "DNS CNAME chain too long";
-                    return result;
+                    return Failed(common::ErrorCode::DNS_SERVER_FAILED, "DNS CNAME chain too long");
                 }
                 chain[chain_size++] = target;
                 chain_ttl = std::min(chain_ttl, ttl);
@@ -621,6 +507,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
     }
 
     if (rcode != RCODE_NAME_ERROR && !addresses.empty()) {
+        DnsResult result;
         result.addresses = std::move(addresses);
         result.ttl = std::min(chain_ttl, address_ttl);
         return result;
@@ -630,17 +517,13 @@ DnsResult DNSWorker::Impl::ParseResponse(
     // min(SOA TTL, SOA MINIMUM) from the authority section (§5), also bounded
     // by the chain; without a SOA it is not cached (TTL 0).
     if (nscount > (response.size() - pos) / 11) {
-        result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-        result.error_msg = "DNS authority count exceeds packet";
-        return result;
+        return Failed(common::ErrorCode::DNS_FORMAT_ERROR, "DNS authority count exceeds packet");
     }
     const WireName& sname = chain[chain_size - 1];
     std::optional<uint32_t> negative_ttl;
     for (uint16_t i = 0; i < nscount; ++i) {
         if (!ReadWireName(response, pos, owner) || pos + 10 > response.size()) {
-            result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-            result.error_msg = "DNS authority header truncated";
-            return result;
+            return Failed(common::ErrorCode::DNS_FORMAT_ERROR, "DNS authority header truncated");
         }
         const uint16_t type = common::LoadU16BE(response.data() + pos);
         const uint16_t rr_class = common::LoadU16BE(response.data() + pos + 2);
@@ -648,28 +531,24 @@ DnsResult DNSWorker::Impl::ParseResponse(
         const uint16_t rdlength = common::LoadU16BE(response.data() + pos + 8);
         pos += 10;
         if (pos + rdlength > response.size()) {
-            result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-            result.error_msg = "DNS authority data truncated";
-            return result;
+            return Failed(common::ErrorCode::DNS_FORMAT_ERROR, "DNS authority data truncated");
         }
         const size_t rdata_end = pos + rdlength;
         // The SOA of the zone holding sname: its owner is sname or an ancestor.
         if (!negative_ttl && type == TYPE_SOA && rr_class == 1 && IsSameOrAncestor(owner, sname)) {
+            // MNAME and RNAME, then five 32-bit fields ending with MINIMUM.
             size_t fields = pos;
-            if (!UpstreamExchange::SkipWireName(response, fields) ||
-                !UpstreamExchange::SkipWireName(response, fields) ||
+            if (!ReadWireName(response, fields, target) || !ReadWireName(response, fields, target) ||
                 fields + 20 != rdata_end) {
-                result.error = common::ErrorCode::DNS_FORMAT_ERROR;
-                result.error_msg = "DNS SOA record malformed";
-                return result;
+                return Failed(common::ErrorCode::DNS_FORMAT_ERROR, "DNS SOA record malformed");
             }
             negative_ttl = std::min({ttl, WireTtl(response.data() + rdata_end - 4), chain_ttl});
         }
         pos = rdata_end;
     }
 
-    result.error = common::ErrorCode::DNS_NO_RECORD;
-    result.error_msg = rcode == RCODE_NAME_ERROR ? "NXDOMAIN" : "NODATA";
+    DnsResult result = Failed(common::ErrorCode::DNS_NO_RECORD,
+                              rcode == RCODE_NAME_ERROR ? "NXDOMAIN" : "NODATA");
     result.ttl = negative_ttl.value_or(0);
     return result;
 }
@@ -693,8 +572,8 @@ net::awaitable<void> DNSWorker::AsyncJoin() {
     RequestStop();
     co_await impl_->mailbox.AsyncJoinAccepted();
     co_await impl_->inflight_resolves.AsyncJoin();
-    // A query can finish before its shared socket's cancelled receive callback.
-    // Both boundaries must pass while the DNS executor and scheduler still live.
+    // Every exchange frame must have closed its socket and unwound while the
+    // DNS executor and its timeout scheduler still live.
     for (const auto& upstream : impl_->upstreams) co_await upstream->AsyncJoin();
 }
 

@@ -987,7 +987,7 @@ TEST_P(DnsDatagramStop, JoinsReceiveOwnerAndRejectsNewExchanges) {
     std::exception_ptr query_error;
     ::IoErrorCode reply_error;
     if (active) {
-        net::co_spawn(io, transport->ExchangeDatagram(query, 30s),
+        net::co_spawn(io, transport->Exchange<::udp::socket>(query, 30s),
             [&](std::exception_ptr error, ::app::UpstreamExchange::Reply reply) {
                 query_error = error;
                 reply_error = reply.error;
@@ -1007,7 +1007,7 @@ TEST_P(DnsDatagramStop, JoinsReceiveOwnerAndRejectsNewExchanges) {
     std::exception_ptr join_error;
     auto stop = [&]() -> net::awaitable<void> {
         co_await transport->AsyncJoin();
-        const auto rejected = co_await transport->ExchangeDatagram(query, 30s);
+        const auto rejected = co_await transport->Exchange<::udp::socket>(query, 30s);
         EXPECT_EQ(rejected.error, ::io_error::operation_aborted) << "a stopped exchange must not reopen its socket";
         transport.reset();
         EXPECT_TRUE(weak.expired()) << "join must release the actual receive callback's captured owner";
@@ -1042,7 +1042,7 @@ TEST(DnsDatagram, AllocationFailureUnwindsBeforeStopAndJoin) {
         // Opening the per-query socket is the exchange's first process-layer allocation.
         ::common::reject_next_process_allocation = true;
         try {
-            (void)co_await transport->ExchangeDatagram(query, 30s);
+            (void)co_await transport->Exchange<::udp::socket>(query, 30s);
         } catch (const std::bad_alloc&) {
             failed = true;
         }
