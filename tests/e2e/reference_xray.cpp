@@ -131,10 +131,10 @@ TEST_P(VisionReference, BidirectionalPaddingDirectAndInnerTlsEof) {
     }
     xray["log"]["loglevel"] = "debug";
     WriteJson(root.Path(), "xray.json", xray);
-    (xray_client ? front_reservation : server_reservation).Close();
     Child reference({CNODE_REFERENCE_XRAY, "run", "-config", (root.Path() / "xray.json").string()}, root.Path() / "xray.log");
-    reference.WaitForLog("started");
+    reference.WaitForLog(XrayStarted);
     Child cnode({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "cnode.log");
+    cnode.WaitForServerStart();
     for (int number = 0; number != 2; ++number) {
         auto socket = Connect(front_port);
         if (xray_client) Socks(socket, target.Port()); else socket.Write(VlessRequest(target.Port()));
@@ -204,10 +204,10 @@ TEST_P(VisionUdpReference, XudpDatagramsRoundTripThroughVision) {
         xray = {{"inbounds", Json::array({inbound})}, {"outbounds", Json::array({Freedom(true)})}};
     }
     WriteJson(root.Path(), "xray.json", xray);
-    (xray_client ? front_reservation : server_reservation).Close();
     Child reference({CNODE_REFERENCE_XRAY, "run", "-config", (root.Path() / "xray.json").string()}, root.Path() / "xray.log");
-    reference.WaitForLog("started");
+    reference.WaitForLog(XrayStarted);
     Child cnode({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "cnode.log");
+    cnode.WaitForServerStart();
     auto control = Connect(front_port);
     if (xray_client) {
         const auto relay_port = Socks(control, 0, 3);
@@ -275,7 +275,6 @@ TEST_P(EncryptionReference, CrossWorkerTicketsReplayAndHandshakeBoundaries) {
         {"inbounds", Json::array({SocksInbound(front_port)})},
         {"outbounds", Json::array({XrayOutbound(bridge.Port(), {{"id", UserId}, {"encryption", encryption}})})}});
     Child cnode({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "cnode.log");
-    front_reservation.Close();
     Child reference({CNODE_REFERENCE_XRAY, "run", "-config", (root.Path() / "xray.json").string()}, root.Path() / "xray.log");
     for (size_t number = 0; number != 17; ++number) {
         auto socket = Connect(front_port); Socks(socket, target.Port()); socket.Write("vless-0rtt-real-xray");
@@ -289,6 +288,9 @@ TEST_P(EncryptionReference, CrossWorkerTicketsReplayAndHandshakeBoundaries) {
         EXPECT_GE(flights[i].first_response, 98u); EXPECT_LT(flights[i].first_response, 1000u);
     }
     std::vector<std::pair<std::string, uint16_t>> boundary;
+    // Held until the logs are read: a closed probe's source port can be handed
+    // to a later connection, whose log lines would then be taken for the probe's.
+    std::vector<Socket> probes;
     for (const auto& kind : {"empty", "truncated", "rejected", "timeout"}) {
         auto socket = Connect(server_port);
         boundary.emplace_back(kind, socket.Port());
@@ -302,6 +304,7 @@ TEST_P(EncryptionReference, CrossWorkerTicketsReplayAndHandshakeBoundaries) {
         char buffer[4096];
         const auto count = recv(socket.Fd(), buffer, sizeof(buffer), MSG_DONTWAIT);
         EXPECT_LE(count, 0) << kind;
+        probes.push_back(std::move(socket));
     }
     const auto replay = flights[1].sent;
     ASSERT_FALSE(replay.empty());
@@ -364,9 +367,8 @@ TEST_P(EncryptionReference, CnodeOutboundResumesRealXrayTickets) {
         {"inbounds", Json::array({inbound})}, {"outbounds", Json::array({Freedom(true)})}});
     Configure(root.Path(), VlessInbound(front_port), {{"protocol", "vless"}, {"settings", {
         {"address", "127.0.0.1"}, {"port", bridge.Port()}, {"id", UserId}, {"encryption", encryption}}}});
-    server_reservation.Close();
     Child reference({CNODE_REFERENCE_XRAY, "run", "-config", (root.Path() / "xray.json").string()}, root.Path() / "xray.log");
-    reference.WaitForLog("started");
+    reference.WaitForLog(XrayStarted);
     Child cnode({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "cnode.log");
     Socket first;
     for (size_t number = 0; number != 17; ++number) {
@@ -413,9 +415,8 @@ TEST(XhttpReference, FourConcurrentStreamUpRequestsDrainUploadResponses) {
     auto inbound = VlessInbound(xray_port); inbound["streamSettings"] = stream;
     WriteJson(root.Path(), "xray.json", {{"log", {{"loglevel", "debug"}}},
         {"inbounds", Json::array({inbound})}, {"outbounds", Json::array({Freedom(true)})}});
-    xray_reservation.Close();
     Child reference({CNODE_REFERENCE_XRAY, "run", "-config", (root.Path() / "xray.json").string()}, root.Path() / "xray.log");
-    reference.WaitForLog("started");
+    reference.WaitForLog(XrayStarted);
     Bridge bridge(xray_port, true);
     auto outbound = XrayOutbound(bridge.Port(), {{"id", UserId}, {"encryption", "none"}});
     outbound["streamSettings"] = stream;

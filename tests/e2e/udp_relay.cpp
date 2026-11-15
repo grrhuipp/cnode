@@ -60,9 +60,8 @@ public:
         WriteJson(root.Path(), "inbounds.json", Json::array({inbound}));
         WriteJson(root.Path(), "outbounds.json", outbounds);
         WriteJson(root.Path(), "routing.json", routing);
-        reservation.ReleaseUdp();
         child = std::make_unique<Child>(std::vector<std::string>{Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-        child->WaitForLog("server started");
+        child->WaitForServerStart();
     }
     static Json SsSettings(uint16_t port, std::string_view address = "127.0.0.1") {
         return {{"servers", Json::array({{{"address", address}, {"port", port}, {"method", "aes-128-gcm"}, {"password", "secret"}}})}};

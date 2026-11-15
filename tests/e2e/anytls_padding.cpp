@@ -23,7 +23,7 @@ TEST_P(AnyTlsInboundPadding, SharedPreparedPolicyDistributesOriginalBytesOnlyOnD
         }
     });
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-    child.WaitForLog("server started");
+    child.WaitForServerStart();
     TlsContext tls(false);
     for (unsigned connection = 0; connection < 4; ++connection) {
         SCOPED_TRACE("physical connection " + std::to_string(connection));
@@ -105,7 +105,7 @@ TEST_P(AnyTlsOutboundPadding, SparseStopAndInvalidUpdatesKeepOnePhysicalSessionU
         EXPECT_EQ(barriers.load(), 3U);
     });
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-    child.WaitForLog("server started");
+    child.WaitForServerStart();
     for (unsigned sid = 1; sid <= 3; ++sid) {
         Roundtrip(port);
         Until([&] { return barriers.load() == sid; });

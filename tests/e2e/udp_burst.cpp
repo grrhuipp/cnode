@@ -19,7 +19,7 @@ TEST(UdpBurst, StreamCarriedBurstArrivesWholeAndKeepsItsAssociation) {
          {"settings", {{"clients", Json::array({{{"id", UserId}}})}}}},
         {{"protocol", "freedom"}, {"settings", Json::object()}});
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-    child.WaitForLog("server started");
+    child.WaitForServerStart();
 
     Client client(reservation.port, target.Port(), false);
     constexpr size_t kBurst = 512;

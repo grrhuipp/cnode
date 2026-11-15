@@ -85,7 +85,7 @@ TEST(Xudp, GlobalIdKeepsOneOutboundAcrossConnectionsAndWorkers) {
                                                 {{"id", SecondUser}, {"email", "second@xudp"}}})}}}},
         {{"protocol", "freedom"}, {"settings", Json::object()}}, 4);
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-    child.WaitForLog("server started");
+    child.WaitForServerStart();
 
     const std::string flow_id("\x11\x22\x33\x44\x55\x66\x77\x88", 8);
     auto first = std::make_unique<XudpConnection>(reservation.port, UserId);

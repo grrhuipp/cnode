@@ -16,7 +16,6 @@
 #include <stdexcept>
 
 namespace cnode::e2e::reference {
-inline uint16_t UdpPort() { return Socket::BindUdp().Port(); }
 inline std::string Address(uint16_t port) { return "127.0.0.1:" + std::to_string(port); }
 inline std::string Digest(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
@@ -66,6 +65,9 @@ inline void VerifyXray(const std::string& path) {
     Require(version.find("26.10.31") != std::string::npos && version.find("a4a3dff") != std::string::npos,
             "wrong Xray reference release (expected v26.10.31)");
 }
+// Logged once every Xray inbound listens. A bare "started" also matches the
+// "Logger started" line that debug logging prints before any listener exists.
+inline constexpr std::string_view XrayStarted = "core: Xray 26.10.31 started";
 inline Socket Connect(uint16_t port) {
     Socket socket;
     Until([&] { try { socket = Socket::Connect(port, "127.0.0.1", 200ms); return true; } catch (...) { return false; } }, 15s);

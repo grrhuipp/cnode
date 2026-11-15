@@ -18,15 +18,14 @@ class QuicUdpFrameBudget : public ::testing::TestWithParam<uint64_t> {};
 TEST_P(QuicUdpFrameBudget, DownlinkRestoresFlowTargetWithinPeerFrameBudget) {
     TempDir root;
     auto next_hop = Socket::BindUdp();
-    auto reservation = Socket::BindUdp();
+    auto reservation = Socket::ReserveUdp();
     const auto port = reservation.Port();
     Configure(root.Path(), HysteriaInbound(port), {
         {"protocol", "shadowsocks"},
         {"settings", {{"servers", Json::array({{{"address", "127.0.0.1"},
             {"port", next_hop.Port()}, {"method", "aes-128-gcm"}, {"password", "secret"}}})}}}});
-    reservation.Close();
     Child server({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-    server.WaitForLog("server started");
+    server.WaitForServerStart();
     const auto frame_limit = GetParam();
     Peer peer(port, "smoke-secret", frame_limit);
     const auto host = std::string(63, 'a') + "." + std::string(63, 'b') + "." +
@@ -121,15 +120,14 @@ INSTANTIATE_TEST_SUITE_P(AdvertisedLimit, QuicUdpFrameBudget,
 TEST(QuicUdp, UnfragmentedIdsAreIgnoredWithoutBreakingFragmentedPackets) {
     TempDir root;
     auto target = Socket::BindUdp();
-    auto reservation = Socket::BindUdp();
+    auto reservation = Socket::ReserveUdp();
     const auto port = reservation.Port();
     auto inbound = HysteriaInbound(port);
     inbound["sniffing"]["enabled"] = true;
     Configure(root.Path(), std::move(inbound),
         {{"protocol", "freedom"}, {"settings", Json::object()}});
-    reservation.Close();
     Child server({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-    server.WaitForLog("server started");
+    server.WaitForServerStart();
     Peer peer(port);
     const auto address = "127.0.0.1:" + std::to_string(target.Port());
     constexpr uint32_t session = 0x10203040;
@@ -258,16 +256,15 @@ class QuicFragmentExpiry : public ::testing::TestWithParam<FragmentDeadline> {};
 TEST_P(QuicFragmentExpiry, EnforcesIdleAndOverallBudgetsWithoutClosingAssociation) {
     TempDir root;
     auto target = Socket::BindUdp();
-    auto reservation = Socket::BindUdp();
+    auto reservation = Socket::ReserveUdp();
     const auto port = reservation.Port();
     Configure(root.Path(), HysteriaInbound(port),
         {{"protocol", "freedom"}, {"settings", Json::object()}});
     auto config = Json::parse(ReadFile(root.Path() / "config.json"));
     config["timeouts"]["connIdle"] = 120;
     WriteJson(root.Path(), "config.json", config);
-    reservation.Close();
     Child server({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-    server.WaitForLog("server started");
+    server.WaitForServerStart();
     Peer peer(port);
     const auto address = "127.0.0.1:" + std::to_string(target.Port());
     constexpr uint32_t session = 0x50607080;
@@ -346,7 +343,7 @@ TEST(QuicUdp, ShutdownJoinsSessionWaitingForDnsWithLaterInput) {
             socket.Write(bytes);
         }
     });
-    auto reservation = Socket::BindUdp();
+    auto reservation = Socket::ReserveUdp();
     const auto port = reservation.Port();
     Configure(root.Path(), HysteriaInbound(port),
         {{"protocol", "freedom"}, {"settings", Json::object()}});
@@ -355,9 +352,8 @@ TEST(QuicUdp, ShutdownJoinsSessionWaitingForDnsWithLaterInput) {
                      {"timeout", 60}};
     config["timeouts"] = {{"handshake", 10}, {"connIdle", 120}, {"write", 10}};
     WriteJson(root.Path(), "config.json", config);
-    reservation.Close();
     Child server({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-    server.WaitForLog("server started");
+    server.WaitForServerStart();
     Peer peer(port);
     constexpr std::string_view host = "queued-cancel.test";
     const auto address = std::string(host) + ":53";
@@ -454,12 +450,12 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
     WriteJson(upstream_root.Path(), "config.json", upstream_config);
     Child upstream({Binary().string(), "--config-dir", upstream_root.Path().string()},
         upstream_root.Path() / "upstream.log");
-    upstream.WaitForLog("server started");
-    auto reservation = Socket::BindUdp();
+    upstream.WaitForServerStart();
+    auto reservation = Socket::ReserveUdp();
     const auto port = reservation.Port();
     auto vless_reservation = Socket::ReserveTcp();
     const auto vless_port = vless_reservation.Port();
-    udp::PortReservation ss_reservation(true);
+    PortReservation ss_reservation(true);
     const auto ss_port = ss_reservation.port;
     const auto ss_key = udp::Sequence(16);
 
@@ -566,11 +562,9 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
         {{"domain", Json::array({"domain:anytls.route.test"})}, {"outboundTag", "anytls-out"}},
         {{"domain", Json::array({"domain:direct.route.test"})}, {"outboundTag", "direct-out"}},
         {{"domain", Json::array({"domain:blocked.route.test"})}, {"outboundTag", "block-out"}}})}});
-    reservation.Close();
-    ss_reservation.ReleaseUdp();
     Child server({Binary().string(), "--config-dir", root.Path().string()},
         root.Path() / "child.log");
-    server.WaitForLog("server started");
+    server.WaitForServerStart();
     Until([&] { return panel_user_pulls.load() >= 1; }, 10s);
 
     constexpr size_t client_count = 8;
@@ -886,17 +880,17 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
         "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
     auto reality_fallback_guard = Socket::Listen();
 
-    std::vector<udp::PortReservation> final_reservations;
+    std::vector<PortReservation> final_reservations;
     final_reservations.reserve(second_hop_count);
     for (size_t q = 0; q < second_hop_count; ++q) {
         final_reservations.emplace_back(true);
     }
-    std::vector<udp::PortReservation> mid_reservations;
+    std::vector<PortReservation> mid_reservations;
     mid_reservations.reserve(first_hop_count);
     for (size_t p = 0; p < first_hop_count; ++p) {
         mid_reservations.emplace_back(true);
     }
-    auto hy2_reservation = Socket::BindUdp();
+    auto hy2_reservation = Socket::ReserveUdp();
     const auto hy2_port = hy2_reservation.Port();
 
     auto make_stream = [&](std::string_view net, std::string_view sec, bool server,
@@ -1155,16 +1149,12 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
     WriteJson(upstream_root.Path(), "outbounds.json", upstream_outbounds);
     WriteJson(upstream_root.Path(), "routing.json", {{"rules", upstream_rules}});
 
-    for (auto& res : final_reservations) res.ReleaseUdp();
-    for (auto& res : mid_reservations) res.ReleaseUdp();
-    hy2_reservation.Close();
-
     Child upstream({Binary().string(), "--config-dir", upstream_root.Path().string()},
         upstream_root.Path() / "upstream.log");
-    upstream.WaitForLog("server started");
+    upstream.WaitForServerStart();
     Child gateway({Binary().string(), "--config-dir", gateway_root.Path().string()},
         gateway_root.Path() / "gateway.log");
-    gateway.WaitForLog("server started");
+    gateway.WaitForServerStart();
 
     struct HopClient {
         std::unique_ptr<Peer> peer;

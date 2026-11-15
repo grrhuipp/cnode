@@ -211,7 +211,7 @@ inline std::vector<Observation> PhysicalSessions(const std::vector<PhysicalCase>
 #endif
     if (reference) reservation.Close();
     Child child(command, root.Path() / "child.log");
-    if (!reference) child.WaitForLog("server started");
+    if (!reference) child.WaitForServerStart();
     for (size_t i = 0; i < cases.size(); ++i) {
         Roundtrip(front, reference);
         roundtrip_done.store(i + 1);

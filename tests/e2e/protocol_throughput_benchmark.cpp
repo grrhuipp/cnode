@@ -462,14 +462,13 @@ TEST_P(ProtocolUdpThroughputBenchmark, VerifiedDatagramTransfer) {
     } join_echo{stop_echo, echo_thread};
 
     if (uc.protocol == "hysteria2") {
-        auto reservation = Socket::BindUdp();
+        auto reservation = Socket::ReserveUdp();
         const uint16_t hy2_port = reservation.Port();
         auto inbound = quic::HysteriaInbound(hy2_port);
         inbound["settings"]["upMbps"] = 10000;
         inbound["settings"]["downMbps"] = 10000;
         Configure(root.Path(), std::move(inbound),
                   {{"protocol", "freedom"}, {"settings", Json::object()}}, Workers);
-        reservation.Close();
 
         const auto usage_before = ChildrenUsage();
         const auto lifetime_started = Clock::now();
@@ -528,7 +527,7 @@ TEST_P(ProtocolUdpThroughputBenchmark, VerifiedDatagramTransfer) {
     }
 
     const bool native_ss = (uc.variant == "native_aes" || uc.variant == "native_2022_aes");
-    udp::PortReservation entry_res(native_ss);
+    PortReservation entry_res(native_ss);
     auto hop_res = Socket::ReserveTcp();
     auto fallback_listener = Socket::Listen();
 
@@ -557,7 +556,6 @@ TEST_P(ProtocolUdpThroughputBenchmark, VerifiedDatagramTransfer) {
                 {{"log", {{"loglevel", "info"}}},
                  {"timeouts", {{"handshake", 10}, {"connIdle", 60}, {"write", 60},
                                {"uplinkOnly", 10}, {"downlinkOnly", 10}}}});
-    if (native_ss) entry_res.ReleaseUdp();
 
     const auto usage_before = ChildrenUsage();
     const auto lifetime_started = Clock::now();

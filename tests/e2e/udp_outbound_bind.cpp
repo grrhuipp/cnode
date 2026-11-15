@@ -112,7 +112,7 @@ TEST_P(OutboundBind, RespectsAddressFamilyAndOrderedBinding) {
     ConfigFiles(root, config, Json::array({Inbound(inbound.port)}),
                 Json::array({Outbound(item.addresses, item.strategy, item.domain_strategy)}));
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-    child.WaitForLog("server started");
+    child.WaitForServerStart();
     if (item.succeeds) {
         std::string source;
         PeerThread echo([&] {
@@ -207,7 +207,7 @@ TEST_P(PassthroughHash, PreservesOriginAcrossAnyTlsAndVlessHops) {
     ConfigFiles(root, {{"workers", 1}, {"log", {{"rotateDaily", false}, {"access", (root.Path() / "access.log").string()}}}}, inbounds, outbounds);
     auto target = Socket::Listen();
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-    child.WaitForLog("server started");
+    child.WaitForServerStart();
     std::vector<std::string> sources;
     PeerThread echo([&] {
         for (int i = 0; i < (ip_hash ? 3 : 4); ++i) {

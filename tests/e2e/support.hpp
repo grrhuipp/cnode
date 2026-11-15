@@ -28,6 +28,12 @@ namespace cnode::e2e {
 using Json = nlohmann::json;
 using namespace std::chrono_literals;
 using Milliseconds = std::chrono::milliseconds;
+// A panel-configured cnode syncs its traffic journal directories while it
+// boots and its final record while it stops. On a busy disk one fsync can
+// take many seconds, and a process inside it reacts to no signal, SIGKILL
+// included. Bounds that span such a phase use this value; a child that exits
+// in the meantime is still reported at once.
+inline constexpr Milliseconds StorageStallBound = 60s;
 
 std::filesystem::path Binary();
 std::filesystem::path SourceRoot();
@@ -75,10 +81,14 @@ public:
     MemorySnapshot ReadMemorySnapshot();
     bool Running();
     // Wait/Stop return the exit code, or 128 + signal for signal termination.
-    int Wait(Milliseconds timeout = 5s);
+    // Stop's timeout bounds the SIGTERM phase; the SIGKILL that follows is
+    // reaped within StorageStallBound.
+    int Wait(Milliseconds timeout = StorageStallBound);
     void Signal(int signal);
-    int Stop(Milliseconds timeout = 5s);
+    int Stop(Milliseconds timeout = StorageStallBound);
     void WaitForLog(std::string_view text, Milliseconds timeout = 10s);
+    // The marker cnode logs once every worker serves its inbounds.
+    void WaitForServerStart();
     const std::filesystem::path& LogPath() const noexcept { return log_; }
 private:
     int pid_ = -1;
@@ -107,6 +117,11 @@ public:
     // lifetime of the cnode child that serves the port; close it first only
     // for peers that bind without SO_REUSEADDR.
     static Socket ReserveTcp(std::string_view address = "127.0.0.1");
+    // UDP counterpart, held for the lifetime of the cnode child as well: no
+    // bind(0) of any process is handed the port, and cnode's SO_REUSEADDR
+    // listeners bind beside it. Connected to its own address, it matches no
+    // peer's datagrams, so every one of them reaches cnode.
+    static Socket ReserveUdp(uint16_t port = 0, std::string_view address = "127.0.0.1");
     Socket Accept(Milliseconds timeout = 5s) const;
     uint16_t Port() const;
     int Fd() const noexcept { return fd_; }
@@ -119,6 +134,16 @@ public:
     void SendTo(std::string_view bytes, uint16_t port, std::string_view address = "127.0.0.1");
 private:
     int fd_ = -1;
+};
+
+// One loopback port number reserved for TCP and, on request, for UDP too (a
+// shadowsocks inbound listens on both). The reservations are held until
+// destruction, for cnode's SO_REUSEADDR listeners to bind beside them.
+struct PortReservation {
+    Socket tcp;
+    Socket udp;
+    uint16_t port = 0;
+    explicit PortReservation(bool with_udp = false);
 };
 
 class TlsContext {

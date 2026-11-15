@@ -66,7 +66,7 @@ TEST_P(AnyTlsClientPadding, LearnedPoliciesAreScopedToOutboundClientAcrossPhysic
         }
     });
     Child child({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-    child.WaitForLog("server started");
+    child.WaitForServerStart();
     for (size_t index = 0; index < sequence.size(); ++index) {
         Roundtrip(front[sequence[index]]);
         roundtrip_done.store(index + 1);

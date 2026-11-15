@@ -31,7 +31,7 @@ TEST(InboundHandshake, SegmentedVmessTrojanReplayFlowEofAndDeadline) {
     config["log"].update({{"loglevel", "debug"}});
     WriteJson(server_dir, "config.json", config);
     auto server = Start(server_dir);
-    server->WaitForLog("server started");
+    server->WaitForServerStart();
     auto splitter = Socket::Listen();
     std::string captured;
     PeerThread split([&] {
@@ -70,7 +70,7 @@ TEST(InboundHandshake, SegmentedVmessTrojanReplayFlowEofAndDeadline) {
     config["log"].update({{"loglevel", "debug"}});
     WriteJson(client_dir, "config.json", config);
     auto client = Start(client_dir);
-    client->WaitForLog("server started");
+    client->WaitForServerStart();
     {
         auto probe = Socket::Connect(front_port);
         probe.Write(VlessRequest(backend.Port(), payload));
@@ -114,7 +114,7 @@ TEST(InboundHandshake, SegmentedVmessTrojanReplayFlowEofAndDeadline) {
     trojan_inbound["streamSettings"] = TlsSettings(true);
     Configure(trojan_dir, trojan_inbound, Direct());
     auto trojan = Start(trojan_dir);
-    trojan->WaitForLog("server started");
+    trojan->WaitForServerStart();
     TlsContext tls(false);
     {
         TlsSocket stream(Socket::Connect(trojan_port), tls, false);

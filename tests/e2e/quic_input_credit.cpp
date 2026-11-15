@@ -30,7 +30,7 @@ TEST_P(QuicInputCredit, RetiredRequestCannotExhaustUnrelatedStreams) {
             socket.Write(bytes);
         }
     });
-    auto reservation = Socket::BindUdp();
+    auto reservation = Socket::ReserveUdp();
     const auto port = reservation.Port();
     Configure(root.Path(), HysteriaInbound(port),
         {{"protocol", "freedom"}, {"settings", Json::object()}});
@@ -40,9 +40,8 @@ TEST_P(QuicInputCredit, RetiredRequestCannotExhaustUnrelatedStreams) {
     config["timeouts"] = {{"handshake", 10}, {"connIdle", 120}, {"write", 10},
                            {"uplinkOnly", 1}, {"downlinkOnly", 1}};
     WriteJson(root.Path(), "config.json", config);
-    reservation.Close();
     Child server({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-    server.WaitForLog("server started");
+    server.WaitForServerStart();
     Peer peer(port);
     const std::string target_address = "127.0.0.1:" + std::to_string(target.Port());
     const auto control = peer.Open(target_address);
@@ -119,13 +118,12 @@ TEST(QuicInputCredit, NormalFinKeepsConnectionReusableBeyondItsInitialWindow) {
             socket.Write(bytes);
         }
     });
-    auto reservation = Socket::BindUdp();
+    auto reservation = Socket::ReserveUdp();
     const auto port = reservation.Port();
     Configure(root.Path(), HysteriaInbound(port),
         {{"protocol", "freedom"}, {"settings", Json::object()}});
-    reservation.Close();
     Child server({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-    server.WaitForLog("server started");
+    server.WaitForServerStart();
     Peer peer(port);
     const std::string address = "127.0.0.1:" + std::to_string(target.Port());
     const std::string payload = Pattern(2 * 1024 * 1024);
@@ -186,13 +184,12 @@ void FinishBackpressuredWriter(OutputEnd ending) {
             socket.Write(bytes);
         }
     });
-    auto reservation = Socket::BindUdp();
+    auto reservation = Socket::ReserveUdp();
     const auto port = reservation.Port();
     Configure(root.Path(), HysteriaInbound(port),
         {{"protocol", "freedom"}, {"settings", Json::object()}});
-    reservation.Close();
     Child server({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "child.log");
-    server.WaitForLog("server started");
+    server.WaitForServerStart();
     Peer peer(port, "smoke-secret", 65535, ReceiveWindow);
     const std::string address = "127.0.0.1:" + std::to_string(target.Port());
     const auto control = peer.Open(address, "C");

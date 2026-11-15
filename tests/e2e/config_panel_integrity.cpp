@@ -111,6 +111,7 @@ TEST_P(AccountingFault, QuarantinesAmbiguousRequestsAcrossRestartUntilExplicitRe
     reservation.tcp.Close();
     reservation.udp.Close();
     auto child = Start(directory.Path());
+    child->WaitForServerStart();
     WaitEcho(*child, node, echo.Port(), "127.0.0.1", reservation.address);
     Until([&] { return panel.Posts(true) != 0; }, 12s);
     Until([&] { return !Records(directory.Path(), "unknown").empty(); }, 12s);
@@ -119,7 +120,7 @@ TEST_P(AccountingFault, QuarantinesAmbiguousRequestsAcrossRestartUntilExplicitRe
         const auto count = panel.Posts(true);
         panel.EmptyCycles(*child);
         EXPECT_EQ(panel.Posts(true), count) << "ambiguous additive request was retried";
-        EXPECT_EQ(child->Stop(10s), 0);
+        EXPECT_EQ(child->Stop(), 0);
     }
     const auto unknown = SnapshotUnknown(directory.Path());
     ASSERT_FALSE(unknown.empty());
@@ -133,10 +134,11 @@ TEST_P(AccountingFault, QuarantinesAmbiguousRequestsAcrossRestartUntilExplicitRe
     panel.Mode("ok");
     auto count = panel.Posts(true);
     child = Start(directory.Path());
+    child->WaitForServerStart();
     panel.EmptyCycles(*child);
     EXPECT_EQ(panel.Posts(true), count) << "restart retransmitted unknown traffic";
     EXPECT_EQ(SnapshotUnknown(directory.Path()), unknown);
-    EXPECT_EQ(child->Stop(10s), 0);
+    EXPECT_EQ(child->Stop(), 0);
     const auto path = Records(directory.Path(), "unknown").front();
     {
         Child list({CNODE_TEST_JOURNAL_BINARY, path.parent_path().string(), "list"}, directory.Path() / "journal-list.log");
@@ -155,12 +157,13 @@ TEST_P(AccountingFault, QuarantinesAmbiguousRequestsAcrossRestartUntilExplicitRe
         EXPECT_TRUE(std::filesystem::exists(ready));
         count = panel.Posts(true);
         child = Start(directory.Path());
+        child->WaitForServerStart();
         Until([&] { return panel.Posts(true) >= count + 1; }, 12s);
         panel.EmptyCycles(*child);
         EXPECT_EQ(panel.Posts(true), count + 1) << "explicit replay was repeated";
         EXPECT_FALSE(std::filesystem::exists(ready));
         EXPECT_FALSE(std::filesystem::exists(path));
-        EXPECT_EQ(child->Stop(10s), 0);
+        EXPECT_EQ(child->Stop(), 0);
     }
     panel.Join();
     echo.Join();
@@ -181,18 +184,20 @@ TEST(PanelIntegrity, GracefulShutdownPersistsUnsampledCountersAndReplaysExactlyO
     reservation.tcp.Close();
     reservation.udp.Close();
     auto child = Start(directory.Path());
+    child->WaitForServerStart();
     WaitEcho(*child, node, echo.Port(), "127.0.0.1", reservation.address);
-    EXPECT_EQ(child->Stop(10s), 0);
+    EXPECT_EQ(child->Stop(), 0);
     EXPECT_FALSE(Records(directory.Path(), "ready").empty());
     EXPECT_EQ(panel.Posts(true), 0u);
     panel.PushInterval(1);
     child = Start(directory.Path());
+    child->WaitForServerStart();
     Until([&] { return panel.Posts(true) != 0; }, 12s);
     Until([&] { return Records(directory.Path(), "ready").empty() && Records(directory.Path(), "unknown").empty(); }, 12s);
     const auto count = panel.Posts(true);
     panel.EmptyCycles(*child);
     EXPECT_EQ(panel.Posts(true), count);
-    EXPECT_EQ(child->Stop(10s), 0);
+    EXPECT_EQ(child->Stop(), 0);
     panel.Join();
     echo.Join();
 }
@@ -211,6 +216,7 @@ TEST(PanelIntegrity, InvalidRuleCandidateNeverAdmitsOrPartiallyReplacesCommitted
     reservation.tcp.Close();
     reservation.udp.Close();
     auto child = Start(directory.Path());
+    child->WaitForServerStart();
     // A rejected initial candidate cannot publish its one-second pull interval;
     // without committed state the controller retains the 60-second default.
     // Wait for completed rejection, not three requests or an arbitrary sleep.
@@ -229,9 +235,10 @@ TEST(PanelIntegrity, InvalidRuleCandidateNeverAdmitsOrPartiallyReplacesCommitted
     SCOPED_TRACE("default loopback port remains owned by this fixture, not the child");
     EXPECT_TRUE(Listening(node)) << "the unrelated default-address listener must remain live";
     EXPECT_FALSE(Listening(node, reservation.address)) << "invalid initial rules admitted a listener";
-    EXPECT_EQ(child->Stop(10s), 0);
+    EXPECT_EQ(child->Stop(), 0);
     panel.Rules("blocked");
     child = Start(directory.Path(), "committed.log");
+    child->WaitForServerStart();
     WaitEcho(*child, node, echo.Port(), "127.0.0.2", reservation.address);
     EXPECT_FALSE(Echo(node, echo.Port(), UserA, "127.0.0.1", reservation.address));
     const auto baseline = panel.Gets().size();
@@ -248,7 +255,7 @@ TEST(PanelIntegrity, InvalidRuleCandidateNeverAdmitsOrPartiallyReplacesCommitted
     WaitEcho(*child, node, echo.Port(), "127.0.0.1", reservation.address);
     EXPECT_TRUE(Echo(node, echo.Port(), UserA, "127.0.0.2", reservation.address))
         << "valid recovery retained a prefix from the invalid candidate";
-    EXPECT_EQ(child->Stop(10s), 0);
+    EXPECT_EQ(child->Stop(), 0);
     EXPECT_FALSE(Listening(node, reservation.address));
     EXPECT_TRUE(Listening(node));
     panel.Join();
@@ -302,6 +309,7 @@ TEST_P(ReportErrorLog, PrintsBoundedResponseDetailsWithoutLeakingTheRequestKey) 
     reservation.tcp.Close();
     reservation.udp.Close();
     auto child = Start(directory.Path());
+    child->WaitForServerStart();
     WaitEcho(*child, node, echo.Port(), "127.0.0.1", reservation.address);
     auto link = Socket::Connect(node, reservation.address, 1s);
     link.Write("PROXY TCP4 192.0.2.7 " + reservation.address + " 12345 " + std::to_string(node) + "\r\n" +
@@ -309,7 +317,7 @@ TEST_P(ReportErrorLog, PrintsBoundedResponseDetailsWithoutLeakingTheRequestKey) 
     EXPECT_EQ(link.ReadExact(Payload.size() + 2, 3s), std::string("\0\0", 2) + std::string(Payload));
     child->WaitForLog("ONLINE_RESPONSE_DETAIL");
     link.Close();
-    EXPECT_EQ(child->Stop(10s), 0);
+    EXPECT_EQ(child->Stop(), 0);
     panel.Join();
     echo.Join();
 

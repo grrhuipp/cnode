@@ -72,7 +72,7 @@ TEST_P(Ss2022TcpReplay, RejectsCapturedRequestAndAcceptsFreshSaltWithoutBanningC
     TempDir root;
     const auto server_dir = root.Path() / "server";
     const auto client_dir = root.Path() / "client";
-    udp::PortReservation server_reservation(true);
+    PortReservation server_reservation(true);
     auto client_reservation = Socket::ReserveTcp();
     const auto server_port = server_reservation.port;
     const auto client_port = client_reservation.Port();
@@ -104,9 +104,8 @@ TEST_P(Ss2022TcpReplay, RejectsCapturedRequestAndAcceptsFreshSaltWithoutBanningC
     config["limits"]["ipBan"] = {
         {"enabled", true}, {"failureLimit", 1}, {"windowSeconds", 60}, {"banSeconds", 180}};
     WriteJson(server_dir, "config.json", config);
-    server_reservation.ReleaseUdp();
     auto server = Start(server_dir);
-    server->WaitForLog("server started");
+    server->WaitForServerStart();
 
     const auto user_key = Key(cipher.key_size, static_cast<uint8_t>(cipher.selected));
     Configure(client_dir, Inbound(client_port), {{"protocol", "shadowsocks"},
@@ -114,7 +113,7 @@ TEST_P(Ss2022TcpReplay, RejectsCapturedRequestAndAcceptsFreshSaltWithoutBanningC
             {"method", cipher.method},
             {"password", cipher.identity ? identity_key + ':' + user_key : user_key}}}});
     auto client = Start(client_dir);
-    client->WaitForLog("server started");
+    client->WaitForServerStart();
 
     std::string captured;
     {

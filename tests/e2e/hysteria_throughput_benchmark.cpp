@@ -373,7 +373,7 @@ TEST_P(HysteriaThroughputBenchmark, VerifiedTcpTransfer) {
     const auto deadline = Clock::now() + 150s;
     TempDir root;
     TcpTarget target(payload, workload.upload, streams);
-    auto reservation = Socket::BindUdp();
+    auto reservation = Socket::ReserveUdp();
     const auto port = reservation.Port();
     auto inbound = quic::HysteriaInbound(port);
     // Do not inherit the fixture's 100 Mbit/s cap when studying throughput.
@@ -385,7 +385,6 @@ TEST_P(HysteriaThroughputBenchmark, VerifiedTcpTransfer) {
         {"timeouts", {{"handshake", 10}, {"connIdle", IdleTimeout.count()},
             {"write", 120}, {"uplinkOnly", 10}, {"downlinkOnly", 10}}},
         {"log", {{"logDir", (root.Path() / "logs").string()}}}});
-    reservation.Close();
 
     // There is exactly one child process and no other child is reaped here.
     // The difference is daemon-only CPU over its COMPLETE lifetime, not the

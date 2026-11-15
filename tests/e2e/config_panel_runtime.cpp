@@ -115,7 +115,7 @@ TEST(RuntimeExit, StartupFailureRollsBackEarlierTcpAndUdpListeners) {
     reservation.tcp.Close();
     reservation.udp.Close();
     auto child = Start(directory.Path());
-    EXPECT_EQ(child->Wait(10s), 1) << ReadFile(child->LogPath());
+    EXPECT_EQ(child->Wait(), 1) << ReadFile(child->LogPath());
     ExpectPortsReleased(port, reservation.address);
 }
 TEST(RuntimeExit, SigtermJoinsPendingTcpUdpAndHangingPanelOperations) {
@@ -134,14 +134,14 @@ TEST(RuntimeExit, SigtermJoinsPendingTcpUdpAndHangingPanelOperations) {
     reservation.tcp.Close();
     reservation.udp.Close();
     auto child = Start(directory.Path());
-    child->WaitForLog("server started");
+    child->WaitForServerStart();
     Until([&] { return connected.load(); }, 8s);
     auto held = Socket::Connect(port, reservation.address);
     held.Write("z");
     auto udp = Socket::BindUdp();
     udp.SendTo("z", port, reservation.address);
     EXPECT_THROW(Socket::BindUdp(port, reservation.address), std::exception);
-    EXPECT_EQ(child->Stop(10s), 0);
+    EXPECT_EQ(child->Stop(), 0);
     peer.Join();
     EXPECT_TRUE(closed.load());
     EXPECT_TRUE(ReadClosed(held, 2s));
@@ -165,12 +165,12 @@ TEST_P(TestMode, ExplicitAndImplicitListenerOwnership) {
     if (mode != "implicit") args.push_back("--test");
     Child child(args, directory.Path() / "child.log", directory.Path());
     if (mode == "coexist" || mode == "implicit") {
-        child.WaitForLog("server started");
+        child.WaitForServerStart();
         EXPECT_TRUE(Listening(10086));
         if (mode == "coexist") EXPECT_TRUE(Listening(port));
-        EXPECT_EQ(child.Stop(10s), 0);
+        EXPECT_EQ(child.Stop(), 0);
     } else {
-        EXPECT_EQ(child.Wait(10s), 1) << ReadFile(child.LogPath());
+        EXPECT_EQ(child.Wait(), 1) << ReadFile(child.LogPath());
         EXPECT_FALSE(Listening(port));
     }
 }
@@ -184,6 +184,7 @@ TEST_P(PanelRuntime, RequestLifecycleAndListenerOwnership) {
     PanelHttpFixture fixture(mode);
     ASSERT_TRUE(fixture.WriteConfig(directory.Path()));
     auto child = Start(directory.Path());
+    child->WaitForServerStart();
     const bool collision = mode == Mode::Collision || mode == Mode::CollisionRace || mode == Mode::StaticCollision;
     if (collision) {
         const auto port = fixture.NodePort();
@@ -206,7 +207,7 @@ TEST_P(PanelRuntime, RequestLifecycleAndListenerOwnership) {
             "owner=replay-panel/" + std::to_string(3 - loser) + " port=" + std::to_string(port);
         Until([&] { return Logs(directory.Path() / "logs").find(expected) != std::string::npos; }, 1s);
         EXPECT_TRUE(Listening(port, fixture.ListenAddress()));
-        EXPECT_EQ(child->Stop(10s), 0);
+        EXPECT_EQ(child->Stop(), 0);
         EXPECT_EQ(Events(child->LogPath(), "Panel configuration ready:", loser), 0u);
         return;
     }
@@ -222,7 +223,7 @@ TEST_P(PanelRuntime, RequestLifecycleAndListenerOwnership) {
         EXPECT_TRUE(Listening(node, addr)); EXPECT_TRUE(Listening(companion, addr));
         EXPECT_TRUE(fixture.WaitForUserRequests(3));
         EXPECT_TRUE(Listening(node, addr)); EXPECT_TRUE(Listening(companion, addr));
-        EXPECT_EQ(child->Stop(10s), 0);
+        EXPECT_EQ(child->Stop(), 0);
         return;
     }
     ASSERT_TRUE(fixture.WaitForPost());
@@ -232,7 +233,7 @@ TEST_P(PanelRuntime, RequestLifecycleAndListenerOwnership) {
         Until([&] { return Events(child->LogPath(), "Panel status:", 1) >= 2; }, 70s);
         EXPECT_TRUE(fixture.RequestPending());
     } else std::this_thread::sleep_for(500ms);
-    EXPECT_EQ(child->Stop(10s), 0);
+    EXPECT_EQ(child->Stop(), 0);
     if (mode == Mode::Heartbeat) EXPECT_TRUE(fixture.WaitForClientClose());
     const auto posts = fixture.Posts();
     ASSERT_EQ(posts.size(), 1u);

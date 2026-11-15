@@ -39,7 +39,7 @@ inline void Config(const std::filesystem::path& root, Json inbounds, Json outbou
 inline Json Direct() { return {{"tag", "direct"}, {"protocol", "freedom"}}; }
 inline std::unique_ptr<Child> Start(const std::filesystem::path& root) {
     auto child = std::make_unique<Child>(std::vector<std::string>{Binary().string(), "--config-dir", root.string()}, root / "child.log");
-    child->WaitForLog("server started");
+    child->WaitForServerStart();
     Require(child->Running(), "cnode exited at startup");
     return child;
 }

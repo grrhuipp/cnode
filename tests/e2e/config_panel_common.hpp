@@ -237,7 +237,8 @@ inline void Reply(Socket& socket, int status, std::string_view body, std::string
 }
 inline void PanelConfig(const std::filesystem::path& root, uint16_t port, std::string_view name,
                         bool mixed = false) {
-    Json config = {{"workers", 2}, {"log", {{"loglevel", "WARNING"}, {"logDir", (root / "logs").string()}}},
+    // INFO: the fixtures wait for the start marker, which cnode logs at that level.
+    Json config = {{"workers", 2}, {"log", {{"loglevel", "INFO"}, {"logDir", (root / "logs").string()}}},
         {"panels", Json::array({{{"name", name}, {"type", "V2Board"},
             {"apiHost", "http://127.0.0.1:" + std::to_string(port)}, {"key", "fixture-secret-must-not-persist"},
             {"nodeIDs", {1}}, {"nodeType", "VLESS"}, {"listenIP", "127.0.0.1"},

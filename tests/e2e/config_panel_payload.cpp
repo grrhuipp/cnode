@@ -134,7 +134,7 @@ TEST_P(InitialPayload, PreservesAuthenticationTargetServerFirstGreetingAndByteOr
         }
     });
     auto child = Start(directory.Path());
-    child->WaitForLog("server started");
+    child->WaitForServerStart();
     auto client = Socket::Connect(port);
     client.Write(VlessRequest(protocol == "freedom" ? backend.Port() : 443, prefix, 1, "127.0.0.1", UserA));
     EXPECT_EQ(client.ReadExact(2 + Banner.size()), std::string("\0\0", 2) + std::string(Banner));

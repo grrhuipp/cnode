@@ -31,10 +31,10 @@ TEST_P(VlessEmptyDatagrams, TwoRealNodesPreserveEmptyMessagesTargetsAndAssociati
                        {"id", UserId}, {"encryption", "none"}, {"packetEncoding", encoding}}}});
     Child exit({Binary().string(), "--config-dir", exit_root.Path().string()},
                exit_root.Path() / "child.log");
-    exit.WaitForLog("server started");
+    exit.WaitForServerStart();
     Child entry({Binary().string(), "--config-dir", entry_root.Path().string()},
                 entry_root.Path() / "child.log");
-    entry.WaitForLog("server started");
+    entry.WaitForServerStart();
 
     Client first(entry_port.port, first_target.Port(), false);
     Client second(entry_port.port, second_target.Port(), false, true, "127.0.0.2");

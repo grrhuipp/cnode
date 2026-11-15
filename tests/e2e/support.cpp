@@ -427,7 +427,7 @@ int Child::Stop(Milliseconds timeout) {
     while (Running() && Clock::now() < deadline)
         std::this_thread::sleep_until(std::min(deadline, Clock::now() + 10ms));
     Signal(SIGKILL);
-    return Wait(5s);
+    return Wait();
 }
 
 void Child::WaitForLog(std::string_view text, Milliseconds timeout) {
@@ -437,6 +437,8 @@ void Child::WaitForLog(std::string_view text, Milliseconds timeout) {
         return false;
     }, timeout);
 }
+
+void Child::WaitForServerStart() { WaitForLog("server started", StorageStallBound); }
 
 Socket::Socket(int fd) : fd_(fd) {
     if (fd_ < 0) throw std::invalid_argument("invalid socket descriptor");
@@ -502,6 +504,28 @@ Socket Socket::BindUdp(uint16_t port, std::string_view address) {
     auto socket = NewSocket(endpoint.family, SOCK_DGRAM);
     if (::bind(socket.Fd(), endpoint.Get(), endpoint.size) < 0) SystemError("bind UDP");
     return socket;
+}
+
+Socket Socket::ReserveUdp(uint16_t port, std::string_view address) {
+    // Bind exclusively first: a UDP bind(0) made with SO_REUSEADDR already set
+    // may be handed a port another SO_REUSEADDR socket holds.
+    auto socket = BindUdp(port, address);
+    const int one = 1;
+    if (::setsockopt(socket.Fd(), SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0) SystemError("SO_REUSEADDR");
+    const auto self = NumericAddress(address, socket.Port());
+    if (::connect(socket.Fd(), self.Get(), self.size) < 0) SystemError("connect UDP reservation");
+    return socket;
+}
+
+PortReservation::PortReservation(bool with_udp) {
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        tcp = Socket::ReserveTcp();
+        port = tcp.Port();
+        if (!with_udp) return;
+        try { udp = Socket::ReserveUdp(port); return; }
+        catch (const std::exception&) { tcp.Close(); }
+    }
+    throw std::runtime_error("no free TCP/UDP port");
 }
 
 Socket Socket::Accept(Milliseconds timeout) const {

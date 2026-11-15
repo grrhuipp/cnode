@@ -121,6 +121,7 @@ TEST(PanelUserSync, FailuresPreserveCommittedUsersAndValidatorsThenRevokeAndReco
     SyncPanel panel(node, blocked.Port());
     PanelConfig(directory.Path(), panel.Port(), "user-sync", true);
     auto child = Start(directory.Path());
+    child->WaitForServerStart();
     panel.WaitCycles(*child);
     CheckUsers(node, echo.Port(), {UserA}, {UserB});
     const auto ready = panel.Headers("ready", false);

@@ -151,24 +151,6 @@ inline void Reply(const Socket& socket, const Datagram& peer, std::string_view p
     Require(sendto(socket.Fd(), payload.data(), payload.size(), 0,
                    reinterpret_cast<const sockaddr*>(&peer.address), peer.address_size) == static_cast<ssize_t>(payload.size()), "sendto failed");
 }
-// The TCP reservation stays held until destruction: every user starts cnode,
-// whose SO_REUSEADDR listener binds beside it. Only the UDP guard is released.
-struct PortReservation {
-    Socket tcp;
-    Socket udp;
-    uint16_t port = 0;
-    explicit PortReservation(bool native = false) {
-        for (int attempt = 0; attempt < 64; ++attempt) {
-            tcp = Socket::ReserveTcp();
-            port = tcp.Port();
-            if (!native) return;
-            try { udp = Socket::BindUdp(port); return; }
-            catch (const std::exception&) { tcp.Close(); }
-        }
-        throw std::runtime_error("no free TCP/UDP port");
-    }
-    void ReleaseUdp() { udp.Close(); }
-};
 
 class Client {
 public:

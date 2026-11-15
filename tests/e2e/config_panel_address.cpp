@@ -105,7 +105,7 @@ TEST_P(DnsEndpoints, NormalizesEndpointFallsBackAndSharesCacheAcrossWorkers) {
         }
     });
     auto child = Start(directory.Path());
-    child->WaitForLog("server started");
+    child->WaitForServerStart();
     const auto domain = mode + ".endpoint.test";
     std::array<size_t, 2> query_counts{};
     for (size_t i = 0; i < query_counts.size(); ++i) {
@@ -155,7 +155,7 @@ TEST_P(DnsAnswerTtl, RequeriesZeroTtlBeforeDialingTheNextDestination) {
         }
     });
     auto child = Start(directory.Path());
-    child->WaitForLog("server started");
+    child->WaitForServerStart();
     for (size_t i = 0; i < 2; ++i) {
         resolver.SetLastOctet(static_cast<uint8_t>(i + 1));
         auto socket = Socket::Connect(port);
@@ -218,7 +218,7 @@ TEST_P(AbsoluteDomainInbound, SegmentedRaw254ByteNameAuthenticatesResolvesAndFor
     });
     front.tcp.Close();
     auto child = Start(directory.Path());
-    child->WaitForLog("server started");
+    child->WaitForServerStart();
     TlsContext tls(false);
     for (size_t i = 0; i < names.size(); ++i) {
         SCOPED_TRACE("raw domain length: " + std::to_string(names[i].size()));
@@ -286,7 +286,7 @@ TEST_P(IpLiterals, ConsumesWholeAddressWithoutEndpointOrCStringCoercion) {
         socket.Write(Banner);
     });
     auto child = Start(directory.Path());
-    child->WaitForLog("server started");
+    child->WaitForServerStart();
     auto socket = Socket::Connect(port);
     socket.Write(DomainRequest(backend.Port(), host));
     if (accepted) {

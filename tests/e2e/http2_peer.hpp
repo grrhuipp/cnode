@@ -95,10 +95,10 @@ inline void PatchConfig(const std::filesystem::path& root, const std::function<v
     WriteJson(root, "config.json", value);
 }
 class Node {
-    Socket reservation_ = Socket::ReserveTcp();
+    PortReservation reservation_{true};
 public:
     TempDir root;
-    uint16_t port = reservation_.Port();
+    uint16_t port = reservation_.port;
     std::unique_ptr<Child> child;
     void Setup(std::string_view network, bool tls, std::string_view mode = "stream-one", unsigned workers = 1) {
         Configure(root.Path(), Inbound(port, network, tls, mode), Freedom(), workers);
@@ -110,7 +110,7 @@ public:
         child =
             std::make_unique<Child>(std::vector<std::string>{Binary().string(), "--config-dir", root.Path().string()},
                                     root.Path() / "child.log");
-        child->WaitForLog("server started");
+        child->WaitForServerStart();
     }
 };
 inline Socket ConnectFrom(uint16_t port, std::string_view source) {

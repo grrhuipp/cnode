@@ -43,7 +43,7 @@ TEST_P(ConfigSources, RejectsInvalidSourcesAndStartsValidSources) {
     }
     auto child = Start(directory.Path());
     if (value.starts) {
-        child->WaitForLog("server started");
+        child->WaitForServerStart();
         EXPECT_TRUE(child->Running());
         EXPECT_EQ(child->Stop(), 0);
     } else {
@@ -88,7 +88,7 @@ TEST_P(StaticRouting, DefaultDirectForcedOutboundAndOptInRouting) {
     });
     Child child({Binary().string(), mixed ? "--config-file" : "--config-dir",
                  mixed ? (directory.Path() / "config.json").string() : directory.Path().string()}, directory.Path() / "child.log", directory.Path());
-    child.WaitForLog("server started");
+    child.WaitForServerStart();
     EXPECT_TRUE(Echo(direct_port, backend.Port()));
     EXPECT_TRUE(Echo(forced_port, backend.Port()));
     peer.Join();
@@ -137,7 +137,7 @@ TEST(ConfigRouting, ValidatesKnownAndIgnoresUnknownInboundRoutingControls) {
         auto reservation = Socket::ReserveTcp();
         write_config(directory.Path(), reservation.Port(), override);
         auto child = Start(directory.Path());
-        child->WaitForLog("server started");
+        child->WaitForServerStart();
         EXPECT_EQ(child->Stop(), 0);
     }
 }

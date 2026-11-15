@@ -26,11 +26,9 @@ TEST_P(AnyTlsReference, FinAndRecoveryReuseOnePhysicalConnection) {
     if (reference_client) {
         Configure(root.Path(), {{"protocol", "anytls"}, {"listen", "127.0.0.1"}, {"port", server_port},
             {"settings", {{"clients", Json::array({{{"password", "secret"}}})}}}, {"streamSettings", TlsSettings(true)}}, Freedom());
-        front_reservation.Close();
         reference = std::make_unique<Child>(std::vector<std::string>{CNODE_REFERENCE_ANYTLS_CLIENT, "-l", Address(front_port),
             "-s", Address(bridge.Port()), "-p", "secret", "-m", "1"}, root.Path() / "reference.log");
     } else {
-        server_reservation.Close();
         reference = std::make_unique<Child>(std::vector<std::string>{CNODE_REFERENCE_ANYTLS_SERVER, "-l", Address(server_port),
             "-p", "secret"}, root.Path() / "reference.log");
         Configure(root.Path(), VlessInbound(front_port), {{"protocol", "anytls"}, {"settings", {
