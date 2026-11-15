@@ -120,7 +120,7 @@ net::awaitable<bool> BaseWsStream::EnsurePendingData() {
             ProtocolFailure("WebSocket truncated without Close");
         co_return false;
     }
-    pending_data_.AppendAndCoalesce(std::move(next));
+    next.MoveTo(pending_data_);
     co_return HasPendingBytes();
 }
 
@@ -467,14 +467,6 @@ net::awaitable<void> BaseWsStream::WriteBuffers(
     size_t size = 0;
     for (const auto& buffer : buffers) AddPayloadSize(size, buffer.size());
     return WriteDataFrame(buffers, size);
-}
-
-net::awaitable<size_t> BaseWsStream::AsyncWrite(net::const_buffer buffer) {
-    CheckWritable();
-    if (buffer.size() > kMaxFrameSize)
-        throw IoSystemError(io_error::message_size, "WebSocket frame exceeds payload budget");
-    if (buffer.size() != 0) co_await WriteDataFrame({&buffer, 1}, buffer.size());
-    co_return buffer.size();
 }
 
 net::awaitable<void> BaseWsStream::WriteMultiBuffer(common::MultiBuffer buffers) {

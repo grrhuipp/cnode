@@ -104,13 +104,13 @@ private:
 };
 
 // Waits on a frame-local channel until signalled or `cancellation` fires.
-struct ChannelWait final : transport::CancellationSubscription {
+struct ChannelWait final : common::CancellationSubscription {
     explicit ChannelWait(common::SignalChannel& wake) noexcept : wake(wake) {}
     common::SignalChannel& wake;
     bool cancelled = false;
 
 private:
-    void OnCancellation(transport::Cancellation) noexcept override {
+    void OnCancellation(common::Cancellation) noexcept override {
         cancelled = true;
         (void)wake.try_send(IoErrorCode{});
     }
@@ -131,7 +131,7 @@ public:
                 const XudpKey& key, XudpRelay* relay, XudpSessionTable& table);
     ~XudpSession() noexcept override;
 
-    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+    common::CancellationSource& Cancellation() noexcept override { return cancellation_; }
     [[nodiscard]] bool Closed() const noexcept { return closed_; }
 
     // Starts the dispatch, owned by the Worker's flow table.
@@ -157,7 +157,7 @@ public:
     // flow queue: the wait holds back its Mux connection. False once the
     // flow closed or `carrier` (the sub-session's) was cancelled.
     [[nodiscard]] net::awaitable<bool> AwaitUplinkRoom(
-        const common::MultiBuffer& datagram, transport::CancellationSource& carrier);
+        const common::MultiBuffer& datagram, common::CancellationSource& carrier);
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override;
@@ -199,7 +199,7 @@ private:
     common::SignalChannel room_signal_;
     // Woken when the attached sub-session may take a held-back reply.
     common::SignalChannel reply_room_signal_;
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
     DatagramQueue uplink_;
     // Replies held while no sub-session is attached.
     DatagramQueue parked_;
@@ -233,10 +233,10 @@ public:
     }
 
     void Spawn(net::any_io_executor executor, net::awaitable<void> task,
-               transport::CancellationSource& cancellation) {
+               common::CancellationSource& cancellation) {
         if (stopping_) throw IoSystemError(io_error::operation_aborted);
         if (!tasks_) tasks_.emplace(std::move(executor));
-        tasks_->Tasks().Spawn(std::move(task), &cancellation);
+        tasks_->Spawn(std::move(task), &cancellation);
     }
 
     void RequestStop() noexcept {
@@ -406,7 +406,7 @@ void XudpSession::DetachRemote(uint32_t from, uint32_t slot, uint32_t generation
 }
 
 net::awaitable<bool> XudpSession::AwaitUplinkRoom(
-    const common::MultiBuffer& datagram, transport::CancellationSource& carrier) {
+    const common::MultiBuffer& datagram, common::CancellationSource& carrier) {
     ChannelWait watch(room_signal_);
     watch.Resubscribe(carrier);
     while (!closed_ && !watch.cancelled && !uplink_.HasRoom(datagram)) {
@@ -582,7 +582,7 @@ XudpRelay::Attachment XudpRelay::Open(uint32_t owner, uint64_t token, XudpClient
 }
 
 net::awaitable<bool> XudpRelay::AwaitAttached(
-    const Attachment& attachment, transport::CancellationSource& cancellation) {
+    const Attachment& attachment, common::CancellationSource& cancellation) {
     common::SignalChannel wake(endpoint_.Context().get_executor(), 1);
     auto* slot = SlotFor(attachment.slot, attachment.generation);
     if (!slot) co_return false;

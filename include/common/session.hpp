@@ -29,15 +29,13 @@ using ID = uint64_t;
 // xray-core common/session.Inbound 对应的连接入站元数据。
 // 配置标签、协议与安全方式按值保存在 Worker 本地。
 struct Inbound {
-    enum class ClientIpSource : uint8_t { Socket, ProxyProtocol, HttpHeader };
-
     net::ip::address source_addr;
     std::string source_ip;
     uint16_t source_port = 0;
-    ClientIpSource client_ip_source = ClientIpSource::Socket;
+    bool client_ip_from_proxy_protocol = false;
 
     [[nodiscard]] bool HasProxyProtocolClientIP() const noexcept {
-        return client_ip_source == ClientIpSource::ProxyProtocol && !source_ip.empty();
+        return client_ip_from_proxy_protocol && !source_ip.empty();
     }
     std::optional<tcp::endpoint> local_endpoint;
     std::string tag;

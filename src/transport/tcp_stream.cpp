@@ -46,9 +46,9 @@ struct OperationTimeoutScope {
 
 // Explicit cancellation also covers a successful readiness notification that
 // was queued before Cancel. Only the owning Worker touches payload.
-class WriteCompletion final : private transport::CancellationSubscription {
+class WriteCompletion final : private common::CancellationSubscription {
 public:
-    explicit WriteCompletion(transport::CancellationSource& source) noexcept {
+    explicit WriteCompletion(common::CancellationSource& source) noexcept {
         Resubscribe(source);
     }
 
@@ -56,7 +56,7 @@ public:
     bool Cancelled() const noexcept { return cancelled_; }
 
 private:
-    void OnCancellation(transport::Cancellation) noexcept override { cancelled_ = true; }
+    void OnCancellation(common::Cancellation) noexcept override { cancelled_ = true; }
     bool cancelled_ = false;
 };
 
@@ -411,11 +411,6 @@ net::awaitable<void> TcpStream::WriteBuffersFrom(
     } catch (...) { failure = std::current_exception(); }
     co_await net::this_coro::throw_if_cancelled(previous_throw);
     if (failure) std::rethrow_exception(failure);
-}
-net::awaitable<std::size_t> TcpStream::AsyncWrite(net::const_buffer buf) {
-    const size_t size = buf.size();
-    co_await WriteBuffers(std::span<const net::const_buffer>(&buf, 1));
-    co_return size;
 }
 
 void TcpStream::ShutdownRead() {
@@ -872,16 +867,8 @@ bool TcpStream::ConsumeIdleTimeout() noexcept {
     return impl_->timeouts.ConsumeIdleTimeout();
 }
 
-void TcpStream::SetReadTimeout(std::chrono::seconds timeout) {
-    impl_->timeouts.SetReadTimeout(timeout);
-}
-
 void TcpStream::SetWriteTimeout(std::chrono::seconds timeout) {
     impl_->timeouts.SetWriteTimeout(timeout);
-}
-
-bool TcpStream::ConsumeReadTimeout() noexcept {
-    return impl_->timeouts.ConsumeReadTimeout();
 }
 
 bool TcpStream::ConsumeWriteTimeout() noexcept {

@@ -11,7 +11,7 @@
 #include <string_view>
 #include <vector>
 
-// DNS 公开契约：配置、结果与 DNSWorker/DNS 客户端。缓存、上游 UDP/TCP 交换与
+// DNS 公开契约：配置、结果与 DNSWorker。缓存、上游 UDP/TCP 交换与
 // 在途合并是 DNSWorker 私有实现，见 src/app/dns_internal.hpp。
 namespace app {
 
@@ -53,7 +53,8 @@ public:
     DNSWorker(const DNSWorker&) = delete;
     DNSWorker& operator=(const DNSWorker&) = delete;
 
-    net::awaitable<DnsResult> Resolve(std::string domain);
+    // Copies domain at task creation; the caller's view is not retained.
+    net::awaitable<DnsResult> Resolve(std::string_view domain);
     net::awaitable<DnsCacheStats> GetCacheStats();
 
     // Main/control executor only. Both operations are idempotent. AsyncJoin
@@ -65,23 +66,6 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
-};
-
-class DNS final {
-public:
-    // Client only: all resolution state and sockets belong to DNSWorker.
-    explicit DNS(DNSWorker& worker) noexcept : worker_(worker) {}
-
-    DNS(const DNS&) = delete;
-    DNS& operator=(const DNS&) = delete;
-
-    // Copies domain at task creation. The DNSWorker must outlive the task.
-    net::awaitable<DnsResult> Resolve(std::string_view domain) {
-        return worker_.Resolve(std::string(domain));
-    }
-
-private:
-    DNSWorker& worker_;
 };
 
 }  // namespace app

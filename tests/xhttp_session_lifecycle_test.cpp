@@ -31,7 +31,7 @@
 #include <vector>
 
 namespace {
-namespace net = ::net;
+
 using namespace ::transport;
 using namespace std::chrono_literals;
 
@@ -76,7 +76,7 @@ net::awaitable<std::shared_ptr<XHttpPacketUpSession>> GetXHttpPacketSession(
     if (access == XHttpSessionAccess::Open) {
         co_return co_await OpenXHttpDownlinkSession(coordinator, io, session_namespace, session_id);
     }
-    ::transport::CancellationSource request;
+    ::common::CancellationSource request;
     co_return (co_await ResolveXHttpUploadTarget(
         coordinator, io, session_namespace, session_id, access, request)).session;
 }
@@ -137,7 +137,7 @@ net::awaitable<void> BoundedReplayWindow(app::GroupCoordinator& coordinator, net
     EXPECT_FALSE((co_await GetXHttpPacketSession(coordinator, io, "replay", "1024", XHttpSessionAccess::Upload))) << "newest tombstone was evicted";
     // An evicted id is unknown again: its upload waits for a downlink instead
     // of being refused, and the downlink's session then takes it.
-    ::transport::CancellationSource request;
+    ::common::CancellationSource request;
     std::optional<XHttpUploadTarget> oldest;
     net::co_spawn(io, [&]() -> net::awaitable<void> {
         oldest = co_await ResolveXHttpUploadTarget(
@@ -247,6 +247,7 @@ TEST(XhttpSessionLifecycle, UploadResponseDrainPreservesWritesAndJoinsReaderOnCl
     bool drained = false;
     bool wrote = false;
     const std::string later = "second";
+    const net::const_buffer later_buffer = net::buffer(later);
     auto scenario = [&] {
         ASSERT_TRUE(RunUntil(io, [&] { return built; }));
         if (failure) std::rethrow_exception(failure);
@@ -266,10 +267,10 @@ TEST(XhttpSessionLifecycle, UploadResponseDrainPreservesWritesAndJoinsReaderOnCl
         ASSERT_TRUE(RunUntil(io, [&] { return drained; }));
         if (failure) std::rethrow_exception(failure);
         EXPECT_TRUE(upload->IsOpen());
-        net::co_spawn(io, upload->AsyncWrite(net::buffer(later)),
-            [&](std::exception_ptr error, size_t n) {
+        net::co_spawn(io, upload->WriteBuffers({&later_buffer, 1}),
+            [&](std::exception_ptr error) {
                 failure = error;
-                wrote = n == later.size();
+                wrote = !error;
             });
         ASSERT_TRUE(RunUntil(io, [&] { return wrote || failure; }));
         if (failure) std::rethrow_exception(failure);

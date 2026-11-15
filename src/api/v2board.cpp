@@ -14,6 +14,7 @@
 #include <asio/ssl.hpp>
 #include <asio/redirect_error.hpp>
 #include <asio/cancel_after.hpp>
+#include <asio/write.hpp>
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -37,6 +38,14 @@ namespace api {
 namespace ssl = net::ssl;
 
 namespace {
+
+std::string NormalizeV2BoardApiNodeType(std::string_view node_type) {
+    auto lowered = common::LowerAscii(node_type);
+    if (lowered.empty() || lowered == "vmess") {
+        return "v2ray";
+    }
+    return lowered;
+}
 
 constexpr size_t kHttpErrorDetailLimit = 256;
 
@@ -152,8 +161,9 @@ public:
         buffer->Produce(static_cast<uint32_t>(n));
         co_return common::MultiBuffer{std::move(buffer)};
     }
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        return stream.async_write_some(buffer, net::use_awaitable);
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        if (net::buffer_size(buffers) == 0) co_return;
+        co_await net::async_write(stream, buffers, net::use_awaitable);
     }
     void ShutdownRead() override {
         IoErrorCode ec;
@@ -283,7 +293,7 @@ class APIClient final : public API {
 public:
     APIClient(net::io_context& io_context,
               Config config,
-              app::DNS& dns_service);
+              app::DNSWorker& dns_service);
     ~APIClient() override = default;
 
     net::awaitable<NodeInfoFetchResult>
@@ -339,14 +349,14 @@ private:
     std::optional<net::ip::address> literal_address_;
     std::string api_node_type_;
     std::string host_header_;
-    app::DNS& dns_service_;
+    app::DNSWorker& dns_service_;
 
     std::shared_ptr<ssl::context> https_context_;
 };
 
 APIClient::APIClient(net::io_context& io_context,
                      Config config,
-                     app::DNS& dns_service)
+                     app::DNSWorker& dns_service)
     : io_context_(io_context)
     , config_(std::move(config))
     , log_context_{config_.Name, config_.APIHost, config_.NodeID, config_.NodeType}
@@ -368,7 +378,7 @@ APIClient::APIClient(net::io_context& io_context,
     }
     url_parts_ = std::move(*parts);
     literal_address_ = common::ParseLiteral(url_parts_.host);
-    api_node_type_ = common::NormalizeV2BoardApiNodeType(config_.NodeType);
+    api_node_type_ = NormalizeV2BoardApiNodeType(config_.NodeType);
     common::FormatHttpHostHeaderInto(
         host_header_, url_parts_.host, url_parts_.port, url_parts_.use_ssl);
 
@@ -649,42 +659,10 @@ APIClient::ReportUserTraffic(const std::vector<UserTraffic>& data) {
     const int node_id = config_.NodeID;
 
     // V2Board UniProxy push 格式: {user_id: [upload, download], ...}
-    struct AggregatedTraffic {
-        int64_t uid = 0;
-        int64_t up = 0;
-        int64_t down = 0;
-    };
-    std::vector<AggregatedTraffic> items;
-    items.reserve(data.size());
-    for (const auto& t : data) {
-        if (t.UID <= 0 || (t.Upload <= 0 && t.Download <= 0)) {
-            continue;
-        }
-        items.push_back(AggregatedTraffic{
-            .uid = t.UID,
-            .up = std::max<int64_t>(0, t.Upload),
-            .down = std::max<int64_t>(0, t.Download),
-        });
-    }
-    std::sort(items.begin(), items.end(),
-              [](const AggregatedTraffic& a, const AggregatedTraffic& b) {
-                  return a.uid < b.uid;
-              });
-    size_t unique_count = 0;
-    for (const auto& item : items) {
-        if (unique_count > 0 && items[unique_count - 1].uid == item.uid) {
-            auto& prev = items[unique_count - 1];
-            prev.up = (item.up > INT64_MAX - prev.up) ? INT64_MAX : (prev.up + item.up);
-            prev.down = (item.down > INT64_MAX - prev.down) ? INT64_MAX : (prev.down + item.down);
-        } else {
-            items[unique_count++] = item;
-        }
-    }
-    items.resize(unique_count);
-    const size_t reported_users = items.size();
+    const size_t reported_users = data.size();
 
     std::string body_json;
-    body_json.reserve(2 + items.size() * 32);
+    body_json.reserve(2 + data.size() * 32);
     body_json.push_back('{');
     char num_buf[24];
     auto append_int = [&](int64_t val) {
@@ -692,18 +670,17 @@ APIClient::ReportUserTraffic(const std::vector<UserTraffic>& data) {
         (void)ec;
         body_json.append(num_buf, ptr);
     };
-    for (size_t i = 0; i < items.size(); ++i) {
+    for (size_t i = 0; i < data.size(); ++i) {
         if (i != 0) body_json.push_back(',');
         body_json.push_back('"');
-        append_int(items[i].uid);
+        append_int(data[i].UID);
         body_json.append("\":[");
-        append_int(items[i].up);
+        append_int(data[i].Upload);
         body_json.push_back(',');
-        append_int(items[i].down);
+        append_int(data[i].Download);
         body_json.push_back(']');
     }
     body_json.push_back('}');
-    std::vector<AggregatedTraffic>{}.swap(items);
 
     // 路径包含 node_id 和 node_type
     std::string path = std::format("/api/v1/server/UniProxy/push?node_id={}&node_type={}",
@@ -744,7 +721,7 @@ APIClient::ReportNodeOnlineUsers(const std::vector<OnlineUser>& online_users) {
 std::unique_ptr<API> CreatePanelClient(
     net::io_context& io_context,
     Config config,
-    app::DNS& dns_service) {
+    app::DNSWorker& dns_service) {
     return std::make_unique<APIClient>(io_context, std::move(config), dns_service);
 }
 
@@ -1102,9 +1079,8 @@ tl::expected<uint64_t, std::string> ParseOptionalLimit(
     return *limit;
 }
 
-template <typename Object>
 tl::expected<std::string, std::string> ParseOptionalString(
-    Object&& source,
+    infra::object& source,
     std::string_view field,
     size_t user_index) {
     auto* value = source.if_contains(field);
@@ -1117,36 +1093,12 @@ tl::expected<std::string, std::string> ParseOptionalString(
         return tl::unexpected(std::format(
             "users[{}].{} contains control characters", user_index, field));
     }
-    if constexpr (!std::is_const_v<std::remove_reference_t<Object>> &&
-                  !std::is_lvalue_reference_v<Object>) {
-        return std::move(value->as_string());
-    } else {
-        return std::string(value->as_string());
-    }
+    return std::move(value->as_string());
 }
 
-bool IsValidDevice(const OnlineUser& device) noexcept {
-    return device.UID > 0 && !device.IP.empty();
-}
+}  // namespace
 
-bool DeviceLess(const OnlineUser& lhs, const OnlineUser& rhs) noexcept {
-    if (lhs.UID != rhs.UID) return lhs.UID < rhs.UID;
-    return lhs.IP < rhs.IP;
-}
-
-bool IsCanonicalDeviceList(std::span<const OnlineUser> devices) noexcept {
-    for (size_t i = 0; i < devices.size(); ++i) {
-        if (!IsValidDevice(devices[i])) {
-            return false;
-        }
-        if (i > 0 && !DeviceLess(devices[i - 1], devices[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-
-OnlineReportPayload BuildFromCanonicalDevices(
+OnlineReportPayload BuildOnlineReportPayload(
     std::span<const OnlineUser> devices,
     int node_id) {
     OnlineReportPayload result;
@@ -1196,8 +1148,6 @@ OnlineReportPayload BuildFromCanonicalDevices(
     result.alive_json.push_back('}');
     return result;
 }
-
-}  // namespace
 
 tl::expected<NodeInfo, std::string> ParseNodeInfo(
     const infra::object& source,
@@ -1497,14 +1447,8 @@ tl::expected<std::vector<common::DetectRule>, std::string> ExtractBlockDetectRul
     return rules;
 }
 
-namespace {
-
-template <typename Object>
 tl::expected<std::vector<UserInfo>, std::string>
-ParseUserListImpl(Object&& source) {
-    constexpr bool kCanConsume =
-        !std::is_const_v<std::remove_reference_t<Object>> &&
-        !std::is_lvalue_reference_v<Object>;
+ParseUserList(infra::object&& source) {
     auto* users_value = source.if_contains("users");
     if (!users_value) {
         return tl::unexpected("users is required");
@@ -1549,19 +1493,9 @@ ParseUserListImpl(Object&& source) {
             return tl::unexpected(std::format(
                 "users[{}].uuid contains control characters", i));
         }
-        if constexpr (kCanConsume) {
-            user.UUID = std::move(uuid->as_string());
-        } else {
-            user.UUID = std::string(uuid->as_string());
-        }
+        user.UUID = std::move(uuid->as_string());
 
-        auto flow = [&]() {
-            if constexpr (kCanConsume) {
-                return ParseOptionalString(std::move(source_user), "flow", i);
-            } else {
-                return ParseOptionalString(source_user, "flow", i);
-            }
-        }();
+        auto flow = ParseOptionalString(source_user, "flow", i);
         if (!flow) return tl::unexpected(std::move(flow.error()));
         user.Flow = common::LowerAscii(std::move(*flow));
 
@@ -1587,58 +1521,13 @@ ParseUserListImpl(Object&& source) {
         }
         user.DeviceLimit = static_cast<uint32_t>(*device_limit);
 
-        auto email = [&]() {
-            if constexpr (kCanConsume) {
-                return ParseOptionalString(std::move(source_user), "email", i);
-            } else {
-                return ParseOptionalString(source_user, "email", i);
-            }
-        }();
+        auto email = ParseOptionalString(source_user, "email", i);
         if (!email) return tl::unexpected(std::move(email.error()));
         user.Email = std::move(*email);
-        if constexpr (kCanConsume) {
-            user_value = infra::value{};
-        }
+        user_value = infra::value{};
         users.push_back(std::move(user));
     }
     return users;
-}
-
-}  // namespace
-
-tl::expected<std::vector<UserInfo>, std::string>
-ParseUserList(const infra::object& source) {
-    return ParseUserListImpl(source);
-}
-
-tl::expected<std::vector<UserInfo>, std::string>
-ParseUserList(infra::object&& source) {
-    return ParseUserListImpl(std::move(source));
-}
-
-OnlineReportPayload BuildOnlineReportPayload(
-    std::span<const OnlineUser> online_devices,
-    int node_id) {
-    if (IsCanonicalDeviceList(online_devices)) {
-        return BuildFromCanonicalDevices(online_devices, node_id);
-    }
-
-    std::vector<OnlineUser> valid;
-    valid.reserve(online_devices.size());
-    for (const auto& device : online_devices) {
-        if (IsValidDevice(device)) {
-            valid.push_back(device);
-        }
-    }
-
-    std::ranges::sort(valid, DeviceLess);
-    const auto duplicate_tail = std::ranges::unique(
-        valid, [](const OnlineUser& lhs, const OnlineUser& rhs) {
-            return lhs.UID == rhs.UID && lhs.IP == rhs.IP;
-        });
-    valid.erase(duplicate_tail.begin(), duplicate_tail.end());
-
-    return BuildFromCanonicalDevices(valid, node_id);
 }
 
 }  // namespace api

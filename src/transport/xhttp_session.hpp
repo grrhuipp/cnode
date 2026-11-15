@@ -24,18 +24,14 @@ struct XHttpPacketSessionKeyRef {
     std::string_view session_namespace;
 };
 
-template <typename StringType>
-struct BasicXHttpPacketSessionKey {
-    StringType session_id{};
-    StringType session_namespace{};
+struct XHttpPacketSessionKey {
+    std::string session_id{};
+    std::string session_namespace{};
 
     [[nodiscard]] constexpr operator XHttpPacketSessionKeyRef() const noexcept {
         return {session_id, session_namespace};
     }
 };
-
-using XHttpPacketSessionKey =
-    BasicXHttpPacketSessionKey<std::string>;
 
 struct XHttpPacketSessionKeyHash {
     using is_transparent = void;
@@ -270,12 +266,12 @@ struct XHttpSessionTableEntry;
 
 // Execution-group-local logical XHTTP session joining uploads to one downlink.
 // Queued packets and in-flight uploads share one bounded payload budget.
-class XHttpPacketUpSession final : private transport::CancellationSubscription {
+class XHttpPacketUpSession final : private common::CancellationSubscription {
 public:
     explicit XHttpPacketUpSession(net::io_context& io_context);
     ~XHttpPacketUpSession() noexcept;
 
-    transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
+    common::CancellationSource& Cancellation() noexcept { return cancellation_; }
     [[nodiscard]] net::io_context& IoContext() const noexcept;
     [[nodiscard]] bool Reserve(size_t bytes) noexcept {
         return !closed_ && packet_queue_.Reserve(bytes);
@@ -293,7 +289,7 @@ public:
     // a downlink joins. False when `connection` is cancelled first (its
     // request deadline or close) or the session closes without a downlink.
     [[nodiscard]] net::awaitable<bool> AwaitDownlink(
-        transport::CancellationSource& cancellation);
+        common::CancellationSource& cancellation);
     [[nodiscard]] net::awaitable<bool> AwaitDownlink(AsyncStream& connection) {
         return AwaitDownlink(connection.Cancellation());
     }
@@ -338,7 +334,7 @@ private:
         }
     };
 
-    void OnCancellation(transport::Cancellation cancellation) noexcept override;
+    void OnCancellation(common::Cancellation cancellation) noexcept override;
     void ReleaseAttachedUpload(const std::shared_ptr<AsyncStream>& stream) noexcept;
     void Wake() noexcept;
 
@@ -346,11 +342,11 @@ private:
     common::SignalChannel input_signal_;
     XHttpPacketQueue packet_queue_;
     XHttpUploadStreamSlot stream_input_;
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
     // JoinAttachedUpload's frame-local channel, published only while it runs.
     common::SignalChannel* upload_signal_ = nullptr;
     // Event that AttachDownlink and Close broadcast to AwaitDownlink waiters.
-    transport::CancellationSource downlink_ready_;
+    common::CancellationSource downlink_ready_;
     size_t upload_reads_ = 0;
     bool downlink_attached_ = false;
     bool input_closed_ = false;
@@ -450,12 +446,12 @@ struct XHttpUploadTarget {
     std::string_view session_namespace,
     std::string_view session_id,
     XHttpSessionAccess access,
-    CancellationSource& cancellation);
+    common::CancellationSource& cancellation);
 
 // One packet-up body bound for its session. On the session's Worker it reads
 // under the session payload budget; on another under the relay budget toward
 // the session's Worker, waiting while that budget is spent.
-class XHttpPacketUpload final : private CancellationSubscription {
+class XHttpPacketUpload final : private common::CancellationSubscription {
 public:
     // Throws no_buffer_space when the local session admits no more uploads.
     XHttpPacketUpload(const XHttpUploadTarget& target, AsyncStream& stream);
@@ -467,7 +463,7 @@ public:
     net::awaitable<XHttpCommit> Commit(uint64_t seq, common::MultiBuffer payload);
 
 private:
-    void OnCancellation(Cancellation cancellation) noexcept override;
+    void OnCancellation(common::Cancellation cancellation) noexcept override;
     // Adds `bytes` to this upload's reservation; false when the local session
     // budget is spent. A remote reservation waits instead.
     net::awaitable<bool> Reserve(size_t bytes);

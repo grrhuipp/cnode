@@ -17,7 +17,7 @@
 #include <string_view>
 
 namespace {
-namespace net = ::net;
+
 using Response = ::api::PanelHttpResponse;
 using ::api::ExecutePanelHttpRequest;
 using namespace std::chrono_literals;
@@ -176,7 +176,6 @@ TEST_P(PanelHttpConsumer, PreservesResponseBoundariesAndValidatorIdentity) {
     ::app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 53}};
     ::app::DNSWorker resolver(io, dns_config, 16);
-    ::app::DNS dns(resolver);
     tcp::acceptor acceptor(io, {net::ip::address_v4::loopback(), 0});
     ::api::Config config;
     config.Name = "http-consumer";
@@ -185,7 +184,7 @@ TEST_P(PanelHttpConsumer, PreservesResponseBoundariesAndValidatorIdentity) {
     config.NodeType = "vless";
     config.APIHost = "http://127.0.0.1:" + std::to_string(acceptor.local_endpoint().port());
     config.RequestTimeout = 2s;
-    auto client = ::api::CreatePanelClient(io, std::move(config), dns);
+    auto client = ::api::CreatePanelClient(io, std::move(config), resolver);
     std::exception_ptr server_failure, client_failure;
     bool served = false, completed = false;
     api::UserListFetchResult result;

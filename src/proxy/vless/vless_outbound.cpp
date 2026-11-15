@@ -71,23 +71,6 @@ public:
         ::common::MultiBufferBatch first_payload) override;
 
 private:
-    ::net::awaitable<::proxy::OutboundProcessResult> ProcessPlain(
-        ::common::Context& ctx,
-        ::transport::Link inbound,
-        ::transport::OutboundDialer& dialer,
-        const ::infra::TimeoutsConfig& timeouts,
-        ::app::StatsShard& stats,
-        const ::app::RelayConfig& relay_config,
-        ::common::MultiBufferBatch first_payload);
-    ::net::awaitable<::proxy::OutboundProcessResult> ProcessEncrypted(
-        ::common::Context& ctx,
-        ::transport::Link inbound,
-        ::transport::OutboundDialer& dialer,
-        const ::infra::TimeoutsConfig& timeouts,
-        ::app::StatsShard& stats,
-        const ::app::RelayConfig& relay_config,
-        ::common::MultiBufferBatch first_payload);
-
     std::shared_ptr<const ::proxy::VlessOutboundConfig> config_;
     std::optional<::proxy::VlessEncryptionClientTicketCache> encryption_tickets_;
 };
@@ -515,48 +498,6 @@ struct VlessClientTicketLease {
         forwarded);
 }
 
-net::awaitable<tl::expected<std::unique_ptr<transport::AsyncStream>, common::ErrorCode>>
-DialAndSendPlainVlessHandshake(
-    common::Context& ctx,
-    transport::OutboundDialer& dialer,
-    const VlessOutboundConfig& config,
-    bool is_udp,
-    bool use_vision,
-    bool use_xudp,
-    bool use_packet_addr,
-    std::chrono::seconds handshake_timeout) {
-    auto dialed = co_await dialer.Dial(ctx, config.server);
-    if (!dialed) {
-        co_return tl::unexpected(dialed.error());
-    }
-    auto stream = std::move(*dialed);
-    stream->SetIdleTimeout(handshake_timeout);
-    transport::PhaseDeadlineToken outbound_protocol_deadline =
-        stream->StartPhaseDeadline(handshake_timeout);
-
-    std::array<uint8_t, ::proxy::kVlessMaxRequestHeaderSize> header_buf{};
-    const size_t header_len = EncodeOutboundVlessRequestHeader(
-        config, ctx.outbound.target, is_udp, use_vision, use_xudp,
-        use_packet_addr, dialer.ForwardedMetadata(ctx), header_buf);
-    if (header_len == 0) {
-        stream->CloseAbortive();
-        co_return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
-    }
-    try {
-        const net::const_buffer header_buffer(header_buf.data(), header_len);
-        co_await stream->WriteBuffers(
-            std::span<const net::const_buffer>{&header_buffer, 1});
-    } catch (...) {
-        OPENSSL_cleanse(header_buf.data(), header_len);
-        const common::ErrorCode classified = proxy::ClassifyOutboundHandshakeException(
-            *stream, outbound_protocol_deadline);
-        stream->CloseAbortive();
-        co_return tl::unexpected(classified);
-    }
-    OPENSSL_cleanse(header_buf.data(), header_len);
-    co_return stream;
-}
-
 net::awaitable<tl::expected<::proxy::VlessActiveIo, common::ErrorCode>>
 SendVlessHandshake(
     transport::AsyncStream& stream,
@@ -711,9 +652,7 @@ VlessOutboundHandler::Process(
     const app::RelayConfig& relay_config,
     common::MultiBufferBatch first_payload) {
     if (!inbound.Valid()) {
-        return []() -> net::awaitable<OutboundProcessResult> {
-            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-        }();
+        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
     }
     if (!config_->flow.empty()) {
         const auto network = ctx.content.network;
@@ -721,66 +660,9 @@ VlessOutboundHandler::Process(
             ctx.outbound.target.port == 443 && !config_->vision_udp443;
         if ((network != common::Network::TCP && network != common::Network::UDP) ||
             rejected_udp443) {
-            return []() -> net::awaitable<OutboundProcessResult> {
-                co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
-            }();
+            co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
         }
     }
-    if (!config_->encryption) {
-        return ProcessPlain(
-            ctx, inbound, dialer, timeouts, stats, relay_config, std::move(first_payload));
-    }
-    return ProcessEncrypted(
-        ctx, inbound, dialer, timeouts, stats, relay_config, std::move(first_payload));
-}
-
-net::awaitable<OutboundProcessResult>
-VlessOutboundHandler::ProcessPlain(
-    common::Context& ctx,
-    transport::Link inbound,
-    transport::OutboundDialer& dialer,
-    const infra::TimeoutsConfig& timeouts,
-    app::StatsShard& stats,
-    const app::RelayConfig& relay_config,
-    common::MultiBufferBatch first_payload) {
-    const bool is_udp = ctx.content.network == common::Network::UDP;
-    const bool use_vision = !config_->flow.empty();
-    const bool use_xudp = is_udp && (config_->packet_xudp || use_vision);
-    const bool use_packet_addr = is_udp && config_->packet_addr && !use_vision;
-
-    std::unique_ptr<transport::AsyncStream> stream;
-    {
-        auto dialed = co_await DialAndSendPlainVlessHandshake(
-            ctx, dialer, *config_, is_udp, use_vision, use_xudp,
-            use_packet_addr, timeouts.HandshakeTimeout());
-        if (!dialed) {
-            co_return tl::unexpected(dialed.error());
-        }
-        stream = std::move(*dialed);
-    }
-    proxy::ApplyOutboundRelayTimeouts(*stream, relay_config);
-    proxy::BufferedStreamReader protocol_reader(*stream);
-    if (is_udp || use_vision) {
-        co_return co_await RelayVlessFramedOutbound(
-            ctx, inbound, dialer, *stream, protocol_reader, *stream,
-            *config_, is_udp, use_vision, use_xudp, use_packet_addr,
-            stats, relay_config, std::move(first_payload));
-    }
-    VlessTcpOutboundEndpoint target_endpoint(*stream, protocol_reader, *stream);
-    co_return co_await app::DoRelayLink(
-        dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-        target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-}
-
-net::awaitable<OutboundProcessResult>
-VlessOutboundHandler::ProcessEncrypted(
-    common::Context& ctx,
-    transport::Link inbound,
-    transport::OutboundDialer& dialer,
-    const infra::TimeoutsConfig& timeouts,
-    app::StatsShard& stats,
-    const app::RelayConfig& relay_config,
-    common::MultiBufferBatch first_payload) {
     const auto& target = ctx.outbound.target;
     std::unique_ptr<transport::AsyncStream> stream;
     {

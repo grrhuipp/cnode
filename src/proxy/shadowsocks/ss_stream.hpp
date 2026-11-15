@@ -50,20 +50,7 @@ public:
         other.ClearHandshakeKeys();
     }
 
-    SsStreamWriter& operator=(SsStreamWriter&& other) noexcept {
-        if (this != &other) {
-            ClearHandshakeKeys();
-            cipher_type_ = other.cipher_type_;
-            key_size_ = other.key_size_;
-            pending_handshake_ = std::move(other.pending_handshake_);
-            write_nonce_ = other.write_nonce_;
-            write_init_ = other.write_init_;
-            write_finished_ = other.write_finished_;
-            stream_ = std::exchange(other.stream_, nullptr);
-            other.ClearHandshakeKeys();
-        }
-        return *this;
-    }
+    SsStreamWriter& operator=(SsStreamWriter&&) = delete;
 
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;

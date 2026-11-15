@@ -9,7 +9,7 @@
 #include "app/inbound_handler.hpp"
 #include "app/request_load.hpp"
 #include "app/stats.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/shadowsocks/ss_udp.hpp"
@@ -51,7 +51,7 @@ struct DatagramScript {
     ::proxy::InboundDatagramOwner owner;
     uint64_t session_id = 0;
     ::common::TargetAddress target;
-    // One-shot: rejects the first PMR allocation after decoding completes, so
+    // One-shot: rejects the first allocation after decoding completes, so
     // the fault lands in the ingress delivery path rather than the decoder.
     bool fail_next_allocation = false;
 };
@@ -176,7 +176,7 @@ protected:
     WorkerCoordinatorFixture coordinator{io_context};
     std::shared_ptr<::app::ConnectionLimiter> limiter =
         ::app::ConnectionLimiter::Acquire({}, coordinator.Get());
-    ::common::UserOnlineTracker online_users{*coordinator.Get()};
+    ::app::UserOnlineTracker online_users{*coordinator.Get()};
     UdpSocketFixtures sockets{io_context};
     UdpReplyPeer large_sink{io_context}, moved_sink{io_context};
     ::app::UdpResourceBudget udp_budget;

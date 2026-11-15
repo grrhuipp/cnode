@@ -26,7 +26,7 @@ namespace {
 
 using ::app::DnsResult;
 using ::app::InflightResolves;
-namespace net = ::net;
+
 using namespace std::chrono_literals;
 
 thread_local size_t fail_size = 0;
@@ -255,8 +255,6 @@ TEST(DnsWorker, ReturnsOwnedAnswersToIndependentCallerExecutors) {
     ::app::DNSWorker worker(main_context, config, 8);
     net::io_context first_io;
     net::io_context second_io;
-    ::app::DNS first(worker);
-    ::app::DNS second(worker);
     std::array<DnsResult, 2> answers;
     std::array<std::exception_ptr, 2> failures;
     size_t completed = 0;
@@ -265,13 +263,13 @@ TEST(DnsWorker, ReturnsOwnedAnswersToIndependentCallerExecutors) {
             if (++completed == 2) main_guard.reset();
         });
     };
-    net::co_spawn(first_io, first.Resolve("192.0.2.1"),
+    net::co_spawn(first_io, worker.Resolve("192.0.2.1"),
                   [&](std::exception_ptr error, DnsResult result) {
                       failures[0] = error;
                       answers[0] = std::move(result);
                       finish();
                   });
-    net::co_spawn(second_io, second.Resolve("192.0.2.2"),
+    net::co_spawn(second_io, worker.Resolve("192.0.2.2"),
                   [&](std::exception_ptr error, DnsResult result) {
                       failures[1] = error;
                       answers[1] = std::move(result);
@@ -299,10 +297,9 @@ TEST(DnsWorker, OwnsDomainBeforeDeferredTaskStarts) {
     ::app::DnsConfig config;
     config.servers = {sink.local_endpoint()};
     ::app::DNSWorker worker(main_context, config, 8);
-    ::app::DNS client(worker);
     std::string domain = "192.0.2.1";
-    auto task = client.Resolve(domain);
-    // The remote facade must capture owned input before the task is scheduled.
+    auto task = worker.Resolve(domain);
+    // Resolve must capture owned input before the task is scheduled.
     // Reusing the caller's storage must not change the submitted DNS request.
     domain.assign("192.0.2.2");
     bool completed = false;
@@ -323,33 +320,6 @@ TEST(DnsWorker, OwnsDomainBeforeDeferredTaskStarts) {
     EXPECT_EQ(answer.addresses.front(), net::ip::make_address("192.0.2.1"));
 }
 
-TEST(DnsWorker, DeferredTaskOutlivesClientFacade) {
-    net::io_context main_context;
-    net::ip::udp::socket sink(main_context, {net::ip::address_v4::loopback(), 0});
-    ::app::DnsConfig config;
-    config.servers = {sink.local_endpoint()};
-    ::app::DNSWorker worker(main_context, config, 8);
-    // The facade must not be captured in a deferred coroutine: the task only
-    // needs its input and the DNSWorker, not this already-destroyed client.
-    auto task = ::app::DNS(worker).Resolve("192.0.2.3");
-    bool completed = false;
-    std::exception_ptr failure;
-    DnsResult answer;
-    net::co_spawn(main_context, std::move(task),
-        [&](std::exception_ptr error, DnsResult result) {
-            failure = error;
-            answer = std::move(result);
-            completed = true;
-        });
-    main_context.run();
-    JoinService(main_context, worker);
-    EXPECT_TRUE(completed);
-    EXPECT_FALSE(failure);
-    EXPECT_TRUE(answer.Ok());
-    ASSERT_EQ(answer.addresses.size(), 1u);
-    EXPECT_EQ(answer.addresses.front(), net::ip::make_address("192.0.2.3"));
-}
-
 TEST(DnsWorker, CancellingCallerStopsWaitingForService) {
     net::io_context caller;
     net::ip::udp::socket sink(caller, {net::ip::address_v4::loopback(), 0});
@@ -357,10 +327,9 @@ TEST(DnsWorker, CancellingCallerStopsWaitingForService) {
     config.servers = {sink.local_endpoint()};
     config.timeout_sec = 2;
     ::app::DNSWorker worker(caller, config, 8);
-    ::app::DNS client(worker);
     net::cancellation_signal signal;
     bool completed = false;
-    net::co_spawn(caller, client.Resolve("cancel-dns-worker.example"),
+    net::co_spawn(caller, worker.Resolve("cancel-dns-worker.example"),
         net::bind_cancellation_slot(signal.slot(),
             [&](std::exception_ptr, DnsResult) { completed = true; }));
     net::steady_timer timer(caller, 50ms);
@@ -383,7 +352,6 @@ TEST_P(DnsWorkerCapacity, FullMailboxRejectsRequestsAndCancellationReturnsSlot) 
     config.servers = {sink.local_endpoint()};
     config.timeout_sec = 2;
     ::app::DNSWorker worker(main_context, config, 1);
-    ::app::DNS client(worker);
     net::cancellation_signal cancel;
     bool owner_done = false;
     bool rejected = false;
@@ -395,7 +363,7 @@ TEST_P(DnsWorkerCapacity, FullMailboxRejectsRequestsAndCancellationReturnsSlot) 
             sink.cancel();
         }
     });
-    net::co_spawn(main_context, client.Resolve("capacity.example"),
+    net::co_spawn(main_context, worker.Resolve("capacity.example"),
         net::bind_cancellation_slot(cancel.slot(),
             [&](std::exception_ptr, DnsResult) { owner_done = true; }));
     // Receiving the first upstream packet proves the only mailbox slot is held.
@@ -418,7 +386,7 @@ TEST_P(DnsWorkerCapacity, FullMailboxRejectsRequestsAndCancellationReturnsSlot) 
                         watchdog.cancel();
                     });
             } else {
-                net::co_spawn(main_context, client.Resolve("192.0.2.4"),
+                net::co_spawn(main_context, worker.Resolve("192.0.2.4"),
                     [&](std::exception_ptr error, DnsResult result) {
                         failure = error;
                         rejected = result.error == ::common::ErrorCode::RESOURCE_EXHAUSTED;
@@ -440,7 +408,7 @@ TEST_P(DnsWorkerCapacity, FullMailboxRejectsRequestsAndCancellationReturnsSlot) 
                 recovered = !error;
             });
     } else {
-        net::co_spawn(main_context, client.Resolve("192.0.2.4"),
+        net::co_spawn(main_context, worker.Resolve("192.0.2.4"),
             [&](std::exception_ptr error, DnsResult result) {
                 recovered = !error && result.Ok();
             });
@@ -526,7 +494,6 @@ TEST(DnsWorker, CrossExecutorStopJoinsUdpQueriesAndCallerCompletions) {
     config.servers = {sink.local_endpoint()};
     config.timeout_sec = 30;
     auto worker = std::make_unique<::app::DNSWorker>(main_context, config, 8);
-    ::app::DNS first(*worker), second(*worker);
     auto guard = net::make_work_guard(main_context);
     std::array<DnsResult, 4> results;
     std::array<std::exception_ptr, 4> errors;
@@ -547,10 +514,10 @@ TEST(DnsWorker, CrossExecutorStopJoinsUdpQueriesAndCallerCompletions) {
             net::post(main_context, [&] { ++completed; finish(); });
         };
     };
-    net::co_spawn(first_io, first.Resolve("first-stop.example"), handler(0));
-    net::co_spawn(first_io, first.Resolve("first-stop.example"), handler(1));
-    net::co_spawn(second_io, second.Resolve("second-stop.example"), handler(2));
-    net::co_spawn(second_io, second.Resolve("second-stop.example"), handler(3));
+    net::co_spawn(first_io, worker->Resolve("first-stop.example"), handler(0));
+    net::co_spawn(first_io, worker->Resolve("first-stop.example"), handler(1));
+    net::co_spawn(second_io, worker->Resolve("second-stop.example"), handler(2));
+    net::co_spawn(second_io, worker->Resolve("second-stop.example"), handler(3));
     size_t packets = 0;
     auto stop = [&]() -> net::awaitable<void> {
         std::array<uint8_t, 512> packet{};

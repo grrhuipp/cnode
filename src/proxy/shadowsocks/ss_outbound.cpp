@@ -273,10 +273,8 @@ PrepareTCPRequestLegacy(const common::TargetAddress& target,
     prepared.write_cipher.emplace(cipher_info.type, write_subkey.data(), cipher_info.key_size);
     OPENSSL_cleanse(write_subkey.data(), write_subkey.size());
     const size_t payload_size = addr_size;
-    const uint8_t len_plain[2] = {
-        static_cast<uint8_t>(payload_size >> 8),
-        static_cast<uint8_t>(payload_size & 0xFF)
-    };
+    uint8_t len_plain[2];
+    common::StoreU16BE(len_plain, static_cast<uint16_t>(payload_size));
 
     if (auto sealed = AppendHandshakeRecord(*prepared.write_cipher, 0, len_plain, *out); !sealed)
         return tl::unexpected(sealed.error());

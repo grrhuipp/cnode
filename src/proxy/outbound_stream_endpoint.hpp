@@ -59,7 +59,6 @@ inline void ApplyOutboundRelayTimeouts(
     transport::AsyncStream& stream,
     const app::RelayConfig& relay_config) {
     stream.SetIdleTimeout(relay_config.idle_timeout);
-    stream.SetReadTimeout(std::chrono::seconds(0));
     stream.SetWriteTimeout(relay_config.write_timeout);
     stream.ClearPhaseDeadline();
 }
@@ -78,7 +77,7 @@ inline void ApplyOutboundDatagramTimeouts(
 // owned by its logical write until DNS and socket I/O have both finished.
 // The transport knows only the resulting IP endpoint, never DNS or routing.
 inline net::awaitable<tl::expected<udp::endpoint, common::ErrorCode>> ResolveUdpEndpoint(
-    app::DNS& dns,
+    app::DNSWorker& dns,
     const common::TargetAddress& target,
     transport::DatagramSocket& socket,
     const transport::DatagramSocket::WriteOperation& write) {
@@ -94,14 +93,14 @@ inline net::awaitable<tl::expected<udp::endpoint, common::ErrorCode>> ResolveUdp
     }
     if (!target.IsDomain()) co_return tl::unexpected(common::ErrorCode::INVALID_ARGUMENT);
 
-    struct CancellationWait final : transport::CancellationSubscription {
+    struct CancellationWait final : common::CancellationSubscription {
         explicit CancellationWait(net::any_io_executor executor)
             : wake(std::move(executor), 1) {}
         common::SignalChannel wake;
         common::ErrorCode reason = common::ErrorCode::OK;
 
     private:
-        void OnCancellation(transport::Cancellation event) noexcept override {
+        void OnCancellation(common::Cancellation event) noexcept override {
             reason = event.reason;
             wake.close();
         }

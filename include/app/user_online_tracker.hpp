@@ -21,7 +21,9 @@
 #include <vector>
 #include <unordered_map>
 
-namespace common {
+namespace app {
+
+class GroupCoordinator;
 
 struct OnlineDevice {
     int64_t user_id = 0;
@@ -36,18 +38,21 @@ struct OnlineDevice {
 
 class UserOnlineSessionGuard;
 
-}  // namespace common
-namespace app {
-
-class GroupCoordinator;
-
-}  // namespace app
-
-namespace common {
+// tag -> user id -> client IP -> live session count. The Worker-local view and
+// the coordinator-owned quota use the same shape.
+using OnlineDeviceCounts = std::unordered_map<
+    std::string,
+    std::unordered_map<uint64_t,
+                       std::unordered_map<std::string,
+                                          uint32_t,
+                                          common::TransparentStringHash,
+                                          common::TransparentStringEq>>,
+    common::TransparentStringHash,
+    common::TransparentStringEq>;
 
 class UserOnlineTracker {
 public:
-    explicit UserOnlineTracker(app::GroupCoordinator& coordinator) noexcept : coordinator_(coordinator) {}
+    explicit UserOnlineTracker(GroupCoordinator& coordinator) noexcept : coordinator_(coordinator) {}
     ~UserOnlineTracker() = default;
     // UserOnlineSessionGuard 借用本对象地址：禁止拷贝，且不声明移动。
     UserOnlineTracker(const UserOnlineTracker&) = delete;
@@ -76,20 +81,9 @@ private:
         void operator()(DeviceReservation* node) const noexcept;
     };
     using ReservationPtr = std::unique_ptr<DeviceReservation, DeviceReservationDeleter>;
-    using DeviceIpMap =
-        std::unordered_map<std::string,
-                           uint32_t,
-                           TransparentStringHash,
-                           TransparentStringEq>;
-    using UserDeviceMap = std::unordered_map<uint64_t, DeviceIpMap>;
-    using TagDeviceMap =
-        std::unordered_map<std::string,
-                           UserDeviceMap,
-                           TransparentStringHash,
-                           TransparentStringEq>;
 
-    app::GroupCoordinator& coordinator_;
-    TagDeviceMap devices_;
+    GroupCoordinator& coordinator_;
+    OnlineDeviceCounts devices_;
 };
 
 class UserOnlineSessionGuard {
@@ -126,5 +120,5 @@ private:
     UserOnlineTracker::ReservationPtr quota_reservation_;
 };
 
-}  // namespace common
+}  // namespace app
 

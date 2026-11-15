@@ -497,7 +497,7 @@ BuildOutboundTransportTarget(OutboundTargetOptions options) {
 }
 
 OutboundDialer::OutboundDialer(net::io_context& io_context,
-                               app::DNS& dns,
+                               app::DNSWorker& dns,
                                const OutboundSenderSettings& sender,
                                std::chrono::seconds timeout)
     : io_context_(io_context)

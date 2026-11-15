@@ -125,7 +125,7 @@ net::awaitable<void> WriteH2FrameBuffers(
         throw;
     }
 }
-[[nodiscard]] HpackBuffer EncodeHttpRequestHeaders(
+[[nodiscard]] HeaderBlockBuffer EncodeHttpRequestHeaders(
     std::string_view authority,
     bool tls,
     const HttpClientRequestView& req) {
@@ -136,7 +136,7 @@ net::awaitable<void> WriteH2FrameBuffers(
         (req.headers ? req.headers->size() : 0) +
         (!req.default_content_type.empty() ? 1 : 0) +
         (!req.default_referer.empty() ? 1 : 0);
-    HpackBuffer h;
+    HeaderBlockBuffer h;
     h.reserve(128 + authority.size() + req_path.size() + method.size() +
               header_count * 32);
 

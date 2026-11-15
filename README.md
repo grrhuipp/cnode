@@ -5,7 +5,7 @@ cnode 是面向 V2Board 面板的高性能 Linux 代理节点服务端。项目�
 ## 文档分工
 
 - `README.md` 面向使用者，说明项目定位、构建、配置、部署、日志格式和对使用者可见的运行语义；本地日志文本格式由本文件[日志格式](#日志格式)一节维护。
-- [`AGENTS.md`](AGENTS.md) 面向代码修改和自动化协作者，记录分层职责、禁止项、审查清单和删除规则。
+- [`AGENTS.md`](AGENTS.md) 面向代码修改和自动化协作者，记录工程准则、架构边界与通用机制。
 - [`docs/local_logging.md`](docs/local_logging.md) 说明本地 error/access/console 通道的语义、级别口径与后端行为。
 
 如果只是部署、配置或了解项目，从本文件开始；如果要改代码、做重构或接入新协议/面板，先读 `AGENTS.md`。
@@ -189,7 +189,6 @@ geosite.dat
 - 所有本地配置键（含侧车、`panels` 和嵌套 `settings`）不区分 ASCII 大小写，示例采用 camelCase：`APIHost`、`apiHost`、`apihost` 等价。大小写归一化后重复的键直接报错。`api_host` 等下划线别名不被识别。
 - 语义上大小写无关的值统一按小写处理：协议、`nodeType`、面板 `type`、`network`、`security`、日志级别、加密方法、`flow`、`decryption`/`encryption`、`packetEncoding`、`auto`、`sendThroughStrategy`、`domainStrategy`、`dnsType`、Blackhole 响应类型、Host/SNI/`serverName`/gRPC `authority`。路径、gRPC `serviceName`、Header 值、标签、邮箱、UUID、密码、密钥与 padding 方案区分大小写。
 - 未知枚举、空值、错误类型拒绝加载；路由引用不存在的 outbound 直接报错。
-- 主配置、日志、DNS、限额、超时、面板、入站、出站和路由对象中的未知键拒绝加载。例如连接空闲超时必须写 `timeouts.connIdle`，`timeouts.idle` 不再被静默忽略。
 - IP 字段必须是完整地址：IPv4 四段无前导零，IPv6 可带数字 scope ID（如 `fe80::1%3`），不接受接口名 scope。单独的 host、listen、sendThrough 字段不接受端口、方括号或尾随内容；方括号只用于 endpoint/URL 中的 IPv6。出站服务器字段可使用 DNS 主机名。
 
 ### config.json
@@ -210,7 +209,7 @@ geosite.dat
 | `limits.ipBan` | 见[认证失败限制](#认证失败限制) |
 | `timeouts.handshake` | 握手阶段期限，秒，默认 60 |
 | `timeouts.dial` | 出站拨号，秒，默认 10 |
-| `timeouts.read`、`timeouts.write` | 读写期限，秒，默认 15 / 30 |
+| `timeouts.write` | 写期限，秒，默认 30 |
 | `timeouts.connIdle` | 连接与 UDP 会话空闲超时，秒，默认 300 |
 | `timeouts.uplinkOnly`、`timeouts.downlinkOnly` | 单方向结束后另一方向的剩余时间，秒，默认 5 / 5 |
 | `panels` | 面板对象数组，见下文 |

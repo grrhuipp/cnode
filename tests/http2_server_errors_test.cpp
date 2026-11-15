@@ -18,7 +18,6 @@
 #include <string_view>
 
 namespace {
-namespace net = ::net;
 using namespace std::chrono_literals;
 
 

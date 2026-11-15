@@ -3,8 +3,9 @@
 #include "common/multi_buffer.hpp"
 #include "common/const_buffer_span.hpp"
 #include "transport/async_stream.hpp"
+#include "transport/header_block_buffer.hpp"
 #include "transport/stream_settings.hpp"
-#include "transport/transport_build_result.hpp"
+#include "transport/transport_stack.hpp"
 
 #include <tl/expected.hpp>
 
@@ -135,85 +136,14 @@ struct Http1Request {
 // TLS 明文绝不进入 TCP 密文队列。
 void MoveReadAhead(AsyncStream& stream, Http1MessageHead& head);
 
-class Http1HeaderBuffer {
-public:
-    static constexpr size_t kInlineCapacity = 512;
+void AppendRequestStart(HeaderBlockBuffer& request,
+                        std::string_view method,
+                        std::string_view path,
+                        std::string_view host);
+void AppendHeaderLine(HeaderBlockBuffer& out,
+                      std::string_view name,
+                      std::string_view value);
 
-    void reserve(size_t total) {
-        if (spilled_) {
-            heap_.reserve(total);
-        } else if (total > kInlineCapacity) {
-            Spill(total);
-        }
-    }
-
-    void push_back(char ch) {
-        if (!spilled_ && inline_size_ < kInlineCapacity) {
-            inline_[inline_size_++] = ch;
-            return;
-        }
-        if (!spilled_) {
-            Spill(inline_size_ + 1);
-        }
-        heap_.push_back(ch);
-    }
-
-    void append(std::string_view text) {
-        if (text.empty()) {
-            return;
-        }
-        if (!spilled_ && text.size() <= kInlineCapacity - inline_size_) {
-            std::memcpy(inline_.data() + inline_size_, text.data(), text.size());
-            inline_size_ += text.size();
-            return;
-        }
-        if (!spilled_) {
-            Spill(inline_size_ + text.size());
-        }
-        heap_.append(text);
-    }
-
-    [[nodiscard]] std::string_view View() const noexcept {
-        return spilled_ ? std::string_view(heap_)
-                        : std::string_view(inline_.data(), inline_size_);
-    }
-
-private:
-    void Spill(size_t needed) {
-        heap_.reserve(std::max(needed, kInlineCapacity * 2));
-        heap_.assign(inline_.data(), inline_size_);
-        spilled_ = true;
-    }
-
-    std::array<char, kInlineCapacity> inline_{};
-    std::string heap_;
-    size_t inline_size_ = 0;
-    bool spilled_ = false;
-};
-
-template <typename Buffer>
-inline void AppendRequestStart(Buffer& request,
-                               std::string_view method,
-                               std::string_view path,
-                               std::string_view host) {
-    request.append(method);
-    request.push_back(' ');
-    request.append(path);
-    request.append(" HTTP/1.1\r\n");
-    request.append("Host: ");
-    request.append(host);
-    request.append("\r\n");
-}
-
-template <typename Buffer>
-inline void AppendHeaderLine(Buffer& out,
-                             std::string_view name,
-                             std::string_view value) {
-    out.append(name);
-    out.append(": ");
-    out.append(value);
-    out.append("\r\n");
-}
 using Http1ChunkPrefixBuffer = std::array<char, sizeof(size_t) * 2 + 2>;
 
 template <size_t StackCapacity>

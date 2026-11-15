@@ -52,13 +52,15 @@ public:
         transferred += count;
         co_return count;
     }
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        if (fault != Fault::None) {
-            const size_t count = std::min(buffer.size(), threshold - std::min(threshold, transferred));
-            transferred += count;
-            if (count < buffer.size()) co_await Fail();
-        } else transferred += buffer.size();
-        co_return buffer.size();
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        for (const auto& buffer : buffers) {
+            if (buffer.size() == 0) continue;
+            if (fault != Fault::None) {
+                const size_t count = std::min(buffer.size(), threshold - std::min(threshold, transferred));
+                transferred += count;
+                if (count < buffer.size()) co_await Fail();
+            } else transferred += buffer.size();
+        }
     }
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override { co_return common::MultiBuffer{}; }
     void ShutdownWrite() override {}
@@ -101,8 +103,8 @@ net::awaitable<common::ErrorCode> Invoke(Stream& stream, int operation) {
             auto body = Payload(1);
             co_return Result(co_await proxy::WriteFrame(stream, 2, 1, body.FrontSpan()));
         }
-        case 7: co_return Result(co_await proxy::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1)));
-        case 8: co_return Result(co_await proxy::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(9)));
+        case 7: co_return Result(co_await proxy::WriteAnyTlsMultiBufferAsFramesWithPadding(stream, no_padding, 0, 2, 1, Payload(1)));
+        case 8: co_return Result(co_await proxy::WriteAnyTlsMultiBufferAsFramesWithPadding(stream, no_padding, 0, 2, 1, Payload(9)));
         case 9: co_return Result(co_await proxy::WriteAnyTlsMultiBufferAsFramesWithPadding(stream, padding, 1, 2, 1, Payload(9)));
         case 10: co_return Result(co_await proxy::WriteAnyTlsBuffersAsFramesWithPadding(stream, no_padding, 0, 2, 1, std::span(buffers).first(1)));
         case 11: co_return Result(co_await proxy::WriteAnyTlsBuffersAsFramesWithPadding(stream, no_padding, 0, 2, 1, buffers));
@@ -146,7 +148,8 @@ TEST(AnytlsCodecErrors, FrameBatchReencodesAfterGrowthAndShrink) {
 TEST(AnytlsCodecErrors, DeferredBatchOwnsPayloadUntilAwaited) {
     net::io_context io;
     Stream stream;
-    auto pending = proxy::WriteMultiBufferAsFrameBatch(stream, 2, 1, Payload(1));
+    const proxy::AnyTlsPaddingScheme no_padding;
+    auto pending = proxy::WriteAnyTlsMultiBufferAsFramesWithPadding(stream, no_padding, 0, 2, 1, Payload(1));
     EXPECT_EQ(stream.transferred, 0);
     bool returned = false;
     common::ErrorCode code = common::ErrorCode::INTERNAL;
@@ -271,10 +274,12 @@ TEST(AnytlsCodecErrors, LargeMultiBufferSplitsIntoMaxPayloadFrames) {
     public:
         std::vector<uint8_t> written;
         net::awaitable<size_t> AsyncRead(net::mutable_buffer) override { co_return 0; }
-        net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-            const auto* data = static_cast<const uint8_t*>(buffer.data());
-            written.insert(written.end(), data, data + buffer.size());
-            co_return buffer.size();
+        net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+            for (const auto& buffer : buffers) {
+                const auto* data = static_cast<const uint8_t*>(buffer.data());
+                written.insert(written.end(), data, data + buffer.size());
+            }
+            co_return;
         }
         net::awaitable<common::MultiBuffer> ReadMultiBuffer() override { co_return common::MultiBuffer{}; }
         void ShutdownWrite() override {}
@@ -291,52 +296,47 @@ TEST(AnytlsCodecErrors, LargeMultiBufferSplitsIntoMaxPayloadFrames) {
     }
 
     const proxy::AnyTlsPaddingScheme no_padding;
-    for (const bool padded_path : {false, true}) {
-        common::MultiBuffer payload;
-        ASSERT_TRUE(payload.AppendSpan(expected));
-        ASSERT_GT(payload.FrontSpan().size(), proxy::kMaxFramePayload);
+    common::MultiBuffer payload;
+    ASSERT_TRUE(payload.AppendSpan(expected));
+    ASSERT_GT(payload.FrontSpan().size(), proxy::kMaxFramePayload);
 
-        net::io_context io;
-        RecordingStream stream;
-        tl::expected<void, common::ErrorCode> outcome = tl::unexpected(common::ErrorCode::INTERNAL);
-        net::co_spawn(
-            io,
-            padded_path
-                ? proxy::WriteAnyTlsMultiBufferAsFramesWithPadding(
-                      stream, no_padding, 0, uint8_t{2}, 0x01020304u, std::move(payload))
-                : proxy::WriteMultiBufferAsFrameBatch(
-                      stream, uint8_t{2}, 0x01020304u, std::move(payload)),
-            [&](std::exception_ptr error, tl::expected<void, common::ErrorCode> res) {
-                ASSERT_FALSE(error);
-                outcome = res;
-            });
-        io.run();
-        ASSERT_TRUE(outcome.has_value());
-        ASSERT_EQ(stream.written.size(), 2 * proxy::kFrameHeaderSize + kTotalBytes);
+    net::io_context io;
+    RecordingStream stream;
+    tl::expected<void, common::ErrorCode> outcome = tl::unexpected(common::ErrorCode::INTERNAL);
+    net::co_spawn(
+        io,
+        proxy::WriteAnyTlsMultiBufferAsFramesWithPadding(
+            stream, no_padding, 0, uint8_t{2}, 0x01020304u, std::move(payload)),
+        [&](std::exception_ptr error, tl::expected<void, common::ErrorCode> res) {
+            ASSERT_FALSE(error);
+            outcome = res;
+        });
+    io.run();
+    ASSERT_TRUE(outcome.has_value());
+    ASSERT_EQ(stream.written.size(), 2 * proxy::kFrameHeaderSize + kTotalBytes);
 
-        std::vector<uint8_t> decoded;
-        size_t offset = 0;
-        std::vector<uint16_t> lengths;
-        while (offset < stream.written.size()) {
-            ASSERT_LE(offset + proxy::kFrameHeaderSize, stream.written.size());
-            EXPECT_EQ(stream.written[offset], uint8_t{2});
-            const uint32_t sid = (uint32_t(stream.written[offset + 1]) << 24) |
-                                 (uint32_t(stream.written[offset + 2]) << 16) |
-                                 (uint32_t(stream.written[offset + 3]) << 8) |
-                                 uint32_t(stream.written[offset + 4]);
-            EXPECT_EQ(sid, 0x01020304u);
-            const uint16_t len = (uint16_t(stream.written[offset + 5]) << 8) |
-                                 uint16_t(stream.written[offset + 6]);
-            lengths.push_back(len);
-            offset += proxy::kFrameHeaderSize;
-            ASSERT_LE(offset + len, stream.written.size());
-            decoded.insert(decoded.end(),
-                           stream.written.begin() + static_cast<ptrdiff_t>(offset),
-                           stream.written.begin() + static_cast<ptrdiff_t>(offset + len));
-            offset += len;
-        }
-        EXPECT_EQ(lengths, (std::vector<uint16_t>{65535, 4465}));
-        EXPECT_EQ(decoded, expected);
-        EXPECT_EQ(common::test_buffers_live, 0);
+    std::vector<uint8_t> decoded;
+    size_t offset = 0;
+    std::vector<uint16_t> lengths;
+    while (offset < stream.written.size()) {
+        ASSERT_LE(offset + proxy::kFrameHeaderSize, stream.written.size());
+        EXPECT_EQ(stream.written[offset], uint8_t{2});
+        const uint32_t sid = (uint32_t(stream.written[offset + 1]) << 24) |
+                             (uint32_t(stream.written[offset + 2]) << 16) |
+                             (uint32_t(stream.written[offset + 3]) << 8) |
+                             uint32_t(stream.written[offset + 4]);
+        EXPECT_EQ(sid, 0x01020304u);
+        const uint16_t len = (uint16_t(stream.written[offset + 5]) << 8) |
+                             uint16_t(stream.written[offset + 6]);
+        lengths.push_back(len);
+        offset += proxy::kFrameHeaderSize;
+        ASSERT_LE(offset + len, stream.written.size());
+        decoded.insert(decoded.end(),
+                       stream.written.begin() + static_cast<ptrdiff_t>(offset),
+                       stream.written.begin() + static_cast<ptrdiff_t>(offset + len));
+        offset += len;
     }
+    EXPECT_EQ(lengths, (std::vector<uint16_t>{65535, 4465}));
+    EXPECT_EQ(decoded, expected);
+    EXPECT_EQ(common::test_buffers_live, 0);
 }

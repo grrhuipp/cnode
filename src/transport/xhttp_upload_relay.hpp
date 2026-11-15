@@ -94,14 +94,14 @@ public:
     [[nodiscard]] bool TryReservePacketBytes(size_t owner, size_t bytes) noexcept;
     void ReleasePacketBytes(size_t owner, size_t bytes) noexcept;
     [[nodiscard]] net::awaitable<bool> AwaitPacketBudget(
-        size_t owner, CancellationSource& cancellation);
+        size_t owner, common::CancellationSource& cancellation);
 
     // Hands one complete packet to session `token` on `owner`. The `reserved`
     // budget travels with the payload and returns when the session takes it.
     // Missing once `cancellation` fires before the session answers.
     [[nodiscard]] net::awaitable<XHttpCommit> SendPacket(
         size_t owner, uint64_t token, uint64_t seq, common::MultiBuffer payload,
-        size_t reserved, CancellationSource& cancellation);
+        size_t reserved, common::CancellationSource& cancellation);
 
     // Streams `upload` into session `token` on `owner` until its EOF, within
     // the window the session grants. Returns once EOF is sent or the session

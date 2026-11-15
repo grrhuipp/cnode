@@ -3,12 +3,13 @@
 #include "api/panel_wire.hpp"
 #include <limits>
 #include <string_view>
+#include <utility>
 
 namespace {
 
 auto Parse(std::string_view body) {
-    const auto parsed = ::infra::parse(body);
-    return ::api::ParseUserList(parsed.as_object());
+    auto parsed = ::infra::parse(body);
+    return ::api::ParseUserList(std::move(parsed.as_object()));
 }
 
 TEST(V2BoardUserListJson, ValidUsersAreNormalized) {

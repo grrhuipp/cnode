@@ -313,33 +313,6 @@ ParseUdpMessage(HysteriaVersion version, std::span<const uint8_t> input) {
     return result;
 }
 
-tl::expected<size_t, ProtocolError>
-UdpMessageHeaderSize(HysteriaVersion version, const common::TargetAddress& target) {
-    std::optional<common::AddressText> address_storage;
-    const auto text = PrepareUdpTargetText(version, target, address_storage);
-    if (!text) return tl::unexpected(text.error());
-    return UdpTargetHeaderSize(version, *text);
-}
-
-tl::expected<std::vector<uint8_t>, ProtocolError>
-EncodeUdpMessage(HysteriaVersion version, const HysteriaUdpMessage& message) {
-    if (!ValidFragmentIndex(version, message.fragment_id, message.fragment_count) ||
-        message.payload.size() > kMaxUdpPayloadLength)
-        return tl::unexpected(ProtocolError::Invalid);
-
-    std::optional<common::AddressText> address_storage;
-    const auto text = PrepareUdpTargetText(version, message.target, address_storage);
-    if (!text) return tl::unexpected(text.error());
-    if (text->host.empty() && RequiresUdpTarget(
-            version, message.fragment_id, message.fragment_count))
-        return tl::unexpected(ProtocolError::Invalid);
-    const auto header_size = UdpTargetHeaderSize(version, *text);
-    if (!header_size) return tl::unexpected(header_size.error());
-    if (message.payload.size() > std::numeric_limits<size_t>::max() - *header_size)
-        return tl::unexpected(ProtocolError::TooLarge);
-    return EncodeUdpFragment(version, message, *text, *header_size);
-}
-
 std::array<uint8_t, 32> HashCredential(std::string_view credential) noexcept {
     std::array<uint8_t, 32> digest{};
     SHA256(reinterpret_cast<const uint8_t*>(credential.data()), credential.size(), digest.data());

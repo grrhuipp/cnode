@@ -1,8 +1,9 @@
 #include "proxy/vless/vless_encryption.hpp"
+#include "proxy/blake3.hpp"
+#include "common/byte_reader.hpp"
 #include "common/scoped_cleanse.hpp"
 #include "infra/log.hpp"
 
-#include <blake3.h>
 #include <openssl/rand.h>
 
 #include <algorithm>
@@ -91,19 +92,6 @@ constexpr VlessEncryptionPadding kDefaultPaddingLens[] = {
 template <typename Key>
 [[nodiscard]] size_t RelaySize(const Key& key) noexcept {
     return key.mlkem_key ? kMlKem768RelaySize : kX25519RelaySize;
-}
-
-[[nodiscard]] std::array<uint8_t, kHashSize> Hash32(
-    std::span<const uint8_t> data) noexcept {
-    std::array<uint8_t, kHashSize> out{};
-    blake3_hasher hasher;
-    blake3_hasher_init(&hasher);
-    if (!data.empty()) {
-        blake3_hasher_update(&hasher, data.data(), data.size());
-    }
-    blake3_hasher_finalize(&hasher, out.data(), out.size());
-    OPENSSL_cleanse(&hasher, sizeof(hasher));
-    return out;
 }
 
 [[nodiscard]] std::span<const uint8_t, kVlessEncryptionIvSize>
@@ -288,8 +276,7 @@ BuildVlessEncryptionClientNfsHello(
             return std::nullopt;
         }
 
-        auto hash = Hash32(config.client_keys[i + 1].public_key);
-        std::copy(hash.begin(), hash.end(), relays.begin());
+        Blake3Digest(config.client_keys[i + 1].public_key, relays.first(kHashSize));
         last_ctr = VlessEncryptionCtr::Create(hello.nfs_key.bytes,
                                               IvSpan(hello.iv));
         if (!last_ctr ||
@@ -371,7 +358,8 @@ OpenVlessEncryptionClientNfsHello(
             !last_ctr->XorInPlace(relays.first(kHashSize))) {
             return std::nullopt;
         }
-        const auto expected_hash = Hash32(config.server_keys[i + 1].public_key);
+        std::array<uint8_t, kHashSize> expected_hash;
+        Blake3Digest(config.server_keys[i + 1].public_key, expected_hash);
         if (!std::ranges::equal(expected_hash, relays.first(kHashSize))) {
             return std::nullopt;
         }
@@ -399,8 +387,10 @@ BuildVlessEncryptionClientPfsHello(
               hello.public_key.begin() +
                   static_cast<std::ptrdiff_t>(kVlessMlKem768PublicKeySize));
 
-    const auto encrypted_len = EncodeVlessEncryptionLength(
-        kVlessEncryptionEncryptedClientPfsPublicSize);
+    std::array<uint8_t, kVlessEncryptionLengthSize> encrypted_len;
+    common::StoreU16BE(
+        encrypted_len.data(),
+        static_cast<uint16_t>(kVlessEncryptionEncryptedClientPfsPublicSize));
     auto encrypted = std::span<uint8_t, kVlessEncryptionClientPfsHelloSize>(
         hello.encrypted.data(), kVlessEncryptionClientPfsHelloSize);
     auto sealed_len = nfs_aead.Seal(
@@ -480,10 +470,7 @@ BuildVlessEncryptionServerPfsResponse(
         return std::nullopt;
     }
     response.ticket_seconds = TicketSeconds(config);
-    const auto encoded_seconds =
-        EncodeVlessEncryptionLength(response.ticket_seconds);
-    std::copy(encoded_seconds.begin(), encoded_seconds.end(),
-              response.ticket.begin());
+    common::StoreU16BE(response.ticket.data(), response.ticket_seconds);
 
     auto ticket_aead = VlessEncryptionAead::Create(
         public_key,
@@ -558,9 +545,7 @@ OpenVlessEncryptionServerPfsResponse(
     if (!opened_ticket || *opened_ticket != result.ticket.size()) {
         return std::nullopt;
     }
-    result.ticket_seconds = DecodeVlessEncryptionLength(
-        std::span<const uint8_t, kVlessEncryptionTicketSize>(result.ticket)
-            .first<kVlessEncryptionLengthSize>());
+    result.ticket_seconds = common::LoadU16BE(result.ticket.data());
     result.read_aead = std::move(*ticket_aead);
     return result;
 }
@@ -577,7 +562,9 @@ std::optional<std::vector<uint8_t>> BuildVlessEncryptionPadding(
         *padding_length - kVlessEncryptionEncryptedLengthSize;
     const size_t plaintext_body_length =
         encrypted_body_length - kVlessEncryptionTagSize;
-    auto encoded_length = EncodeVlessEncryptionLength(encrypted_body_length);
+    std::array<uint8_t, kVlessEncryptionLengthSize> encoded_length;
+    common::StoreU16BE(
+        encoded_length.data(), static_cast<uint16_t>(encrypted_body_length));
 
     std::vector<uint8_t> out(*padding_length);
     auto sealed_length = aead.Seal(
@@ -615,8 +602,10 @@ BuildVlessEncryptionClientZeroRttRequest(
     request.united_key = BuildUnitedKey(pfs_key, nfs_key);
     auto bytes = std::span<uint8_t, kVlessEncryptionZeroRttRequestSize>(
         request.bytes);
-    const auto encoded_ticket_len =
-        EncodeVlessEncryptionLength(kVlessEncryptionEncryptedTicketSize);
+    std::array<uint8_t, kVlessEncryptionLengthSize> encoded_ticket_len;
+    common::StoreU16BE(
+        encoded_ticket_len.data(),
+        static_cast<uint16_t>(kVlessEncryptionEncryptedTicketSize));
     auto sealed_len = nfs_aead->Seal(
         encoded_ticket_len,
         {},
@@ -687,7 +676,7 @@ OpenEncryptedTicketAfterLength(
     if (!opened || *opened != plain.size()) {
         return std::nullopt;
     }
-    return DecodeVlessEncryptionLength(plain);
+    return common::LoadU16BE(plain.data());
 }
 
 [[nodiscard]] std::optional<

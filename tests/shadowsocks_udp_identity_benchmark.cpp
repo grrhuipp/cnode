@@ -1,7 +1,7 @@
-// SS2022 UDP 身份匹配基准，共 130 格：AES-128/256、1/16/256/4096 个用户、1/4/16 个 identity key 组、
-// 已发布快照的首/中/末用户、0/1200 B 载荷，并保留无 identity 与普通重放接收对照。
+// SS2022 UDP 身份匹配基准，共 128 格：AES-128/256、1/16/256/4096 个用户、1/4/16 个 identity key 组、
+// 已发布快照的首/中/末用户、0/1200 B 载荷，并保留无 identity 对照。
 // 预热与测量次数同 TCP 身份基准（CNODE_BENCH_ITERATIONS）。每批最多预编码 32 个唯一包，编码在
-// 计时外；计时包含解码认证、目标/载荷/归属校验及结果释放。主矩阵只测延迟提交重放的认证阶段，
+// 计时外；计时包含解码认证、目标/载荷/归属校验及结果释放。只测认证阶段，
 // 不含入站目录的重放提交、路由或网络 I/O，不代表 UDP 转发吞吐。
 
 #include "shadowsocks_identity_fixture.hpp"
@@ -51,11 +51,11 @@ void Verify(const proxy::SsUdpDecodeResult& result,
 
 void RunCase(const char* cipher_name, const proxy::SsCipherInfo& cipher,
              const UserStore::ShadowsocksUsersView& users, size_t groups,
-             size_t position, size_t payload_size, bool deferred_replay,
+             size_t position, size_t payload_size,
              size_t iterations, size_t idle_rss) {
     SCOPED_TRACE(::testing::Message() << cipher_name << " users=" << users.size()
         << " groups=" << groups << " snapshot_position=" << position
-        << " payload=" << payload_size << " deferred_replay=" << deferred_replay);
+        << " payload=" << payload_size);
     const common::TargetAddress target("127.0.0.1", 443);
     std::array<uint8_t, 1200> payload_storage{};
     for (size_t i = 0; i < payload_storage.size(); ++i)
@@ -82,7 +82,6 @@ void RunCase(const char* cipher_name, const proxy::SsCipherInfo& cipher,
     std::vector<uint8_t> wire(kBatchSize * wire_size);
     std::array<uint64_t, kBatchSize> packet_ids{};
     std::vector<double> latencies(iterations);
-    proxy::Ss2022UdpReplayCache replay_cache;
     const auto prepare = [&](size_t count) {
         for (size_t i = 0; i < count; ++i) {
             packet_ids[i] = encoder.next_packet_id;
@@ -91,20 +90,19 @@ void RunCase(const char* cipher_name, const proxy::SsCipherInfo& cipher,
                 wire.data() + i * wire_size, wire_size) == wire_size);
         }
     };
-    const auto decode = [&](size_t i, bool deferred) {
+    const auto decode = [&](size_t i) {
         return proxy::DecodeUdpPacket(wire.data() + i * wire_size, wire_size, users,
-            cipher.type, cipher.key_size, cipher.salt_size, replay_cache, deferred);
+            cipher.type, cipher.key_size, cipher.salt_size);
     };
-    const auto authenticate = [&](size_t i, bool deferred) {
-        auto result = decode(i, deferred);
+    const auto authenticate = [&](size_t i) {
+        auto result = decode(i);
         Require(result.has_value());
         Verify(*result, users, position, target, payload, packet_ids[i]);
         // Result/payload release belongs to the timed call, not the next packet.
     };
     prepare(kBatchSize);
     for (size_t i = 0; i < kBatchSize; ++i)
-        authenticate(i, deferred_replay);
-    Require(replay_cache.Size() == (deferred_replay ? 0u : 1u));
+        authenticate(i);
 
     const size_t warm_rss = benchmark::ResidentBytes();
     benchmark::AllocationCounts counts;
@@ -120,47 +118,39 @@ void RunCase(const char* cipher_name, const proxy::SsCipherInfo& cipher,
             const auto cpu_start = CpuNs();
             for (size_t i = 0; i < count; ++i) {
                 const auto start = std::chrono::steady_clock::now();
-                authenticate(i, deferred_replay);
+                authenticate(i);
                 const auto finish = std::chrono::steady_clock::now();
                 latencies[offset + i] =
                     std::chrono::duration<double, std::nano>(finish - start).count();
             }
             cpu_ns += CpuNs() - cpu_start;
         }
-        Require(replay_cache.Size() == (deferred_replay ? 0u : 1u));
         offset += count;
         final_batch_size = count;
     }
     const size_t after_rss = benchmark::ResidentBytes();
     const auto process_memory = benchmark::ReadProcessMemory();
 
-    // Behavioral controls are outside measurement. Ordinary mode has accepted
-    // unique IDs throughout warmup and measurement; the most recent duplicate
-    // must fail. Deferred authentication accepts duplicates without consulting
-    // or populating the cache, including after an ordinary commit populates it.
+    // Behavioral control outside measurement: authentication alone accepts a
+    // duplicate, the association it selects rejects the repeated packet ID.
     const size_t last = final_batch_size - 1;
-    if (deferred_replay) {
-        authenticate(last, true);
-        authenticate(last, true);
-        Require(replay_cache.Size() == 0);
-        authenticate(last, false);
-        Require(replay_cache.Size() == 1);
-    }
-    Require(!decode(last, false));
-    authenticate(last, true);
-    Require(replay_cache.Size() == 1);
+    UdpAssociations associations;
+    const auto fresh = decode(last);
+    Require(fresh && associations.Commit(*fresh));
+    const auto duplicate = decode(last);
+    Require(duplicate && !associations.Commit(*duplicate));
 
     std::sort(latencies.begin(), latencies.end());
     double total_ns = 0;
     for (double value : latencies) total_ns += value;
     std::printf("ss-udp-identity cipher=%s users=%zu groups=%zu snapshot_position=%zu "
-        "payload_bytes=%zu replay=%s n=%zu cpu_ns=%.1f mean_ns=%.1f "
+        "payload_bytes=%zu n=%zu cpu_ns=%.1f mean_ns=%.1f "
         "p50_ns=%.1f p95_ns=%.1f p99_ns=%.1f cpp_new_calls=%.3f cpp_bytes=%.1f "
         "mi_aligned_calls=%.3f "
         "idle_rss=%zu warm_rss=%zu after_rss=%zu "
         "process_peak_rss=%zu anonymous_rss=%zu file_rss=%zu\n",
         cipher_name, users.size(), groups, position, payload_size,
-        deferred_replay ? "deferred-auth-only" : "ordinary-accept", iterations,
+        iterations,
         double(cpu_ns) / iterations, total_ns / iterations, latencies[iterations / 2],
         latencies[(iterations - 1) * 95 / 100], latencies[(iterations - 1) * 99 / 100],
         double(counts.cpp_calls) / iterations, double(counts.cpp_bytes) / iterations,
@@ -180,10 +170,9 @@ TEST(ShadowsocksUdpIdentityBenchmark, AuthenticationMatrix) {
         struct ClearView {
             ~ClearView() { UserStore::ClearWorkerView(); }
         } clear_view;
-        // 112 identity + 16 no-identity deferred rows; two ordinary replay
-        // controls (256 users, four groups, last position, 1200-byte payload).
-        // This is codec/authentication work, NOT full UDP ingress: deferred rows
-        // exclude directory/association replay commit, routing and network I/O.
+        // 112 identity + 16 no-identity rows. This is codec/authentication
+        // work, NOT full UDP ingress: rows exclude directory/association
+        // replay commit, routing and network I/O.
         for (const char* cipher_name : {"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"}) {
             const auto cipher = proxy::ParseCipherMethod(cipher_name);
             ASSERT_TRUE(cipher.has_value());
@@ -200,10 +189,7 @@ TEST(ShadowsocksUdpIdentityBenchmark, AuthenticationMatrix) {
                         // never from the fixture's pre-sort input order.
                         for (size_t payload_size : {0u, 1200u}) {
                             RunCase(cipher_name, *cipher, users, groups, *it,
-                                    payload_size, true, iterations, idle_rss);
-                            if (count == 256 && groups == 4 && *it == count - 1 && payload_size == 1200)
-                                RunCase(cipher_name, *cipher, users, groups, *it,
-                                        payload_size, false, iterations, idle_rss);
+                                    payload_size, iterations, idle_rss);
                         }
                     }
                     UserStore::ClearWorkerView();

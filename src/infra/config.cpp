@@ -50,9 +50,12 @@ std::optional<RoutingIpNetwork> RoutingIpNetwork::Parse(std::string_view value) 
 }
 
 
+namespace {
+
+// Header presence policy is independent of v1/v2 format detection.
 transport::ProxyProtocolMode ParseProxyProtocolMode(
     const infra::object& object, std::string_view key,
-    transport::ProxyProtocolMode fallback) {
+    transport::ProxyProtocolMode fallback = transport::ProxyProtocolMode::Auto) {
     const auto* value = object.if_contains(key);
     if (!value) return fallback;
     if (value->is_string()) {
@@ -64,6 +67,57 @@ transport::ProxyProtocolMode ParseProxyProtocolMode(
     throw std::invalid_argument(
         "proxyProtocol must be off, auto or on");
 }
+
+transport::InboundListen ParseInboundListen(
+    const infra::object& object,
+    std::string_view key,
+    std::string_view field_label,
+    transport::InboundListen fallback) {
+    const auto* value = object.if_contains(key);
+    if (!value) {
+        return fallback;
+    }
+    if (!value->is_string()) {
+        throw std::invalid_argument(std::format("{} must be a string", field_label));
+    }
+    auto parsed = transport::InboundListen::Parse(value->as_string());
+    if (!parsed) {
+        throw std::invalid_argument(std::format(
+            "{} '{}' must be auto or an IP address",
+            field_label, value->as_string()));
+    }
+    return std::move(*parsed);
+}
+
+// A REALITY server name names a TLS ClientHello SNI: a DNS hostname, never an
+// IP literal and never with a trailing dot.
+bool IsValidRealityServerName(std::string_view name) noexcept {
+    return !name.empty() && !common::ParseLiteral(name) &&
+           common::IsValidDnsHostname(name, common::TrailingDotPolicy::Forbid);
+}
+
+// Xray destOverride names to the SniffConfig bitset; fakedns is rejected.
+tl::expected<uint8_t, std::string> ParseSniffDestOverride(
+    std::span<const std::string> protocols) {
+    uint8_t bits = 0;
+    for (const auto& raw : protocols) {
+        const std::string protocol = common::LowerAscii(raw);
+        if (protocol == "fakedns" || protocol == "fakedns+others") {
+            return tl::unexpected(
+                "sniffing destOverride fakedns is not supported");
+        }
+        const uint8_t bit = routing::SniffedProtocolBit(protocol);
+        if (bit == 0) {
+            return tl::unexpected(std::format(
+                "sniffing destOverride contains unsupported value '{}'",
+                protocol));
+        }
+        bits |= bit;
+    }
+    return bits;
+}
+
+}  // namespace
 
 tl::expected<std::optional<uint32_t>, std::string>
 ParseHttp2InitialWindow(const object& source) {
@@ -130,6 +184,8 @@ transport::OutboundBind ParseOutboundBindConfig(
     return std::move(*result);
 }
 
+namespace {
+
 std::optional<transport::OutboundBind> ParseOptionalOutboundBind(
     const object& source, std::string_view context) {
     const auto* send_through = source.if_contains("sendThrough");
@@ -143,6 +199,8 @@ std::optional<transport::OutboundBind> ParseOptionalOutboundBind(
     }
     return ParseOutboundBindConfig(*send_through, strategy);
 }
+
+}  // namespace
 
 OutboundSourceConfig OutboundSourceConfig::FromJson(const object& j) {
     OutboundSourceConfig cfg;
@@ -170,9 +228,6 @@ OutboundSourceConfig OutboundSourceConfig::FromJson(const object& j) {
 // ============================================================================
 
 namespace {
-
-
-transport::StreamSettings ParseStreamSettingsFields(const object& source, transport::StreamEndpointRole role);
 
 [[nodiscard]] RoutingIpNetwork RequireRoutingIpNetwork(
     std::string_view value, std::string_view field) {
@@ -588,7 +643,6 @@ TimeoutsConfig TimeoutsConfig::FromJson(const object& j) {
     TimeoutsConfig cfg;
     cfg.handshake = JsonUint32Or(j, "handshake", cfg.handshake);
     cfg.dial = JsonUint32Or(j, "dial", cfg.dial);
-    cfg.read = JsonUint32Or(j, "read", cfg.read);
     cfg.write = JsonUint32Or(j, "write", cfg.write);
     cfg.idle = JsonUint32Or(j, "connIdle", cfg.idle);
     cfg.uplink_only = JsonUint32Or(j, "uplinkOnly", cfg.uplink_only);
@@ -801,6 +855,8 @@ RoutingConfig RoutingConfig::FromJson(const object& j) {
 // WsConfig / StreamSettings
 // ============================================================================
 
+namespace {
+
 transport::WsConfig ParseWsConfig(const object& j) {
     transport::WsConfig cfg;
     cfg.path = RequireJson(infra::NormalizeTransportPath(
@@ -890,7 +946,7 @@ std::shared_ptr<const transport::XHttpDownloadSettings> ParseXHttpDownloadSettin
         settings->send_through = std::move(*bind);
     }
 
-    settings->stream_settings = ParseStreamSettingsFields(
+    settings->stream_settings = ParseStreamSettings(
         j, transport::StreamEndpointRole::Outbound);
     if (settings->stream_settings.xhttp.download_settings) {
         throw std::invalid_argument("nested xhttp downloadSettings is not supported");
@@ -1014,9 +1070,9 @@ transport::RealityConfig ParseRealityConfig(const object& j) {
     return cfg;
 }
 
-namespace {
+}  // namespace
 
-transport::StreamSettings ParseStreamSettingsFields(
+transport::StreamSettings ParseStreamSettings(
     const object& j, transport::StreamEndpointRole role) {
     transport::StreamSettings cfg;
     bool min_version_declared = false;
@@ -1172,12 +1228,6 @@ transport::StreamSettings ParseStreamSettingsFields(
 
     cfg.http.force_http2 = cfg.http.force_http2 || common::EqualsAsciiCI(network, "h2");
     return transport::NormalizeStreamSettings(cfg);
-}
-
-}  // namespace
-
-transport::StreamSettings ParseStreamSettings(const object& source, transport::StreamEndpointRole role) {
-    return ParseStreamSettingsFields(source, role);
 }
 
 // ============================================================================
@@ -1879,7 +1929,6 @@ bool ValidateConfig(const Config& config) {
 
     if (config.timeouts.handshake == 0 ||
         config.timeouts.dial == 0 ||
-        config.timeouts.read == 0 ||
         config.timeouts.write == 0 ||
         config.timeouts.idle == 0 ||
         config.timeouts.uplink_only == 0 ||
@@ -2253,11 +2302,6 @@ bool PanelConfig::Validate() const {
 }
 
 
-bool IsValidRealityServerName(std::string_view name) noexcept {
-    return !name.empty() && !common::ParseLiteral(name) &&
-           common::IsValidDnsHostname(name, common::TrailingDotPolicy::Forbid);
-}
-
 tl::expected<void, std::string> ApplyRealityServerInput(
     const RealityServerInput& input, transport::RealityConfig& out) {
     if (input.private_key) {
@@ -2423,26 +2467,6 @@ tl::expected<void, std::string> ValidateGrpcServiceName(
     return {};
 }
 
-tl::expected<uint8_t, std::string> ParseSniffDestOverride(
-    std::span<const std::string> protocols) {
-    uint8_t bits = 0;
-    for (const auto& raw : protocols) {
-        const std::string protocol = common::LowerAscii(raw);
-        if (protocol == "fakedns" || protocol == "fakedns+others") {
-            return tl::unexpected(
-                "sniffing destOverride fakedns is not supported");
-        }
-        const uint8_t bit = routing::SniffedProtocolBit(protocol);
-        if (bit == 0) {
-            return tl::unexpected(std::format(
-                "sniffing destOverride contains unsupported value '{}'",
-                protocol));
-        }
-        bits |= bit;
-    }
-    return bits;
-}
-
 tl::expected<std::string, std::string> ParseAnyTlsPaddingScheme(
     const infra::value& value, std::string_view field) {
     std::string scheme;
@@ -2480,27 +2504,6 @@ tl::expected<std::string, std::string> ParseAnyTlsPaddingScheme(
         return tl::unexpected(std::format("{} is invalid", field));
     }
     return scheme;
-}
-
-transport::InboundListen ParseInboundListen(
-    const infra::object& object,
-    std::string_view key,
-    std::string_view field_label,
-    transport::InboundListen fallback) {
-    const auto* value = object.if_contains(key);
-    if (!value) {
-        return fallback;
-    }
-    if (!value->is_string()) {
-        throw std::invalid_argument(std::format("{} must be a string", field_label));
-    }
-    auto parsed = transport::InboundListen::Parse(value->as_string());
-    if (!parsed) {
-        throw std::invalid_argument(std::format(
-            "{} '{}' must be auto or an IP address",
-            field_label, value->as_string()));
-    }
-    return std::move(*parsed);
 }
 
 }  // namespace infra

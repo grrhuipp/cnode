@@ -1,4 +1,5 @@
 #include "common/address_codec.hpp"
+#include "common/byte_reader.hpp"
 #include "common/awaitable_task_group.hpp"
 
 #include "proxy/anytls/anytls_codec.hpp"
@@ -90,7 +91,7 @@ struct AnyTlsOutboundHandler::ClientSession {
             WakePayloadReader();
         }
 
-        transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
+        common::CancellationSource& Cancellation() noexcept { return cancellation_; }
 
         void CheckWrite() const {
             if (error_ != common::ErrorCode::OK) throw transport::LinkError(error_);
@@ -201,7 +202,7 @@ struct AnyTlsOutboundHandler::ClientSession {
             (void)payload_signal_.try_send(IoErrorCode{});
         }
 
-        transport::CancellationSource cancellation_;
+        common::CancellationSource cancellation_;
         common::SignalChannel syn_signal_;
         common::SignalChannel payload_signal_;
         common::SignalChannel payload_space_signal_;
@@ -946,8 +947,7 @@ DialPhysicalSession(
         auth_ptr = heap_auth.data();
     }
     std::copy(settings.password_hash.begin(), settings.password_hash.end(), auth_ptr);
-    auth_ptr[32] = static_cast<uint8_t>(auth_padding_size >> 8);
-    auth_ptr[33] = static_cast<uint8_t>(auth_padding_size);
+    common::StoreU16BE(auth_ptr + 32, auth_padding_size);
 
     tl::expected<void, common::ErrorCode> ok;
     try {
@@ -1224,7 +1224,7 @@ net::awaitable<OutboundProcessResult> AnyTlsOutboundHandler::ProcessSession(
             }
         }
 
-        transport::CancellationSource& Cancellation() noexcept override { return logical.Cancellation(); }
+        common::CancellationSource& Cancellation() noexcept override { return logical.Cancellation(); }
 
         void Cancel() noexcept {
             cancelled = true;
@@ -1266,7 +1266,6 @@ net::awaitable<OutboundProcessResult> AnyTlsOutboundHandler::ProcessSession(
     if (result.error == common::ErrorCode::OK) {
         // Request and half-close deadlines must not escape into the idle pool.
         stream.SetIdleTimeout(std::chrono::seconds(0));
-        stream.SetReadTimeout(std::chrono::seconds(0));
         stream.SetWriteTimeout(std::chrono::seconds(0));
         stream.ClearPhaseDeadline();
     }

@@ -65,7 +65,7 @@ public:
 
 class FragmentReader final : public transport::MultiBufferReader {
 public:
-    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+    common::CancellationSource& Cancellation() noexcept override { return cancellation_; }
 
     FragmentReader(std::vector<uint8_t> bytes,
                    std::vector<size_t> fragments)
@@ -89,7 +89,7 @@ public:
     }
 
 private:
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
 
     std::vector<uint8_t> bytes_;
     std::vector<size_t> fragments_;
@@ -105,7 +105,7 @@ public:
                                   std::vector<size_t> fragments = {})
         : reader_(std::move(input), std::move(fragments)) {}
 
-    transport::CancellationSource& Cancellation() noexcept override {
+    common::CancellationSource& Cancellation() noexcept override {
         return reader_.Cancellation();
     }
 

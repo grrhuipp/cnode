@@ -162,36 +162,6 @@ net::awaitable<tl::expected<PreparedRequest, common::ErrorCode>> ReadUotRequestH
     }
 }
 
-namespace {
-net::awaitable<app::RelayResult> RunPreparedUotSession(
-    bool is_connect,
-    common::TargetAddress reader_destination,
-    common::MultiBuffer pending,
-    common::InitialPayload initial_payload,
-    std::unique_ptr<transport::AsyncStream> stream,
-    transport::MultiBufferReader& request_reader,
-    transport::MultiBufferWriter& response_writer,
-    routing::Dispatcher& dispatcher,
-    const routing::DispatchPolicy& dispatch_policy,
-    net::io_context& io_context,
-    common::Context& ctx,
-    app::StatsShard& stats,
-    const infra::TimeoutsConfig& timeouts) {
-    UotPacketReader uot_reader(
-        request_reader, is_connect, std::move(reader_destination), std::move(pending));
-    UotPacketWriter uot_writer(response_writer, is_connect, ctx.outbound.target);
-    co_return co_await dispatcher.Dispatch(
-        io_context,
-        dispatch_policy,
-        std::move(stream),
-        transport::Link{&uot_reader, &uot_writer},
-        std::move(initial_payload),
-        ctx,
-        stats,
-        timeouts);
-}
-}  // namespace
-
 net::awaitable<app::RelayResult> DispatchPreparedUotRequest(
     PreparedRequest prepared,
     std::unique_ptr<transport::AsyncStream> stream,
@@ -213,17 +183,15 @@ net::awaitable<app::RelayResult> DispatchPreparedUotRequest(
             common::Network::UDP,
             std::move(prepared.destination),
             std::move(prepared.forwarded)});
-    return RunPreparedUotSession(
-        is_connect,
-        std::move(reader_destination),
-        std::move(prepared.pending),
-        std::move(initial_payload),
-        std::move(stream),
-        request_reader,
-        response_writer,
-        dispatcher,
-        dispatch_policy,
+    UotPacketReader uot_reader(
+        request_reader, is_connect, std::move(reader_destination), std::move(prepared.pending));
+    UotPacketWriter uot_writer(response_writer, is_connect, ctx.outbound.target);
+    co_return co_await dispatcher.Dispatch(
         io_context,
+        dispatch_policy,
+        std::move(stream),
+        transport::Link{&uot_reader, &uot_writer},
+        std::move(initial_payload),
         ctx,
         stats,
         timeouts);
@@ -325,14 +293,10 @@ net::awaitable<common::MultiBuffer> UotPacketReader::ReadMultiBuffer() {
         pending_.ReleaseIfIdle();
         auto incoming = co_await reader_.ReadMultiBuffer();
         const bool received = incoming.byte_size() != 0;
-        if (received) {
-            if (pending_.byte_size() > common::kPacketStreamPendingLimit ||
-                incoming.byte_size() > common::kPacketStreamPendingLimit - pending_.byte_size()) {
-                failed_ = true;
-                pending_.clear();
-                throw IoSystemError(io_error::message_size, "stream pending buffer exceeded");
-            }
-            incoming.MoveTo(pending_, true);
+        if (received && !common::AppendPacketStreamInput(pending_, std::move(incoming))) {
+            failed_ = true;
+            pending_.clear();
+            throw IoSystemError(io_error::message_size, "stream pending buffer exceeded");
         }
         if ((co_await net::this_coro::cancellation_state).cancelled() !=
             net::cancellation_type::none) {

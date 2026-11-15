@@ -30,7 +30,7 @@ public:
         if (entry && entry->expires_at > now) return false;
         const auto expires_at = now + kTtlSeconds;
         if (entry) {
-            entries_.Rearm(key, *entry, expires_at);
+            entries_.Rearm(*entry, expires_at);
             return true;
         }
         if (entries_.size() >= entries_.capacity()) return false;

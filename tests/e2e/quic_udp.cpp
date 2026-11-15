@@ -546,7 +546,7 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
         {"workers", 4},
         {"dns", {{"servers", Json::array({"127.77.0.53:" + std::to_string(dns_socket.Port())})},
                  {"timeout", 5}, {"cacheSize", 1024}}},
-        {"timeouts", {{"handshake", 10}, {"dial", 10}, {"read", 15}, {"write", 30},
+        {"timeouts", {{"handshake", 10}, {"dial", 10}, {"write", 30},
                       {"connIdle", 60}, {"uplinkOnly", 5}, {"downlinkOnly", 5}}},
         {"panels", Json::array({{{"name", "full-app"}, {"type", "V2board"},
             {"apiHost", "http://127.0.0.1:" + std::to_string(panel_listener.Port())},
@@ -1139,7 +1139,7 @@ TEST(QuicUdp, AllProtocolsAndTransportsFullMatrixConcurrentMigration) {
 
     const Json base_config = {
         {"workers", 4},
-        {"timeouts", {{"handshake", 15}, {"dial", 10}, {"read", 20}, {"write", 30},
+        {"timeouts", {{"handshake", 15}, {"dial", 10}, {"write", 30},
                       {"connIdle", 60}, {"uplinkOnly", 10}, {"downlinkOnly", 10}}}};
     auto gw_cfg = base_config;
     gw_cfg["log"] = {{"loglevel", "debug"}, {"logDir", (gateway_root.Path() / "logs").string()}};

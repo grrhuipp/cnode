@@ -18,7 +18,7 @@
 #include <string>
 
 namespace {
-namespace net = ::net;
+
 using namespace ::transport;
 using namespace std::chrono_literals;
 
@@ -113,7 +113,7 @@ public:
     net::awaitable<size_t> AsyncRead(net::mutable_buffer) override {
         throw IoSystemError(io_error::operation_not_supported);
     }
-    net::awaitable<size_t> AsyncWrite(net::const_buffer) override {
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer>) override {
         throw IoSystemError(io_error::operation_not_supported);
     }
     void ShutdownWrite() override {}
@@ -157,7 +157,7 @@ void ReadSession(net::io_context& io, std::shared_ptr<XHttpPacketUpSession> sess
 }
 
 void SendPacket(WorkerPair& pair, uint64_t token, uint64_t seq, std::string_view text,
-                CancellationSource& request, std::optional<XHttpCommit>& result) {
+                common::CancellationSource& request, std::optional<XHttpCommit>& result) {
     const size_t owner = pair.SessionEndpoint();
     EXPECT_TRUE(pair.UploadRelay().TryReservePacketBytes(owner, text.size()));
     net::co_spawn(pair.upload_io,
@@ -170,7 +170,7 @@ void SendPacket(WorkerPair& pair, uint64_t token, uint64_t seq, std::string_view
 
 TEST(XHttpUploadRelay, PacketWaitsForItsSessionThenCommitsOrReportsWhy) {
     WorkerPair pair;
-    CancellationSource request;
+    common::CancellationSource request;
     auto session = std::make_shared<XHttpPacketUpSession>(pair.session_io);
     const uint64_t token = pair.SessionRelay().ReserveSessionToken();
 

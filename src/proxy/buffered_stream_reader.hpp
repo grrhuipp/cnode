@@ -18,7 +18,7 @@ namespace proxy {
 // 进度可由调用方持有，取消后续读不丢失已到达的字节。
 class BufferedStreamReader final : public transport::MultiBufferReader {
 public:
-    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
+    common::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
     transport::EofAction ReadEofAction() const noexcept override { return src_.ReadEofAction(); }
     [[nodiscard]] bool EnableRawRead() noexcept override { return src_.EnableRawRead(); }
     explicit BufferedStreamReader(transport::MultiBufferReader& src) noexcept : src_(src) {}

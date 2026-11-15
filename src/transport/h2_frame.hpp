@@ -195,12 +195,12 @@ public:
 private:
     int64_t size_ = kDefault;
 };
-[[nodiscard]] inline HpackBuffer EncodeGrpcRequestHeaders(
+[[nodiscard]] inline HeaderBlockBuffer EncodeGrpcRequestHeaders(
     std::string_view authority,
     std::string_view path,
     bool tls,
     std::string_view user_agent) {
-    HpackBuffer h;
+    HeaderBlockBuffer h;
     h.reserve(128 + authority.size() + path.size() + user_agent.size());
     AppendHpackIndexed(h, kHpackStaticMethodPost);
     AppendHpackIndexed(h, tls ? kHpackStaticSchemeHttps : kHpackStaticSchemeHttp);
@@ -353,7 +353,7 @@ inline void EncodeH2FrameHeader(uint8_t* out,
 void EncodeWindowUpdateFrame(uint8_t* out, uint32_t stream_id, uint32_t increment) noexcept;
 net::awaitable<void> SendWindowUpdates(AsyncStream&, uint32_t, uint32_t, uint32_t);
 struct HttpClientRequestView;
-HpackBuffer EncodeHttpRequestHeaders(
+HeaderBlockBuffer EncodeHttpRequestHeaders(
     std::string_view, bool, const HttpClientRequestView&);
 std::vector<uint8_t> EncodeHttpResponseHeaders(
     const HttpHeaders& headers, std::string_view default_content_type = {});

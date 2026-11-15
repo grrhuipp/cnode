@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "app/inbound_handler.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "transport/quic_listener.hpp"
 #include "app/relay.hpp"
 #include "app/stats.hpp"
@@ -189,7 +189,7 @@ TEST(ProtocolRegistration, DuplicateInboundDoesNotReplacePublishedFactory) {
     ::net::io_context io;
     ::WorkerCoordinatorFixture coordinator(io);
     auto limiter = ::app::ConnectionLimiter::Acquire({}, coordinator.Get());
-    ::common::UserOnlineTracker tracker(*coordinator.Get());
+    ::app::UserOnlineTracker tracker(*coordinator.Get());
     ::app::StatsShard stats;
     const ::app::AdmissionEnvironment environment{
         *coordinator.Get(), *limiter, tracker, stats};
@@ -250,7 +250,7 @@ TEST_P(DatagramRegistration, ReportsCapabilityAndConstructionOutcome) {
     ::net::io_context io;
     ::WorkerCoordinatorFixture coordinator(io);
     auto limiter = ::app::ConnectionLimiter::Acquire({}, coordinator.Get());
-    ::common::UserOnlineTracker tracker(*coordinator.Get());
+    ::app::UserOnlineTracker tracker(*coordinator.Get());
     ::app::StatsShard stats;
     const AdmissionEnvironment environment{*coordinator.Get(), *limiter, tracker, stats};
     InboundHandlerRegistry registry(environment);
@@ -333,7 +333,7 @@ TEST(ProtocolRegistration, DuplicateOutboundDoesNotReplacePublishedCreator) {
     ASSERT_TRUE(prepared);
     ::net::io_context io;
     ::common::ResidentTaskGroup tasks(io.get_executor());
-    EXPECT_TRUE(NewProxy(*prepared, io, tasks.Tasks()));
+    EXPECT_TRUE(NewProxy(*prepared, io, tasks));
 }
 
 TEST(ProtocolRegistration, ExplicitSendThroughOverridesProtocolBinding) {
@@ -365,7 +365,7 @@ TEST_P(InvalidRuntimeCreator, RejectsMissingOrNullRuntimeCreator) {
         ASSERT_TRUE(prepared);
         config = std::move(*prepared);
     }
-    EXPECT_THROW((void)NewProxy(config, io, tasks.Tasks()), std::logic_error);
+    EXPECT_THROW((void)NewProxy(config, io, tasks), std::logic_error);
 }
 
 INSTANTIATE_TEST_SUITE_P(RuntimeCreation, InvalidRuntimeCreator, ::testing::Bool(), ([](const ::testing::TestParamInfo<bool>& info) { return info.param ? "NullRuntime" : "MissingCreator"; }));
@@ -403,7 +403,7 @@ TEST_P(BuiltinOutboundSettings, CreatesOnlyProtocolMatchingTypedSettings) {
     ASSERT_TRUE(prepared);
     net::io_context io;
     common::ResidentTaskGroup tasks(io.get_executor());
-    EXPECT_TRUE(app::NewProxy(*prepared, io, tasks.Tasks()));
+    EXPECT_TRUE(app::NewProxy(*prepared, io, tasks));
 }
 
 INSTANTIATE_TEST_SUITE_P(ProtocolsAndSettings, BuiltinOutboundSettings, ::testing::Combine(::testing::Bool(), ::testing::Bool()), ([](const ::testing::TestParamInfo<BuiltinOutboundSettings::ParamType>& info) { const auto [freedom_protocol, freedom_settings] = info.param;

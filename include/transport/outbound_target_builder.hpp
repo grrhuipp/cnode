@@ -25,7 +25,7 @@
 #include <vector>
 
 namespace app {
-class DNS;
+class DNSWorker;
 }  // namespace app
 
 namespace transport {
@@ -78,7 +78,7 @@ struct OutboundTransportTarget {
 };
 
 struct OutboundTargetOptions {
-    app::DNS* dns_service = nullptr;
+    app::DNSWorker* dns_service = nullptr;
     std::string_view address{};
     std::optional<net::ip::address> literal_address = std::nullopt;
     uint16_t port = 0;
@@ -152,7 +152,7 @@ public:
     };
 
     OutboundDialer(net::io_context& io_context,
-                   app::DNS& dns,
+                   app::DNSWorker& dns,
                    const OutboundSenderSettings& sender,
                    std::chrono::seconds timeout);
     OutboundDialer(const OutboundDialer&) = delete;
@@ -225,7 +225,7 @@ private:
                       const std::optional<net::ip::address>& local) const;
 
     net::io_context& io_context_;
-    app::DNS& dns_;
+    app::DNSWorker& dns_;
     const OutboundSenderSettings& sender_;
     TransportSecurity security_;  // Contexts for sender_.stream_settings.
     std::chrono::seconds timeout_;

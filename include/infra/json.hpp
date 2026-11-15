@@ -74,7 +74,6 @@ public:
     [[nodiscard]] bool is_string() const noexcept;
     [[nodiscard]] bool is_int64() const noexcept;
     [[nodiscard]] bool is_uint64() const noexcept;
-    [[nodiscard]] bool is_double() const noexcept;
     [[nodiscard]] bool is_object() const noexcept;
     [[nodiscard]] bool is_array() const noexcept;
 
@@ -83,7 +82,6 @@ public:
     [[nodiscard]] const std::string& as_string() const;
     [[nodiscard]] int64_t as_int64() const;
     [[nodiscard]] uint64_t as_uint64() const;
-    [[nodiscard]] double as_double() const;
     [[nodiscard]] object& as_object();
     [[nodiscard]] const object& as_object() const;
     [[nodiscard]] array& as_array();
@@ -94,21 +92,10 @@ public:
         return !(*this == other);
     }
 
-    // 以实际类型访问取值；object/array 以引用传入，不暴露内部指针。
-    template <typename Visitor>
-    decltype(auto) visit(Visitor&& visitor) const {
-        return std::visit([&](const auto& alternative) -> decltype(auto) {
-            using Alternative = std::decay_t<decltype(alternative)>;
-            if constexpr (std::is_same_v<Alternative, object_ptr> ||
-                          std::is_same_v<Alternative, array_ptr>) {
-                return visitor(*alternative);
-            } else {
-                return visitor(alternative);
-            }
-        }, data_);
-    }
-
 private:
+    friend std::string serialize(const value& v);
+    void append_serialized(std::string& out) const;
+
     using data_type = std::variant<std::nullptr_t, bool, int64_t, uint64_t, double,
                                    std::string, object_ptr, array_ptr>;
     data_type data_;
@@ -156,9 +143,6 @@ public:
     [[nodiscard]] size_t size() const noexcept { return values_.size(); }
 
     [[nodiscard]] bool operator==(const object& other) const noexcept;
-    [[nodiscard]] bool operator!=(const object& other) const noexcept {
-        return !(*this == other);
-    }
 
 private:
     storage_type values_;
@@ -191,9 +175,6 @@ public:
     [[nodiscard]] size_t size() const noexcept { return values_.size(); }
 
     [[nodiscard]] bool operator==(const array& other) const noexcept;
-    [[nodiscard]] bool operator!=(const array& other) const noexcept {
-        return !(*this == other);
-    }
 
 private:
     storage_type values_;

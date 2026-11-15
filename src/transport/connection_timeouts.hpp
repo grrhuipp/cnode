@@ -37,14 +37,6 @@ public:
         Reconcile();
     }
 
-    void SetReadTimeout(std::chrono::seconds timeout) {
-        if (stopped_) return;
-        read_timeout_ = timeout > std::chrono::seconds::zero() ? timeout : std::chrono::seconds::zero();
-        read_expired_ = false;
-        if (read_pending_) read_deadline_ = MakeDeadline(read_timeout_);
-        Reconcile();
-    }
-
     void SetWriteTimeout(std::chrono::seconds timeout) {
         if (stopped_) return;
         write_timeout_ = timeout > std::chrono::seconds::zero() ? timeout : std::chrono::seconds::zero();
@@ -83,7 +75,6 @@ public:
     }
 
     [[nodiscard]] bool ConsumeIdleTimeout() noexcept { return Consume(idle_expired_); }
-    [[nodiscard]] bool ConsumeReadTimeout() noexcept { return Consume(read_expired_); }
     [[nodiscard]] bool ConsumeWriteTimeout() noexcept { return Consume(write_expired_); }
     [[nodiscard]] bool ConsumePhaseDeadline() noexcept { return Consume(phase_expired_); }
 
@@ -95,12 +86,10 @@ public:
     void BeginRead() {
         CheckCanBegin(read_pending_);
         read_pending_ = true;
-        read_expired_ = false;
-        read_deadline_ = MakeDeadline(read_timeout_);
         try { Reconcile(); }
-        catch (...) { read_pending_ = false; read_deadline_ = kNone; throw; }
+        catch (...) { read_pending_ = false; throw; }
     }
-    void EndRead() noexcept { read_pending_ = false; read_deadline_ = kNone; ReconcileNoThrow(); }
+    void EndRead() noexcept { read_pending_ = false; ReconcileNoThrow(); }
 
     void BeginWrite() {
         CheckCanBegin(write_pending_);
@@ -124,14 +113,13 @@ public:
         stopped_ = true;
         idle_enabled_ = false;
         read_pending_ = write_pending_ = false;
-        idle_deadline_ = read_deadline_ = write_deadline_ = phase_deadline_ = kNone;
+        idle_deadline_ = write_deadline_ = phase_deadline_ = kNone;
         Cancel();
         armed_deadline_ = kNone;
     }
 
 private:
     static constexpr uint8_t kIdleMask = 1u << 0;
-    static constexpr uint8_t kReadMask = 1u << 1;
     static constexpr uint8_t kWriteMask = 1u << 2;
     static constexpr uint8_t kPhaseMask = 1u << 3;
     // 无截止期哨兵：Deadline() 饱和到 max 与"未设置"在 Earliest/OnTimeout 中本就等价，
@@ -164,11 +152,11 @@ private:
         return result;
     }
     void UpdateFlags() noexcept {
-        flags_ = (idle_expired_ ? kIdleMask : 0) | (read_expired_ ? kReadMask : 0) |
-                 (write_expired_ ? kWriteMask : 0) | (phase_expired_ ? kPhaseMask : 0);
+        flags_ = (idle_expired_ ? kIdleMask : 0) | (write_expired_ ? kWriteMask : 0) |
+                 (phase_expired_ ? kPhaseMask : 0);
     }
     [[nodiscard]] TimePoint Earliest() const noexcept {
-        return std::min({idle_deadline_, read_deadline_, write_deadline_, phase_deadline_});
+        return std::min({idle_deadline_, write_deadline_, phase_deadline_});
     }
     void Reconcile() {
         if (stopped_) return;
@@ -198,11 +186,10 @@ private:
         if (stopped_) return;
         const auto now = Clock::now();
         if (idle_deadline_ <= now) idle_expired_ = true;
-        if (read_deadline_ <= now) read_expired_ = true;
         if (write_deadline_ <= now) write_expired_ = true;
         if (phase_deadline_ <= now) phase_expired_ = true;
         UpdateFlags();
-        if (idle_expired_ || read_expired_ || write_expired_ || phase_expired_) {
+        if (idle_expired_ || write_expired_ || phase_expired_) {
             Stop();
             owner_.OnTimeout(common::ErrorCode::CANCELLED);
             return;
@@ -215,13 +202,13 @@ private:
     }
 
     Owner& owner_;
-    TimePoint idle_deadline_ = kNone, read_deadline_ = kNone, write_deadline_ = kNone, phase_deadline_ = kNone;
+    TimePoint idle_deadline_ = kNone, write_deadline_ = kNone, phase_deadline_ = kNone;
     TimePoint armed_deadline_ = kNone;
-    std::chrono::seconds idle_timeout_{0}, read_timeout_{0}, write_timeout_{0};
+    std::chrono::seconds idle_timeout_{0}, write_timeout_{0};
     uint32_t phase_generation_ = 0;
     uint8_t flags_ = 0;
     bool idle_enabled_ = false, read_pending_ = false, write_pending_ = false, stopped_ = false;
-    bool idle_expired_ = false, read_expired_ = false, write_expired_ = false, phase_expired_ = false;
+    bool idle_expired_ = false, write_expired_ = false, phase_expired_ = false;
 };
 
 template <class Socket>

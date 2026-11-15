@@ -6,7 +6,7 @@
 #include "app/user_store.hpp"
 #include "app/stats.hpp"
 #include "app/group_coordinator.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "common/allocator.hpp"
 #include "common/mux_codec.hpp"
 #include "proxy/mux/mux_server.hpp"
@@ -160,7 +160,13 @@ public:
         }
         co_return count;
     }
-    net::awaitable<size_t> AsyncWrite(net::const_buffer data) override {
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        for (const auto& data : buffers) {
+            if (data.size() != 0) co_await WriteBuffer(data);
+        }
+    }
+    // One physical write per non-empty buffer, so faults can target a frame.
+    net::awaitable<void> WriteBuffer(net::const_buffer data) {
         const auto* bytes = static_cast<const uint8_t*>(data.data());
         if (state_.synack_fault != 0 && data.size() == 7 && bytes[0] == 7) {
             ++state_.synack_faults;
@@ -188,7 +194,7 @@ public:
             }
         }
         state_.output.insert(state_.output.end(), bytes, bytes + data.size());
-        co_return data.size();
+        co_return;
     }
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         std::array<uint8_t, 8192> data{};
@@ -307,7 +313,7 @@ void RunCase(int mode, bool blocked_writes, bool mux) {
     domain.InstallUsers(updates);
     std::weak_ptr<const UserStore::AnyTlsCredential> old_table =
         UserStore::FindAnyTlsUser("lifecycle", hash);
-    common::UserOnlineTracker tracker(domain.Coordinator());
+    app::UserOnlineTracker tracker(domain.Coordinator());
     app::StatsShard stats;
     const AdmissionEnvironment environment{
         domain.Coordinator(), domain.Limiter(), tracker, stats};
@@ -463,7 +469,7 @@ void RunHandshakeCase(int mode) {
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"handshake", users}};
     domain.InstallUsers(updates);
-    common::UserOnlineTracker tracker(domain.Coordinator());
+    app::UserOnlineTracker tracker(domain.Coordinator());
     app::StatsShard stats;
     const AdmissionEnvironment environment{
         domain.Coordinator(), domain.Limiter(), tracker, stats};
@@ -623,7 +629,7 @@ void RunIdentityCase(int mode) {
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"identity", users}};
     domain.InstallUsers(updates);
-    common::UserOnlineTracker tracker(domain.Coordinator());
+    app::UserOnlineTracker tracker(domain.Coordinator());
     app::StatsShard stats;
     const AdmissionEnvironment environment{
         domain.Coordinator(), domain.Limiter(), tracker, stats};
@@ -786,7 +792,7 @@ void RunParsingCase(int mode) {
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"parsing", users}};
     execution.InstallUsers(updates);
-    common::UserOnlineTracker tracker(execution.Coordinator());
+    app::UserOnlineTracker tracker(execution.Coordinator());
     app::StatsShard stats;
     const AdmissionEnvironment environment{
         execution.Coordinator(), execution.Limiter(), tracker, stats};
@@ -898,7 +904,7 @@ void RunQueueCase(int mode, uint32_t seed = 0) {
     const UserSet users = PreparedAnyTlsUsers{user};
     const std::array updates{UserStore::UserUpdate{"queue", users}};
     domain.InstallUsers(updates);
-    common::UserOnlineTracker tracker(domain.Coordinator());
+    app::UserOnlineTracker tracker(domain.Coordinator());
     app::StatsShard stats;
     const AdmissionEnvironment environment{
         domain.Coordinator(), domain.Limiter(), tracker, stats};
@@ -1062,7 +1068,7 @@ void RunMuxUdpCase(int mode) {
     MuxUdpDispatcher dispatcher(io);
     dispatcher.pause = mode >= 2;
     app::StatsShard stats;
-    common::UserOnlineTracker tracker(domain.Coordinator());
+    app::UserOnlineTracker tracker(domain.Coordinator());
     const app::AdmissionEnvironment environment{
         domain.Coordinator(), domain.Limiter(), tracker, stats};
     app::ReceiverSettings receiver{

@@ -39,10 +39,9 @@ protected:
 
     auto Decode(const std::vector<uint8_t>& packet,
                 const UserStore::ShadowsocksUsersView& view,
-                const proxy::SsCipherInfo& cipher, proxy::Ss2022UdpReplayCache& replay,
-                bool deferred = false) {
+                const proxy::SsCipherInfo& cipher) {
         return proxy::DecodeUdpPacket(packet.data(), packet.size(), view,
-            cipher.type, cipher.key_size, cipher.salt_size, replay, deferred);
+            cipher.type, cipher.key_size, cipher.salt_size);
     }
 
     void ExpectUser(const proxy::SsUdpDecodeResult& decoded,
@@ -73,21 +72,24 @@ TEST_F(ShadowsocksUdpIdentity, EverySortedPositionAndGroupAuthenticates) {
             const auto users = Users(19, cipher, groups);
             Install(users);
             const auto view = UserStore::ShadowsocksUsers(kTag);
-            proxy::Ss2022UdpReplayCache replay;
+            UdpAssociations associations;
             // Visit every snapshot position, including each group's first,
             // middle and last hash; all users share session and packet IDs.
             for (size_t index = 0; index < view.size(); ++index) {
                 const auto& user = users[view[index].profile.user_id - 1];
                 auto packet = Packet(user, cipher);
-                auto decoded = Decode(packet, view, cipher, replay);
+                auto decoded = Decode(packet, view, cipher);
                 ASSERT_TRUE(decoded);
                 EXPECT_EQ(decoded->user_index, index);
                 if (groups == 0) EXPECT_EQ(view[index].profile.user_id, users[index].profile.user_id);
                 // The returned payload owns its storage, not the input packet.
                 std::fill(packet.begin(), packet.end(), 0);
                 ExpectUser(*decoded, view, user);
-                EXPECT_EQ(replay.Size(), index + 1);
-                EXPECT_FALSE(Decode(Packet(user, cipher), view, cipher, replay));
+                EXPECT_TRUE(associations.Commit(*decoded));
+                EXPECT_EQ(associations.Size(), index + 1);
+                auto replayed = Decode(Packet(user, cipher), view, cipher);
+                ASSERT_TRUE(replayed);
+                EXPECT_FALSE(associations.Commit(*replayed));
             }
         }
     }
@@ -104,19 +106,14 @@ TEST_F(ShadowsocksUdpIdentity, HashCollisionsRequireFullPayloadAuthentication) {
             const auto packet = Packet(expected, cipher);
             Install(users);
             auto view = UserStore::ShadowsocksUsers(kTag);
-            proxy::Ss2022UdpReplayCache replay;
-            auto decoded = Decode(packet, view, cipher, replay, true);
+            auto decoded = Decode(packet, view, cipher);
             ASSERT_TRUE(decoded);
             ExpectUser(*decoded, view, expected);
-            EXPECT_EQ(replay.Size(), 0u);
 
             users.erase(users.begin() + chosen);
             Install(users);
             view = UserStore::ShadowsocksUsers(kTag);
-            for (bool deferred : {false, true}) {
-                EXPECT_FALSE(Decode(packet, view, cipher, replay, deferred));
-                EXPECT_EQ(replay.Size(), 0u);
-            }
+            EXPECT_FALSE(Decode(packet, view, cipher));
         }
     }
 }
@@ -129,15 +126,16 @@ TEST_F(ShadowsocksUdpIdentity, MixedIdentityAndNonidentityCredentialsAuthenticat
         std::reverse(users.begin(), users.end());
         Install(users);
         const auto view = UserStore::ShadowsocksUsers(kTag);
-        proxy::Ss2022UdpReplayCache replay;
+        UdpAssociations associations;
         for (const auto& user : users) {
             const auto packet = Packet(user, cipher);
-            auto decoded = Decode(packet, view, cipher, replay);
+            auto decoded = Decode(packet, view, cipher);
             ASSERT_TRUE(decoded);
             ExpectUser(*decoded, view, user);
-            EXPECT_FALSE(Decode(packet, view, cipher, replay));
+            EXPECT_TRUE(associations.Commit(*decoded));
+            EXPECT_FALSE(associations.Commit(*decoded));
         }
-        EXPECT_EQ(replay.Size(), users.size());
+        EXPECT_EQ(associations.Size(), users.size());
     }
 }
 
@@ -156,57 +154,54 @@ TEST_F(ShadowsocksUdpIdentity, RetiredSnapshotKeepsItsOwnCredentialsAndOrdering)
     Install(users);
     const auto new_view = UserStore::ShadowsocksUsers(kTag);
     UserStore::ClearWorkerView();
-    proxy::Ss2022UdpReplayCache replay;
-    EXPECT_FALSE(Decode(old_packet, new_view, cipher, replay));
-    EXPECT_EQ(replay.Size(), 0u);
-    auto old_decoded = Decode(old_packet, old_view, cipher, replay);
+    UdpAssociations associations;
+    EXPECT_FALSE(Decode(old_packet, new_view, cipher));
+    auto old_decoded = Decode(old_packet, old_view, cipher);
     ASSERT_TRUE(old_decoded);
     ExpectUser(*old_decoded, old_view, retired);
+    EXPECT_TRUE(associations.Commit(*old_decoded));
     const auto replacement = std::find_if(users.begin(), users.end(), [&](const auto& user) {
         return user.profile.user_id == retired.profile.user_id;
     });
     ASSERT_NE(replacement, users.end());
     const auto new_packet = Packet(*replacement, cipher);
-    EXPECT_FALSE(Decode(new_packet, old_view, cipher, replay));
-    auto new_decoded = Decode(new_packet, new_view, cipher, replay);
+    EXPECT_FALSE(Decode(new_packet, old_view, cipher));
+    auto new_decoded = Decode(new_packet, new_view, cipher);
     ASSERT_TRUE(new_decoded);
     ExpectUser(*new_decoded, new_view, *replacement);
-    EXPECT_EQ(replay.Size(), 2u);
-    EXPECT_FALSE(Decode(old_packet, old_view, cipher, replay));
-    EXPECT_FALSE(Decode(new_packet, new_view, cipher, replay));
+    EXPECT_TRUE(associations.Commit(*new_decoded));
+    EXPECT_EQ(associations.Size(), 2u);
+    EXPECT_FALSE(associations.Commit(*old_decoded));
+    EXPECT_FALSE(associations.Commit(*new_decoded));
 }
 
-TEST_F(ShadowsocksUdpIdentity, DeferredAndInvalidAuthenticationLeaveReplayUntouched) {
+TEST_F(ShadowsocksUdpIdentity, AuthenticationAloneLeavesAssociationReplayUntouched) {
     const auto cipher = *proxy::ParseCipherMethod("2022-blake3-aes-256-gcm");
     const auto users = Users(17, cipher, 3);
     Install(users);
     const auto view = UserStore::ShadowsocksUsers(kTag);
     const auto& user = users[view[view.size() - 1].profile.user_id - 1];
-    proxy::Ss2022UdpReplayCache replay;
+    UdpAssociations associations;
     for (uint64_t packet_id : {0u, 1u}) {
         const auto packet = Packet(user, cipher, packet_id);
         auto invalid = packet;
         invalid.back() ^= 1;
-        for (bool deferred : {false, true}) {
-            EXPECT_FALSE(Decode(invalid, view, cipher, replay, deferred));
-            EXPECT_EQ(replay.Size(), packet_id == 0 ? 0u : 1u);
-        }
+        EXPECT_FALSE(Decode(invalid, view, cipher));
         for (size_t attempt = 0; attempt < 2; ++attempt) {
-            auto authenticated = Decode(packet, view, cipher, replay, true);
+            auto authenticated = Decode(packet, view, cipher);
             ASSERT_TRUE(authenticated);
             ExpectUser(*authenticated, view, user, packet_id);
-            EXPECT_EQ(replay.Size(), packet_id == 0 ? 0u : 1u);
         }
-        auto accepted = Decode(packet, view, cipher, replay);
+        auto accepted = Decode(packet, view, cipher);
         ASSERT_TRUE(accepted);
         ExpectUser(*accepted, view, user, packet_id);
-        EXPECT_EQ(replay.Size(), 1u);
-        EXPECT_FALSE(Decode(packet, view, cipher, replay));
-        auto deferred_replay = Decode(packet, view, cipher, replay, true);
-        ASSERT_TRUE(deferred_replay);
-        ExpectUser(*deferred_replay, view, user, packet_id);
-        EXPECT_EQ(replay.Size(), 1u);
-        EXPECT_FALSE(Decode(packet, view, cipher, replay));
+        EXPECT_TRUE(associations.Commit(*accepted));
+        EXPECT_EQ(associations.Size(), 1u);
+        auto replayed = Decode(packet, view, cipher);
+        ASSERT_TRUE(replayed);
+        ExpectUser(*replayed, view, user, packet_id);
+        EXPECT_FALSE(associations.Commit(*replayed));
+        EXPECT_EQ(associations.Size(), 1u);
     }
 }
 } // namespace

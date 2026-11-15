@@ -57,7 +57,7 @@ class AnyTLSSubStream final
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
-    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+    common::CancellationSource& Cancellation() noexcept override { return cancellation_; }
     transport::EofAction ReadEofAction() const noexcept override { return transport::EofAction::CloseLink; }
     bool WriteShutdownClosesLink() const noexcept override { return true; }
 
@@ -175,7 +175,7 @@ public:
     net::awaitable<void> AsyncShutdownWrite() override;
 
 private:
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
 
     void WakeInputReader() noexcept {
         (void)input_signal_.try_send(IoErrorCode{});
@@ -235,14 +235,14 @@ public:
             pinned_sub = FindStream(sid);
             sub = pinned_sub.get();
         }
-        struct WriteCancelSubscription final : transport::CancellationSubscription {
+        struct WriteCancelSubscription final : common::CancellationSubscription {
             transport::AsyncWriteGate& gate;
             transport::AsyncStream* stream = nullptr;
             net::cancellation_signal gate_cancel;
             bool writing = false;
             explicit WriteCancelSubscription(transport::AsyncWriteGate& g) noexcept
                 : gate(g) {}
-            void OnCancellation(transport::Cancellation) noexcept override {
+            void OnCancellation(common::Cancellation) noexcept override {
                 if (!writing) gate_cancel.emit(net::cancellation_type::terminal);
                 else if (stream) stream->Cancel();
             }
@@ -875,7 +875,7 @@ net::awaitable<tl::expected<void, common::ErrorCode>> ReadAuth(
     co_return tl::expected<void, common::ErrorCode>{};
 }
 
-net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>>
+net::awaitable<tl::expected<app::UserOnlineSessionGuard, common::ErrorCode>>
 AuthenticateSession(
     transport::AsyncStream& stream,
     const app::AdmissionEnvironment& environment,
@@ -895,7 +895,6 @@ AuthenticateSession(
     auto user = app::UserStore::FindAnyTlsUser(ctx.inbound.tag, auth_hash);
     OPENSSL_cleanse(auth_hash.data(), auth_hash.size());
     if (!user) co_return tl::unexpected(co_await authentication.RejectCredential("no matching credential"));
-    stream.SetReadTimeout(std::chrono::seconds(0));
     stream.SetWriteTimeout(
         std::min(timeouts.WriteTimeout(), control_idle_timeout));
 
@@ -931,7 +930,7 @@ AnyTlsInboundHandler::Process(
                 std::chrono::seconds(pressure_idle_timeout));
         }
 
-        common::UserOnlineSessionGuard user_session;
+        app::UserOnlineSessionGuard user_session;
         {
             auto auth = co_await AuthenticateSession(
                 *stream, environment_, ctx, timeouts, control_idle_timeout);

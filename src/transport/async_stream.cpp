@@ -68,26 +68,9 @@ net::awaitable<void> AsyncStream::WriteMultiBuffer(common::MultiBuffer mb) {
     mb.clear();
 }
 
-net::awaitable<void> AsyncStream::WriteBuffers(
-    std::span<const net::const_buffer> buffers) {
-
-    for (const auto& buffer : buffers) {
-        if (buffer.size() == 0) {
-            continue;
-        }
-        co_await AsyncWrite(buffer);
-    }
-}
-
 void AsyncStream::SetIdleTimeout(std::chrono::seconds timeout) {
     if (auto* tcp = BaseTcpStream()) {
         tcp->SetIdleTimeout(timeout);
-    }
-}
-
-void AsyncStream::SetReadTimeout(std::chrono::seconds timeout) {
-    if (auto* tcp = BaseTcpStream()) {
-        tcp->SetReadTimeout(timeout);
     }
 }
 
@@ -139,7 +122,7 @@ void AsyncStream::PrependReadMultiBuffer(common::MultiBuffer&& mb) {
 
 }  // namespace transport
 
-transport::CancellationSource& transport::AsyncStream::Cancellation() noexcept {
+common::CancellationSource& transport::AsyncStream::Cancellation() noexcept {
     if (LogicalPhaseDeadline()) return cancellation_;
     if (auto* tcp = BaseTcpStream(); tcp && static_cast<transport::AsyncStream*>(tcp) != this)
         return tcp->Cancellation();
@@ -151,11 +134,6 @@ namespace transport {
 bool AsyncStream::ConsumeIdleTimeout() noexcept {
     auto* tcp = BaseTcpStream();
     return tcp && tcp->ConsumeIdleTimeout();
-}
-
-bool AsyncStream::ConsumeReadTimeout() noexcept {
-    auto* tcp = BaseTcpStream();
-    return tcp && tcp->ConsumeReadTimeout();
 }
 
 bool AsyncStream::ConsumeWriteTimeout() noexcept {

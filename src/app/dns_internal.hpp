@@ -8,7 +8,6 @@
 #include "common/ascii.hpp"
 #include "common/awaitable_task_group.hpp"
 #include "common/byte_reader.hpp"
-#include "common/clock.hpp"
 #include "transport/timeout_scheduler.hpp"
 #include <asio/as_tuple.hpp>
 #include <asio/experimental/channel.hpp>
@@ -67,7 +66,7 @@ public:
             return std::nullopt;
         }
         const auto node = found->second;
-        const auto now = common::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
         if (now >= node->entry.expire_time) {
             if (std::holds_alternative<std::string>(node->entry.answer)) {
                 // Keep only bounded recovery metadata, never serve an expired
@@ -134,7 +133,7 @@ public:
                 result.error_msg.data(), result.error_msg.size());
         }
         const uint32_t ttl = result.ttl == 0 ? 0 : std::clamp(result.ttl, min_ttl_, max_ttl_);
-        prepared.expire_time = common::steady_clock::now() + std::chrono::seconds(ttl);
+        prepared.expire_time = std::chrono::steady_clock::now() + std::chrono::seconds(ttl);
 
         if (existing != entries_.end()) {
             const auto node = existing->second;
@@ -184,7 +183,7 @@ private:
         DnsCacheEntry() = default;
         std::variant<std::vector<net::ip::address>,
                      std::string> answer;
-        common::time_point expire_time;
+        std::chrono::steady_clock::time_point expire_time;
         uint64_t negative_hits = 0;
         bool expired_negative = false;
     };
@@ -541,7 +540,7 @@ class InflightResolves {
         common::SignalChannel completion;
         std::optional<DnsResult> result;
         std::exception_ptr failure;
-        transport::CancellationSource cancellation;
+        common::CancellationSource cancellation;
         size_t waiters = 0;
     };
     using PendingPtr = std::shared_ptr<Pending>;
@@ -605,7 +604,7 @@ public:
             pending->result->error = common::ErrorCode::CANCELLED;
             pending->completion.close();
         }
-        tasks_.Tasks().Cancel();
+        tasks_.Cancel();
     }
 
     net::awaitable<void> AsyncJoin() {
@@ -633,7 +632,7 @@ public:
             table_.emplace(std::string_view(pending->domain), pending);
             ++active_;
             try {
-                tasks_.Tasks().Spawn(Execute(pending, std::move(query)), &pending->cancellation);
+                tasks_.Spawn(Execute(pending, std::move(query)), &pending->cancellation);
             } catch (...) {
                 --active_;
                 Remove(*pending);

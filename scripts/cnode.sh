@@ -376,7 +376,6 @@ ${DNS_SERVERS_LINE}    "timeout": 5,
   "timeouts": {
     "handshake": 60,
     "dial": 10,
-    "read": 15,
     "write": 30,
     "connIdle": 300
   },

@@ -55,7 +55,8 @@ public:
         const app::ReceiverSettings&, net::io_context&,
         common::Context&, const infra::TimeoutsConfig&, uint32_t) override {
         const std::array<char, 1> admitted{'A'};
-        co_await stream->AsyncWrite(net::buffer(admitted));
+        const net::const_buffer admitted_buffer = net::buffer(admitted);
+        co_await stream->WriteBuffers({&admitted_buffer, 1});
         std::array<char, 1> input{};
         while (co_await stream->AsyncRead(net::buffer(input)) != 0) {}
         co_return app::RelayResult{};
@@ -245,7 +246,6 @@ void ExerciseWorkers(app::DNSWorker& dns, uint32_t global, uint32_t per_ip,
                 config.limits.max_connections = global;
                 config.limits.max_connections_per_ip = per_ip;
                 config.timeouts.idle = 0;
-                config.timeouts.read = 0;
                 auto worker = std::make_unique<app::Worker>(id, io, config, stats, dns, coordinator);
                 net::co_spawn(io, Exercise(io, *worker, state, ready, limited, replace_handler),
                     [&](std::exception_ptr error) { failures[id] = error; });

@@ -9,7 +9,7 @@
 #include "app/inbound_handler.hpp"
 #include "app/request_load.hpp"
 #include "app/stats.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "common/session.hpp"
 #include "common/target_address.hpp"
 #include "routing/dispatcher.hpp"
@@ -83,11 +83,11 @@ struct ReenterOnCancel {
     }
 };
 
-struct ReentryCancellation final : ::transport::CancellationSubscription {
+struct ReentryCancellation final : ::common::CancellationSubscription {
     explicit ReentryCancellation(ReenterOnCancel& owner) noexcept : owner(owner) {}
     ReenterOnCancel& owner;
 private:
-    void OnCancellation(::transport::Cancellation) noexcept override {
+    void OnCancellation(::common::Cancellation) noexcept override {
         owner.Cancel();
     }
 };
@@ -175,7 +175,7 @@ struct DatagramSource {
     }
     WorkerCoordinatorFixture coordinator;
     std::shared_ptr<::app::ConnectionLimiter> limiter;
-    ::common::UserOnlineTracker online_users;
+    ::app::UserOnlineTracker online_users;
     DatagramDispatcher dispatcher;
     ::app::StatsShard stats;
     const ::app::AdmissionEnvironment admission{

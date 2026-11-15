@@ -105,8 +105,7 @@ size_t EncodePacketAddrHeaderTo(const common::TargetAddress& target,
         out[0] = 0x01;
         const auto bytes = target.resolved_addr->to_v4().to_bytes();
         std::memcpy(out + 1, bytes.data(), bytes.size());
-        out[5] = static_cast<uint8_t>(target.port >> 8);
-        out[6] = static_cast<uint8_t>(target.port);
+        common::StoreU16BE(out + 5, target.port);
         return kPacketAddrV4HeaderSize;
     }
     if (target.resolved_addr->is_v6()) {
@@ -116,8 +115,7 @@ size_t EncodePacketAddrHeaderTo(const common::TargetAddress& target,
         out[0] = 0x02;
         const auto bytes = target.resolved_addr->to_v6().to_bytes();
         std::memcpy(out + 1, bytes.data(), bytes.size());
-        out[17] = static_cast<uint8_t>(target.port >> 8);
-        out[18] = static_cast<uint8_t>(target.port);
+        common::StoreU16BE(out + 17, target.port);
         return kPacketAddrV6HeaderSize;
     }
     return 0;
@@ -173,8 +171,7 @@ size_t EncodeRequiredUdpHeaderTo(const common::TargetAddress& target,
         throw transport::LinkError(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
 
     const size_t frame_payload_size = address_size + payload_size;
-    out[0] = static_cast<uint8_t>(frame_payload_size >> 8);
-    out[1] = static_cast<uint8_t>(frame_payload_size);
+    common::StoreU16BE(out.data(), static_cast<uint16_t>(frame_payload_size));
     if (address_size > 0) {
         std::memcpy(out.data() + 2, address.data(), address_size);
     }

@@ -24,7 +24,6 @@
   "timeouts": {
     "handshake": 60,
     "dial": 10,
-    "read": 15,
     "write": 30,
     "connIdle": 300
   },

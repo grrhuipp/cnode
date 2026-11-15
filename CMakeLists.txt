@@ -107,7 +107,6 @@ set(CNODE_CORE_SOURCES
     # Common
     src/common/rule.cpp
     src/common/session.cpp
-    src/common/user_online_tracker.cpp
     src/common/mux_codec.cpp
 
     # Geo & Sniff
@@ -118,6 +117,7 @@ set(CNODE_CORE_SOURCES
     src/app/dns.cpp
     src/app/default_dispatcher.cpp
     src/app/udp_flow_dispatcher.cpp
+    src/app/user_online_tracker.cpp
     src/app/session_tracking.cpp
     src/app/rate_limiter.cpp
     src/app/relay.cpp
@@ -287,7 +287,7 @@ target_link_options(cnode_shadowsocks_stream_crypto_test PRIVATE
 foreach(target IN ITEMS cnode_anytls_outbound_lifecycle_test cnode_anytls_padding_test
                         cnode_xhttp_upload_stream_slot_test
                         cnode_awaitable_batch_test cnode_awaitable_task_group_test
-                        cnode_cancellation_source_test cnode_dns_inflight_test cnode_grpc_hunk_test
+                        cnode_dns_inflight_test cnode_grpc_hunk_test
                         cnode_timeout_scheduler_test
                         cnode_udp_socket_owner_test
                         cnode_user_store_batch_test)

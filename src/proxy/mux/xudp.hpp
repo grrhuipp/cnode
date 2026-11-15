@@ -135,7 +135,7 @@ public:
     // True once the flow took the attachment; false when it refused it or
     // `cancellation` (the sub-session's) fired first.
     [[nodiscard]] net::awaitable<bool> AwaitAttached(
-        const Attachment& attachment, transport::CancellationSource& cancellation);
+        const Attachment& attachment, common::CancellationSource& cancellation);
     void SendUplink(const Attachment& attachment, common::MultiBuffer datagram) noexcept;
     // The sub-session ends: tells the flow Worker unless it detached first.
     void Close(const Attachment& attachment) noexcept;

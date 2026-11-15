@@ -2,13 +2,14 @@
 
 #include "app/inbound_handler.hpp"
 #include "app/session_owner_directory.hpp"
+#include "app/udp_session_relay.hpp"
 #include "common/allocator.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/error.hpp"
 #include "common/hash.hpp"
 #include "common/ip_address.hpp"
 #include "common/session.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/inbound.hpp"
@@ -46,7 +47,6 @@ namespace app {
 struct ReceiverSettings;
 
 class UdpIngress;
-class UdpSessionRelay;
 struct UdpSocketState;
 using UdpSocketStatePtr = std::shared_ptr<UdpSocketState>;
 
@@ -54,7 +54,7 @@ struct ClientSessionKey final {
     ClientSessionKey(proxy::InboundDatagramOwner authenticated_owner,
                      std::optional<uint64_t> protocol_session_id,
                      udp::endpoint client_endpoint = {},
-                     const void* configuration_identity = nullptr) noexcept
+                     const PreparedInboundSettings* configuration_identity = nullptr) noexcept
         : owner(authenticated_owner), session_id(protocol_session_id),
           endpoint(protocol_session_id ? udp::endpoint{} :
               udp::endpoint(common::NormalizeAddress(client_endpoint.address()), client_endpoint.port())),
@@ -68,7 +68,7 @@ struct ClientSessionKey final {
     proxy::InboundDatagramOwner owner;
     std::optional<uint64_t> session_id;
     udp::endpoint endpoint;
-    const void* configuration = nullptr;
+    const PreparedInboundSettings* configuration = nullptr;
 };
 
 struct ClientSessionKeyHash final {
@@ -509,14 +509,9 @@ private:
     struct RemoteRoute {
         SessionOwner owner;
     };
-    struct RouteKeyHash {
-        [[nodiscard]] size_t operator()(const std::pair<uint32_t, uint64_t>& key) const noexcept {
-            return static_cast<size_t>(common::Mix64(key.second ^ (uint64_t{key.first} << 56)));
-        }
-    };
     // Sessions other Workers run, with the reverse index their Gone uses.
     std::unordered_map<UdpHandoffIdentity, RemoteRoute, UdpHandoffIdentityHash> remote_routes_;
-    std::unordered_map<std::pair<uint32_t, uint64_t>, UdpHandoffIdentity, RouteKeyHash>
+    std::unordered_map<std::pair<uint32_t, uint64_t>, UdpHandoffIdentity, UdpRouteKeyHash>
         remote_route_keys_;
     std::unordered_map<UdpHandoffIdentity, std::unique_ptr<PendingSessionClaim>,
                        UdpHandoffIdentityHash> pending_claims_;
@@ -570,7 +565,7 @@ class UdpIngress::ClientSession final
     : public transport::MultiBufferReader,
       public transport::MultiBufferWriter {
 public:
-    transport::CancellationSource& Cancellation() noexcept override;
+    common::CancellationSource& Cancellation() noexcept override;
 
     ClientSession(net::io_context& io_context,
                   ReplyRoute reply,
@@ -640,7 +635,7 @@ private:
     bool closed_ = false;
     common::ErrorCode terminal_error_ = common::ErrorCode::OK;
     ::proxy::InboundDatagramOwner session_owner_;
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
     std::optional<SessionDispatchState> request_;
     ClientSession* job_previous_ = nullptr;
     ClientSession* job_next_ = nullptr;

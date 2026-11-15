@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -59,7 +60,7 @@ size_t ConfiguredIterations(size_t fallback = 2048) {
 
 class MemoryLoopStream final : public transport::AsyncStream {
 public:
-    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+    common::CancellationSource& Cancellation() noexcept override { return cancellation_; }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
         const size_t n = pending_.ConsumePrefixTo(
@@ -67,19 +68,12 @@ public:
         co_return n;
     }
 
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        const auto span = std::span(
-            static_cast<const uint8_t*>(buffer.data()), buffer.size());
-        Require(pending_.AppendSpan(span));
-        co_return buffer.size();
-    }
-
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         co_return std::move(pending_);
     }
 
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
-        pending_.AppendAndCoalesce(std::move(mb));
+        mb.MoveTo(pending_);
         co_return;
     }
 
@@ -102,7 +96,7 @@ public:
 
 private:
     common::MultiBuffer pending_;
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
 };
 
 template <typename StepFn>
@@ -329,7 +323,12 @@ TEST(ProtocolCodecBenchmark, HysteriaV1AndV2WireCodec) {
              std::pair{"v1_udp_1200b", transport::HysteriaVersion::V1},
              std::pair{"v2_udp_1200b", transport::HysteriaVersion::V2}}) {
         RunBenchCase("hysteria", name, udp_payload.size(), iterations, [&] {
-            auto encoded = transport::EncodeUdpMessage(ver, message);
+            std::optional<common::AddressText> address_storage;
+            const auto text = transport::PrepareUdpTargetText(ver, message.target, address_storage);
+            Require(text.has_value(), "Hysteria UDP target format failed");
+            const auto header_size = transport::UdpTargetHeaderSize(ver, *text);
+            Require(header_size.has_value(), "Hysteria UDP header size failed");
+            auto encoded = transport::EncodeUdpFragment(ver, message, *text, *header_size);
             Require(encoded.has_value(), "Hysteria UDP encode failed");
             auto decoded = transport::ParseUdpMessage(ver, *encoded);
             Require(decoded.has_value() && decoded->payload.size() == udp_payload.size(),

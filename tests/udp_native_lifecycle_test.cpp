@@ -11,7 +11,7 @@
 #include "app/inbound_handler.hpp"
 #include "app/request_load.hpp"
 #include "app/stats.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "common/session.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
@@ -90,11 +90,11 @@ private:
 };
 
 class GateDispatcher final : public ::routing::Dispatcher {
-    struct RequestCancellation final : ::transport::CancellationSubscription {
+    struct RequestCancellation final : ::common::CancellationSubscription {
         explicit RequestCancellation(GateDispatcher& owner) noexcept : owner(owner) {}
         GateDispatcher& owner;
     private:
-        void OnCancellation(::transport::Cancellation) noexcept override {
+        void OnCancellation(::common::Cancellation) noexcept override {
             ++owner.cancellations;
             if (owner.reenter_stop && !owner.stop_reentered) {
                 owner.stop_reentered = true;
@@ -210,7 +210,7 @@ protected:
     WorkerCoordinatorFixture coordinator{io};
     std::shared_ptr<::app::ConnectionLimiter> limiter =
         ::app::ConnectionLimiter::Acquire({}, coordinator.Get());
-    ::common::UserOnlineTracker tracker{*coordinator.Get()};
+    ::app::UserOnlineTracker tracker{*coordinator.Get()};
     ::app::StatsShard stats;
     const ::app::AdmissionEnvironment admission{
         *coordinator.Get(), *limiter, tracker, stats};
@@ -579,11 +579,11 @@ protected:
     WorkerCoordinatorFixture coordinator{io};
     std::shared_ptr<::app::ConnectionLimiter> limiter =
         ::app::ConnectionLimiter::Acquire({}, coordinator.Get());
-    ::common::UserOnlineTracker tracker{*coordinator.Get()};
+    ::app::UserOnlineTracker tracker{*coordinator.Get()};
     ::app::StatsShard stats{};
     const ::app::AdmissionEnvironment admission{
         *coordinator.Get(), *limiter, tracker, stats};
-    const int configuration = 1, other_configuration = 2;
+    const ::app::PreparedInboundSettings configuration, other_configuration;
     const ::udp::endpoint first{::net::ip::address_v4::loopback(), 48234};
     const ::udp::endpoint second{::net::ip::address_v4::loopback(), 48235};
     const ::common::TargetAddress target{"127.0.0.1", 53};

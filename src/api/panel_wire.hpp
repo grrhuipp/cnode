@@ -76,11 +76,11 @@ struct OnlineReportPayload {
 ExtractBlockDetectRules(const infra::object& config);
 
 [[nodiscard]] tl::expected<std::vector<UserInfo>, std::string>
-ParseUserList(const infra::object& source);
-[[nodiscard]] tl::expected<std::vector<UserInfo>, std::string>
 ParseUserList(infra::object&& source);
+// Precondition: devices are valid (UID > 0, non-empty IP), strictly ascending
+// by (UID, IP), as controller::BuildOnlineSnapshot produces.
 [[nodiscard]] OnlineReportPayload BuildOnlineReportPayload(
-    std::span<const OnlineUser> online_devices,
+    std::span<const OnlineUser> devices,
     int node_id);
 
 }  // namespace api

@@ -22,7 +22,6 @@
 #include <vector>
 
 namespace {
-namespace net = ::net;
 using namespace std::chrono_literals;
 
 constexpr uint32_t kDefaultWindow = 65535;
@@ -233,7 +232,8 @@ TEST(Http2FlowControl, ClientWaitsForPeerWindows) {
         auto result = co_await ::transport::BuildOutboundTransport(std::move(raw), settings, nullptr);
         if (!result || !*result) throw std::runtime_error("gRPC client handshake failed");
         stream = std::move(*result);
-        (void)co_await stream->AsyncWrite(net::buffer(payload));
+        const net::const_buffer buffer = net::buffer(payload);
+        co_await stream->WriteBuffers({&buffer, 1});
         written = true;
     };
     net::co_spawn(io, client(), [&](std::exception_ptr error) {
@@ -286,7 +286,8 @@ struct ParkedWriterClient {
             auto result = co_await ::transport::BuildOutboundTransport(std::move(raw), settings, nullptr);
             if (!result || !*result) throw std::runtime_error("gRPC client handshake failed");
             stream = std::move(*result);
-            (void)co_await stream->AsyncWrite(net::buffer(payload));
+            const net::const_buffer buffer = net::buffer(payload);
+            co_await stream->WriteBuffers({&buffer, 1});
         };
         net::co_spawn(io, std::move(client), [this](std::exception_ptr error) {
             writer_failure = error;
@@ -422,7 +423,8 @@ public:
         std::unique_ptr<::transport::AsyncStream> stream,
         ::transport::InboundTransportMetadata) override {
         try {
-            (void)co_await stream->AsyncWrite(net::buffer(payload));
+            const net::const_buffer buffer = net::buffer(payload);
+            co_await stream->WriteBuffers({&buffer, 1});
             written = true;
         } catch (const ::IoSystemError&) {
         }

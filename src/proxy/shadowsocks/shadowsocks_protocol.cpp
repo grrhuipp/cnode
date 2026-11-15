@@ -1,9 +1,9 @@
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
+#include "proxy/blake3.hpp"
 #include "common/scoped_cleanse.hpp"
 
 #include "common/constants.hpp"
 #include "transport/http_headers.hpp"
-#include <blake3.h>
 #include <openssl/base64.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -239,12 +239,10 @@ bool Derive2022ContextKey(const char* context,
         salt_size == 0 || salt_size > KeyBytes::kMaxSize) {
         return false;
     }
-    blake3_hasher hasher;
-    blake3_hasher_init_derive_key(&hasher, context);
-    blake3_hasher_update(&hasher, key, key_size);
-    blake3_hasher_update(&hasher, salt, salt_size);
-    blake3_hasher_finalize(&hasher, out_key, key_size);
-    OPENSSL_cleanse(&hasher, sizeof(hasher));
+    Blake3DeriveKey(context,
+                    {std::span<const uint8_t>(key, key_size),
+                     std::span<const uint8_t>(salt, salt_size)},
+                    std::span<uint8_t>(out_key, key_size));
     return true;
 }
 
@@ -268,11 +266,7 @@ bool Hash2022Psk(std::span<const uint8_t> key, std::span<uint8_t, 16> out_hash) 
     if (key.empty()) {
         return false;
     }
-    blake3_hasher hasher;
-    blake3_hasher_init(&hasher);
-    blake3_hasher_update(&hasher, key.data(), key.size());
-    blake3_hasher_finalize(&hasher, out_hash.data(), out_hash.size());
-    OPENSSL_cleanse(&hasher, sizeof(hasher));
+    Blake3Digest(key, out_hash);
     return true;
 }
 

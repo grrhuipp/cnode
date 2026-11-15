@@ -20,7 +20,6 @@
 #include <utility>
 
 namespace {
-namespace net = ::net;
 using namespace std::chrono_literals;
 constexpr size_t kStreamWindow = 4 * 1024 * 1024;
 constexpr size_t kConnectionWindow = 8 * 1024 * 1024;

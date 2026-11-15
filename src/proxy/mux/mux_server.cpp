@@ -284,7 +284,7 @@ struct ClientReadQueueState {
             return false;
         }
         if (!queue.empty()) {
-            queue.back().payload.AppendAndCoalesce(std::move(mb));
+            mb.MoveTo(queue.back().payload);
             queue.back().bytes += bytes;
         } else {
             queue.emplace_back(std::move(mb), bytes);
@@ -338,7 +338,7 @@ class MuxSubSession
     : public transport::MultiBufferReader
     , public transport::MultiBufferWriter {
 public:
-    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+    common::CancellationSource& Cancellation() noexcept override { return cancellation_; }
 
     MuxSubSession(const MuxSubSession&) = delete;
     MuxSubSession& operator=(const MuxSubSession&) = delete;
@@ -362,10 +362,6 @@ public:
         common::MultiBuffer mb,
         size_t data_len,
         const common::TargetAddress* packet_target = nullptr) = 0;
-
-    [[nodiscard]] bool DispatchDone() const noexcept {
-        return dispatch_done_;
-    }
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         while (!cancelled_) {
@@ -497,7 +493,7 @@ protected:
     // frames once all sub-sessions together hold kMuxQueueHighWaterBytes.
     void QueueInput(common::MultiBuffer mb, size_t bytes, bool coalesce = false) {
         if (coalesce && !input_queue_.empty()) {
-            input_queue_.back().payload.AppendAndCoalesce(std::move(mb));
+            mb.MoveTo(input_queue_.back().payload);
             input_queue_.back().bytes += bytes;
         } else {
             input_queue_.emplace_back(std::move(mb), bytes);
@@ -545,7 +541,7 @@ private:
     MuxSubSession* next_waiting_writer_ = nullptr;
     bool waiting_in_reply_queue_ = false;
     friend struct ReplyQueueState;
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
     common::RingDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
     common::ErrorCode terminal_error_ = common::ErrorCode::CANCELLED;
@@ -913,7 +909,6 @@ public:
             relay_idle_timeout, std::chrono::seconds(pressure_idle_timeout));
     }
     client_control.SetIdleTimeout(relay_idle_timeout);
-    client_control.SetReadTimeout(std::chrono::seconds(0));
     client_control.SetWriteTimeout(
         std::min(timeouts.WriteTimeout(), relay_idle_timeout));
         parent_ctx.traffic.bytes_up = 0;
@@ -970,7 +965,7 @@ private:
                 common::ErrorCode ec = client_reads.running
                     ? transport::ClassifyFailure(std::current_exception(), common::ErrorCode::INTERNAL)
                     : common::ErrorCode::OK;
-                if (transport::ConsumeReadSideTimeout(client_control)) {
+                if (client_control.ConsumeIdleTimeout()) {
                     ec = common::ErrorCode::RELAY_TIMEOUT;
                 }
                 client_reads.MarkDone(ec);
@@ -1146,7 +1141,7 @@ private:
                 if (read_bytes > 0) {
                     parent_ctx.traffic.bytes_up += read_bytes;
                     result.bytes_up += read_bytes;
-                    frame_buf.AppendAndCoalesce(std::move(read_mb));
+                    read_mb.MoveTo(frame_buf);
                 } else {
                     read_mb.clear();
                 }

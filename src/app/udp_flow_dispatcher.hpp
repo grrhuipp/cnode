@@ -28,21 +28,18 @@ struct StatsShard;
 // Splits one authenticated UDP protocol association into independently routed
 // logical flows. Protocol authentication/replay state stays with the caller;
 // each child owns its sniff, route, outbound and access-log lifecycle.
-class UdpFlowDispatcher final {
-public:
-    static net::awaitable<void> Run(
-        DefaultDispatcher& dispatcher,
-        net::io_context& io_context,
-        const routing::DispatchPolicy& policy,
-        std::unique_ptr<transport::AsyncStream> inbound,
-        transport::Link inbound_link,
-        common::InitialPayload first_packet,
-        common::Context& parent_context,
-        StatsShard& stats,
-        const infra::TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout,
-        RelayResult& result,
-        common::ErrorCode& cancellation_reason);
-};
+net::awaitable<void> DispatchUdpFlows(
+    DefaultDispatcher& dispatcher,
+    net::io_context& io_context,
+    const routing::DispatchPolicy& policy,
+    std::unique_ptr<transport::AsyncStream> inbound,
+    transport::Link inbound_link,
+    common::InitialPayload first_packet,
+    common::Context& parent_context,
+    StatsShard& stats,
+    const infra::TimeoutsConfig& timeouts,
+    uint32_t pressure_idle_timeout,
+    RelayResult& result,
+    common::ErrorCode& cancellation_reason);
 
 }  // namespace app

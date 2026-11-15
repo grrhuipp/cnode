@@ -2,7 +2,7 @@
 
 #include "transport/hysteria_ingress.hpp"
 #include "transport/timeout_scheduler.hpp"
-#include "transport/transport_build_result.hpp"
+#include "transport/transport_stack.hpp"
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
@@ -185,7 +185,7 @@ private:
     common::Context base_context_;
     common::SignalChannel physical_ready_;
     app::ConnectionLimiter::Reservation physical_reservation_;
-    std::optional<common::UserOnlineSessionGuard> online_session_;
+    std::optional<app::UserOnlineSessionGuard> online_session_;
     std::shared_ptr<InboundTransportStreamHandler> stream_sink_;
     std::unordered_map<uint64_t, PendingFragments> fragments_;
     ngtcp2_tstamp fragment_expiry_ = std::numeric_limits<ngtcp2_tstamp>::max();

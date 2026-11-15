@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/asio_types.hpp"
+#include "common/cancellation.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/error.hpp"
 
@@ -16,107 +17,10 @@ namespace transport {
 
 class AsyncStream;
 
-struct Cancellation {
-    common::ErrorCode reason;
-    bool terminal;
-};
-
-class CancellationSubscription;
-
-// Worker-local source with stable identity. Pending cancellation applies only
-// to registered work. Stop is permanent and is also delivered to later work.
-// Registration, notification and removal never allocate or post work.
-class CancellationSource {
-public:
-    CancellationSource() noexcept = default;
-    ~CancellationSource() noexcept;
-    CancellationSource(const CancellationSource&) = delete;
-    CancellationSource& operator=(const CancellationSource&) = delete;
-
-    void CancelPending(common::ErrorCode reason = common::ErrorCode::CANCELLED) noexcept;
-    void Stop(common::ErrorCode reason = common::ErrorCode::CANCELLED) noexcept;
-    [[nodiscard]] bool Stopped() const noexcept { return terminal_reason_ != common::ErrorCode::OK; }
-
-private:
-    friend class CancellationSubscription;
-    void Notify(Cancellation cancellation) noexcept;
-    CancellationSubscription* head_ = nullptr;
-    common::ErrorCode terminal_reason_ = common::ErrorCode::OK;
-};
-
-// One-shot listener embedded at a stable address. Derived state must be fully
-// initialized before Resubscribe: a stopped source delivers synchronously.
-class CancellationSubscription {
-public:
-    CancellationSubscription() noexcept = default;
-    CancellationSubscription(const CancellationSubscription&) = delete;
-    CancellationSubscription& operator=(const CancellationSubscription&) = delete;
-    CancellationSubscription(CancellationSubscription&&) = delete;
-    CancellationSubscription& operator=(CancellationSubscription&&) = delete;
-
-    // A transport composing multiple sources can listen for the next operation
-    // from inside its callback. The source's current batch remains detached.
-    void Resubscribe(CancellationSource& source) noexcept {
-        Unsubscribe();
-        if (source.terminal_reason_ != common::ErrorCode::OK) {
-            OnCancellation({source.terminal_reason_, true});
-            return;
-        }
-        next_ = source.head_;
-        previous_ = &source.head_;
-        if (next_) next_->previous_ = &next_;
-        source.head_ = this;
-    }
-
-    void Unsubscribe() noexcept {
-        if (!previous_) return;
-        *previous_ = next_;
-        if (next_) next_->previous_ = previous_;
-        previous_ = nullptr;
-        next_ = nullptr;
-    }
-
-protected:
-    ~CancellationSubscription() noexcept { Unsubscribe(); }
-    virtual void OnCancellation(Cancellation cancellation) noexcept = 0;
-
-private:
-    friend class CancellationSource;
-
-    CancellationSubscription* next_ = nullptr;
-    CancellationSubscription** previous_ = nullptr;
-};
-
-inline CancellationSource::~CancellationSource() noexcept {
-    while (head_) head_->Unsubscribe();
-}
-
-inline void CancellationSource::CancelPending(common::ErrorCode reason) noexcept {
-    Notify({terminal_reason_ == common::ErrorCode::OK ? reason : terminal_reason_, terminal_reason_ != common::ErrorCode::OK});
-}
-
-inline void CancellationSource::Stop(common::ErrorCode reason) noexcept {
-    if (terminal_reason_ != common::ErrorCode::OK) return;
-    terminal_reason_ = reason == common::ErrorCode::OK ? common::ErrorCode::CANCELLED : reason;
-    Notify({terminal_reason_, true});
-}
-
-inline void CancellationSource::Notify(Cancellation cancellation) noexcept {
-    // Detach the batch before delivery: callbacks may remove subscriptions,
-    // register later work, or notify reentrantly without invalidating iteration.
-    auto* batch = std::exchange(head_, nullptr);
-    if (batch) batch->previous_ = &batch;
-    while (batch) {
-        auto* subscription = batch;
-        subscription->Unsubscribe();
-        subscription->OnCancellation(cancellation);
-    }
-}
-
 // 把父协程取消槽与可选的连接取消源合流为一个本地信号，供单次异步等待绑定。
 // 驻留在等待协程帧内的稳定地址；析构先解除父槽，再由基类退订取消源。已停止的
 // 取消源在构造期间同步投递，调用方须在开始等待前检查 Cancelled()。
-class CancellationBridge final : private CancellationSubscription {
+class CancellationBridge final : private common::CancellationSubscription {
 public:
     explicit CancellationBridge(net::cancellation_slot parent) : parent_(parent) {
         if (parent_.is_connected()) {
@@ -126,7 +30,7 @@ public:
             });
         }
     }
-    CancellationBridge(net::cancellation_slot parent, CancellationSource& source)
+    CancellationBridge(net::cancellation_slot parent, common::CancellationSource& source)
         : CancellationBridge(parent) {
         Resubscribe(source);
     }
@@ -140,7 +44,7 @@ public:
     void Interrupt() noexcept { signal_.emit(net::cancellation_type::terminal); }
 
 private:
-    void OnCancellation(Cancellation) noexcept override {
+    void OnCancellation(common::Cancellation) noexcept override {
         cancelled_ = true;
         signal_.emit(net::cancellation_type::all);
     }
@@ -180,7 +84,7 @@ public:
     virtual ~MultiBufferReader() noexcept = default;
 
     virtual net::awaitable<common::MultiBuffer> ReadMultiBuffer() = 0;
-    virtual CancellationSource& Cancellation() noexcept = 0;
+    virtual common::CancellationSource& Cancellation() noexcept = 0;
     virtual EofAction ReadEofAction() const noexcept { return EofAction::WaitForPeer; }
     // Vision command 2 is a read-direction transition at an idle read boundary.
     // Wrappers retain already-read bytes; unsupported transports fail closed.

@@ -123,7 +123,10 @@ size_t EncodeRequestTo(
     return writer.Position() + encoded + tail.Position();
 }
 
-size_t EncodeUdpPacketHeaderTo(
+namespace {
+
+// 返回写入字节数，0 表示目标非法、负载超过 uint16 或缓冲区不足。
+[[nodiscard]] size_t EncodeUdpPacketHeaderTo(
     const common::TargetAddress& target,
     size_t payload_len,
     uint8_t* output,
@@ -147,6 +150,7 @@ size_t EncodeUdpPacketHeaderTo(
     return encoded + writer.Position();
 }
 
+}  // namespace
 
 void TrojanUdpFramer::Feed(common::MultiBuffer input) {
     if (state_ != State::Active) {

@@ -334,8 +334,4 @@ ParseUuidBytes(std::string_view uuid) noexcept {
     return std::nullopt;
 }
 
-std::string NormalizeFlow(std::string_view flow) {
-    return common::LowerAscii(flow);
-}
-
 }  // namespace proxy

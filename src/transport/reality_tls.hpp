@@ -2,7 +2,6 @@
 
 #include "common/byte_reader.hpp"
 #include "transport/stream_settings.hpp"
-#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstddef>
@@ -112,9 +111,10 @@ VerifyRealityClientHello(
     const SslContext& ctx);
 
 // RFC 8446 sections 4.1.2 and 5.1: handshake messages may span records.
-// Retain the original wire image for fallback/replay, but authenticate the
-// concatenated handshake, never record headers. Append only received bytes;
-// neither record nor handshake lengths cause speculative allocation.
+// The caller keeps the original wire image for fallback/replay; this reader
+// collects the concatenated handshake, never record headers. Only received
+// bytes are stored; neither record nor handshake lengths cause speculative
+// allocation.
 class RealityClientHelloReader {
 public:
     enum class Status { Reading, Complete, Invalid };
@@ -122,19 +122,10 @@ public:
     static constexpr size_t kMaxHelloSize = 4 + 2 + 32 + 1 + 32 + 2 + 65534 + 1 + 255 + 2 + 65535;
 
     [[nodiscard]] Status State() const noexcept { return status_; }
-    [[nodiscard]] size_t ReadSize() const noexcept {
-        if (status_ != Status::Reading) return 0;
-        return header_size_ < header_.size()
-            ? header_.size() - header_size_
-            : std::min<size_t>(remaining_, 1024);
-    }
-    void Append(std::span<const uint8_t> bytes);
-    // Consumes up to the end of the ClientHello from already-received bytes
-    // without copying wire records into `wire_`; returns consumed byte count.
+    // Consumes up to the end of the ClientHello from already-received bytes;
+    // returns consumed byte count.
     [[nodiscard]] size_t ConsumeHandshake(std::span<const uint8_t> available);
-    [[nodiscard]] std::span<const uint8_t> Hello() const noexcept { return hello_; }
     [[nodiscard]] std::vector<uint8_t> TakeHello() noexcept { return std::move(hello_); }
-    [[nodiscard]] std::vector<uint8_t> TakeWire() noexcept { return std::move(wire_); }
 private:
     void AppendPayload(std::span<const uint8_t> bytes);
     std::array<uint8_t, 5> header_{};
@@ -142,7 +133,6 @@ private:
     size_t remaining_ = 0;
     size_t hello_size_ = 0;
     Status status_ = Status::Reading;
-    std::vector<uint8_t> wire_;
     std::vector<uint8_t> hello_;
 };
 }  // namespace transport

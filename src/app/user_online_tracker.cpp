@@ -1,4 +1,4 @@
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 
 #include "common/hash.hpp"
 #include "common/allocator.hpp"
@@ -9,24 +9,19 @@
 #include <vector>
 
 
-namespace common {
+namespace app {
 
 namespace {
-template <typename Map>
-bool AcquireDeviceCount(Map& devices,
+bool AcquireDeviceCount(OnlineDeviceCounts& devices,
                         std::string_view tag,
                         uint64_t user_id,
                         std::string_view ip,
                         uint32_t device_limit) {
-    using TagKey = typename Map::key_type;
-    using IpMap = typename Map::mapped_type::mapped_type;
-    using IpKey = typename IpMap::key_type;
-
     auto tag_it = devices.find(tag);
     bool tag_inserted = false;
     if (tag_it == devices.end()) {
         std::tie(tag_it, tag_inserted) =
-            devices.try_emplace(TagKey(tag));
+            devices.try_emplace(std::string(tag));
     }
     try {
         auto [user_it, user_inserted] = tag_it->second.try_emplace(user_id);
@@ -40,7 +35,7 @@ bool AcquireDeviceCount(Map& devices,
                     if (tag_inserted && tag_it->second.empty()) devices.erase(tag_it);
                     return false;
                 }
-                all_ips.emplace(IpKey(ip), 1u);
+                all_ips.emplace(std::string(ip), 1u);
             }
         } catch (...) {
             if (user_inserted && user_it->second.empty()) tag_it->second.erase(user_it);
@@ -53,8 +48,7 @@ bool AcquireDeviceCount(Map& devices,
     return true;
 }
 
-template <typename Map>
-void ReleaseDeviceCount(Map& devices,
+void ReleaseDeviceCount(OnlineDeviceCounts& devices,
                         std::string_view tag,
                         uint64_t user_id,
                         std::string_view ip) noexcept {
@@ -66,25 +60,20 @@ void ReleaseDeviceCount(Map& devices,
     if (ip_it == user_it->second.end()) return;
     if (--ip_it->second == 0) {
         user_it->second.erase(ip_it);
-        MaybeShrinkHashContainer(user_it->second, 8);
+        common::MaybeShrinkHashContainer(user_it->second, 8);
     }
     if (user_it->second.empty()) {
         tag_it->second.erase(user_it);
-        MaybeShrinkHashContainer(tag_it->second, 8);
+        common::MaybeShrinkHashContainer(tag_it->second, 8);
     }
     if (tag_it->second.empty()) {
         devices.erase(tag_it);
-        MaybeShrinkHashContainer(devices, 8);
+        common::MaybeShrinkHashContainer(devices, 8);
     }
 }
 
 struct DeviceQuota {
-    using IpMap = std::unordered_map<std::string, uint32_t,
-                                     TransparentStringHash, TransparentStringEq>;
-    using Users = std::unordered_map<uint64_t, IpMap>;
-    std::unordered_map<std::string, Users,
-                       TransparentStringHash, TransparentStringEq>
-        devices;
+    OnlineDeviceCounts devices;
 
     void Release(std::string_view tag, uint64_t user, std::string_view ip) noexcept {
         ReleaseDeviceCount(devices, tag, user, ip);
@@ -101,8 +90,8 @@ struct DeviceQuotaService final : net::execution_context::service {
 
 } // namespace
 
-struct UserOnlineTracker::DeviceReservation final : app::GroupCoordinator::ReservedOperation {
-    app::GroupCoordinator* coordinator = nullptr;
+struct UserOnlineTracker::DeviceReservation final : GroupCoordinator::ReservedOperation {
+    GroupCoordinator* coordinator = nullptr;
     std::shared_ptr<DeviceQuota> quota;
     std::string tag;
     std::string ip;
@@ -212,5 +201,5 @@ UserOnlineTracker::GetOnlineDevices(std::string_view tag) const {
     return result;
 }
 
-}  // namespace common
+}  // namespace app
 

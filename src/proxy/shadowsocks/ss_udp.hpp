@@ -47,7 +47,7 @@ private:
     bool initialized_ = false;
 };
 
-// Worker-local cache, scoped by authenticated credential and protocol session ID.
+// Outbound receive-side replay state, scoped by credential and server session ID.
 // Rejects new sessions when full instead of reopening a protected replay window.
 class Ss2022UdpReplayCache {
 public:
@@ -66,8 +66,6 @@ public:
         uint64_t packet_id,
         std::chrono::steady_clock::time_point now =
             std::chrono::steady_clock::now());
-
-    [[nodiscard]] size_t Size() const noexcept { return sessions_.size(); }
 
 private:
     struct SessionKey {
@@ -202,9 +200,8 @@ struct SsUdpDecodeResult {
 //
 // 最小包长: salt_size + 1(ATYP) + 1(域名长度或4字节IP) + 2(port) + kTagSize
 // 返回 nullopt: 包过短 / 所有用户均不匹配
-// deferred_replay authenticates SS2022 without reading or mutating replay_cache;
-// the caller must commit packet_id in the full session_owner/session_id namespace.
-// Classic AEAD behavior is unchanged.
+// SS2022 packets are only authenticated here: the caller must commit packet_id
+// through Ss2022UdpAssociation::Check in the full session_owner/session_id namespace.
 // ============================================================================
 [[nodiscard]] std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const uint8_t*               datagram,
@@ -212,9 +209,7 @@ struct SsUdpDecodeResult {
     const app::UserStore::ShadowsocksUsersView& users,
     SsCipherType                 cipher_type,
     size_t                       key_size,
-    size_t                       salt_size,
-    Ss2022UdpReplayCache&        replay_cache,
-    bool                         deferred_replay);
+    size_t                       salt_size);
 
 // ============================================================================
 // EncodeUdpPacket — 编码 SS AEAD UDP 回包
@@ -259,14 +254,6 @@ struct SsUdpDecodeResult {
     uint8_t* output,
     size_t output_size,
     common::ForwardedMetadataView forwarded = {});
-
-[[nodiscard]] size_t Encode2022UdpResponsePacketTo(
-    const common::TargetAddress& target,
-    const uint8_t* payload,
-    size_t payload_len,
-    Ss2022UdpTxState& state,
-    uint8_t* output,
-    size_t output_size);
 
 [[nodiscard]] std::optional<SsUdpDecodeResult> Decode2022UdpResponsePacket(
     const uint8_t* datagram,

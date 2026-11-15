@@ -4,7 +4,6 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -51,19 +50,20 @@ private:
     };
     static_assert(std::atomic<const Snapshot*>::is_always_lock_free);
     AutoSignContextRenewal(bssl::UniquePtr<SSL_CTX> initial, TlsConfig config);
+    // Construction (before scheduler registration) or the scheduler thread only.
     bool Publish(bssl::UniquePtr<SSL_CTX> context);
     // Runs on the scheduler thread only; null when signing or setup fails.
     [[nodiscard]] bssl::UniquePtr<SSL_CTX> Rebuild() const;
     // Atomic invariant: Publish() constructs an immutable Snapshot at a fixed
-    // heap address owned by history_ under publish_mutex_, then publishes it
-    // with memory_order_release; Acquire() loads with memory_order_acquire.
+    // heap address owned by history_, then publishes it with
+    // memory_order_release; Acquire() loads with memory_order_acquire.
     // Reclamation waits until ~AutoSignContextRenewal(), while active SSL
     // connections hold BoringSSL's own SSL_CTX reference count.
-    mutable std::mutex publish_mutex_;
     std::vector<std::unique_ptr<const Snapshot>> history_;
     std::atomic<const Snapshot*> current_{nullptr};
     const TlsConfig config_;
-    std::atomic<Clock::time_point> next_attempt_{Clock::time_point::min()};
+    // Scheduler-thread state, like history_; handed over by registration.
+    Clock::time_point next_attempt_ = Clock::time_point::min();
 };
 
 [[nodiscard]] bool ConfigureTlsServerIdentity(

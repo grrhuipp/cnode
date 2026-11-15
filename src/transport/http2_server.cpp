@@ -246,24 +246,6 @@ net::awaitable<size_t> Http2ServerSubStreamState::AsyncRead(
     return inbound_.Read(*this, buffer);
 }
 
-net::awaitable<size_t> Http2ServerSubStreamState::AsyncWrite(
-    net::const_buffer buffer) {
-    auto session = LockWritableSession();
-    if (payload_codec_ == H2PayloadCodec::RawData) {
-        if (!co_await session->WriteDataSerialized(
-                stream_id_, std::span<const net::const_buffer>(&buffer, 1))) {
-            throw IoSystemError(io_error::connection_reset, "HTTP/2 raw server stream write failed");
-        }
-        co_return buffer.size();
-    }
-    const auto* data = static_cast<const uint8_t*>(buffer.data());
-    if (!co_await session->WriteGrpcMessageSerialized(
-            stream_id_, std::span<const uint8_t>(data, buffer.size()))) {
-        throw IoSystemError(io_error::connection_reset, "gRPC server stream write failed");
-    }
-    co_return buffer.size();
-}
-
 net::awaitable<common::MultiBuffer> Http2ServerSubStreamState::ReadMultiBuffer() {
     return inbound_.ReadMultiBuffer(*this);
 }

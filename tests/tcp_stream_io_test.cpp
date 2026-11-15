@@ -16,7 +16,7 @@
 #include <thread>
 
 namespace {
-namespace net = ::net;
+
 using namespace std::chrono_literals;
 
 class TcpStreamIoTest : public ::testing::Test {
@@ -41,16 +41,8 @@ protected:
 TEST_F(TcpStreamIoTest, NativeWriteDeliversEveryByteToPeer) {
     constexpr std::array<char, 4> sent{'a', '\0', 'b', '\xff'};
     std::array<char, sent.size()> received{};
-    auto written = net::co_spawn(io_, [&]() -> net::awaitable<std::size_t> {
-        std::size_t offset = 0;
-        while (offset < sent.size()) {
-            const auto count = co_await stream_.AsyncWrite(
-                net::buffer(sent.data() + offset, sent.size() - offset));
-            if (count == 0) break;
-            offset += count;
-        }
-        co_return offset;
-    }, net::use_future);
+    const net::const_buffer sent_buffer = net::buffer(sent);
+    auto written = net::co_spawn(io_, stream_.WriteBuffers({&sent_buffer, 1}), net::use_future);
     auto read = net::co_spawn(io_, [&]() -> net::awaitable<std::size_t> {
         co_return co_await net::async_read(peer_, net::buffer(received), net::use_awaitable);
     }, net::use_future);
@@ -64,7 +56,7 @@ TEST_F(TcpStreamIoTest, NativeWriteDeliversEveryByteToPeer) {
         io_.run();
     }
     ASSERT_TRUE(completed);
-    EXPECT_EQ(written.get(), sent.size());
+    written.get();
     EXPECT_EQ(read.get(), received.size());
     EXPECT_EQ(received, sent);
 }
@@ -172,7 +164,8 @@ TEST_F(TcpStreamIoTest, QueuedReadinessOwnsPayloadUntilCallbackCompletes) {
         });
     EXPECT_FALSE(pending.expired());
     const char value = 'q';
-    auto written = net::co_spawn(io_, stream_.AsyncWrite(net::buffer(&value, 1)), net::use_future);
+    const net::const_buffer buffer = net::buffer(&value, 1);
+    auto written = net::co_spawn(io_, stream_.WriteBuffers({&buffer, 1}), net::use_future);
     io_.run_for(1s);
     const bool completed = written.wait_for(0s) == std::future_status::ready && consumed;
     if (!completed) {
@@ -182,7 +175,7 @@ TEST_F(TcpStreamIoTest, QueuedReadinessOwnsPayloadUntilCallbackCompletes) {
         io_.run();
     }
     ASSERT_TRUE(completed);
-    EXPECT_EQ(written.get(), 1u);
+    written.get();
     EXPECT_TRUE(pending.expired());
     EXPECT_TRUE(released);
 }

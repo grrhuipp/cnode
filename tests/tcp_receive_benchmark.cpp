@@ -71,7 +71,6 @@ TEST(TcpReceiveBenchmark, VerifiedBursts) {
         socket.connect(acceptor.local_endpoint());
         acceptor.accept(peer);
         transport::TcpStream stream(std::move(socket));
-        stream.SetReadTimeout(2s);
         std::vector<uint8_t> payload(burst);
         for (std::size_t index = 0; index < burst; ++index)
             payload[index] = static_cast<uint8_t>((index * 131 + index / 251) & 255);

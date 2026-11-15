@@ -86,8 +86,8 @@ std::string FormatAccessLog(const Context& ctx,
     const std::string_view out_tag = ctx.outbound.tag;
     const bool accepted = status == AccessStatus::Accepted;
     const bool has_target = accepted || target_valid;
-    // Only the final owning string crosses the logging queue. Do not use the
-    // Worker PMR for it or retain connection-local formatting scratch.
+    // Only the final owning string crosses the logging queue; do not retain
+    // connection-local formatting scratch.
     std::optional<AddressText> origin_host_storage;
     std::string_view origin_host = ctx.inbound.origin_source_ip;
     if (origin_host.empty() && !ctx.inbound.origin_source_addr.is_unspecified()) {

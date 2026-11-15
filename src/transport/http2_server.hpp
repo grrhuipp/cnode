@@ -25,7 +25,7 @@ public:
                               int64_t initial_send_window);
     ~Http2ServerSubStreamState() noexcept { DropQueuedData(); }
 
-    transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
+    common::CancellationSource& Cancellation() noexcept { return cancellation_; }
     [[nodiscard]] std::shared_ptr<Http2ServerSession> LockSession() const noexcept {
         return session_.lock();
     }
@@ -69,7 +69,6 @@ public:
     }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer);
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer);
     net::awaitable<common::MultiBuffer> ReadMultiBuffer();
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers);
     net::awaitable<void> AsyncShutdownWrite();
@@ -124,7 +123,7 @@ private:
     bool owner_released_ = false;
     IoErrorCode terminal_error_ = io_error::operation_aborted;
     std::weak_ptr<Http2ServerSession> session_;
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
     std::weak_ptr<XHttpPacketUpSession> upload_budget_;
     size_t upload_reserved_ = 0;
     uint32_t stream_id_ = 0;
@@ -147,7 +146,7 @@ public:
     explicit Http2ServerSubStream(std::shared_ptr<Http2ServerSubStreamState> state)
         : state_(std::move(state)), deadline_(state_->IoContext(), *this) {}
 
-    transport::CancellationSource& Cancellation() noexcept override {
+    common::CancellationSource& Cancellation() noexcept override {
         return state_->Cancellation();
     }
 
@@ -158,13 +157,6 @@ public:
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
         return state_->AsyncRead(buffer);
-    }
-
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        if (closed_) {
-            throw IoSystemError(io_error::connection_reset, "gRPC write on closed stream");
-        }
-        return state_->AsyncWrite(buffer);
     }
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
@@ -241,7 +233,7 @@ private:
 };
 class Http2ServerSession final
     : public std::enable_shared_from_this<Http2ServerSession>
-    , private transport::CancellationSubscription {
+    , private common::CancellationSubscription {
 public:
     struct RequestScope {
         size_t& count;
@@ -390,7 +382,7 @@ private:
     // FailConnection when `connection`, otherwise ResetStream on the frame's stream.
     [[nodiscard]] std::optional<DataFault> ReceiveData(H2Frame& frame);
 
-    void OnCancellation(transport::Cancellation) noexcept override {
+    void OnCancellation(common::Cancellation) noexcept override {
         CancelAll();
     }
 

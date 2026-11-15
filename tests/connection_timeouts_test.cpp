@@ -27,7 +27,7 @@ TEST(ConnectionTimeouts, ActivityArmsIdleTimeoutAfterCompletedWrite) {
     EXPECT_FALSE(timeouts.ConsumeWriteTimeout());
 }
 
-TEST(ConnectionTimeouts, ReadTimeoutSurvivesPhaseReplacementAndClear) {
+TEST(ConnectionTimeouts, WriteTimeoutSurvivesPhaseReplacementAndClear) {
     ::net::io_context io;
     Owner owner;
     Timeouts timeouts(io, owner);
@@ -40,14 +40,14 @@ TEST(ConnectionTimeouts, ReadTimeoutSurvivesPhaseReplacementAndClear) {
     timeouts.ClearPhaseDeadline();
     EXPECT_FALSE(current.Expired());
     EXPECT_FALSE(timeouts.ConsumePhaseDeadline());
-    timeouts.SetReadTimeout(1s);
-    timeouts.BeginRead();
+    timeouts.SetWriteTimeout(1s);
+    timeouts.BeginWrite();
     auto later_phase = timeouts.StartPhaseDeadline(2s);
     io.run_for(1100ms);
     EXPECT_EQ(owner.calls, 1);
     EXPECT_TRUE(later_phase);
     EXPECT_FALSE(later_phase.Expired());
-    EXPECT_TRUE(timeouts.ConsumeReadTimeout());
+    EXPECT_TRUE(timeouts.ConsumeWriteTimeout());
     EXPECT_FALSE(timeouts.ConsumePhaseDeadline());
 }
 

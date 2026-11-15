@@ -103,7 +103,6 @@ jobs:
         run: |
           set -euo pipefail
           mise exec -- ctest --test-dir build/musl --output-on-failure --no-tests=error --parallel --output-junit "$PWD/build/test-results.xml"
-          awk '/^udp-session-churn / { print }' build/musl/Testing/Temporary/LastTest.log
           binary=build/musl/cnode
           file "$binary"
           if readelf -l "$binary" | grep -q INTERP; then
@@ -146,7 +145,6 @@ jobs:
           path: |
             build/*-results.xml
             build/musl/Testing/Temporary/LastTest.log
-            build/musl/*_test/**/*.log
             build/musl/e2e-artifacts/**
             build/musl/vcpkg-manifest-install.log
 

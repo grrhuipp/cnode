@@ -41,7 +41,7 @@ void RunFixture(const app::RateLimitConfig& config, Scenario scenario) {
     auto coordinator = std::make_shared<app::GroupCoordinator>(io);
     coordinator->RegisterWorker();
     auto limiter = app::ConnectionLimiter::Acquire(config, coordinator);
-    common::UserOnlineTracker tracker(*coordinator);
+    app::UserOnlineTracker tracker(*coordinator);
     app::StatsShard stats;
     const app::AdmissionEnvironment environment{
         *coordinator, *limiter, tracker, stats};
@@ -107,7 +107,7 @@ public:
         std::memset(buffer.data(), 0, buffer.size());
         co_return buffer.size();
     }
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override { co_return buffer.size(); }
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer>) override { co_return; }
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override { co_return common::MultiBuffer{}; }
     void ShutdownWrite() override {}
     void Cancel() noexcept override { NotifyCancellation(); }
@@ -389,7 +389,7 @@ TEST(InboundAdmission, PostBindRejectionNeitherBansNorOccupiesADevice) {
         common::Context context;
         context.inbound.tag = "post-bind";
         context.inbound.source_ip = "192.0.2.1";
-        context.inbound.client_ip_source = common::Inbound::ClientIpSource::ProxyProtocol;
+        context.inbound.client_ip_from_proxy_protocol = true;
         const common::UserProfile profile{.user_id = 7, .email = "bound", .device_limit = 1};
         constexpr std::array<uint8_t, 1> raw{0x41};
         for (unsigned attempt = 0; attempt != 12; ++attempt) {
@@ -526,7 +526,7 @@ TEST(InboundAdmission, ClosedCoordinatorCancelsEveryAuthenticationPhaseWithoutAD
         if (!admitted) EXPECT_EQ(admitted.error(), common::ErrorCode::CANCELLED);
         constexpr std::array<uint8_t, 1> credential{0x42};
         EXPECT_EQ(co_await credential_phase->VerifyCredential({proxy::KeyedInboundProtocol::Vless, credential}), common::ErrorCode::CANCELLED);
-        context.inbound.client_ip_source = common::Inbound::ClientIpSource::ProxyProtocol;
+        context.inbound.client_ip_from_proxy_protocol = true;
         auto beginning = co_await proxy::BeginInboundAuthentication(environment, context);
         EXPECT_FALSE(beginning);
         if (!beginning) EXPECT_EQ(beginning.error(), common::ErrorCode::CANCELLED);

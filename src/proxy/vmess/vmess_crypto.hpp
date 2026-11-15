@@ -24,10 +24,10 @@
 namespace proxy {
 
 
-constexpr uint8_t VERSION             = 1;
+constexpr uint8_t kVmessVersion       = 1;
 constexpr size_t  GCM_TAG_SIZE        = 16;
 constexpr size_t  MAX_CHUNK_SIZE      = 16 * 1024;  // 16KB
-constexpr int64_t TIMESTAMP_TOLERANCE = 60;         // ±60秒，防重放攻击
+constexpr int64_t kVmessTimestampTolerance = 60;    // ±60秒，防重放攻击
 
 enum class VmessCommand : uint8_t {
     TCP = 1,

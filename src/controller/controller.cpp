@@ -9,6 +9,7 @@
 #include "app/outbound_handler.hpp"
 #include "app/worker.hpp"
 #include "common/asio_types.hpp"
+#include "common/ascii.hpp"
 #include "common/constants.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config.hpp"
@@ -923,7 +924,7 @@ Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
         total_online += online.size();
     }
 
-    std::vector<common::OnlineDevice> devices;
+    std::vector<app::OnlineDevice> devices;
     devices.reserve(total_online);
     for (auto& online : per_worker) {
         devices.insert(devices.end(),

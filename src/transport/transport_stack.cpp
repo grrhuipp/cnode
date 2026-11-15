@@ -154,7 +154,6 @@ net::awaitable<void> RunRealityFallbackProxy(
     client_tcp->ClearPhaseDeadline();
     for (AsyncStream* stream : {static_cast<AsyncStream*>(client_tcp.get()), dest_stream.get()}) {
         stream->SetIdleTimeout(idle_timeout);
-        stream->SetReadTimeout(std::chrono::seconds(0));
         stream->SetWriteTimeout(write_timeout);
     }
 
@@ -214,7 +213,7 @@ net::awaitable<TransportBuildResult> AcceptInboundSecurity(
                         if (next.empty()) {
                             co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
                         }
-                        pending.AppendAndCoalesce(std::move(next));
+                        next.MoveTo(pending);
                     }
                     consumed += reader.ConsumeHandshake(
                         pending.FrontSpan().subspan(consumed));

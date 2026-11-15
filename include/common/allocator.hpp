@@ -6,7 +6,6 @@
 #include <limits>
 #include <memory>
 #include <new>
-#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -365,10 +364,11 @@ private:
 template <typename HashContainer>
 inline void MaybeShrinkHashContainer(
     HashContainer& container,
-    std::size_t keep_min_buckets = 64,
-    std::size_t sparse_ratio = 8) noexcept {
+    std::size_t keep_min_buckets = 64) noexcept {
+    // Shrink only once fewer than one bucket in this many is occupied.
+    constexpr std::size_t kSparseBucketRatio = 8;
     const std::size_t buckets = container.bucket_count();
-    if (buckets <= keep_min_buckets || sparse_ratio == 0) {
+    if (buckets <= keep_min_buckets) {
         return;
     }
     const std::size_t size = container.size();
@@ -378,7 +378,7 @@ inline void MaybeShrinkHashContainer(
         } catch (...) {}
         return;
     }
-    if (buckets / sparse_ratio <= size) {
+    if (buckets / kSparseBucketRatio <= size) {
         return;
     }
     const std::size_t target_buckets = std::max(keep_min_buckets, size * 2);

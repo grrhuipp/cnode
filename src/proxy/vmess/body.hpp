@@ -328,7 +328,7 @@ public:
     RequestBodyReader(RequestBodyReader&&) noexcept = default;
     RequestBodyReader& operator=(RequestBodyReader&&) noexcept = default;
 
-    transport::CancellationSource& Cancellation() noexcept override {
+    common::CancellationSource& Cancellation() noexcept override {
         return stream_->Cancellation();
     }
     transport::EofAction ReadEofAction() const noexcept override {

@@ -214,7 +214,7 @@ class FragmentReader final : public transport::MultiBufferReader {
 public:
     FragmentReader(std::span<const uint8_t> bytes)
         : bytes_(bytes) {}
-    transport::CancellationSource& Cancellation() noexcept override {
+    common::CancellationSource& Cancellation() noexcept override {
         return cancellation_;
     }
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
@@ -222,7 +222,7 @@ public:
         co_return MakeInput(bytes_.subspan(offset_++, 1));
     }
 private:
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
     std::span<const uint8_t> bytes_;
     size_t offset_ = 0;
 };

@@ -5,6 +5,7 @@
 #include "proxy/shadowsocks/ss_inbound.hpp"
 #include "proxy/shadowsocks/ss_outbound.hpp"
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
+#include "shadowsocks_identity_fixture.hpp"
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
 #include <asio/co_spawn.hpp>
@@ -76,22 +77,18 @@ void CheckClassic(const common::TargetAddress& target,
     app::UserStore::ShadowsocksCredential user;
     EXPECT_TRUE((user.derived_key.assign(key.span()))) << "failed to prepare classic UDP user";
     user_list->push_back(std::move(user));
-    proxy::Ss2022UdpReplayCache replay_cache;
-    for (bool deferred_replay : {false, true}) {
-        auto inbound = proxy::DecodeUdpPacket(
-            encoded.data(), encoded.size(), {user_list},
-            cipher.type, cipher.key_size, cipher.salt_size, replay_cache, deferred_replay);
-        ASSERT_TRUE(inbound);
-        EXPECT_TRUE((inbound && !inbound->session_id && !inbound->packet_id &&
-              inbound->target.SameEndpoint(target) && Flatten(inbound->payload) == source &&
-              replay_cache.Size() == 0)) << "deferred replay changed classic UDP decoding";
-        const auto request_datagram = common::InspectUdpDatagram(inbound->payload);
-        EXPECT_TRUE((request_datagram.Valid() && request_datagram.target->SameEndpoint(target) &&
-              request_datagram.payload_size == source.size())) << "classic authenticated request lost its UDP message boundary";
-    }
+    auto inbound = proxy::DecodeUdpPacket(
+        encoded.data(), encoded.size(), {user_list},
+        cipher.type, cipher.key_size, cipher.salt_size);
+    ASSERT_TRUE(inbound);
+    EXPECT_TRUE((!inbound->session_id && !inbound->packet_id &&
+          inbound->target.SameEndpoint(target) && Flatten(inbound->payload) == source)) << "classic authenticated request lost its target or payload";
+    const auto request_datagram = common::InspectUdpDatagram(inbound->payload);
+    EXPECT_TRUE((request_datagram.Valid() && request_datagram.target->SameEndpoint(target) &&
+          request_datagram.payload_size == source.size())) << "classic authenticated request lost its UDP message boundary";
 
     EXPECT_TRUE((!proxy::DecodeUdpPacket(nullptr, 0, {user_list}, cipher.type,
-                              cipher.salt_size, cipher.salt_size, replay_cache, false) &&
+                              cipher.salt_size, cipher.salt_size) &&
           !proxy::DecodeUdpPacketWithKey(nullptr, 0, key.span(), cipher.type,
                                      cipher.key_size, cipher.salt_size))) << "raw empty Shadowsocks wire bypassed authentication";
     // Cross-check the one-shot AEAD API against the existing streaming EVP
@@ -182,49 +179,21 @@ void Check2022(const common::TargetAddress& target,
         auto bad_prepared = prepared_users;
         bad_prepared.back().psk_hash[0] ^= 1;
         const auto bad_users = prepare_view(bad_prepared);
-        proxy::Ss2022UdpReplayCache bad_cache;
         EXPECT_FALSE((proxy::DecodeUdpPacket(encoded.data(), encoded.size(), bad_users,
-                                  cipher.type, cipher.key_size, cipher.salt_size, bad_cache, false))) << "identity authentication ignored prepared PSK hash";
-        EXPECT_TRUE((!proxy::DecodeUdpPacket(encoded.data(), encoded.size(), bad_users,
-                                  cipher.type, cipher.key_size, cipher.salt_size, bad_cache, true) &&
-              bad_cache.Size() == 0)) << "deferred identity authentication accepted an invalid PSK hash or mutated replay";
+                                  cipher.type, cipher.key_size, cipher.salt_size))) << "identity authentication ignored prepared PSK hash";
     }
+    const auto decode = [&cipher](const std::vector<uint8_t>& wire,
+                                  const app::UserStore::ShadowsocksUsersView& view) {
+        return proxy::DecodeUdpPacket(
+            wire.data(), wire.size(), view, cipher.type, cipher.key_size, cipher.salt_size);
+    };
     std::vector<uint8_t> corrupted = encoded;
     corrupted.back() ^= 0x01;
-    proxy::Ss2022UdpReplayCache validation_cache;
-    EXPECT_FALSE((proxy::DecodeUdpPacket(
-              corrupted.data(), corrupted.size(), users,
-              cipher.type, cipher.key_size, cipher.salt_size,
-              validation_cache, false))) << "invalid Shadowsocks 2022 request unexpectedly decoded";
-    EXPECT_EQ((validation_cache.Size()), (0)) << "invalid Shadowsocks 2022 authentication created replay state";
-    EXPECT_TRUE((!proxy::DecodeUdpPacket(
-              corrupted.data(), corrupted.size(), users,
-              cipher.type, cipher.key_size, cipher.salt_size, validation_cache, true) &&
-          validation_cache.Size() == 0)) << "deferred invalid authentication accepted ciphertext or mutated replay";
-    EXPECT_TRUE((!proxy::DecodeUdpPacket(nullptr, 0, users, cipher.type, cipher.key_size,
-                              cipher.salt_size, validation_cache, false) &&
-          validation_cache.Size() == 0)) << "raw empty SS2022 wire bypassed authentication or created replay state";
-    EXPECT_TRUE((proxy::DecodeUdpPacket(
-              encoded.data(), encoded.size(), users,
-              cipher.type, cipher.key_size, cipher.salt_size,
-              validation_cache, false).has_value())) << "invalid Shadowsocks 2022 request poisoned the replay window";
+    EXPECT_FALSE((decode(corrupted, users))) << "invalid Shadowsocks 2022 request unexpectedly decoded";
+    EXPECT_FALSE((proxy::DecodeUdpPacket(nullptr, 0, users, cipher.type, cipher.key_size,
+                              cipher.salt_size))) << "raw empty SS2022 wire bypassed authentication";
 
-    proxy::Ss2022UdpReplayCache replay_cache;
-    for (size_t attempt = 0; attempt < 2; ++attempt) {
-        auto authenticated = proxy::DecodeUdpPacket(
-            encoded.data(), encoded.size(), users,
-            cipher.type, cipher.key_size, cipher.salt_size, replay_cache, true);
-        EXPECT_TRUE((authenticated && authenticated->session_id == 0x00123456789abcdeULL &&
-              authenticated->packet_id == 0 &&
-              authenticated->session_owner.size == key.size &&
-              std::equal(key.span().begin(), key.span().end(),
-                         authenticated->session_owner.span().begin()) &&
-              authenticated->target.SameEndpoint(target) &&
-              Flatten(authenticated->payload) == source && replay_cache.Size() == 0)) << "SS2022 authentication lost metadata or committed replay";
-    }
-    auto decoded = proxy::DecodeUdpPacket(
-        encoded.data(), encoded.size(), users,
-        cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false);
+    auto decoded = decode(encoded, users);
     ASSERT_TRUE(decoded);
     EXPECT_TRUE((decoded && decoded->target.SameEndpoint(target) &&
           Flatten(decoded->payload) == source)) << "Shadowsocks 2022 split one MultiBuffer datagram";
@@ -234,26 +203,20 @@ void Check2022(const common::TargetAddress& target,
     EXPECT_EQ((decoded->session_id), (0x00123456789abcdeULL)) << "Shadowsocks 2022 session ID lost byte order or leading zeros";
     EXPECT_TRUE((decoded->packet_id == 0 && decoded->session_owner.size == key.size &&
           std::equal(key.span().begin(), key.span().end(), decoded->session_owner.span().begin()))) << "SS2022 decode lost authenticated packet ID or full credential";
-    EXPECT_FALSE((proxy::DecodeUdpPacket(
-              encoded.data(), encoded.size(), users,
-              cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false))) << "Shadowsocks 2022 accepted a replayed request packet";
-    auto authenticated_replay = proxy::DecodeUdpPacket(
-        encoded.data(), encoded.size(), users,
-        cipher.type, cipher.key_size, cipher.salt_size, replay_cache, true);
-    ASSERT_TRUE(authenticated_replay);
-    ASSERT_TRUE(authenticated_replay->session_id);
-    ASSERT_TRUE(authenticated_replay->packet_id);
-    EXPECT_TRUE((authenticated_replay && replay_cache.Size() == 1)) << "deferred authentication consulted already committed replay state";
-    std::array<uint8_t, 8> authenticated_session{};
-    for (size_t i = 0; i < authenticated_session.size(); ++i) {
-        authenticated_session[i] = static_cast<uint8_t>(
-            *authenticated_replay->session_id >> ((authenticated_session.size() - 1 - i) * 8));
-    }
-    proxy::Ss2022UdpReplayCache ingress_replay;
-    EXPECT_TRUE((ingress_replay.Accept(authenticated_replay->session_owner.span(),
-                               authenticated_session, *authenticated_replay->packet_id) &&
-          !ingress_replay.Accept(authenticated_replay->session_owner.span(),
-                                authenticated_session, *authenticated_replay->packet_id))) << "authenticated metadata did not support a unique external replay commit";
+    ASSERT_TRUE(decoded->session_id);
+    ASSERT_TRUE(decoded->packet_id);
+
+    // Decoding only authenticates; the association selected by the full
+    // credential and session ID is the replay authority.
+    ss_identity_test::UdpAssociations associations;
+    EXPECT_TRUE((associations.Commit(*decoded))) << "Shadowsocks 2022 rejected a fresh request packet";
+    auto replayed = decode(encoded, users);
+    ASSERT_TRUE(replayed);
+    ASSERT_TRUE(replayed->session_id);
+    ASSERT_TRUE(replayed->packet_id);
+    EXPECT_TRUE((replayed->packet_id == decoded->packet_id &&
+          !associations.Commit(*replayed) &&
+          associations.Size() == 1)) << "Shadowsocks 2022 accepted a replayed request packet";
 
     // A forged high packet ID must not advance an already initialized window.
     constexpr uint64_t kHighPacketId = 0x0102030405060708ULL;
@@ -263,29 +226,21 @@ void Check2022(const common::TargetAddress& target,
               target, payload.data(), payload.size(), encoder, psk_chain,
               high_packet.data(), high_packet.size())), (high_packet.size())) << "failed to encode high packet ID";
     high_packet.back() ^= 1;
-    for (bool deferred_replay : {false, true}) {
-        EXPECT_TRUE((!proxy::DecodeUdpPacket(
-                  high_packet.data(), high_packet.size(), users,
-                  cipher.type, cipher.key_size, cipher.salt_size, replay_cache, deferred_replay) &&
-              replay_cache.Size() == 1)) << "invalid authentication changed an existing replay namespace";
-    }
+    EXPECT_FALSE((decode(high_packet, users))) << "forged high packet ID passed authentication";
     encoder.next_packet_id = 1;
     std::vector<uint8_t> next_packet(encoded_size);
     EXPECT_EQ((proxy::Encode2022UdpRequestPacketTo(
               target, payload.data(), payload.size(), encoder, psk_chain,
               next_packet.data(), next_packet.size())), (next_packet.size())) << "failed to encode next packet ID";
-    auto next_decoded = proxy::DecodeUdpPacket(
-        next_packet.data(), next_packet.size(), users,
-        cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false);
-    EXPECT_TRUE((next_decoded && next_decoded->packet_id == 1)) << "invalid authentication advanced the replay window";
+    auto next_decoded = decode(next_packet, users);
+    ASSERT_TRUE(next_decoded);
+    ASSERT_TRUE(next_decoded->session_id);
+    EXPECT_TRUE((next_decoded->packet_id == 1 && associations.Commit(*next_decoded) &&
+          associations.Size() == 1)) << "invalid authentication advanced the replay window";
     high_packet.back() ^= 1;
-    auto high_authenticated = proxy::DecodeUdpPacket(
-        high_packet.data(), high_packet.size(), users,
-        cipher.type, cipher.key_size, cipher.salt_size, replay_cache, true);
+    auto high_authenticated = decode(high_packet, users);
     EXPECT_TRUE((high_authenticated && high_authenticated->packet_id == kHighPacketId)) << "SS2022 authenticated packet ID lost width or byte order";
-    EXPECT_FALSE((proxy::DecodeUdpPacket(
-              next_packet.data(), next_packet.size(), users,
-              cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false))) << "deferred authentication cleared existing replay history";
+    EXPECT_FALSE((associations.Commit(*next_decoded))) << "uncommitted authentication cleared existing replay history";
     // Distinct authenticated users may independently choose identical session
     // and packet IDs. Authentication must scope the replay window too.
     proxy::KeyBytes second_key = key;
@@ -306,23 +261,19 @@ void Check2022(const common::TargetAddress& target,
     EXPECT_TRUE((second_size != 0 && proxy::Encode2022UdpRequestPacketTo(
               target, payload.data(), payload.size(), second_encoder, psk_chain,
               second_packet.data(), second_packet.size()) == second_size)) << "failed to encode second user's UDP packet";
-    auto second_decoded = proxy::DecodeUdpPacket(
-        second_packet.data(), second_packet.size(), second_users,
-        cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false);
-    EXPECT_TRUE((second_decoded && second_decoded->session_id == decoded->session_id &&
-          !std::equal(decoded->session_owner.span().begin(), decoded->session_owner.span().end(),
-                      second_decoded->session_owner.span().begin()) &&
-          Flatten(second_decoded->payload) == source)) << "SS2022 replay state crossed authenticated users with identical session and packet IDs";
+    auto second_decoded = decode(second_packet, second_users);
     ASSERT_TRUE(second_decoded);
-    EXPECT_TRUE((second_decoded->packet_id == decoded->packet_id &&
+    ASSERT_TRUE(second_decoded->session_id);
+    ASSERT_TRUE(second_decoded->packet_id);
+    EXPECT_TRUE((second_decoded->session_id == decoded->session_id &&
+          second_decoded->packet_id == decoded->packet_id &&
           second_decoded->session_owner.size == second_key.size &&
           std::equal(second_key.span().begin(), second_key.span().end(),
                      second_decoded->session_owner.span().begin()) &&
-          ingress_replay.Accept(second_decoded->session_owner.span(),
-                                authenticated_session, *second_decoded->packet_id))) << "SS2022 external replay namespace truncated the authenticated credential";
-    EXPECT_FALSE((proxy::DecodeUdpPacket(
-              second_packet.data(), second_packet.size(), second_users,
-              cipher.type, cipher.key_size, cipher.salt_size, replay_cache, false))) << "SS2022 second user accepted its own repeated packet";
+          Flatten(second_decoded->payload) == source)) << "SS2022 decode lost the second user's credential or payload";
+    EXPECT_TRUE((associations.Commit(*second_decoded) &&
+          associations.Size() == 2)) << "SS2022 replay state crossed authenticated users with identical session and packet IDs";
+    EXPECT_FALSE((associations.Commit(*second_decoded))) << "SS2022 second user accepted its own repeated packet";
 
 }
 
@@ -341,12 +292,12 @@ void Expect2022Response(const common::TargetAddress& target, const std::vector<u
     response_decoder.client_session_id = response_encoder.client_session_id;
     response_decoder.server_session_id = response_encoder.server_session_id;
     const std::span<const uint8_t> payload(source);
-    const size_t response_size = proxy::Encode2022UdpResponsePacketTo(
-        target, payload.data(), payload.size(), response_encoder, nullptr, 0);
-    std::vector<uint8_t> response(response_size);
-    EXPECT_EQ((proxy::Encode2022UdpResponsePacketTo(
-              target, payload.data(), payload.size(), response_encoder,
-              response.data(), response.size())), (response.size())) << "Shadowsocks 2022 UDP response encoding failed";
+    proxy::UdpResponse responder(
+        static_cast<const proxy::Ss2022UdpTxState&>(response_encoder));
+    const auto encoded_response = responder.Encode({target, payload});
+    std::vector<uint8_t> response(encoded_response.byte_size());
+    ASSERT_FALSE(response.empty()) << "Shadowsocks 2022 UDP response encoding failed";
+    ASSERT_EQ(encoded_response.CopyPrefixTo(response), response.size());
     auto response_decoded = proxy::Decode2022UdpResponsePacket(
         response.data(), response.size(), response_decoder);
     ASSERT_TRUE(response_decoded);
@@ -436,9 +387,9 @@ public:
         co_return count;
     }
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override { co_return common::MultiBuffer{}; }
-    net::awaitable<size_t> AsyncWrite(net::const_buffer) override {
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer>) override {
         throw std::logic_error("unexpected byte write");
-        co_return 0;
+        co_return;
     }
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
         if (!open) throw IoSystemError(io_error::not_connected);

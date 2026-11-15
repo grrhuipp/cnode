@@ -159,7 +159,6 @@ private:
         app::WorkerRuntimeConfig config;
         config.workers = 1;
         config.timeouts.idle = 0;
-        config.timeouts.read = 0;
         return config;
     }
     uint16_t port = 0;

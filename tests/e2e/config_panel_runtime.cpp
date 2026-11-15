@@ -87,7 +87,7 @@ void ShutdownConfig(const std::filesystem::path& root, const std::vector<uint16_
     Json config = {{"workers", 2}, {"log", {{"logDir", (root / "logs").string()}}},
         {"dns", {{"servers", {"127.0.0.1", "::1"}}, {"timeout", 5}, {"cacheSize", 1000}, {"minTTL", 30}, {"maxTTL", 3600}}},
         {"limits", {{"maxConnections", 0}, {"maxConnectionsPerIP", 100}}},
-        {"timeouts", {{"handshake", 60}, {"dial", 10}, {"read", 15}, {"write", 30}, {"connIdle", 300}, {"uplinkOnly", 5}, {"downlinkOnly", 5}}},
+        {"timeouts", {{"handshake", 60}, {"dial", 10}, {"write", 30}, {"connIdle", 300}, {"uplinkOnly", 5}, {"downlinkOnly", 5}}},
         {"panels", Json::array({{{"name", "shutdown-panel"}, {"type", "V2board"},
             {"apiHost", "http://127.0.0.1:" + std::to_string(panel)}, {"key", "shutdown-key"}, {"nodeIDs", {1}},
             {"nodeType", "vmess"}, {"listenIP", "auto"}, {"sendIP", "auto"}}})}};

@@ -1,18 +1,24 @@
 #pragma once
 
+#include "common/error.hpp"
+#include "common/target_address.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/proxy_protocol.hpp"
 #include "transport/stream_settings.hpp"
-#include "transport/transport_build_result.hpp"
+
+#include <tl/expected.hpp>
+
 #include <memory>
+#include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 
 namespace app {
 
 class GroupCoordinator;
 struct StatsShard;
-class DNS;
+class DNSWorker;
 
 }  // namespace app
 namespace infra {
@@ -25,6 +31,17 @@ struct Context;
 }  // namespace common
 
 namespace transport {
+
+// 传输层构建结果：成功时为最终传输流；入站把请求交给 InboundTransportStreamHandler
+// 后返回空流。
+using TransportBuildResult = tl::expected<std::unique_ptr<AsyncStream>, common::ErrorCode>;
+
+// 入站传输握手期间从请求中提取、随逻辑流交给入站处理的元数据。
+struct InboundTransportMetadata {
+    std::string real_ip;
+    // 传输层已识别的原生 UDP 会话的首个目标；有值即该逻辑流是 UDP 会话（Network::UDP）。
+    std::optional<common::TargetAddress> udp_session_target;
+};
 
 class SslContext;
 class InboundTransportStreamHandler {
@@ -49,7 +66,7 @@ struct InboundFallbackContext {
     common::Context& ctx;
     app::StatsShard& stats;
     const infra::TimeoutsConfig& timeouts;
-    app::DNS* dns_service = nullptr;
+    app::DNSWorker* dns_service = nullptr;
 };
 
 

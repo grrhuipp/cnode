@@ -468,7 +468,7 @@ template <typename Reader>
             co_await ThrowIfCancelledOnEof();
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
-        pending.AppendAndCoalesce(std::move(next));
+        next.MoveTo(pending);
     }
 }
 

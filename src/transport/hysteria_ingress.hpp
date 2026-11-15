@@ -7,7 +7,7 @@
 #include "common/multi_buffer.hpp"
 #include "common/hash.hpp"
 #include "common/session.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "common/asio_types.hpp"
 
 #include "common/target_address.hpp"
@@ -90,7 +90,7 @@ public:
                     std::weak_ptr<HysteriaConnection> owner);
 
     [[nodiscard]] net::io_context& IoContext() const noexcept { return io_context_; }
-    transport::CancellationSource& Cancellation() noexcept { return cancellation_; }
+    common::CancellationSource& Cancellation() noexcept { return cancellation_; }
     [[nodiscard]] bool PushInput(std::span<const uint8_t> data, bool fin);
     // Bytes received but not yet read; the transport inspects a request
     // prefix here before deciding who reads the stream.
@@ -144,7 +144,7 @@ private:
     bool input_done_ = false;
     bool write_done_ = false;
     bool cancelled_ = false;
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
 };
 
 // One Hysteria TCP request stream handed to the inbound handler.
@@ -153,10 +153,9 @@ public:
     // |state| must be non-null.
     explicit QuicStream(std::shared_ptr<QuicStreamState> state);
     ~QuicStream() noexcept override;
-    transport::CancellationSource& Cancellation() noexcept override { return state_->Cancellation(); }
+    common::CancellationSource& Cancellation() noexcept override { return state_->Cancellation(); }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override;
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override;
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer payload) override;
     net::awaitable<void> WriteBuffers(
@@ -211,7 +210,7 @@ public:
         return transport::EofAction::WaitForPeer;
     }
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override;
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override;
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer packet) override;
     void ShutdownWrite() override {}
@@ -243,8 +242,6 @@ private:
 // sockets.
 class HysteriaIngress final : public QuicListener {
 public:
-    using SocketPtr = std::shared_ptr<udp::socket>;
-
     HysteriaIngress(uint32_t worker_id, uint32_t worker_count, net::io_context& io_context,
                    app::DatagramSessionEnvironment environment);
     ~HysteriaIngress() noexcept;
@@ -282,9 +279,7 @@ private:
     uint32_t worker_id;
     uint32_t worker_count;
     net::io_context& io;
-    HysteriaVersion version = HysteriaVersion::V2;
-    uint64_t upload_bytes_per_second = 0;
-    uint64_t download_bytes_per_second = 0;
+    HysteriaSettings settings;
     std::unique_ptr<SslContext> ssl_context;
     std::unordered_map<std::string,
         std::shared_ptr<HysteriaSocketState>, common::TransparentStringHash, common::TransparentStringEq> sockets;

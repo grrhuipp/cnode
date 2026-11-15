@@ -90,13 +90,6 @@ struct TrojanRequestDecodeResult {
     size_t output_size,
     common::ForwardedMetadataView forwarded = {});
 
-// 返回写入字节数，0 表示目标非法、负载超过 uint16 或缓冲区不足。
-[[nodiscard]] size_t EncodeUdpPacketHeaderTo(
-    const common::TargetAddress& target,
-    size_t payload_len,
-    uint8_t* output,
-    size_t output_size);
-
 struct TrojanFramedUdpPacket {
     common::TargetAddress target;
     common::MultiBuffer payload;

@@ -87,10 +87,8 @@ bool BodyChunkCipher::EncodeLength(size_t chunk_size, uint8_t* out) {
             return false;
         }
         const size_t plain_size = chunk_size - overhead;
-        const uint8_t plain[2] = {
-            static_cast<uint8_t>(plain_size >> 8),
-            static_cast<uint8_t>(plain_size),
-        };
+        uint8_t plain[2];
+        common::StoreU16BE(plain, static_cast<uint16_t>(plain_size));
         return length_->Encrypt(plain, sizeof(plain), out) ==
             static_cast<ssize_t>(LengthSize());
     }
@@ -101,8 +99,7 @@ bool BodyChunkCipher::EncodeLength(size_t chunk_size, uint8_t* out) {
     if (mask_) {
         wire ^= mask_->NextMask();
     }
-    out[0] = static_cast<uint8_t>(wire >> 8);
-    out[1] = static_cast<uint8_t>(wire);
+    common::StoreU16BE(out, wire);
     return true;
 }
 
@@ -706,7 +703,7 @@ tl::expected<size_t, common::ErrorCode> BuildRequestHeaderPacket(
     std::array<uint8_t, kRequestHeaderMax> header{};
     common::ScopedCleanse cleanse_header{header};
     common::ByteWriter writer(header.data(), header.size());
-    writer.WriteU8(VERSION);
+    writer.WriteU8(kVmessVersion);
     writer.WriteBytes(request_body.iv.data(), request_body.iv.size());
     writer.WriteBytes(request_body.key.data(), request_body.key.size());
     writer.WriteU8(response_header);
@@ -734,10 +731,8 @@ tl::expected<size_t, common::ErrorCode> BuildRequestHeaderPacket(
         return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     const uint32_t checksum = common::Fnv1a32(std::span<const uint8_t>(header.data(), header_len));
-    header[header_len++] = static_cast<uint8_t>(checksum >> 24);
-    header[header_len++] = static_cast<uint8_t>(checksum >> 16);
-    header[header_len++] = static_cast<uint8_t>(checksum >> 8);
-    header[header_len++] = static_cast<uint8_t>(checksum);
+    common::StoreU32BE(header.data() + header_len, checksum);
+    header_len += 4;
 
     const int64_t timestamp = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -753,10 +748,8 @@ tl::expected<size_t, common::ErrorCode> BuildRequestHeaderPacket(
     const std::span<const uint8_t, 8> nonce_view(connection_nonce, 8);
 
     const auto length_key = RequestHeaderLengthKey(user.cmd_key, auth_id_view, nonce_view);
-    const uint8_t length_plain[2] = {
-        static_cast<uint8_t>(header_len >> 8),
-        static_cast<uint8_t>(header_len),
-    };
+    uint8_t length_plain[2];
+    common::StoreU16BE(length_plain, static_cast<uint16_t>(header_len));
     if (!proxy::SealScatterOneShotAead(EVP_aead_aes_128_gcm(), {length_key.key.data(), 16}, {length_key.nonce.data(), 12}, {length_plain, sizeof(length_plain)}, {auth_id, 16}, sealed_length, {sealed_length + 2, 16})) {
         return tl::unexpected(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
@@ -973,7 +966,7 @@ bool ParseDecryptedHeader(const uint8_t* data, size_t len,
     common::ByteReader reader(data, len);
 
     const uint8_t version = reader.ReadU8();
-    if (!reader.Ok() || version != VERSION) {
+    if (!reader.Ok() || version != kVmessVersion) {
         LOG_CONN_DEBUG(trace_conn_id, "unsupported version {}", version);
         return false;
     }
@@ -1321,7 +1314,7 @@ FindByAuthIDForTag(
             timestamp = (timestamp << 8) | plaintext[i];
         }
 
-        if (timestamp > now + TIMESTAMP_TOLERANCE || timestamp < now - TIMESTAMP_TOLERANCE) {
+        if (timestamp > now + kVmessTimestampTolerance || timestamp < now - kVmessTimestampTolerance) {
             OPENSSL_cleanse(plaintext.data(), plaintext.size());
             return false;
         }

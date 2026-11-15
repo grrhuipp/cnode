@@ -284,7 +284,7 @@ TEST(BufferOwnership, EmptyUdpMessageSurvivesTransfersAndChecksEveryTarget) {
     common::MultiBuffer later;
     later.push_back(Buffer(1));
     ASSERT_TRUE(common::SetUdpTarget(later, second_target));
-    destination.AppendAndCoalesce(std::move(later));
+    later.MoveTo(destination);
     EXPECT_EQ(destination.byte_size(), 1u);
     EXPECT_EQ(common::InspectUdpDatagram(destination).status, common::UdpDatagramStatus::MixedTarget);
 }

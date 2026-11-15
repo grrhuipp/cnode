@@ -45,10 +45,6 @@ TEST_P(VlessEncryptionAbsent, NoneIsSuccessfulAbsence) {
 INSTANTIATE_TEST_SUITE_P(Spellings, VlessEncryptionAbsent, testing::Values("", "none", "NONE"));
 }  // namespace
 
-TEST(VlessCredentials, NormalizesFlowCase) {
-    EXPECT_EQ(::proxy::NormalizeFlow("XTLS-rprx-VISION"), "xtls-rprx-vision");
-}
-
 TEST(VlessCredentials, RejectsUnknownEncryption) {
     EXPECT_FALSE(proxy::ParseVlessClientEncryption("invalid"));
     EXPECT_FALSE(proxy::ParseVlessServerDecryption("invalid"));

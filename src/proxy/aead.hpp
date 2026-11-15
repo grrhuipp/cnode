@@ -101,8 +101,8 @@ struct ScopedAeadCtx {
     std::span<const uint8_t> nonce,
     std::span<const uint8_t> plaintext,
     std::span<const uint8_t> aad,
-    std::span<uint8_t> output,
-    size_t tag_size = 16) noexcept {
+    std::span<uint8_t> output) noexcept {
+    constexpr size_t tag_size = AeadContext::kTagSize;
     if (!cipher || output.size() < tag_size || output.size() - tag_size < plaintext.size()) {
         return false;
     }
@@ -149,8 +149,8 @@ struct ScopedAeadCtx {
     std::span<const uint8_t> ciphertext,
     std::span<const uint8_t> aad,
     std::span<uint8_t> output,
-    size_t& out_len,
-    size_t tag_size = 16) noexcept {
+    size_t& out_len) noexcept {
+    constexpr size_t tag_size = AeadContext::kTagSize;
     out_len = 0;
     if (!cipher || ciphertext.size() < tag_size ||
         output.size() < ciphertext.size() - tag_size) {

@@ -22,7 +22,7 @@ class AwaitableTaskGroup;
 }  // namespace common
 namespace app {
 
-class DNS;
+class DNSWorker;
 struct RelayConfig;
 
 struct OutboundProtocolSettings {
@@ -131,13 +131,11 @@ public:
     // The protocol instance and dialer live in the owning Worker (reactor, DNS
     // client and resident task group outlive the handler).
     OutboundHandler(PreparedOutboundConfig config, net::io_context& io_context,
-                    app::DNS& dns, std::chrono::seconds dial_timeout,
+                    app::DNSWorker& dns, std::chrono::seconds dial_timeout,
                     common::AwaitableTaskGroup& tasks);
     ~OutboundHandler();
     OutboundHandler(const OutboundHandler&) = delete;
     OutboundHandler& operator=(const OutboundHandler&) = delete;
-
-    [[nodiscard]] std::string_view Tag() const noexcept { return config_.tag; }
 
     // The caller keeps this handler alive until the returned awaitable completes.
     [[nodiscard]] net::awaitable<proxy::OutboundProcessResult> Dispatch(
@@ -156,8 +154,6 @@ private:
     std::unique_ptr<::proxy::Outbound> proxy_;
 };
 
-using OutboundHandlerPtr = std::shared_ptr<OutboundHandler>;
-
 // ============================================================================
 // HandlerRegistry - Xray app/proxyman/outbound.Manager，每个 Worker 一份
 //
@@ -170,7 +166,7 @@ class OutboundHandlerRegistry final {
 public:
     // 任一配置非法、tag 重复或协议构造失败都直接抛出，不留下部分发布。
     OutboundHandlerRegistry(const std::vector<PreparedOutboundConfig>& configurations,
-                            net::io_context& io_context, app::DNS& dns,
+                            net::io_context& io_context, app::DNSWorker& dns,
                             std::chrono::seconds dial_timeout, common::AwaitableTaskGroup& tasks);
     ~OutboundHandlerRegistry();
     OutboundHandlerRegistry(const OutboundHandlerRegistry&) = delete;
@@ -187,7 +183,7 @@ private:
         const PreparedOutboundConfig& configuration) const;
 
     net::io_context& io_context_;
-    app::DNS& dns_;
+    app::DNSWorker& dns_;
     const std::chrono::seconds dial_timeout_;
     common::AwaitableTaskGroup& tasks_;
     std::unordered_map<std::string, std::shared_ptr<OutboundHandler>,

@@ -36,7 +36,6 @@ public:
 private:
     const ::app::AdmissionEnvironment& environment_;
     ::proxy::SsCipherInfo cipher_info_;
-    ::proxy::Ss2022UdpReplayCache udp_replay_cache_;
     // 上次匹配成功的用户索引，用于优先尝试（大概率命中同一活跃用户）
     size_t last_matched_index_ = 0;
 };

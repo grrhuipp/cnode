@@ -29,14 +29,13 @@ struct ClassicCipher {
     proxy::KeyBytes key;
 };
 
-enum class Noise { ReadGarbage, IdleWrongPeer, IdleGarbage };
+enum class Noise { IdleWrongPeer, IdleGarbage };
 
 class SsUdpRequestFixture : public testing::Test {
 protected:
     net::io_context io;
     app::DNSWorker dns_worker{
         io, app::DnsConfig{.servers = {{net::ip::address_v4::loopback(), 53}}}, 8};
-    app::DNS dns{dns_worker};
     std::optional<ClassicCipher> cipher;
     std::vector<std::shared_ptr<UdpRequest>> requests;
 
@@ -49,7 +48,7 @@ protected:
 
     UdpRequest& Request(const udp::endpoint& server) {
         requests.push_back(std::make_shared<UdpRequest>(
-            io, dns, net::ip::address_v4::loopback(),
+            io, dns_worker, net::ip::address_v4::loopback(),
             common::TargetAddress(server.address(), server.port()), cipher->info, cipher->key,
             std::span<const proxy::KeyBytes>{}));
         return *requests.back();
@@ -222,10 +221,8 @@ TEST_P(SsUdpNoiseTest, RejectedPacketsCannotSatisfyReadOrRefreshItsTimeout) {
         udp::socket wrong_source(io, udp::endpoint(net::ip::address_v4::loopback(), 0));
         auto& request = Request(server.local_endpoint());
         const auto mode = std::get<1>(GetParam());
-        const bool read_timeout = mode == Noise::ReadGarbage;
         const bool wrong_peer = mode == Noise::IdleWrongPeer;
-        if (read_timeout) request.RelayControl().SetReadTimeout(1s);
-        else request.RelayControl().SetIdleTimeout(1s);
+        request.RelayControl().SetIdleTimeout(1s);
         const auto client = co_await SendOneAndGetClientEndpoint(request, server);
         const auto packet = wrong_peer
             ? EncodeClassic(common::TargetAddress(net::ip::address_v4::loopback(), 8123),
@@ -284,8 +281,7 @@ TEST_P(SsUdpNoiseTest, RejectedPacketsCannotSatisfyReadOrRefreshItsTimeout) {
         const auto elapsed = std::chrono::steady_clock::now() - started;
         EXPECT_GE(elapsed, 800ms);
         EXPECT_LT(elapsed, 3s);
-        if (read_timeout) EXPECT_TRUE(request.RelayControl().ConsumeReadTimeout());
-        else EXPECT_TRUE(request.RelayControl().ConsumeIdleTimeout());
+        EXPECT_TRUE(request.RelayControl().ConsumeIdleTimeout());
     });
 }
 
@@ -340,11 +336,10 @@ INSTANTIATE_TEST_SUITE_P(ClassicCiphers, SsUdpRequestTest,
 INSTANTIATE_TEST_SUITE_P(CipherAndNoiseModes, SsUdpNoiseTest,
     testing::Combine(
         testing::Values("aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"),
-        testing::Values(Noise::ReadGarbage, Noise::IdleWrongPeer, Noise::IdleGarbage)),
+        testing::Values(Noise::IdleWrongPeer, Noise::IdleGarbage)),
     [](const testing::TestParamInfo<NoiseParam>& info) {
         const char* mode = "";
         switch (std::get<1>(info.param)) {
-        case Noise::ReadGarbage: mode = "ReadBudgetWithUnauthenticatedPeer"; break;
         case Noise::IdleWrongPeer: mode = "IdleWithAuthenticatedWrongPeer"; break;
         case Noise::IdleGarbage: mode = "IdleWithUnauthenticatedPeer"; break;
         }

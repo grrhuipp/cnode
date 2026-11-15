@@ -100,7 +100,6 @@ public:
 
     // AsyncStream 接口实现
     net::awaitable<std::size_t> AsyncRead(net::mutable_buffer buf) override;
-    net::awaitable<std::size_t> AsyncWrite(net::const_buffer buf) override;
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;

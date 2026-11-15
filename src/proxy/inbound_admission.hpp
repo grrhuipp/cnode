@@ -9,7 +9,7 @@
 #include "app/stats.hpp"
 #include "common/asio_types.hpp"
 #include "common/session.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "common/target_address.hpp"
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"
@@ -175,11 +175,10 @@ public:
     AuthenticatedInbound(AuthenticatedInbound&&) noexcept = default;
     AuthenticatedInbound(const AuthenticatedInbound&) = delete;
     [[nodiscard]] common::ErrorCode Reject(std::string_view reason, common::ErrorCode error) && {
-        LOG_CONN_WARN(*ctx_, "request rejected from {}:{} > {}", ctx_->inbound.source_ip, ctx_->inbound.source_port, reason);
-        LOG_ACCESS(common::FormatAccessLog(*ctx_, common::AccessStatus::Rejected, reason));
+        LogInboundRequestRejected(*ctx_, reason);
         return error;
     }
-    [[nodiscard]] net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>> Admit() && {
+    [[nodiscard]] net::awaitable<tl::expected<app::UserOnlineSessionGuard, common::ErrorCode>> Admit() && {
         return AdmitSession(*environment_, *ctx_, user_id_, device_limit_);
     }
 private:
@@ -187,7 +186,7 @@ private:
     AuthenticatedInbound(const AdmissionEnvironment& environment, common::Context& ctx,
                          const common::UserProfile& profile) noexcept
         : environment_(&environment), ctx_(&ctx), user_id_(profile.user_id), device_limit_(profile.device_limit) {}
-    static net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>> AdmitSession(
+    static net::awaitable<tl::expected<app::UserOnlineSessionGuard, common::ErrorCode>> AdmitSession(
         const AdmissionEnvironment& environment, common::Context& ctx,
         int64_t user_id, uint32_t device_limit) {
         try {
@@ -235,12 +234,12 @@ BeginInboundAuthentication(const AdmissionEnvironment& environment, common::Cont
     }
 }
 
-[[nodiscard]] inline net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>>
+[[nodiscard]] inline net::awaitable<tl::expected<app::UserOnlineSessionGuard, common::ErrorCode>>
 AuthenticateAndAdmit(InboundAuthentication authentication, const common::UserProfile* matched,
                      std::string_view mismatch_reason, std::optional<InboundRequestTarget> request) {
     if (!matched) {
         return [](InboundAuthentication auth, std::string_view reason)
-            -> net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>> {
+            -> net::awaitable<tl::expected<app::UserOnlineSessionGuard, common::ErrorCode>> {
             co_return tl::unexpected(co_await auth.RejectCredential(reason));
         }(std::move(authentication), mismatch_reason);
     }
@@ -250,7 +249,7 @@ AuthenticateAndAdmit(InboundAuthentication authentication, const common::UserPro
 struct NativeAssociationAdmission {
     app::ConnectionLimiter::Reservation connection;
     app::ConnectionLimiter::Reservation ip;
-    common::UserOnlineSessionGuard user_session;
+    app::UserOnlineSessionGuard user_session;
 };
 [[nodiscard]] inline net::awaitable<std::optional<NativeAssociationAdmission>>
 AdmitNativeAssociation(const AdmissionEnvironment& environment, common::Context& ctx,

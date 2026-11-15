@@ -102,7 +102,7 @@ public:
         return &it->second;
     }
 
-    void Rearm(const Key&, Entry& entry, TimePoint expires_at) noexcept {
+    void Rearm(Entry& entry, TimePoint expires_at) noexcept {
         Unlink(entry);
         entry.expires_at = expires_at;
         Append(entry);

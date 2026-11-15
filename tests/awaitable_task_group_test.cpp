@@ -22,7 +22,7 @@
 #include <vector>
 
 namespace {
-namespace net = ::net;
+
 using async_allocation_test::fail_after;
 using async_allocation_test::injected;
 
@@ -209,7 +209,7 @@ TEST(AwaitableTaskGroup, FailureOutranksCancellation) {
 
 net::awaitable<void> CancelledRequest(
     net::steady_timer& operation, net::steady_timer& cleanup, Counts& counts,
-    std::unique_ptr<::transport::CancellationSource> source, bool fail_cleanup) {
+    std::unique_ptr<::common::CancellationSource> source, bool fail_cleanup) {
     Lifetime lifetime(counts);
     auto [error] = co_await operation.async_wait(net::as_tuple(net::use_awaitable));
     EXPECT_TRUE(error == net::error::operation_aborted) << "request operation was not cancelled";
@@ -232,7 +232,7 @@ TEST_P(TaskGroupRequestCancellation, JoinsCleanupAndPreservesSiblingFailureSeman
     cleanup.expires_at(net::steady_timer::time_point::max());
     sibling.expires_at(net::steady_timer::time_point::max());
     Counts request_counts, sibling_counts;
-    auto source = std::make_unique<::transport::CancellationSource>();
+    auto source = std::make_unique<::common::CancellationSource>();
     auto* request_source = source.get();
     auto request = CancelledRequest(operation, cleanup, request_counts,
                                     std::move(source), fail_cleanup);
@@ -267,7 +267,7 @@ TEST(AwaitableTaskGroup, StoppedRequestNeverStarts) {
     net::io_context io;
     net::steady_timer gate(io);
     gate.expires_at(net::steady_timer::time_point::max());
-    ::transport::CancellationSource source;
+    ::common::CancellationSource source;
     source.Stop();
     Counts counts;
     auto result = net::co_spawn(io, ::common::RunAwaitableTaskGroup(io.get_executor(),
@@ -396,10 +396,10 @@ TEST(AwaitableTaskGroup, ResidentJoinCancelsChildrenAndClosesAdmission) {
     bool rejected = false;
     {
         ::common::ResidentTaskGroup resident(io.get_executor());
-        ::transport::CancellationSource own;
+        ::common::CancellationSource own;
         auto started = net::co_spawn(io, [&]() -> net::awaitable<void> {
-            resident.Tasks().Spawn(Wait(gate, counts, true));
-            resident.Tasks().Spawn(Wait(gate, counts, true), &own);
+            resident.Spawn(Wait(gate, counts, true));
+            resident.Spawn(Wait(gate, counts, true), &own);
             co_return;
         }, net::use_future);
         io.poll();
@@ -419,7 +419,7 @@ TEST(AwaitableTaskGroup, ResidentJoinCancelsChildrenAndClosesAdmission) {
         io.restart();
         io.run();
         EXPECT_TRUE(completed_without_external_release);
-        try { resident.Tasks().Spawn(Wait(gate, counts)); }
+        try { resident.Spawn(Wait(gate, counts)); }
         catch (const ::IoSystemError& error) {
             rejected = error.code() == net::error::operation_aborted;
         }

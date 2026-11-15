@@ -26,12 +26,6 @@ struct InboundProtocolSettings;
 struct InboundUserSpec;
 
 }  // namespace infra
-namespace common {
-
-struct OnlineDevice;
-class UserOnlineTracker;
-
-}  // namespace common
 namespace transport {
 
 class InboundTransportStreamHandler;
@@ -43,8 +37,9 @@ class QuicListener;
 namespace app {
 class RequestLoadState;
 struct StatsShard;
+class UserOnlineTracker;
 
-class DNS;
+class DNSWorker;
 
 // ============================================================================
 // ReceiverSettings - xray-style proxyman receiver settings
@@ -113,7 +108,7 @@ struct DatagramHandlerBuildResult {
 struct AdmissionEnvironment final {
     app::GroupCoordinator& coordinator;
     app::ConnectionLimiter& limiter;
-    common::UserOnlineTracker& online_users;
+    UserOnlineTracker& online_users;
     app::StatsShard& stats;
 };
 
@@ -232,7 +227,7 @@ public:
         const infra::TimeoutsConfig& timeouts,
         std::unique_ptr<transport::AsyncStream> raw_conn,
         common::Context& ctx,
-        app::DNS* dns_service = nullptr);
+        app::DNSWorker* dns_service = nullptr);
 
     // Logical-stream sink for a transport session that authenticated its
     // client itself (Hysteria QUIC, as Xray's hysteria hub). Each delivered
@@ -262,14 +257,14 @@ private:
         const infra::TimeoutsConfig& timeouts,
         std::unique_ptr<transport::AsyncStream> raw_conn,
         common::Context& ctx,
-        app::DNS* dns_service);
+        app::DNSWorker* dns_service);
 
     const app::ReceiverSettings receiver_;
     transport::TransportSecurity security_;
     std::unique_ptr<proxy::Inbound> proxy_;
     const AdmissionEnvironment& environment_;
 };
-using InboundHandlerPtr = std::shared_ptr<InboundHandler>;
+
 // ============================================================================
 // HandlerRegistry - per-Worker inbound handler registry
 //

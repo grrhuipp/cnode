@@ -58,7 +58,7 @@ TEST_P(QuicUdpCancellation, ReturnsUnreadBuffersBeforeNotifyingSubscribers) {
         EXPECT_EQ(delivered.byte_size(), input[0].size());
         if (delivered.empty() || delivered.byte_size() != input[0].size()) co_return;
         EXPECT_EQ(common::test_buffers_live, baseline + input.size());
-        struct Observer final : transport::CancellationSubscription {
+        struct Observer final : common::CancellationSubscription {
             std::unique_ptr<UdpSessionStream>& host;
             bool destroy;
             bool notified = false;
@@ -66,7 +66,7 @@ TEST_P(QuicUdpCancellation, ReturnsUnreadBuffersBeforeNotifyingSubscribers) {
             common::ErrorCode reason = common::ErrorCode::OK;
             Observer(std::unique_ptr<UdpSessionStream>& host, bool destroy)
                 : host(host), destroy(destroy) {}
-            void OnCancellation(transport::Cancellation cancellation) noexcept override {
+            void OnCancellation(common::Cancellation cancellation) noexcept override {
                 notified = true;
                 reason = cancellation.reason;
                 buffers_at_notification = common::test_buffers_live;
@@ -225,12 +225,12 @@ TEST(QuicUdpQueue, EmptyMessagesConsumeBufferAdmissionAndRemainReadable) {
     });
 }
 
-struct StreamCancellation final : transport::CancellationSubscription {
+struct StreamCancellation final : common::CancellationSubscription {
     bool notified = false;
     common::ErrorCode reason = common::ErrorCode::OK;
     bool terminal = false;
 
-    void OnCancellation(transport::Cancellation cancellation) noexcept override {
+    void OnCancellation(common::Cancellation cancellation) noexcept override {
         notified = true;
         reason = cancellation.reason;
         terminal = cancellation.terminal;

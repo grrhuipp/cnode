@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <charconv>
@@ -205,6 +206,8 @@ TrafficJournal::Batch TrafficJournal::Prepare() {
         }
         result.traffic.reserve(merged.size());
         for (const auto& [uid, value] : merged) result.traffic.push_back(value);
+        // The push body lists users in ascending uid, independent of hash order.
+        std::ranges::sort(result.traffic, {}, &api::UserTraffic::UID);
         return result;
     } catch (...) {
         failed_ = true;

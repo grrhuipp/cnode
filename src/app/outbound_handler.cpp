@@ -15,7 +15,7 @@ namespace app {
 // ============================================================================
 
 OutboundHandler::OutboundHandler(PreparedOutboundConfig config, net::io_context& io_context,
-                                 app::DNS& dns, std::chrono::seconds dial_timeout,
+                                 app::DNSWorker& dns, std::chrono::seconds dial_timeout,
                                  common::AwaitableTaskGroup& tasks)
     : config_(std::move(config))
     , dialer_(io_context, dns, config_.sender, dial_timeout)
@@ -42,7 +42,7 @@ net::awaitable<proxy::OutboundProcessResult> OutboundHandler::Dispatch(
 
 OutboundHandlerRegistry::OutboundHandlerRegistry(
     const std::vector<PreparedOutboundConfig>& configurations,
-    net::io_context& io_context, app::DNS& dns,
+    net::io_context& io_context, app::DNSWorker& dns,
     std::chrono::seconds dial_timeout, common::AwaitableTaskGroup& tasks)
     : io_context_(io_context), dns_(dns), dial_timeout_(dial_timeout), tasks_(tasks) {
     handlers_.reserve(configurations.size());

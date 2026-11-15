@@ -20,9 +20,7 @@
 #include <asio/write.hpp>
 
 namespace {
-namespace net = ::net;
 using namespace std::chrono_literals;
-using ::app::DNS;
 using ::app::DnsResult;
 
 // Builds answers from the echoed question only: resolver queries carry an EDNS
@@ -308,14 +306,13 @@ protected:
         io.run_for(4s);
         const bool completed_before_cleanup = done;
         peer.Stop();
-        JoinService(io, worker);
+        JoinService(io, dns);
         EXPECT_TRUE(completed_before_cleanup) << "DNS 查询未在截止前完成";
         if (failure) std::rethrow_exception(failure);
     }
     net::io_context io;
     Peer peer{io, GetParam()};
-    ::app::DNSWorker worker{io, Config(peer), 8};
-    DNS dns{worker};
+    ::app::DNSWorker dns{io, Config(peer), 8};
 };
 
 TEST_P(DnsDatagramQueries, ValidatesOutOfOrderAnswersAndCachesCanonicalNames) {
@@ -545,14 +542,13 @@ TEST_P(DnsNegativeWithoutZoneSoa, IsNotCached) {
     peer.omit_soa = !GetParam();
     peer.unrelated_soa = GetParam();
     ::app::DNSWorker worker(io, Config(peer), 8);
-    DNS dns(worker);
     bool done = false;
     std::exception_ptr failure;
     auto run = [&]() -> net::awaitable<void> {
-        const auto first = co_await dns.Resolve("nosoa.example");
+        const auto first = co_await worker.Resolve("nosoa.example");
         EXPECT_EQ(first.error, ::common::ErrorCode::DNS_NO_RECORD);
         EXPECT_EQ(first.ttl, 0u);
-        const auto second = co_await dns.Resolve("nosoa.example");
+        const auto second = co_await worker.Resolve("nosoa.example");
         EXPECT_EQ(second.error, ::common::ErrorCode::DNS_NO_RECORD);
         EXPECT_FALSE(second.from_cache);
         EXPECT_EQ(peer.packets, 4u);
@@ -657,7 +653,6 @@ TEST_P(DnsDatagramIsolation, OneRequestEndingDoesNotCancelAnotherQuery) {
     Peer peer(io);
     peer.hold = cancel;
     ::app::DNSWorker worker(io, Config(peer), 8);
-    DNS dns(worker);
     net::cancellation_signal signal;
     std::array<DnsResult, 2> answers;
     std::array<std::exception_ptr, 2> errors;
@@ -666,8 +661,8 @@ TEST_P(DnsDatagramIsolation, OneRequestEndingDoesNotCancelAnotherQuery) {
         errors[i] = e; answers[i] = std::move(result);
         if (++completed == 2) peer.Stop();
     }; };
-    net::co_spawn(io, dns.Resolve("timeout.example"), net::bind_cancellation_slot(signal.slot(), finish(0)));
-    net::co_spawn(io, dns.Resolve("other.example"), finish(1));
+    net::co_spawn(io, worker.Resolve("timeout.example"), net::bind_cancellation_slot(signal.slot(), finish(0)));
+    net::co_spawn(io, worker.Resolve("other.example"), finish(1));
     net::steady_timer timer(io, 40ms);
     if (cancel) timer.async_wait([&](::IoErrorCode ec) {
         if (!ec) { signal.emit(net::cancellation_type::terminal); peer.Flush("other.example"); }
@@ -802,9 +797,8 @@ TEST(DnsDatagram, RefusedUpstreamFallsBackAfterOutstandingQueriesFinish) {
     auto config = Config(first);
     config.servers.push_back(second.socket.local_endpoint());
     ::app::DNSWorker worker(io, config, 8);
-    DNS dns(worker);
     bool ok = false;
-    net::co_spawn(io, dns.Resolve("fallback.example"), [&](std::exception_ptr e, DnsResult result) {
+    net::co_spawn(io, worker.Resolve("fallback.example"), [&](std::exception_ptr e, DnsResult result) {
         ok = !e && result.Ok(); first.Stop(); second.Stop();
     });
     io.run_for(3s);
@@ -821,12 +815,11 @@ TEST(DnsDatagram, CacheWriteFailurePreservesAnswerAndLaterWriteRecovers) {
     net::io_context io;
     Peer peer(io);
     ::app::DNSWorker worker(io, Config(peer), 8);
-    DNS dns(worker);
     std::exception_ptr error;
     bool done = false;
     auto run = [&]() -> net::awaitable<void> {
         peer.fault_cache_write = true;
-        auto result = co_await dns.Resolve("cache-fault.example");
+        auto result = co_await worker.Resolve("cache-fault.example");
         peer.fault_cache_write = false;
         const bool fault_consumed = !::common::reject_next_process_allocation;
         ::common::reject_next_process_allocation = false;
@@ -836,7 +829,7 @@ TEST(DnsDatagram, CacheWriteFailurePreservesAnswerAndLaterWriteRecovers) {
         EXPECT_TRUE(fault_consumed);
         EXPECT_GT(::common::rejected_process_allocations, rejected);
         EXPECT_EQ(failed_stats.entries, 0u);
-        result = co_await dns.Resolve("cache-fault.example");
+        result = co_await worker.Resolve("cache-fault.example");
         const auto recovered_stats = co_await worker.GetCacheStats();
         EXPECT_TRUE(result.Ok());
         EXPECT_EQ(result.addresses.size(), 2u);
@@ -1057,12 +1050,11 @@ TEST_P(DnsTtl, PreservesAddressesButDoesNotCacheZeroTtl) {
     config.min_ttl = 60;
     config.max_ttl = 3600;
     ::app::DNSWorker worker(io, config, 8);
-    DNS dns(worker);
     bool done = false;
     std::exception_ptr error;
     auto run = [&]() -> net::awaitable<void> {
-        const auto first = co_await dns.Resolve("ttl.example");
-        const auto second = co_await dns.Resolve("TTL.EXAMPLE.");
+        const auto first = co_await worker.Resolve("ttl.example");
+        const auto second = co_await worker.Resolve("TTL.EXAMPLE.");
         const std::vector<net::ip::address> expected{
             net::ip::make_address("192.0.2.1"), net::ip::make_address("2001:db8::1")};
         EXPECT_EQ(first.addresses, expected);

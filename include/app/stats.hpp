@@ -1,9 +1,9 @@
 #pragma once
 
-#include "common/clock.hpp"
 #include "common/hash.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -68,22 +68,6 @@ struct WorkerRuntimeStatsSnapshot {
 };
 
 // ============================================================================
-// 本地累加器（Per-Connection 或 Per-Task，无锁）
-// ============================================================================
-struct LocalStatsAccumulator {
-    uint64_t bytes_in = 0;
-    uint64_t bytes_out = 0;
-
-    void AddBytesIn(uint64_t n) { bytes_in += n; }
-    void AddBytesOut(uint64_t n) { bytes_out += n; }
-
-    void Reset() {
-        bytes_in = 0;
-        bytes_out = 0;
-    }
-};
-
-// ============================================================================
 // 统计分片：一个 Worker 一片，占一个缓存行
 // ============================================================================
 struct alignas(64) StatsShard {
@@ -108,12 +92,6 @@ struct alignas(64) StatsShard {
         snapshot.bytes_out = bytes_out;
         snapshot.errors = errors;
         return snapshot;
-    }
-
-    // 批量提交（从本地累加器）
-    void CommitAccumulator(const LocalStatsAccumulator& acc) {
-        bytes_in += acc.bytes_in;
-        bytes_out += acc.bytes_out;
     }
 };
 
@@ -151,7 +129,7 @@ public:
     // Requires at least one Worker; each Worker owns exactly one shard.
     explicit ShardedStats(uint32_t num_workers)
         : shards_(num_workers)
-        , last_sample_time_(common::steady_clock::now()) {
+        , last_sample_time_(std::chrono::steady_clock::now()) {
         if (shards_.empty()) {
             throw std::invalid_argument("stats require at least one worker shard");
         }
@@ -171,7 +149,7 @@ public:
 
     // 采样（每秒调用）
     void SampleNow(const StatsSnapshot& snapshot) {
-        auto now = common::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
         auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - last_sample_time_).count();
         if (elapsed_ms <= 0) return;
@@ -190,7 +168,7 @@ public:
         // 滑动窗口：遍历所有有效采样点，累加增量 / 计算时间跨度
         uint64_t window_in  = 0;
         uint64_t window_out = 0;
-        common::time_point oldest_start = now;
+        std::chrono::steady_clock::time_point oldest_start = now;
         bool has_valid = false;
 
         for (const auto& s : samples_) {
@@ -225,7 +203,7 @@ private:
     struct Sample {
         uint64_t bytes_in   = 0;
         uint64_t bytes_out  = 0;
-        common::time_point start_time;   // 本采样周期的起始时刻（= 上次采样时间）
+        std::chrono::steady_clock::time_point start_time;   // 本采样周期的起始时刻（= 上次采样时间）
         bool valid = false;      // 是否已写入有效数据
     };
 
@@ -234,7 +212,7 @@ private:
 
     uint64_t last_bytes_in_ = 0;
     uint64_t last_bytes_out_ = 0;
-    common::time_point last_sample_time_;
+    std::chrono::steady_clock::time_point last_sample_time_;
 
     double current_in_rate_ = 0;
     double current_out_rate_ = 0;

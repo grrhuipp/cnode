@@ -5,11 +5,12 @@
 #include <array>
 #include <cstdint>
 #include <iterator>
+#include <optional>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
-using ::transport::EncodeUdpMessage;
 using ::transport::ParseUdpMessage;
 using ::transport::ParseV1ClientHello;
 using ::transport::ParseV1Request;
@@ -18,6 +19,24 @@ using UdpMessage = ::transport::HysteriaUdpMessage;
 using Version = ::transport::HysteriaVersion;
 
 namespace {
+
+struct EncodedUdp {
+    std::vector<uint8_t> wire;
+    size_t header_size = 0;
+};
+
+// The production send path: format the target once, size the header, encode
+// one fragment.
+std::optional<EncodedUdp> EncodeUdp(Version version, const UdpMessage& message) {
+    std::optional<::common::AddressText> address_storage;
+    const auto text = ::transport::PrepareUdpTargetText(version, message.target, address_storage);
+    if (!text) return std::nullopt;
+    const auto header_size = ::transport::UdpTargetHeaderSize(version, *text);
+    if (!header_size) return std::nullopt;
+    auto wire = ::transport::EncodeUdpFragment(version, message, *text, *header_size);
+    if (!wire) return std::nullopt;
+    return EncodedUdp{std::move(*wire), *header_size};
+}
 
 constexpr uint8_t kV2SinglePacket[]{
     0, 0, 0, 7, 0x12, 0x34, 255, 1, 14,
@@ -79,9 +98,9 @@ TEST_F(HysteriaProtocol, V1UdpRoundTrip) {
     message.packet_id = 42;
     message.target = ::common::TargetAddress("1.2.3.4", 53);
     message.payload = payload;
-    const auto encoded = EncodeUdpMessage(Version::V1, message);
+    const auto encoded = EncodeUdp(Version::V1, message);
     ASSERT_TRUE(encoded);
-    const auto parsed = ParseUdpMessage(Version::V1, *encoded);
+    const auto parsed = ParseUdpMessage(Version::V1, encoded->wire);
     ASSERT_TRUE(parsed);
     ASSERT_TRUE(parsed->session_id == message.session_id);
     ASSERT_TRUE(parsed->packet_id == message.packet_id);
@@ -98,17 +117,17 @@ TEST_F(HysteriaProtocol, V2UdpRoundTripAndContinuationFragment) {
     message.fragment_count = 2;
     message.target = ::common::TargetAddress("example.com", 53);
     message.payload = payload;
-    const auto encoded = EncodeUdpMessage(Version::V2, message);
+    const auto encoded = EncodeUdp(Version::V2, message);
     ASSERT_TRUE(encoded);
-    const auto parsed = ParseUdpMessage(Version::V2, *encoded);
+    const auto parsed = ParseUdpMessage(Version::V2, encoded->wire);
     ASSERT_TRUE(parsed);
     ASSERT_TRUE(parsed->target.SameEndpoint(message.target));
 
     message.fragment_id = 1;
     message.target = {};
-    const auto continuation = EncodeUdpMessage(Version::V2, message);
+    const auto continuation = EncodeUdp(Version::V2, message);
     ASSERT_TRUE(continuation);
-    const auto parsed_continuation = ParseUdpMessage(Version::V2, *continuation);
+    const auto parsed_continuation = ParseUdpMessage(Version::V2, continuation->wire);
     ASSERT_TRUE(parsed_continuation);
     ASSERT_TRUE(!parsed_continuation->target.IsValid());
 }
@@ -136,13 +155,12 @@ TEST_F(HysteriaProtocol, V2SinglePacketEncodesIgnoredFragmentId) {
     const UdpMessage message{.session_id = 7, .packet_id = 0x1234,
         .fragment_id = 255, .fragment_count = 1,
         .target = ::common::TargetAddress("example.com", 53), .payload = payload};
-    const auto encoded = EncodeUdpMessage(Version::V2, message);
+    const auto encoded = EncodeUdp(Version::V2, message);
     ASSERT_TRUE(encoded);
-    EXPECT_TRUE(std::ranges::equal(*encoded, kV2SinglePacket));
+    EXPECT_TRUE(std::ranges::equal(encoded->wire, kV2SinglePacket));
 }
 
 TEST_F(HysteriaProtocol, V2FragmentCountAndIndexRemainValidated) {
-    const std::vector<uint8_t> payload{'d', 'n', 's'};
     for (const uint8_t count : {uint8_t{0}, uint8_t{2}}) {
         SCOPED_TRACE(static_cast<unsigned>(count));
         auto wire = std::vector<uint8_t>(
@@ -151,10 +169,6 @@ TEST_F(HysteriaProtocol, V2FragmentCountAndIndexRemainValidated) {
         const auto parsed = ParseUdpMessage(Version::V2, wire);
         ASSERT_FALSE(parsed);
         EXPECT_EQ(parsed.error(), ::transport::ProtocolError::Invalid);
-        const UdpMessage message{.session_id = 7, .packet_id = 0x1234,
-            .fragment_id = 255, .fragment_count = count,
-            .target = ::common::TargetAddress("example.com", 53), .payload = payload};
-        EXPECT_FALSE(EncodeUdpMessage(Version::V2, message));
     }
 }
 
@@ -163,45 +177,33 @@ TEST_F(HysteriaProtocol, V2SinglePacketRequiresTargetRegardlessOfFragmentId) {
     const auto parsed = ParseUdpMessage(Version::V2, wire);
     ASSERT_FALSE(parsed);
     EXPECT_EQ(parsed.error(), ::transport::ProtocolError::Invalid);
-    const std::vector<uint8_t> payload{'x'};
-    const UdpMessage message{.session_id = 7, .packet_id = 0x1234,
-        .fragment_id = 255, .fragment_count = 1, .target = {}, .payload = payload};
-    EXPECT_FALSE(EncodeUdpMessage(Version::V2, message));
 }
 
 TEST_F(HysteriaProtocol, UdpPreservesEmptyAndMaximumPayloadsAcrossAddressForms) {
     using ::transport::kMaxUdpPayloadLength;
-    using ::transport::UdpMessageHeaderSize;
     const auto domain = std::string(63, 'a') + "." + std::string(63, 'b') +
         "." + std::string(63, 'c') + "." + std::string(61, 'd');
     const std::array targets{
         ::common::TargetAddress("192.0.2.123", 65535),
         ::common::TargetAddress("2001:db8::1234", 65535),
         ::common::TargetAddress(domain, 65535)};
-    std::array<uint8_t, kMaxUdpPayloadLength + 1> payload{};
+    std::array<uint8_t, kMaxUdpPayloadLength> payload{};
     for (size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<uint8_t>(i);
     for (const auto version : {Version::V1, Version::V2}) {
         for (const auto& target : targets) {
             for (const size_t size : {size_t{0}, size_t{1}, kMaxUdpPayloadLength}) {
                 const UdpMessage message{.session_id = 0x12345678, .packet_id = 0x8765,
                     .target = target, .payload = std::span(payload).first(size)};
-                const auto encoded = EncodeUdpMessage(version, message);
+                const auto encoded = EncodeUdp(version, message);
                 ASSERT_TRUE(encoded);
-                const auto header = UdpMessageHeaderSize(version, target);
-                ASSERT_TRUE(header);
-                EXPECT_EQ(encoded->size(), *header + size);
-                const auto parsed = ParseUdpMessage(version, *encoded);
+                EXPECT_EQ(encoded->wire.size(), encoded->header_size + size);
+                const auto parsed = ParseUdpMessage(version, encoded->wire);
                 ASSERT_TRUE(parsed);
                 EXPECT_EQ(parsed->session_id, message.session_id);
                 EXPECT_EQ(parsed->packet_id, message.packet_id);
                 EXPECT_TRUE(parsed->target.SameEndpoint(target));
                 EXPECT_TRUE(std::ranges::equal(parsed->payload, message.payload));
             }
-            const UdpMessage oversized{.target = target, .payload = payload};
-            const auto rejected = EncodeUdpMessage(version, oversized);
-            ASSERT_FALSE(rejected);
-            EXPECT_EQ(rejected.error(),
-                ::transport::ProtocolError::Invalid);
         }
     }
 }

@@ -18,7 +18,7 @@
 #include <vector>
 
 namespace {
-namespace net = ::net;
+
 using namespace ::controller;
 using ::api::NodeInfo;
 using ::app::UserSet;

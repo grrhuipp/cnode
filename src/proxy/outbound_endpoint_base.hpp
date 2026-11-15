@@ -28,7 +28,7 @@ public:
         return stream_;
     }
 
-    transport::CancellationSource& Cancellation() noexcept override {
+    common::CancellationSource& Cancellation() noexcept override {
         return stream_.Cancellation();
     }
 
@@ -68,7 +68,7 @@ public:
         return socket_;
     }
 
-    transport::CancellationSource& Cancellation() noexcept override {
+    common::CancellationSource& Cancellation() noexcept override {
         return socket_.Cancellation();
     }
 

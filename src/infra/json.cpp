@@ -190,7 +190,6 @@ bool value::is_bool() const noexcept { return std::holds_alternative<bool>(data_
 bool value::is_string() const noexcept { return std::holds_alternative<std::string>(data_); }
 bool value::is_int64() const noexcept { return std::holds_alternative<int64_t>(data_); }
 bool value::is_uint64() const noexcept { return std::holds_alternative<uint64_t>(data_); }
-bool value::is_double() const noexcept { return std::holds_alternative<double>(data_); }
 bool value::is_object() const noexcept { return std::holds_alternative<object_ptr>(data_); }
 bool value::is_array() const noexcept { return std::holds_alternative<array_ptr>(data_); }
 
@@ -199,12 +198,6 @@ std::string& value::as_string() { return std::get<std::string>(data_); }
 const std::string& value::as_string() const { return std::get<std::string>(data_); }
 int64_t value::as_int64() const { return std::get<int64_t>(data_); }
 uint64_t value::as_uint64() const { return std::get<uint64_t>(data_); }
-double value::as_double() const {
-    if (is_double()) return std::get<double>(data_);
-    if (is_int64()) return static_cast<double>(as_int64());
-    if (is_uint64()) return static_cast<double>(as_uint64());
-    throw std::bad_variant_access();
-}
 object& value::as_object() { return *std::get<object_ptr>(data_); }
 const object& value::as_object() const { return *std::get<object_ptr>(data_); }
 array& value::as_array() { return *std::get<array_ptr>(data_); }
@@ -230,7 +223,10 @@ bool value::operator==(const value& other) const noexcept {
         }
         return false;
     }
-    if (is_double()) return other.is_double() && as_double() == other.as_double();
+    if (const auto* number = std::get_if<double>(&data_)) {
+        const auto* other_number = std::get_if<double>(&other.data_);
+        return other_number && *number == *other_number;
+    }
     if (is_object()) return other.is_object() && as_object() == other.as_object();
     if (is_array()) return other.is_array() && as_array() == other.as_array();
     return false;
@@ -545,8 +541,10 @@ struct Overloaded : Handlers... {
     using Handlers::operator()...;
 };
 
-void SerializeValue(const value& v, std::string& out) {
-    v.visit(Overloaded{
+}  // namespace
+
+void value::append_serialized(std::string& out) const {
+    std::visit(Overloaded{
         [&](std::nullptr_t) { out += "null"; },
         [&](bool b) { out += b ? "true" : "false"; },
         [&](int64_t n) {
@@ -566,31 +564,30 @@ void SerializeValue(const value& v, std::string& out) {
             std::format_to(std::back_inserter(out), "{}", d);
         },
         [&](const std::string& s) { SerializeString(s, out); },
-        [&](const array& items) {
+        [&](const array_ptr& items) {
             out.push_back('[');
             bool first = true;
-            for (const auto& item : items) {
+            for (const auto& item : *items) {
                 if (!first) out.push_back(',');
                 first = false;
-                SerializeValue(item, out);
+                item.append_serialized(out);
             }
             out.push_back(']');
         },
-        [&](const object& members) {
+        [&](const object_ptr& members) {
             out.push_back('{');
             bool first = true;
-            for (const auto& [key, item] : members) {
+            for (const auto& [key, item] : *members) {
                 if (!first) out.push_back(',');
                 first = false;
                 SerializeString(key, out);
                 out.push_back(':');
-                SerializeValue(item, out);
+                item.append_serialized(out);
             }
             out.push_back('}');
         }
-    });
+    }, data_);
 }
-}  // namespace
 
 void append_json_string(std::string& out, std::string_view s) {
     SerializeString(s, out);
@@ -602,7 +599,7 @@ value parse(std::string_view text, KeyComparison comparison) {
 
 std::string serialize(const value& v) {
     std::string out;
-    SerializeValue(v, out);
+    v.append_serialized(out);
     return out;
 }
 

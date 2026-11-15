@@ -204,7 +204,7 @@ struct DatagramSocket::Impl final {
         WriteOperation& operation, udp::endpoint destination, Payload payload);
     udp::socket socket;
     Timeouts timeouts;
-    transport::CancellationSource cancellation;
+    common::CancellationSource cancellation;
     uint64_t generation = 0;
     uint64_t cancellation_epoch_ = 0;
     common::ErrorCode cancellation_reason = common::ErrorCode::OK;
@@ -436,10 +436,6 @@ void DatagramSocket::SetIdleTimeout(std::chrono::seconds timeout) {
     try { impl_->timeouts.SetIdleTimeout(timeout); }
     catch (const std::bad_alloc&) { throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED); }
 }
-void DatagramSocket::SetReadTimeout(std::chrono::seconds timeout) {
-    try { impl_->timeouts.SetReadTimeout(timeout); }
-    catch (const std::bad_alloc&) { throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED); }
-}
 void DatagramSocket::SetWriteTimeout(std::chrono::seconds timeout) {
     try { impl_->timeouts.SetWriteTimeout(timeout); }
     catch (const std::bad_alloc&) { throw LinkError(common::ErrorCode::RESOURCE_EXHAUSTED); }
@@ -450,11 +446,10 @@ PhaseDeadlineToken DatagramSocket::StartPhaseDeadline(std::chrono::seconds timeo
 }
 void DatagramSocket::ClearPhaseDeadline() noexcept { impl_->timeouts.ClearPhaseDeadline(); }
 bool DatagramSocket::ConsumeIdleTimeout() noexcept { return impl_->timeouts.ConsumeIdleTimeout(); }
-bool DatagramSocket::ConsumeReadTimeout() noexcept { return impl_->timeouts.ConsumeReadTimeout(); }
 bool DatagramSocket::ConsumeWriteTimeout() noexcept { return impl_->timeouts.ConsumeWriteTimeout(); }
 bool DatagramSocket::ConsumePhaseDeadline() noexcept { return impl_->timeouts.ConsumePhaseDeadline(); }
 void DatagramSocket::TouchActivity() noexcept { impl_->timeouts.TouchActivity(); }
-CancellationSource& DatagramSocket::Cancellation() noexcept { return impl_->cancellation; }
+common::CancellationSource& DatagramSocket::Cancellation() noexcept { return impl_->cancellation; }
 void DatagramSocket::Cancel() noexcept { impl_->Cancel(); }
 void DatagramSocket::Close() noexcept { impl_->Close(common::ErrorCode::CANCELLED); }
 bool DatagramSocket::IsIPv6() const noexcept { return impl_->ipv6; }

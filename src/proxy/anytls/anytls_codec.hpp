@@ -6,7 +6,7 @@
 #include "common/asio_types.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/error.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "common/target_address.hpp"
 #include <openssl/mem.h>
 #include "infra/outbound_types.hpp"
@@ -136,15 +136,6 @@ net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteAnyTlsPacketWithPadding(transport::AsyncStream& stream,
                        std::span<const PaddingRecord> record_rules,
                        std::span<const uint8_t> packet);
-
-net::awaitable<tl::expected<void, common::ErrorCode>>
-WriteMultiBufferAsFrameBatch(transport::AsyncStream& stream, uint8_t cmd, uint32_t sid, common::MultiBuffer mb);
-
-net::awaitable<tl::expected<void, common::ErrorCode>>
-WriteBuffersAsFrameBatch(transport::AsyncStream& stream,
-                         uint8_t cmd,
-                         uint32_t sid,
-                         std::span<const net::const_buffer> buffers);
 
 net::awaitable<tl::expected<void, common::ErrorCode>>
 WriteAnyTlsMultiBufferAsFramesWithPadding(transport::AsyncStream& stream,

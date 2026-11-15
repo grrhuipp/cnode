@@ -24,7 +24,7 @@ using namespace std::chrono_literals;
 using UdpRequest = proxy::FreedomUdpRequest;
 
 enum class WriteAbort { RequestCancel, ParentCancellation, Deadline };
-enum class Deadline { Idle, Read, Phase };
+enum class Deadline { Idle, Phase };
 enum class RelayAbort { Cancellation, Deadline };
 
 common::TargetAddress Target(const udp::endpoint& endpoint) {
@@ -140,12 +140,11 @@ protected:
     DnsPeer dns_peer{io};
     app::DNSWorker dns_worker{
         io, app::DnsConfig{.servers = {dns_peer.Endpoint()}}, 8};
-    app::DNS dns{dns_worker};
     std::vector<std::shared_ptr<UdpRequest>> requests;
 
     UdpRequest& Request() {
         requests.push_back(std::make_shared<UdpRequest>(
-            io, dns, net::ip::address_v4::loopback()));
+            io, dns_worker, net::ip::address_v4::loopback()));
         return *requests.back();
     }
 
@@ -337,7 +336,6 @@ TEST_P(UdpDeadlineTest, PendingReadExpiresOnceAtItsDeadline) {
         transport::PhaseDeadlineToken phase;
         const auto kind = GetParam();
         if (kind == Deadline::Idle) channel.RelayControl().SetIdleTimeout(1s);
-        if (kind == Deadline::Read) channel.RelayControl().SetReadTimeout(1s);
         if (kind == Deadline::Phase) phase = channel.RelayControl().StartPhaseDeadline(1s);
         const auto started = std::chrono::steady_clock::now();
         bool cancelled = false;
@@ -354,10 +352,6 @@ TEST_P(UdpDeadlineTest, PendingReadExpiresOnceAtItsDeadline) {
             EXPECT_TRUE(channel.RelayControl().ConsumeIdleTimeout());
             EXPECT_FALSE(channel.RelayControl().ConsumeIdleTimeout());
         }
-        if (kind == Deadline::Read) {
-            EXPECT_TRUE(channel.RelayControl().ConsumeReadTimeout());
-            EXPECT_FALSE(channel.RelayControl().ConsumeReadTimeout());
-        }
         if (kind == Deadline::Phase) {
             EXPECT_TRUE(phase.Expired());
             channel.RelayControl().ClearPhaseDeadline();
@@ -369,11 +363,10 @@ TEST_P(UdpDeadlineTest, PendingReadExpiresOnceAtItsDeadline) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Deadlines, UdpDeadlineTest,
-    testing::Values(Deadline::Idle, Deadline::Read, Deadline::Phase),
+    testing::Values(Deadline::Idle, Deadline::Phase),
     [](const testing::TestParamInfo<Deadline>& info) {
         switch (info.param) {
         case Deadline::Idle: return "Idle";
-        case Deadline::Read: return "Read";
         case Deadline::Phase: return "Phase";
         }
         return "Unknown";
@@ -440,7 +433,7 @@ TEST_F(UdpRequestTest, ParentCancellationJoinsReaderWithoutAffectingOtherRequest
 TEST_F(UdpRequestTest, QueuedDeadlineCallbacksDoNotBorrowDestroyedRequests) {
     Run([&]() -> net::awaitable<void> {
         {
-            UdpRequest old(io, dns, net::ip::address_v4::loopback());
+            UdpRequest old(io, dns_worker, net::ip::address_v4::loopback());
             EXPECT_TRUE(static_cast<bool>(old.RelayControl().StartPhaseDeadline(1s)));
             std::this_thread::sleep_for(1050ms);
         }
@@ -460,7 +453,7 @@ TEST_F(UdpRequestTest, MaximumDurationDeadlineDoesNotOverflow) {
 
 class OnePacketReader final : public transport::MultiBufferReader {
 public:
-    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+    common::CancellationSource& Cancellation() noexcept override { return cancellation_; }
 
     OnePacketReader(common::TargetAddress target)
         : target_(std::move(target)) {}
@@ -470,7 +463,7 @@ public:
         co_return Packet(target_, 2000);
     }
 private:
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
 
     common::TargetAddress target_;
     bool used_ = false;

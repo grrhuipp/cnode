@@ -31,7 +31,7 @@
 #include <sys/socket.h>
 
 namespace {
-namespace net = ::net;
+
 using namespace std::chrono_literals;
 
 class TransportBehavior : public testing::Test {
@@ -103,7 +103,6 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
     auto raw = std::make_unique<::transport::TcpStream>(std::move(socket));
     const int native = raw->NativeHandle();
     raw->SetIdleTimeout(3s);
-    raw->SetReadTimeout(2s);
     raw->SetWriteTimeout(2s);
     (void)raw->StartPhaseDeadline(3s);
 
@@ -273,7 +272,8 @@ void Case(bool outbound, bool tls, bool upgrade, bool fragmented, bool abortive)
         }
         EXPECT_TRUE(cancelled);
         EXPECT_TRUE(stream->IsOpen());
-        co_await stream->AsyncWrite(net::buffer("ack", 3));
+        const net::const_buffer ack = net::buffer("ack", 3);
+        co_await stream->WriteBuffers({&ack, 1});
         received.clear();
         while (received.size() < 3) {
             const size_t n = co_await stream->AsyncRead(net::buffer(small));
@@ -351,7 +351,8 @@ void WriteTimeoutResetsQueuedPayload() {
         // graceful close would leave the kernel draining this queued payload.
         const std::string payload(1024 * 1024, 'x');
         bool cancelled = false;
-        try { (void)co_await stream.AsyncWrite(net::buffer(payload)); }
+        const net::const_buffer payload_buffer = net::buffer(payload);
+        try { co_await stream.WriteBuffers({&payload_buffer, 1}); }
         catch (const ::IoSystemError& failure) {
             EXPECT_EQ(failure.code(), ::io_error::operation_aborted) << "write deadline failed with unrelated I/O error";
             cancelled = true;
@@ -645,7 +646,8 @@ void WsResume(bool client, bool multi_buffer, size_t size, size_t cut, uint8_t o
             const size_t prefix = cut > header_size ? cut - header_size : 0;
             EXPECT_EQ(received, payload.substr(0, prefix)) << "WS read waited to fill its caller buffer before delivering available payload";
         }
-        co_await stream.AsyncWrite(net::buffer("ack", 3));
+        const net::const_buffer ack = net::buffer("ack", 3);
+        co_await stream.WriteBuffers({&ack, 1});
         if (opcode == 8) {
             EXPECT_TRUE((co_await read()).empty()) << "complete WS Close leaked application bytes";
         } else {

@@ -1,8 +1,8 @@
 #include "proxy/vless/vless_encryption.hpp"
+#include "proxy/blake3.hpp"
 #include "common/byte_reader.hpp"
 #include "common/scoped_cleanse.hpp"
 
-#include <blake3.h>
 #include <openssl/bytestring.h>
 #include <openssl/curve25519.h>
 #include <openssl/err.h>
@@ -178,37 +178,7 @@ namespace {
     return nullptr;
 }
 
-[[nodiscard]] std::array<uint8_t, kVlessEncryptionAeadKeySize>
-DeriveAeadKey(std::span<const uint8_t> context,
-              std::span<const uint8_t> key) noexcept {
-    std::array<uint8_t, kVlessEncryptionAeadKeySize> out{};
-    blake3_hasher hasher;
-    blake3_hasher_init_derive_key_raw(
-        &hasher,
-        context.empty() ? nullptr : context.data(),
-        context.size());
-    if (!key.empty()) {
-        blake3_hasher_update(&hasher, key.data(), key.size());
-    }
-    blake3_hasher_finalize(&hasher, out.data(), out.size());
-    OPENSSL_cleanse(&hasher, sizeof(hasher));
-    return out;
-}
-
 }  // namespace
-
-std::array<uint8_t, kVlessEncryptionLengthSize>
-EncodeVlessEncryptionLength(size_t length) noexcept {
-    return {
-        static_cast<uint8_t>((length >> 8) & 0xffu),
-        static_cast<uint8_t>(length & 0xffu),
-    };
-}
-
-uint16_t DecodeVlessEncryptionLength(
-    std::span<const uint8_t, kVlessEncryptionLengthSize> encoded) noexcept {
-    return common::LoadU16BE(encoded.data());
-}
 
 bool EncodeVlessEncryptionRecordHeader(
     std::span<uint8_t, kVlessEncryptionRecordHeaderSize> header,
@@ -220,8 +190,7 @@ bool EncodeVlessEncryptionRecordHeader(
     header[0] = 23;
     header[1] = 3;
     header[2] = 3;
-    header[3] = static_cast<uint8_t>((ciphertext_length >> 8) & 0xffu);
-    header[4] = static_cast<uint8_t>(ciphertext_length & 0xffu);
+    common::StoreU16BE(&header[3], static_cast<uint16_t>(ciphertext_length));
     return true;
 }
 
@@ -264,7 +233,11 @@ std::optional<VlessEncryptionAead> VlessEncryptionAead::Create(
     }
 
     VlessEncryptionAead aead;
-    auto derived = DeriveAeadKey(context, key);
+    std::array<uint8_t, kVlessEncryptionAeadKeySize> derived;
+    Blake3DeriveKey(
+        std::string_view(reinterpret_cast<const char*>(context.data()), context.size()),
+        {key},
+        derived);
     aead.cipher_ = cipher;
     bool ready = false;
     try {
@@ -366,28 +339,14 @@ namespace {
 constexpr char kVlessCtrContext[] = "VLESS";
 constexpr size_t kVlessEncryptionCtrKeySize = 32;
 
-using CtrKey = std::array<uint8_t, kVlessEncryptionCtrKeySize>;
-
-
-[[nodiscard]] CtrKey DeriveCtrKey(std::span<const uint8_t> key) noexcept {
-    CtrKey out{};
-    blake3_hasher hasher;
-    blake3_hasher_init_derive_key(&hasher, kVlessCtrContext);
-    if (!key.empty()) {
-        blake3_hasher_update(&hasher, key.data(), key.size());
-    }
-    blake3_hasher_finalize(&hasher, out.data(), out.size());
-    OPENSSL_cleanse(&hasher, sizeof(hasher));
-    return out;
-}
-
 }  // namespace
 
 std::optional<VlessEncryptionCtr> VlessEncryptionCtr::Create(
     std::span<const uint8_t> key,
     std::span<const uint8_t, kVlessEncryptionCtrIvSize> iv) noexcept {
     VlessEncryptionCtr ctr;
-    auto derived = DeriveCtrKey(key);
+    std::array<uint8_t, kVlessEncryptionCtrKeySize> derived;
+    Blake3DeriveKey(kVlessCtrContext, {key}, derived);
     const int rc = AES_set_encrypt_key(derived.data(), 256, &ctr.key_);
     OPENSSL_cleanse(derived.data(), derived.size());
     if (rc != 0) {

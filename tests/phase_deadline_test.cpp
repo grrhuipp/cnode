@@ -20,7 +20,7 @@ public:
     ::net::awaitable<std::size_t> AsyncRead(::net::mutable_buffer) override {
         throw std::logic_error("deadline test does not perform byte reads");
     }
-    ::net::awaitable<std::size_t> AsyncWrite(::net::const_buffer) override {
+    ::net::awaitable<void> WriteBuffers(std::span<const ::net::const_buffer>) override {
         throw std::logic_error("deadline test does not perform byte writes");
     }
     ::net::awaitable<::common::MultiBuffer> ReadMultiBuffer() override {
@@ -50,11 +50,11 @@ private:
     bool open_ = true;
 };
 
-struct CancellationObserver final : ::transport::CancellationSubscription {
+struct CancellationObserver final : ::common::CancellationSubscription {
     explicit CancellationObserver(int& notifications) noexcept : notifications(notifications) {}
     int& notifications;
 private:
-    void OnCancellation(::transport::Cancellation) noexcept override {
+    void OnCancellation(::common::Cancellation) noexcept override {
         ++notifications;
     }
 };

@@ -12,7 +12,7 @@
 
 namespace {
 
-namespace net = ::net;
+
 using ::common::MonitorLoop;
 
 

@@ -18,7 +18,7 @@
 #include <string_view>
 
 namespace {
-namespace net = ::net;
+
 using namespace std::chrono_literals;
 
 
@@ -72,7 +72,8 @@ public:
                 if (n == 0) break;
                 uplink.append(chunk.data(), n);
             }
-            (void)co_await stream->AsyncWrite(net::buffer(reply));
+            const net::const_buffer reply_buffer = net::buffer(reply);
+            co_await stream->WriteBuffers({&reply_buffer, 1});
         } catch (const ::IoSystemError&) {
         }
         co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());

@@ -3,7 +3,7 @@
 #include "app/relay.hpp"
 #include "common/scoped_cleanse.hpp"
 #include "proxy/inbound.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "transport/async_stream.hpp"
 #include "proxy/trojan/trojan_codec.hpp"
 #include "app/stats.hpp"
@@ -65,7 +65,7 @@ ReadRawTrojanRequest(transport::AsyncStream& stream, common::Context& ctx) {
     }
 }
 
-net::awaitable<tl::expected<common::UserOnlineSessionGuard, common::ErrorCode>>
+net::awaitable<tl::expected<app::UserOnlineSessionGuard, common::ErrorCode>>
 AuthenticateTrojanRequest(transport::AsyncStream& stream,
                           const app::AdmissionEnvironment& environment,
                           common::Context& ctx) {
@@ -158,7 +158,7 @@ TrojanInboundHandler::Process(
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}",
                    ctx.inbound.source_ip, ctx.inbound.source_port);
 
-    common::UserOnlineSessionGuard user_session;
+    app::UserOnlineSessionGuard user_session;
     {
         auto admitted = co_await AuthenticateTrojanRequest(*stream, environment_, ctx);
         if (!admitted) {

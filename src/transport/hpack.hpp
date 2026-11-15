@@ -1,9 +1,9 @@
 #pragma once
 #include "common/allocator.hpp"
+#include "transport/header_block_buffer.hpp"
 #include "transport/http_headers.hpp"
 #include <array>
 #include <algorithm>
-#include <cstring>
 #include <limits>
 #include <optional>
 #include <span>
@@ -11,56 +11,8 @@
 #include <type_traits>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace transport {
-class HpackBuffer final {
-public:
-    static constexpr size_t kInlineCapacity = 512;
-
-    void reserve(size_t n) {
-        if (n > kInlineCapacity) spill(n);
-    }
-
-    void push_back(uint8_t byte) {
-        if (!spilled_ && inline_size_ < kInlineCapacity) {
-            inline_[inline_size_++] = byte;
-            return;
-        }
-        if (!spilled_) spill(kInlineCapacity * 2);
-        heap_.push_back(byte);
-    }
-
-    void append(std::string_view value) {
-        if (value.empty()) return;
-        if (!spilled_ && value.size() <= kInlineCapacity - inline_size_) {
-            std::memcpy(inline_.data() + inline_size_, value.data(), value.size());
-            inline_size_ += value.size();
-            return;
-        }
-        if (!spilled_) spill(std::max(kInlineCapacity * 2, inline_size_ + value.size()));
-        const auto* bytes = reinterpret_cast<const uint8_t*>(value.data());
-        heap_.insert(heap_.end(), bytes, bytes + value.size());
-    }
-
-    [[nodiscard]] std::span<const uint8_t> Span() const noexcept {
-        return spilled_ ? std::span<const uint8_t>(heap_)
-                        : std::span<const uint8_t>(inline_.data(), inline_size_);
-    }
-
-private:
-    void spill(size_t cap) {
-        heap_.reserve(cap);
-        heap_.assign(inline_.data(), inline_.data() + inline_size_);
-        spilled_ = true;
-    }
-
-    std::array<uint8_t, kInlineCapacity> inline_{};
-    size_t inline_size_ = 0;
-    std::vector<uint8_t> heap_;
-    bool spilled_ = false;
-};
-
 template <typename Out>
 inline void AppendHpackInt(Out& out, uint8_t prefix_bits, uint8_t first_mask, uint32_t value) {
     const uint8_t max_prefix = static_cast<uint8_t>((1u << prefix_bits) - 1u);

@@ -378,7 +378,7 @@ struct PreparedSsTcpSession {
     proxy::BodyReader request_reader;
     proxy::SsStreamWriter response_writer;
     common::InitialPayload initial_payload;
-    common::UserOnlineSessionGuard user_session;
+    app::UserOnlineSessionGuard user_session;
     std::optional<proxy::UotVersion> uot_version;
 };
 
@@ -593,8 +593,7 @@ proxy::SsInboundHandler::Process(
 
     auto decoded = proxy::DecodeUdpPacket(
         request.payload.data(), request.payload.size(), users,
-        cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size,
-        udp_replay_cache_, request.associations != nullptr);
+        cipher_info_.type, cipher_info_.key_size, cipher_info_.salt_size);
     if (!decoded) {
         // UDP datagrams use the socket peer address, never a PROXY protocol source.
         return tl::unexpected(common::ErrorCode::PROTOCOL_AUTH_FAILED);

@@ -47,7 +47,7 @@ public:
         : bytes_(bytes), chunk_(chunk) {}
     bool EnableRawRead() noexcept override { switched_at = offset_; return true; }
     size_t switched_at = 0;
-    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+    common::CancellationSource& Cancellation() noexcept override { return cancellation_; }
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         common::MultiBuffer mb;
         if (offset_ < bytes_.size()) {
@@ -61,7 +61,7 @@ private:
     const std::vector<uint8_t>& bytes_;
     size_t offset_ = 0;
     size_t chunk_;
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
 };
 const std::array<uint8_t, 16> uuid{};
 const std::array<uint8_t, 6> hello{0x16, 0x03, 0x01, 0, 1, 1};

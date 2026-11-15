@@ -52,7 +52,7 @@ public:
 
     [[nodiscard]] static TimeoutScheduler& ForIoContext(net::io_context& io_context);
     // Call on the owner after all users join; drain cancellation before
-    // destroying the io_context and its PMR-backed scheduler service.
+    // destroying the io_context and its scheduler service.
     static void ReleaseForIoContext(net::io_context& io_context);
     // Detach all events and join any in-flight native timer cancellation.
     static net::awaitable<void> AsyncReleaseForIoContext(net::io_context& io_context);

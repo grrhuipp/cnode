@@ -61,7 +61,7 @@ public:
         : bytes_(bytes), cutpoints_(std::move(cutpoints)), signal_(signal),
           empty_on_cancel_(empty_on_cancel) {}
 
-    transport::CancellationSource& Cancellation() noexcept override {
+    common::CancellationSource& Cancellation() noexcept override {
         return cancellation_;
     }
 
@@ -109,7 +109,7 @@ public:
     }
 
 private:
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
     const std::vector<uint8_t>& bytes_;
     std::vector<size_t> cutpoints_;
     net::cancellation_signal& signal_;

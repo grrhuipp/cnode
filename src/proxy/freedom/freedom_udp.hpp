@@ -21,7 +21,7 @@ namespace proxy {
 // its concrete transport owns the socket, byte I/O and aggregate deadlines.
 class FreedomUdpRequest final : public ::proxy::OutboundDatagramEndpointBase {
 public:
-    FreedomUdpRequest(net::io_context& io, app::DNS& dns, const net::ip::address& bind_address)
+    FreedomUdpRequest(net::io_context& io, app::DNSWorker& dns, const net::ip::address& bind_address)
         : OutboundDatagramEndpointBase(io, bind_address), dns_(dns) {}
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
@@ -63,7 +63,7 @@ public:
     }
 
 private:
-    app::DNS& dns_;
+    app::DNSWorker& dns_;
 };
 
 }  // namespace proxy

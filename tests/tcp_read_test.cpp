@@ -41,7 +41,6 @@ struct ReadFixture {
     }
     void Start() {
         stream = std::make_unique<transport::TcpStream>(std::move(socket));
-        stream->SetReadTimeout(2s);
     }
     void Preload(const std::vector<uint8_t>& payload) {
         // Establish actual queued bytes without consuming them, before cnode
@@ -113,7 +112,6 @@ TEST(TcpRead, AllocationFailureDoesNotConsumeQueuedInput) {
     fixture.Preload(payload);
     fixture.peer.shutdown(tcp::socket::shutdown_send);
     fixture.Start();
-    fixture.stream->SetReadTimeout(0s);
     common::test_buffers_peak = 0;
     common::reject_next_process_allocation = true;
     auto failed = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
@@ -121,7 +119,6 @@ TEST(TcpRead, AllocationFailureDoesNotConsumeQueuedInput) {
     EXPECT_FALSE(common::reject_next_process_allocation);
     EXPECT_EQ(common::test_buffers_peak, 0u);
     EXPECT_EQ(common::test_buffers_live, 0u);
-    fixture.stream->SetReadTimeout(2s);
     auto retry = net::co_spawn(fixture.io, ReadToEof(*fixture.stream), net::use_future);
     EXPECT_EQ(fixture.Finish(std::move(retry)), payload);
     EXPECT_EQ(common::test_buffers_live, 0u);

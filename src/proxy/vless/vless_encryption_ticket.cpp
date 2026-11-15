@@ -1,7 +1,6 @@
 #include "proxy/vless/vless_encryption.hpp"
+#include "proxy/blake3.hpp"
 #include "app/group_coordinator.hpp"
-
-#include <blake3.h>
 
 #include <algorithm>
 #include <chrono>
@@ -9,18 +8,6 @@
 #include <unordered_map>
 #include <utility>
 namespace proxy {
-namespace {
-[[nodiscard]] std::array<uint8_t, 32> DigestNfsKey(
-    const VlessEncryptionNfsKey& nfs_key) noexcept {
-    std::array<uint8_t, 32> out{};
-    blake3_hasher hasher;
-    blake3_hasher_init(&hasher);
-    blake3_hasher_update(&hasher, nfs_key.bytes.data(), nfs_key.bytes.size());
-    blake3_hasher_finalize(&hasher, out.data(), out.size());
-    OPENSSL_cleanse(&hasher, sizeof(hasher));
-    return out;
-}
-}  // namespace
 bool VlessEncryptionClientTicketCache::Valid(
     std::chrono::steady_clock::time_point now) const noexcept {
     return expires_at > now;
@@ -65,7 +52,9 @@ VlessEncryptionServerTicketStore::Lookup(
     if (!entry || entry->expires_at <= now || !entry->value.identity ||
         entry->value.seen_nfs_keys.size() >= kMaxSeenNfsKeysPerSession) return std::nullopt;
     auto& session = entry->value;
-    if (!session.seen_nfs_keys.insert(DigestNfsKey(nfs_key)).second) return std::nullopt;
+    std::array<uint8_t, 32> nfs_key_digest;
+    Blake3Digest(nfs_key.bytes, nfs_key_digest);
+    if (!session.seen_nfs_keys.insert(nfs_key_digest).second) return std::nullopt;
     ++seen_nfs_keys_;
     return ResumedSession{session.pfs_key, *session.identity};
 }

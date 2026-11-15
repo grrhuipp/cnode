@@ -85,17 +85,6 @@ public:
         return ReadRaw(buffer);
     }
 
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        if (closed_ || write_closed_) {
-            throw IoSystemError(io_error::operation_aborted, "http1 body write closed");
-        }
-        if (buffer.size() == 0) {
-            co_return 0;
-        }
-        co_await WriteBuffers({&buffer, 1});
-        co_return buffer.size();
-    }
-
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         if (content_remaining_) {
             return ReadContentLengthMultiBuffer();
@@ -221,7 +210,7 @@ public:
         inner_->Cancel();
     }
 
-    transport::CancellationSource& Cancellation() noexcept override {
+    common::CancellationSource& Cancellation() noexcept override {
         return inner_->Cancellation();
     }
 
@@ -900,6 +889,28 @@ bool HeaderContainsTokenCI(std::string_view value, std::string_view token) {
     return false;
 }
 
+void AppendRequestStart(HeaderBlockBuffer& request,
+                        std::string_view method,
+                        std::string_view path,
+                        std::string_view host) {
+    request.append(method);
+    request.push_back(' ');
+    request.append(path);
+    request.append(" HTTP/1.1\r\n");
+    request.append("Host: ");
+    request.append(host);
+    request.append("\r\n");
+}
+
+void AppendHeaderLine(HeaderBlockBuffer& out,
+                      std::string_view name,
+                      std::string_view value) {
+    out.append(name);
+    out.append(": ");
+    out.append(value);
+    out.append("\r\n");
+}
+
 bool HeaderListContainsTokenCI(std::string_view head,
                                std::string_view name,
                                std::string_view token) {
@@ -1124,7 +1135,7 @@ ExecuteHttp1UpgradeClientHandshake(
                 }
             }
         }
-        Http1HeaderBuffer request;
+        HeaderBlockBuffer request;
         request.reserve(reserve_size);
         AppendRequestStart(request, "GET", req_path, host);
         request.append("Upgrade: websocket\r\n");
@@ -1246,7 +1257,7 @@ net::awaitable<TransportBuildResult> DoHttp1ServerHandshake(
     if (cfg.headers.empty()) {
         wrote = co_await WriteFullToStream(*stream, kDefaultOkResponse);
     } else {
-        Http1HeaderBuffer response;
+        HeaderBlockBuffer response;
         response.reserve(96 + cfg.headers.size() * 32);
         response.append("HTTP/1.1 200 OK\r\nCache-Control: no-store\r\n");
         for (const auto& [key, value] : cfg.headers) {
@@ -1283,7 +1294,7 @@ net::awaitable<TransportBuildResult> DoHttp1ClientHandshake(
                 reserve_size += key.size() + value.size() + 4;
             }
         }
-        Http1HeaderBuffer request;
+        HeaderBlockBuffer request;
         request.reserve(reserve_size);
         AppendRequestStart(request, method, req_path, host);
         for (const auto& [key, value] : cfg.headers) {

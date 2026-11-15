@@ -162,9 +162,6 @@ template <typename Control>
 bool ConsumeTimeoutSignals(Control& raw_control) {
     auto& control = RelayControlOf(raw_control);
     bool expired = false;
-    if constexpr (requires { control.ConsumeReadTimeout(); }) {
-        expired = control.ConsumeReadTimeout() || expired;
-    }
     if constexpr (requires { control.ConsumeWriteTimeout(); }) {
         expired = control.ConsumeWriteTimeout() || expired;
     }
@@ -179,7 +176,7 @@ bool ConsumeTimeoutSignals(Control& raw_control) {
 
 struct RelayTargetAdapter {
     void* target = nullptr;
-    transport::CancellationSource* cancellation = nullptr;
+    common::CancellationSource* cancellation = nullptr;
     net::awaitable<common::MultiBuffer> (*read)(void*) = nullptr;
     net::awaitable<void> (*write)(void*, common::MultiBuffer) = nullptr;
     net::awaitable<void> (*shutdown_write)(void*, bool preserve_phase_deadline) = nullptr;

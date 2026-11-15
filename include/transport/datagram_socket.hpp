@@ -90,17 +90,15 @@ public:
     [[nodiscard]] WriteOperation StartWrite();
 
     void SetIdleTimeout(std::chrono::seconds timeout);
-    void SetReadTimeout(std::chrono::seconds timeout);
     void SetWriteTimeout(std::chrono::seconds timeout);
     [[nodiscard]] PhaseDeadlineToken StartPhaseDeadline(std::chrono::seconds timeout);
     void ClearPhaseDeadline() noexcept;
     [[nodiscard]] bool ConsumeIdleTimeout() noexcept;
-    [[nodiscard]] bool ConsumeReadTimeout() noexcept;
     [[nodiscard]] bool ConsumeWriteTimeout() noexcept;
     [[nodiscard]] bool ConsumePhaseDeadline() noexcept;
     void TouchActivity() noexcept;
 
-    [[nodiscard]] CancellationSource& Cancellation() noexcept;
+    [[nodiscard]] common::CancellationSource& Cancellation() noexcept;
     void Cancel() noexcept;
     void Close() noexcept;
     [[nodiscard]] bool IsIPv6() const noexcept;

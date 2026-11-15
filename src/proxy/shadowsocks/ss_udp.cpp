@@ -187,8 +187,7 @@ struct Parsed2022Body {
             std::numeric_limits<size_t>::max() - SsAeadCipher::kTagSize) return false;
     return proxy::SealOneShotAead(
         algorithm, key, nonce, plaintext, {},
-        {output, plaintext.size() + SsAeadCipher::kTagSize},
-        SsAeadCipher::kTagSize);
+        {output, plaintext.size() + SsAeadCipher::kTagSize});
 }
 
 [[nodiscard]] bool AeadDecrypt(const EVP_AEAD* algorithm,
@@ -201,7 +200,7 @@ struct Parsed2022Body {
     size_t written = 0;
     return proxy::OpenOneShotAead(
                algorithm, key, nonce, ciphertext, {},
-               {output, capacity}, written, SsAeadCipher::kTagSize) &&
+               {output, capacity}, written) &&
            written == capacity;
 }
 
@@ -284,9 +283,7 @@ struct PlaintextScratch {
     const uint8_t* datagram,
     size_t datagram_len,
     const app::UserStore::ShadowsocksUsersView& users,
-    const SsCipherInfo& cipher_info,
-    Ss2022UdpReplayCache& replay_cache,
-    bool deferred_replay) {
+    const SsCipherInfo& cipher_info) {
 
     constexpr size_t kMinBodyPlain = 1 + 8 + 2 + kMinSocks5AddressSize;
     if (datagram_len < kSs2022UdpSeparateHeaderSize +
@@ -373,10 +370,6 @@ struct PlaintextScratch {
             }
             const uint64_t packet_id = common::LoadU64BE(
                 separate.data() + kSs2022UdpSessionIdSize);
-            if (!deferred_replay &&
-                !replay_cache.Accept(user.derived_key.span(), client_session_id, packet_id)) {
-                return std::nullopt;
-            }
             return Make2022DecodeResult(
                 candidate, client_session_id, user.derived_key.span(), packet_id,
                 std::move(*parsed), scratch);
@@ -389,9 +382,7 @@ struct PlaintextScratch {
 [[nodiscard]] std::optional<SsUdpDecodeResult> Decode2022UdpChachaRequest(
     const uint8_t* datagram,
     size_t datagram_len,
-    const app::UserStore::ShadowsocksUsersView& users,
-    Ss2022UdpReplayCache& replay_cache,
-    bool deferred_replay) {
+    const app::UserStore::ShadowsocksUsersView& users) {
 
     constexpr size_t kMinPlain =
         kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize + 1 + 8 + 2 + kMinSocks5AddressSize;
@@ -431,10 +422,6 @@ struct PlaintextScratch {
             kSs2022UdpSessionIdSize + kSs2022UdpPacketIdSize);
         auto parsed = Parse2022ClientBodyPlaintext(body);
         if (!parsed) {
-            return std::nullopt;
-        }
-        if (!deferred_replay &&
-            !replay_cache.Accept(user.derived_key.span(), client_session_id, packet_id)) {
             return std::nullopt;
         }
         return Make2022DecodeResult(
@@ -825,9 +812,7 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const app::UserStore::ShadowsocksUsersView& users,
     SsCipherType cipher_type,
     size_t key_size,
-    size_t salt_size,
-    Ss2022UdpReplayCache& replay_cache,
-    bool deferred_replay) {
+    size_t salt_size) {
 
     if (users.empty()) {
         return std::nullopt;
@@ -835,12 +820,10 @@ std::optional<SsUdpDecodeResult> DecodeUdpPacket(
 
     const SsCipherInfo cipher_info{cipher_type, key_size, salt_size};
     if (Is2022AesCipher(cipher_type)) {
-        return Decode2022UdpAesRequest(
-            datagram, datagram_len, users, cipher_info, replay_cache, deferred_replay);
+        return Decode2022UdpAesRequest(datagram, datagram_len, users, cipher_info);
     }
     if (cipher_type == SsCipherType::CHACHA20_POLY1305_2022) {
-        return Decode2022UdpChachaRequest(
-            datagram, datagram_len, users, replay_cache, deferred_replay);
+        return Decode2022UdpChachaRequest(datagram, datagram_len, users);
     }
 
     if (key_size > 64 || salt_size > 64) {
@@ -1035,27 +1018,6 @@ size_t Encode2022UdpRequestPacketTo(
     if (state.cipher_info.type == SsCipherType::CHACHA20_POLY1305_2022) {
         return Encode2022UdpChachaPacketWithAddrSize(
             target, addr_size, payload, payload_len, state, false, output, output_size, forwarded);
-    }
-    return 0;
-}
-
-size_t Encode2022UdpResponsePacketTo(
-    const common::TargetAddress& target,
-    const uint8_t* payload,
-    size_t payload_len,
-    Ss2022UdpTxState& state,
-    uint8_t* output,
-    size_t output_size) {
-
-    const size_t addr_size = common::AddressEncodedSize(target);
-    if (Is2022AesCipher(state.cipher_info.type)) {
-        return Encode2022UdpAesPacketWithAddrSize(
-            target, addr_size, payload, payload_len, state, {},
-            true, output, output_size);
-    }
-    if (state.cipher_info.type == SsCipherType::CHACHA20_POLY1305_2022) {
-        return Encode2022UdpChachaPacketWithAddrSize(
-            target, addr_size, payload, payload_len, state, true, output, output_size);
     }
     return 0;
 }

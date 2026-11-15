@@ -3,6 +3,7 @@
 #include "transport/reality_tls.hpp"
 #include <algorithm>
 #include <array>
+#include <span>
 #include <tuple>
 #include <vector>
 
@@ -18,12 +19,14 @@ std::vector<uint8_t> Records(const std::vector<uint8_t>& hello, size_t fragment)
     }
     return wire;
 }
-void Feed(Reader& reader, std::span<const uint8_t> wire, size_t fragment) {
-    while (!wire.empty() && reader.State() == Reader::Status::Reading) {
-        const size_t count = std::min({wire.size(), fragment, reader.ReadSize()});
-        reader.Append(wire.first(count));
-        wire = wire.subspan(count);
+// Offers the wire in TCP-sized pieces; returns how many bytes the reader took.
+size_t Feed(Reader& reader, std::span<const uint8_t> wire, size_t fragment) {
+    size_t consumed = 0;
+    while (consumed < wire.size() && reader.State() == Reader::Status::Reading) {
+        const size_t count = std::min(wire.size() - consumed, fragment);
+        consumed += reader.ConsumeHandshake(wire.subspan(consumed, count));
     }
+    return consumed;
 }
 }
 namespace {
@@ -37,15 +40,14 @@ std::vector<uint8_t> Hello() {
 }
 
 class RealityHelloFragments : public testing::TestWithParam<std::tuple<size_t, size_t>> {};
-TEST_P(RealityHelloFragments, ReassemblesTranscriptAndPreservesReplayWireBytes) {
+TEST_P(RealityHelloFragments, ReassemblesTranscriptAndConsumesEveryRecord) {
     const auto [record, tcp] = GetParam();
     const auto hello = Hello();
     const auto wire = Records(hello, record);
     Reader reader;
-    Feed(reader, wire, tcp);
+    EXPECT_EQ(Feed(reader, wire, tcp), wire.size());
     ASSERT_EQ(reader.State(), Reader::Status::Complete);
-    EXPECT_TRUE(std::ranges::equal(reader.Hello(), hello));
-    EXPECT_TRUE(std::ranges::equal(reader.TakeWire(), wire));
+    EXPECT_EQ(reader.TakeHello(), hello);
 }
 INSTANTIATE_TEST_SUITE_P(RecordAndTcpSplits, RealityHelloFragments, testing::Combine(
     testing::Values(size_t{1}, size_t{2}, size_t{3}, size_t{17}, size_t{16384}),
@@ -54,15 +56,15 @@ INSTANTIATE_TEST_SUITE_P(RecordAndTcpSplits, RealityHelloFragments, testing::Com
 TEST(RealityClientHello, RejectsOversizedHandshakeBeforeReadingBody) {
     const std::array<uint8_t, 9> wire{22, 3, 3, 0, 4, 1, 0xff, 0xff, 0xff};
     Reader reader;
-    Feed(reader, wire, 1);
+    EXPECT_EQ(Feed(reader, wire, 1), wire.size());
     EXPECT_EQ(reader.State(), Reader::Status::Invalid);
-    EXPECT_EQ(reader.Hello().size(), 4);
+    EXPECT_EQ(reader.TakeHello().size(), 4);
 }
 
 TEST(RealityClientHello, IncompleteRecordRemainsPending) {
     const auto wire = Records(Hello(), 13);
     Reader reader;
-    Feed(reader, std::span(wire).first(wire.size() - 1), 1);
+    EXPECT_EQ(Feed(reader, std::span(wire).first(wire.size() - 1), 1), wire.size() - 1);
     EXPECT_EQ(reader.State(), Reader::Status::Reading);
 }
 
@@ -71,7 +73,7 @@ TEST_P(RealityInvalidRecord, RejectsHeaderWithoutReadingPayload) {
     Reader reader;
     Feed(reader, GetParam(), 1);
     EXPECT_EQ(reader.State(), Reader::Status::Invalid);
-    EXPECT_TRUE(reader.Hello().empty());
+    EXPECT_TRUE(reader.TakeHello().empty());
 }
 INSTANTIATE_TEST_SUITE_P(Headers, RealityInvalidRecord, testing::Values(
     std::array<uint8_t, 5>{22, 3, 3, 0, 0}, std::array<uint8_t, 5>{22, 3, 3, 0x40, 1},
@@ -80,7 +82,7 @@ INSTANTIATE_TEST_SUITE_P(Headers, RealityInvalidRecord, testing::Values(
 TEST(RealityClientHello, RejectsNonTlsProbeAfterFirstByte) {
     Reader reader;
     const std::array<uint8_t, 1> wire{'G'};
-    reader.Append(wire);
+    EXPECT_EQ(reader.ConsumeHandshake(wire), wire.size());
     EXPECT_EQ(reader.State(), Reader::Status::Invalid);
 }
 }  // namespace

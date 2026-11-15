@@ -1,7 +1,6 @@
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"
 
-#include "common/clock.hpp"
 #include "common/session.hpp"
 
 #include <concurrentqueue.h>
@@ -26,7 +25,6 @@
 #include <iterator>
 #include <algorithm>
 #include <limits>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -46,6 +44,31 @@ std::atomic_bool Log::initialized_{false};
 namespace {
 
 using namespace std::chrono_literals;
+
+// 获取当前时间戳（微秒，Unix 纪元）
+int64_t NowMicros() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+}
+
+// 使用系统本地时区转换时间，避免依赖 chrono tzdb 在静态环境中漂移。
+std::tm LocalTime(std::time_t timestamp) noexcept {
+    std::tm tm{};
+    localtime_r(&timestamp, &tm);
+    return tm;
+}
+
+std::string FormatLocalTime(
+    std::chrono::system_clock::time_point tp,
+    const char* format) {
+    const auto timestamp = std::chrono::system_clock::to_time_t(tp);
+    const std::tm tm = LocalTime(timestamp);
+
+    char buffer[64]{};
+    const size_t written = std::strftime(buffer, sizeof(buffer), format, &tm);
+    return written > 0 ? std::string(buffer, written) : std::string{};
+}
 
 enum class LogChannel {
     Error,
@@ -78,7 +101,6 @@ struct DailyLogSpec {
     std::string extension{".log"};
 };
 
-std::mutex g_lifecycle_mutex;
 // The writer drains continuously. Keep a bounded burst window without paying
 // for 65K preallocated LogRecord slots throughout the process lifetime.
 constexpr size_t kAsyncLogQueueCapacity = 8 * 1024;
@@ -100,7 +122,7 @@ std::string_view LevelName(LogLevel level) noexcept {
 }
 
 void AppendConsoleTimestamp(std::string& out, int64_t timestamp_us) {
-    const auto tm = common::LocalTime(static_cast<std::time_t>(timestamp_us / 1'000'000));
+    const auto tm = LocalTime(static_cast<std::time_t>(timestamp_us / 1'000'000));
     char buffer[48]{};
     const auto written = std::strftime(
         buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S%z", &tm);
@@ -349,7 +371,7 @@ private:
     void AppendTimestamp(int64_t timestamp_us) {
         const auto seconds = timestamp_us / 1'000'000;
         if (!has_cached_second_ || seconds != cached_second_) {
-            const auto tm = common::LocalTime(static_cast<std::time_t>(seconds));
+            const auto tm = LocalTime(static_cast<std::time_t>(seconds));
             second_prefix_size_ = std::strftime(
                 second_prefix_.data(), second_prefix_.size(), "%Y/%m/%d %H:%M:%S", &tm);
             cached_second_ = seconds;
@@ -376,7 +398,7 @@ private:
 };
 
 std::string DateString(std::chrono::system_clock::time_point now) {
-    return common::FormatLocalTime(now, "%Y-%m-%d");
+    return FormatLocalTime(now, "%Y-%m-%d");
 }
 
 // Next local day boundary; tm_isdst = -1 lets mktime resolve DST changes.
@@ -384,7 +406,7 @@ std::string DateString(std::chrono::system_clock::time_point now) {
 // clock step still rotates before the next record is written.
 std::chrono::system_clock::time_point NextLocalMidnight(
     std::chrono::system_clock::time_point now) {
-    auto tm = common::LocalTime(std::chrono::system_clock::to_time_t(now));
+    auto tm = LocalTime(std::chrono::system_clock::to_time_t(now));
     tm.tm_mday += 1;
     tm.tm_hour = 0;
     tm.tm_min = 0;
@@ -782,7 +804,7 @@ private:
             return;
         }
         if (output.fd >= 0) {
-            Send(output, FormatConsoleRecord(common::NowMicros(), LogLevel::ERROR, text) + '\n');
+            Send(output, FormatConsoleRecord(NowMicros(), LogLevel::ERROR, text) + '\n');
             ::close(output.fd);
         }
     }
@@ -808,7 +830,7 @@ private:
                 "console queue/write-failure dropped {} records; stdout_failed={} stderr_failed={} stdout_partial_record={} stderr_partial_record={}",
                 unreported_drops_, stdout_.failed, error_output_->failed,
                 stdout_.partial_write, error_output_->partial_write);
-            auto line = FormatConsoleRecord(common::NowMicros(), LogLevel::WARN, message) + '\n';
+            auto line = FormatConsoleRecord(NowMicros(), LogLevel::WARN, message) + '\n';
             if (Send(*error_output_, line)) unreported_drops_ = 0;
         }
     }
@@ -857,7 +879,7 @@ private:
 AsyncConsole g_console;
 
 void WriteStderrFallback(LogLevel level, std::string_view msg) {
-    g_console.Enqueue(FormatConsoleRecord(common::NowMicros(), level, msg), true);
+    g_console.Enqueue(FormatConsoleRecord(NowMicros(), level, msg), true);
 }
 
 class AsyncLogBackend {
@@ -1264,7 +1286,7 @@ private:
         LogRecord record{
             .channel = LogChannel::Error,
             .level = level,
-            .timestamp_us = common::NowMicros(),
+            .timestamp_us = NowMicros(),
             .message = std::move(msg),
             .source_file = "src/infra/log.cpp",
             .connection = std::nullopt,
@@ -1369,49 +1391,45 @@ std::optional<LogLevel> ParseLogLevel(std::string_view name) noexcept {
 }
 
 bool Log::Init(const LogConfig& config) {
-    {
-        std::lock_guard lock(g_lifecycle_mutex);
-        if (initialized_.load(std::memory_order_acquire)) return true;
+    if (initialized_.load(std::memory_order_acquire)) return true;
 
-        min_level_.store(config.level, std::memory_order_release);
+    min_level_.store(config.level, std::memory_order_release);
 
-        try {
-            g_console.Start();
-            if (!g_async_log_backend.Start(
-                    config.log_dir, config.error_path, config.access_path, config.max_days,
-                    config.rotate_daily, config.gzip)) {
-                WriteConsole(LogLevel::ERROR,
-                             "Failed to initialize logging > cannot open access/error log files");
-                g_console.Stop();
-                return false;
-            }
-
-            const auto resolved_error_path = g_async_log_backend.ErrorPath();
-            const auto resolved_access_path = g_async_log_backend.AccessPath();
-            const auto rotation = config.rotate_daily ? "daily" : "fixed";
-            const auto compression = (config.rotate_daily && config.gzip) ? "gzip" : "none";
-
-            initialized_.store(true, std::memory_order_release);
-            WriteConsole(LogLevel::INFO, std::format(
-                "Logging initialized: level {}; access {}; error {}; directory {}; "
-                "{} rotation; compression {}; retention {} days",
-                ConsoleLevelName(config.level), resolved_access_path.string(), resolved_error_path.string(),
-                config.log_dir.string(), rotation, compression, config.max_days));
-        } catch (const std::exception& e) {
+    try {
+        g_console.Start();
+        if (!g_async_log_backend.Start(
+                config.log_dir, config.error_path, config.access_path, config.max_days,
+                config.rotate_daily, config.gzip)) {
             WriteConsole(LogLevel::ERROR,
-                         std::format("Failed to initialize logging > {}", e.what()));
-            g_async_log_backend.Stop();
-            initialized_.store(false, std::memory_order_release);
+                         "Failed to initialize logging > cannot open access/error log files");
             g_console.Stop();
             return false;
         }
+
+        const auto resolved_error_path = g_async_log_backend.ErrorPath();
+        const auto resolved_access_path = g_async_log_backend.AccessPath();
+        const auto rotation = config.rotate_daily ? "daily" : "fixed";
+        const auto compression = (config.rotate_daily && config.gzip) ? "gzip" : "none";
+
+        initialized_.store(true, std::memory_order_release);
+        WriteConsole(LogLevel::INFO, std::format(
+            "Logging initialized: level {}; access {}; error {}; directory {}; "
+            "{} rotation; compression {}; retention {} days",
+            ConsoleLevelName(config.level), resolved_access_path.string(), resolved_error_path.string(),
+            config.log_dir.string(), rotation, compression, config.max_days));
+    } catch (const std::exception& e) {
+        WriteConsole(LogLevel::ERROR,
+                     std::format("Failed to initialize logging > {}", e.what()));
+        g_async_log_backend.Stop();
+        initialized_.store(false, std::memory_order_release);
+        g_console.Stop();
+        return false;
     }
 
     return true;
 }
 
 void Log::Shutdown() {
-    std::lock_guard lifecycle_lock(g_lifecycle_mutex);
     initialized_.store(false, std::memory_order_release);
     g_async_log_backend.Stop();
     g_console.Stop();
@@ -1435,7 +1453,7 @@ void Log::WriteSystem(LogLevel level,
     g_async_log_backend.Enqueue(LogRecord{
         .channel = LogChannel::Error,
         .level = level,
-        .timestamp_us = common::NowMicros(),
+        .timestamp_us = NowMicros(),
         .message = std::move(message),
         .source_file = location.file_name(),
         .connection = std::nullopt,
@@ -1451,7 +1469,7 @@ void Log::WriteConnection(LogLevel level,
     g_async_log_backend.Enqueue(LogRecord{
         .channel = LogChannel::Error,
         .level = level,
-        .timestamp_us = common::NowMicros(),
+        .timestamp_us = NowMicros(),
         .message = std::move(message),
         .source_file = location.file_name(),
         .connection = std::nullopt,
@@ -1468,7 +1486,7 @@ void Log::WriteConnection(LogLevel level,
     g_async_log_backend.Enqueue(LogRecord{
         .channel = LogChannel::Error,
         .level = level,
-        .timestamp_us = common::NowMicros(),
+        .timestamp_us = NowMicros(),
         .message = std::move(message),
         .source_file = location.file_name(),
         .connection = std::move(context),
@@ -1512,7 +1530,7 @@ void Log::WriteAccess(std::string message) {
     g_async_log_backend.Enqueue(LogRecord{
         .channel = LogChannel::Access,
         .level = LogLevel::INFO,
-        .timestamp_us = common::NowMicros(),
+        .timestamp_us = NowMicros(),
         .message = std::move(message),
         .source_file = {},
         .connection = std::nullopt,
@@ -1526,7 +1544,7 @@ void Log::WriteConsole(LogLevel level,
     // ordinary diagnostic macros perform the configured severity check first.
     if (level != LogLevel::ERROR && !ShouldLog(level)) return;
     if (message.empty()) return;
-    const int64_t timestamp_us = common::NowMicros();
+    const int64_t timestamp_us = NowMicros();
     auto console_line = FormatConsoleRecord(timestamp_us, level, message);
     if (level >= LogLevel::WARN && ShouldLog(level) &&
         initialized_.load(std::memory_order_acquire)) {
@@ -1549,7 +1567,7 @@ void Log::WritePanel(LogLevel level,
     if (!ShouldLog(level)) return;
     const bool initialized = initialized_.load(std::memory_order_acquire);
     if (level < LogLevel::INFO && !initialized) return;
-    const int64_t timestamp_us = common::NowMicros();
+    const int64_t timestamp_us = NowMicros();
     if ((level < LogLevel::INFO || level >= LogLevel::WARN) && initialized) {
         auto diagnostic = context.node_id > 0
             ? std::format("[{}/{}] {}", context.name, context.node_id, message)

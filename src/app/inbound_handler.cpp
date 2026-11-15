@@ -39,7 +39,8 @@ void ApplyHttpRealIp(
     // Forwarded address headers do not reliably carry the original client
     // port. Zero is explicit unknown; retaining the CDN port is a false tuple.
     ctx.inbound.source_port = 0;
-    ctx.inbound.client_ip_source = common::Inbound::ClientIpSource::HttpHeader;
+    // The header-derived address replaces any PROXY protocol address.
+    ctx.inbound.client_ip_from_proxy_protocol = false;
 }
 
 void ApplyProxyProtocolResult(
@@ -60,7 +61,7 @@ void ApplyProxyProtocolResult(
     ctx.inbound.source_addr = normalized_addr;
     ctx.inbound.source_ip = normalized_ip.View();
     ctx.inbound.source_port = result.src_port;
-    ctx.inbound.client_ip_source = common::Inbound::ClientIpSource::ProxyProtocol;
+    ctx.inbound.client_ip_from_proxy_protocol = true;
 }
 
 // 物理连接与逻辑子流共用的协议处理收尾：Process 自身已分类上报结果，
@@ -210,7 +211,7 @@ InboundHandler::PrepareAcceptedTCP(
     const infra::TimeoutsConfig& timeouts,
     std::unique_ptr<transport::AsyncStream> raw_conn,
     common::Context& ctx,
-    app::DNS* dns_service) {
+    app::DNSWorker* dns_service) {
     const app::ReceiverSettings& listener = receiver_;
 
     ctx.inbound.accounting_key.assign(listener.accounting_key);
@@ -366,7 +367,7 @@ net::awaitable<void> InboundHandler::ProcessAcceptedTCP(
     const infra::TimeoutsConfig& timeouts,
     std::unique_ptr<transport::AsyncStream> raw_conn,
     common::Context& ctx,
-    app::DNS* dns_service) {
+    app::DNSWorker* dns_service) {
     app::ConnectionStatsScope connection_stats(stats);
     auto prepared = co_await PrepareAcceptedTCP(
         io_context, dispatcher, stats, request_load, timeouts,

@@ -255,7 +255,6 @@ struct WorkerPool {
 struct BootstrapEnvironment {
     std::unique_ptr<net::io_context> main_ctx;
     std::unique_ptr<app::DNSWorker> dns_worker;
-    std::unique_ptr<app::DNS> panel_dns_service;
     std::unique_ptr<geo::GeoDatabase> geo_database;
     std::unique_ptr<ShardedStats> stats;
     WorkerPool worker_pool;
@@ -362,7 +361,7 @@ WorkerRuntimeConfig MakeWorkerRuntimeConfig(
 void SetupPanels(net::io_context& main_ctx,
                  controller::Controller& controller,
                  const infra::Config& config,
-                 app::DNS& panel_dns_service) {
+                 app::DNSWorker& panel_dns_service) {
     if (config.panels.empty()) {
         return;
     }
@@ -438,7 +437,6 @@ void SetupPanels(net::io_context& main_ctx,
     env.main_ctx = std::make_unique<net::io_context>(kMainIoConcurrencyHint);
     env.dns_worker = std::make_unique<app::DNSWorker>(
         *env.main_ctx, MakeDnsServiceConfig(config), common::kWorkerMailboxCapacity);
-    env.panel_dns_service = std::make_unique<app::DNS>(*env.dns_worker);
     // Geo tags are read from the routing rules before they move to the Workers.
     env.geo_database = LoadGeoDatabase(config);
     env.stats = std::make_unique<ShardedStats>(config.workers);
@@ -469,7 +467,7 @@ void SetupPanels(net::io_context& main_ctx,
         env.controller = std::make_unique<controller::Controller>(
             *env.main_ctx, env.worker_pool.workers);
 
-        SetupPanels(*env.main_ctx, *env.controller, config, *env.panel_dns_service);
+        SetupPanels(*env.main_ctx, *env.controller, config, *env.dns_worker);
         if (enable_test_mode) {
             LOG_CONSOLE("Test mode enabled: port={}", common::kTestPort);
         }
@@ -671,7 +669,7 @@ public:
         std::vector<IdleHeapState> heap_states(env.worker_pool.workers.size());
         std::vector<Worker*> idle_workers;
         idle_workers.reserve(env.worker_pool.workers.size());
-        auto last_log_flush_at = common::steady_clock::time_point{};
+        auto last_log_flush_at = std::chrono::steady_clock::time_point{};
         while (true) {
             auto worker_snapshots = co_await CollectWorkerRuntimeStats(false);
             auto aggregate_stats = AggregateWorkerStats(worker_snapshots);
@@ -715,7 +713,7 @@ public:
                 }
             }
             {
-                const auto flush_now = common::steady_clock::now();
+                const auto flush_now = std::chrono::steady_clock::now();
                 if (last_log_flush_at.time_since_epoch().count() == 0 ||
                     flush_now - last_log_flush_at >= kAsyncLogFlushInterval) {
                     infra::Log::Flush();

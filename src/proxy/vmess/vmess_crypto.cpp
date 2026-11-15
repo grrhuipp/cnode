@@ -49,19 +49,14 @@ AES_KEY ExpandAuthIDEncryptKey(const std::array<uint8_t, 16>& auth_key) {
 void GenerateAuthID(const AES_KEY& auth_id_key, int64_t timestamp, uint8_t* out_auth_id) {
     uint8_t plaintext[16];
 
-    for (int i = 7; i >= 0; i--) {
-        plaintext[7 - i] = static_cast<uint8_t>(timestamp >> (i * 8));
-    }
+    common::StoreU64BE(plaintext, static_cast<uint64_t>(timestamp));
 
     if (RAND_bytes(plaintext + 8, 4) != 1) {
         throw std::runtime_error("VMess AuthID random generation failed");
     }
 
     uint32_t crc = CRC32(plaintext, 12);
-    plaintext[12] = static_cast<uint8_t>(crc >> 24);
-    plaintext[13] = static_cast<uint8_t>(crc >> 16);
-    plaintext[14] = static_cast<uint8_t>(crc >> 8);
-    plaintext[15] = static_cast<uint8_t>(crc);
+    common::StoreU32BE(plaintext + 12, crc);
 
     AES_encrypt(plaintext, out_auth_id, &auth_id_key);
 }

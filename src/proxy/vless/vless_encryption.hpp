@@ -147,12 +147,6 @@ enum class VlessEncryptionAeadCipher : uint8_t {
     Chacha20Poly1305,
 };
 
-[[nodiscard]] std::array<uint8_t, kVlessEncryptionLengthSize>
-EncodeVlessEncryptionLength(size_t length) noexcept;
-
-[[nodiscard]] uint16_t DecodeVlessEncryptionLength(
-    std::span<const uint8_t, kVlessEncryptionLengthSize> encoded) noexcept;
-
 [[nodiscard]] bool EncodeVlessEncryptionRecordHeader(
     std::span<uint8_t, kVlessEncryptionRecordHeaderSize> header,
     size_t ciphertext_length) noexcept;
@@ -477,7 +471,7 @@ using VlessEncryptionReadKeys =
 
 class VlessEncryptionReader final : public transport::MultiBufferReader {
 public:
-    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
+    common::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
     transport::EofAction ReadEofAction() const noexcept override { return src_.ReadEofAction(); }
 
     // A deferred read side must not come with a header XOR; it derives its own.

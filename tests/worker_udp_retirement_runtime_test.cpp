@@ -8,7 +8,7 @@
 #include "app/stats.hpp"
 #include "app/worker.hpp"
 #include "worker_coordinator_fixture.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "common/allocator.hpp"
 #include "common/session.hpp"
 #include "infra/config_types.hpp"
@@ -190,11 +190,11 @@ void RegisterProtocol() {
     (void)registered;
 }
 
-struct LinkStopObserver final : ::transport::CancellationSubscription {
+struct LinkStopObserver final : ::common::CancellationSubscription {
     explicit LinkStopObserver(FixtureState& owner) noexcept : owner(owner) {}
     FixtureState& owner;
 private:
-    void OnCancellation(::transport::Cancellation) noexcept override {
+    void OnCancellation(::common::Cancellation) noexcept override {
         owner.stop_observed = true;
     }
 };
@@ -744,7 +744,6 @@ TEST_P(WorkerUdpRetirementRuntime, Lifecycle) {
 
         ::app::WorkerRuntimeConfig runtime;
         runtime.timeouts.idle = 0;
-        runtime.timeouts.read = 0;
         SharedWorker shared;
         std::thread data_thread([&] {
             try {

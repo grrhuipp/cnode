@@ -150,7 +150,7 @@ struct app::Worker::ListenerState {
     size_t udp_receive_loops = 0;
     size_t tcp_tasks = 0;
     bool stopping = false;
-    struct TaskCancellation final : transport::CancellationSubscription {
+    struct TaskCancellation final : common::CancellationSubscription {
         explicit TaskCancellation(ListenerState& state) : owner(state), next(state.tasks) {
             if (next) next->previous = this;
             state.tasks = this;
@@ -167,7 +167,7 @@ struct app::Worker::ListenerState {
         net::cancellation_signal signal;
         transport::TcpStream* stream = nullptr;
     private:
-        void OnCancellation(transport::Cancellation cancellation) noexcept override {
+        void OnCancellation(common::Cancellation cancellation) noexcept override {
             if (cancellation.terminal) stream = nullptr;
             else if (stream) Resubscribe(stream->Cancellation());
         }
@@ -298,7 +298,6 @@ struct app::Worker::RuntimeState {
         , stats(stats_ref)
         , request_load(runtime_config.pressure_threshold,
                        runtime_config.pressure_idle_timeout)
-        , dns_worker(dns_worker)
         , dns(dns_worker)
         , listener_state(std::make_unique<ListenerState>(io_context))
         {}
@@ -317,8 +316,7 @@ struct app::Worker::RuntimeState {
     app::UserStore::WorkerView initial_user_view;
     app::StatsShard& stats;
     app::RequestLoadState request_load;
-    app::DNSWorker& dns_worker;
-    app::DNS dns;
+    app::DNSWorker& dns;
     std::unique_ptr<common::ResidentTaskGroup> outbound_tasks;
     std::unique_ptr<app::OutboundHandlerRegistry> outbound_handlers;
     std::unique_ptr<app::DefaultDispatcher> dispatcher;
@@ -326,7 +324,7 @@ struct app::Worker::RuntimeState {
     // Constructed on this Worker's executor; outlives managers, retired
     // listeners and their request guards. Runtime teardown stays on that thread.
     std::shared_ptr<app::ConnectionLimiter> connection_limiter;
-    std::optional<common::UserOnlineTracker> online_users;
+    std::optional<UserOnlineTracker> online_users;
     std::optional<app::AdmissionEnvironment> admission;
 
     // Declared before the row owners: Stop precedes their teardown, but the
@@ -524,7 +522,7 @@ net::awaitable<void> Worker::StopRuntimeTask() {
     co_await DrainRuntimeTask();
     runtime_->outbound_handlers.reset();
     if (runtime_->outbound_tasks) {
-        runtime_->outbound_tasks->Tasks().Cancel();
+        runtime_->outbound_tasks->Cancel();
         co_await runtime_->outbound_tasks->AsyncJoin();
     }
     // Every connection and listener of this Worker has ended; its relay
@@ -540,11 +538,11 @@ net::awaitable<void> Worker::StopRuntimeTask() {
 }
 
 net::awaitable<void> Worker::AsyncJoin() {
-    if (joined_.load(std::memory_order_acquire)) co_return;
+    if (joined_) co_return;
     RequestStop();
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     co_await net::co_spawn(io_context_, StopRuntimeTask(), net::use_awaitable);
-    joined_.store(true, std::memory_order_release);
+    joined_ = true;
 }
 
 // ============================================================================
@@ -583,7 +581,7 @@ void Worker::RuntimeState::Start(Worker& worker) {
               worker.id_, router->RuleCount());
     outbound_tasks = std::make_unique<common::ResidentTaskGroup>(io_context.get_executor());
     outbound_handlers = std::make_unique<OutboundHandlerRegistry>(
-        config->outbounds, io_context, dns, timeouts.DialTimeout(), outbound_tasks->Tasks());
+        config->outbounds, io_context, dns, timeouts.DialTimeout(), *outbound_tasks);
     dispatcher = std::make_unique<app::DefaultDispatcher>(
         *router, *outbound_handlers, *detect_rule_policy,
         *session_tracking, dns, request_load);
@@ -1068,7 +1066,7 @@ void Worker::RollbackTraffic(
     runtime_->session_tracking->RollbackTraffic(tag, snapshot);
 }
 
-std::vector<common::OnlineDevice> Worker::GetOnlineDevices(std::string_view tag) const {
+std::vector<OnlineDevice> Worker::GetOnlineDevices(std::string_view tag) const {
     if (!runtime_ || !runtime_->inbound_handlers || !runtime_->online_users) return {};
     if (!runtime_->inbound_handlers->GetHandler(tag)) return {};
     return runtime_->online_users->GetOnlineDevices(tag);

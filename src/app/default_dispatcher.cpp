@@ -180,10 +180,7 @@ net::awaitable<bool> SniffRemainingPayload(
 
     bool read_timed_out = false;
     auto consume_inbound_timeout = [&]() noexcept {
-        if (!inbound_control) return false;
-        const bool read_to = inbound_control->ConsumeReadTimeout();
-        const bool idle_to = inbound_control->ConsumeIdleTimeout();
-        return read_to || idle_to;
+        return inbound_control && inbound_control->ConsumeIdleTimeout();
     };
     try {
         struct ReadResult {
@@ -215,7 +212,7 @@ net::awaitable<bool> SniffRemainingPayload(
                 if (datagram) {
                     stage.payload = std::move(payload);
                 } else {
-                    stage.payload.AppendAndCoalesce(std::move(payload));
+                    payload.MoveTo(stage.payload);
                 }
                 read.received = true;
             } catch (...) {
@@ -327,7 +324,7 @@ DefaultDispatcher::DefaultDispatcher(
     const OutboundHandlerRegistry& outbound_handlers,
     common::DetectRulePolicy& request_policy,
     app::SessionTrackingState& session_tracking,
-    app::DNS& dns_service,
+    app::DNSWorker& dns_service,
     app::RequestLoadState& request_load) noexcept
     : router_(router)
     , outbound_handlers_(outbound_handlers)
@@ -349,7 +346,7 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     const uint32_t pressure_idle_timeout = request_load_.PressureIdleTimeout();
     RelayResult result;
     common::ErrorCode cancellation_reason = common::ErrorCode::OK;
-    struct RequestCancellation final : transport::CancellationSubscription {
+    struct RequestCancellation final : common::CancellationSubscription {
         net::cancellation_slot parent_slot;
         net::cancellation_signal signal;
         common::ErrorCode& reason;
@@ -366,7 +363,7 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
             }
         }
     private:
-        void OnCancellation(transport::Cancellation event) noexcept override {
+        void OnCancellation(common::Cancellation event) noexcept override {
             reason = event.reason == common::ErrorCode::OK ? common::ErrorCode::CANCELLED : event.reason;
             signal.emit(net::cancellation_type::all);
         }
@@ -464,7 +461,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
 
     if (split_udp_association &&
         ctx.content.network == common::Network::UDP) {
-        co_await UdpFlowDispatcher::Run(
+        co_await DispatchUdpFlows(
             *this, io_context, policy, std::move(inbound), inbound_link,
             std::move(first_packet), ctx, stats, timeouts,
             pressure_idle_timeout, result, cancellation_reason);
@@ -550,7 +547,6 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
         std::min(timeouts.WriteTimeout(), relay_idle_timeout);
     if (inbound_control) {
         inbound_control->SetIdleTimeout(relay_idle_timeout);
-        inbound_control->SetReadTimeout(std::chrono::seconds(0));
         inbound_control->SetWriteTimeout(relay_write_timeout);
     }
 

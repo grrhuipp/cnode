@@ -1,6 +1,7 @@
 #pragma once
 
 #include "app/relay.hpp"
+#include "app/user_store.hpp"
 #include "common/asio_types.hpp"
 #include "common/error.hpp"
 #include "common/multi_buffer.hpp"
@@ -127,7 +128,7 @@ struct InboundDatagramAssociationPolicy {
 struct InboundDatagramAssociationKey {
     InboundDatagramOwner owner;
     uint64_t session_id;
-    const void* configuration = nullptr;
+    const app::PreparedInboundSettings* configuration = nullptr;
     [[nodiscard]] bool operator==(const InboundDatagramAssociationKey& other) const noexcept {
         return session_id == other.session_id && configuration == other.configuration &&
             owner.Same(other.owner);
@@ -154,7 +155,7 @@ struct InboundDatagramRequest {
     std::string_view tag;
     std::span<const uint8_t> payload;
     const InboundDatagramAssociationIndex* associations = nullptr;
-    const void* configuration = nullptr;
+    const app::PreparedInboundSettings* configuration = nullptr;
     uint32_t worker_id = 0;
     udp::endpoint client_endpoint;
 };

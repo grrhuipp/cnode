@@ -1,16 +1,13 @@
 #include <gtest/gtest.h>
 
-#include "allocation_hook.hpp"
 #include "transport/link.hpp"
 
 #include <array>
 #include <optional>
 
-
-constinit allocation_hook::Hooks allocation_hook::hooks{};
-using ::transport::CancellationSource;
-using ::transport::Cancellation;
-using ::transport::CancellationSubscription;
+using ::common::CancellationSource;
+using ::common::Cancellation;
+using ::common::CancellationSubscription;
 
 namespace {
 struct Counter {

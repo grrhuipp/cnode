@@ -69,6 +69,8 @@ struct DNSWorker::Impl {
     Impl(net::io_context& io_context, const DnsConfig& config, size_t mailbox_capacity);
 
     net::awaitable<DnsResult> ResolveOwned(std::string domain);
+    // Client side of the mailbox; runs on the caller's executor.
+    net::awaitable<DnsResult> PostResolve(std::string domain);
 
     net::awaitable<DnsResult> ResolveUncached(std::string_view domain);
     net::awaitable<DnsResult> DoResolve(std::string_view domain);
@@ -260,9 +262,9 @@ net::awaitable<void> DNSWorker::Impl::QueryServer(
     std::array<uint8_t, kQueryCapacity> query;
     size_t query_size = BuildQueryTo(query, domain, query_aaaa);
     // One deadline bounds the datagram, the plain retry and the TCP retry.
-    const auto deadline = common::steady_clock::now() + std::chrono::seconds(config.timeout_sec);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(config.timeout_sec);
     const auto remaining = [deadline] {
-        return std::chrono::ceil<std::chrono::milliseconds>(deadline - common::steady_clock::now());
+        return std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
     };
     auto response = co_await server.Exchange<udp::socket>(
         std::span<uint8_t>(query.data(), query_size), remaining());
@@ -517,9 +519,13 @@ net::awaitable<void> DNSWorker::AsyncJoin() {
     for (const auto& upstream : impl_->upstreams) co_await upstream->AsyncJoin();
 }
 
-net::awaitable<DnsResult> DNSWorker::Resolve(std::string domain) {
+net::awaitable<DnsResult> DNSWorker::Resolve(std::string_view domain) {
+    return impl_->PostResolve(std::string(domain));
+}
+
+net::awaitable<DnsResult> DNSWorker::Impl::PostResolve(std::string domain) {
     try {
-        co_return co_await impl_->mailbox.Post(impl_->ResolveOwned(std::move(domain)));
+        co_return co_await mailbox.Post(ResolveOwned(std::move(domain)));
     } catch (const WorkerMailboxFull&) {
         DnsResult rejected;
         rejected.error = common::ErrorCode::RESOURCE_EXHAUSTED;

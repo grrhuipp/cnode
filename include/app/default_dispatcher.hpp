@@ -19,8 +19,7 @@ class OutboundHandler;
 class OutboundHandlerRegistry;
 class SessionTrackingState;
 class RequestLoadState;
-class UdpFlowDispatcher;
-class DNS;
+class DNSWorker;
 
 enum class SelectionSource : uint8_t {
     Forced,
@@ -75,7 +74,7 @@ public:
         const OutboundHandlerRegistry& outbound_handlers,
         common::DetectRulePolicy& request_policy,
         app::SessionTrackingState& session_tracking,
-        app::DNS& dns_service,
+        app::DNSWorker& dns_service,
         app::RequestLoadState& request_load) noexcept;
 
     net::awaitable<RelayResult> Dispatch(
@@ -88,12 +87,8 @@ public:
         StatsShard& stats,
         const infra::TimeoutsConfig& timeouts) override;
 
-private:
-    struct RouteResult {
-        std::shared_ptr<OutboundHandler> handler;
-        common::ErrorCode error;
-    };
-
+    // Dispatches one already authenticated link. DispatchUdpFlows re-enters
+    // here once per logical flow with split_udp_association = false.
     net::awaitable<void> DispatchPreparedLink(
         net::io_context& io_context,
         const routing::DispatchPolicy& policy,
@@ -107,6 +102,13 @@ private:
         bool split_udp_association,
         RelayResult& result,
         common::ErrorCode& cancellation_reason);
+
+private:
+    struct RouteResult {
+        std::shared_ptr<OutboundHandler> handler;
+        common::ErrorCode error;
+    };
+
     [[nodiscard]] OutboundSelection SelectRoute(
         common::Context& ctx,
         const routing::DispatchPolicy& policy) const;
@@ -118,13 +120,11 @@ private:
         const routing::DispatchPolicy& policy,
         std::optional<OutboundSelection> initial_selection);
 
-
-    friend class UdpFlowDispatcher;
     const routing::Router& router_;
     const OutboundHandlerRegistry& outbound_handlers_;
     common::DetectRulePolicy& request_policy_;
     app::SessionTrackingState& session_tracking_;
-    app::DNS& dns_service_;
+    app::DNSWorker& dns_service_;
     app::RequestLoadState& request_load_;
 };
 

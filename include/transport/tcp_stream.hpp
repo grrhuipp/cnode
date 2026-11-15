@@ -31,7 +31,6 @@ public:
 
     // AsyncStream 接口实现
     net::awaitable<std::size_t> AsyncRead(net::mutable_buffer buf) override;
-    net::awaitable<std::size_t> AsyncWrite(net::const_buffer buf) override;
 
     // common::MultiBuffer 优化路径
     // ReadMultiBuffer : 可读后才借用单个 8 KiB Buffer，不为空闲连接预借 payload
@@ -61,9 +60,7 @@ public:
     tcp::endpoint RemoteEndpoint() const;
     void SetIdleTimeout(std::chrono::seconds timeout);
     bool ConsumeIdleTimeout() noexcept;
-    void SetReadTimeout(std::chrono::seconds timeout);
     void SetWriteTimeout(std::chrono::seconds timeout) override;
-    bool ConsumeReadTimeout() noexcept;
     bool ConsumeWriteTimeout() noexcept override;
     PhaseDeadlineToken StartPhaseDeadline(std::chrono::seconds timeout);
     void ClearPhaseDeadline();

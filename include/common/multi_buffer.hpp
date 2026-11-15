@@ -307,13 +307,6 @@ public:
         clear();
     }
 
-    void AppendAndCoalesce(MultiBuffer&& next) {
-        if (std::addressof(next) == this) {
-            return;
-        }
-        next.MoveTo(*this, false);
-    }
-
     [[nodiscard]] bool AppendSpan(std::span<const uint8_t> data) {
         if (data.empty()) return true;
         if (data.size() > std::numeric_limits<size_t>::max() - byte_size()) {
@@ -593,12 +586,6 @@ public:
         } catch (...) {
             Reset();
             return false;
-        }
-    }
-
-    void AppendTo(size_t size, MultiBuffer& out) {
-        if (!TryAppendTo(size, out)) {
-            throw std::bad_alloc();
         }
     }
 

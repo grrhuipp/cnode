@@ -496,7 +496,7 @@ private:
             const auto now = Clock::now();
             for (const auto& weak : states_) {
                 if (auto state = weak.lock()) {
-                    const auto attempt_at = state->next_attempt_.load(std::memory_order_acquire);
+                    const auto attempt_at = state->next_attempt_;
                     if (attempt_at <= now) {
                         due = std::move(state);
                         break;
@@ -521,10 +521,10 @@ private:
             if (!renewed) {
                 // Existing connections retain their own SSL_CTX. New handshakes
                 // fail closed after notAfter if renewal cannot recover.
-                due->next_attempt_.store(minimum_retry, std::memory_order_release);
+                due->next_attempt_ = minimum_retry;
                 LOG_ERROR("TLS auto-sign renewal unavailable; retrying in one minute");
-            } else if (due->next_attempt_.load(std::memory_order_acquire) < minimum_retry) {
-                due->next_attempt_.store(minimum_retry, std::memory_order_release);
+            } else if (due->next_attempt_ < minimum_retry) {
+                due->next_attempt_ = minimum_retry;
             }
         }
     }
@@ -551,14 +551,13 @@ bool AutoSignContextRenewal::Publish(bssl::UniquePtr<SSL_CTX> context) {
         return false;
     const auto expires = Clock::time_point(std::chrono::seconds(expires_seconds));
     if (expires <= Clock::now()) return false;
-    std::lock_guard lock(publish_mutex_);
     const Snapshot* previous = current_.load(std::memory_order_relaxed);
     if (previous && expires <= previous->expires) return false;
     auto snapshot = std::make_unique<const Snapshot>(Snapshot{std::move(context), expires});
     const Snapshot* published = snapshot.get();
     history_.push_back(std::move(snapshot));
     current_.store(published, std::memory_order_release);
-    next_attempt_.store(expires - std::chrono::hours(24 * 30), std::memory_order_release);
+    next_attempt_ = expires - std::chrono::hours(24 * 30);
     return true;
 }
 

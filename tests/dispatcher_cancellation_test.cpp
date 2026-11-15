@@ -76,9 +76,9 @@ public:
         if (state_.notify_closed_on_destroy) NotifyClosed();
     }
     net::awaitable<size_t> AsyncRead(net::mutable_buffer) override { co_return 0; }
-    net::awaitable<size_t> AsyncWrite(net::const_buffer data) override {
-        state_.written += data.size();
-        co_return data.size();
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        for (const auto& data : buffers) state_.written += data.size();
+        co_return;
     }
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         ++state_.entered;
@@ -155,11 +155,11 @@ struct OutboundProbes {
 };
 
 struct Outbounds {
-    Outbounds(OutboundProbes& probes, net::io_context& io, app::DNS& dns)
+    Outbounds(OutboundProbes& probes, net::io_context& io, app::DNSWorker& dns)
         : tasks(io.get_executor()),
           registry({ProbeConfig("direct", probes.direct),
                     ProbeConfig("second", probes.second)},
-                   io, dns, std::chrono::seconds(1), tasks.Tasks()) {}
+                   io, dns, std::chrono::seconds(1), tasks) {}
     common::ResidentTaskGroup tasks;
     app::OutboundHandlerRegistry registry;
 };
@@ -255,7 +255,6 @@ void ExerciseDispatch(Case which, bool controlled, common::ErrorCode reason = co
         ctx.outbound.original_target = ctx.outbound.target;
     }
     app::DNSWorker dns_worker(io, dns_config, 8);
-    app::DNS dns(dns_worker);
     app::SessionTrackingState session_tracking;
     common::DetectRulePolicy request_policy;
     if (which == Case::PolicyBlockedForce || which == Case::PolicyBlockedRoute ||
@@ -268,9 +267,9 @@ void ExerciseDispatch(Case which, bool controlled, common::ErrorCode reason = co
                         ? "198\\.51\\.100\\.1" : "192\\.0\\.2\\.1"),
                 }}));
     }
-    Outbounds outbound_handlers(outbounds, io, dns);
+    Outbounds outbound_handlers(outbounds, io, dns_worker);
     app::DefaultDispatcher dispatcher(
-        router, outbound_handlers.registry, request_policy, session_tracking, dns, load);
+        router, outbound_handlers.registry, request_policy, session_tracking, dns_worker, load);
     if (which == Case::PreStopped) reader->Cancellation().Stop(reason);
     bool done = false;
     bool triggered = false;
@@ -402,10 +401,9 @@ void ExerciseSiblingIsolation(bool controlled) {
     udp::socket dns_peer(io, udp::endpoint(net::ip::address_v4::loopback(), 0));
     app::DnsConfig dns_config{.servers = {dns_peer.local_endpoint()}};
     app::DNSWorker dns_worker(io, dns_config, 8);
-    app::DNS dns(dns_worker);
-    Outbounds outbound_handlers(outbounds, io, dns);
+    Outbounds outbound_handlers(outbounds, io, dns_worker);
     app::DefaultDispatcher dispatcher(
-        router, outbound_handlers.registry, request_policy, session_tracking, dns, load);
+        router, outbound_handlers.registry, request_policy, session_tracking, dns_worker, load);
     routing::DispatchPolicy policy_a{routing::SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"direct"}};
     routing::DispatchPolicy policy_b{routing::SniffConfig{.enabled = false, .domains_excluded = {}}, routing::ForceOutbound{"second"}};
     common::Context ctx_a, ctx_b;

@@ -309,7 +309,13 @@ public:
         }
         co_return count;
     }
-    net::awaitable<size_t> AsyncWrite(net::const_buffer data) override {
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+        for (const auto& data : buffers) {
+            if (data.size() != 0) co_await WriteBuffer(data);
+        }
+    }
+    // One physical write per non-empty buffer, so the wire observes each frame.
+    net::awaitable<void> WriteBuffer(net::const_buffer data) {
         struct PendingWrite {
             int& count;
             explicit PendingWrite(int& count) : count(count) { ++count; }
@@ -338,7 +344,7 @@ public:
                     wire_->auth_update_seen = dialed[0]->heart_responses == 1;
                 }
             } else wire_->ObservePaddingWrites(bytes, data.size());
-            co_return data.size();
+            co_return;
         }
         if (wire_->open_order) {
             // The first write is authentication; all subsequent bytes are frames.
@@ -352,7 +358,7 @@ public:
                     co_await net::post(net::use_awaitable);
                 wire_->open_order->write_released = true;
             }
-            co_return data.size();
+            co_return;
         }
         if (data.size() == 7 && bytes[0] == proxy::kCmdHeartResponse) ++wire_->heart_responses;
         if ((wire_->io_fault_mode == 2 && wire_->writes == 2) ||
@@ -383,7 +389,7 @@ public:
                 co_await wire_->open_gate.async_wait(net::use_awaitable);
             }
         }
-        co_return data.size();
+        co_return;
     }
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override { co_return common::MultiBuffer{}; }
     void ShutdownWrite() override {}
@@ -397,7 +403,7 @@ private:
 
 class Client final : public transport::MultiBufferReader, public transport::MultiBufferWriter {
 public:
-    transport::CancellationSource source;
+    common::CancellationSource source;
     size_t received = 0;
     int active_reads = 0;
     bool eof = false;
@@ -414,7 +420,7 @@ public:
         }
         co_return common::MultiBuffer{};
     }
-    transport::CancellationSource& Cancellation() noexcept override { return source; }
+    common::CancellationSource& Cancellation() noexcept override { return source; }
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
         co_return co_await WriteBuffersAsMultiBuffer(buffers);
     }
@@ -524,7 +530,7 @@ bool JoinResidentTasks(net::io_context& io, common::ResidentTaskGroup& tasks) {
 // The Handler's production dialer over the default raw TCP sender settings;
 // only DialOutboundTransport above is replaced.
 struct TestDialer {
-    TestDialer(net::io_context& io, app::DNS& dns) : dialer(io, dns, sender, 1s) {}
+    TestDialer(net::io_context& io, app::DNSWorker& dns) : dialer(io, dns, sender, 1s) {}
     transport::OutboundSenderSettings sender;
     transport::OutboundDialer dialer;
 };
@@ -542,8 +548,7 @@ void RunClientPadding() {
     app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
     app::DNSWorker dns_worker(io, dns_config, 8);
-    app::DNS dns(dns_worker);
-    TestDialer outbound(io, dns);
+    TestDialer outbound(io, dns_worker);
     common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
@@ -554,7 +559,7 @@ void RunClientPadding() {
         return std::make_unique<proxy::AnyTlsOutboundHandler>(
             "same-client-tag", io,
             std::make_shared<const infra::AnyTlsSettings>(settings),
-            tasks.Tasks());
+            tasks);
     };
     auto handler = make_handler();
     dialed.clear();
@@ -670,8 +675,7 @@ void RunOpenOrder(int mode, bool before) {
     app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
     app::DNSWorker dns_worker(io, dns_config, 8);
-    app::DNS dns(dns_worker);
-    TestDialer outbound(io, dns);
+    TestDialer outbound(io, dns_worker);
     common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
@@ -683,7 +687,7 @@ void RunOpenOrder(int mode, bool before) {
     dialed.clear();
     auto handler = std::make_unique<proxy::AnyTlsOutboundHandler>("open-order", io,
         std::make_shared<const infra::AnyTlsSettings>(settings),
-        tasks.Tasks());
+        tasks);
     auto request = [&](Client& client, common::Context& ctx) -> net::awaitable<proxy::OutboundProcessResult> {
         ctx.outbound.target = common::TargetAddress("192.0.2.1", 443);
         ctx.content.network = common::Network::TCP;
@@ -823,8 +827,7 @@ void RunQueue(int mode, unsigned seed = 1) {
     app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
     app::DNSWorker dns_worker(io, dns_config, 8);
-    app::DNS dns(dns_worker);
-    TestDialer outbound(io, dns);
+    TestDialer outbound(io, dns_worker);
     common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
@@ -833,7 +836,7 @@ void RunQueue(int mode, unsigned seed = 1) {
     settings.min_idle_sessions = 1;
     auto handler = std::make_unique<proxy::AnyTlsOutboundHandler>("queue", io,
         std::make_shared<const infra::AnyTlsSettings>(settings),
-        tasks.Tasks());
+        tasks);
     queue_scenario = &queue;
     dialed.clear();
     fail_first_session = respond_on_auth = false;
@@ -963,8 +966,7 @@ void RunIoFault(int mode, int kind) {
     app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
     app::DNSWorker dns_worker(io, dns_config, 8);
-    app::DNS dns(dns_worker);
-    TestDialer outbound(io, dns);
+    TestDialer outbound(io, dns_worker);
     common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
@@ -973,7 +975,7 @@ void RunIoFault(int mode, int kind) {
     settings.min_idle_sessions = 1;
     auto handler = std::make_unique<proxy::AnyTlsOutboundHandler>("io-fault", io,
         std::make_shared<const infra::AnyTlsSettings>(settings),
-        tasks.Tasks());
+        tasks);
     dialed.clear();
     fail_first_session = false;
     respond_on_auth = false;
@@ -1085,8 +1087,7 @@ void RunSessionRetirement(int mode) {
     app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
     app::DNSWorker dns_worker(io, dns_config, 8);
-    app::DNS dns(dns_worker);
-    TestDialer outbound(io, dns);
+    TestDialer outbound(io, dns_worker);
     common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
@@ -1096,7 +1097,7 @@ void RunSessionRetirement(int mode) {
     auto handler = std::make_unique<proxy::AnyTlsOutboundHandler>(
         "test", io,
         std::make_shared<const infra::AnyTlsSettings>(settings),
-        tasks.Tasks());
+        tasks);
     dialed.clear();
     fail_first_session = mode == 0 || mode == 3;
     respond_on_auth = mode == 3;
@@ -1219,8 +1220,7 @@ void RunPoolLifecycle(bool join_before_retirement) {
     app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::make_address("127.0.0.1"), 53}};
     app::DNSWorker dns_worker(io, dns_config, 8);
-    app::DNS dns(dns_worker);
-    TestDialer outbound(io, dns);
+    TestDialer outbound(io, dns_worker);
     common::ResidentTaskGroup tasks(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
@@ -1229,7 +1229,7 @@ void RunPoolLifecycle(bool join_before_retirement) {
     settings.min_idle_sessions = 1;
     auto handler = std::make_unique<proxy::AnyTlsOutboundHandler>("pool", io,
         std::make_shared<const infra::AnyTlsSettings>(settings),
-        tasks.Tasks());
+        tasks);
     dialed.clear();
     fail_first_session = respond_on_auth = false;
     io_fault_mode = io_fault_kind = 0;
@@ -1332,15 +1332,14 @@ void RunDomainPoolIsolation() {
     app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 1}};
     app::DNSWorker dns_worker(io, dns_config, 8);
-    app::DNS dns(dns_worker);
-    TestDialer outbound(io, dns);
+    TestDialer outbound(io, dns_worker);
     auto tasks = std::make_unique<common::ResidentTaskGroup>(io.get_executor());
     infra::AnyTlsSettings settings;
     settings.server = LoopbackServer();
     settings.idle_session_check_interval = 60s;
     settings.idle_session_timeout = 60s;
     auto handler = std::make_unique<proxy::AnyTlsOutboundHandler>("isolation", io,
-        std::make_shared<const infra::AnyTlsSettings>(settings), tasks->Tasks());
+        std::make_shared<const infra::AnyTlsSettings>(settings), *tasks);
     OpenOrderScenario scenario{.mode = 0, .before_write_completion = false};
     open_order_scenario = &scenario;
     fail_first_session = respond_on_auth = client_padding_probe = false;

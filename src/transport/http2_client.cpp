@@ -16,7 +16,7 @@ namespace {
 // reader; its credit returns to the peer only when the reader takes it, so the
 // queue never outgrows those windows (RFC 9113 6.9.1).
 class Http2ClientStream final : public AsyncStream,
-                                private transport::CancellationSubscription {
+                                private common::CancellationSubscription {
 public:
     Http2ClientStream(std::unique_ptr<AsyncStream> inner,
                       uint32_t stream_id,
@@ -45,16 +45,6 @@ public:
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
         return inbound_.Read(*this, buffer);
-    }
-
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        if (payload_codec_ == H2PayloadCodec::RawData) {
-            co_await SendData(std::span<const net::const_buffer>(&buffer, 1));
-            co_return buffer.size();
-        }
-        const auto* data = static_cast<const uint8_t*>(buffer.data());
-        co_await SendGrpcHunkMessage(std::span<const uint8_t>(data, buffer.size()));
-        co_return buffer.size();
     }
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
@@ -95,7 +85,7 @@ public:
         inner_->Cancel();
     }
 
-    transport::CancellationSource& Cancellation() noexcept override {
+    common::CancellationSource& Cancellation() noexcept override {
         return inner_->Cancellation();
     }
 
@@ -431,7 +421,7 @@ private:
         WakePumpWaiters();
     }
 
-    void OnCancellation(transport::Cancellation event) noexcept override {
+    void OnCancellation(common::Cancellation event) noexcept override {
         AbortPumpWaits();
         if (event.terminal) {
             write_gate_.Cancel();

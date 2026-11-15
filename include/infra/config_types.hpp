@@ -46,7 +46,6 @@ struct LimitsConfig {
 struct TimeoutsConfig {
     uint32_t handshake = common::kHandshakeTimeout;       // 握手阶段预算（idle + absolute deadline）
     uint32_t dial = common::kDialTimeout;                 // 拨号超时
-    uint32_t read = common::kReadTimeout;                 // 连接读方向 deadline
     uint32_t write = common::kWriteTimeout;               // 连接写方向 deadline
     uint32_t idle = common::kIdleTimeout;                 // UDP/会话空闲超时
     uint32_t uplink_only = common::kUplinkOnlyTimeout;    // 下行关闭后上行最多保留多久
@@ -219,8 +218,7 @@ struct InboundSpec {
     // Normalized and validated by the source's shared field parsers.
     transport::StreamSettings stream_settings;
     routing::SniffConfig sniffing;
-    routing::OutboundSelectionPolicy outbound_policy{
-        routing::ForceOutbound(std::string(common::kDirect))};
+    routing::OutboundSelectionPolicy outbound_policy;
 };
 
 // Static inbound source as written in inbounds.json. Only tag fallback and

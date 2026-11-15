@@ -122,7 +122,6 @@ public:
     void SetPendingMultiBuffer(common::MultiBuffer&& mb);
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override;
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override;
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer buffers) override;
 
@@ -132,7 +131,7 @@ public:
     void ShutdownRead() override;
     net::awaitable<void> AsyncShutdownWrite() override;
     void Cancel() noexcept override;
-    transport::CancellationSource& Cancellation() noexcept override {
+    common::CancellationSource& Cancellation() noexcept override {
         return inner_->Cancellation();
     }
     bool IsOpen() const override;

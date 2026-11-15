@@ -141,7 +141,7 @@ public:
         , framer_(packet_addr)
         , packet_addr_(packet_addr) {}
 
-    transport::CancellationSource& Cancellation() noexcept override {
+    common::CancellationSource& Cancellation() noexcept override {
         return src_.Cancellation();
     }
 
@@ -213,7 +213,7 @@ struct VisionTrafficState {
 
 class VisionReader final : public transport::MultiBufferReader {
 public:
-    transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
+    common::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
     transport::EofAction ReadEofAction() const noexcept override { return src_.ReadEofAction(); }
 
     VisionReader(transport::MultiBufferReader& src,

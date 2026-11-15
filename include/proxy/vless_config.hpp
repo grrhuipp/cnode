@@ -127,6 +127,4 @@ using VlessEncryptionParseResult =
 [[nodiscard]] std::optional<std::array<uint8_t, 16>>
 ParseUuidBytes(std::string_view uuid) noexcept;
 
-[[nodiscard]] std::string NormalizeFlow(std::string_view flow);
-
 }  // namespace proxy

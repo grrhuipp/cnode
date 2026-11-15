@@ -13,7 +13,7 @@ struct ProcessMemorySnapshot {
 [[nodiscard]] ProcessMemorySnapshot ReadProcessMemory();
 
 // Counts intercepted throwing C++ new calls and mi_malloc_aligned entries.
-// Neither category is a total of logical PMR allocations; do not add them.
+// Neither category is a total of allocations; do not add them.
 struct AllocationCounts {
     uint64_t cpp_calls = 0;
     uint64_t cpp_bytes = 0;

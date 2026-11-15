@@ -224,12 +224,11 @@ TEST(DatagramSocket, IPv6MaximumAndFamilyValidation) {
     EXPECT_TRUE(size_rejected);
 }
 
-TEST(DatagramSocket, CloseAndReadScopeTimeout) {
+TEST(DatagramSocket, ReceiveAndCloseWithPendingRead) {
     const auto baseline = DatagramSocket::ActiveCount();
     ::net::io_context io;
     DatagramSocket receiver(io, ::net::ip::address_v4::loopback());
     DatagramSocket sender(io, ::net::ip::address_v4::loopback());
-    receiver.SetReadTimeout(1s);
     auto operation = receiver.StartRead();
     auto first = ::net::co_spawn(io, operation.Receive(), ::net::use_future);
     const std::array<uint8_t, 1> one_byte{7};
@@ -246,22 +245,6 @@ TEST(DatagramSocket, CloseAndReadScopeTimeout) {
     }
     EXPECT_EQ(first.get().payload.byte_size(), 1u);
 
-    // The same scope keeps its original read deadline across repeated receives.
-    auto second = ::net::co_spawn(io, operation.Receive(), ::net::use_future);
-    io.restart();
-    io.run_for(1100ms);
-    if (second.wait_for(0ms) != std::future_status::ready) {
-        receiver.Close();
-        io.restart();
-        io.run();
-        ADD_FAILURE() << "read scope deadline did not complete the receive";
-    }
-    bool timed_out = false;
-    try { (void)second.get(); }
-    catch (const ::transport::LinkError&) { timed_out = true; }
-    EXPECT_TRUE(timed_out);
-    EXPECT_TRUE(receiver.ConsumeReadTimeout());
-
     DatagramSocket closed(io, ::net::ip::address_v4::loopback());
     auto pending = closed.StartRead();
     auto pending_future = ::net::co_spawn(io, pending.Receive(), ::net::use_future);
@@ -274,7 +257,8 @@ TEST(DatagramSocket, CloseAndReadScopeTimeout) {
     try { (void)pending_future.get(); }
     catch (const ::transport::LinkError&) { closed_error = true; }
     EXPECT_TRUE(closed_error);
-    EXPECT_EQ(DatagramSocket::ActiveCount(), baseline + 1);
+    // receiver and sender stay open; only the closed socket is released.
+    EXPECT_EQ(DatagramSocket::ActiveCount(), baseline + 2);
 }
 TEST(DatagramSocket, SocketLimitAndReclamation) {
     constexpr std::size_t limit = 4096;

@@ -16,7 +16,7 @@
 #include "common/ip_address.hpp"
 #include "common/allocator.hpp"
 #include "common/session.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "common/hash.hpp"
 #include "infra/config_types.hpp"
 #include "infra/log.hpp"
@@ -99,32 +99,6 @@ bool AttachQuicReuseportBpf(int fd, uint32_t worker_count) noexcept {
 
 namespace {
 
-
-// The C libraries need realloc semantics; use mimalloc's native API directly.
-void* AllocateQuicMemory(size_t size, void*) {
-    return mi_malloc(size);
-}
-
-void FreeQuicMemory(void* pointer, void*) noexcept {
-    mi_free(pointer);
-}
-
-void* CallocateQuicMemory(size_t count, size_t size, void*) {
-    return mi_calloc(count, size);
-}
-
-void* ReallocateQuicMemory(void* pointer, size_t size, void*) {
-    if (size == 0) {
-        mi_free(pointer);
-        return nullptr;
-    }
-    return mi_realloc(pointer, size);
-}
-
-const ngtcp2_mem kQuicMemory{
-    nullptr, &AllocateQuicMemory, &FreeQuicMemory, &CallocateQuicMemory, &ReallocateQuicMemory};
-const nghttp3_mem kHttp3Memory{
-    nullptr, &AllocateQuicMemory, &FreeQuicMemory, &CallocateQuicMemory, &ReallocateQuicMemory};
 constexpr size_t kMaxQueuedSocketPackets = 1024;
 constexpr size_t kMaxConnections = 65536;
 constexpr size_t kMaxStreamHeaderBytes = 8192;
@@ -299,7 +273,7 @@ int HysteriaConnection::ReceiveTxKey(ngtcp2_conn*, ngtcp2_encryption_level level
     void* user_data) {
     auto& self = *static_cast<HysteriaConnection*>(user_data);
     return level == NGTCP2_ENCRYPTION_LEVEL_1RTT &&
-           self.listener_->version == HysteriaVersion::V2 && !self.SetupHttp3()
+           self.listener_->settings.version == HysteriaVersion::V2 && !self.SetupHttp3()
         ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
 }
 
@@ -308,7 +282,7 @@ int HysteriaConnection::ReceiveDatagram(ngtcp2_conn*, uint32_t flags,
     auto& self = *static_cast<HysteriaConnection*>(user_data);
     if ((flags & NGTCP2_DATAGRAM_FLAG_0RTT) || !self.authenticated_)
         return 0;
-    auto message = ParseUdpMessage(self.listener_->version, {data, length});
+    auto message = ParseUdpMessage(self.listener_->settings.version, {data, length});
     if (message) self.ProcessUdpMessage(*message);
     return 0;
 }
@@ -395,7 +369,7 @@ bool HysteriaConnection::Initialize(const ngtcp2_pkt_hd& header) {
     if (ngtcp2_conn_server_new(
             &core_->quic, &header.scid, &core_->server_cid, &path,
             header.version, &callbacks, &quic_settings, &parameters,
-            &kQuicMemory, this) != 0)
+            nullptr, this) != 0)
         return false;
 
     core_->conn_ref = {&GetConn, this};
@@ -708,7 +682,7 @@ int HysteriaConnection::OpenStream(ngtcp2_conn*, int64_t stream_id, void* user_d
     auto [it, inserted] = self.core_->streams.try_emplace(
         stream_id, std::move(state));
     if (!inserted) return NGTCP2_ERR_CALLBACK_FAILURE;
-    const auto version = self.listener_->version;
+    const auto version = self.listener_->settings.version;
     if (version == HysteriaVersion::V1 && stream_id == 0) {
         self.SpawnOwned(self.RunV1Control(stream_id));
     } else if (version == HysteriaVersion::V2 && !self.authenticated_) {
@@ -1112,7 +1086,7 @@ void HysteriaConnection::OnStreamData(
     uint32_t flags, int64_t stream_id, std::span<const uint8_t> data) {
     const bool fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
     auto it = core_->streams.find(stream_id);
-    if (listener_->version == HysteriaVersion::V2 &&
+    if (listener_->settings.version == HysteriaVersion::V2 &&
         (it == core_->streams.end() || !it->second.raw)) {
         const auto consumed = nghttp3_conn_read_stream2(
             core_->http, stream_id, data.data(), data.size(), fin, Timestamp());
@@ -1142,7 +1116,7 @@ void HysteriaConnection::OnStreamData(
 // inbound handler; otherwise it opens a UDP session, a transport concern.
 void HysteriaConnection::StartRawStream(int64_t stream_id, StreamRecord& stream) {
     if (stream.delivered) return;
-    if (listener_->version == HysteriaVersion::V1) {
+    if (listener_->settings.version == HysteriaVersion::V1) {
         const auto& input = stream.state->PendingInput();
         const auto front = input.FrontSpan();
         if (front.empty()) return;
@@ -1217,8 +1191,8 @@ net::awaitable<void> HysteriaConnection::RunV1Control(int64_t stream_id) {
     {
         std::array<uint8_t, 32> response;
         const size_t size = EncodeV1ServerHelloTo(
-            response, true, listener_->download_bytes_per_second,
-            listener_->upload_bytes_per_second, "");
+            response, true, listener_->settings.download_bytes_per_second,
+            listener_->settings.upload_bytes_per_second, "");
         co_await state->WriteMultiBuffer(CopyPacket({response.data(), size}));
     }
     if (closed_) co_return;
@@ -1275,7 +1249,7 @@ bool HysteriaConnection::SetupHttp3() {
     http_settings.qpack_max_dtable_capacity = 4096;
     http_settings.qpack_blocked_streams = 32;
     if (nghttp3_conn_server_new(&core_->http, &callbacks, &http_settings,
-            &kHttp3Memory, this) != 0) return false;
+            nullptr, this) != 0) return false;
     nghttp3_conn_set_max_client_streams_bidi(core_->http, kMaxStreams);
     int64_t control = -1, encoder = -1, decoder = -1;
     return ngtcp2_conn_open_uni_stream(core_->quic, &control, nullptr) == 0 &&
@@ -1569,7 +1543,7 @@ HysteriaUdpSend HysteriaConnection::SendUdpMessage(
     // 消息至多 1100B；LEN 在 63B 边界由一字节增为两字节。
     const auto message_budget = static_cast<size_t>(
         frame_budget <= 65 ? frame_budget - 2 : frame_budget - kUdpDatagramFrameOverhead);
-    const auto version = listener_->version;
+    const auto version = listener_->settings.version;
     std::optional<common::AddressText> address_storage;
     const auto text = PrepareUdpTargetText(version, target, address_storage);
     if (!text) return kDropped;
@@ -1674,15 +1648,13 @@ HysteriaIngress::HysteriaIngress(
         !environment.dispatcher || !environment.request_load ||
         worker_count == 0 || worker_id >= worker_count)
         throw std::invalid_argument("incomplete Hysteria listener environment");
-    const auto* settings = GetSettings(*environment.prepared);
-    if (!settings) throw std::invalid_argument("missing Hysteria settings");
-    version = settings->version;
-    upload_bytes_per_second = settings->upload_bytes_per_second;
-    download_bytes_per_second = settings->download_bytes_per_second;
+    const auto* configured = GetSettings(*environment.prepared);
+    if (!configured) throw std::invalid_argument("missing Hysteria settings");
+    settings = *configured;
     const auto& stream_settings = Receiver().stream_settings;
     const std::vector<std::string> default_alpn{
-        version == HysteriaVersion::V2 ? "h3" : "hysteria"};
-    const auto& alpn = version == HysteriaVersion::V2 || stream_settings.tls.alpn.empty()
+        settings.version == HysteriaVersion::V2 ? "h3" : "hysteria"};
+    const auto& alpn = settings.version == HysteriaVersion::V2 || stream_settings.tls.alpn.empty()
         ? default_alpn : stream_settings.tls.alpn;
     if (!stream_settings.IsTls())
         throw std::invalid_argument("Hysteria requires TLS");
@@ -2068,16 +2040,6 @@ net::awaitable<size_t> QuicStream::AsyncRead(net::mutable_buffer buffer) {
     return []() -> net::awaitable<size_t> { co_return 0; }();
 }
 
-net::awaitable<size_t> QuicStream::AsyncWrite(net::const_buffer buffer) {
-    if (closed_) throw transport::LinkError(common::ErrorCode::CONNECTION_CLOSED);
-    common::MultiBuffer payload;
-    const auto bytes = std::span(
-        static_cast<const uint8_t*>(buffer.data()), buffer.size());
-    if (!payload.AppendSpan(bytes)) throw std::bad_alloc();
-    co_await state_->WriteMultiBuffer(std::move(payload));
-    co_return buffer.size();
-}
-
 net::awaitable<common::MultiBuffer> QuicStream::ReadMultiBuffer() {
     if (!closed_) return state_->ReadMultiBuffer();
     return []() -> net::awaitable<common::MultiBuffer> { co_return common::MultiBuffer{}; }();
@@ -2180,7 +2142,7 @@ net::awaitable<size_t> UdpSessionStream::AsyncRead(net::mutable_buffer) {
     throw transport::LinkError(common::ErrorCode::NOT_SUPPORTED);
 }
 
-net::awaitable<size_t> UdpSessionStream::AsyncWrite(net::const_buffer) {
+net::awaitable<void> UdpSessionStream::WriteBuffers(std::span<const net::const_buffer>) {
     throw transport::LinkError(common::ErrorCode::NOT_SUPPORTED);
 }
 

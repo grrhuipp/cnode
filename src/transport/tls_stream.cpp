@@ -53,7 +53,7 @@ bool IsBenignServerHandshakeError(unsigned long err_code) {
 
 }  // namespace
 
-struct TlsStream::Impl final : private transport::CancellationSubscription {
+struct TlsStream::Impl final : private common::CancellationSubscription {
     using Gate = AsyncWriteGate;
     enum class Kind { Handshake, Read, Write, Shutdown };
 
@@ -145,7 +145,7 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
         Unsubscribe();
     }
 
-    void OnCancellation(transport::Cancellation event) noexcept override {
+    void OnCancellation(common::Cancellation event) noexcept override {
         ++cancel_epoch;
         if (event.terminal) {
             engine_gate.Cancel();
@@ -290,7 +290,7 @@ struct TlsStream::Impl final : private transport::CancellationSubscription {
     net::awaitable<void> WaitForInput(std::uint64_t epoch, std::uint64_t generation,
                                       bool deferred = false) {
         // The other direction may advance SSL while this operation waits for
-        // the single TCP read deadline. Retry SSL instead of waiting for a new
+        // the single TCP input gate. Retry SSL instead of waiting for a new
         // network edge when its state has already changed.
         auto lease = input_gate.TryAcquire();
         if (!lease) lease = co_await input_gate.Acquire(deferred);
@@ -853,12 +853,6 @@ net::awaitable<common::MultiBuffer> TlsStream::ReadMultiBufferSlow() {
         co_return co_await impl_->tcp->ReadMultiBuffer();
     }
     co_return co_await impl_->ReadMultiBuffer();
-}
-
-net::awaitable<std::size_t> TlsStream::AsyncWrite(net::const_buffer buffer) {
-    const std::array buffers{buffer};
-    co_await WriteBuffers(buffers);
-    co_return buffer.size();
 }
 
 net::awaitable<void> TlsStream::WriteMultiBuffer(common::MultiBuffer mb) {

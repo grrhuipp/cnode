@@ -68,12 +68,11 @@ protected:
     ::app::DNSWorker dns_worker{
         io, ::app::DnsConfig{
             .servers = {{::net::ip::address_v4::loopback(), 9}}}, 8};
-    ::app::DNS dns{dns_worker};
     ::common::ResidentTaskGroup tasks{io.get_executor()};
     Probe first_probe;
     Probe second_probe;
-    OutboundHandlerRegistry registry{{MakeConfig("direct", first_probe)}, io, dns,
-                             std::chrono::seconds(1), tasks.Tasks()};
+    OutboundHandlerRegistry registry{{MakeConfig("direct", first_probe)}, io, dns_worker,
+                             std::chrono::seconds(1), tasks};
 
     void TearDown() override {
         bool joined = false;
@@ -154,7 +153,7 @@ TEST_F(HandlerRegistryTest, DuplicateTagsReleaseAllUnpublishedHandlers) {
     Probe probe;
     EXPECT_THROW(
         (OutboundHandlerRegistry({MakeConfig("same", probe), MakeConfig("same", probe)},
-                         io, dns, std::chrono::seconds(1), tasks.Tasks())),
+                         io, dns_worker, std::chrono::seconds(1), tasks)),
         std::logic_error);
     EXPECT_EQ(probe.destroyed, probe.created);
 }

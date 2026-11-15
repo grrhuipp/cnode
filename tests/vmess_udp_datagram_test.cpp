@@ -677,7 +677,7 @@ public:
                           std::span<const uint8_t> suffix)
         : prefix_(CopyBytes(prefix)), suffix_(CopyBytes(suffix)) {}
 
-    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+    common::CancellationSource& Cancellation() noexcept override { return cancellation_; }
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         ++reads_;
         if (reads_ == 1) {
@@ -699,7 +699,7 @@ private:
 
     common::MultiBuffer prefix_;
     common::MultiBuffer suffix_;
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
     size_t reads_ = 0;
 };
 
@@ -850,11 +850,6 @@ public:
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
         co_return co_await connection_.stream.AsyncRead(buffer);
-    }
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        const std::array<net::const_buffer, 1> buffers{buffer};
-        co_await WriteBuffers(buffers);
-        co_return buffer.size();
     }
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         co_return co_await connection_.stream.ReadMultiBuffer();

@@ -202,10 +202,8 @@ inline void EncryptToMultiBuffer(SsAeadCipher& cipher,
     size_t written = 0;
     while (remaining > 0) {
         const size_t chunk_size = std::min(remaining, kStreamChunkPayloadSize);
-        const uint8_t len_plain[2] = {
-            static_cast<uint8_t>(chunk_size >> 8),
-            static_cast<uint8_t>(chunk_size & 0xFF),
-        };
+        uint8_t len_plain[2];
+        common::StoreU16BE(len_plain, static_cast<uint16_t>(chunk_size));
         const auto nonce_l = MakeNonce(nonce);
         if (!cipher.Encrypt(nonce_l.data(), len_plain, 2, dst + written)) {
             throw IoSystemError(
@@ -318,7 +316,7 @@ public:
     BodyReader(BodyReader&&) noexcept = default;
     BodyReader& operator=(BodyReader&&) noexcept = default;
 
-    transport::CancellationSource& Cancellation() noexcept override { return stream_->Cancellation(); }
+    common::CancellationSource& Cancellation() noexcept override { return stream_->Cancellation(); }
     transport::EofAction ReadEofAction() const noexcept override { return stream_->ReadEofAction(); }
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         if (failure_) std::rethrow_exception(failure_);

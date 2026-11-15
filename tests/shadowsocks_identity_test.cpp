@@ -148,7 +148,7 @@ TEST_F(ShadowsocksIdentity, SortedSnapshotPreservesUdpOwnerAndReplayIsolation) {
     const auto users = Users(17, cipher, 3);
     Install(users);
     const auto view = UserStore::ShadowsocksUsers(kTag);
-    proxy::Ss2022UdpReplayCache replay;
+    UdpAssociations associations;
     for (size_t index : {0u, 8u, 16u}) {
         proxy::KeyBytes key;
         ASSERT_TRUE(key.assign(users[index].derived_key.span()));
@@ -166,12 +166,12 @@ TEST_F(ShadowsocksIdentity, SortedSnapshotPreservesUdpOwnerAndReplayIsolation) {
         ASSERT_EQ(proxy::Encode2022UdpRequestPacketTo(target, payload.data(), payload.size(),
             state, chain, packet.data(), packet.size()), size);
         auto result = proxy::DecodeUdpPacket(packet.data(), packet.size(), view,
-            cipher.type, cipher.key_size, cipher.salt_size, replay, false);
+            cipher.type, cipher.key_size, cipher.salt_size);
         ASSERT_TRUE(result);
         ASSERT_LT(result->user_index, view.size());
         EXPECT_EQ(view[result->user_index].profile.user_id, users[index].profile.user_id);
-        EXPECT_FALSE(proxy::DecodeUdpPacket(packet.data(), packet.size(), view,
-            cipher.type, cipher.key_size, cipher.salt_size, replay, false));
+        EXPECT_TRUE(associations.Commit(*result));
+        EXPECT_FALSE(associations.Commit(*result));
     }
 }
 } // namespace

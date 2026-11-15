@@ -105,9 +105,6 @@ public:
     // 返回 0 表示 EOF（对端关闭写端）；网络错误或取消抛 IoSystemError，取消不能伪装成 EOF。
     virtual net::awaitable<std::size_t> AsyncRead(net::mutable_buffer buf) = 0;
 
-    // 失败抛 IoSystemError。
-    virtual net::awaitable<std::size_t> AsyncWrite(net::const_buffer buf) = 0;
-
     // ========================================================================
     // common::MultiBuffer 流式接口（对应 Xray buf.Reader / buf.Writer）
     //
@@ -125,13 +122,13 @@ public:
     virtual net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override;
 
     /**
-     * 批量写入非 owning buffer 序列。
+     * 批量写入非 owning buffer 序列，是字节写出的唯一入口。
      *
-     * 调用方保证 buffers 指向的数据在 co_await 返回前有效。默认实现逐段
-     * AsyncWrite；TcpStream/TlsStream/WS 可 override 为 scatter 或协议内聚写，
-     * 用于小协议头 + 现有 payload 的零拷贝写出。
+     * 调用方保证 buffers 指向的数据在 co_await 返回前有效。按序写完全部非空
+     * buffer（TcpStream scatter-write、TlsStream/WS 协议内聚写），用于小协议头 +
+     * 现有 payload 的零拷贝写出；失败抛 IoSystemError。
      */
-    virtual net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
+    virtual net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override = 0;
 
     // ========================================================================
     // 关闭操作（所有操作必须幂等）
@@ -148,7 +145,7 @@ public:
     /**
      * 半关闭写端（同步，幂等）
      *
-     * 效果：发送 EOF 信号，后续 AsyncWrite() 返回错误
+     * 效果：发送 EOF 信号，后续 WriteBuffers() 返回错误
      * TCP：调用 shutdown(SHUT_WR)，发送 FIN
      *
      * ⚠️ 对于 TLS 流，应使用 AsyncShutdownWrite() 以发送 close_notify
@@ -172,13 +169,13 @@ public:
     /**
      * 取消所有挂起的异步操作（幂等）
      *
-     * 效果：所有挂起的 AsyncRead/AsyncWrite 返回 operation_aborted
+     * 效果：所有挂起的 AsyncRead/WriteBuffers 返回 operation_aborted
      * 注意：不改变 socket 状态，不发送任何数据
      */
     virtual void Cancel() noexcept = 0;
 
     // Observe cancellation while higher layers wait outside socket I/O.
-    transport::CancellationSource& Cancellation() noexcept override;
+    common::CancellationSource& Cancellation() noexcept override;
 
     /**
      * 完全关闭连接（幂等）
@@ -226,7 +223,6 @@ public:
     // ========================================================================
 
     void SetIdleTimeout(std::chrono::seconds timeout);
-    void SetReadTimeout(std::chrono::seconds timeout);
     virtual void SetWriteTimeout(std::chrono::seconds timeout);
     void SetAbortiveClose(bool enable = true) noexcept;
     // Shared byte transports can finish a started write when a logical caller
@@ -234,7 +230,6 @@ public:
     [[nodiscard]] bool DeferWriteCancellation() noexcept;
 
     [[nodiscard]] bool ConsumeIdleTimeout() noexcept;
-    [[nodiscard]] bool ConsumeReadTimeout() noexcept;
     [[nodiscard]] virtual bool ConsumeWriteTimeout() noexcept;
 
     // Logical streams select their inline deadline owner below; ordinary byte
@@ -270,22 +265,14 @@ protected:
     virtual const TcpStream* BaseTcpStream() const { return nullptr; }
 
 private:
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
 };
 
 // ============================================================================
-// 超时辅助函数 — relay 层统一判定读/写侧是否因超时被 Cancel
+// 超时辅助函数 — relay 层统一判定写侧是否因超时被 Cancel
 // ============================================================================
 
 // Stream 为 AsyncStream 或任何暴露同名 Consume*Timeout 的出站端点/UDP 请求控制面。
-template <typename Stream>
-bool ConsumeReadSideTimeout(Stream& stream) {
-    // 不使用 || 短路：两个标志位都需要被消费，避免残留
-    bool read  = stream.ConsumeReadTimeout();
-    bool idle  = stream.ConsumeIdleTimeout();
-    return read || idle;
-}
-
 template <typename Stream>
 bool ConsumeWriteSideTimeout(Stream& stream) {
     bool write = stream.ConsumeWriteTimeout();

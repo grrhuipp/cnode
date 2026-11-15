@@ -90,14 +90,6 @@ ParseV2TcpRequest(std::span<const uint8_t> input);
 [[nodiscard]] tl::expected<HysteriaUdpMessage, ProtocolError>
 ParseUdpMessage(HysteriaVersion version, std::span<const uint8_t> input);
 
-// V2 的空目标按无地址续片计长；是否必须带目标仍由报文语义校验决定。
-[[nodiscard]] tl::expected<size_t, ProtocolError>
-UdpMessageHeaderSize(HysteriaVersion version, const common::TargetAddress& target);
-
-// 输出归属当前分配域，可直接移动到连接的待发送队列。
-[[nodiscard]] tl::expected<std::vector<uint8_t>, ProtocolError>
-EncodeUdpMessage(HysteriaVersion version, const HysteriaUdpMessage& message);
-
 // 已格式化的 UDP 目标：分片发送时地址只格式化一次，逐片复用。
 // host 借用调用方的 target 或 address_storage，二者须覆盖本对象寿命。
 struct UdpTargetText {

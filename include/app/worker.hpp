@@ -16,13 +16,13 @@
 
 namespace common {
 
-struct OnlineDevice;
 struct DetectRule;
 
 }  // namespace common
 namespace app {
 
 class GroupCoordinator;
+struct OnlineDevice;
 struct BuildRequest;
 struct ReceiverSettings;
 struct PreparedOutboundConfig;
@@ -136,7 +136,7 @@ public:
     void RollbackTraffic(std::string_view tag, const app::UserTrafficCounters& snapshot);
 
     // 协议类型由 inbound handler 的 ReceiverSettings 自动判断，无需外部传入。
-    [[nodiscard]] std::vector<common::OnlineDevice> GetOnlineDevices(std::string_view tag) const;
+    [[nodiscard]] std::vector<OnlineDevice> GetOnlineDevices(std::string_view tag) const;
 
     // Resource traversal is requested only by the low-frequency diagnostics loop.
     [[nodiscard]] WorkerRuntimeStatsSnapshot CollectRuntimeStats(bool include_resources) const;
@@ -160,7 +160,7 @@ private:
     net::io_context& io_context_;
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> drain_requested_{false};
-    std::atomic<bool> joined_{false};
+    bool joined_ = false; // owner executor only
     bool stop_notification_delivered_ = false; // owner executor only
     void* failure_context_ = nullptr;
     FailureHandler failure_handler_ = nullptr;

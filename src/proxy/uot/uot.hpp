@@ -80,7 +80,7 @@ ReadUotRequestHeader(
     const infra::TimeoutsConfig& timeouts);
 class UotPacketReader final : public transport::MultiBufferReader {
 public:
-    transport::CancellationSource& Cancellation() noexcept override { return reader_.Cancellation(); }
+    common::CancellationSource& Cancellation() noexcept override { return reader_.Cancellation(); }
     // A UDP association has no write-half-close to propagate to its peer.
     transport::EofAction ReadEofAction() const noexcept override {
         return transport::EofAction::CloseLink;
@@ -162,7 +162,7 @@ public:
         return writer_.AsyncShutdownWrite();
     }
 
-    transport::CancellationSource& Cancellation() noexcept override { return underlying_.Cancellation(); }
+    common::CancellationSource& Cancellation() noexcept override { return underlying_.Cancellation(); }
     transport::EofAction ReadEofAction() const noexcept override { return reader_.ReadEofAction(); }
     bool WriteShutdownClosesLink() const noexcept override { return writer_.WriteShutdownClosesLink(); }
 

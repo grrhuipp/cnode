@@ -286,13 +286,13 @@ template <class Function>
 constexpr size_t kReplyEncodingOverhead = 512;
 
 // Waits on a session's channel until signalled or `cancellation` fires.
-struct ReplyRoomWait final : transport::CancellationSubscription {
+struct ReplyRoomWait final : common::CancellationSubscription {
     explicit ReplyRoomWait(common::SignalChannel& signal) noexcept : signal(signal) {}
     common::SignalChannel& signal;
     bool cancelled = false;
 
 private:
-    void OnCancellation(transport::Cancellation) noexcept override {
+    void OnCancellation(common::Cancellation) noexcept override {
         cancelled = true;
         (void)signal.try_send(IoErrorCode{});
     }
@@ -353,7 +353,7 @@ UdpIngress::ClientSession::~ClientSession() noexcept {
         handoff_record_->session.reset();
 }
 
-transport::CancellationSource& UdpIngress::ClientSession::Cancellation() noexcept {
+common::CancellationSource& UdpIngress::ClientSession::Cancellation() noexcept {
     return cancellation_;
 }
 

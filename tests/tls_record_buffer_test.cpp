@@ -21,7 +21,7 @@
 #include <vector>
 
 namespace {
-namespace net = ::net;
+
 using namespace std::chrono_literals;
 
 
@@ -301,12 +301,13 @@ TEST(TlsRecordBuffer, DuplexKeyUpdatePreservesFramesThroughCancellationAndHalfCl
     EXPECT_TRUE(::common::test_buffers_live == idle_buffers) << "completed duplex TLS operation retained relay payload";
 
     const std::string next_record = "after-backpressure-and-key-update";
+    const net::const_buffer next_buffer = net::buffer(next_record);
     auto next_write = net::co_spawn(fixture.io,
-        fixture.stream->AsyncWrite(net::buffer(next_record)), net::use_future);
+        fixture.stream->WriteBuffers({&next_buffer, 1}), net::use_future);
     auto next_read = net::co_spawn(fixture.io,
         fixture.peer->Read(next_record.size()), net::use_future);
-    EXPECT_TRUE(fixture.Wait(next_write) == next_record.size() &&
-                fixture.Wait(next_read) == next_record) << "resuming direct output after a queued TLS control record corrupted the sequence";
+    fixture.Wait(next_write);
+    EXPECT_TRUE(fixture.Wait(next_read) == next_record) << "resuming direct output after a queued TLS control record corrupted the sequence";
     EXPECT_TRUE(::common::test_buffers_live == idle_buffers) << "resumed TLS output retained relay payload";
 
     auto close = net::co_spawn(fixture.io, fixture.stream->AsyncShutdownWrite(), net::use_future);
@@ -331,8 +332,9 @@ TEST(TlsRecordBuffer, BidirectionalBackpressureStillAllowsConcurrentReaders) {
     const std::string inbound(512 * 1024, 'd');
     const auto encrypted = fixture.peer->Encrypt(inbound);
     JoinPending join{fixture};
+    const net::const_buffer outbound_buffer = net::buffer(outbound);
     auto outgoing = net::co_spawn(fixture.io,
-        fixture.stream->AsyncWrite(net::buffer(outbound)), net::use_future);
+        fixture.stream->WriteBuffers({&outbound_buffer, 1}), net::use_future);
     auto incoming = net::async_write(
         fixture.peer->socket, net::buffer(encrypted), net::use_future);
     fixture.io.restart();
@@ -343,7 +345,7 @@ TEST(TlsRecordBuffer, BidirectionalBackpressureStillAllowsConcurrentReaders) {
         ReadBytes(*fixture.stream, inbound.size()), net::use_future);
     auto peer_read = net::co_spawn(fixture.io,
         fixture.peer->Read(outbound.size()), net::use_future);
-    EXPECT_TRUE(fixture.Wait(outgoing) == outbound.size()) << "product duplex write was incomplete";
+    fixture.Wait(outgoing);
     EXPECT_TRUE(fixture.Wait(incoming) == encrypted.size()) << "peer duplex write was incomplete";
     EXPECT_TRUE(fixture.Wait(product_read) == inbound && fixture.Wait(peer_read) == outbound) << "TLS physical write gate blocked concurrent inbound progress";
 }
@@ -357,9 +359,9 @@ TEST(TlsRecordBuffer, LargeHandshakeReleasesPayloadAndPreservesRecordSequence) {
     EXPECT_TRUE(Flatten(fixture.Wait(read)) == "after-large-flight") << "large handshake corrupted record sequence";
 }
 
-TEST(TlsRecordBuffer, ReadDeadlineAbortsPhysicalConnection) {
+TEST(TlsRecordBuffer, IdleDeadlineAbortsPhysicalConnection) {
     Fixture fixture;
-    fixture.stream->SetReadTimeout(1s);
+    fixture.stream->SetIdleTimeout(1s);
     auto read = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
     bool timed_out = false;
     try { (void)fixture.Wait(read); }
@@ -367,8 +369,8 @@ TEST(TlsRecordBuffer, ReadDeadlineAbortsPhysicalConnection) {
         if (error.code() != net::error::operation_aborted) throw;
         timed_out = true;
     }
-    EXPECT_TRUE(timed_out && fixture.stream->ConsumeReadTimeout() &&
-                !fixture.stream->IsOpen()) << "TLS readable wait escaped the physical read deadline";
+    EXPECT_TRUE(timed_out && fixture.stream->ConsumeIdleTimeout() &&
+                !fixture.stream->IsOpen()) << "TLS readable wait escaped the physical idle deadline";
 }
 }  // namespace
 
@@ -379,10 +381,11 @@ TEST_P(TlsWriteReset, SocketResetAbortsWrites) {
     const bool backpressured = GetParam();
     const std::string payload(512 * 1024, 'r');
     JoinPending join{fixture};
-    std::future<std::size_t> write;
+    const net::const_buffer buffer = net::buffer(payload);
+    std::future<void> write;
     if (backpressured) {
         write = net::co_spawn(fixture.io,
-            fixture.stream->AsyncWrite(net::buffer(payload)), net::use_future);
+            fixture.stream->WriteBuffers({&buffer, 1}), net::use_future);
         fixture.io.restart();
         fixture.io.run_for(20ms);
         EXPECT_NE(write.wait_for(0s), std::future_status::ready);
@@ -391,9 +394,9 @@ TEST_P(TlsWriteReset, SocketResetAbortsWrites) {
     fixture.peer->socket.close();
     if (!backpressured)
         write = net::co_spawn(fixture.io,
-            fixture.stream->AsyncWrite(net::buffer(payload)), net::use_future);
+            fixture.stream->WriteBuffers({&buffer, 1}), net::use_future);
     bool failed = false;
-    try { (void)fixture.Wait(write); }
+    try { fixture.Wait(write); }
     catch (const IoSystemError& error) {
         EXPECT_TRUE(error.code() == net::error::connection_reset ||
                     error.code() == net::error::broken_pipe) << error.what();
@@ -456,11 +459,12 @@ TEST_P(TlsReadShutdown, PendingReadEndsWithoutClosingWriteDirection) {
     EXPECT_EQ(fixture.Wait(eof), 0);
 
     const std::string payload = "write-after-local-read-shutdown";
+    const net::const_buffer buffer = net::buffer(payload);
     auto write = net::co_spawn(fixture.io,
-        fixture.stream->AsyncWrite(net::buffer(payload)), net::use_future);
+        fixture.stream->WriteBuffers({&buffer, 1}), net::use_future);
     auto received = net::co_spawn(fixture.io,
         fixture.peer->Read(payload.size()), net::use_future);
-    EXPECT_EQ(fixture.Wait(write), payload.size());
+    fixture.Wait(write);
     EXPECT_EQ(fixture.Wait(received), payload);
     auto shutdown = net::co_spawn(fixture.io,
         fixture.stream->AsyncShutdownWrite(), net::use_future);

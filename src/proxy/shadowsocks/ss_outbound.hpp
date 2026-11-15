@@ -6,7 +6,7 @@
 #include "proxy/uot/uot.hpp"
 #include "app/user_store.hpp"
 #include "common/multi_buffer.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "common/target_address.hpp"
 #include <openssl/mem.h>
 #include "proxy/inbound.hpp"
@@ -55,7 +55,7 @@ namespace proxy {
 // packet target is encoded as supplied; only the server name is resolved here.
 class SsUdpRequest final : public ::proxy::OutboundDatagramEndpointBase {
 public:
-    SsUdpRequest(net::io_context& io, app::DNS& dns,
+    SsUdpRequest(net::io_context& io, app::DNSWorker& dns,
                const net::ip::address& bind_address, common::TargetAddress server,
                const proxy::SsCipherInfo& cipher_info, const proxy::KeyBytes& master_key,
                std::span<const proxy::KeyBytes> psk_chain,
@@ -134,7 +134,7 @@ private:
             output, output_size, forwarded);
     }
 
-    app::DNS& dns_;
+    app::DNSWorker& dns_;
     const common::TargetAddress server_;
     std::optional<udp::endpoint> server_endpoint_;
     const proxy::SsCipherInfo cipher_info_;

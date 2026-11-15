@@ -16,27 +16,25 @@
 // 握手阶段读写的超时、取消与异常分类，入站与出站共用；不含任何准入语义。
 namespace proxy {
 
-[[nodiscard]] inline bool ConsumeStreamReadTimeout(
+[[nodiscard]] inline bool ConsumeStreamDeadline(
     transport::AsyncStream& stream) noexcept {
-    return stream.ConsumePhaseDeadline() || stream.ConsumeIdleTimeout() ||
-           stream.ConsumeReadTimeout();
+    return stream.ConsumePhaseDeadline() || stream.ConsumeIdleTimeout();
 }
 
 [[nodiscard]] inline bool ConsumeStreamWriteTimeout(
     transport::AsyncStream& stream) noexcept {
-    return stream.ConsumePhaseDeadline() || stream.ConsumeIdleTimeout() ||
-           stream.ConsumeWriteTimeout();
+    return ConsumeStreamDeadline(stream) || stream.ConsumeWriteTimeout();
 }
 [[nodiscard]] inline common::ErrorCode ResolveHandshakeReadFailure(
     transport::AsyncStream& stream,
     common::ErrorCode fallback = common::ErrorCode::SOCKET_READ_FAILED) noexcept {
-    return ConsumeStreamReadTimeout(stream) ? common::ErrorCode::TIMEOUT : fallback;
+    return ConsumeStreamDeadline(stream) ? common::ErrorCode::TIMEOUT : fallback;
 }
 
 [[nodiscard]] inline common::ErrorCode ClassifyHandshakeReadException(
     transport::AsyncStream& stream,
     const IoSystemError& error) noexcept {
-    if (ConsumeStreamReadTimeout(stream) || error.code() == io_error::timed_out) {
+    if (ConsumeStreamDeadline(stream) || error.code() == io_error::timed_out) {
         return common::ErrorCode::TIMEOUT;
     }
     if (error.code() == io_error::operation_aborted) {
@@ -85,7 +83,7 @@ enum class HandshakeProgress : uint8_t {
 
 // 唯一的握手精确读：填满 `out` 才返回成功。
 // 握手首字节前 EOF 是对端正常关闭 → SOCKET_EOF；收到任何握手字节后 EOF 是
-// 异常截断 → PROTOCOL_DECODE_FAILED；已触发的读、空闲或阶段超时优先归为 TIMEOUT。
+// 异常截断 → PROTOCOL_DECODE_FAILED；已触发的空闲或阶段超时优先归为 TIMEOUT。
 [[nodiscard]] inline net::awaitable<tl::expected<void, common::ErrorCode>> ReadHandshakeExact(
     transport::AsyncStream& stream,
     std::span<uint8_t> out,
@@ -112,7 +110,7 @@ enum class HandshakeProgress : uint8_t {
 [[nodiscard]] inline bool ConsumeOutboundHandshakeTimeout(
     transport::AsyncStream& stream,
     const transport::PhaseDeadlineToken& deadline) noexcept {
-    return deadline.Expired() || ConsumeStreamReadTimeout(stream) ||
+    return deadline.Expired() || ConsumeStreamDeadline(stream) ||
            stream.ConsumeWriteTimeout();
 }
 

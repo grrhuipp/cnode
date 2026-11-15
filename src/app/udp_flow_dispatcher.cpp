@@ -178,7 +178,7 @@ public:
     void Close(common::ErrorCode error) noexcept;
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override;
-    transport::CancellationSource& Cancellation() noexcept override {
+    common::CancellationSource& Cancellation() noexcept override {
         return cancellation_;
     }
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer payload) override;
@@ -202,7 +202,7 @@ private:
     }
 
     common::SignalChannel read_signal_;
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
     common::RingDeque<QueuedDatagram> queue_;
     size_t queued_bytes_ = 0;
     common::ErrorCode terminal_error_ = common::ErrorCode::OK;
@@ -211,7 +211,6 @@ private:
 
 struct UdpTargetState {
     const common::TargetAddress* target = nullptr;
-    std::weak_ptr<UdpRouteFlow> plain_flow;
     bool saw_quic = false;
 };
 
@@ -335,11 +334,6 @@ public:
                 aliases_.erase(found);
             }
         }
-        auto* target = const_cast<UdpTargetState*>(flow->key.target);
-        if (!flow->key.quic &&
-            target->plain_flow.lock().get() == flow.get()) {
-            target->plain_flow.reset();
-        }
         if (auto found = flows_.find(flow->key);
             found != flows_.end() && found->second.get() == flow.get()) {
             flows_.erase(found);
@@ -427,13 +421,13 @@ public:
     // waits until a flow takes or drops queued data, the association fails,
     // or the parent reader is cancelled. True when it may retry.
     net::awaitable<bool> AwaitRoom() {
-        struct CancelWait final : transport::CancellationSubscription {
+        struct CancelWait final : common::CancellationSubscription {
             explicit CancelWait(common::SignalChannel& signal) noexcept : signal(signal) {}
             common::SignalChannel& signal;
             bool cancelled = false;
 
         private:
-            void OnCancellation(transport::Cancellation) noexcept override {
+            void OnCancellation(common::Cancellation) noexcept override {
                 cancelled = true;
                 (void)signal.try_send(IoErrorCode{});
             }
@@ -491,11 +485,7 @@ private:
             *this, key, parent_context_, io_context_);
         auto [inserted, accepted] = flows_.emplace(key, flow);
         if (!accepted) return {.flow = inserted->second};
-        if (key.quic) {
-            const_cast<UdpTargetState*>(key.target)->saw_quic = true;
-        } else {
-            const_cast<UdpTargetState*>(key.target)->plain_flow = flow;
-        }
+        if (key.quic) const_cast<UdpTargetState*>(key.target)->saw_quic = true;
         return {.flow = std::move(flow), .created = true};
     }
 
@@ -691,7 +681,7 @@ net::awaitable<void> UdpRouteFlow::WriteBuffers(
 
 }  // namespace
 
-net::awaitable<void> UdpFlowDispatcher::Run(
+net::awaitable<void> DispatchUdpFlows(
     DefaultDispatcher& dispatcher,
     net::io_context& io_context,
     const routing::DispatchPolicy& policy,

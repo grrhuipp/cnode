@@ -46,11 +46,11 @@ static_assert(kXHttpRefererPadding.size() == 100);
 }
 
 class XHttpPacketUpServerStream final : public AsyncStream {
-    struct SessionCancellation final : transport::CancellationSubscription {
+    struct SessionCancellation final : common::CancellationSubscription {
         explicit SessionCancellation(XHttpPacketUpServerStream& owner) noexcept : owner(owner) {}
         XHttpPacketUpServerStream& owner;
     private:
-        void OnCancellation(transport::Cancellation cancellation) noexcept override {
+        void OnCancellation(common::Cancellation cancellation) noexcept override {
             if (cancellation.terminal) {
                 owner.NotifyClosed(cancellation.reason);
                 owner.downlink_->Cancel();
@@ -60,11 +60,11 @@ class XHttpPacketUpServerStream final : public AsyncStream {
             }
         }
     };
-    struct DownlinkCancellation final : transport::CancellationSubscription {
+    struct DownlinkCancellation final : common::CancellationSubscription {
         explicit DownlinkCancellation(XHttpPacketUpServerStream& owner) noexcept : owner(owner) {}
         XHttpPacketUpServerStream& owner;
     private:
-        void OnCancellation(transport::Cancellation cancellation) noexcept override {
+        void OnCancellation(common::Cancellation cancellation) noexcept override {
             if (cancellation.terminal) {
                 owner.NotifyClosed(cancellation.reason);
                 owner.session_->Close();
@@ -102,13 +102,6 @@ public:
             }
         }
         co_return n;
-    }
-
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        if (!downlink_) {
-            throw IoSystemError(io_error::operation_aborted, "xhttp downlink closed");
-        }
-        return downlink_->AsyncWrite(buffer);
     }
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
@@ -235,10 +228,10 @@ public:
         : net::execution_context::service(context) {}
 
     void Spawn(net::any_io_executor executor, net::awaitable<void> task,
-               transport::CancellationSource& cancellation) {
+               common::CancellationSource& cancellation) {
         if (joining_) throw IoSystemError(io_error::operation_aborted);
         if (!tasks_) tasks_.emplace(std::move(executor));
-        tasks_->Tasks().Spawn(std::move(task), &cancellation);
+        tasks_->Spawn(std::move(task), &cancellation);
     }
 
     net::awaitable<void> Join() {
@@ -276,9 +269,6 @@ public:
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         co_return common::MultiBuffer{};
     }
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        return state_->stream->AsyncWrite(buffer);
-    }
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer payload) override {
         return state_->stream->WriteMultiBuffer(std::move(payload));
     }
@@ -302,7 +292,7 @@ public:
     }
     int NativeHandle() const override { return state_->stream->NativeHandle(); }
     bool IsOpen() const override { return state_->stream->IsOpen(); }
-    transport::CancellationSource& Cancellation() noexcept override {
+    common::CancellationSource& Cancellation() noexcept override {
         return state_->stream->Cancellation();
     }
 
@@ -389,7 +379,7 @@ private:
     // Close cancels the reader; the registered task retains the transport
     // until the physical session's explicit resident-task join completes.
     std::shared_ptr<SharedState> state_;
-    transport::CancellationSource drain_cancellation_;
+    common::CancellationSource drain_cancellation_;
 };
 
 // `close_connection` announces that the server ends the connection after this
@@ -401,7 +391,7 @@ net::awaitable<bool> SendXHttpResponseHeaders(
     bool close_connection) {
     const bool add_sse = !xhttp_cfg.no_sse_header &&
                          !FindHttpHeader(xhttp_cfg.headers, "Content-Type");
-    Http1HeaderBuffer response;
+    HeaderBlockBuffer response;
     response.reserve(192 + (xhttp_cfg.headers.size() + (add_sse ? 1 : 0)) * 32);
     response.append("HTTP/1.1 200 OK\r\n"
                     "X-Accel-Buffering: no\r\n"
@@ -442,7 +432,7 @@ net::awaitable<bool> SendXHttpResponseHeaders(
 net::awaitable<bool> SendEmptyHttp1Response(AsyncStream& stream,
                                             std::string_view status,
                                             bool close_connection) {
-    Http1HeaderBuffer response;
+    HeaderBlockBuffer response;
     response.reserve(64 + status.size());
     response.append("HTTP/1.1 ");
     response.append(status);
@@ -556,7 +546,7 @@ net::awaitable<std::optional<common::MultiBuffer>> ReadXHttpPacketBody(
 }
 
 void BuildXHttp1ClientRequest(
-    Http1HeaderBuffer& request,
+    HeaderBlockBuffer& request,
     const HttpClientRequestView& req,
     std::string_view host,
     std::string_view content_length,
@@ -608,7 +598,7 @@ net::awaitable<common::ErrorCode> SendXHttp1ClientRequest(
     std::span<const net::const_buffer> packet_payload,
     size_t payload_len) {
     const bool chunked_upload = kind == XHttpClientRequestKind::StreamUp;
-    Http1HeaderBuffer request;
+    HeaderBlockBuffer request;
     BuildXHttp1ClientRequest(
         request, cfg, host, content_length, chunked_upload);
     const std::string_view head_view = request.View();
@@ -634,7 +624,7 @@ net::awaitable<common::ErrorCode> SendXHttp1ClientRequest(
 // Coordinator-owned metadata only. Each admitted record reserves its own
 // retirement node: noexcept close cannot lose an event to mailbox exhaustion.
 class XHttpSessionDirectory final : public net::execution_context::service {
-    using Key = BasicXHttpPacketSessionKey<std::string>;
+    using Key = XHttpPacketSessionKey;
 
 public:
     static net::execution_context::id id;
@@ -1096,7 +1086,7 @@ net::awaitable<XHttpCommit> XHttpPacketUpload::Commit(uint64_t seq, common::Mult
         std::exchange(reserved_, 0), stream_.Cancellation());
 }
 
-void XHttpPacketUpload::OnCancellation(Cancellation cancellation) noexcept {
+void XHttpPacketUpload::OnCancellation(common::Cancellation cancellation) noexcept {
     if (cancellation.terminal) {
         stream_.CloseAbortive();
     } else {
@@ -1199,24 +1189,24 @@ bool XHttpPacketUpSession::AttachDownlink() noexcept {
 }
 
 net::awaitable<bool> XHttpPacketUpSession::AwaitDownlink(
-    transport::CancellationSource& cancellation) {
+    common::CancellationSource& cancellation) {
     common::SignalChannel wake(io_context_.get_executor(), 1);
-    struct ReadyWatch final : transport::CancellationSubscription {
+    struct ReadyWatch final : common::CancellationSubscription {
         explicit ReadyWatch(common::SignalChannel& wake) noexcept : wake(wake) {}
         common::SignalChannel& wake;
 
     private:
-        void OnCancellation(transport::Cancellation) noexcept override {
+        void OnCancellation(common::Cancellation) noexcept override {
             (void)wake.try_send(IoErrorCode{});
         }
     } ready{wake};
-    struct ConnectionCancellation final : transport::CancellationSubscription {
+    struct ConnectionCancellation final : common::CancellationSubscription {
         explicit ConnectionCancellation(common::SignalChannel& wake) noexcept : wake(wake) {}
         common::SignalChannel& wake;
         bool cancelled = false;
 
     private:
-        void OnCancellation(transport::Cancellation) noexcept override {
+        void OnCancellation(common::Cancellation) noexcept override {
             cancelled = true;
             (void)wake.try_send(IoErrorCode{});
         }
@@ -1335,7 +1325,7 @@ net::awaitable<common::MultiBuffer> XHttpPacketUpSession::ReadMultiBuffer() {
     }
 }
 
-void XHttpPacketUpSession::OnCancellation(transport::Cancellation cancellation) noexcept {
+void XHttpPacketUpSession::OnCancellation(common::Cancellation cancellation) noexcept {
     if (cancellation.terminal) {
         Close();
     } else {
@@ -1426,19 +1416,19 @@ struct AbandonOwnerWait final : app::GroupCoordinator::ReservedOperation {
 net::awaitable<bool> AwaitXHttpSessionOwner(
     app::GroupCoordinator& coordinator,
     XHttpSessionDirectory::Claim claim,
-    CancellationSource& cancellation) {
+    common::CancellationSource& cancellation) {
     auto abandon = std::make_unique<AbandonOwnerWait>();
     abandon->coordinator = &coordinator;
     abandon->record = claim.record;
     abandon->waiter = claim.wait_owner;
-    struct CancelWait final : CancellationSubscription {
+    struct CancelWait final : common::CancellationSubscription {
         explicit CancelWait(XHttpSessionDirectory::OwnerWaiter& waiter) noexcept
             : waiter(waiter) {}
         XHttpSessionDirectory::OwnerWaiter& waiter;
         bool cancelled = false;
 
     private:
-        void OnCancellation(Cancellation) noexcept override {
+        void OnCancellation(common::Cancellation) noexcept override {
             cancelled = true;
             waiter.CancelOnOwner();
         }
@@ -1504,7 +1494,7 @@ net::awaitable<XHttpUploadTarget> ResolveXHttpUploadTarget(
     std::string_view session_namespace,
     std::string_view session_id,
     XHttpSessionAccess access,
-    CancellationSource& cancellation) {
+    common::CancellationSource& cancellation) {
     auto& table = net::use_service<XHttpSessionTable>(io_context);
     if (access != XHttpSessionAccess::Open) {
         if (auto session = table.Get(

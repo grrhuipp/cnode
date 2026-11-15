@@ -2,7 +2,6 @@
 
 #include "common/multi_buffer.hpp"
 #include "common/binary_text_codec.hpp"
-#include "common/const_buffer_span.hpp"
 #include "common/ip_address.hpp"
 #include "infra/log.hpp"
 #include "transport/async_write_gate.hpp"
@@ -17,7 +16,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
-#include <new>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -55,24 +53,20 @@ namespace {
     return false;
 }
 
-// Upload bytes written before the first upload request are coalesced into it,
-// so the protocol header shares that request; the limit bounds that deferral.
-constexpr size_t kMaxDeferredUploadBytes = 64 * 1024;
-
 class XHttpSplitOutboundStreamBase : public AsyncStream {
 protected:
-    struct DownlinkCancellation final : transport::CancellationSubscription {
+    struct DownlinkCancellation final : common::CancellationSubscription {
         explicit DownlinkCancellation(XHttpSplitOutboundStreamBase& owner) noexcept
             : owner(owner) {}
         XHttpSplitOutboundStreamBase& owner;
 
     private:
-        void OnCancellation(transport::Cancellation event) noexcept override {
+        void OnCancellation(common::Cancellation event) noexcept override {
             owner.OnDownlinkCancellation(event);
         }
     };
 
-    struct InFlightUploadScope final : transport::CancellationSubscription {
+    struct InFlightUploadScope final : common::CancellationSubscription {
         XHttpSplitOutboundStreamBase& owner;
         TcpStream* tcp;
 
@@ -100,7 +94,7 @@ protected:
         }
 
     private:
-        void OnCancellation(transport::Cancellation event) noexcept override {
+        void OnCancellation(common::Cancellation event) noexcept override {
             if (!tcp) return;
             const bool write_expired = tcp->ConsumeWriteTimeout();
             const bool idle_expired = tcp->ConsumeIdleTimeout();
@@ -221,7 +215,7 @@ protected:
     virtual void CloseUpload(bool /*abortive*/) {}
     virtual void CancelUpload() noexcept {}
 
-    void OnDownlinkCancellation(transport::Cancellation event) noexcept {
+    void OnDownlinkCancellation(common::Cancellation event) noexcept {
         if (event.terminal) {
             if (downlink_ && (downlink_->ConsumeWriteTimeout() ||
                               downlink_->ConsumeIdleTimeout() ||
@@ -359,12 +353,12 @@ protected:
 };
 
 class XHttpSplitClientStream final : public XHttpSplitOutboundStreamBase {
-    struct UploadCancellation final : transport::CancellationSubscription {
+    struct UploadCancellation final : common::CancellationSubscription {
         explicit UploadCancellation(XHttpSplitClientStream& owner) noexcept : owner(owner) {}
         XHttpSplitClientStream& owner;
 
     private:
-        void OnCancellation(transport::Cancellation event) noexcept override {
+        void OnCancellation(common::Cancellation event) noexcept override {
             owner.OnUploadCancellation(event);
         }
     };
@@ -394,42 +388,17 @@ public:
     }
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
-        if (downlink_ && !ReaderMustSendDeferredUpload()) {
+        if (downlink_) {
             return downlink_->AsyncRead(buffer);
         }
-        return AsyncReadSlow(buffer);
-    }
-
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        CheckUploadWritableBeforeAcquire();
-        if (buffer.size() == 0) {
-            co_return 0;
-        }
-        auto lease = co_await AcquireUploadWriteLease();
-        if (!upload_ &&
-            buffer.size() <= kMaxDeferredUploadBytes - pending_initial_.byte_size()) {
-            const auto* data = static_cast<const uint8_t*>(buffer.data());
-            if (!pending_initial_.AppendSpan(
-                    std::span<const uint8_t>(data, buffer.size()))) {
-                throw std::bad_alloc();
-            }
-            co_return buffer.size();
-        }
-        if (upload_) {
-            const size_t n = co_await upload_->AsyncWrite(buffer);
-            TouchDownlinkActivity();
-            co_return n;
-        }
-        co_await OpenUploadLocked({&buffer, 1});
-        TouchDownlinkActivity();
-        co_return buffer.size();
+        return []() -> net::awaitable<size_t> { co_return 0; }();
     }
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
-        if (downlink_ && !ReaderMustSendDeferredUpload()) {
+        if (downlink_) {
             return downlink_->ReadMultiBuffer();
         }
-        return ReadMultiBufferSlow();
+        return []() -> net::awaitable<common::MultiBuffer> { co_return common::MultiBuffer{}; }();
     }
 
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
@@ -475,7 +444,6 @@ public:
         }
         write_closed_ = true;
         upload_cancel_.Unsubscribe();
-        pending_initial_.clear();
         if (upload_) {
             upload_->ShutdownWrite();
         }
@@ -489,12 +457,6 @@ public:
         if (!lease) lease = co_await upload_gate_.Acquire();
         if (!lease || closed_ || write_closed_) {
             co_return;
-        }
-        if (!upload_ && pending_initial_.byte_size() != 0) {
-            if (upload_failed_) {
-                throw IoSystemError(io_error::broken_pipe, "xhttp stream-up upload unavailable");
-            }
-            co_await OpenUploadLocked({});
         }
         write_closed_ = true;
         if (upload_) {
@@ -541,7 +503,6 @@ public:
 protected:
     void CloseUpload(bool abortive) override {
         upload_cancel_.Unsubscribe();
-        pending_initial_.clear();
         if (!upload_) {
             return;
         }
@@ -559,26 +520,6 @@ protected:
     }
 
 private:
-    net::awaitable<size_t> AsyncReadSlow(net::mutable_buffer buffer) {
-        if (!downlink_) {
-            co_return 0;
-        }
-        if (ReaderMustSendDeferredUpload()) {
-            co_await FlushDeferredUploadForRead();
-        }
-        co_return co_await downlink_->AsyncRead(buffer);
-    }
-
-    net::awaitable<common::MultiBuffer> ReadMultiBufferSlow() {
-        if (!downlink_) {
-            co_return common::MultiBuffer{};
-        }
-        if (ReaderMustSendDeferredUpload()) {
-            co_await FlushDeferredUploadForRead();
-        }
-        co_return co_await downlink_->ReadMultiBuffer();
-    }
-
     void CheckUploadWritableBeforeAcquire() const {
         // upload_failed_ is provisionally set while an open is in flight;
         // only a finished failed open poisons the stream.
@@ -596,7 +537,7 @@ private:
         co_return lease;
     }
 
-    void OnUploadCancellation(transport::Cancellation event) noexcept {
+    void OnUploadCancellation(common::Cancellation event) noexcept {
         if (!upload_) {
             return;
         }
@@ -623,40 +564,10 @@ private:
         }
     }
 
-    // A reader may wait for the reply to deferred bytes (e.g. a protocol
-    // header); it sends them unless a writer is already opening the upload.
-    [[nodiscard]] bool ReaderMustSendDeferredUpload() const noexcept {
-        return !upload_ && !upload_opening_ && !write_closed_ &&
-               pending_initial_.byte_size() != 0;
-    }
-
-    net::awaitable<void> FlushDeferredUploadForRead() {
-        auto lease = upload_gate_.TryAcquire();
-        if (!lease) lease = co_await upload_gate_.Acquire();
-        if (!lease || closed_ || upload_failed_) {
-            throw IoSystemError(io_error::broken_pipe, "xhttp stream-up upload unavailable");
-        }
-        if (!upload_ && !write_closed_ && pending_initial_.byte_size() != 0) {
-            co_await OpenUploadLocked({});
-        }
-    }
-
-    // Single-flight under upload_gate_: the first caller opens the upload
-    // request carrying the deferred bytes followed by |payload|. A failed open
-    // poisons the stream, since the deferred bytes are gone with it.
+    // Single-flight under upload_gate_: the first writer opens the upload
+    // request carrying |payload|, which holds at least one byte. A failed open
+    // poisons the stream.
     net::awaitable<void> OpenUploadLocked(std::span<const net::const_buffer> payload) {
-        const common::MultiBuffer initial = std::move(pending_initial_);
-        common::ConstBufferSpanBuilder<4> combined;
-        std::span<const net::const_buffer> request_payload = payload;
-        if (const auto prefix = initial.FrontSpan(); !prefix.empty()) {
-            combined.Append(net::buffer(prefix.data(), prefix.size()));
-            combined.AppendBuffers(payload);
-            request_payload = combined.Span();
-        } else if (!HasNonEmptyBuffer(payload)) {
-            co_return;
-        }
-        if (request_payload.empty()) co_return;
-
         upload_failed_ = true;
         upload_opening_ = true;
         struct OpeningScope {
@@ -665,7 +576,7 @@ private:
         } opening_scope{upload_opening_};
 
         upload_ = co_await DialAndBuildUploadRequest(
-            upload_path_, XHttpClientRequestKind::StreamUp, request_payload);
+            upload_path_, XHttpClientRequestKind::StreamUp, payload);
         upload_->ClearPhaseDeadline();
         upload_->SetIdleTimeout(std::chrono::seconds(0));
         upload_->SetWriteTimeout(write_timeout_);
@@ -674,7 +585,6 @@ private:
     }
 
     std::unique_ptr<AsyncStream> upload_;
-    common::MultiBuffer pending_initial_;
     UploadCancellation upload_cancel_{*this};
     bool upload_opening_ = false;
     bool upload_failed_ = false;
@@ -706,16 +616,6 @@ public:
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer) override {
         return downlink_->AsyncRead(buffer);
-    }
-
-    net::awaitable<size_t> AsyncWrite(net::const_buffer buffer) override {
-        CheckWritable();
-        if (buffer.size() == 0) {
-            co_return 0;
-        }
-        std::array<net::const_buffer, 1> buffers{buffer};
-        co_await SendPacket(buffers);
-        co_return buffer.size();
     }
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {

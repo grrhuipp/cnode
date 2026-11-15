@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace ss_identity_test {
@@ -19,6 +21,25 @@ inline constexpr std::string_view kTag = "ss-identity-fixture";
 inline void Require(bool condition) {
     if (!condition) throw std::runtime_error("SS identity fixture contract failed");
 }
+
+// Stands in for the ingress association directory: one production replay
+// authority per authenticated credential and SS2022 session ID.
+class UdpAssociations {
+public:
+    [[nodiscard]] bool Commit(const proxy::SsUdpDecodeResult& decoded) {
+        proxy::InboundDatagramAssociationKey key{};
+        Require(decoded.session_id && decoded.packet_id &&
+                key.owner.Assign(decoded.session_owner.span()));
+        key.session_id = *decoded.session_id;
+        return rows_.try_emplace(key).first->second.Check(
+            *decoded.packet_id, 0, {}, proxy::InboundDatagramCheck::Commit);
+    }
+    [[nodiscard]] size_t Size() const noexcept { return rows_.size(); }
+
+private:
+    std::unordered_map<proxy::InboundDatagramAssociationKey, proxy::Ss2022UdpAssociation,
+                       proxy::InboundDatagramAssociationKeyHash> rows_;
+};
 
 // Only the transport is in memory: both ends use the production SS2022 codec.
 class Wire final : public transport::AsyncStream {
@@ -31,10 +52,12 @@ public:
         offset += count;
         co_return count;
     }
-    net::awaitable<size_t> AsyncWrite(net::const_buffer in) override {
-        const auto* first = static_cast<const uint8_t*>(in.data());
-        bytes.insert(bytes.end(), first, first + in.size());
-        co_return in.size();
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> in) override {
+        for (const auto& buffer : in) {
+            const auto* first = static_cast<const uint8_t*>(buffer.data());
+            bytes.insert(bytes.end(), first, first + buffer.size());
+        }
+        co_return;
     }
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         co_return common::MultiBuffer{};

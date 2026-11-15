@@ -197,7 +197,7 @@ public:
                         size_t fragment = SIZE_MAX)
         : wire_(wire), fragment_(fragment) {}
 
-    transport::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+    common::CancellationSource& Cancellation() noexcept override { return cancellation_; }
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         if (cut_ < cuts.size() && offset_ == cuts[cut_]) {
@@ -238,7 +238,7 @@ public:
     bool fail_payload_allocation = false;
 
 private:
-    transport::CancellationSource cancellation_;
+    common::CancellationSource cancellation_;
     const std::vector<uint8_t>& wire_;
     size_t fragment_;
     size_t offset_ = 0;

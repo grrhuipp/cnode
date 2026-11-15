@@ -32,11 +32,6 @@ udp::endpoint PackedUdpEndpoint::Endpoint() const noexcept {
     return udp::endpoint(net::ip::address_v4(bytes), port);
 }
 
-size_t UdpSessionRelay::RouteKeyHash::operator()(
-    const std::pair<uint32_t, uint64_t>& key) const noexcept {
-    return static_cast<size_t>(common::Mix64(key.second ^ (uint64_t{key.first} << 56)));
-}
-
 UdpSessionRelay::UdpSessionRelay(net::io_context& io_context,
                                  std::shared_ptr<Mesh> mesh, size_t index)
     : endpoint_(*this, io_context, std::move(mesh), index) {}

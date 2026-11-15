@@ -15,7 +15,6 @@ constexpr uint32_t kMaxConnectionsPerIP = 0;       // 单 IP 最大连接数（0
 // 超时配置（秒）—— 对齐 Xray policy.SessionDefault()
 constexpr uint32_t kHandshakeTimeout = 60;    // 握手阶段超时（对齐 Nginx client_header_timeout，防时序指纹）
 constexpr uint32_t kDialTimeout = 10;         // 拨号超时
-constexpr uint32_t kReadTimeout = 15;         // 连接读方向 deadline
 constexpr uint32_t kWriteTimeout = 30;        // 连接写方向 deadline
 constexpr uint32_t kIdleTimeout = 300;        // 连接空闲超时（connIdle）
 constexpr uint32_t kUplinkOnlyTimeout = 5;    // 半关闭后另一方向最多保留 5 秒

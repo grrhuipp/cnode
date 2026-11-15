@@ -3,7 +3,7 @@
 #include "app/relay.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "proxy/inbound.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "transport/async_stream.hpp"
 #include "app/stats.hpp"
 #include "routing/dispatcher.hpp"
@@ -65,7 +65,7 @@ ReadVMessHandshakeHeader(transport::AsyncStream& stream,
 }
 
 struct PreparedVmessInboundSession {
-    common::UserOnlineSessionGuard user_session;
+    app::UserOnlineSessionGuard user_session;
     ::proxy::RequestBodyReader request_reader;
     ::proxy::ResponseBodyWriter response_writer;
 };

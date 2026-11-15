@@ -122,12 +122,6 @@ void CancelRelayRateWaits(RelayRateLimits& limits) noexcept {
     return (upload ? limits.up_wait : limits.down_wait).WaitFor(delay);
 }
 
-void FlushRelayStats(StatsShard& stats, LocalStatsAccumulator& acc) {
-    if (acc.bytes_in == 0 && acc.bytes_out == 0) return;
-    stats.CommitAccumulator(acc);
-    acc.Reset();
-}
-
 enum class RelayPhase { Transferring, HalfClosed, Completing, Stopping };
 
 struct RelayDirectionState {
@@ -175,11 +169,11 @@ struct RelayState {
 };
 
 struct CancellationContext {
-    struct Subscription final : transport::CancellationSubscription {
+    struct Subscription final : common::CancellationSubscription {
         explicit Subscription(CancellationContext& owner) noexcept : owner(owner) {}
         CancellationContext& owner;
     private:
-        void OnCancellation(transport::Cancellation cancellation) noexcept override {
+        void OnCancellation(common::Cancellation cancellation) noexcept override {
             owner.Stop(cancellation.reason);
         }
     };
@@ -310,7 +304,11 @@ net::awaitable<RelayResult> DoRelayLinkImpl(
         auto& current = upload ? state.up : state.down;
         const auto& peer = upload ? state.down : state.up;
         auto& bytes = upload ? ctx.traffic.bytes_up : ctx.traffic.bytes_down;
-        LocalStatsAccumulator acc;
+        uint64_t unreported = 0;
+        const auto flush_stats = [&]() noexcept {
+            (upload ? stats.bytes_out : stats.bytes_in) += unreported;
+            unreported = 0;
+        };
         bool operation_side_is_client = upload;
         bool writing = false;
         try {
@@ -377,10 +375,8 @@ net::awaitable<RelayResult> DoRelayLinkImpl(
                 if (upload) co_await target.write(target.target, std::move(payload));
                 else co_await client_writer.WriteMultiBuffer(std::move(payload));
                 bytes += count;
-                if (upload) acc.AddBytesOut(count);
-                else acc.AddBytesIn(count);
-                if (acc.bytes_in + acc.bytes_out >= kRelayStatsFlushBytes)
-                    FlushRelayStats(stats, acc);
+                unreported += count;
+                if (unreported >= kRelayStatsFlushBytes) flush_stats();
             }
         } catch (const transport::WriteClosed&) {
             current.eof = true;
@@ -400,7 +396,7 @@ net::awaitable<RelayResult> DoRelayLinkImpl(
                 cancellation.Stop(error);
             }
         }
-        FlushRelayStats(stats, acc);
+        flush_stats();
     };
     auto watch_stop = [&]() -> net::awaitable<void> {
         if (!state.Ending())

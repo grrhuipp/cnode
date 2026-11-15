@@ -159,7 +159,6 @@ public:
     [[nodiscard]] std::optional<size_t> IndexOf(const net::io_context& worker) const noexcept {
         return mesh_->IndexOf(worker);
     }
-    [[nodiscard]] bool Stopping() const noexcept { return stopping_; }
 
     // Sends `message` to Worker `to`; a full ring keeps it, in order, until
     // the consumer makes room. Toward a stopped Worker it is released.

@@ -38,15 +38,6 @@
 
 namespace transport {
 
-void RealityClientHelloReader::Append(std::span<const uint8_t> bytes) {
-    if (bytes.empty() || bytes.size() > ReadSize()) {
-        status_ = Status::Invalid;
-        return;
-    }
-    wire_.insert(wire_.end(), bytes.begin(), bytes.end());
-    AppendPayload(bytes);
-}
-
 size_t RealityClientHelloReader::ConsumeHandshake(std::span<const uint8_t> available) {
     size_t consumed = 0;
     while (!available.empty() && status_ == Status::Reading) {

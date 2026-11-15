@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common/asio_types.hpp"
-#include "transport/link.hpp"
+#include "common/cancellation.hpp"
 
 #include <asio/async_result.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -30,7 +30,7 @@ namespace common {
 class AwaitableTaskGroup {
 public:
     virtual void Spawn(net::awaitable<void> task,
-                       transport::CancellationSource* source = nullptr) = 0;
+                       CancellationSource* source = nullptr) = 0;
     virtual void Cancel() = 0;
 
 protected:
@@ -39,15 +39,11 @@ protected:
 
 
 
-struct Child final : transport::CancellationSubscription {
+struct Child final : CancellationSubscription {
     net::cancellation_signal cancellation;
     bool source_cancelled = false;
     Child* next = nullptr;
     Child** previous = nullptr;
-
-    void Bind(transport::CancellationSource& source) noexcept {
-        Resubscribe(source);
-    }
 
     std::exception_ptr Complete(std::exception_ptr error) noexcept {
         Unsubscribe();
@@ -68,7 +64,7 @@ struct Child final : transport::CancellationSubscription {
     ~Child() { Unlink(); }
 
 private:
-    void OnCancellation(transport::Cancellation) noexcept override {
+    void OnCancellation(Cancellation) noexcept override {
         source_cancelled = true;
         cancellation.emit(net::cancellation_type::all);
     }
@@ -82,12 +78,12 @@ public:
         : executor_(std::move(executor)), completion_(std::move(handler)) {}
 
     void Spawn(net::awaitable<void> task,
-               transport::CancellationSource* source = nullptr) override {
+               CancellationSource* source = nullptr) override {
         if (stopping_) throw IoSystemError(net::error::operation_aborted);
         // Acquired and released on the group's executor, never on its caller's.
         auto child = std::make_shared<Child>();
         if (source) {
-            child->Bind(*source);
+            child->Resubscribe(*source);
             // Stop is delivered synchronously on subscription. Do not start
             // work whose source was already stopped before co_spawn had a slot.
             if (child->source_cancelled) return;
@@ -222,7 +218,7 @@ net::awaitable<void> RunAwaitableTaskGroup(net::any_io_executor executor, Start 
 // Owner for tasks that outlive the coroutine starting them, such as pooled
 // physical sessions held for a Worker's lifetime. The common no-child case
 // stores only the executor; join state and the self-retaining group are created
-// by the first Spawn. Spawn through Tasks() is valid on the executor until
+// by the first Spawn. Spawn is valid on the executor until
 // AsyncJoin, which cancels every child and resumes after each actual completion.
 // As in any group, an uncaught child failure stops all siblings: resident
 // children must contain their own failures.
@@ -254,10 +250,8 @@ public:
     ResidentTaskGroup& operator=(const ResidentTaskGroup&) = delete;
     ~ResidentTaskGroup() { Close(); }
 
-    [[nodiscard]] AwaitableTaskGroup& Tasks() noexcept { return *this; }
-
     void Spawn(net::awaitable<void> task,
-               transport::CancellationSource* source = nullptr) override {
+               CancellationSource* source = nullptr) override {
         if (stopping_) throw IoSystemError(net::error::operation_aborted);
         EnsureStarted();
         group_->Spawn(std::move(task), source);

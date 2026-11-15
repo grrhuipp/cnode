@@ -30,12 +30,6 @@ class value;
 }  // namespace infra
 
 namespace infra {
-[[nodiscard]] transport::WsConfig ParseWsConfig(const object& source);
-[[nodiscard]] transport::HttpUpgradeConfig ParseHttpUpgradeConfig(const object& source);
-[[nodiscard]] transport::HttpConfig ParseHttpConfig(const object& source);
-[[nodiscard]] transport::GrpcConfig ParseGrpcConfig(const object& source);
-[[nodiscard]] transport::XHttpConfig ParseXHttpConfig(const object& source);
-[[nodiscard]] transport::RealityConfig ParseRealityConfig(const object& source);
 [[nodiscard]] transport::StreamSettings ParseStreamSettings(const object& source, transport::StreamEndpointRole role);
 [[nodiscard]] OutboundSettings ParseOutboundSettings(
     std::string_view protocol, const object& settings);
@@ -177,17 +171,11 @@ struct StaticInboundSemanticValidation {
 // binding semantics; an ordered array chooses only assigned local addresses.
 [[nodiscard]] transport::OutboundBind ParseOutboundBindConfig(
     const infra::value& value, const infra::value* strategy = nullptr);
-[[nodiscard]] std::optional<transport::OutboundBind> ParseOptionalOutboundBind(
-    const object& source, std::string_view context);
 
 
 // ---------------------------------------------------------------------------
 // REALITY (Xray-core infra/conf/transport_internet.go REALITYConfig semantics)
 // ---------------------------------------------------------------------------
-
-// A REALITY server name names a TLS ClientHello SNI: a DNS hostname, never an
-// IP literal and never with a trailing dot.
-[[nodiscard]] bool IsValidRealityServerName(std::string_view name) noexcept;
 
 // Server-side REALITY fields after wire mapping. `std::nullopt` means the
 // field was not declared; a declared empty value is invalid where Xray-core
@@ -237,14 +225,6 @@ struct RealityServerInput {
     std::string_view value, std::string_view field);
 
 // ---------------------------------------------------------------------------
-// Sniffing
-// ---------------------------------------------------------------------------
-
-// Xray destOverride names to the SniffConfig bitset; fakedns is rejected.
-[[nodiscard]] tl::expected<uint8_t, std::string> ParseSniffDestOverride(
-    std::span<const std::string> protocols);
-
-// ---------------------------------------------------------------------------
 // AnyTLS padding scheme
 // ---------------------------------------------------------------------------
 
@@ -255,19 +235,8 @@ struct RealityServerInput {
     const infra::value& value, std::string_view field);
 
 // ---------------------------------------------------------------------------
-// Proxy Protocol & HTTP/2 initial window
+// HTTP/2 initial window
 // ---------------------------------------------------------------------------
-
-[[nodiscard]] transport::InboundListen ParseInboundListen(
-    const object& object,
-    std::string_view key,
-    std::string_view field_label,
-    transport::InboundListen fallback = transport::InboundListen{});
-
-// Header presence policy is independent of v1/v2 format detection.
-[[nodiscard]] transport::ProxyProtocolMode ParseProxyProtocolMode(
-    const object& object, std::string_view key,
-    transport::ProxyProtocolMode fallback = transport::ProxyProtocolMode::Auto);
 
 inline constexpr uint32_t kHttp2MaxInitialWindow = 0x7fffffffU;
 [[nodiscard]] tl::expected<std::optional<uint32_t>, std::string>

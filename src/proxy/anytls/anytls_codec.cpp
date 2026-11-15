@@ -201,34 +201,10 @@ WriteEncodedFrameBatch(transport::AsyncStream& stream,
     if (framed.empty()) {
         co_return tl::expected<void, common::ErrorCode>{};
     }
-    if (records.empty()) {
-        try {
-            co_await stream.WriteBuffers(framed);
-        } catch (const IoSystemError& e) {
-            co_return tl::unexpected(common::MapAsioError(e.code()));
-        }
-        co_return tl::expected<void, common::ErrorCode>{};
-    }
     co_return co_await WriteSlicesWithPadding(stream, records, framed);
 }
 
 }  // namespace
-
-net::awaitable<tl::expected<void, common::ErrorCode>>
-WriteMultiBufferAsFrameBatch(transport::AsyncStream& stream,
-                             uint8_t cmd,
-                             uint32_t sid,
-                             common::MultiBuffer mb) {
-    return WriteEncodedFrameBatch(stream, {}, cmd, sid, std::move(mb));
-}
-
-net::awaitable<tl::expected<void, common::ErrorCode>>
-WriteBuffersAsFrameBatch(transport::AsyncStream& stream,
-                         uint8_t cmd,
-                         uint32_t sid,
-                         std::span<const net::const_buffer> buffers) {
-    return WriteEncodedFrameBatch(stream, {}, cmd, sid, buffers);
-}
 
 tl::expected<PeerSettings, common::ErrorCode> ParsePeerSettings(std::string_view text) {
     PeerSettings result;

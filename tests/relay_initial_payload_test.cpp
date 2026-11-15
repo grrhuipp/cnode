@@ -72,7 +72,7 @@ struct Endpoint : transport::TimeoutEvent {
     int active_reads = 0;
     std::optional<net::steady_timer> pending_write;
     int active_writes = 0;
-    transport::CancellationSource cancellation;
+    common::CancellationSource cancellation;
     std::chrono::steady_clock::time_point first_write{};
     std::chrono::steady_clock::time_point last_write{};
 
@@ -138,11 +138,10 @@ struct Endpoint : transport::TimeoutEvent {
         }
         if (pending_write) pending_write->cancel();
     }
-    transport::CancellationSource& Cancellation() noexcept { return cancellation; }
+    common::CancellationSource& Cancellation() noexcept { return cancellation; }
     void Close() noexcept {}
     void SetAbortiveClose(bool) noexcept {}
     void SetIdleTimeout(std::chrono::seconds) noexcept {}
-    void SetReadTimeout(std::chrono::seconds) noexcept {}
     void SetWriteTimeout(std::chrono::seconds) noexcept {}
     transport::PhaseDeadlineToken StartPhaseDeadline(std::chrono::seconds timeout) {
         if (!io) return {};
@@ -167,7 +166,6 @@ struct Endpoint : transport::TimeoutEvent {
         phase_expired = false;
     }
     bool ConsumeIdleTimeout() noexcept { return false; }
-    bool ConsumeReadTimeout() noexcept { return false; }
     bool ConsumeWriteTimeout() noexcept { return std::exchange(write_timed_out, false); }
     bool ConsumePhaseDeadline() noexcept {
         phase_flags = 0;
@@ -191,15 +189,12 @@ public:
     }
     net::awaitable<void> AsyncShutdownWrite() override { return endpoint_.AsyncShutdownWrite(); }
     bool WriteShutdownClosesLink() const noexcept override { return endpoint_.WriteShutdownClosesLink(); }
-    transport::CancellationSource& Cancellation() noexcept override { return endpoint_.Cancellation(); }
+    common::CancellationSource& Cancellation() noexcept override { return endpoint_.Cancellation(); }
     void Cancel() noexcept override { endpoint_.Cancel(); }
     void Close() override { endpoint_.Close(); }
     bool ConsumeWriteTimeout() noexcept override { return endpoint_.ConsumeWriteTimeout(); }
     net::awaitable<std::size_t> AsyncRead(net::mutable_buffer) override {
         throw std::logic_error("relay reads MultiBuffer only");
-    }
-    net::awaitable<std::size_t> AsyncWrite(net::const_buffer) override {
-        throw std::logic_error("relay writes MultiBuffer only");
     }
     void ShutdownWrite() override {}
     int NativeHandle() const override { return -1; }
@@ -303,11 +298,10 @@ net::awaitable<bool> TestTcpCancellation(net::io_context& io, bool controlled, i
     ClientStream link(io, client);
     client.input = Payload(4000);
     std::array<uint8_t, 4000> response{};
-    if (mode != 4) net::write(peer, net::buffer(response));
+    net::write(peer, net::buffer(response));
     if (mode == 0) target.SetIdleTimeout(1s);
     if (mode == 1) (void)target.StartPhaseDeadline(1s);
     if (mode == 3) (void)target.StartPhaseDeadline(std::chrono::seconds::max());
-    if (mode == 4) target.SetReadTimeout(1s);
     TestEvent external([&] { target.Cancel(); });
     if (mode == 2 || mode == 3)
         (void)transport::TimeoutScheduler::ForIoContext(io).ScheduleAfter(50ms, external);
@@ -740,7 +734,7 @@ TEST_F(RelayInitialPayload, Lifecycle) {
         for (int mode = 0; mode < 5; ++mode) {
             passed = RunScenario([&](net::io_context& io) { return TestPendingRead(io, controlled, mode); }) && passed;
         }
-        for (int mode = 0; mode < 5; ++mode) {
+        for (int mode = 0; mode < 4; ++mode) {
             passed = RunScenario([&](net::io_context& io) { return TestTcpCancellation(io, controlled, mode); }) && passed;
         }
         for (int failure = 0; failure != 4; ++failure) {

@@ -2,6 +2,7 @@
 
 #include "common/asio_types.hpp"
 #include "common/multi_buffer.hpp"
+#include "common/hash.hpp"
 #include "common/worker_mesh.hpp"
 
 #include <array>
@@ -45,6 +46,13 @@ inline void ReleaseWorkerMessage(UdpRelayMessage& message) noexcept {
     common::Buffer::Free(std::exchange(message.payload, nullptr));
 }
 
+// (session Worker, token): the key both ends of a relayed session index by.
+struct UdpRouteKeyHash {
+    [[nodiscard]] size_t operator()(const std::pair<uint32_t, uint64_t>& key) const noexcept {
+        return static_cast<size_t>(common::Mix64(key.second ^ (uint64_t{key.first} << 56)));
+    }
+};
+
 // One Worker's end of the native UDP session relay. A datagram of a session
 // that another Worker runs (an SS2022 client after NAT rebinding) is decoded
 // where it arrives and handed to that Worker through the SPSC rings; replies
@@ -82,12 +90,8 @@ public:
     void Receive(size_t from, UdpRelayMessage& message) noexcept;
 
 private:
-    struct RouteKeyHash {
-        [[nodiscard]] size_t operator()(const std::pair<uint32_t, uint64_t>& key) const noexcept;
-    };
-
     std::unordered_map<uint64_t, UdpIngress*> owned_;
-    std::unordered_map<std::pair<uint32_t, uint64_t>, UdpIngress*, RouteKeyHash> routes_;
+    std::unordered_map<std::pair<uint32_t, uint64_t>, UdpIngress*, UdpRouteKeyHash> routes_;
     uint64_t next_token_ = 0;
     // Last: destroyed first, before the maps its receiver touches.
     common::WorkerMeshEndpoint<UdpSessionRelay, UdpRelayMessage, 256> endpoint_;

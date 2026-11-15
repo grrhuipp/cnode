@@ -29,11 +29,10 @@ struct RequiredUdpDatagram {
 
 // 唯一的数据报写前校验。空数据报返回 nullopt（调用方直接跳过）；端点缺失、
 // 混合或无效，或与 fixed_target（非空时）不是同一端点 → PROTOCOL_INVALID_ADDRESS；
-// 负载超过 max_payload → PROTOCOL_ENCODE_FAILED。
+// 负载超过 kMaxFramedDatagramPayload → PROTOCOL_ENCODE_FAILED。
 [[nodiscard]] inline std::optional<RequiredUdpDatagram> RequireUdpDatagram(
     const common::MultiBuffer& mb,
-    const common::TargetAddress* fixed_target,
-    size_t max_payload = kMaxFramedDatagramPayload) {
+    const common::TargetAddress* fixed_target) {
     const auto datagram = common::InspectUdpDatagram(mb);
     if (datagram.status == common::UdpDatagramStatus::Empty) {
         return std::nullopt;
@@ -42,7 +41,7 @@ struct RequiredUdpDatagram {
         (fixed_target && !datagram.target->SameEndpoint(*fixed_target))) {
         throw transport::LinkError(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
     }
-    if (datagram.payload_size > max_payload) {
+    if (datagram.payload_size > kMaxFramedDatagramPayload) {
         throw transport::LinkError(common::ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
     return RequiredUdpDatagram{.target = datagram.target,

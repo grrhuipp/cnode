@@ -224,7 +224,7 @@ public:
         }
     }
 
-    net::awaitable<size_t> AsyncWrite(net::const_buffer) override {
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer>) override {
         throw IoSystemError(io_error::operation_not_supported, "xhttp upload stream is read-only");
     }
     void ShutdownWrite() override {}
@@ -415,20 +415,20 @@ namespace {
 
 // Waits until the slot changes or the upload's connection is cancelled.
 // Returns true when cancelled, by the connection or by this coroutine.
-struct SlotWait final : CancellationSubscription {
+struct SlotWait final : common::CancellationSubscription {
     explicit SlotWait(common::SignalChannel& wake) noexcept : wake(wake) {}
     common::SignalChannel& wake;
     bool cancelled = false;
 
 private:
-    void OnCancellation(Cancellation) noexcept override {
+    void OnCancellation(common::Cancellation) noexcept override {
         cancelled = true;
         (void)wake.try_send(IoErrorCode{});
     }
 };
 
 net::awaitable<bool> WaitOnce(common::SignalChannel& wake, SlotWait& watch,
-                              CancellationSource& cancellation) {
+                              common::CancellationSource& cancellation) {
     if (!watch.cancelled) watch.Resubscribe(cancellation);
     if (watch.cancelled) co_return true;
     auto [error] = co_await wake.async_receive(net::as_tuple(net::use_awaitable));
@@ -522,7 +522,7 @@ void XHttpUploadRelay::ReleasePacketBytes(size_t owner, size_t bytes) noexcept {
 }
 
 net::awaitable<bool> XHttpUploadRelay::AwaitPacketBudget(
-    size_t owner, CancellationSource& cancellation) {
+    size_t owner, common::CancellationSource& cancellation) {
     auto& link = state_->links[owner];
     common::SignalChannel wake(state_->io.get_executor(), 1);
     link.budget_waiters.push_back(&wake);
@@ -537,7 +537,7 @@ net::awaitable<bool> XHttpUploadRelay::AwaitPacketBudget(
 
 net::awaitable<XHttpCommit> XHttpUploadRelay::SendPacket(
     size_t owner, uint64_t token, uint64_t seq, common::MultiBuffer payload,
-    size_t reserved, CancellationSource& cancellation) {
+    size_t reserved, common::CancellationSource& cancellation) {
     auto& state = *state_;
     auto& link = state.links[owner];
     const auto index_in_link = state.AllocateSlot(link);

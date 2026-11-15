@@ -15,7 +15,7 @@
 
 
 namespace app {
-class DNS;
+class DNSWorker;
 }  // namespace app
 
 namespace api {
@@ -160,7 +160,7 @@ public:
 [[nodiscard]] std::unique_ptr<API> CreatePanelClient(
     net::io_context& io_context,
     Config config,
-    app::DNS& dns_service);
+    app::DNSWorker& dns_service);
 
 }  // namespace api
 

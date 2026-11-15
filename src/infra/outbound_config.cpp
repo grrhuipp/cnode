@@ -167,7 +167,7 @@ OutboundSettings ParseOutboundSettings(std::string_view protocol, const object& 
             const auto uuid = proxy::ParseUuidBytes(id);
             if (!uuid) throw std::invalid_argument("VLESS id must be a UUID or a 1-30 byte custom id");
             result.id = *uuid;
-            result.flow = proxy::NormalizeFlow(JsonStringOr(*user, "flow", ""));
+            result.flow = common::LowerAscii(JsonStringOr(*user, "flow", ""));
             if (!result.flow.empty() && result.flow != "xtls-rprx-vision" &&
                 result.flow != "xtls-rprx-vision-udp443") {
                 throw std::invalid_argument("unsupported VLESS flow");

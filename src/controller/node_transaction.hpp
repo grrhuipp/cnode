@@ -4,7 +4,7 @@
 #include "app/prepared_inbound.hpp"
 #include "app/outbound_handler.hpp"
 #include "app/stats.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "common/constants.hpp"
 #include "infra/config_types.hpp"
 #include "infra/config.hpp"
@@ -179,8 +179,8 @@ struct OnlineSnapshot {
 };
 
 [[nodiscard]] inline OnlineSnapshot
-BuildOnlineSnapshot(std::vector<common::OnlineDevice> devices) {
-    std::erase_if(devices, [](const common::OnlineDevice& d) {
+BuildOnlineSnapshot(std::vector<app::OnlineDevice> devices) {
+    std::erase_if(devices, [](const app::OnlineDevice& d) {
         return d.user_id <= 0 || d.ip.empty();
     });
     std::sort(devices.begin(), devices.end());

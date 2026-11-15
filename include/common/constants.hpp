@@ -1,8 +1,5 @@
 #pragma once
 
-#include "common/ascii.hpp"
-
-#include <algorithm>
 #include <cstdint>
 #include <format>
 #include <string>
@@ -82,17 +79,6 @@ inline constexpr std::string_view kPanelNodeTagPrefix = "panel/";
 [[nodiscard]] inline std::string BuildPanelNodeAccountingKey(std::string_view panel_name,
                                                              int node_id) {
     return std::format("{}{}/{}/", kPanelNodeTagPrefix, panel_name, node_id);
-}
-
-[[nodiscard]] inline std::string NormalizeV2BoardApiNodeType(std::string_view node_type) {
-    const auto lowered = LowerAscii(std::string(node_type));
-    if (lowered.empty() || lowered == "vmess") {
-        return "v2ray";
-    }
-    if (lowered == "vless") {
-        return "vless";
-    }
-    return lowered;
 }
 
 }  // namespace common

@@ -1,10 +1,11 @@
+#include "common/ascii.hpp"
 #include "proxy/handshake_errors.hpp"
 #include "proxy/mux/mux_server.hpp"
 #include "app/relay.hpp"
 #include "common/scoped_cleanse.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "proxy/inbound.hpp"
-#include "common/user_online_tracker.hpp"
+#include "app/user_online_tracker.hpp"
 #include "proxy/vless/vless_codec.hpp"
 #include "proxy/vless/vless_encryption.hpp"
 #include "app/inbound_handler.hpp"
@@ -167,7 +168,7 @@ ReadVlessRequestHeader(proxy::BufferedStreamReader& active_reader,
 }
 
 struct VlessHandshakeOutcome {
-    common::UserOnlineSessionGuard user_session;
+    app::UserOnlineSessionGuard user_session;
     bool packet_addr_udp = false;
     bool use_vision = false;
     std::array<uint8_t, 16> request_uuid{};
@@ -206,7 +207,7 @@ CompleteVlessInboundHandshake(
                     tag,
                     ctx.worker_id);
             if (!runtime) {
-                if (proxy::ConsumeStreamReadTimeout(stream)) {
+                if (proxy::ConsumeStreamDeadline(stream)) {
                     LOG_CONN_WARN(ctx, "encryption handshake timed out from {}:{}",
                                   client_ip, ctx.inbound.source_port);
                     co_return tl::unexpected(common::ErrorCode::TIMEOUT);
@@ -233,7 +234,7 @@ CompleteVlessInboundHandshake(
             active_writer = &(*encrypted_io)->writer;
         } catch (...) {
             auto classified = proxy::ClassifyInboundHandshakeException(std::current_exception());
-            if (proxy::ConsumeStreamReadTimeout(stream)) {
+            if (proxy::ConsumeStreamDeadline(stream)) {
                 classified = common::ErrorCode::TIMEOUT;
             }
             if (classified == common::ErrorCode::CANCELLED) {
@@ -591,7 +592,7 @@ proxy::VlessInboundHandler::ProcessPlain(
     const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
     proxy::BufferedStreamReader protocol_reader(*stream);
-    common::UserOnlineSessionGuard user_session;
+    app::UserOnlineSessionGuard user_session;
     VlessSessionMeta meta;
     std::array<uint8_t, 16> request_uuid{};
     common::ScopedCleanse cleanse_uuid{request_uuid};
@@ -649,7 +650,7 @@ proxy::VlessInboundHandler::ProcessEncrypted(
     transport::MultiBufferWriter* active_writer = &protocol_writer;
     std::optional<::proxy::VlessEncryptedIo> encrypted_io;
 
-    common::UserOnlineSessionGuard user_session;
+    app::UserOnlineSessionGuard user_session;
     VlessSessionMeta meta;
     std::array<uint8_t, 16> request_uuid{};
     common::ScopedCleanse cleanse_uuid{request_uuid};
@@ -709,7 +710,7 @@ BuildPreparedVlessUser(const ::infra::InboundUserSpec& spec) {
     }
     ::app::PreparedVlessUser info;
     info.uuid_bytes = *uuid_bytes;
-    info.flow = ::proxy::NormalizeFlow(spec.flow);
+    info.flow = common::LowerAscii(spec.flow);
     info.profile = ::proxy::MakeUserProfile(spec);
     return info;
 }
