@@ -406,7 +406,13 @@ TEST(QuicUdp, ConcurrentMultiSessionMigrationAndEphemeralAnyTlsStreams) {
                 }
                 if (count < 17) continue;
                 ++dns_queries;
-                std::string reply(reinterpret_cast<const char*>(bytes.data()), static_cast<size_t>(count));
+                // Answer from the question alone: queries end with an EDNS OPT record.
+                size_t question_end = 12;
+                while (question_end < static_cast<size_t>(count) && bytes[question_end] != 0)
+                    question_end += size_t{bytes[question_end]} + 1;
+                question_end += 5;
+                if (question_end > static_cast<size_t>(count)) continue;
+                std::string reply(reinterpret_cast<const char*>(bytes.data()), question_end);
                 const bool is_a = static_cast<uint8_t>(reply[reply.size() - 4]) == 0 &&
                     static_cast<uint8_t>(reply[reply.size() - 3]) == 1;
                 reply[2] = static_cast<char>(0x81);

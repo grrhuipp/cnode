@@ -165,7 +165,8 @@ TEST_P(DnsAnswerTtl, RequeriesZeroTtlBeforeDialingTheNextDestination) {
             std::string(Banner) + std::string(1, expected_address));
     }
     peer.Join();
-    EXPECT_EQ(resolver.Names().size(), reusable ? 4u : 8u);
+    // One A and one AAAA query per resolution.
+    EXPECT_EQ(resolver.Names().size(), reusable ? 2u : 4u);
     EXPECT_TRUE(child->Running());
     EXPECT_EQ(child->Stop(), 0);
     resolver.Join();
