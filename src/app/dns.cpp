@@ -286,7 +286,12 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
                 }
                 continue;
             }
-            if (!a_result.Ok() && a_result.error != common::ErrorCode::DNS_NO_RECORD) {
+            if (attempt_result.error == common::ErrorCode::DNS_NO_RECORD &&
+                a_result.error == common::ErrorCode::DNS_NO_RECORD) {
+                // The negative answer may be cached only as long as every
+                // sample allows (RFC 2308 §5).
+                a_result.ttl = std::min(a_result.ttl, attempt_result.ttl);
+            } else if (!a_result.Ok() && a_result.error != common::ErrorCode::DNS_NO_RECORD) {
                 a_result = std::move(attempt_result);
             }
         }

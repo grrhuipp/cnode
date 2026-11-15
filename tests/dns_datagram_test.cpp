@@ -83,7 +83,16 @@ struct Peer {
             return packet;
         }
         packet[3] = refuse ? 0x82 : negative ? 0x83 : 0x80;
-        if ((negative || nodata) && !omit_soa) AppendSoa(packet);
+        if ((negative || nodata) && !omit_soa) {
+            // Varying A samples by arrival order: the first sent gets the
+            // largest TTL, so only a true minimum over all samples matches.
+            uint32_t ttl = soa_ttl;
+            if (vary_a_soa_ttl) {
+                ttl = v6 ? 1000u : static_cast<uint32_t>(200 - ordinal * 30);
+                if (!v6) min_a_soa_ttl = std::min(min_a_soa_ttl, ttl);
+            }
+            AppendSoa(packet, ttl);
+        }
         if (refuse || negative || nodata ||
             (malformed_type != 0 && malformed_type != (v6 ? 28 : 1))) return packet;
         const size_t count = bulk_answers ? bulk_answers : 1;
@@ -114,7 +123,7 @@ struct Peer {
     }
     // Authority-section SOA (RFC 2308 §3). Owner is the parent of QNAME via a
     // compression pointer, or an unrelated zone; MNAME and RNAME are root.
-    void AppendSoa(std::vector<uint8_t>& packet) const {
+    void AppendSoa(std::vector<uint8_t>& packet, uint32_t ttl) const {
         packet[9] = 1;  // NSCOUNT
         if (unrelated_soa) {
             const auto owner = WireNameOf("other.test");
@@ -124,7 +133,7 @@ struct Peer {
         }
         AppendU16(packet, 6);
         AppendU16(packet, 1);
-        AppendU32(packet, soa_ttl);
+        AppendU32(packet, ttl);
         AppendU16(packet, 22);
         packet.insert(packet.end(), {0, 0});
         for (uint32_t field : {1u, 7200u, 900u, 1209600u, soa_minimum}) AppendU32(packet, field);
@@ -261,6 +270,8 @@ struct Peer {
     bool omit_soa = false, unrelated_soa = false, ignore_udp_limit = false;
     bool noise = false, duplicate_id = false, fault_cache_write = false, stall_stream = false;
     uint32_t soa_ttl = 900, soa_minimum = 120;
+    bool vary_a_soa_ttl = false;
+    mutable uint32_t min_a_soa_ttl = UINT32_MAX;
     std::function<std::vector<uint8_t>(const Query&)> answer_override;
     int malformed_type = 0;
     std::optional<uint32_t> answer_ttl;
@@ -504,6 +515,19 @@ TEST_P(DnsDatagramQueries, CnameLoopIsServerFailureAndNotCached) {
         const auto second = co_await dns.Resolve("loop.example");
         EXPECT_FALSE(second.from_cache);
         EXPECT_EQ(peer.packets, 8u);
+    };
+    Run(run());
+}
+
+TEST_P(DnsDatagramQueries, NegativeTtlIsMinimumOverEveryAddressSample) {
+    peer.nodata = true;
+    peer.vary_a_soa_ttl = true;
+    peer.soa_minimum = 3600;
+    auto run = [&]() -> net::awaitable<void> {
+        const auto result = co_await dns.Resolve("samples.example");
+        EXPECT_EQ(result.error, ::common::ErrorCode::DNS_NO_RECORD);
+        EXPECT_EQ(result.ttl, peer.min_a_soa_ttl);
+        EXPECT_LT(peer.min_a_soa_ttl, 170u) << "samples must carry different TTLs";
     };
     Run(run());
 }
