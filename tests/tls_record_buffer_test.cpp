@@ -249,6 +249,31 @@ TEST(TlsRecordBuffer, FragmentedAndCoalescedRecordsPreserveUnreadPlaintextAfterC
     EXPECT_TRUE(::common::test_buffers_live == idle_buffers) << "completed TLS read retained relay payload";
 }
 
+TEST(TlsRecordBuffer, CallerCancellationAbortsReadableWaitWithoutClosingConnection) {
+    Fixture fixture;
+    const auto idle_buffers = ::common::test_buffers_live;
+    net::cancellation_signal cancellation;
+    auto read = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(),
+        net::bind_cancellation_slot(cancellation.slot(), net::use_future));
+    fixture.io.restart();
+    fixture.io.run_for(20ms);
+    EXPECT_TRUE(read.wait_for(0s) != std::future_status::ready) << "idle TLS read completed without input";
+    EXPECT_TRUE(::common::test_buffers_live == idle_buffers) << "readable wait retained a relay buffer";
+    cancellation.emit(net::cancellation_type::terminal);
+    bool cancelled = false;
+    try { (void)fixture.Wait(read); }
+    catch (const ::IoSystemError& error) {
+        if (error.code() != net::error::operation_aborted) throw;
+        cancelled = true;
+    }
+    EXPECT_TRUE(cancelled && fixture.stream->IsOpen()) << "caller cancellation was EOF or closed TLS";
+    const auto record = fixture.peer->Encrypt("after-caller-cancellation");
+    net::write(fixture.peer->socket, net::buffer(record));
+    read = net::co_spawn(fixture.io, fixture.stream->ReadMultiBuffer(), net::use_future);
+    EXPECT_TRUE(Flatten(fixture.Wait(read)) == "after-caller-cancellation") << "cancelled readable wait left the read direction unusable";
+    EXPECT_TRUE(::common::test_buffers_live == idle_buffers) << "completed TLS read retained relay payload";
+}
+
 TEST(TlsRecordBuffer, AllocationFailurePreservesRetainedPlaintextForRetry) {
     Fixture fixture;
 

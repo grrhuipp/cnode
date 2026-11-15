@@ -312,6 +312,183 @@ TEST_P(DatagramSocketWrite, ZeroLengthNativeSends) {
     EXPECT_EQ(packet.source, sender.LocalEndpoint());
 }
 
+TEST(DatagramSocket, TryReceiveDrainsQueuedDatagramsWithinBudget) {
+    ::net::io_context io;
+    DatagramSocket receiver(io, ::net::ip::address_v4::loopback());
+    ::udp::socket peer(io, {::net::ip::address_v4::loopback(), 0});
+    // One readiness admits 16 datagrams; the 17th needs a new wait.
+    constexpr uint8_t kQueued = 17;
+    for (uint8_t index = 0; index < kQueued; ++index) {
+        const std::array<uint8_t, 1> byte{index};
+        peer.send_to(::net::buffer(byte), receiver.LocalEndpoint());
+    }
+    std::vector<uint8_t> synchronous;
+    std::vector<uint8_t> awaited;
+    bool empty_before_readiness = false;
+    auto drain = [&]() -> ::net::awaitable<void> {
+        const auto cancellation_state = co_await ::net::this_coro::cancellation_state;
+        auto operation = receiver.StartRead();
+        empty_before_readiness = !operation.TryReceive(cancellation_state);
+        while (synchronous.size() + awaited.size() < kQueued) {
+            if (auto packet = operation.TryReceive(cancellation_state)) {
+                synchronous.push_back(packet->payload.FrontSpan()[0]);
+                EXPECT_EQ(packet->source, peer.local_endpoint());
+                continue;
+            }
+            const auto packet = co_await operation.Receive();
+            awaited.push_back(packet.payload.FrontSpan()[0]);
+        }
+        EXPECT_FALSE(operation.TryReceive(cancellation_state));
+    };
+    auto result = ::net::co_spawn(io, drain(), ::net::use_future);
+    io.run_for(2s);
+    if (result.wait_for(0s) != std::future_status::ready) {
+        receiver.Close();
+        io.restart();
+        io.run();
+        FAIL() << "queued datagrams were not drained";
+    }
+    result.get();
+    EXPECT_TRUE(empty_before_readiness);
+    EXPECT_EQ(awaited, (std::vector<uint8_t>{0, 16}));
+    std::vector<uint8_t> expected(15);
+    for (uint8_t index = 0; index < 15; ++index) expected[index] = index + 1;
+    EXPECT_EQ(synchronous, expected);
+}
+
+TEST(DatagramSocket, TryReceiveReportsCancellationBeforeTakingDatagram) {
+    ::net::io_context io;
+    DatagramSocket receiver(io, ::net::ip::address_v4::loopback());
+    ::udp::socket peer(io, {::net::ip::address_v4::loopback(), 0});
+    const std::array<uint8_t, 1> byte{9};
+    for (int index = 0; index < 3; ++index)
+        peer.send_to(::net::buffer(byte), receiver.LocalEndpoint());
+    ::net::cancellation_signal parent_cancel;
+    bool caller_aborted = false;
+    bool socket_cancelled = false;
+    std::size_t left_queued = 0;
+    auto read = [&]() -> ::net::awaitable<void> {
+        co_await ::net::this_coro::throw_if_cancelled(false);
+        const auto cancellation_state = co_await ::net::this_coro::cancellation_state;
+        {
+            auto operation = receiver.StartRead();
+            // Arms the drain budget so the next datagrams are synchronously available.
+            (void)co_await operation.Receive();
+            receiver.Cancel();
+            try { (void)operation.TryReceive(cancellation_state); }
+            catch (const ::transport::LinkError& error) {
+                socket_cancelled = error.code() == ::common::ErrorCode::CANCELLED;
+            }
+        }
+        auto operation = receiver.StartRead();
+        (void)co_await operation.Receive();
+        parent_cancel.emit(::net::cancellation_type::terminal);
+        try { (void)operation.TryReceive(cancellation_state); }
+        catch (const std::system_error& error) {
+            caller_aborted = error.code() == ::io_error::operation_aborted;
+        }
+        // An uncancelled view of the same operation finds exactly the one
+        // datagram neither rejected attempt consumed.
+        while (operation.TryReceive(::net::cancellation_state{})) ++left_queued;
+    };
+    auto result = ::net::co_spawn(io, read(),
+        ::net::bind_cancellation_slot(parent_cancel.slot(), ::net::use_future));
+    io.run_for(2s);
+    if (result.wait_for(0s) != std::future_status::ready) {
+        receiver.Close();
+        io.restart();
+        io.run();
+        FAIL() << "cancelled synchronous receive did not complete";
+    }
+    result.get();
+    EXPECT_TRUE(socket_cancelled);
+    EXPECT_TRUE(caller_aborted);
+    EXPECT_EQ(left_queued, 1u);
+}
+
+TEST(DatagramSocket, TrySendToSendsOnceAndConsumesOperation) {
+    ::net::io_context io;
+    DatagramSocket sender(io, ::net::ip::address_v4::loopback());
+    DatagramSocket other_family(io, ::net::ip::address_v6::loopback());
+    ::udp::socket peer(io, {::net::ip::address_v4::loopback(), 0});
+    peer.non_blocking(true);
+    const std::array<uint8_t, 3> bytes{1, 2, 3};
+    bool sent = false;
+    bool reuse_rejected = false;
+    bool invalid_destination = false;
+    bool retry_after_error_rejected = false;
+    auto send = [&]() -> ::net::awaitable<void> {
+        const auto cancellation_state = co_await ::net::this_coro::cancellation_state;
+        const auto payload = MakePayload(bytes);
+        {
+            auto operation = sender.StartWrite();
+            sent = operation.TrySendTo(peer.local_endpoint(), payload, cancellation_state);
+            try { (void)operation.TrySendTo(peer.local_endpoint(), payload, cancellation_state); }
+            catch (const ::transport::LinkError& error) {
+                reuse_rejected = error.code() == ::common::ErrorCode::INVALID_ARGUMENT;
+            }
+        }
+        auto operation = sender.StartWrite();
+        try {
+            (void)operation.TrySendTo(other_family.LocalEndpoint(), payload, cancellation_state);
+        } catch (const ::transport::LinkError& error) {
+            invalid_destination = error.code() == ::common::ErrorCode::INVALID_ARGUMENT;
+        }
+        // A failed attempt consumes the operation exactly like a failed SendTo.
+        try { co_await operation.SendTo(peer.local_endpoint(), MakePayload(bytes)); }
+        catch (const ::transport::LinkError& error) {
+            retry_after_error_rejected = error.code() == ::common::ErrorCode::INVALID_ARGUMENT;
+        }
+    };
+    auto result = ::net::co_spawn(io, send(), ::net::use_future);
+    io.run();
+    result.get();
+    EXPECT_TRUE(sent);
+    EXPECT_TRUE(reuse_rejected);
+    EXPECT_TRUE(invalid_destination);
+    EXPECT_TRUE(retry_after_error_rejected);
+    std::array<uint8_t, 4> received{};
+    ::udp::endpoint source;
+    ::IoErrorCode error;
+    EXPECT_EQ(peer.receive_from(::net::buffer(received), source, 0, error), bytes.size());
+    EXPECT_FALSE(error);
+    EXPECT_EQ(source, sender.LocalEndpoint());
+    EXPECT_TRUE(std::equal(bytes.begin(), bytes.end(), received.begin()));
+    (void)peer.receive_from(::net::buffer(received), source, 0, error);
+    EXPECT_TRUE(error == ::io_error::would_block || error == ::io_error::try_again);
+}
+
+TEST(DatagramSocket, CancelledTrySendToDoesNotSend) {
+    ::net::io_context io;
+    DatagramSocket sender(io, ::net::ip::address_v4::loopback());
+    ::udp::socket peer(io, {::net::ip::address_v4::loopback(), 0});
+    peer.non_blocking(true);
+    ::net::cancellation_signal cancellation;
+    const std::array<uint8_t, 1> byte{42};
+    auto send = [&]() -> ::net::awaitable<void> {
+        co_await ::net::this_coro::throw_if_cancelled(false);
+        const auto cancellation_state = co_await ::net::this_coro::cancellation_state;
+        auto operation = sender.StartWrite();
+        cancellation.emit(::net::cancellation_type::terminal);
+        const auto payload = MakePayload(byte);
+        (void)operation.TrySendTo(peer.local_endpoint(), payload, cancellation_state);
+    };
+    auto result = ::net::co_spawn(io, send(),
+        ::net::bind_cancellation_slot(cancellation.slot(), ::net::use_future));
+    io.run();
+    bool aborted = false;
+    try { result.get(); }
+    catch (const std::system_error& error) {
+        aborted = error.code() == ::io_error::operation_aborted;
+    }
+    EXPECT_TRUE(aborted);
+    std::array<uint8_t, 1> received{};
+    ::udp::endpoint source;
+    ::IoErrorCode error;
+    (void)peer.receive_from(::net::buffer(received), source, 0, error);
+    EXPECT_TRUE(error == ::io_error::would_block || error == ::io_error::try_again);
+}
+
 }  // namespace
 
 

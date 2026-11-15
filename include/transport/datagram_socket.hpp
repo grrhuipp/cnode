@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <memory>
 #include <new>
+#include <optional>
 #include <span>
 #include <type_traits>
 #include <vector>
@@ -41,6 +42,13 @@ public:
         ~ReadOperation() noexcept;
 
         [[nodiscard]] net::awaitable<ReceivedDatagram> Receive();
+        // The synchronous part of Receive(): a datagram already queued within
+        // the current drain budget, with the same errors as Receive(). Empty
+        // when readiness must be awaited; then `co_await Receive()`.
+        // |cancellation_state| is the caller's own
+        // net::this_coro::cancellation_state, which Receive() would observe.
+        [[nodiscard]] std::optional<ReceivedDatagram> TryReceive(
+            const net::cancellation_state& cancellation_state);
         [[nodiscard]] bool Cancelled() const noexcept;
         [[nodiscard]] common::ErrorCode CancellationReason() const noexcept;
 
@@ -64,6 +72,12 @@ public:
             udp::endpoint destination, std::span<const net::const_buffer> buffers);
         [[nodiscard]] net::awaitable<void> SendTo(
             udp::endpoint destination, common::MultiBuffer payload);
+        // The synchronous part of SendTo(): one non-blocking send with the same
+        // validation and errors. False when the socket buffer is full; nothing
+        // was sent and the operation remains available for `co_await SendTo()`.
+        [[nodiscard]] bool TrySendTo(
+            const udp::endpoint& destination, const common::MultiBuffer& payload,
+            const net::cancellation_state& cancellation_state);
         [[nodiscard]] bool Cancelled() const noexcept;
         [[nodiscard]] common::ErrorCode CancellationReason() const noexcept;
 

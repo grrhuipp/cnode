@@ -159,6 +159,7 @@ private:
     [[nodiscard]] bool HasPendingBytes() noexcept;
     [[nodiscard]] bool TryFillHeaderFromPending() noexcept;
     [[nodiscard]] bool TryAdvanceDataFrameFromPending();
+    [[nodiscard]] bool AcceptInnerRead(common::MultiBuffer&& next);
     net::awaitable<bool> EnsurePendingData();
     net::awaitable<bool> PrepareNextDataFrame();
     void ConsumePayloadBytes(std::span<uint8_t> bytes);

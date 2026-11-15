@@ -313,13 +313,25 @@ net::awaitable<RelayResult> DoRelayLinkImpl(
         bool writing = false;
         try {
             const auto direction_cancellation = co_await net::this_coro::cancellation_state;
+            // A unit taken here is one the awaited read would have returned
+            // without suspending, so the loop suspends exactly where it would
+            // otherwise; a run of them is bounded by the reader's queue, which
+            // nothing refills until this coroutine suspends. A cancelled
+            // direction takes the awaited path, which fails before consuming.
+            const auto try_read = [&](common::MultiBuffer& out) noexcept {
+                if (direction_cancellation.cancelled() != net::cancellation_type::none) return false;
+                return upload ? client_reader.TryReadMultiBuffer(out)
+                              : target.try_read(target.target, out);
+            };
             while (!state.Ending()) {
                 operation_side_is_client = upload;
                 writing = false;
                 common::MultiBuffer payload;
                 if (upload && !initial_payload.empty()) payload = initial_payload.PopFront();
-                else if (upload) payload = co_await client_reader.ReadMultiBuffer();
-                else payload = co_await target.read(target.target);
+                else if (!try_read(payload)) {
+                    if (upload) payload = co_await client_reader.ReadMultiBuffer();
+                    else payload = co_await target.read(target.target);
+                }
                 if (state.Ending()) break;
                 if (direction_cancellation.cancelled() != net::cancellation_type::none)
                     throw transport::LinkError(common::ErrorCode::CANCELLED);

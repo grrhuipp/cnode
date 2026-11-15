@@ -402,15 +402,19 @@ void UdpIngress::ClientSession::Close() noexcept {
     CloseWithError(common::ErrorCode::OK);
 }
 
+bool UdpIngress::ClientSession::TryReadMultiBuffer(common::MultiBuffer& out) noexcept {
+    if (input_queue_.empty()) return false;
+    auto input = std::move(input_queue_.front());
+    queued_bytes_ -= std::min(queued_bytes_, input.bytes);
+    input_queue_.pop_front();
+    out = std::move(input.payload);
+    return true;
+}
+
 net::awaitable<common::MultiBuffer>
 UdpIngress::ClientSession::ReadMultiBuffer() {
     while (true) {
-        if (!input_queue_.empty()) {
-            auto input = std::move(input_queue_.front());
-            queued_bytes_ -= std::min(queued_bytes_, input.bytes);
-            input_queue_.pop_front();
-            co_return std::move(input.payload);
-        }
+        if (common::MultiBuffer payload; TryReadMultiBuffer(payload)) co_return payload;
 
         if (closed_) {
             if (terminal_error_ == common::ErrorCode::RESOURCE_EXHAUSTED) {

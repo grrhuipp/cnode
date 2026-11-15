@@ -178,6 +178,7 @@ public:
     void Close(common::ErrorCode error) noexcept;
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override;
+    [[nodiscard]] bool TryReadMultiBuffer(common::MultiBuffer& out) noexcept override;
     common::CancellationSource& Cancellation() noexcept override {
         return cancellation_;
     }
@@ -643,15 +644,19 @@ void UdpRouteFlow::Close(common::ErrorCode error) noexcept {
     WakeReader();
 }
 
+bool UdpRouteFlow::TryReadMultiBuffer(common::MultiBuffer& out) noexcept {
+    if (queue_.empty()) return false;
+    auto item = std::move(queue_.front());
+    queue_.pop_front();
+    queued_bytes_ -= item.bytes;
+    owner.RemoveQueuedBytes(item.bytes);
+    out = std::move(item.payload);
+    return true;
+}
+
 net::awaitable<common::MultiBuffer> UdpRouteFlow::ReadMultiBuffer() {
     for (;;) {
-        if (!queue_.empty()) {
-            auto item = std::move(queue_.front());
-            queue_.pop_front();
-            queued_bytes_ -= item.bytes;
-            owner.RemoveQueuedBytes(item.bytes);
-            co_return std::move(item.payload);
-        }
+        if (common::MultiBuffer payload; TryReadMultiBuffer(payload)) co_return payload;
         if (closed_) {
             if (terminal_error_ != common::ErrorCode::OK) {
                 throw transport::LinkError(terminal_error_);
@@ -791,9 +796,19 @@ net::awaitable<void> DispatchUdpFlows(
         // Like the pipes of Xray's dispatcher, a full flow queue blocks the
         // association's reader: stream-carried UDP then waits in its transport,
         // and the flow never ends for a burst.
+        //
+        // A datagram the parent already queued is taken without a read frame;
+        // the run is bounded by that queue, which nothing refills until this
+        // coroutine suspends. A cancelled association takes the awaited path,
+        // which fails before consuming.
+        const auto association_cancellation = co_await net::this_coro::cancellation_state;
         for (bool first = true;; first = false) {
-            auto packet = first ? std::move(initial)
-                                : co_await parent_link.reader->ReadMultiBuffer();
+            common::MultiBuffer packet;
+            if (first) packet = std::move(initial);
+            else if (association_cancellation.cancelled() != net::cancellation_type::none ||
+                     !parent_link.reader->TryReadMultiBuffer(packet)) {
+                packet = co_await parent_link.reader->ReadMultiBuffer();
+            }
             if (packet.empty() && !packet.HasUDP()) {
                 if (first) continue;
                 break;

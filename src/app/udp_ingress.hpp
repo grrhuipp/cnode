@@ -590,6 +590,7 @@ public:
     void Close() noexcept;
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override;
+    [[nodiscard]] bool TryReadMultiBuffer(common::MultiBuffer& out) noexcept override;
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {

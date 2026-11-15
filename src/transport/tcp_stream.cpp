@@ -22,44 +22,6 @@ namespace transport {
 
 namespace {
 constexpr size_t kProxyProbeBytes = 256;
-template<class Timeouts, bool IsRead>
-struct OperationTimeoutScope {
-    explicit OperationTimeoutScope(Timeouts& timeouts, bool adopt_existing = false)
-        : timeouts(timeouts)
-        , owns(!adopt_existing || !timeouts.IsPending(IsRead)) {
-        if (owns) {
-            if constexpr (IsRead) timeouts.BeginRead();
-            else timeouts.BeginWrite();
-        }
-    }
-    OperationTimeoutScope(const OperationTimeoutScope&) = delete;
-    OperationTimeoutScope& operator=(const OperationTimeoutScope&) = delete;
-    ~OperationTimeoutScope() noexcept {
-        if (owns) {
-            if constexpr (IsRead) timeouts.EndRead();
-            else timeouts.EndWrite();
-        }
-    }
-    Timeouts& timeouts;
-    bool owns = true;
-};
-
-// Explicit cancellation also covers a successful readiness notification that
-// was queued before Cancel. Only the owning Worker touches payload.
-class WriteCompletion final : private common::CancellationSubscription {
-public:
-    explicit WriteCompletion(common::CancellationSource& source) noexcept {
-        Resubscribe(source);
-    }
-
-
-    bool Cancelled() const noexcept { return cancelled_; }
-
-private:
-    void OnCancellation(common::Cancellation) noexcept override { cancelled_ = true; }
-    bool cancelled_ = false;
-};
-
 struct ConnectTimeout final : TimeoutEvent {
     explicit ConnectTimeout(TcpStream& stream) : stream(stream) {}
 
@@ -189,7 +151,10 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
         co_return copy;
     }
 
-    auto [ec, n] = co_await AsyncReceiveSome(buf);
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    auto received = TryReceiveSome(buf, false, cancellation.cancelled());
+    if (!received) received = co_await ReceiveSomeWhenReadable(buf, false);
+    const auto [ec, n] = *received;
 
     if (ec) {
         if (ec == io_error::eof) {
@@ -198,8 +163,7 @@ net::awaitable<std::size_t> TcpStream::AsyncRead(net::mutable_buffer buf) {
         // A reset is a truncation, not the peer's orderly end of stream.
         throw IoSystemError(ec);
     }
-    // AsyncReceiveSome already refreshed idle activity on every successful
-    // non-peek return.
+    // Every successful non-peek receive already refreshed idle activity.
     co_return n;
 }
 
@@ -476,28 +440,34 @@ bool TcpStream::IsOpen() const {
     return impl_->socket.is_open();
 }
 
-net::awaitable<std::pair<IoErrorCode, std::size_t>> TcpStream::AsyncReceiveSome(
+// The complete receive whenever it needs no readiness wait; nullopt means the
+// socket is empty and the caller continues with ReceiveSomeWhenReadable.
+std::optional<TcpStream::ReceiveResult> TcpStream::TryReceiveSome(
     net::mutable_buffer buffer,
-    bool peek) {
+    bool peek,
+    net::cancellation_type coro_cancelled) {
     if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
         impl_->read_drain_budget = 0;
-        co_return std::make_pair(io_error::not_connected, std::size_t{0});
+        return ReceiveResult{io_error::not_connected, 0};
     }
 
     if (buffer.size() == 0) {
         if (!peek) TouchActivity();
-        co_return std::make_pair(IoErrorCode{}, size_t{0});
+        return ReceiveResult{};
     }
     impl_->timeouts.CheckCanBeginRead();
-    const auto cancellation = co_await net::this_coro::cancellation_state;
-    std::optional<WriteCompletion> completion;
-    std::optional<OperationTimeoutScope<decltype(impl_->timeouts), true>> timeout_scope;
+    return ReceiveAvailable(
+        buffer, peek,
+        Cancellation().Stopped() || coro_cancelled != net::cancellation_type::none);
+}
+
+std::optional<TcpStream::ReceiveResult> TcpStream::ReceiveAvailable(
+    net::mutable_buffer buffer, bool peek, bool aborted) noexcept {
+    if (aborted) {
+        impl_->read_drain_budget = 0;
+        return ReceiveResult{io_error::operation_aborted, 0};
+    }
     for (;;) {
-        if ((completion ? completion->Cancelled() : Cancellation().Stopped()) ||
-            cancellation.cancelled() != net::cancellation_type::none) {
-            impl_->read_drain_budget = 0;
-            co_return std::make_pair(IoErrorCode(io_error::operation_aborted), size_t{0});
-        }
         const auto received = ::recv(impl_->socket.native_handle(), buffer.data(), buffer.size(),
                                     MSG_DONTWAIT | (peek ? MSG_PEEK : 0));
         if (received > 0) {
@@ -505,19 +475,36 @@ net::awaitable<std::pair<IoErrorCode, std::size_t>> TcpStream::AsyncReceiveSome(
                 impl_->read_drain_budget = 0;
             }
             if (!peek) TouchActivity();
-            co_return std::make_pair(IoErrorCode{}, static_cast<size_t>(received));
+            return ReceiveResult{IoErrorCode{}, static_cast<size_t>(received)};
         }
         impl_->read_drain_budget = 0;
-        if (received == 0) co_return std::make_pair(IoErrorCode(io_error::eof), size_t{0});
+        if (received == 0) return ReceiveResult{io_error::eof, 0};
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK)
-            co_return std::make_pair(IoErrorCode(errno, std::system_category()), size_t{0});
-        if (!completion) completion.emplace(Cancellation());
-        if (!timeout_scope) timeout_scope.emplace(impl_->timeouts, true);
-        if (completion->Cancelled() || cancellation.cancelled() != net::cancellation_type::none)
-            co_return std::make_pair(IoErrorCode(io_error::operation_aborted), size_t{0});
+            return ReceiveResult{IoErrorCode(errno, std::system_category()), 0};
+        return std::nullopt;
+    }
+}
+
+// Entered only after TryReceiveSome found the socket empty: owns the read
+// deadline and the cancellation subscription across the readiness waits.
+net::awaitable<TcpStream::ReceiveResult> TcpStream::ReceiveSomeWhenReadable(
+    net::mutable_buffer buffer,
+    bool peek) {
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    WriteCompletion completion(Cancellation());
+    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts, true};
+    for (;;) {
+        if (completion.Cancelled() || cancellation.cancelled() != net::cancellation_type::none)
+            co_return ReceiveResult{io_error::operation_aborted, 0};
         const auto ec = co_await impl_->Wait(tcp::socket::wait_read, cancellation.slot());
-        if (ec) co_return std::make_pair(ec, size_t{0});
+        if (ec) co_return ReceiveResult{ec, 0};
+        if (const auto received = ReceiveAvailable(
+                buffer, peek,
+                completion.Cancelled() ||
+                    cancellation.cancelled() != net::cancellation_type::none)) {
+            co_return *received;
+        }
     }
 }
 
@@ -541,9 +528,11 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
             : ProxyProtocolReadStatus::Truncated, std::move(result));
     };
 
+    const auto cancellation = co_await net::this_coro::cancellation_state;
     std::array<uint8_t, kProxyProbeBytes> probe;
-    auto [peek_ec, probe_len] = co_await AsyncReceiveSome(
-        net::buffer(probe), true);
+    auto peeked = TryReceiveSome(net::buffer(probe), true, cancellation.cancelled());
+    if (!peeked) peeked = co_await ReceiveSomeWhenReadable(net::buffer(probe), true);
+    const auto [peek_ec, probe_len] = *peeked;
     if (peek_ec || probe_len == 0) co_return read_failed({});
 
     auto result = ParseProxyProtocolHeader(
@@ -557,8 +546,10 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
         size_t remaining = result.consumed;
         while (remaining > 0) {
             const size_t want = std::min(remaining, probe.size());
-            auto [read_ec, n] = co_await AsyncReceiveSome(
-                net::buffer(probe.data(), want));
+            const auto chunk = net::buffer(probe.data(), want);
+            auto received = TryReceiveSome(chunk, false, cancellation.cancelled());
+            if (!received) received = co_await ReceiveSomeWhenReadable(chunk, false);
+            const auto [read_ec, n] = *received;
             if (read_ec || n == 0) co_return read_failed(std::move(result));
             remaining -= n;
         }
@@ -568,7 +559,9 @@ net::awaitable<ProxyProtocolReadResult> TcpStream::ReadProxyProtocolHeader(
     std::vector<uint8_t> buf;
 
     while (buf.size() < kProxyHeaderMaxBytes) {
-        auto [read_ec, n] = co_await AsyncReceiveSome(net::buffer(probe));
+        auto received = TryReceiveSome(net::buffer(probe), false, cancellation.cancelled());
+        if (!received) received = co_await ReceiveSomeWhenReadable(net::buffer(probe), false);
+        const auto [read_ec, n] = *received;
         // Only an incomplete header reaches this loop: whatever arrived so far
         // cannot complete it any more.
         if (read_ec || n == 0) co_return read_failed(std::move(result));
@@ -647,32 +640,37 @@ tcp::socket::executor_type TcpStream::GetExecutor() noexcept {
     return impl_->GetExecutor();
 }
 
-net::awaitable<IoErrorCode> TcpStream::WaitReadable(net::cancellation_slot cancellation) {
+std::optional<IoErrorCode> TcpStream::ReadableWithoutWait() noexcept {
     if (!impl_->socket.is_open() || impl_->HasFlag(kReadShutdown)) {
         impl_->read_drain_budget = 0;
-        co_return io_error::eof;
+        return io_error::eof;
     }
     if (impl_->pending_data.byte_size() != 0) {
-        co_return IoErrorCode{};
+        return IoErrorCode{};
     }
+    return std::nullopt;
+}
 
-    WriteCompletion completion(Cancellation());
-    OperationTimeoutScope<decltype(impl_->timeouts), true> timeout_scope{impl_->timeouts, true};
-    const auto coro_cancellation = co_await net::this_coro::cancellation_state;
-    if (!cancellation.is_connected())
-        cancellation = coro_cancellation.slot();
-    if (completion.Cancelled() ||
-        coro_cancellation.cancelled() != net::cancellation_type::none) {
-        impl_->read_drain_budget = 0;
-        co_return IoErrorCode(io_error::operation_aborted);
-    }
-    const auto ec = co_await impl_->Wait(tcp::socket::wait_read, cancellation);
-    if (completion.Cancelled() && !ec) {
-        impl_->read_drain_budget = 0;
-        co_return IoErrorCode(io_error::operation_aborted);
-    }
+bool TcpStream::IsPending(bool is_read) const noexcept {
+    return impl_->timeouts.IsPending(is_read);
+}
+
+void TcpStream::BeginRead() {
+    impl_->timeouts.BeginRead();
+}
+
+void TcpStream::EndRead() noexcept {
+    impl_->timeouts.EndRead();
+}
+
+net::awaitable<IoErrorCode> TcpStream::WaitSocketReadable(net::cancellation_slot cancellation) {
+    return impl_->Wait(tcp::socket::wait_read, cancellation);
+}
+
+IoErrorCode TcpStream::FinishReadableWait(IoErrorCode ec, bool cancelled) noexcept {
+    if (cancelled && !ec) ec = io_error::operation_aborted;
     impl_->read_drain_budget = ec ? 0 : static_cast<uint8_t>(Impl::kReadDrainBudget - 1);
-    co_return ec;
+    return ec;
 }
 
 bool TcpStream::CanRead() const noexcept {

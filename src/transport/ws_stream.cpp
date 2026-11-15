@@ -38,6 +38,12 @@ void AddPayloadSize(size_t& total, size_t size) {
     total += size;
 }
 
+// An inner EOF is not an error of its own: the read stays empty and
+// AcceptInnerRead judges it. Call only from the catch handler.
+void RethrowUnlessEof(const IoSystemError& error) {
+    if (error.code() != io_error::eof) throw;
+}
+
 }  // namespace
 
 BaseWsStream::BaseWsStream(
@@ -104,6 +110,18 @@ bool BaseWsStream::TryFillHeaderFromPending() noexcept {
     return header_used_ == header_required_;
 }
 
+// Commits one completed inner read. RFC 6455 §7.1.5: the lower layer ending
+// before a Close frame is a truncation unless this side already stopped.
+bool BaseWsStream::AcceptInnerRead(common::MultiBuffer&& next) {
+    if (next.empty()) {
+        if (!closed_ && !read_closed_)
+            ProtocolFailure("WebSocket truncated without Close");
+        return false;
+    }
+    next.MoveTo(pending_data_);
+    return HasPendingBytes();
+}
+
 net::awaitable<bool> BaseWsStream::EnsurePendingData() {
     if (HasPendingBytes()) co_return true;
     if (closed_ || read_closed_) co_return false;
@@ -111,17 +129,9 @@ net::awaitable<bool> BaseWsStream::EnsurePendingData() {
     try {
         next = co_await inner_->ReadMultiBuffer();
     } catch (const IoSystemError& error) {
-        if (error.code() != io_error::eof) throw;
-        if (!closed_ && !read_closed_) ProtocolFailure("WebSocket truncated without Close");
-        co_return false;
+        RethrowUnlessEof(error);
     }
-    if (next.empty()) {
-        if (!closed_ && !read_closed_)
-            ProtocolFailure("WebSocket truncated without Close");
-        co_return false;
-    }
-    next.MoveTo(pending_data_);
-    co_return HasPendingBytes();
+    co_return AcceptInnerRead(std::move(next));
 }
 
 void BaseWsStream::ConsumePayloadBytes(std::span<uint8_t> bytes) {
@@ -292,16 +302,19 @@ net::awaitable<bool> BaseWsStream::PrepareNextDataFrame() {
 
 net::awaitable<size_t> BaseWsStream::AsyncRead(net::mutable_buffer buffer) {
     if (buffer.size() == 0) co_return 0;
-    if (!TryAdvanceDataFrameFromPending()) {
-        if (!closed_ && !read_closed_ && !peer_closed_cleanly_ &&
-            read_stage_ != ReadStage::Control) {
-            if (!co_await EnsurePendingData()) co_return 0;
-            if (!TryAdvanceDataFrameFromPending() && !co_await PrepareNextDataFrame()) {
-                co_return 0;
-            }
-        } else if (!co_await PrepareNextDataFrame()) {
-            co_return 0;
+    while (!(TryAdvanceDataFrameFromPending() && HasPendingBytes())) {
+        if (closed_ || read_closed_ || peer_closed_cleanly_) co_return 0;
+        if (read_stage_ == ReadStage::Control) {
+            if (!co_await PrepareNextDataFrame()) co_return 0;
+            continue;
         }
+        common::MultiBuffer next;
+        try {
+            next = co_await inner_->ReadMultiBuffer();
+        } catch (const IoSystemError& error) {
+            RethrowUnlessEof(error);
+        }
+        if (!AcceptInnerRead(std::move(next))) co_return 0;
     }
     const size_t size = static_cast<size_t>(std::min<uint64_t>(
         buffer.size(), frame_payload_remaining_));
@@ -309,7 +322,6 @@ net::awaitable<size_t> BaseWsStream::AsyncRead(net::mutable_buffer buffer) {
     // A single read-some commits its bytes immediately. Filling the requested
     // buffer would both delay small messages and lose an unreported prefix if
     // a later lower-layer read were cancelled.
-    if (!HasPendingBytes() && !co_await EnsurePendingData()) co_return 0;
     const size_t n = pending_data_.ConsumePrefixTo(std::span<uint8_t>(data, size));
     pending_data_.ReleaseIfIdle();
     if (n == 0) co_return 0;
@@ -318,18 +330,20 @@ net::awaitable<size_t> BaseWsStream::AsyncRead(net::mutable_buffer buffer) {
 }
 
 net::awaitable<common::MultiBuffer> BaseWsStream::ReadMultiBuffer() {
-    if (!TryAdvanceDataFrameFromPending()) {
-        if (!closed_ && !read_closed_ && !peer_closed_cleanly_ &&
-            read_stage_ != ReadStage::Control) {
-            if (!co_await EnsurePendingData()) co_return common::MultiBuffer{};
-            if (!TryAdvanceDataFrameFromPending() && !co_await PrepareNextDataFrame()) {
-                co_return common::MultiBuffer{};
-            }
-        } else if (!co_await PrepareNextDataFrame()) {
-            co_return common::MultiBuffer{};
+    while (!(TryAdvanceDataFrameFromPending() && HasPendingBytes())) {
+        if (closed_ || read_closed_ || peer_closed_cleanly_) co_return common::MultiBuffer{};
+        if (read_stage_ == ReadStage::Control) {
+            if (!co_await PrepareNextDataFrame()) co_return common::MultiBuffer{};
+            continue;
         }
+        common::MultiBuffer next;
+        try {
+            next = co_await inner_->ReadMultiBuffer();
+        } catch (const IoSystemError& error) {
+            RethrowUnlessEof(error);
+        }
+        if (!AcceptInnerRead(std::move(next))) co_return common::MultiBuffer{};
     }
-    if (!HasPendingBytes() && !co_await EnsurePendingData()) co_return common::MultiBuffer{};
     if (const auto* front = pending_data_.FrontBuffer();
         front && front->Len() <= frame_payload_remaining_) {
         common::BufferGuard output = pending_data_.pop_front();

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/cancellation.hpp"
 #include "common/error.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/timeout_scheduler.hpp"
@@ -209,6 +210,45 @@ private:
     uint8_t flags_ = 0;
     bool idle_enabled_ = false, read_pending_ = false, write_pending_ = false, stopped_ = false;
     bool idle_expired_ = false, write_expired_ = false, phase_expired_ = false;
+};
+
+// Holds one direction's operation slot for the scope of a wait. With
+// `adopt_existing` an operation already pending in that direction keeps it.
+template<class Timeouts, bool IsRead>
+struct OperationTimeoutScope {
+    explicit OperationTimeoutScope(Timeouts& timeouts, bool adopt_existing = false)
+        : timeouts(timeouts)
+        , owns(!adopt_existing || !timeouts.IsPending(IsRead)) {
+        if (owns) {
+            if constexpr (IsRead) timeouts.BeginRead();
+            else timeouts.BeginWrite();
+        }
+    }
+    OperationTimeoutScope(const OperationTimeoutScope&) = delete;
+    OperationTimeoutScope& operator=(const OperationTimeoutScope&) = delete;
+    ~OperationTimeoutScope() noexcept {
+        if (owns) {
+            if constexpr (IsRead) timeouts.EndRead();
+            else timeouts.EndWrite();
+        }
+    }
+    Timeouts& timeouts;
+    bool owns = true;
+};
+
+// Explicit cancellation also covers a successful readiness notification that
+// was queued before Cancel. Only the owning Worker touches payload.
+class WriteCompletion final : private common::CancellationSubscription {
+public:
+    explicit WriteCompletion(common::CancellationSource& source) noexcept {
+        Resubscribe(source);
+    }
+
+    bool Cancelled() const noexcept { return cancelled_; }
+
+private:
+    void OnCancellation(common::Cancellation) noexcept override { cancelled_ = true; }
+    bool cancelled_ = false;
 };
 
 template <class Socket>

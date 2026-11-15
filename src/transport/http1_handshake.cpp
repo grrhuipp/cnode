@@ -265,8 +265,12 @@ private:
             ChargeBodyRead(payload.byte_size());
             co_return payload;
         }
-        if (chunk_remaining_ == 0 && !co_await EnsureChunkPayload()) {
-            co_return common::MultiBuffer{};
+        if (chunk_remaining_ == 0) {
+            const ChunkStep step = AdvanceChunkFraming();
+            if (step == ChunkStep::End ||
+                (step == ChunkStep::NeedBytes && !co_await EnsureChunkPayload())) {
+                co_return common::MultiBuffer{};
+            }
         }
         if (pending_.byte_size() == 0) {
             pending_ = co_await inner_->ReadMultiBuffer();
@@ -307,22 +311,28 @@ private:
         trailer_bytes_ += bytes;
     }
 
+    // Completes a raw read without suspending: zero once reading has ended,
+    // otherwise the read-ahead prefix charged to the body budget. Empty means
+    // the caller must read from inner_ and charge the result itself.
+    std::optional<size_t> TryReadBuffered(net::mutable_buffer buffer) {
+        if (closed_ || read_closed_ || buffer.size() == 0) {
+            return 0;
+        }
+        if (pending_.byte_size() == 0) {
+            return std::nullopt;
+        }
+        const size_t n = pending_.ConsumePrefixTo(std::span<uint8_t>(
+            static_cast<uint8_t*>(buffer.data()), buffer.size()));
+        pending_.ReleaseIfIdle();
+        ChargeBodyRead(n);
+        return n;
+    }
+
     net::awaitable<size_t> ReadRaw(net::mutable_buffer buffer) {
-        if (closed_ || read_closed_) {
-            co_return 0;
+        if (const auto buffered = TryReadBuffered(buffer)) {
+            co_return *buffered;
         }
-        auto* out = static_cast<uint8_t*>(buffer.data());
-        const size_t capacity = buffer.size();
-        if (capacity == 0) {
-            co_return 0;
-        }
-        if (pending_.byte_size() != 0) {
-            const size_t n = pending_.ConsumePrefixTo(std::span<uint8_t>(out, capacity));
-            pending_.ReleaseIfIdle();
-            ChargeBodyRead(n);
-            co_return n;
-        }
-        const auto n = co_await inner_->AsyncRead(buffer);
+        const size_t n = co_await inner_->AsyncRead(buffer);
         ChargeBodyRead(n);
         co_return n;
     }
@@ -339,7 +349,10 @@ private:
         }
         const auto want = static_cast<size_t>(
             std::min<uint64_t>(buffer.size(), *content_remaining_));
-        const size_t n = co_await ReadRaw(net::buffer(buffer.data(), want));
+        const net::mutable_buffer raw(buffer.data(), want);
+        const auto buffered = TryReadBuffered(raw);
+        const size_t n = buffered ? *buffered : co_await inner_->AsyncRead(raw);
+        if (!buffered) ChargeBodyRead(n);
         if (n == 0) {
             if (closed_ || read_closed_) co_return 0;
             FailBodyRead("truncated HTTP/1 Content-Length body");
@@ -400,22 +413,21 @@ private:
         throw IoSystemError(io_error::invalid_argument, what);
     }
 
-    net::awaitable<bool> EnsureChunkPayload() {
-        if (closed_ || read_closed_) {
-            co_return false;
-        }
+    enum class ChunkStep { Payload, End, NeedBytes };
+
+    // The chunked framing state machine, run over the read-ahead only: skips
+    // the previous chunk's terminator, then parses the chunk-size line and,
+    // after the last chunk, the trailer section. Payload: chunk_remaining_ is
+    // non-zero. End: the body is complete or reading has ended. NeedBytes:
+    // the read-ahead is exhausted in the middle of the framing; the progress
+    // is kept in the stream, so the step resumes once pending_ is refilled.
+    ChunkStep AdvanceChunkFraming() {
         const size_t wire_limit = max_line_bytes_ + 2;
         while (chunk_remaining_ == 0) {
             if (chunk_terminator_pending_) {
                 constexpr std::array<uint8_t, 2> terminator{'\r', '\n'};
                 while (chunk_terminator_bytes_ != terminator.size()) {
-                    if (pending_.byte_size() == 0) {
-                        pending_ = co_await inner_->ReadMultiBuffer();
-                        if (pending_.byte_size() == 0) {
-                            if (closed_ || read_closed_) co_return false;
-                            FailBodyRead("incomplete HTTP/1 chunk terminator");
-                        }
-                    }
+                    if (pending_.byte_size() == 0) return ChunkStep::NeedBytes;
                     const auto bytes = pending_.FrontSpan();
                     const size_t count = std::min(bytes.size(),
                         terminator.size() - chunk_terminator_bytes_);
@@ -432,10 +444,7 @@ private:
             }
             bool line_ok = false;
             while (line_.size() < wire_limit) {
-                if (pending_.byte_size() == 0) {
-                    pending_ = co_await inner_->ReadMultiBuffer();
-                    if (pending_.byte_size() == 0) break;
-                }
+                if (pending_.byte_size() == 0) return ChunkStep::NeedBytes;
                 const auto bytes = pending_.FrontSpan();
                 const auto end = std::find(bytes.begin(), bytes.end(), uint8_t{'\n'});
                 const bool finished = end != bytes.end();
@@ -455,7 +464,7 @@ private:
                 }
             }
             if (!line_ok) {
-                if (closed_ || read_closed_) co_return false;
+                if (closed_ || read_closed_) return ChunkStep::End;
                 FailBodyRead("incomplete HTTP/1 chunk-size or trailer line");
             }
             if (reading_trailers_) {
@@ -466,7 +475,7 @@ private:
                     ResetLine();
                     read_closed_ = true;
                     pending_.clear();
-                    co_return false;
+                    return ChunkStep::End;
                 }
                 std::string_view trailer_name;
                 std::string_view trailer_value;
@@ -492,7 +501,26 @@ private:
             if (*chunk_size > read_budget_) FailBodyRead("HTTP body too large");
             chunk_remaining_ = *chunk_size;
         }
-        co_return true;
+        return ChunkStep::Payload;
+    }
+
+    // Slow path of AdvanceChunkFraming, entered only after it reported
+    // NeedBytes: refills the read-ahead until the framing is decided.
+    net::awaitable<bool> EnsureChunkPayload() {
+        for (;;) {
+            pending_ = co_await inner_->ReadMultiBuffer();
+            if (pending_.byte_size() == 0) {
+                if (closed_ || read_closed_) co_return false;
+                FailBodyRead(chunk_terminator_pending_
+                    ? "incomplete HTTP/1 chunk terminator"
+                    : "incomplete HTTP/1 chunk-size or trailer line");
+            }
+            switch (AdvanceChunkFraming()) {
+                case ChunkStep::Payload: co_return true;
+                case ChunkStep::End: co_return false;
+                case ChunkStep::NeedBytes: break;
+            }
+        }
     }
 
     net::awaitable<size_t> ReadChunked(net::mutable_buffer buffer) {
@@ -505,9 +533,17 @@ private:
             co_return 0;
         }
 
-        if (chunk_remaining_ == 0 && !co_await EnsureChunkPayload()) co_return 0;
-        const size_t want = std::min(capacity, chunk_remaining_);
-        const size_t n = co_await ReadRaw(net::buffer(out, want));
+        if (chunk_remaining_ == 0) {
+            const ChunkStep step = AdvanceChunkFraming();
+            if (step == ChunkStep::End ||
+                (step == ChunkStep::NeedBytes && !co_await EnsureChunkPayload())) {
+                co_return 0;
+            }
+        }
+        const net::mutable_buffer raw(out, std::min(capacity, chunk_remaining_));
+        const auto buffered = TryReadBuffered(raw);
+        const size_t n = buffered ? *buffered : co_await inner_->AsyncRead(raw);
+        if (!buffered) ChargeBodyRead(n);
         if (n == 0) {
             if (closed_ || read_closed_) co_return 0;
             FailBodyRead("truncated HTTP/1 chunk payload");

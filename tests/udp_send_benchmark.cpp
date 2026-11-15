@@ -57,6 +57,7 @@ net::awaitable<Measurement> Transfer(
     const auto destination = peer.local_endpoint();
     const auto expected_source = sender.LocalEndpoint();
     const std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
+    const auto cancellation_state = co_await net::this_coro::cancellation_state;
     benchmark::AllocationCounts allocations;
     benchmark::AllocationCountScope allocation_scope(allocations);
     const auto cpu_start = CpuNanoseconds();
@@ -64,8 +65,15 @@ net::awaitable<Measurement> Transfer(
     for (size_t iteration = 0; iteration < iterations; ++iteration) {
         {
             auto write = sender.StartWrite();
-            if (owned) co_await write.SendTo(destination, MakePayload(payload));
-            else co_await write.SendTo(destination, buffers);
+            if (owned) {
+                // The entry the UDP outbound endpoints use: a synchronous
+                // attempt first, the coroutine only under backpressure.
+                auto datagram = MakePayload(payload);
+                if (!write.TrySendTo(destination, datagram, cancellation_state))
+                    co_await write.SendTo(destination, std::move(datagram));
+            } else {
+                co_await write.SendTo(destination, buffers);
+            }
         }
         udp::endpoint source;
         const auto size = co_await peer.async_receive_from(

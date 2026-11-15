@@ -316,50 +316,8 @@ public:
     //   ID that query already carries.
     template <typename Socket>
     net::awaitable<Reply> Exchange(std::span<uint8_t> query, std::chrono::milliseconds timeout) {
-        constexpr bool kDatagram = std::is_same_v<Socket, udp::socket>;
-        auto owner = shared_from_this();
-        Reply reply;
-        if (stopping_) {
-            reply.error = io_error::operation_aborted;
-            co_return reply;
-        }
-        if (timeout <= std::chrono::milliseconds::zero()) {
-            reply.error = io_error::timed_out;
-            co_return reply;
-        }
-        ActiveExchange active(*this);
-        common::CheckTestAllocationFault();
-        InFlight<Socket> exchange(*this, InFlightHead<Socket>());
-        if constexpr (kDatagram) {
-            exchange.socket.open(endpoint_.protocol(), reply.error);
-            if (!reply.error) exchange.socket.connect(endpoint_, reply.error);
-            // Reads after a readiness wait must never block the control loop.
-            if (!reply.error) exchange.socket.non_blocking(true, reply.error);
-            if (reply.error) co_return reply;
-            uint16_t id;
-            if (RAND_bytes(reinterpret_cast<uint8_t*>(&id), sizeof(id)) != 1) {
-                reply.error = io_error::fault;
-                co_return reply;
-            }
-            common::StoreU16BE(query.data(), id);
-        }
-        if (!scheduler_.ScheduleAfter(timeout, exchange)) {
-            reply.error = io_error::operation_aborted;
-            co_return reply;
-        }
-        if constexpr (kDatagram) {
-            reply.error = co_await ExchangeOverDatagram(exchange.socket, query, reply.bytes);
-        } else {
-            reply.error = co_await ExchangeOverStream(
-                exchange.socket, tcp::endpoint(endpoint_.address(), endpoint_.port()), query, reply.bytes);
-        }
-        // A complete answer wins even if the deadline fired in the same turn.
-        if (reply.error) {
-            if (exchange.timed_out) reply.error = io_error::timed_out;
-            else if (stopping_) reply.error = io_error::operation_aborted;
-            reply.bytes.clear();
-        }
-        co_return reply;
+        if constexpr (std::is_same_v<Socket, udp::socket>) return ExchangeOverDatagram(query, timeout);
+        else return ExchangeOverStream(query, timeout);
     }
 
     // RFC 6891 §7: a responder that does not implement EDNS answers FORMERR
@@ -417,48 +375,89 @@ private:
         bool timed_out = false;
     };
 
+    // Why a query may not start; no error when it may.
+    [[nodiscard]] IoErrorCode Refusal(std::chrono::milliseconds timeout) const noexcept {
+        if (stopping_) return io_error::operation_aborted;
+        if (timeout <= std::chrono::milliseconds::zero()) return io_error::timed_out;
+        return {};
+    }
+
+    // The deadline and RequestStop both end an exchange by closing its socket;
+    // the reply names that cause instead of the resulting I/O error. A complete
+    // answer never comes through here, so it wins even if the deadline fired
+    // in the same turn.
     template <typename Socket>
-    InFlight<Socket>*& InFlightHead() noexcept {
-        if constexpr (std::is_same_v<Socket, udp::socket>) return datagrams_;
-        else return streams_;
+    [[nodiscard]] Reply Failure(const InFlight<Socket>& exchange, IoErrorCode error) const {
+        if (exchange.timed_out) error = io_error::timed_out;
+        else if (stopping_) error = io_error::operation_aborted;
+        return Reply{{}, error};
     }
 
     // Waits for readability before sizing the buffer to the queued datagram
     // (Linux FIONREAD), one octet past the advertised payload so an oversized
     // reply stays detectable. Datagrams that do not answer this query are
     // dropped and the wait continues (RFC 5452 §9.1).
-    static net::awaitable<IoErrorCode> ExchangeOverDatagram(
-        udp::socket& socket, std::span<const uint8_t> query, std::vector<uint8_t>& response) {
+    net::awaitable<Reply> ExchangeOverDatagram(std::span<uint8_t> query,
+                                               std::chrono::milliseconds timeout) {
+        auto owner = shared_from_this();
+        if (const auto refusal = Refusal(timeout)) co_return Reply{{}, refusal};
+        ActiveExchange active(*this);
+        common::CheckTestAllocationFault();
+        InFlight<udp::socket> exchange(*this, datagrams_);
+        udp::socket& socket = exchange.socket;
+        IoErrorCode error;
+        socket.open(endpoint_.protocol(), error);
+        if (!error) socket.connect(endpoint_, error);
+        // Reads after a readiness wait must never block the control loop.
+        if (!error) socket.non_blocking(true, error);
+        if (error) co_return Failure(exchange, error);
+        uint16_t id;
+        if (RAND_bytes(reinterpret_cast<uint8_t*>(&id), sizeof(id)) != 1) {
+            co_return Failure(exchange, io_error::fault);
+        }
+        common::StoreU16BE(query.data(), id);
+        if (!scheduler_.ScheduleAfter(timeout, exchange)) {
+            co_return Failure(exchange, io_error::operation_aborted);
+        }
         auto [send_error, sent] = co_await socket.async_send(
             net::buffer(query.data(), query.size()), net::as_tuple(net::use_awaitable));
-        if (send_error) co_return send_error;
+        if (send_error) co_return Failure(exchange, send_error);
+        Reply reply;
         for (;;) {
             auto [wait_error] = co_await socket.async_wait(
                 udp::socket::wait_read, net::as_tuple(net::use_awaitable));
-            if (wait_error) co_return wait_error;
-            IoErrorCode error;
+            if (wait_error) co_return Failure(exchange, wait_error);
             const size_t queued = socket.available(error);
-            if (error) co_return error;
-            response.resize(std::clamp<size_t>(queued, 1, kDnsUdpPayloadSize + 1));
-            const size_t size = socket.receive(net::buffer(response), 0, error);
+            if (error) co_return Failure(exchange, error);
+            reply.bytes.resize(std::clamp<size_t>(queued, 1, kDnsUdpPayloadSize + 1));
+            const size_t size = socket.receive(net::buffer(reply.bytes), 0, error);
             if (error == io_error::would_block) continue;
             // ICMP port unreachable surfaces here as connection_refused.
-            if (error) co_return error;
-            response.resize(size);
-            if (size >= 2 && common::LoadU16BE(response.data()) == common::LoadU16BE(query.data()) &&
-                (Matches(response, query) || RejectsEdnsWithoutQuestion(response, query))) {
-                co_return IoErrorCode{};
+            if (error) co_return Failure(exchange, error);
+            reply.bytes.resize(size);
+            if (size >= 2 && common::LoadU16BE(reply.bytes.data()) == common::LoadU16BE(query.data()) &&
+                (Matches(reply.bytes, query) || RejectsEdnsWithoutQuestion(reply.bytes, query))) {
+                co_return reply;
             }
-            response = {};  // Hold nothing across the next wait.
+            reply.bytes = {};  // Hold nothing across the next wait.
         }
     }
 
-    static net::awaitable<IoErrorCode> ExchangeOverStream(
-        tcp::socket& socket, tcp::endpoint endpoint,
-        std::span<const uint8_t> query, std::vector<uint8_t>& response) {
+    net::awaitable<Reply> ExchangeOverStream(std::span<const uint8_t> query,
+                                             std::chrono::milliseconds timeout) {
+        auto owner = shared_from_this();
+        if (const auto refusal = Refusal(timeout)) co_return Reply{{}, refusal};
+        ActiveExchange active(*this);
+        common::CheckTestAllocationFault();
+        InFlight<tcp::socket> exchange(*this, streams_);
+        tcp::socket& socket = exchange.socket;
+        if (!scheduler_.ScheduleAfter(timeout, exchange)) {
+            co_return Failure(exchange, io_error::operation_aborted);
+        }
         const auto bad_message = std::make_error_code(std::errc::bad_message);
-        auto [connect_error] = co_await socket.async_connect(endpoint, net::as_tuple(net::use_awaitable));
-        if (connect_error) co_return connect_error;
+        auto [connect_error] = co_await socket.async_connect(
+            tcp::endpoint(endpoint_.address(), endpoint_.port()), net::as_tuple(net::use_awaitable));
+        if (connect_error) co_return Failure(exchange, connect_error);
         // RFC 1035 §4.2.2: each TCP message carries a two-octet length prefix.
         std::array<uint8_t, 2> length{};
         common::StoreU16BE(length.data(), static_cast<uint16_t>(query.size()));
@@ -466,28 +465,31 @@ private:
             net::buffer(length), net::buffer(query.data(), query.size())};
         auto [write_error, written] = co_await net::async_write(
             socket, request, net::as_tuple(net::use_awaitable));
-        if (write_error) co_return write_error;
+        if (write_error) co_return Failure(exchange, write_error);
         auto [prefix_error, prefix_size] = co_await net::async_read(
             socket, net::buffer(length), net::as_tuple(net::use_awaitable));
-        if (prefix_error) co_return prefix_error;
+        if (prefix_error) co_return Failure(exchange, prefix_error);
         const size_t expected = common::LoadU16BE(length.data());
-        if (expected < 12) co_return bad_message;
+        if (expected < 12) co_return Failure(exchange, bad_message);
         // Grow with bytes that actually arrived, never by the declared length.
-        response.resize(std::min(expected, kDnsUdpPayloadSize));
+        Reply reply;
+        reply.bytes.resize(std::min(expected, kDnsUdpPayloadSize));
         size_t received = 0;
         while (received < expected) {
-            if (received == response.size()) response.resize(std::min(expected, response.size() * 2));
+            if (received == reply.bytes.size()) {
+                reply.bytes.resize(std::min(expected, reply.bytes.size() * 2));
+            }
             auto [read_error, read] = co_await socket.async_read_some(
-                net::buffer(response.data() + received, response.size() - received),
+                net::buffer(reply.bytes.data() + received, reply.bytes.size() - received),
                 net::as_tuple(net::use_awaitable));
-            if (read_error) co_return read_error;
+            if (read_error) co_return Failure(exchange, read_error);
             received += read;
         }
-        if (common::LoadU16BE(response.data()) != common::LoadU16BE(query.data()) ||
-            !Matches(response, query)) {
-            co_return bad_message;
+        if (common::LoadU16BE(reply.bytes.data()) != common::LoadU16BE(query.data()) ||
+            !Matches(reply.bytes, query)) {
+            co_return Failure(exchange, bad_message);
         }
-        co_return IoErrorCode{};
+        co_return reply;
     }
 
     // RFC 1035 does not require an error reply to echo the question. Accept a

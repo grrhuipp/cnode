@@ -86,7 +86,7 @@ TEST_F(TcpStreamIoTest, NativeReadReturnsPeerPayload) {
     EXPECT_EQ(received, sent);
 }
 
-enum class ReadKind { Readiness, Bytes, MultiBuffer };
+enum class ReadKind { Bytes, MultiBuffer };
 class NativeReadCancellation : public TcpStreamIoTest,
                                public ::testing::WithParamInterface<ReadKind> {};
 
@@ -96,9 +96,6 @@ TEST_P(NativeReadCancellation, CancelsPendingOperationWithoutClosingConnection) 
     auto read = [&]() -> net::awaitable<void> {
         try {
             switch (GetParam()) {
-            case ReadKind::Readiness:
-                cancelled = co_await stream_.WaitReadable() == net::error::operation_aborted;
-                break;
             case ReadKind::Bytes: {
                 char byte{};
                 (void)co_await stream_.AsyncRead(net::buffer(&byte, 1));
@@ -141,7 +138,7 @@ TEST_P(NativeReadCancellation, CancelsPendingOperationWithoutClosingConnection) 
 }
 
 INSTANTIATE_TEST_SUITE_P(AllNativeReads, NativeReadCancellation,
-    ::testing::Values(ReadKind::Readiness, ReadKind::Bytes, ReadKind::MultiBuffer));
+    ::testing::Values(ReadKind::Bytes, ReadKind::MultiBuffer));
 
 TEST_F(TcpStreamIoTest, QueuedReadinessOwnsPayloadUntilCallbackCompletes) {
     auto payload = ::common::BufferGuard{::common::Buffer::New()};

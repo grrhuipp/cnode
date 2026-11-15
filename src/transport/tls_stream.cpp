@@ -4,6 +4,7 @@
 #include "transport/tls_context.hpp"
 #include "transport/async_write_gate.hpp"
 #include "transport/stream_settings.hpp"
+#include "transport/connection_timeouts.hpp"
 #include "infra/log.hpp"
 #include <openssl/bio.h>
 #include <openssl/err.h>
@@ -299,7 +300,24 @@ struct TlsStream::Impl final : private common::CancellationSubscription {
         if (generation != input_generation) co_return;
         const auto cancellation = co_await net::this_coro::cancellation_state;
         InputWait waiting(*this, deferred ? net::cancellation_slot{} : cancellation.slot());
-        const auto ec = co_await tcp->WaitReadable(waiting.bridge.Slot());
+        // A coroutine that throws on cancellation never starts the wait, even
+        // when `deferred` would let a changed generation retry SSL.
+        if (cancellation.cancelled() != net::cancellation_type::none &&
+            co_await net::this_coro::throw_if_cancelled())
+            throw IoSystemError(io_error::operation_aborted);
+        // Payload-free socket wait: ciphertext is received by the BIO, so only
+        // the cancellation subscription and read deadline span the suspension.
+        auto ready = tcp->ReadableWithoutWait();
+        if (!ready) {
+            WriteCompletion completion(tcp->Cancellation());
+            OperationTimeoutScope<TcpStream, true> timeout_scope{*tcp, true};
+            IoErrorCode wait_ec = io_error::operation_aborted;
+            if (!completion.Cancelled() &&
+                cancellation.cancelled() == net::cancellation_type::none)
+                wait_ec = co_await tcp->WaitSocketReadable(waiting.bridge.Slot());
+            ready = tcp->FinishReadableWait(wait_ec, completion.Cancelled());
+        }
+        const IoErrorCode ec = *ready;
         CheckCancellation(epoch);
         if (!deferred && cancellation.cancelled() != net::cancellation_type::none)
             throw IoSystemError(io_error::operation_aborted);

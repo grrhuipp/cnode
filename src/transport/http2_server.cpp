@@ -115,11 +115,14 @@ bool Http2ServerSubStreamState::EnqueueData(
         if (upload_budget) upload_budget->Release(storage);
         throw;
     }
-    if (coalesced != 0) {
+    if (auto& added = *data_frames_.back().payload;
+        data_frames_.size() > 1 && added.start + coalesced != 0) {
         // Do not modify the old tail until the new allocation and deque entry
         // are committed: rejection must leave every input byte unqueued.
+        // Behind another frame the payload moves to the front of its
+        // allocation, wherever it lay in the received Buffer, so that only
+        // the head and the tail of the queue hold slack.
         auto& tail = *data_frames_[data_frames_.size() - 2].payload;
-        auto& added = *data_frames_.back().payload;
         std::memcpy(tail.data + tail.end, added.data + added.start, coalesced);
         tail.end += coalesced;
         const size_t remaining = size - coalesced;
@@ -251,7 +254,9 @@ net::awaitable<common::MultiBuffer> Http2ServerSubStreamState::ReadMultiBuffer()
 }
 
 net::awaitable<void> Http2ServerSubStreamState::WriteBuffers(
-    std::span<const net::const_buffer> buffers) {
+    std::span<const net::const_buffer> buffers, common::MultiBuffer owned) {
+    const H2WriteBody body(buffers, owned);
+    buffers = body.Buffers();
     auto session = LockWritableSession();
     if (payload_codec_ == H2PayloadCodec::RawData) {
         const bool has_data = std::any_of(buffers.begin(), buffers.end(),
@@ -610,6 +615,7 @@ void Http2ServerSession::CancelAll(IoErrorCode error) noexcept {
     if (stream_) {
         stream_->CloseAbortive();
     }
+    frame_reader_.Clear();
 }
 
 net::awaitable<bool> Http2ServerSession::WriteFrameSerialized(
@@ -678,7 +684,8 @@ net::awaitable<bool> Http2ServerSession::WriteTrailersSerialized(uint32_t stream
 net::awaitable<void> Http2ServerSession::RunReadLoop() {
     try {
         while (!cancelled_ && stream_) {
-            auto frame = co_await ReadH2Frame(*stream_);
+            auto frame = frame_reader_.TryNext();
+            if (!frame) frame = co_await frame_reader_.Next(*stream_);
             if (!frame) {
                 const bool ended = std::all_of(streams_.begin(), streams_.end(),
                     [](const auto& entry) { return entry.second->InputEnded(); });
@@ -1086,7 +1093,7 @@ net::awaitable<bool> Http2ServerSession::ReceiveHeaders(H2Frame frame) {
             ? TryParseSingleH2RequestHeaders(
                   hpack_decoder_, frame, real_ip_header, trailers || closed_client_stream)
             : co_await ParseH2RequestHeaders(
-                  *stream_, hpack_decoder_, std::move(frame),
+                  *stream_, frame_reader_, hpack_decoder_, std::move(frame),
                   real_ip_header, trailers || closed_client_stream);
     } catch (const std::bad_alloc&) {
         CancelAll();

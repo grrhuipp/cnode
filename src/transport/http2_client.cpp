@@ -51,6 +51,17 @@ public:
         return inbound_.ReadMultiBuffer(*this);
     }
 
+    net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
+        // Nothing to frame: the base class releases an empty buffer.
+        if (mb.byte_size() == 0) {
+            return AsyncStream::WriteMultiBuffer(std::move(mb));
+        }
+        if (payload_codec_ == H2PayloadCodec::RawData) {
+            return SendData({}, std::move(mb));
+        }
+        return WriteGrpcBuffers({}, std::move(mb));
+    }
+
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override {
         if (payload_codec_ == H2PayloadCodec::RawData) {
@@ -101,6 +112,7 @@ public:
         inbound_.decoder.Clear();
         ReleaseDataFrame();
         received_.clear();
+        frame_reader_.Clear();
         inner_->Close();
     }
 
@@ -116,6 +128,7 @@ public:
         inbound_.decoder.Clear();
         ReleaseDataFrame();
         received_.clear();
+        frame_reader_.Clear();
         inner_->CloseAbortive();
     }
 
@@ -146,8 +159,9 @@ private:
     };
 
     net::awaitable<void> WriteGrpcBuffers(
-        std::span<const net::const_buffer> buffers) {
-        for (const auto& buffer : buffers) {
+        std::span<const net::const_buffer> buffers, common::MultiBuffer owned = {}) {
+        const H2WriteBody body(buffers, owned);
+        for (const auto& buffer : body.Buffers()) {
             if (buffer.size() == 0) {
                 continue;
             }
@@ -251,8 +265,10 @@ private:
     // Sends body bytes as DATA frames within the peer's connection and stream
     // windows (RFC 9113 6.9.1). The physical write gate is held per frame, so
     // a reader pumping frames can still answer SETTINGS and PING meanwhile.
-    net::awaitable<void> SendData(std::span<const net::const_buffer> buffers) {
-        H2DataCursor cursor(buffers);
+    net::awaitable<void> SendData(std::span<const net::const_buffer> buffers,
+                                  common::MultiBuffer owned = {}) {
+        const H2WriteBody body(buffers, owned);
+        H2DataCursor cursor(body.Buffers());
         const auto cancellation = co_await net::this_coro::cancellation_state;
         while (cursor.Remaining() != 0) {
             if (cancellation.cancelled() != net::cancellation_type::none) {
@@ -342,7 +358,8 @@ private:
         try {
             std::optional<H2Frame> frame;
             try {
-                frame = co_await ReadH2Frame(*inner_);
+                frame = frame_reader_.TryNext();
+                if (!frame) frame = co_await frame_reader_.Next(*inner_);
             } catch (const IoSystemError& error) {
                 if (error.code() == io_error::operation_aborted) {
                     store_failure = false;
@@ -792,7 +809,7 @@ private:
         const bool end_stream = (frame.flags & kFlagEndStream) != 0;
         ResponseHeaderValidator validator;
         const auto decoded = co_await ReadH2HeaderFields(
-            *inner_, response_decoder_, std::move(frame),
+            *inner_, frame_reader_, response_decoder_, std::move(frame),
             [&validator](std::string_view name, std::string_view value) {
                 validator.OnField(name, value);
             });
@@ -816,7 +833,7 @@ private:
         }
         ResponseTrailerValidator validator;
         const auto decoded = co_await ReadH2HeaderFields(
-            *inner_, response_decoder_, std::move(frame),
+            *inner_, frame_reader_, response_decoder_, std::move(frame),
             [&validator](std::string_view name, std::string_view value) {
                 validator.OnField(name, value);
             });
@@ -835,6 +852,8 @@ private:
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
     H2InboundPayload inbound_;
     HpackDecoder response_decoder_;
+    // Bytes read from inner_ ahead of the frame being pumped.
+    H2FrameReader frame_reader_;
     // Received DATA the reader has not taken yet.
     common::RingDeque<QueuedDataFrame> received_;
     // Current DATA frame payload; data_frame_->Bytes() is unread body.

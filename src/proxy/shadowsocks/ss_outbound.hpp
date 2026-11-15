@@ -79,8 +79,11 @@ public:
         // Keep one absolute read budget across unauthenticated or wrong-source
         // packets. Only an authenticated payload is valid receive activity.
         auto read = socket_.StartRead();
+        const auto cancellation_state = co_await net::this_coro::cancellation_state;
         while (true) {
-            auto packet = co_await read.Receive();
+            auto received = read.TryReceive(cancellation_state);
+            if (!received) received = co_await read.Receive();
+            auto& packet = *received;
             if (!server_endpoint_ || packet.source != *server_endpoint_) continue;
             const auto bytes = packet.payload.FrontSpan();
             auto decoded = ss2022_state_
@@ -116,7 +119,9 @@ public:
             throw transport::LinkError(common::ErrorCode::INTERNAL);
         encoded->Produce(encoded_len);
         payload.clear();
-        co_await write.SendTo(*server_endpoint_, common::MultiBuffer{std::move(encoded)});
+        common::MultiBuffer packet{std::move(encoded)};
+        if (!write.TrySendTo(*server_endpoint_, packet, co_await net::this_coro::cancellation_state))
+            co_await write.SendTo(*server_endpoint_, std::move(packet));
     }
 private:
     size_t EncodedPacketSize(const common::TargetAddress& target, std::span<const uint8_t> payload) {

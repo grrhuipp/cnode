@@ -2,89 +2,107 @@
 #include "transport/http2_session.hpp"
 
 namespace transport {
-// Returns nullopt only on a clean EOF at a frame boundary.
-net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream) {
-    std::array<uint8_t, kHttp2FrameHeaderSize> header{};
-    size_t received = 0;
-    while (received != header.size()) {
-        size_t n = 0;
-        try {
-            n = co_await stream.AsyncRead(
-                net::buffer(header.data() + received, header.size() - received));
-        } catch (const IoSystemError& error) {
-            if (received != 0 && error.code() == io_error::operation_aborted) {
-                throw IoSystemError(io_error::connection_reset, "cancelled mid-HTTP/2 frame header");
-            }
-            throw;
-        }
-        if (n == 0) {
-            if (received == 0) co_return std::nullopt;
-            throw IoSystemError(io_error::connection_reset, "truncated HTTP/2 frame header");
-        }
-        received += n;
+std::optional<H2Frame> H2FrameReader::TryNext() {
+    const common::Buffer* received = read_ahead_.FrontBuffer();
+    if (header_size_ != header_.size()) {
+        if (!received) return std::nullopt;
+        const size_t take = std::min(header_.size() - header_size_, received->Len());
+        std::memcpy(header_.data() + header_size_, received->Bytes().data(), take);
+        header_size_ += static_cast<uint8_t>(take);
+        read_ahead_.DropPrefixBytes(take);
+        if (header_size_ != header_.size()) return std::nullopt;
+        received = read_ahead_.FrontBuffer();
     }
-
-    H2Frame frame;
-    const uint32_t length = common::LoadU24BE(header.data());
-    frame.type = static_cast<H2FrameType>(header[3]);
-    frame.flags = header[4];
-    frame.stream_id = common::LoadU32BE(header.data() + 5) & 0x7fff'ffffu;
-
-    if (length > kHttp2MaxFramePayload) {
+    const size_t payload_size = common::LoadU24BE(header_.data());
+    if (payload_size > kHttp2MaxFramePayload) {
         throw IoSystemError(io_error::message_size, "HTTP/2 frame exceeds receive limit");
     }
-    if (length > 0) {
-        try {
-            if (length <= H2Frame::kInlinePayloadCapacity) {
-                size_t filled = 0;
-                while (filled < length) {
-                    const size_t n = co_await stream.AsyncRead(
-                        net::buffer(frame.inline_payload.data() + filled, length - filled));
-                    if (n == 0) {
-                        throw IoSystemError(
-                            io_error::connection_reset, "truncated HTTP/2 frame payload");
-                    }
-                    filled += n;
-                }
-                frame.inline_size = static_cast<uint8_t>(length);
-            } else {
-                frame.buffer_payload.reset(common::Buffer::New());
-                if (!frame.buffer_payload) {
-                    throw std::bad_alloc();
-                }
-                size_t filled = 0;
-                while (filled < length) {
-                    if (filled == frame.buffer_payload->capacity) {
-                        const size_t next_cap = std::min<size_t>(
-                            length, frame.buffer_payload->capacity * 2);
-                        common::BufferGuard grown{common::Buffer::New(next_cap)};
-                        if (!grown) {
-                            throw std::bad_alloc();
-                        }
-                        std::memcpy(grown->data, frame.buffer_payload->data, filled);
-                        grown->Produce(filled);
-                        frame.buffer_payload = std::move(grown);
-                    }
-                    const size_t want = std::min<size_t>(
-                        length - filled, frame.buffer_payload->Available());
-                    const size_t n = co_await stream.AsyncRead(
-                        net::buffer(frame.buffer_payload->Tail().data(), want));
-                    if (n == 0) {
-                        throw IoSystemError(
-                            io_error::connection_reset, "truncated HTTP/2 frame payload");
-                    }
-                    frame.buffer_payload->Produce(n);
-                    filled += n;
-                }
+    const bool fits_inline = payload_size <= H2Frame::kInlinePayloadCapacity;
+    const size_t filled = fits_inline ? frame_.inline_size
+        : frame_.buffer_payload ? frame_.buffer_payload->Len() : 0;
+    if (filled != payload_size) {
+        if (!received) return std::nullopt;
+        const size_t take = std::min(payload_size - filled, received->Len());
+        if (fits_inline) {
+            std::memcpy(frame_.inline_payload.data() + filled, received->Bytes().data(), take);
+            frame_.inline_size = static_cast<uint8_t>(filled + take);
+            read_ahead_.DropPrefixBytes(take);
+        } else if (!frame_.buffer_payload && take == received->Len()) {
+            frame_.buffer_payload = read_ahead_.pop_front();
+        } else {
+            AppendPayload(received->Bytes().first(take), payload_size);
+            read_ahead_.DropPrefixBytes(take);
+        }
+        if (filled + take != payload_size) return std::nullopt;
+    }
+    frame_.type = static_cast<H2FrameType>(header_[3]);
+    frame_.flags = header_[4];
+    frame_.stream_id = common::LoadU32BE(header_.data() + 5) & 0x7fff'ffffu;
+    header_size_ = 0;
+    std::optional<H2Frame> frame{std::move(frame_)};
+    frame_.inline_size = 0;
+    return frame;
+}
+
+// Capacity follows the bytes that arrived: it doubles once they outgrow it and
+// stops at the frame's declared payload size.
+void H2FrameReader::AppendPayload(std::span<const uint8_t> bytes, size_t payload_size) {
+    auto& payload = frame_.buffer_payload;
+    if (!payload) {
+        payload.reset(common::Buffer::New(bytes.size()));
+        if (!payload) {
+            throw std::bad_alloc();
+        }
+    } else if (bytes.size() > payload->Available()) {
+        const size_t filled = payload->Len();
+        if (bytes.size() <= payload->capacity - filled) {
+            payload->CompactToFront();
+        } else {
+            common::BufferGuard grown{common::Buffer::New(std::min(
+                payload_size, std::max(filled + bytes.size(), payload->capacity * 2)))};
+            if (!grown) {
+                throw std::bad_alloc();
             }
+            std::memcpy(grown->data, payload->Bytes().data(), filled);
+            grown->Produce(filled);
+            payload = std::move(grown);
+        }
+    }
+    std::memcpy(payload->Tail().data(), bytes.data(), bytes.size());
+    payload->Produce(bytes.size());
+}
+
+net::awaitable<std::optional<H2Frame>> H2FrameReader::Next(AsyncStream& stream) {
+    for (;;) {
+        // The part of a frame that an interrupted read tears, fixed before
+        // suspending: Clear() may run while the read is pending.
+        const char* const torn = header_size_ == 0 ? nullptr
+            : header_size_ != header_.size() ? "header" : "payload";
+        common::MultiBuffer received;
+        try {
+            received = co_await stream.ReadMultiBuffer();
         } catch (const IoSystemError& error) {
-            if (error.code() == io_error::operation_aborted) {
-                throw IoSystemError(io_error::connection_reset, "cancelled mid-HTTP/2 frame payload");
+            if (torn && error.code() == io_error::operation_aborted) {
+                throw IoSystemError(io_error::connection_reset,
+                                    std::string("cancelled mid-HTTP/2 frame ") + torn);
             }
             throw;
         }
+        if (received.empty()) {
+            if (!torn) co_return std::nullopt;
+            throw IoSystemError(io_error::connection_reset,
+                                std::string("truncated HTTP/2 frame ") + torn);
+        }
+        read_ahead_ = std::move(received);
+        if (auto frame = TryNext()) co_return frame;
     }
-    co_return frame;
+}
+
+void H2FrameReader::Clear() noexcept {
+    read_ahead_.clear();
+    header_size_ = 0;
+    frame_.inline_size = 0;
+    frame_.buffer_payload.reset();
 }
 
 // 写入失败抛异常并淘汰物理连接，绝不返回可被误认为健康流的失败值。
@@ -403,11 +421,11 @@ TryParseSingleH2RequestHeaders(
 
 [[nodiscard]] net::awaitable<tl::expected<std::optional<H2RequestHeaders>, H2Error>>
 ParseH2RequestHeaders(
-    AsyncStream& stream, HpackDecoder& decoder, H2Frame frame,
+    AsyncStream& stream, H2FrameReader& frames, HpackDecoder& decoder, H2Frame frame,
     std::string_view real_ip_header, bool trailers) {
     H2RequestHeaderCollector collector(real_ip_header, trailers);
     const auto decoded = co_await ReadH2HeaderFields(
-        stream, decoder, std::move(frame),
+        stream, frames, decoder, std::move(frame),
         [&collector](std::string_view name, std::string_view value) {
             collector.OnField(name, value);
         });

@@ -70,7 +70,9 @@ public:
 
     net::awaitable<size_t> AsyncRead(net::mutable_buffer buffer);
     net::awaitable<common::MultiBuffer> ReadMultiBuffer();
-    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers);
+    // `owned`, when set, is the body and stays alive until its last frame is written.
+    net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers,
+                                      common::MultiBuffer owned = {});
     net::awaitable<void> AsyncShutdownWrite();
 
     void ReleaseOwner() noexcept {
@@ -168,7 +170,11 @@ public:
             mb.clear();
             throw IoSystemError(io_error::connection_reset, "gRPC WriteMultiBuffer on closed stream");
         }
-        return AsyncStream::WriteMultiBuffer(std::move(mb));
+        // Nothing to frame: the base class releases an empty buffer.
+        if (mb.byte_size() == 0) {
+            return AsyncStream::WriteMultiBuffer(std::move(mb));
+        }
+        return state_->WriteBuffers({}, std::move(mb));
     }
 
     net::awaitable<void> WriteBuffers(
@@ -385,6 +391,8 @@ private:
     app::GroupCoordinator& coordinator_;
     net::io_context& io_context_;
     std::unique_ptr<AsyncStream> stream_;
+    // Bytes read from stream_ ahead of the frame the read loop is handling.
+    H2FrameReader frame_reader_;
     std::shared_ptr<InboundTransportStreamHandler> stream_handler_;
     AsyncWriteGate write_gate_;
     std::unordered_map<uint32_t, std::shared_ptr<Http2ServerSubStreamState>>

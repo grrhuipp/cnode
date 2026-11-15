@@ -87,12 +87,78 @@ struct H2Frame {
     }
 };
 
-net::awaitable<std::optional<H2Frame>> ReadH2Frame(AsyncStream& stream);
+// Read side of one HTTP/2 connection. Bytes arrive as whole received Buffers
+// and are parsed in place; what follows a returned frame stays here, so this
+// is the only reader of the connection once its first frame is requested.
+// A received Buffer is released as soon as it drains, and a frame whose bytes
+// have not all arrived holds its header and the payload received so far,
+// growing with arrival and never by the declared length.
+class H2FrameReader final {
+public:
+    H2FrameReader() noexcept = default;
+    H2FrameReader(const H2FrameReader&) = delete;
+    H2FrameReader& operator=(const H2FrameReader&) = delete;
+
+    // The next frame when all its bytes are buffered, without suspending. A
+    // payload beyond the inline capacity takes over the received Buffer when
+    // nothing follows it there; it is copied when another frame follows in
+    // the Buffer, and assembled by copying when it straddles Buffers.
+    [[nodiscard]] std::optional<H2Frame> TryNext();
+
+    // The waiting half, entered only when TryNext came up empty: reads
+    // `stream` until a frame completes. Returns nullopt only on a clean EOF
+    // at a frame boundary.
+    net::awaitable<std::optional<H2Frame>> Next(AsyncStream& stream);
+
+    // Drops the buffered bytes and the frame under assembly. They are not
+    // replayed: only for a connection that is closed.
+    void Clear() noexcept;
+
+private:
+    void AppendPayload(std::span<const uint8_t> bytes, size_t payload_size);
+
+    // Received bytes not parsed yet; empty whenever Next() waits.
+    common::MultiBuffer read_ahead_;
+    // Frame under assembly: header_size_ octets of its header, then its
+    // payload in frame_ (inline_size or buffer_payload->Len() octets so far).
+    std::array<uint8_t, kHttp2FrameHeaderSize> header_{};
+    uint8_t header_size_ = 0;
+    H2Frame frame_;
+};
+
 net::awaitable<void> WriteH2FrameBuffers(
     AsyncStream&, H2FrameType, uint8_t, uint32_t,
     std::span<const net::const_buffer>);
 std::optional<std::span<const uint8_t>> H2HeaderBlockFragment(const H2Frame&);
 std::span<const uint8_t> H2DataPayload(const H2Frame&);
+
+// The body of one logical write: the caller's borrowed buffers, or the
+// MultiBuffer a write coroutine took over. `owned` lives in that coroutine's
+// frame until its last DATA frame is written; this releases it on every exit.
+class H2WriteBody final {
+public:
+    H2WriteBody(std::span<const net::const_buffer> borrowed,
+                common::MultiBuffer& owned) noexcept
+        : owned_(owned), buffers_(borrowed) {
+        if (!owned.empty()) {
+            const auto bytes = owned.FrontSpan();
+            owned_bytes_ = net::buffer(bytes.data(), bytes.size());
+            buffers_ = {&owned_bytes_, 1};
+        }
+    }
+    ~H2WriteBody() noexcept { owned_.clear(); }
+    H2WriteBody(const H2WriteBody&) = delete;
+    H2WriteBody& operator=(const H2WriteBody&) = delete;
+
+    [[nodiscard]] std::span<const net::const_buffer> Buffers() const noexcept {
+        return buffers_;
+    }
+
+private:
+    common::MultiBuffer& owned_;
+    net::const_buffer owned_bytes_;
+    std::span<const net::const_buffer> buffers_;
+};
 
 // Sans-I/O cursor slicing body buffers into DATA frame payloads without
 // copying. Each payload fits WriteH2FrameBuffers beside the frame header.
@@ -272,7 +338,8 @@ template <typename Visitor>
 // here is a connection error: the HPACK state can no longer be trusted.
 template <typename Visitor>
 net::awaitable<tl::expected<void, H2Error>> ReadH2HeaderFields(
-    AsyncStream& stream, HpackDecoder& decoder, H2Frame frame, Visitor&& on_field) {
+    AsyncStream& stream, H2FrameReader& frames, HpackDecoder& decoder, H2Frame frame,
+    Visitor&& on_field) {
     if ((frame.flags & kFlagEndHeaders) != 0) {
         co_return DecodeSingleH2HeaderBlock(
             decoder, frame, std::forward<Visitor>(on_field));
@@ -287,7 +354,8 @@ net::awaitable<tl::expected<void, H2Error>> ReadH2HeaderFields(
     }
     std::vector<uint8_t> block(fragment->begin(), fragment->end());
     while (true) {
-        auto continuation = co_await ReadH2Frame(stream);
+        auto continuation = frames.TryNext();
+        if (!continuation) continuation = co_await frames.Next(stream);
         if (!continuation ||
             continuation->type != H2FrameType::CONTINUATION ||
             continuation->stream_id != stream_id) {
@@ -361,7 +429,7 @@ std::vector<uint8_t> EncodeHttpResponseHeaders(
 TryParseSingleH2RequestHeaders(
     HpackDecoder&, const H2Frame&, std::string_view, bool);
 net::awaitable<tl::expected<std::optional<H2RequestHeaders>, H2Error>> ParseH2RequestHeaders(
-    AsyncStream&, HpackDecoder&, H2Frame, std::string_view, bool);
+    AsyncStream&, H2FrameReader&, HpackDecoder&, H2Frame, std::string_view, bool);
 [[nodiscard]] inline std::array<uint8_t, 8> EncodeGoaway(
     uint32_t last_stream, H2Error error) noexcept {
     std::array<uint8_t, 8> payload{};

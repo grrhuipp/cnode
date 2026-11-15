@@ -178,6 +178,7 @@ struct RelayTargetAdapter {
     void* target = nullptr;
     common::CancellationSource* cancellation = nullptr;
     net::awaitable<common::MultiBuffer> (*read)(void*) = nullptr;
+    bool (*try_read)(void*, common::MultiBuffer&) noexcept = nullptr;
     net::awaitable<void> (*write)(void*, common::MultiBuffer) = nullptr;
     net::awaitable<void> (*shutdown_write)(void*, bool preserve_phase_deadline) = nullptr;
     transport::EofAction (*read_eof_action)(const void*) noexcept = nullptr;
@@ -219,6 +220,14 @@ net::awaitable<RelayResult> DoRelayLink(
         .cancellation = std::addressof(target.Cancellation()),
         .read = +[](void* p) -> net::awaitable<common::MultiBuffer> {
             return static_cast<TargetEndpoint*>(p)->ReadMultiBuffer();
+        },
+        .try_read = +[](void* p, common::MultiBuffer& out) noexcept -> bool {
+            auto& endpoint = *static_cast<TargetEndpoint*>(p);
+            if constexpr (requires { endpoint.TryReadMultiBuffer(out); }) {
+                return endpoint.TryReadMultiBuffer(out);
+            } else {
+                return false;
+            }
         },
         .write = +[](void* p, common::MultiBuffer payload) -> net::awaitable<void> {
             return static_cast<TargetEndpoint*>(p)->WriteMultiBuffer(std::move(payload));

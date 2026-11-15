@@ -66,10 +66,7 @@ public:
         , is_udp_(is_udp)
         , udp_target_(udp_target) {}
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
-        if (!is_udp_) {
-            return session_.DecodeResponse(stream_);
-        }
-        return ReadUdpMultiBuffer();
+        return session_.DecodeResponse(stream_, is_udp_ ? &udp_target_ : nullptr);
     }
 
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
@@ -96,14 +93,6 @@ public:
     }
 
 private:
-    net::awaitable<common::MultiBuffer> ReadUdpMultiBuffer() {
-        auto mb = co_await session_.DecodeResponse(stream_);
-        if (mb.byte_size() != 0 && !common::SetUdpTarget(mb, udp_target_)) {
-            throw std::bad_alloc();
-        }
-        co_return mb;
-    }
-
     proxy::ClientSession& session_;
     bool is_udp_ = false;
     const common::TargetAddress& udp_target_;

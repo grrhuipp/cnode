@@ -14,6 +14,7 @@
 
 namespace transport {
 
+template<class Timeouts, bool IsRead> struct OperationTimeoutScope;
 
 // ============================================================================
 // TcpStream - TCP 流实现
@@ -53,9 +54,6 @@ public:
 
     // ── 超时控制 & 端点查询（仅 TcpStream 实现，非虚）─────────────────────────
     tcp::socket::executor_type GetExecutor() noexcept;
-    // 仅等待底层 socket 可读，不接收数据、不申请 payload Buffer。
-    // TLS 层用它将 8KB 申请延后到首个可读事件之后。
-    net::awaitable<IoErrorCode> WaitReadable(net::cancellation_slot cancellation = {});
     tcp::endpoint LocalEndpoint() const;
     tcp::endpoint RemoteEndpoint() const;
     void SetIdleTimeout(std::chrono::seconds timeout);
@@ -95,10 +93,21 @@ private:
         common::MultiBuffer owned = {},
         bool is_multi_buffer = false);
     friend class TlsStream;
+    template<class Timeouts, bool IsRead> friend struct OperationTimeoutScope;
     [[nodiscard]] bool CanRead() const noexcept;
     [[nodiscard]] bool CanWrite() const noexcept;
     [[nodiscard]] bool TryConsumeReadableBudget() noexcept;
     void ResetReadableBudget() noexcept;
+    // Steps of the TLS layer's payload-free readable wait, which suspends in
+    // TlsStream's own coroutine frame: early result, the read slot contract
+    // of OperationTimeoutScope, the socket wait, then the drain budget.
+    [[nodiscard]] std::optional<IoErrorCode> ReadableWithoutWait() noexcept;
+    [[nodiscard]] bool IsPending(bool is_read) const noexcept;
+    void BeginRead();
+    void EndRead() noexcept;
+    [[nodiscard]] net::awaitable<IoErrorCode> WaitSocketReadable(
+        net::cancellation_slot cancellation);
+    [[nodiscard]] IoErrorCode FinishReadableWait(IoErrorCode ec, bool cancelled) noexcept;
     [[nodiscard]] std::size_t ReadAvailable(
         net::mutable_buffer target, IoErrorCode& error) noexcept;
     // One nonblocking attempt; only WriteBuffersFrom waits and owns write deadlines.
@@ -112,9 +121,16 @@ private:
         bool deferred,
         net::cancellation_type coro_cancelled);
 
-    net::awaitable<std::pair<IoErrorCode, std::size_t>> AsyncReceiveSome(
-        net::mutable_buffer buffer,
-        bool peek = false);
+    // Receive result as the PROXY-protocol reader consumes it; AsyncRead maps
+    // it to its own contract. A read that needs no readiness wait completes in
+    // TryReceiveSome without a coroutine frame.
+    using ReceiveResult = std::pair<IoErrorCode, std::size_t>;
+    [[nodiscard]] std::optional<ReceiveResult> TryReceiveSome(
+        net::mutable_buffer buffer, bool peek, net::cancellation_type coro_cancelled);
+    [[nodiscard]] std::optional<ReceiveResult> ReceiveAvailable(
+        net::mutable_buffer buffer, bool peek, bool aborted) noexcept;
+    net::awaitable<ReceiveResult> ReceiveSomeWhenReadable(
+        net::mutable_buffer buffer, bool peek);
 
     [[nodiscard]] size_t ConsumePendingData(net::mutable_buffer target) noexcept;
     void ReleasePendingData() noexcept;

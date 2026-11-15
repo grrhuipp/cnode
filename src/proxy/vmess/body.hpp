@@ -222,7 +222,10 @@ public:
     // Empty result: EOF chunk, or transport EOF exactly at a record boundary.
     // Transport EOF inside a record, authentication failure and other real
     // errors are terminal; subsequent reads throw connection_reset.
-    net::awaitable<common::MultiBuffer> Read(transport::MultiBufferReader& src);
+    // In packet mode a non-null udp_target, which must outlive the read, tags
+    // every non-empty datagram returned.
+    net::awaitable<common::MultiBuffer> Read(transport::MultiBufferReader& src,
+                                             const common::TargetAddress* udp_target = nullptr);
 
     // Exact read through the same buffered input, for the response header
     // that precedes the body. `filled` is caller-owned progress.
@@ -288,7 +291,9 @@ public:
     // chunks; empty at the end of the response body.
     // Authentication/truncation and real I/O errors are terminal; a cancelled
     // read instead preserves the current header/body progress for resumption.
-    net::awaitable<common::MultiBuffer> DecodeResponse(transport::AsyncStream& stream);
+    // udp_target: as for BodyDecoder::Read.
+    net::awaitable<common::MultiBuffer> DecodeResponse(
+        transport::AsyncStream& stream, const common::TargetAddress* udp_target = nullptr);
 
 private:
     struct SessionKeys {
@@ -299,7 +304,8 @@ private:
 
     [[nodiscard]] static SessionKeys GenerateKeys();
     net::awaitable<void> DecodeResponseHeader(transport::AsyncStream& stream);
-    net::awaitable<common::MultiBuffer> DecodeFirstResponse(transport::AsyncStream& stream);
+    net::awaitable<common::MultiBuffer> DecodeFirstResponse(
+        transport::AsyncStream& stream, const common::TargetAddress* udp_target);
 
     VmessSecurity security_ = VmessSecurity::AES_128_GCM;
     SessionKeys keys_;
@@ -336,15 +342,10 @@ public:
     }
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
-        if (!is_udp_) {
-            return decoder_.Read(*stream_);
-        }
-        return ReadUdpMultiBuffer();
+        return decoder_.Read(*stream_, is_udp_ ? &udp_target_ : nullptr);
     }
 
 private:
-    net::awaitable<common::MultiBuffer> ReadUdpMultiBuffer();
-
     BodyDecoder decoder_;
     transport::AsyncStream* stream_ = nullptr;
     bool is_udp_ = false;

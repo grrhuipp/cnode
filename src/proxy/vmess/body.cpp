@@ -451,7 +451,22 @@ net::awaitable<bool> BodyDecoder::ReadExact(transport::MultiBufferReader& src,
         src, pending_read_, out.data(), out.size(), &filled);
 }
 
-net::awaitable<common::MultiBuffer> BodyDecoder::Read(transport::MultiBufferReader& src) {
+namespace {
+
+// A packet-mode datagram that carries payload leaves the decoder tagged with
+// the session's fixed UDP target; an empty one is never tagged.
+common::MultiBuffer TargetedPacket(common::MultiBuffer packet,
+                                   const common::TargetAddress* udp_target) {
+    if (udp_target && packet.byte_size() != 0 && !common::SetUdpTarget(packet, *udp_target)) {
+        throw std::bad_alloc();
+    }
+    return packet;
+}
+
+}  // namespace
+
+net::awaitable<common::MultiBuffer> BodyDecoder::Read(transport::MultiBufferReader& src,
+                                                      const common::TargetAddress* udp_target) {
     // A later chunk in a stream batch can suspend after earlier chunks decoded.
     // Keep that output owned by the decoder until this invocation returns it.
     try {
@@ -540,7 +555,7 @@ net::awaitable<common::MultiBuffer> BodyDecoder::Read(transport::MultiBufferRead
                         sealed->end = sealed->start + static_cast<uint32_t>(opened);
                         FinishRecord();
                         if (packet_mode) {
-                            co_return common::MultiBuffer{std::move(sealed)};
+                            co_return TargetedPacket(common::MultiBuffer{std::move(sealed)}, udp_target);
                         }
                         if (sealed->IsEmpty()) {
                             break;
@@ -579,7 +594,7 @@ net::awaitable<common::MultiBuffer> BodyDecoder::Read(transport::MultiBufferRead
                         out_buf->Produce(static_cast<size_t>(opened));
                         pending_read_.DropPrefixBytes(chunk_len);
                         FinishRecord();
-                        co_return common::MultiBuffer{std::move(out_buf)};
+                        co_return TargetedPacket(common::MultiBuffer{std::move(out_buf)}, udp_target);
                     }
                     uint8_t* dst = pending_output_.PrepareAppend(max_plain);
                     const ssize_t opened = cipher_.Payload().Decrypt(
@@ -618,7 +633,7 @@ net::awaitable<common::MultiBuffer> BodyDecoder::Read(transport::MultiBufferRead
                 if (!appended) {
                     throw std::bad_alloc();
                 }
-                co_return out;
+                co_return TargetedPacket(std::move(out), udp_target);
             }
             if (opened == 0) {
                 FinishRecord();
@@ -918,18 +933,20 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(transport::AsyncStream&
     }
 }
 
-net::awaitable<common::MultiBuffer> ClientSession::DecodeResponse(transport::AsyncStream& stream) {
+net::awaitable<common::MultiBuffer> ClientSession::DecodeResponse(
+    transport::AsyncStream& stream, const common::TargetAddress* udp_target) {
     if (response_header_received_) {
-        return response_decoder_.Read(stream);
+        return response_decoder_.Read(stream, udp_target);
     }
-    return DecodeFirstResponse(stream);
+    return DecodeFirstResponse(stream, udp_target);
 }
 
-net::awaitable<common::MultiBuffer> ClientSession::DecodeFirstResponse(transport::AsyncStream& stream) {
+net::awaitable<common::MultiBuffer> ClientSession::DecodeFirstResponse(
+    transport::AsyncStream& stream, const common::TargetAddress* udp_target) {
     if (!response_header_received_) {
         co_await DecodeResponseHeader(stream);
     }
-    co_return co_await response_decoder_.Read(stream);
+    co_return co_await response_decoder_.Read(stream, udp_target);
 }
 
 // ============================================================================
@@ -1100,14 +1117,6 @@ RequestBodyReader::RequestBodyReader(const VMessRequest& request,
     , stream_(&stream)
     , is_udp_(request.command == VmessCommand::UDP)
     , udp_target_(is_udp_ ? request.target : common::TargetAddress{}) {}
-
-net::awaitable<common::MultiBuffer> RequestBodyReader::ReadUdpMultiBuffer() {
-    auto mb = co_await decoder_.Read(*stream_);
-    if (mb.byte_size() != 0 && !common::SetUdpTarget(mb, udp_target_)) {
-        throw std::bad_alloc();
-    }
-    co_return mb;
-}
 
 ResponseBodyWriter::ResponseBodyWriter(
     const VMessRequest& request,

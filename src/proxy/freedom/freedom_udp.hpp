@@ -26,8 +26,11 @@ public:
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
         auto read = socket_.StartRead();
+        const auto cancellation_state = co_await net::this_coro::cancellation_state;
         for (;;) {
-            auto packet = co_await read.Receive();
+            auto received = read.TryReceive(cancellation_state);
+            if (!received) received = co_await read.Receive();
+            auto& packet = *received;
             if (packet.source.port() == 0) {
                 continue;
             }
@@ -49,17 +52,19 @@ public:
         const common::TargetAddress& target = *datagram.target;
         if (write_closed_) throw transport::WriteClosed{};
         auto write = socket_.StartWrite();
+        udp::endpoint endpoint;
         if (target.resolved_addr) {
             if (target.resolved_addr->is_v6() != socket_.IsIPv6())
                 throw transport::LinkError(common::ErrorCode::INVALID_ARGUMENT);
-            // target 借用 payload 的元数据：先取出端点，再移交 payload。
-            const udp::endpoint endpoint(*target.resolved_addr, target.port);
-            co_await write.SendTo(endpoint, std::move(payload));
+            endpoint = udp::endpoint(*target.resolved_addr, target.port);
         } else {
-            auto endpoint = co_await ResolveUdpEndpoint(dns_, target, socket_, write);
-            if (!endpoint) throw transport::LinkError(endpoint.error());
-            co_await write.SendTo(*endpoint, std::move(payload));
+            auto resolved = co_await ResolveUdpEndpoint(dns_, target, socket_, write);
+            if (!resolved) throw transport::LinkError(resolved.error());
+            endpoint = *resolved;
         }
+        // target 借用 payload 的元数据：端点已取出，此后才移交 payload。
+        if (!write.TrySendTo(endpoint, payload, co_await net::this_coro::cancellation_state))
+            co_await write.SendTo(endpoint, std::move(payload));
     }
 
 private:

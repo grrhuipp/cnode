@@ -84,6 +84,13 @@ public:
     virtual ~MultiBufferReader() noexcept = default;
 
     virtual net::awaitable<common::MultiBuffer> ReadMultiBuffer() = 0;
+    // Synchronous step of ReadMultiBuffer(). True: one unit that
+    // ReadMultiBuffer() would have returned without suspending was moved into
+    // `out`. False: `out` is untouched; EOF, closure and errors are reported
+    // by ReadMultiBuffer() alone. Never waits or performs I/O: it hands out
+    // only what the reader's executor already queued, so a run of true
+    // results is bounded by that queue.
+    [[nodiscard]] virtual bool TryReadMultiBuffer(common::MultiBuffer&) noexcept { return false; }
     virtual common::CancellationSource& Cancellation() noexcept = 0;
     virtual EofAction ReadEofAction() const noexcept { return EofAction::WaitForPeer; }
     // Vision command 2 is a read-direction transition at an idle read boundary.
