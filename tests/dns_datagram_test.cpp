@@ -96,19 +96,10 @@ struct Peer {
             return packet;
         }
         packet[3] = refuse ? 0x82 : negative ? 0x83 : 0x80;
-        if ((negative || nodata) && !omit_soa) {
-            // Varying A samples by arrival order: the first sent gets the
-            // largest TTL, so only a true minimum over all samples matches.
-            uint32_t ttl = soa_ttl;
-            if (vary_a_soa_ttl) {
-                ttl = v6 ? 1000u : static_cast<uint32_t>(200 - ordinal * 30);
-                if (!v6) min_a_soa_ttl = std::min(min_a_soa_ttl, ttl);
-            }
-            AppendSoa(packet, ttl);
-        }
+        if ((negative || nodata) && !omit_soa) AppendSoa(packet, soa_ttl);
         if (refuse || negative || nodata ||
             (malformed_type != 0 && malformed_type != (v6 ? 28 : 1))) return packet;
-        const bool use_bulk = bulk_answers && (!bulk_only_first_a || (!v6 && ordinal == 1));
+        const bool use_bulk = bulk_answers != 0;
         const size_t count = use_bulk ? bulk_answers : 1;
         packet[6] = static_cast<uint8_t>(count >> 8);
         packet[7] = static_cast<uint8_t>(count);
@@ -201,7 +192,7 @@ struct Peer {
         auto group = std::move(queries.at(name));
         queries.erase(name);
         EXPECT_EQ(group.size(), batch_size) << "all queries must be outstanding together";
-        int ordinal = 4;
+        int ordinal = static_cast<int>(group.size());
         for (auto it = group.rbegin(); it != group.rend(); ++it) {
             auto packet = answer_override ? answer_override(*it) : Answer(*it, ordinal);
             if (!ignore_udp_limit && packet.size() > it->udp_limit) {
@@ -264,8 +255,7 @@ struct Peer {
             ++stream_closed;
             co_return;
         }
-        // The bulk-carrying sample is ordinal 1 when only the first A is bulk.
-        const auto packet = Answer(Inspect(std::move(bytes)), bulk_only_first_a ? 1 : 4);
+        const auto packet = Answer(Inspect(std::move(bytes)), 1);
         length = {static_cast<uint8_t>(packet.size() >> 8), static_cast<uint8_t>(packet.size())};
         const std::array<net::const_buffer, 2> reply{net::buffer(length), net::buffer(packet)};
         (void)co_await net::async_write(stream, reply, net::as_tuple(net::use_awaitable));
@@ -278,15 +268,13 @@ struct Peer {
     std::map<std::string, std::vector<Query>> queries;
     std::set<uint16_t> ports;
     std::map<uint16_t, std::bitset<65536>> ids;
-    size_t packets = 0, batch_size = 4, bulk_answers = 0;
+    size_t packets = 0, batch_size = 2, bulk_answers = 0;  // One A and one AAAA query.
     size_t stream_connections = 0, stream_queries = 0, stream_closed = 0, plain_queries = 0;
     bool hold = false, refuse = false, negative = false, nodata = false;
     bool reject_edns = false, reject_without_question = false;
     bool omit_soa = false, unrelated_soa = false, ignore_udp_limit = false;
     bool noise = false, duplicate_id = false, fault_cache_write = false, stall_stream = false;
     uint32_t soa_ttl = 900, soa_minimum = 120;
-    bool vary_a_soa_ttl = false, bulk_only_first_a = false;
-    mutable uint32_t min_a_soa_ttl = UINT32_MAX;
     std::function<std::vector<uint8_t>(const Query&)> answer_override;
     int malformed_type = 0;
     std::optional<uint32_t> answer_ttl;
@@ -335,8 +323,7 @@ TEST_P(DnsDatagramQueries, ValidatesOutOfOrderAnswersAndCachesCanonicalNames) {
     auto run = [&]() -> net::awaitable<void> {
         const auto result = co_await dns.Resolve("first.example");
         const std::vector<net::ip::address> expected{
-            net::ip::make_address("192.0.2.1"), net::ip::make_address("192.0.2.2"),
-            net::ip::make_address("192.0.2.3"), net::ip::make_address("2001:db8::1")};
+            net::ip::make_address("192.0.2.1"), net::ip::make_address("2001:db8::1")};
         EXPECT_TRUE(result.Ok());
         EXPECT_EQ(result.addresses, expected);
         EXPECT_EQ(result.ttl, 10u);
@@ -344,11 +331,11 @@ TEST_P(DnsDatagramQueries, ValidatesOutOfOrderAnswersAndCachesCanonicalNames) {
         EXPECT_TRUE(cached.Ok());
         EXPECT_TRUE(cached.from_cache);
         EXPECT_EQ(cached.addresses, expected);
-        EXPECT_EQ(peer.packets, 4u);
-        EXPECT_EQ(peer.ports.size(), 4u) << "RFC 5452 §9.2: each query owns a source port";
+        EXPECT_EQ(peer.packets, 2u) << "RFC 5452 §5: one query per address family";
+        EXPECT_EQ(peer.ports.size(), 2u) << "RFC 5452 §9.2: each query owns a source port";
         const auto second = co_await dns.Resolve("second.example");
         EXPECT_TRUE(second.Ok());
-        EXPECT_EQ(peer.packets, 8u);
+        EXPECT_EQ(peer.packets, 4u);
     };
     Run(run());
 }
@@ -373,7 +360,7 @@ TEST_P(DnsDatagramQueries, AnswerBeyond512BytesFitsAdvertisedUdpPayload) {
         const auto result = co_await dns.Resolve("large.example");
         EXPECT_TRUE(result.Ok()) << result.error_msg;
         EXPECT_EQ(result.addresses, BulkAddresses(40));
-        EXPECT_EQ(peer.packets, 4u);
+        EXPECT_EQ(peer.packets, 2u);
     };
     Run(run());
 }
@@ -386,32 +373,8 @@ TEST_P(DnsDatagramQueries, TruncatedAnswerIsRetriedOverTcp) {
         const auto result = co_await dns.Resolve("truncated.example");
         EXPECT_TRUE(result.Ok()) << result.error_msg;
         EXPECT_EQ(result.addresses, BulkAddresses(64));
-        EXPECT_EQ(peer.packets, 4u);
+        EXPECT_EQ(peer.packets, 2u);
         EXPECT_EQ(peer.stream_queries, 2u) << "one TCP retry per address family";
-    };
-    Run(run());
-}
-
-// Only one A sample is truncated: its TCP answer and the other samples' UDP
-// answers are merged.
-TEST_P(DnsDatagramQueries, PartiallyTruncatedSamplesMergeTcpAndUdpAnswers) {
-    peer.ServeStream();
-    peer.bulk_answers = 100;
-    peer.bulk_only_first_a = true;
-    auto run = [&]() -> net::awaitable<void> {
-        const auto result = co_await dns.Resolve("partial.example");
-        EXPECT_TRUE(result.Ok()) << result.error_msg;
-        EXPECT_EQ(peer.stream_queries, 1u);
-        const auto contains = [&](std::string_view text) {
-            return std::ranges::find(result.addresses, net::ip::make_address(text)) !=
-                   result.addresses.end();
-        };
-        EXPECT_TRUE(contains("198.51.100.1"));
-        EXPECT_TRUE(contains("198.51.100.64"));
-        EXPECT_TRUE(contains("192.0.2.2"));
-        EXPECT_TRUE(contains("192.0.2.3"));
-        EXPECT_TRUE(contains("2001:db8::1"));
-        EXPECT_EQ(result.addresses.size(), 64u + 2u + 1u);
     };
     Run(run());
 }
@@ -421,9 +384,9 @@ TEST_P(DnsDatagramQueries, UpstreamWithoutEdnsIsAskedAgainWithoutOpt) {
     auto run = [&]() -> net::awaitable<void> {
         const auto result = co_await dns.Resolve("plain.example");
         EXPECT_TRUE(result.Ok()) << result.error_msg;
-        EXPECT_EQ(result.addresses.size(), 4u);
-        EXPECT_EQ(peer.packets, 8u) << "each FORMERR answer earns exactly one plain retry";
-        EXPECT_EQ(peer.plain_queries, 4u) << "retries must drop both ARCOUNT and the OPT bytes";
+        EXPECT_EQ(result.addresses.size(), 2u);
+        EXPECT_EQ(peer.packets, 4u) << "each FORMERR answer earns exactly one plain retry";
+        EXPECT_EQ(peer.plain_queries, 2u) << "retries must drop both ARCOUNT and the OPT bytes";
     };
     Run(run());
 }
@@ -434,8 +397,8 @@ TEST_P(DnsDatagramQueries, QuestionlessEdnsRejectionStillTriggersPlainRetry) {
     auto run = [&]() -> net::awaitable<void> {
         const auto result = co_await dns.Resolve("bare.example");
         EXPECT_TRUE(result.Ok()) << result.error_msg;
-        EXPECT_EQ(result.addresses.size(), 4u);
-        EXPECT_EQ(peer.plain_queries, 4u);
+        EXPECT_EQ(result.addresses.size(), 2u);
+        EXPECT_EQ(peer.plain_queries, 2u);
     };
     Run(run());
 }
@@ -553,20 +516,7 @@ TEST_P(DnsDatagramQueries, CnameLoopIsServerFailureAndNotCached) {
         EXPECT_NE(first.error_msg.find("loops"), std::string::npos) << first.error_msg;
         const auto second = co_await dns.Resolve("loop.example");
         EXPECT_FALSE(second.from_cache);
-        EXPECT_EQ(peer.packets, 8u);
-    };
-    Run(run());
-}
-
-TEST_P(DnsDatagramQueries, NegativeTtlIsMinimumOverEveryAddressSample) {
-    peer.nodata = true;
-    peer.vary_a_soa_ttl = true;
-    peer.soa_minimum = 3600;
-    auto run = [&]() -> net::awaitable<void> {
-        const auto result = co_await dns.Resolve("samples.example");
-        EXPECT_EQ(result.error, ::common::ErrorCode::DNS_NO_RECORD);
-        EXPECT_EQ(result.ttl, peer.min_a_soa_ttl);
-        EXPECT_LT(peer.min_a_soa_ttl, 170u) << "samples must carry different TTLs";
+        EXPECT_EQ(peer.packets, 4u);
     };
     Run(run());
 }
@@ -605,7 +555,7 @@ TEST_P(DnsNegativeWithoutZoneSoa, IsNotCached) {
         const auto second = co_await dns.Resolve("nosoa.example");
         EXPECT_EQ(second.error, ::common::ErrorCode::DNS_NO_RECORD);
         EXPECT_FALSE(second.from_cache);
-        EXPECT_EQ(peer.packets, 8u);
+        EXPECT_EQ(peer.packets, 4u);
     };
     net::co_spawn(io, run(), [&](std::exception_ptr error) {
         failure = error;
@@ -679,7 +629,7 @@ TEST_P(DnsDatagramQueries, NxDomainIsCachedWithoutRepeatingUpstreamQueries) {
         const auto cached = co_await dns.Resolve("negative.example");
         EXPECT_EQ(cached.error, ::common::ErrorCode::DNS_NO_RECORD);
         EXPECT_TRUE(cached.from_cache);
-        EXPECT_EQ(peer.packets, 4u);
+        EXPECT_EQ(peer.packets, 2u);
     };
     Run(run());
 }
@@ -695,7 +645,7 @@ TEST_P(DnsDatagramQueries, NoDataReasonSurvivesNegativeCaching) {
         EXPECT_TRUE(cached.from_cache);
         EXPECT_NE(cached.error_msg.find("NODATA"), std::string::npos);
         EXPECT_EQ(cached.error_msg.find("NXDOMAIN"), std::string::npos);
-        EXPECT_EQ(peer.packets, 4u);
+        EXPECT_EQ(peer.packets, 2u);
     };
     Run(run());
 }
@@ -736,7 +686,7 @@ TEST_P(DnsDatagramIsolation, OneRequestEndingDoesNotCancelAnotherQuery) {
         EXPECT_FALSE(errors[0]);
         EXPECT_EQ(answers[0].error, ::common::ErrorCode::DNS_TIMEOUT);
     }
-    EXPECT_EQ(peer.ports.size(), 8u) << "concurrent queries each own a source port";
+    EXPECT_EQ(peer.ports.size(), 4u) << "concurrent queries each own a source port";
 }
 
 class DnsSameDomainCancellation : public testing::TestWithParam<size_t> {};
@@ -765,8 +715,8 @@ TEST_P(DnsSameDomainCancellation, CancellingOneWaiterPreservesSharedUdpAnswerFor
                 }));
     };
     start(0);
-    while (peer.packets != 4 && !expired) io.run_one();
-    EXPECT_FALSE(expired) << "leader must send all four real UDP questions";
+    while (peer.packets != 2 && !expired) io.run_one();
+    EXPECT_FALSE(expired) << "leader must send both real UDP questions";
     start(1);
     io.poll(); // Drain ready admission work while upstream replies remain held.
     signals[cancelled].emit(net::cancellation_type::terminal);
@@ -779,8 +729,8 @@ TEST_P(DnsSameDomainCancellation, CancellingOneWaiterPreservesSharedUdpAnswerFor
     EXPECT_FALSE(expired);
     EXPECT_FALSE(errors[1 - cancelled]);
     EXPECT_TRUE(answers[1 - cancelled].Ok());
-    EXPECT_EQ(answers[1 - cancelled].addresses.size(), 4u);
-    EXPECT_EQ(peer.packets, 4u);
+    EXPECT_EQ(answers[1 - cancelled].addresses.size(), 2u);
+    EXPECT_EQ(peer.packets, 2u);
     bool joined = false;
     std::exception_ptr join_error;
     net::co_spawn(io, worker.AsyncJoin(), [&](std::exception_ptr error) {
@@ -815,19 +765,19 @@ TEST_P(DnsMalformedAnswer, RejectsInvalidAddressLengthWithoutPoisoningCache) {
         if (fallback) {
             EXPECT_TRUE(result.Ok());
             EXPECT_FALSE(result.from_cache);
-            EXPECT_EQ(first.packets, 4u);
-            EXPECT_EQ(second.packets, 4u);
+            EXPECT_EQ(first.packets, 2u);
+            EXPECT_EQ(second.packets, 2u);
             result = co_await worker.Resolve("malformed.example");
             EXPECT_TRUE(result.Ok());
             EXPECT_TRUE(result.from_cache);
-            EXPECT_EQ(first.packets, 4u);
-            EXPECT_EQ(second.packets, 4u);
+            EXPECT_EQ(first.packets, 2u);
+            EXPECT_EQ(second.packets, 2u);
         } else {
             EXPECT_EQ(result.error, ::common::ErrorCode::DNS_FORMAT_ERROR);
             result = co_await worker.Resolve("malformed.example");
             EXPECT_EQ(result.error, ::common::ErrorCode::DNS_FORMAT_ERROR);
             EXPECT_FALSE(result.from_cache);
-            EXPECT_EQ(first.packets, 8u);
+            EXPECT_EQ(first.packets, 4u);
             EXPECT_EQ(second.packets, 0u);
         }
         co_await worker.AsyncJoin();
@@ -862,8 +812,8 @@ TEST(DnsDatagram, RefusedUpstreamFallsBackAfterOutstandingQueriesFinish) {
     second.Stop();
     JoinService(io, worker);
     EXPECT_TRUE(ok);
-    EXPECT_EQ(first.packets, 4u);
-    EXPECT_EQ(second.packets, 4u);
+    EXPECT_EQ(first.packets, 2u);
+    EXPECT_EQ(second.packets, 2u);
 }
 
 TEST(DnsDatagram, CacheWriteFailurePreservesAnswerAndLaterWriteRecovers) {
@@ -882,14 +832,14 @@ TEST(DnsDatagram, CacheWriteFailurePreservesAnswerAndLaterWriteRecovers) {
         ::common::reject_next_process_allocation = false;
         const auto failed_stats = co_await worker.GetCacheStats();
         EXPECT_TRUE(result.Ok());
-        EXPECT_EQ(result.addresses.size(), 4u);
+        EXPECT_EQ(result.addresses.size(), 2u);
         EXPECT_TRUE(fault_consumed);
         EXPECT_GT(::common::rejected_process_allocations, rejected);
         EXPECT_EQ(failed_stats.entries, 0u);
         result = co_await dns.Resolve("cache-fault.example");
         const auto recovered_stats = co_await worker.GetCacheStats();
         EXPECT_TRUE(result.Ok());
-        EXPECT_EQ(result.addresses.size(), 4u);
+        EXPECT_EQ(result.addresses.size(), 2u);
         EXPECT_EQ(recovered_stats.entries, 1u);
     };
     net::co_spawn(io, run(), [&](std::exception_ptr e) { error = e; done = true; peer.Stop(); });
@@ -928,7 +878,7 @@ TEST(DnsDatagram, ServiceStopJoinsQueriesAndRejectsLateRepliesWithoutFallback) {
     watchdog.async_wait([&](::IoErrorCode ec) {
         if (!ec) { expired = true; worker->RequestStop(); }
     });
-    while (peer.packets != 12 && !expired) io.run_one();
+    while (peer.packets != 6 && !expired) io.run_one();
     EXPECT_FALSE(expired) << "all DNS leaders must reach their upstream before service stop";
     worker->RequestStop();
     worker->RequestStop();
@@ -968,7 +918,7 @@ TEST(DnsDatagram, ServiceStopJoinsQueriesAndRejectsLateRepliesWithoutFallback) {
         EXPECT_FALSE(errors[i]) << i;
         EXPECT_EQ(answers[i].error, ::common::ErrorCode::CANCELLED) << i;
     }
-    EXPECT_EQ(peer.packets, 12u);
+    EXPECT_EQ(peer.packets, 6u);
     EXPECT_EQ(fallback.packets, 0u);
 }
 
@@ -1114,13 +1064,12 @@ TEST_P(DnsTtl, PreservesAddressesButDoesNotCacheZeroTtl) {
         const auto first = co_await dns.Resolve("ttl.example");
         const auto second = co_await dns.Resolve("TTL.EXAMPLE.");
         const std::vector<net::ip::address> expected{
-            net::ip::make_address("192.0.2.1"), net::ip::make_address("192.0.2.2"),
-            net::ip::make_address("192.0.2.3"), net::ip::make_address("2001:db8::1")};
+            net::ip::make_address("192.0.2.1"), net::ip::make_address("2001:db8::1")};
         EXPECT_EQ(first.addresses, expected);
         EXPECT_EQ(second.addresses, expected);
         EXPECT_EQ(first.ttl, expected_ttl);
         EXPECT_EQ(second.from_cache, expected_ttl != 0);
-        EXPECT_EQ(peer.packets, expected_ttl == 0 ? 8u : 4u);
+        EXPECT_EQ(peer.packets, expected_ttl == 0 ? 4u : 2u);
         if (expected_ttl == 0) EXPECT_EQ(second.ttl, 0);
         co_await worker.AsyncJoin();
     };

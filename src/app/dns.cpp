@@ -38,19 +38,6 @@ constexpr size_t kMaxAnswerAddresses = 64;
 // default of 11 query restarts.
 constexpr size_t kMaxCnameChain = 11;
 
-
-constexpr size_t kAddressQueryAttempts = 3;
-
-void AppendUniqueAddresses(
-    std::vector<net::ip::address>& out,
-    std::span<const net::ip::address> addresses) {
-    for (const auto& address : addresses) {
-        if (std::ranges::find(out, address) == out.end()) {
-            out.push_back(address);
-        }
-    }
-}
-
 [[nodiscard]] DnsResult Failed(common::ErrorCode error, std::string message) {
     DnsResult result;
     result.error = error;
@@ -85,14 +72,11 @@ struct DNSWorker::Impl {
 
     net::awaitable<DnsResult> ResolveUncached(std::string_view domain);
     net::awaitable<DnsResult> DoResolve(std::string_view domain);
-    // Leaves out empty when a sibling sample already owns this family's TCP
-    // retry: the stream answer is the complete RRset for every sample.
     net::awaitable<void> QueryServer(
         UpstreamExchange& server,
         std::string_view domain,
         bool query_aaaa,
-        bool& stream_claimed,
-        std::optional<DnsResult>& out);
+        DnsResult& out);
     // Leaves the ID zero; UpstreamExchange writes an unpredictable ID before send.
     static size_t BuildQueryTo(std::span<uint8_t, kQueryCapacity> query,
                                std::string_view domain,
@@ -212,71 +196,33 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
             last_result.error = common::ErrorCode::CANCELLED;
             co_return last_result;
         }
-        // Preserve three A samples (round-robin answer collection), but do not
-        // serialize their RTTs or hold AAAA behind them. Join all children before
+        // One A and one AAAA query, concurrently. RFC 5452 §5: equivalent
+        // queries outstanding at once let a single forged reply match any of
+        // them, so each family is asked exactly once. Join both before
         // returning or moving to another upstream, including cancellation/OOM.
-        std::array<std::optional<DnsResult>, kAddressQueryAttempts + 1> answers;
-        std::array<bool, 2> stream_claimed{};  // A, AAAA
+        std::array<DnsResult, 2> answers;  // A, AAAA
         co_await common::RunAwaitableTaskGroup(co_await net::this_coro::executor, [&](common::AwaitableTaskGroup& group) {
             for (size_t i = 0; i < answers.size(); ++i) {
-                const bool query_aaaa = i == kAddressQueryAttempts;
-                group.Spawn(QueryServer(*server, domain, query_aaaa, stream_claimed[query_aaaa], answers[i]));
+                group.Spawn(QueryServer(*server, domain, i == 1, answers[i]));
             }
         });
-        if (stopping || std::ranges::any_of(answers, [](const std::optional<DnsResult>& answer) {
-                return answer && answer->error == common::ErrorCode::CANCELLED;
+        if (stopping || std::ranges::any_of(answers, [](const DnsResult& answer) {
+                return answer.error == common::ErrorCode::CANCELLED;
             })) {
             DnsResult cancelled;
             cancelled.error = common::ErrorCode::CANCELLED;
             co_return cancelled;
         }
-        DnsResult a_result;
-        a_result.error = common::ErrorCode::DNS_RESOLVE_FAILED;
-        a_result.error_msg = "DNS A query failed";
-
-        for (size_t attempt = 0; attempt < kAddressQueryAttempts; ++attempt) {
-            if (!answers[attempt]) continue;  // Covered by the sibling's TCP retry.
-            auto attempt_result = std::move(*answers[attempt]);
-            if (attempt_result.Ok()) {
-                if (!a_result.Ok()) {
-                    a_result = std::move(attempt_result);
-                } else {
-                    AppendUniqueAddresses(a_result.addresses, attempt_result.addresses);
-                    a_result.ttl = std::min(a_result.ttl, attempt_result.ttl);
-                }
-                continue;
-            }
-            if (attempt_result.error == common::ErrorCode::DNS_NO_RECORD &&
-                a_result.error == common::ErrorCode::DNS_NO_RECORD) {
-                // The negative answer may be cached only as long as every
-                // sample allows (RFC 2308 §5).
-                a_result.ttl = std::min(a_result.ttl, attempt_result.ttl);
-            } else if (!a_result.Ok() && a_result.error != common::ErrorCode::DNS_NO_RECORD) {
-                a_result = std::move(attempt_result);
-            }
-        }
-
-        // The only AAAA query always owns its family's TCP retry.
-        auto aaaa_result = std::move(*answers.back());
+        auto& [a_result, aaaa_result] = answers;
 
         if (a_result.Ok() || aaaa_result.Ok()) {
             DnsResult result;
             result.ttl = UINT32_MAX;
-            result.error = common::ErrorCode::OK;
-            result.addresses.reserve(
-                (a_result.Ok() ? a_result.addresses.size() : 0) +
-                (aaaa_result.Ok() ? aaaa_result.addresses.size() : 0));
-
-            if (a_result.Ok()) {
-                AppendUniqueAddresses(result.addresses, a_result.addresses);
-                result.ttl = std::min(result.ttl, a_result.ttl);
-            }
-            if (aaaa_result.Ok()) {
-                AppendUniqueAddresses(result.addresses, aaaa_result.addresses);
-                result.ttl = std::min(result.ttl, aaaa_result.ttl);
-            }
-            if (result.ttl == UINT32_MAX) {
-                result.ttl = config.min_ttl;
+            for (const DnsResult* family : {&a_result, &aaaa_result}) {
+                if (!family->Ok()) continue;
+                result.addresses.insert(result.addresses.end(),
+                                        family->addresses.begin(), family->addresses.end());
+                result.ttl = std::min(result.ttl, family->ttl);
             }
             co_return result;
         }
@@ -290,7 +236,7 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
             common::ErrorCodeToString(a_result.error), a_result.error_msg,
             common::ErrorCodeToString(aaaa_result.error), aaaa_result.error_msg);
         // A name without either address family is cached for the shorter of
-        // the two negative TTLs (0 when either lacked a SOA).
+        // the two negative TTLs (0 when either lacked a SOA, RFC 2308 §5).
         const uint32_t negative_ttl = std::min(a_result.ttl, aaaa_result.ttl);
         last_result = a_result.error == common::ErrorCode::DNS_NO_RECORD && !no_records
             ? std::move(aaaa_result)
@@ -309,8 +255,7 @@ net::awaitable<void> DNSWorker::Impl::QueryServer(
     UpstreamExchange& server,
     std::string_view domain,
     bool query_aaaa,
-    bool& stream_claimed,
-    std::optional<DnsResult>& out) {
+    DnsResult& out) {
     // BuildQueryTo and Exchange write every byte of [0, query_size).
     std::array<uint8_t, kQueryCapacity> query;
     size_t query_size = BuildQueryTo(query, domain, query_aaaa);
@@ -334,22 +279,17 @@ net::awaitable<void> DNSWorker::Impl::QueryServer(
         ((common::LoadU16BE(response.bytes.data() + 2) & FLAG_TC) != 0 ||
          response.bytes.size() > kDnsUdpPayloadSize);
     if (truncated) {
-        // RFC 7766 §5: a truncated UDP answer is retried over TCP, once per
-        // family; samples run on one executor, so the first to see TC claims it.
-        if (stream_claimed) co_return;
-        stream_claimed = true;
+        // RFC 7766 §5: a truncated UDP answer is retried over TCP.
         response = co_await server.Exchange<tcp::socket>(
             std::span<uint8_t>(query.data(), query_size), remaining());
     }
     if (response.error) {
-        DnsResult& failed = out.emplace();
-        failed.error = response.error == io_error::timed_out ? common::ErrorCode::DNS_TIMEOUT :
+        const auto error = response.error == io_error::timed_out ? common::ErrorCode::DNS_TIMEOUT :
             response.error == io_error::operation_aborted ? common::ErrorCode::CANCELLED :
-            response.error == io_error::no_buffer_space ? common::ErrorCode::RESOURCE_EXHAUSTED :
             common::ErrorCode::DNS_RESOLVE_FAILED;
-        failed.error_msg = truncated
+        out = Failed(error, truncated
             ? std::format("TCP retry of truncated answer: {}", response.error.message())
-            : response.error.message();
+            : response.error.message());
         co_return;
     }
     out = ParseResponse(response.bytes, query_aaaa);

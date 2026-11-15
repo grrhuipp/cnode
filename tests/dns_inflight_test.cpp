@@ -557,7 +557,8 @@ TEST(DnsWorker, CrossExecutorStopJoinsUdpQueriesAndCallerCompletions) {
         net::ip::udp::endpoint sender;
         std::exception_ptr receive_error;
         try {
-            for (; packets < 8; ++packets)
+            // Two names, one A and one AAAA query each.
+            for (; packets < 4; ++packets)
                 co_await sink.async_receive_from(net::buffer(packet), sender, net::use_awaitable);
         } catch (...) {
             receive_error = std::current_exception();
@@ -588,7 +589,7 @@ TEST(DnsWorker, CrossExecutorStopJoinsUdpQueriesAndCallerCompletions) {
     worker.reset();
     EXPECT_FALSE(expired);
     EXPECT_TRUE(joined);
-    EXPECT_EQ(packets, 8u);
+    EXPECT_EQ(packets, 4u);
     EXPECT_EQ(completed, results.size());
     if (join_error) std::rethrow_exception(join_error);
     for (size_t i = 0; i < results.size(); ++i) {
