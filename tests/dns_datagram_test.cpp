@@ -8,6 +8,7 @@
 #include <asio/steady_timer.hpp>
 #include <asio/use_future.hpp>
 #include <array>
+#include <list>
 #include <map>
 #include <optional>
 #include <set>
@@ -31,6 +32,8 @@ struct Peer {
         ::udp::endpoint sender;
         size_t question_size = 0;
         size_t udp_limit = 512;
+        bool has_opt = false;
+        bool plain = false;
     };
     explicit Peer(net::io_context& io, bool ipv6 = false)
         : socket(io, {ipv6 ? net::ip::address(net::ip::address_v6::loopback()) :
@@ -58,8 +61,11 @@ struct Peer {
         const size_t opt = query.question_size;
         if (query.bytes[11] == 1 && query.bytes.size() >= opt + 11 && query.bytes[opt] == 0 &&
             query.bytes[opt + 1] == 0 && query.bytes[opt + 2] == 41) {
+            query.has_opt = true;
             query.udp_limit = std::max<size_t>(512, (query.bytes[opt + 3] << 8) | query.bytes[opt + 4]);
         }
+        query.plain = query.bytes[10] == 0 && query.bytes[11] == 0 &&
+                      query.bytes.size() == query.question_size;
         return query;
     }
     std::vector<uint8_t> Answer(const Query& query, int ordinal) const {
@@ -67,6 +73,14 @@ struct Peer {
         packet[10] = packet[11] = 0;
         const bool v6 = packet[packet.size() - 3] == 28;
         packet[2] = 0x81;
+        if (reject_edns && query.has_opt) {
+            packet[3] = 0x81;  // FORMERR without OPT: responder lacks EDNS.
+            if (reject_without_question) {
+                packet.resize(12);
+                std::fill(packet.begin() + 4, packet.end(), 0);
+            }
+            return packet;
+        }
         packet[3] = refuse ? 0x82 : negative ? 0x83 : 0x80;
         if (refuse || negative || nodata ||
             (malformed_type != 0 && malformed_type != (v6 ? 28 : 1))) return packet;
@@ -115,6 +129,7 @@ struct Peer {
             }
             auto& group = queries[name];
             group.push_back(Inspect({buffer.begin(), buffer.begin() + size}, sender));
+            if (group.back().plain) ++plain_queries;
             // A serial resolver cannot satisfy this barrier. It must submit all
             // three A samples and AAAA before any response is made available.
             if (group.size() == batch_size && !hold && name != "timeout.example") Flush(name);
@@ -181,7 +196,11 @@ struct Peer {
         if (query_error) co_return;
         ++stream_queries;
         if (stall_stream) {
-            held_streams.push_back(std::move(stream));
+            // Never answer; count when the resolver closes its end.
+            auto& held = held_streams.emplace_back(std::move(stream));
+            std::array<uint8_t, 1> probe{};
+            (void)co_await net::async_read(held, net::buffer(probe), net::as_tuple(net::use_awaitable));
+            ++stream_closed;
             co_return;
         }
         const auto packet = Answer(Inspect(std::move(bytes)), 4);
@@ -191,15 +210,16 @@ struct Peer {
     }
     ::udp::socket socket, foreign;
     ::tcp::acceptor acceptor;
-    std::vector<::tcp::socket> held_streams;
+    std::list<::tcp::socket> held_streams;
     ::udp::endpoint sender;
     std::array<uint8_t, 512> buffer{};
     std::map<std::string, std::vector<Query>> queries;
     std::set<uint16_t> ports;
     std::map<uint16_t, std::bitset<65536>> ids;
     size_t packets = 0, batch_size = 4, bulk_answers = 0;
-    size_t stream_connections = 0, stream_queries = 0;
+    size_t stream_connections = 0, stream_queries = 0, stream_closed = 0, plain_queries = 0;
     bool hold = false, refuse = false, negative = false, nodata = false;
+    bool reject_edns = false, reject_without_question = false;
     bool noise = false, duplicate_id = false, fault_cache_write = false, stall_stream = false;
     int malformed_type = 0;
     std::optional<uint32_t> answer_ttl;
@@ -291,34 +311,65 @@ TEST_P(DnsDatagramQueries, AnswerBeyond512BytesFitsAdvertisedUdpPayload) {
     Run(run());
 }
 
+// Bulk answers exceed 1232 bytes; each family keeps the 64-address budget.
 TEST_P(DnsDatagramQueries, TruncatedAnswerIsRetriedOverTcp) {
     peer.ServeStream();
     peer.bulk_answers = 100;
     auto run = [&]() -> net::awaitable<void> {
         const auto result = co_await dns.Resolve("truncated.example");
         EXPECT_TRUE(result.Ok()) << result.error_msg;
-        EXPECT_EQ(result.addresses, BulkAddresses(100));
+        EXPECT_EQ(result.addresses, BulkAddresses(64));
         EXPECT_EQ(peer.packets, 4u);
         EXPECT_EQ(peer.stream_queries, 4u) << "every truncated answer must be retried over TCP";
     };
     Run(run());
 }
 
-class DnsStalledStreamRetry : public testing::TestWithParam<bool> {};
-TEST_P(DnsStalledStreamRetry, EndsAtDeadlineOrServiceStop) {
-    const bool stop = GetParam();
+TEST_P(DnsDatagramQueries, UpstreamWithoutEdnsIsAskedAgainWithoutOpt) {
+    peer.reject_edns = true;
+    auto run = [&]() -> net::awaitable<void> {
+        const auto result = co_await dns.Resolve("plain.example");
+        EXPECT_TRUE(result.Ok()) << result.error_msg;
+        EXPECT_EQ(result.addresses.size(), 4u);
+        EXPECT_EQ(peer.packets, 8u) << "each FORMERR answer earns exactly one plain retry";
+        EXPECT_EQ(peer.plain_queries, 4u) << "retries must drop both ARCOUNT and the OPT bytes";
+    };
+    Run(run());
+}
+
+TEST_P(DnsDatagramQueries, QuestionlessEdnsRejectionStillTriggersPlainRetry) {
+    peer.reject_edns = true;
+    peer.reject_without_question = true;
+    auto run = [&]() -> net::awaitable<void> {
+        const auto result = co_await dns.Resolve("bare.example");
+        EXPECT_TRUE(result.Ok()) << result.error_msg;
+        EXPECT_EQ(result.addresses.size(), 4u);
+        EXPECT_EQ(peer.plain_queries, 4u);
+    };
+    Run(run());
+}
+
+enum class StreamRetryEnd { Deadline, ServiceStop, WaiterCancel };
+class DnsStalledStreamRetry : public testing::TestWithParam<StreamRetryEnd> {};
+TEST_P(DnsStalledStreamRetry, ClosesEveryUpstreamConnection) {
+    const auto end = GetParam();
     net::io_context io;
     Peer peer(io);
     peer.ServeStream();
     peer.bulk_answers = 100;
     peer.stall_stream = true;
-    ::app::DNSWorker worker(io, Config(peer), 8);
+    auto config = Config(peer);
+    // Only the deadline variant may rely on the exchange timeout.
+    if (end != StreamRetryEnd::Deadline) config.timeout_sec = 30;
+    ::app::DNSWorker worker(io, config, 8);
     std::optional<DnsResult> answer;
     std::exception_ptr error;
-    net::co_spawn(io, worker.Resolve("stalled.example"), [&](std::exception_ptr e, DnsResult result) {
-        error = e;
-        answer = std::move(result);
-    });
+    net::cancellation_signal signal;
+    net::co_spawn(io, worker.Resolve("stalled.example"), net::bind_cancellation_slot(signal.slot(),
+        [&](std::exception_ptr e, DnsResult result) {
+            error = e;
+            answer = std::move(result);
+        }));
     net::steady_timer watchdog(io, 4s);
     bool expired = false;
     watchdog.async_wait([&](::IoErrorCode ec) {
@@ -326,9 +377,10 @@ TEST_P(DnsStalledStreamRetry, EndsAtDeadlineOrServiceStop) {
     });
     while (peer.stream_queries != 4 && !expired) io.run_one();
     EXPECT_FALSE(expired) << "truncated answers must reach the upstream over TCP";
-    if (stop) worker.RequestStop();
-    while (!answer && !expired) io.run_one();
-    EXPECT_FALSE(expired);
+    if (end == StreamRetryEnd::ServiceStop) worker.RequestStop();
+    if (end == StreamRetryEnd::WaiterCancel) signal.emit(net::cancellation_type::terminal);
+    while ((!answer || peer.stream_closed != 4) && !expired) io.run_one();
+    EXPECT_FALSE(expired) << "the resolver must close every upstream TCP connection itself";
     bool joined = false;
     net::co_spawn(io, worker.AsyncJoin(), [&](std::exception_ptr join_error) {
         EXPECT_FALSE(join_error);
@@ -338,13 +390,13 @@ TEST_P(DnsStalledStreamRetry, EndsAtDeadlineOrServiceStop) {
     });
     io.run();
     EXPECT_TRUE(joined);
-    EXPECT_FALSE(error);
     ASSERT_TRUE(answer);
-    if (stop) {
-        EXPECT_EQ(answer->error, ::common::ErrorCode::CANCELLED);
-    } else {
+    if (end == StreamRetryEnd::Deadline) {
+        EXPECT_FALSE(error);
         EXPECT_EQ(answer->error, ::common::ErrorCode::DNS_TIMEOUT);
         EXPECT_NE(answer->error_msg.find("TCP retry"), std::string::npos) << answer->error_msg;
+    } else {
+        EXPECT_TRUE(error || answer->error == ::common::ErrorCode::CANCELLED);
     }
 }
 
@@ -786,8 +838,12 @@ INSTANTIATE_TEST_SUITE_P(Upstreams, DnsMalformedAnswer, testing::Values(
     });
 INSTANTIATE_TEST_SUITE_P(Startup, DnsDatagramStop, testing::Bool(),
     [](const testing::TestParamInfo<bool>& info) { return info.param ? "PendingQuery" : "Unused"; });
-INSTANTIATE_TEST_SUITE_P(Outcome, DnsStalledStreamRetry, testing::Bool(),
-    [](const testing::TestParamInfo<bool>& info) { return info.param ? "ServiceStop" : "Deadline"; });
+INSTANTIATE_TEST_SUITE_P(Outcome, DnsStalledStreamRetry, testing::Values(
+    StreamRetryEnd::Deadline, StreamRetryEnd::ServiceStop, StreamRetryEnd::WaiterCancel),
+    [](const testing::TestParamInfo<StreamRetryEnd>& info) {
+        return info.param == StreamRetryEnd::Deadline ? "Deadline" :
+            info.param == StreamRetryEnd::ServiceStop ? "ServiceStop" : "WaiterCancel";
+    });
 
 struct TtlCase {
     uint32_t wire;

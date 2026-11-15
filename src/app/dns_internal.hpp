@@ -254,12 +254,17 @@ public:
         (void)co_await joined_.async_receive(net::as_tuple(net::use_awaitable));
     }
 
-    net::awaitable<Reply> ExchangeDatagram(std::span<uint8_t> query, std::chrono::seconds timeout) {
+    // Arms timeout as the remaining budget; a non-positive one fails at once.
+    net::awaitable<Reply> ExchangeDatagram(std::span<uint8_t> query, std::chrono::milliseconds timeout) {
         // The caller owns query until completion, including cancellation unwind.
         auto owner = shared_from_this();
         Reply failure;
         if (stopping_) {
             failure.error = io_error::operation_aborted;
+            co_return failure;
+        }
+        if (timeout <= std::chrono::milliseconds::zero()) {
+            failure.error = io_error::timed_out;
             co_return failure;
         }
         ActiveExchange active(*this);
@@ -317,11 +322,15 @@ public:
     // upstream. query already carries the ID of the truncated exchange; the
     // caller owns it until completion. One deadline bounds connect through the
     // last response byte.
-    net::awaitable<Reply> ExchangeStream(std::span<const uint8_t> query, std::chrono::seconds timeout) {
+    net::awaitable<Reply> ExchangeStream(std::span<const uint8_t> query, std::chrono::milliseconds timeout) {
         auto owner = shared_from_this();
         Reply reply;
         if (stopping_) {
             reply.error = io_error::operation_aborted;
+            co_return reply;
+        }
+        if (timeout <= std::chrono::milliseconds::zero()) {
+            reply.error = io_error::timed_out;
             co_return reply;
         }
         ActiveExchange active(*this);
@@ -332,13 +341,22 @@ public:
         }
         reply.error = co_await ExchangeOverStream(
             stream.socket, tcp::endpoint(endpoint_.address(), endpoint_.port()), query, reply.bytes);
-        if (stream.timed_out) {
-            reply.error = io_error::timed_out;
-        } else if (reply.error && stopping_) {
-            reply.error = io_error::operation_aborted;
+        // A complete answer wins even if the deadline fired in the same turn.
+        if (reply.error) {
+            if (stream.timed_out) reply.error = io_error::timed_out;
+            else if (stopping_) reply.error = io_error::operation_aborted;
+            reply.bytes.clear();
         }
-        if (reply.error) reply.bytes.clear();
         co_return reply;
+    }
+
+    // RFC 6891 §7: a responder that does not implement EDNS answers FORMERR
+    // or NOTIMP without echoing an OPT record. Callers retry once without OPT.
+    [[nodiscard]] static bool RejectsEdns(std::span<const uint8_t> packet) noexcept {
+        if (packet.size() < 12) return false;
+        const uint8_t rcode = packet[3] & 0x0f;
+        return (rcode == kRcodeFormatError || rcode == kRcodeNotImplemented) &&
+               common::LoadU16BE(packet.data() + 10) == 0;
     }
 
     [[nodiscard]] static bool SkipWireName(std::span<const uint8_t> packet, size_t& offset) noexcept {
@@ -373,6 +391,9 @@ public:
         return false;
     }
 private:
+    static constexpr uint8_t kRcodeFormatError = 1;
+    static constexpr uint8_t kRcodeNotImplemented = 4;
+
     struct ActiveExchange {
         explicit ActiveExchange(UpstreamExchange& owner) noexcept : owner(owner) {
             ++owner.active_;
@@ -470,6 +491,19 @@ private:
         co_return IoErrorCode{};
     }
 
+    // RFC 1035 does not require an error reply to echo the question. Accept a
+    // question-less rejection only for an EDNS query, and only to trigger the
+    // plain retry: it carries no records for ParseResponse to trust.
+    static bool RejectsEdnsWithoutQuestion(std::span<const uint8_t> packet,
+                                           std::span<const uint8_t> query) noexcept {
+        return packet.size() >= 12 && query.size() >= 12 && (packet[2] & 0xf8) == 0x80 &&
+               common::LoadU16BE(query.data() + 10) == 1 &&
+               common::LoadU16BE(packet.data() + 4) == 0 &&
+               common::LoadU16BE(packet.data() + 6) == 0 &&
+               common::LoadU16BE(packet.data() + 8) == 0 &&
+               RejectsEdns(packet);
+    }
+
     // Match the echoed QNAME/QTYPE/QCLASS, not just the 16-bit transaction ID.
     // Support compressed names with bounded pointer traversal and ASCII folding.
     static bool Matches(std::span<const uint8_t> packet, std::span<const uint8_t> query) {
@@ -552,7 +586,9 @@ private:
                         const uint16_t id = common::LoadU16BE(self->buffer_.data());
                         const auto it = self->pending_.find(id);
                         if (it != self->pending_.end() &&
-                            Matches(std::span(self->buffer_.data(), size), it->second->query)) {
+                            (Matches(std::span(self->buffer_.data(), size), it->second->query) ||
+                             RejectsEdnsWithoutQuestion(std::span(self->buffer_.data(), size),
+                                                        it->second->query))) {
                             self->Complete(id, {}, size);
                         }
                     } else if (ec && ec != io_error::operation_aborted && ec != io_error::message_size) {

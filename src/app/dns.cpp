@@ -27,8 +27,13 @@ constexpr uint16_t TYPE_OPT   = 41;
 constexpr uint8_t RCODE_OK         = 0;
 constexpr uint8_t RCODE_NAME_ERROR = 3;
 
-// Header, longest wire QNAME, QTYPE/QCLASS and the RFC 6891 OPT record.
-constexpr size_t kQueryCapacity = 12 + 255 + 4 + 11;
+// Root owner, TYPE, CLASS, TTL and RDLENGTH of the RFC 6891 OPT record.
+constexpr size_t kOptRecordSize = 11;
+// Header, longest wire QNAME, QTYPE/QCLASS and the OPT record.
+constexpr size_t kQueryCapacity = 12 + 255 + 4 + kOptRecordSize;
+// Local budget, not a protocol limit: a TCP answer may hold thousands of
+// addresses, which the dedupe, cache entries and per-hit copies must not carry.
+constexpr size_t kMaxAnswerAddresses = 64;
 
 
 constexpr size_t kAddressQueryAttempts = 3;
@@ -262,15 +267,27 @@ net::awaitable<void> DNSWorker::Impl::QueryServer(
     DnsResult& out) {
     // BuildQueryTo and ExchangeDatagram write every byte of [0, query_size).
     std::array<uint8_t, kQueryCapacity> query;
-    const size_t query_size = BuildQueryTo(query, domain, query_aaaa);
-    const auto query_bytes = std::span<uint8_t>(query.data(), query_size);
-    const auto timeout = std::chrono::seconds(config.timeout_sec);
-    auto response = co_await server.ExchangeDatagram(query_bytes, timeout);
+    size_t query_size = BuildQueryTo(query, domain, query_aaaa);
+    // One deadline bounds the datagram, the plain retry and the TCP retry.
+    const auto deadline = common::steady_clock::now() + std::chrono::seconds(config.timeout_sec);
+    const auto remaining = [deadline] {
+        return std::chrono::ceil<std::chrono::milliseconds>(deadline - common::steady_clock::now());
+    };
+    auto response = co_await server.ExchangeDatagram(
+        std::span<uint8_t>(query.data(), query_size), remaining());
+    if (!response.error && UpstreamExchange::RejectsEdns(response.bytes)) {
+        // Ask once more without the extension; the OPT record is last.
+        common::StoreU16BE(query.data() + 10, 0);
+        query_size -= kOptRecordSize;
+        response = co_await server.ExchangeDatagram(
+            std::span<uint8_t>(query.data(), query_size), remaining());
+    }
     const bool truncated = !response.error && response.bytes.size() >= 4 &&
         (common::LoadU16BE(response.bytes.data() + 2) & FLAG_TC) != 0;
     if (truncated) {
         // RFC 7766 §5: a truncated UDP answer is retried over TCP.
-        response = co_await server.ExchangeStream(query_bytes, timeout);
+        response = co_await server.ExchangeStream(
+            std::span<const uint8_t>(query.data(), query_size), remaining());
     }
     if (response.error) {
         out.error = response.error == io_error::timed_out ? common::ErrorCode::DNS_TIMEOUT :
@@ -318,11 +335,11 @@ size_t DNSWorker::Impl::BuildQueryTo(
 
     // RFC 6891 §6.1.2: root owner, CLASS carries the UDP payload size, TTL
     // carries extended RCODE/version/flags (all zero), empty RDATA.
-    query[out++] = 0x00;
-    common::StoreU16BE(query.data() + out, TYPE_OPT);
-    common::StoreU16BE(query.data() + out + 2, static_cast<uint16_t>(kDnsUdpPayloadSize));
-    std::memset(query.data() + out + 4, 0, 6);
-    return out + 10;
+    query[out] = 0x00;
+    common::StoreU16BE(query.data() + out + 1, TYPE_OPT);
+    common::StoreU16BE(query.data() + out + 3, static_cast<uint16_t>(kDnsUdpPayloadSize));
+    std::memset(query.data() + out + 5, 0, 6);
+    return out + kOptRecordSize;
 }
 
 DnsResult DNSWorker::Impl::ParseResponse(
@@ -416,7 +433,7 @@ DnsResult DNSWorker::Impl::ParseResponse(
         return result;
     }
     std::vector<net::ip::address> addresses;
-    addresses.reserve(ancount);
+    addresses.reserve(std::min<size_t>(ancount, kMaxAnswerAddresses));
     uint32_t min_ttl = UINT32_MAX;
 
     for (uint16_t i = 0; i < ancount; ++i) {
@@ -453,16 +470,18 @@ DnsResult DNSWorker::Impl::ParseResponse(
             return result;
         }
 
+        // Records past the budget are still validated and bound the TTL.
+        const bool keep = addresses.size() < kMaxAnswerAddresses;
         if (!query_aaaa && type == TYPE_A) {
             min_ttl = std::min(min_ttl, ttl);
             net::ip::address_v4::bytes_type bytes;
             std::memcpy(bytes.data(), &response[pos], 4);
-            addresses.emplace_back(net::ip::address_v4(bytes));
+            if (keep) addresses.emplace_back(net::ip::address_v4(bytes));
         } else if (query_aaaa && type == TYPE_AAAA) {
             min_ttl = std::min(min_ttl, ttl);
             net::ip::address_v6::bytes_type bytes;
             std::memcpy(bytes.data(), &response[pos], 16);
-            addresses.emplace_back(net::ip::address_v6(bytes));
+            if (keep) addresses.emplace_back(net::ip::address_v6(bytes));
         } else if (type == TYPE_CNAME) {
             min_ttl = std::min(min_ttl, ttl);
         }
