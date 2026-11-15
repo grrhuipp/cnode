@@ -19,6 +19,19 @@ TEST_P(OutboundSessionEnd, RemoteFinDeliversQueuedPayloadAcrossSessionEnd) {
 }
 INSTANTIATE_TEST_SUITE_P(All, OutboundSessionEnd, testing::Bool(),
                          [](const auto& info) { return info.param ? "Alert" : "TransportClose"; });
+class InboundSessionEnd : public testing::TestWithParam<std::tuple<SessionEnd, bool>> {};
+TEST_P(InboundSessionEnd, RemoteFinDeliversQueuedUpload) {
+    const auto [end, uot] = GetParam();
+    ServerFinThenSessionEnd(end, uot);
+}
+INSTANTIATE_TEST_SUITE_P(All, InboundSessionEnd,
+                         testing::Combine(testing::Values(SessionEnd::KeepOpen, SessionEnd::TransportClose,
+                                                          SessionEnd::Alert),
+                                          testing::Bool()),
+                         SessionEndCase);
+TEST(AnyTlsFin, InboundRejectedFinishedStreamIsAcknowledged) {
+    ServerFinRejected();
+}
 // 开流即 FIN 测试的上游 AnyTLS 对端：流 2 不回 SYNACK，收到首个 PSH 就回（可选载荷 +）FIN；
 // padding 时在流 1 下发一个需要 30 MiB 以上填充的方案，并统计 FIN 之后的填充字节。
 class OpeningFinPeer {

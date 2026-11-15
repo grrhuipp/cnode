@@ -63,6 +63,7 @@ public:
 
     bool RemoteClosed() const noexcept { return remote_closed_; }
     bool IsClosed() const noexcept { return write_closed_; }
+    bool HasQueuedInput() const noexcept { return !queued_input_.empty(); }
 
     void CheckWrite() const {
         if (cancelled_) throw transport::LinkError(common::ErrorCode::CANCELLED);
@@ -264,7 +265,10 @@ public:
         if (sub) {
             if (cmd == kCmdFIN && sub->RemoteClosed())
                 co_return tl::expected<void, common::ErrorCode>{};
-            if (cmd == kCmdSYNACK && (sub->IsClosed() || sub->Cancellation().Stopped()))
+            // The client's own FIN does not waive the acknowledgement its
+            // session waits for; only a stream this side gave up does.
+            if (cmd == kCmdSYNACK &&
+                (sub->Cancellation().Stopped() || (sub->IsClosed() && !sub->RemoteClosed())))
                 co_return tl::unexpected(common::ErrorCode::CONNECTION_CLOSED);
         }
         if (cmd == kCmdSYNACK && sub) {
@@ -353,6 +357,9 @@ public:
         if (sub) {
             sub->Cancel();
         }
+        if (finished_streams_joined_ && streams_.empty()) {
+            (void)finished_streams_joined_->try_send(IoErrorCode{});
+        }
     }
 
 private:
@@ -391,18 +398,39 @@ private:
         }
         cancelled_ = true;
         write_gate_.Cancel();
+        // Detached before notification. A substream its client already
+        // finished owes the target only the bytes queued before that FIN and
+        // never writes to this transport again: it keeps its queue and stays
+        // registered until its upload ends.
         auto streams = std::exchange(
             streams_,
             std::unordered_map<uint32_t, std::shared_ptr<AnyTLSSubStream>>{});
-        for (auto& [sid, sub] : streams) {
-            (void)sid;
+        for (auto it = streams.begin(); it != streams.end();) {
+            if (it->second && it->second->RemoteClosed()) {
+                ++it;
+                continue;
+            }
+            const auto sub = std::move(it->second);
+            it = streams.erase(it);
             if (sub) {
                 sub->Cancel();
             }
         }
+        streams_ = std::move(streams);
         if (stream_) {
             stream_->CloseAbortive();
         }
+    }
+
+    // Resumes once every substream CancelAll retained has left the index.
+    net::awaitable<void> JoinFinishedStreams() {
+        common::SignalChannel joined(net::any_io_executor(io_context_.get_executor()), 1);
+        struct Published {
+            AnyTLSDemuxSession& session;
+            ~Published() noexcept { session.finished_streams_joined_ = nullptr; }
+        } published{*this};
+        finished_streams_joined_ = &joined;
+        (void)co_await joined.async_receive(net::as_tuple(net::use_awaitable));
     }
 
     net::awaitable<app::RelayResult> RejectSession(std::string_view message, common::ErrorCode error) {
@@ -494,6 +522,7 @@ private:
     std::unordered_map<uint32_t, std::shared_ptr<AnyTLSSubStream>> streams_;
     uint32_t last_stream_id_ = 0;
     bool cancelled_ = false;
+    common::SignalChannel* finished_streams_joined_ = nullptr;
     std::optional<common::ErrorCode> physical_write_error_;
     std::optional<SessionVersion> session_version_;
 };
@@ -545,7 +574,12 @@ net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
             co_return finished;
         }
     }
-    if (sub.IsClosed()) co_return common::ErrorCode::CONNECTION_CLOSED;
+    // As for a byte stream: only datagrams sent before the client's FIN
+    // justify dispatching an association it already closed.
+    if (sub.IsClosed() && prepared->pending.empty() && prepared->initial_decoded.empty() &&
+        !sub.HasQueuedInput()) {
+        co_return common::ErrorCode::CONNECTION_CLOSED;
+    }
 
     (void)co_await DispatchPreparedUotRequest(
         std::move(*prepared), nullptr, sub, sub,
@@ -580,8 +614,12 @@ net::awaitable<AnyTLSDemuxSession::PreparedSubstream> AnyTLSDemuxSession::Prepar
                         out.uot_version ? common::Network::UDP : common::Network::TCP,
                         out.uot_version ? common::TargetAddress{} : std::move(parsed->target),
                         std::move(parsed->forwarded)});
+                // A stream its client already closed is acknowledged like any
+                // other; only a session that can no longer carry the SYNACK
+                // leaves it unacknowledged, without failing this phase.
                 if (session_version_ == SessionVersion::V2) {
-                    if (auto ok = co_await WriteFrameSerialized(kCmdSYNACK, sub.Sid(), {}, &sub); !ok) {
+                    if (auto ok = co_await WriteFrameSerialized(kCmdSYNACK, sub.Sid(), {}, &sub);
+                        !ok && !sub.RemoteClosed()) {
                         phase_error = ok.error();
                     }
                 }
@@ -617,7 +655,11 @@ net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessStream(
         if (prepared.error != common::ErrorCode::OK) {
             co_return prepared.error;
         }
-        if (sub.IsClosed()) co_return common::ErrorCode::CONNECTION_CLOSED;
+        // A stream its client already closed is dispatched only to deliver
+        // the bytes sent before that FIN; with none it is simply released.
+        if (sub.IsClosed() && prepared.pending.empty() && !sub.HasQueuedInput()) {
+            co_return common::ErrorCode::CONNECTION_CLOSED;
+        }
         if (prepared.uot_version) {
             co_return co_await ProcessUdpSubstream(
                 sub, *prepared.uot_version, std::move(prepared.pending), opened_at);
@@ -660,6 +702,9 @@ net::awaitable<app::RelayResult> AnyTLSDemuxSession::Run() {
             throw; // The group records this failure before cancelling siblings.
         }
         CancelAll();
+        // Substreams the client finished before the session ended complete
+        // their upload first.
+        if (!streams_.empty()) co_await JoinFinishedStreams();
         // Join every logical task, including header preparation and async
         // cleanup, even when the frame loop returns normally.
         tasks.Cancel();

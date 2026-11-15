@@ -1,6 +1,7 @@
 #pragma once
 #include "support.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cctype>
@@ -386,6 +387,18 @@ inline Socket ConnectChild(Child& child, uint16_t port) {
         8s);
     return socket;
 }
+// 入站被测节点：cnode 的 AnyTLS 入站经 freedom 直连目标（limits 非空时写入连接数上限），或换成参考服务端。
+inline void StartServer(Node& node, const std::string& reference, Json limits = Json::object()) {
+    if (reference.empty()) {
+        Configure(node.directory.Path(), Inbound(node.port), {{"protocol", "freedom"}, {"settings", Json::object()}});
+        if (!limits.empty()) {
+            auto config = Json::parse(ReadFile(node.directory.Path() / "config.json"));
+            config["limits"] = std::move(limits);
+            WriteJson(node.directory.Path(), "config.json", config);
+        }
+        node.Start();
+    } else node.Start({reference, "-l", "127.0.0.1:" + std::to_string(node.port), "-p", "secret"});
+}
 inline void ServerFin(bool remote, std::string reference = {}) {
     std::atomic<unsigned> requests = 0;
     std::atomic<bool> release = false, targetEof = false;
@@ -407,10 +420,7 @@ inline void ServerFin(bool remote, std::string reference = {}) {
         targetEof = true;
     });
     Node node;
-    if (reference.empty()) {
-        Configure(node.directory.Path(), Inbound(node.port), {{"protocol", "freedom"}, {"settings", Json::object()}});
-        node.Start();
-    } else node.Start({reference, "-l", "127.0.0.1:" + std::to_string(node.port), "-p", "secret"});
+    StartServer(node, reference);
     TlsContext context(false);
     TlsSocket client(ConnectChild(*node.child, node.port), context, false);
     Frames frames(client);
@@ -442,6 +452,117 @@ inline void ServerFin(bool remote, std::string reference = {}) {
     EXPECT_TRUE(node.child->Running());
     if (reference.empty()) node.Stop();
     else node.child->Stop();
+    target.Stop();
+}
+enum class SessionEnd { KeepOpen, TransportClose, Alert };
+inline std::string SessionEndCase(const testing::TestParamInfo<std::tuple<SessionEnd, bool>>& info) {
+    const auto [end, uot] = info.param;
+    const char* name = end == SessionEnd::KeepOpen ? "KeepOpen"
+                       : end == SessionEnd::TransportClose ? "TransportClose" : "Alert";
+    return std::string(name) + (uot ? "Uot" : "Tcp");
+}
+// 客户端把整条流压进一个记录：SYN、PSH（地址 + 上行载荷）、FIN，随后按 end 保持会话、直接断开，或先发
+// 会话级 Alert 再断开；断开时 TCP_CORK 让这些帧与传输层 FIN 同段到达，被测节点在一次可读事件内读到整条
+// 流和会话终止。FIN 之前收下的上行载荷仍须送达目标（uot 时是一个 UDP 数据报），未结束的旁路流 1 则照旧
+// 随会话终止而关闭；会话保持时，这条客户端已结束的流仍须得到恰好一个 SYNACK，且没有 FIN 或载荷回复。
+inline void ServerFinThenSessionEnd(SessionEnd end, bool uot, std::string reference = {}) {
+    std::atomic<bool> bystanderEof = false, delivered = false;
+    std::string received;
+    Server bystander([&](Socket socket) {
+        EXPECT_EQ(socket.ReadExact(8), "request!");
+        socket.Write("accepted");
+        Drain(socket, 5s, true);
+        bystanderEof = true;
+    });
+    Server target([&](Socket socket) {
+        received = Drain(socket);
+        delivered = true;
+    });
+    auto udp = Socket::BindUdp();
+    PeerThread datagram([&] {
+        if (!uot) return;
+        Require(Ready(udp.Fd(), 5s), "UDP upload deadline");
+        std::array<char, 64> bytes{};
+        const auto size = ::recv(udp.Fd(), bytes.data(), bytes.size(), 0);
+        Require(size >= 0, "UDP receive failed");
+        received.assign(bytes.data(), static_cast<size_t>(size));
+        delivered = true;
+    });
+    Node node;
+    StartServer(node, reference);
+    TlsContext context(false);
+    TlsSocket client(ConnectChild(*node.child, node.port), context, false);
+    Frames frames(client);
+    Authenticate(client);
+    Open(client, 1, bystander.Port(), "request!");
+    frames.Await([&] { return frames.Payload(1) == "accepted"; });
+    const auto upload = uot ? Magic(false) + std::string("\1\1", 2) + SocksAddress(udp.Port()).substr(1) +
+                                  BigEndian(8, 2) + "request!"
+                            : SocksAddress(target.Port()) + "request!";
+    if (end != SessionEnd::KeepOpen) {
+        const int cork = 1;
+        Require(::setsockopt(client.Fd(), IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork)) == 0, "TCP_CORK");
+    }
+    client.Write(AnyTlsFrame(kSyn, 3) + AnyTlsFrame(kPush, 3, upload) + AnyTlsFrame(kFin, 3) +
+                 (end == SessionEnd::Alert ? AnyTlsFrame(kAlert, 0, "session closed") : std::string{}));
+    if (end != SessionEnd::KeepOpen) client.Close();
+    Until([&] { return delivered.load(); });
+    EXPECT_EQ(received, "request!");
+    if (end == SessionEnd::KeepOpen) {
+        frames.Barrier();
+        EXPECT_FALSE(frames.closed);
+        EXPECT_FALSE(bystanderEof.load());
+        EXPECT_EQ(frames.Count(kSynAck, 3), 1u);
+        EXPECT_EQ(frames.Count(kFin, 3), 0u);
+        EXPECT_EQ(frames.Payload(3), "");
+        client.Close();
+    }
+    Until([&] { return bystanderEof.load(); });
+    datagram.Join();
+    EXPECT_TRUE(node.child->Running());
+    if (reference.empty()) node.Stop();
+    else node.child->Stop();
+    bystander.Stop();
+    target.Stop();
+}
+// 客户端已结束的流被拒绝时同样要回 SYNACK：SYN、PSH（地址 + 载荷）、FIN 压进一个记录，服务端处理它时已知
+// 客户端 FIN。cnode 因连接数上限拒绝准入，参考服务端因目标拒绝连接；两者都须回一个带原因的 SYNACK，会话
+// 与旁路流 1 不受影响，载荷不得到达目标。
+inline void ServerFinRejected(std::string reference = {}) {
+    std::atomic<unsigned> uploads = 0;
+    Server bystander([&](Socket socket) {
+        EXPECT_EQ(socket.ReadExact(8), "request!");
+        socket.Write("accepted");
+        Drain(socket, 5s, true);
+    });
+    Server target([&](Socket socket) {
+        ++uploads;
+        Drain(socket, 5s, true);
+    });
+    const auto refused = Socket::ReserveTcp();
+    Node node;
+    StartServer(node, reference, {{"maxConnectionsPerIP", 2}});
+    TlsContext context(false);
+    TlsSocket client(ConnectChild(*node.child, node.port), context, false);
+    Frames frames(client);
+    Authenticate(client);
+    Open(client, 1, bystander.Port(), "request!");
+    frames.Await([&] { return frames.Payload(1) == "accepted"; });
+    client.Write(AnyTlsFrame(kSyn, 3) +
+                 AnyTlsFrame(kPush, 3, SocksAddress(reference.empty() ? target.Port() : refused.Port()) + "request!") +
+                 AnyTlsFrame(kFin, 3));
+    frames.Await([&] { return frames.Count(kSynAck, 3) > 0; });
+    frames.Barrier();
+    EXPECT_EQ(frames.Count(kSynAck, 3), 1u);
+    EXPECT_TRUE(std::any_of(frames.records.begin(), frames.records.end(),
+                            [](const auto& f) { return f.command == kSynAck && f.stream == 3 && !f.payload.empty(); }));
+    EXPECT_FALSE(frames.closed);
+    EXPECT_EQ(uploads.load(), 0u);
+    client.Close();
+    EXPECT_TRUE(node.child->Running());
+    if (reference.empty()) node.Stop();
+    else node.child->Stop();
+    bystander.Stop();
     target.Stop();
 }
 // ClientFin 的上游 AnyTLS 对端：首个流回 accepted 后，remote 时由对端发完整载荷再 FIN，
@@ -520,15 +641,15 @@ inline void StartClient(Node& node, uint16_t peer, const std::string& reference)
         node.Start({reference, "-l", "127.0.0.1:" + std::to_string(node.port), "-s",
                     "127.0.0.1:" + std::to_string(peer), "-p", "secret", "-m", "1"});
 }
-inline Socket ClientApplication(Node& node, bool reference) {
+inline Socket ClientApplication(Node& node, bool reference, uint16_t target = 443) {
     auto app = ConnectChild(*node.child, node.port);
     if (!reference) {
-        app.Write(VlessRequest(443, "request!"));
+        app.Write(VlessRequest(target, "request!"));
         EXPECT_EQ(app.ReadExact(2), std::string("\0\0", 2));
     } else {
         app.Write(std::string("\5\1\0", 3));
         EXPECT_EQ(app.ReadExact(2), std::string("\5\0", 2));
-        app.Write(std::string("\5\1\0", 3) + SocksAddress(443));
+        app.Write(std::string("\5\1\0", 3) + SocksAddress(target));
         auto reply = app.ReadExact(4);
         EXPECT_EQ(reply.substr(0, 2), std::string("\5\0", 2));
         Require(reply[3] == 1 || reply[3] == 4, "SOCKS address type");
