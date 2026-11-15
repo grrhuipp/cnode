@@ -105,7 +105,7 @@ bool VlessEncryptionReader::EnableRawRead() noexcept {
 net::awaitable<common::MultiBuffer> VlessEncryptionReader::ReadRawBytes() {
     auto out = co_await src_.ReadMultiBuffer();
     if (out.byte_size() == 0) {
-        co_await common::ThrowIfCancelledOnEof("VLESS Encryption read cancelled");
+        common::ThrowIfCancelledOnEof(co_await net::this_coro::cancellation_state, "VLESS Encryption read cancelled");
     }
     if (header_xor_) {
         if (const auto bytes = out.MutableFrontSpan();

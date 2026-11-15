@@ -465,7 +465,7 @@ template <typename Reader>
         }
         auto next = co_await reader.ReadMultiBuffer();
         if (next.byte_size() == 0) {
-            co_await ThrowIfCancelledOnEof();
+            ThrowIfCancelledOnEof(co_await net::this_coro::cancellation_state);
             co_return tl::unexpected(ErrorCode::PROTOCOL_DECODE_FAILED);
         }
         next.MoveTo(pending);

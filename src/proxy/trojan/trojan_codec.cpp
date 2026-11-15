@@ -237,7 +237,7 @@ net::awaitable<common::MultiBuffer> ReadUdpDatagram(
         }
         common::MultiBuffer raw = co_await stream.ReadMultiBuffer();
         if (raw.byte_size() == 0) {
-            co_await common::ThrowIfCancelledOnEof();
+            common::ThrowIfCancelledOnEof(co_await net::this_coro::cancellation_state);
             framer.Finish();
             co_return common::MultiBuffer{};
         }

@@ -184,7 +184,6 @@ public:
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer payload) override;
     net::awaitable<void> WriteBuffers(
         std::span<const net::const_buffer> buffers) override;
-    net::awaitable<void> AsyncShutdownWrite() override { co_return; }
 
     UdpAssociationState& owner;
     UdpFlowKey key;
@@ -302,7 +301,7 @@ public:
     }
 
     net::awaitable<void> WriteReply(
-        const std::shared_ptr<UdpRouteFlow>& flow,
+        std::shared_ptr<UdpRouteFlow> flow,
         common::MultiBuffer payload) {
         LearnReplyCid(flow, payload);
         if (!common::SetUdpTarget(payload, *flow->key.target->target)) {
@@ -670,12 +669,12 @@ net::awaitable<common::MultiBuffer> UdpRouteFlow::ReadMultiBuffer() {
 
 net::awaitable<void> UdpRouteFlow::WriteMultiBuffer(
     common::MultiBuffer payload) {
-    co_await owner.WriteReply(shared_from_this(), std::move(payload));
+    return owner.WriteReply(shared_from_this(), std::move(payload));
 }
 
 net::awaitable<void> UdpRouteFlow::WriteBuffers(
     std::span<const net::const_buffer> buffers) {
-    co_await WriteBuffersAsMultiBuffer(buffers);
+    return WriteBuffersAsMultiBuffer(buffers);
 }
 
 
@@ -788,26 +787,25 @@ net::awaitable<void> DispatchUdpFlows(
         // its target starts a new flow once it is gone.
         return pushed == UdpRouteFlow::PushResult::Full;
     };
-    // Like the pipes of Xray's dispatcher, a full flow queue blocks the
-    // association's reader: stream-carried UDP then waits in its transport,
-    // and the flow never ends for a burst.
-    auto offer = [&](common::MultiBuffer packet) -> net::awaitable<void> {
-        while (process(packet)) {
-            if (!co_await state->AwaitRoom()) {
-                packet.clear();
-                throw transport::LinkError(state->Failure() != common::ErrorCode::OK
-                    ? state->Failure() : common::ErrorCode::CANCELLED);
-            }
-        }
-    };
-
     try {
-        if (!initial.empty() || initial.HasUDP()) co_await offer(std::move(initial));
-        for (;;) {
-            auto packet = co_await parent_link.reader->ReadMultiBuffer();
-            if (packet.empty() && !packet.HasUDP()) break;
-            co_await offer(std::move(packet));
-            if (state->Failure() != common::ErrorCode::OK) {
+        // Like the pipes of Xray's dispatcher, a full flow queue blocks the
+        // association's reader: stream-carried UDP then waits in its transport,
+        // and the flow never ends for a burst.
+        for (bool first = true;; first = false) {
+            auto packet = first ? std::move(initial)
+                                : co_await parent_link.reader->ReadMultiBuffer();
+            if (packet.empty() && !packet.HasUDP()) {
+                if (first) continue;
+                break;
+            }
+            while (process(packet)) {
+                if (!co_await state->AwaitRoom()) {
+                    packet.clear();
+                    throw transport::LinkError(state->Failure() != common::ErrorCode::OK
+                        ? state->Failure() : common::ErrorCode::CANCELLED);
+                }
+            }
+            if (!first && state->Failure() != common::ErrorCode::OK) {
                 throw transport::LinkError(state->Failure());
             }
         }

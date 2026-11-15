@@ -8,16 +8,10 @@ struct H2InboundPayload final {
     H2PayloadCodec codec;
     GrpcHunkDecoder decoder;
 
+    // Decodes hunks from DATA frames already queued; true once payload is ready.
     template <class Source>
-    net::awaitable<bool> EnsureGrpc(Source& source) {
-        while (decoder.Payload().empty()) {
-            if (!co_await source.WaitForDataFrame()) {
-                if (!decoder.AtMessageBoundary()) {
-                    source.HunkFailure();
-                    throw IoSystemError(io_error::connection_reset, "truncated gRPC message");
-                }
-                co_return false;
-            }
+    bool FeedQueued(Source& source) {
+        while (decoder.Payload().empty() && source.RawReady()) {
             const auto bytes = source.HunkInput();
             const auto consumed = decoder.Feed(bytes);
             if (!consumed) {
@@ -25,6 +19,21 @@ struct H2InboundPayload final {
                 throw IoSystemError(io_error::connection_reset, consumed.error().data());
             }
             source.ConsumeHunkInput(bytes.size(), *consumed);
+        }
+        return !decoder.Payload().empty();
+    }
+
+    // The waiting half of a gRPC read, entered only when FeedQueued came up empty.
+    template <class Source>
+    net::awaitable<bool> EnsureGrpc(Source& source) {
+        while (!FeedQueued(source)) {
+            if (!co_await source.WaitForDataFrame()) {
+                if (!decoder.AtMessageBoundary()) {
+                    source.HunkFailure();
+                    throw IoSystemError(io_error::connection_reset, "truncated gRPC message");
+                }
+                co_return false;
+            }
         }
         co_return true;
     }
@@ -46,7 +55,7 @@ struct H2InboundPayload final {
             if (!source.RawReady() && !co_await source.WaitForDataFrame()) co_return 0;
             co_return source.ConsumeRaw(buffer);
         }
-        if (decoder.Payload().empty() && !co_await EnsureGrpc(source)) co_return 0;
+        if (!FeedQueued(source) && !co_await EnsureGrpc(source)) co_return 0;
         co_return ConsumeGrpc(source, buffer);
     }
 
@@ -58,7 +67,7 @@ struct H2InboundPayload final {
             }
             co_return source.ConsumeRawMultiBuffer();
         }
-        if (decoder.Payload().empty() && !co_await EnsureGrpc(source)) {
+        if (!FeedQueued(source) && !co_await EnsureGrpc(source)) {
             co_return common::MultiBuffer{};
         }
         common::BufferGuard buffer{common::Buffer::New()};

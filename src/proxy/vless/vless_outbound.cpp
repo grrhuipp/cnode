@@ -338,7 +338,7 @@ public:
 
             common::MultiBuffer raw = co_await body_reader_.ReadMultiBuffer();
             if (raw.byte_size() == 0) {
-                co_await common::ThrowIfCancelledOnEof();
+                common::ThrowIfCancelledOnEof(co_await net::this_coro::cancellation_state);
                 if (pending_.byte_size() != 0) {
                     throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
                 }

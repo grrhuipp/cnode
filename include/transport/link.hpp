@@ -117,7 +117,7 @@ protected:
                 throw std::bad_alloc();
             }
         }
-        co_await WriteMultiBuffer(std::move(payload));
+        return WriteMultiBuffer(std::move(payload));
     }
 };
 

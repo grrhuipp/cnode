@@ -33,6 +33,16 @@ public:
         : std::runtime_error(std::string(common::ErrorCodeToString(common::ErrorCode::RESOURCE_EXHAUSTED))) {}
 };
 
+// Completion signature of a posted call: no value slot for a void result.
+template <typename R>
+struct PostCallSignature {
+    using type = void(std::exception_ptr, R);
+};
+template <>
+struct PostCallSignature<void> {
+    using type = void(std::exception_ptr);
+};
+
 // Admission and closure have a single atomic linearization point. Accepted
 // slots are released on the owner executor, including failed spawn attempts.
 class WorkerMailbox {
@@ -79,21 +89,29 @@ public:
     }
     // Runs a synchronous, self-contained callable on the owner executor. Only
     // the cross-thread hop and the completion back to the caller are
-    // asynchronous; no owner-side coroutine frame is allocated.
+    // asynchronous: neither side allocates a coroutine frame of its own. The
+    // slot is taken when the operation is awaited, never for a discarded one.
     template <typename Fn>
         requires std::invocable<Fn&>
     net::awaitable<std::invoke_result_t<Fn&>> PostCall(Fn fn) {
         using R = std::invoke_result_t<Fn&>;
-        // void 结果以 monostate 走同一条完成路径，调用方仍得到 awaitable<void>。
-        using Value = std::conditional_t<std::is_void_v<R>, std::monostate, R>;
-        Slot slot = Acquire();
-        auto caller_exec = co_await net::this_coro::executor;
-        [[maybe_unused]] auto value = co_await net::async_initiate<const net::use_awaitable_t<>&,
-                                                  void(std::exception_ptr, Value)>(
-            [this, caller_exec, slot = std::move(slot), fn = std::move(fn)](auto handler) mutable {
-                net::post(io_context_, [caller_exec, slot = std::move(slot), fn = std::move(fn),
+        auto token = net::use_awaitable;
+        return net::async_initiate<decltype(token), typename PostCallSignature<R>::type>(
+            [this, fn = std::move(fn)](auto handler) mutable {
+                // An initiation runs outside the awaiting coroutine: a refused
+                // slot must reach it through the handler, not as an exception.
+                std::optional<Slot> slot;
+                try {
+                    slot.emplace(Acquire());
+                } catch (...) {
+                    CompletePostCall<R>(handler, std::current_exception(), {});
+                    return;
+                }
+                auto caller_exec = net::get_associated_executor(handler);
+                net::post(io_context_, [caller_exec = std::move(caller_exec),
+                                        slot = std::move(*slot), fn = std::move(fn),
                                         handler = std::move(handler)]() mutable {
-                    std::optional<Value> result;
+                    PostCallValue<R> result;
                     std::exception_ptr err;
                     try {
                         if constexpr (std::is_void_v<R>) {
@@ -109,16 +127,28 @@ public:
                     net::dispatch(caller_exec,
                         [handler = std::move(handler), err = std::move(err),
                          result = std::move(result)]() mutable {
-                            std::move(handler)(std::move(err),
-                                result ? std::move(*result) : Value{});
+                            CompletePostCall<R>(handler, std::move(err), std::move(result));
                         });
                 });
             },
-            net::use_awaitable);
-        if constexpr (!std::is_void_v<R>) co_return std::move(value);
+            token);
     }
 
 private:
+    template <typename R>
+    using PostCallValue =
+        std::optional<std::conditional_t<std::is_void_v<R>, std::monostate, R>>;
+    // `value` is empty on failure; a non-void result is then value-initialized.
+    template <typename R, typename Handler>
+    static void CompletePostCall(Handler& handler, std::exception_ptr error,
+                                 PostCallValue<R> value) {
+        if constexpr (std::is_void_v<R>) {
+            std::move(handler)(std::move(error));
+        } else {
+            std::move(handler)(std::move(error), value ? std::move(*value) : R{});
+        }
+    }
+
     using CompletionChannel = common::SignalChannel;
     static constexpr size_t kClosed = size_t{1} << (std::numeric_limits<size_t>::digits - 1);
     class Slot {

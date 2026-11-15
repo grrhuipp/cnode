@@ -438,8 +438,17 @@ struct XHttpUploadTarget {
     [[nodiscard]] explicit operator bool() const noexcept { return session || relay; }
 };
 
-// An upload reaching the directory before its downlink waits for the
-// downlink's Worker to claim the session, until `cancellation` fires.
+// The session when this Worker owns it, joined without leaving the Worker;
+// empty for an Open access or a session that is not here.
+[[nodiscard]] XHttpUploadTarget FindLocalXHttpUploadTarget(
+    net::io_context& io_context,
+    std::string_view session_namespace,
+    std::string_view session_id,
+    XHttpSessionAccess access);
+
+// The directory path, taken when FindLocalXHttpUploadTarget finds nothing. An
+// upload reaching the directory before its downlink waits for the downlink's
+// Worker to claim the session, until `cancellation` fires.
 [[nodiscard]] net::awaitable<XHttpUploadTarget> ResolveXHttpUploadTarget(
     app::GroupCoordinator& coordinator,
     net::io_context& io_context,
@@ -460,13 +469,20 @@ public:
     XHttpPacketUpload& operator=(const XHttpPacketUpload&) = delete;
 
     net::awaitable<size_t> Read(common::MultiBuffer& payload, size_t limit);
-    net::awaitable<XHttpCommit> Commit(uint64_t seq, common::MultiBuffer payload);
+    // A local session takes the packet synchronously; otherwise it travels to
+    // the session's Worker.
+    [[nodiscard]] bool Local() const noexcept { return session_ != nullptr; }
+    [[nodiscard]] XHttpCommit CommitLocal(uint64_t seq, common::MultiBuffer payload);
+    [[nodiscard]] net::awaitable<XHttpCommit> CommitRemote(
+        uint64_t seq, common::MultiBuffer payload);
 
 private:
     void OnCancellation(common::Cancellation cancellation) noexcept override;
-    // Adds `bytes` to this upload's reservation; false when the local session
-    // budget is spent. A remote reservation waits instead.
-    net::awaitable<bool> Reserve(size_t bytes);
+    // Adds `bytes` to this upload's reservation without waiting; false while
+    // the session or relay budget is spent.
+    [[nodiscard]] bool TryReserve(size_t bytes) noexcept;
+    // Waits for the relay budget toward the session's Worker, then reserves.
+    net::awaitable<void> ReserveRemote(size_t bytes);
 
     XHttpPacketUpSession* session_ = nullptr;
     XHttpUploadRelay* relay_ = nullptr;

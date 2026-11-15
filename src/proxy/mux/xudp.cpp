@@ -158,6 +158,11 @@ public:
     // flow closed or `carrier` (the sub-session's) was cancelled.
     [[nodiscard]] net::awaitable<bool> AwaitUplinkRoom(
         const common::MultiBuffer& datagram, common::CancellationSource& carrier);
+    // The common case of AwaitUplinkRoom, without its wait state.
+    [[nodiscard]] bool UplinkReady(const common::MultiBuffer& datagram,
+                                   const common::CancellationSource& carrier) const noexcept {
+        return !closed_ && !carrier.Stopped() && uplink_.HasRoom(datagram);
+    }
 
     net::awaitable<common::MultiBuffer> ReadMultiBuffer() override;
     net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override;
@@ -315,7 +320,8 @@ void XudpSession::Start() {
 net::awaitable<void> XudpSession::Run(std::shared_ptr<XudpSession> self) {
     try {
         InboundSubstreamAdmission admission(stats_);
-        if (co_await admission.Admit(admission_, ctx_)) {
+        auto pending = InboundSubstreamAdmission::Reserve(admission_, ctx_);
+        if (!pending || admission.Hold(co_await std::move(*pending), ctx_, stats_)) {
             (void)co_await dispatcher_.Dispatch(
                 io_context_, policy_, nullptr, transport::Link{this, this},
                 common::InitialPayload{}, ctx_, stats_, timeouts_);
@@ -721,7 +727,8 @@ net::awaitable<void> CarryLocal(std::shared_ptr<XudpSession> flow, XudpClient& c
         for (;;) {
             auto datagram = co_await uplink.ReadMultiBuffer();
             if (datagram.empty()) break;
-            if (!co_await flow->AwaitUplinkRoom(datagram, uplink.Cancellation())) break;
+            if (!flow->UplinkReady(datagram, uplink.Cancellation()) &&
+                !co_await flow->AwaitUplinkRoom(datagram, uplink.Cancellation())) break;
             flow->PushUplink(std::move(datagram));
         }
     } catch (...) {

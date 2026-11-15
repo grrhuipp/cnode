@@ -1025,27 +1025,32 @@ XHttpPacketUpload::~XHttpPacketUpload() noexcept {
     }
 }
 
-net::awaitable<bool> XHttpPacketUpload::Reserve(size_t bytes) {
-    if (session_) {
-        if (!session_->Reserve(bytes)) co_return false;
-    } else {
-        while (!relay_->TryReservePacketBytes(owner_, bytes)) {
-            if (!co_await relay_->AwaitPacketBudget(owner_, stream_.Cancellation())) {
-                throw IoSystemError(io_error::operation_aborted, "xhttp upload cancelled");
-            }
+bool XHttpPacketUpload::TryReserve(size_t bytes) noexcept {
+    if (!(session_ ? session_->Reserve(bytes) : relay_->TryReservePacketBytes(owner_, bytes))) {
+        return false;
+    }
+    reserved_ += bytes;
+    return true;
+}
+
+net::awaitable<void> XHttpPacketUpload::ReserveRemote(size_t bytes) {
+    while (!relay_->TryReservePacketBytes(owner_, bytes)) {
+        if (!co_await relay_->AwaitPacketBudget(owner_, stream_.Cancellation())) {
+            throw IoSystemError(io_error::operation_aborted, "xhttp upload cancelled");
         }
     }
     reserved_ += bytes;
-    co_return true;
 }
 
 net::awaitable<size_t> XHttpPacketUpload::Read(common::MultiBuffer& payload, size_t limit) {
-    if (payload.empty() || payload.byte_size() >= reserved_) {
-        if (!co_await Reserve(common::Buffer::kSize)) {
+    if ((payload.empty() || payload.byte_size() >= reserved_) &&
+        !TryReserve(common::Buffer::kSize)) {
+        if (session_) {
             uint8_t excess;
             if (co_await stream_.AsyncRead(net::buffer(&excess, 1)) == 0) co_return 0;
             throw IoSystemError(io_error::no_buffer_space, "xhttp payload budget exhausted");
         }
+        co_await ReserveRemote(common::Buffer::kSize);
     }
     if (limit == 0) {
         co_return 0;
@@ -1069,20 +1074,25 @@ net::awaitable<size_t> XHttpPacketUpload::Read(common::MultiBuffer& payload, siz
         stream_.PrependReadBytes(first->Bytes().subspan(n));
         first->end = first->start + static_cast<uint32_t>(n);
     }
-    if (n > reserved_ && !co_await Reserve(n - reserved_)) {
-        throw IoSystemError(io_error::no_buffer_space, "xhttp payload budget exhausted");
+    if (n > reserved_ && !TryReserve(n - reserved_)) {
+        if (session_) {
+            throw IoSystemError(io_error::no_buffer_space, "xhttp payload budget exhausted");
+        }
+        co_await ReserveRemote(n - reserved_);
     }
     payload.push_back(std::move(first));
     co_return n;
 }
 
-net::awaitable<XHttpCommit> XHttpPacketUpload::Commit(uint64_t seq, common::MultiBuffer payload) {
-    if (session_) {
-        session_->Release(std::exchange(reserved_, 0));
-        co_return session_->Push(seq, std::move(payload))
-            ? XHttpCommit::Committed : XHttpCommit::Rejected;
-    }
-    co_return co_await relay_->SendPacket(owner_, token_, seq, std::move(payload),
+XHttpCommit XHttpPacketUpload::CommitLocal(uint64_t seq, common::MultiBuffer payload) {
+    session_->Release(std::exchange(reserved_, 0));
+    return session_->Push(seq, std::move(payload))
+        ? XHttpCommit::Committed : XHttpCommit::Rejected;
+}
+
+net::awaitable<XHttpCommit> XHttpPacketUpload::CommitRemote(
+    uint64_t seq, common::MultiBuffer payload) {
+    return relay_->SendPacket(owner_, token_, seq, std::move(payload),
         std::exchange(reserved_, 0), stream_.Cancellation());
 }
 
@@ -1488,6 +1498,16 @@ net::awaitable<std::shared_ptr<XHttpPacketUpSession>> OpenXHttpDownlinkSession(
     }
 }
 
+XHttpUploadTarget FindLocalXHttpUploadTarget(
+    net::io_context& io_context,
+    std::string_view session_namespace,
+    std::string_view session_id,
+    XHttpSessionAccess access) {
+    if (access == XHttpSessionAccess::Open) return {};
+    return XHttpUploadTarget{.session = net::use_service<XHttpSessionTable>(io_context).Get(
+        io_context, session_namespace, session_id, XHttpSessionAccess::Join)};
+}
+
 net::awaitable<XHttpUploadTarget> ResolveXHttpUploadTarget(
     app::GroupCoordinator& coordinator,
     net::io_context& io_context,
@@ -1496,12 +1516,6 @@ net::awaitable<XHttpUploadTarget> ResolveXHttpUploadTarget(
     XHttpSessionAccess access,
     common::CancellationSource& cancellation) {
     auto& table = net::use_service<XHttpSessionTable>(io_context);
-    if (access != XHttpSessionAccess::Open) {
-        if (auto session = table.Get(
-                io_context, session_namespace, session_id, XHttpSessionAccess::Join)) {
-            co_return XHttpUploadTarget{.session = std::move(session)};
-        }
-    }
     for (;;) {
         auto claim = co_await coordinator.PostCall(
             [&coordinator, session_namespace, session_id, access, &io_context] {
@@ -1650,7 +1664,9 @@ net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest
                 if (!payload) {
                     co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
                 }
-                commit = co_await upload.Commit(seq, std::move(*payload));
+                commit = upload.Local()
+                    ? upload.CommitLocal(seq, std::move(*payload))
+                    : co_await upload.CommitRemote(seq, std::move(*payload));
             } catch (const IoSystemError& e) {
                 co_return tl::unexpected(
                     e.code() == io_error::no_buffer_space
@@ -1698,7 +1714,9 @@ net::awaitable<tl::expected<bool, common::ErrorCode>> ExecuteXHttp1UploadRequest
                 if (!payload) {
                     co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
                 }
-                rejection = CommitRejection(co_await upload.Commit(seq, std::move(*payload)));
+                rejection = CommitRejection(upload.Local()
+                    ? upload.CommitLocal(seq, std::move(*payload))
+                    : co_await upload.CommitRemote(seq, std::move(*payload)));
             } catch (const IoSystemError& e) {
                 if (e.code() != io_error::no_buffer_space || !stream->IsOpen()) {
                     co_return tl::unexpected(
@@ -1895,9 +1913,14 @@ net::awaitable<TransportBuildResult> DoXHttp1ServerHandshake(
         if (meta.kind == XHttpRequestMeta::Kind::PacketUp ||
             meta.kind == XHttpRequestMeta::Kind::StreamUp) {
             common::MultiBuffer read_ahead = head->TakeReadAheadMultiBuffer();
-            auto target = co_await ResolveXHttpUploadTarget(coordinator, io_context,
-                xhttp_cfg.session_namespace, meta.session_id, XHttpRequestAccess(meta.kind),
-                stream->Cancellation());
+            const auto access = XHttpRequestAccess(meta.kind);
+            auto target = FindLocalXHttpUploadTarget(
+                io_context, xhttp_cfg.session_namespace, meta.session_id, access);
+            if (!target) {
+                target = co_await ResolveXHttpUploadTarget(coordinator, io_context,
+                    xhttp_cfg.session_namespace, meta.session_id, access,
+                    stream->Cancellation());
+            }
             if (!target && (stream->ConsumePhaseDeadline() || stream->ConsumeIdleTimeout())) {
                 co_return tl::unexpected(common::ErrorCode::TIMEOUT);
             }

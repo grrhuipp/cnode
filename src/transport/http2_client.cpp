@@ -151,8 +151,11 @@ private:
             if (buffer.size() == 0) {
                 continue;
             }
-            const auto* data = static_cast<const uint8_t*>(buffer.data());
-            co_await SendGrpcHunkMessage(std::span<const uint8_t>(data, buffer.size()));
+            GrpcHunkCursor cursor(std::span<const uint8_t>(
+                static_cast<const uint8_t*>(buffer.data()), buffer.size()));
+            do {
+                co_await SendData(cursor.Next());
+            } while (!cursor.Done());
         }
     }
 
@@ -276,13 +279,6 @@ private:
             stream_send_window_.Consume(size);
             co_await WriteH2FrameBuffers(*inner_, H2FrameType::DATA, 0, stream_id_, payload);
         }
-    }
-
-    net::awaitable<void> SendGrpcHunkMessage(std::span<const uint8_t> data) {
-        GrpcHunkCursor cursor(data);
-        do {
-            co_await SendData(cursor.Next());
-        } while (!cursor.Done());
     }
 
     // Pumps one frame directly when idle, or waits for the active pump another

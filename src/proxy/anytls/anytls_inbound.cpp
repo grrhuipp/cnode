@@ -602,7 +602,8 @@ net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessStream(
     common::Context& ctx = sub.ctx;
     // Held for the stream's lifetime; a refusal ends only this stream.
     proxy::InboundSubstreamAdmission admission(environment_.stats);
-    if (!co_await admission.Admit(environment_, ctx)) {
+    if (auto pending = proxy::InboundSubstreamAdmission::Reserve(environment_, ctx);
+        pending && !admission.Hold(co_await std::move(*pending), ctx, environment_.stats)) {
         if (session_version_ == SessionVersion::V2) {
             constexpr std::string_view message = "connection rejected";
             (void)co_await WriteFrameSerialized(kCmdSYNACK, sub.Sid(),

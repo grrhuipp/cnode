@@ -75,7 +75,7 @@ net::awaitable<SessionClaim> ClaimSessionOwner(
     release->coordinator = &coordinator;
     release->key = key;
     release->owner = candidate;
-    co_return co_await coordinator.PostCall(
+    return coordinator.PostCall(
         [&coordinator, key, candidate, release = std::move(release)]() mutable {
             return Directory(coordinator).Claim(key, candidate, std::move(release));
         });

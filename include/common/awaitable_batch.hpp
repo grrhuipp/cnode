@@ -44,15 +44,15 @@ struct BatchState {
     bool failure_is_cancellation = false;
 };
 
-// This coroutine and every completion callback run on the supplied executor.
-// Acquire the join continuation before launching any child, so completion never
-// depends on allocating a separate wait operation after children have started.
+// The initiation and every completion callback run on `executor`, the one this
+// awaitable is spawned on. Acquire the join continuation before launching any
+// child, so completion never depends on allocating a separate wait operation
+// after children have started.
 inline net::awaitable<void> RunBatchOnExecutor(
-    std::vector<net::awaitable<void>> tasks) {
-    const auto executor = co_await net::this_coro::executor;
+    net::any_io_executor executor, std::vector<net::awaitable<void>> tasks) {
     auto token = net::use_awaitable;
-    co_await net::async_initiate<decltype(token), void(std::exception_ptr)>(
-        [executor, tasks = std::move(tasks)](auto handler) mutable {
+    return net::async_initiate<decltype(token), void(std::exception_ptr)>(
+        [executor = std::move(executor), tasks = std::move(tasks)](auto handler) mutable {
             static_assert(std::is_nothrow_move_constructible_v<decltype(handler)>);
             std::shared_ptr<BatchState<decltype(handler)>> state;
             try {
@@ -93,7 +93,7 @@ inline net::awaitable<void> RunAwaitableBatch(
 
     // Cancellation must not detach children from a caller whose state they may
     // borrow. Join on an independent coroutine, then report deferred cancellation.
-    co_await net::co_spawn(executor, RunBatchOnExecutor(std::move(tasks)),
+    co_await net::co_spawn(executor, RunBatchOnExecutor(executor, std::move(tasks)),
         net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
     const auto cancellation = co_await net::this_coro::cancellation_state;
     if (cancellation.cancelled() != net::cancellation_type::none) {

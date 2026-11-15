@@ -410,7 +410,9 @@ public:
         if (mb.byte_size() == 0) {
             co_return;
         }
-        auto lease = co_await AcquireUploadWriteLease();
+        auto lease = upload_gate_.TryAcquire();
+        if (!lease) lease = co_await upload_gate_.Acquire();
+        CheckUploadLease(lease);
         if (upload_) {
             co_await upload_->WriteMultiBuffer(std::move(mb));
             TouchDownlinkActivity();
@@ -428,7 +430,9 @@ public:
         if (!HasNonEmptyBuffer(buffers)) {
             co_return;
         }
-        auto lease = co_await AcquireUploadWriteLease();
+        auto lease = upload_gate_.TryAcquire();
+        if (!lease) lease = co_await upload_gate_.Acquire();
+        CheckUploadLease(lease);
         if (upload_) {
             co_await upload_->WriteBuffers(buffers);
             TouchDownlinkActivity();
@@ -528,13 +532,10 @@ private:
         }
     }
 
-    net::awaitable<AsyncWriteGate::Lease> AcquireUploadWriteLease() {
-        auto lease = upload_gate_.TryAcquire();
-        if (!lease) lease = co_await upload_gate_.Acquire();
+    void CheckUploadLease(const AsyncWriteGate::Lease& lease) const {
         if (!lease || closed_ || write_closed_ || upload_failed_) {
             throw IoSystemError(io_error::broken_pipe, "xhttp stream-up upload unavailable");
         }
-        co_return lease;
     }
 
     void OnUploadCancellation(common::Cancellation event) noexcept {

@@ -445,9 +445,9 @@ net::awaitable<bool> BodyDecoder::ReadExact(transport::MultiBufferReader& src,
         Fail("VMess body reader is failed");
     }
     if (state_ == State::Finished) {
-        co_return false;
+        return []() -> net::awaitable<bool> { co_return false; }();
     }
-    co_return co_await proxy::BufferedStreamReader::ReadExactFrom(
+    return proxy::BufferedStreamReader::ReadExactFrom(
         src, pending_read_, out.data(), out.size(), &filled);
 }
 

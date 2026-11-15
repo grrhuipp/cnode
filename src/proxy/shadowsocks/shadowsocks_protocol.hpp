@@ -330,7 +330,7 @@ public:
             ciphertext_.ReleaseIfIdle();
             auto raw = co_await stream_->ReadMultiBuffer();
             if (raw.byte_size() == 0) {
-                co_await common::ThrowIfCancelledOnEof();
+                common::ThrowIfCancelledOnEof(co_await net::this_coro::cancellation_state);
                 if (length_ || ciphertext_.byte_size() != 0) {
                     try { throw transport::LinkError(common::ErrorCode::PROTOCOL_DECODE_FAILED); }
                     catch (...) { Fail(); }

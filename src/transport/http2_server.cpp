@@ -269,11 +269,13 @@ net::awaitable<void> Http2ServerSubStreamState::WriteBuffers(
         if (buffer.size() == 0) {
             continue;
         }
-        const auto* data = static_cast<const uint8_t*>(buffer.data());
-        if (!co_await session->WriteGrpcMessageSerialized(
-                stream_id_, std::span<const uint8_t>(data, buffer.size()))) {
-            throw IoSystemError(io_error::connection_reset, "gRPC server stream write failed");
-        }
+        GrpcHunkCursor cursor(std::span<const uint8_t>(
+            static_cast<const uint8_t*>(buffer.data()), buffer.size()));
+        do {
+            if (!co_await session->WriteDataSerialized(stream_id_, cursor.Next())) {
+                throw IoSystemError(io_error::connection_reset, "gRPC server stream write failed");
+            }
+        } while (!cursor.Done());
     }
 }
 
@@ -630,18 +632,6 @@ net::awaitable<bool> Http2ServerSession::WriteFrameSerialized(
     co_return true;
 }
 
-net::awaitable<bool> Http2ServerSession::WriteGrpcMessageSerialized(
-    uint32_t stream_id,
-    std::span<const uint8_t> data) {
-    GrpcHunkCursor cursor(data);
-    do {
-        if (!co_await WriteDataSerialized(stream_id, cursor.Next())) {
-            co_return false;
-        }
-    } while (!cursor.Done());
-    co_return true;
-}
-
 net::awaitable<bool> Http2ServerSession::WriteDataSerialized(
     uint32_t stream_id,
     std::span<const net::const_buffer> buffers) {
@@ -800,11 +790,14 @@ net::awaitable<void> Http2ServerSession::RunUpload(
     RequestScope active(active_requests_);
     XHttpUploadTarget target;
     try {
-        target = co_await ResolveXHttpUploadTarget(coordinator_, io_context_,
-            xhttp_config_->session_namespace, session_id,
-            kind == XHttpRequestMeta::Kind::PacketUp
-                ? XHttpSessionAccess::Upload : XHttpSessionAccess::Open,
-            sub->Cancellation());
+        const auto access = kind == XHttpRequestMeta::Kind::PacketUp
+            ? XHttpSessionAccess::Upload : XHttpSessionAccess::Open;
+        target = FindLocalXHttpUploadTarget(
+            io_context_, xhttp_config_->session_namespace, session_id, access);
+        if (!target) {
+            target = co_await ResolveXHttpUploadTarget(coordinator_, io_context_,
+                xhttp_config_->session_namespace, session_id, access, sub->Cancellation());
+        }
     } catch (const IoSystemError&) {
         target = XHttpUploadTarget{};
     }
@@ -841,7 +834,10 @@ net::awaitable<void> Http2ServerSession::RunUpload(
             // The HTTP/2 stream is exactly one POST body; only the upload budget bounds it.
             while (co_await packet.Read(payload, std::numeric_limits<size_t>::max()) != 0) {
             }
-            if (co_await packet.Commit(seq, std::move(payload)) != XHttpCommit::Committed)
+            const auto commit = packet.Local()
+                ? packet.CommitLocal(seq, std::move(payload))
+                : co_await packet.CommitRemote(seq, std::move(payload));
+            if (commit != XHttpCommit::Committed)
                 throw IoSystemError(io_error::no_buffer_space);
             if (target.session && !target.session->DownlinkAttached() &&
                 !co_await target.session->AwaitDownlink(upload->Cancellation())) {

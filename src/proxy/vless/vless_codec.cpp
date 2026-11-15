@@ -613,7 +613,7 @@ net::awaitable<common::MultiBuffer> VlessUdpFramer::ReadDatagram(
 
         common::MultiBuffer raw = co_await src.ReadMultiBuffer();
         if (raw.byte_size() == 0) {
-            co_await common::ThrowIfCancelledOnEof();
+            common::ThrowIfCancelledOnEof(co_await net::this_coro::cancellation_state);
             Finish();
             co_return common::MultiBuffer{};
         }
@@ -744,7 +744,7 @@ net::awaitable<common::MultiBuffer> VisionReader::ReadFramedMultiBuffer() {
         if (!read_process_) {
             common::MultiBuffer raw = co_await src_.ReadMultiBuffer();
             if (raw.byte_size() == 0) {
-                co_await common::ThrowIfCancelledOnEof();
+                common::ThrowIfCancelledOnEof(co_await net::this_coro::cancellation_state);
             } else if (traffic_.packets_to_filter > 0) {
                 traffic_.FilterTLS(raw.FrontSpan());
             }
@@ -753,7 +753,7 @@ net::awaitable<common::MultiBuffer> VisionReader::ReadFramedMultiBuffer() {
 
         common::MultiBuffer raw = co_await src_.ReadMultiBuffer();
         if (raw.byte_size() == 0) {
-            co_await common::ThrowIfCancelledOnEof();
+            common::ThrowIfCancelledOnEof(co_await net::this_coro::cancellation_state);
             if (read_process_ && (header_read_ != 0 || frame_active_ || expect_uuid_)) {
                 throw IoSystemError(io_error::connection_reset, "VLESS Vision frame truncated");
             }

@@ -278,6 +278,13 @@ AdmitNativeAssociation(const AdmissionEnvironment& environment, common::Context&
 class InboundSubstreamAdmission {
 public:
     explicit InboundSubstreamAdmission(app::StatsShard& stats) noexcept : connection_stats_(stats) {}
+    // Reserves the logical-stream slot. Empty when the limiter tracks nothing
+    // for it; otherwise the caller awaits the result and passes it to Hold.
+    [[nodiscard]] static std::optional<net::awaitable<app::ConnectionLimiter::Admission>>
+    Reserve(const AdmissionEnvironment& environment, const common::Context& ctx) {
+        return ReserveInboundConnection(
+            environment, app::ConnectionLimiter::ReservationScope::Logical, ctx);
+    }
     [[nodiscard]] bool Hold(app::ConnectionLimiter::Admission admission, const common::Context& ctx, app::StatsShard& stats) {
         if (admission.reason != app::ConnectionLimiter::RejectReason::NONE) {
             RejectInboundAdmission(ctx, stats, admission.reason);
@@ -285,13 +292,6 @@ public:
         }
         reservation_ = std::move(admission.reservation);
         return true;
-    }
-    [[nodiscard]] net::awaitable<bool> Admit(const AdmissionEnvironment& environment, common::Context& ctx) {
-        if (auto pending = ReserveInboundConnection(
-                environment, app::ConnectionLimiter::ReservationScope::Logical, ctx)) {
-            co_return Hold(co_await std::move(*pending), ctx, environment.stats);
-        }
-        co_return true;
     }
 private:
     app::ConnectionStatsScope connection_stats_;

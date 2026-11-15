@@ -721,7 +721,10 @@ public:
         if (const auto datagram = common::InspectUdpDatagram(mb);
             datagram.Valid() && datagram.payload_size <= std::numeric_limits<uint16_t>::max()) {
             const size_t size = datagram.payload_size;
-            co_await WaitForOutputWindow([this, size] { return !reply_queue_.CanPushUdp(size); });
+            if (!reply_queue_.CanPushUdp(size)) {
+                co_await WaitForOutputWindow(
+                    [this, size] { return !reply_queue_.CanPushUdp(size); });
+            }
         }
         if (cancelled_ || !reply_queue_.running) {
             throw IoSystemError(
@@ -832,7 +835,8 @@ net::awaitable<void> RunSubDispatch(
         }
         // Held for the child's lifetime; a refusal ends only this child.
         proxy::InboundSubstreamAdmission admission(stats);
-        if (!co_await admission.Admit(environment, sub->ctx)) {
+        if (auto pending = proxy::InboundSubstreamAdmission::Reserve(environment, sub->ctx);
+            pending && !admission.Hold(co_await std::move(*pending), sub->ctx, environment.stats)) {
             sub->Reject();
         } else {
             (void)co_await dispatcher.Dispatch(

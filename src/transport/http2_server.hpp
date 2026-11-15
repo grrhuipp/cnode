@@ -298,10 +298,6 @@ public:
         uint32_t stream_id,
         std::span<const uint8_t> payload = {});
 
-    net::awaitable<bool> WriteGrpcMessageSerialized(
-        uint32_t stream_id,
-        std::span<const uint8_t> data);
-
     // Sends DATA within the connection and stream send windows (RFC 9113
     // 6.9.1). The physical gate is held per frame, so other streams and the
     // read loop's control frames proceed while this stream waits for credit.

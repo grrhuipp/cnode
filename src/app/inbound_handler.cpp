@@ -147,7 +147,10 @@ public:
         InboundHandler& handler = *handler_;
         const app::ReceiverSettings& listener = handler.receiver_;
         proxy::InboundSubstreamAdmission admission(stats_);
-        if (!co_await admission.Admit(handler.environment_, ctx)) co_return;
+        if (auto pending = proxy::InboundSubstreamAdmission::Reserve(handler.environment_, ctx);
+            pending && !admission.Hold(co_await std::move(*pending), ctx, stats_)) {
+            co_return;
+        }
 
         (void)stream->StartPhaseDeadline(timeouts_.HandshakeTimeout());
 

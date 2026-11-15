@@ -274,14 +274,14 @@ public:
           stopping_(stopping) {}
 
     net::awaitable<void> RemoveInbound(const std::string& tag) {
-        co_await app::PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
+        return app::PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
             [&tag](app::Worker& worker, size_t) {
                 return worker.PostTask(worker.UnregisterListenerTask(tag));
             });
     }
 
     net::awaitable<void> RemoveOutbound(const std::string& tag) {
-        co_await app::PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
+        return app::PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
             [&tag](app::Worker& worker, size_t) {
                 return worker.PostCall([&worker, tag] { worker.RemoveOutbound(tag); });
             });
@@ -289,7 +289,7 @@ public:
 
     net::awaitable<void> AddOutbound(
         const app::PreparedOutboundConfig& prepared) {
-        co_await app::PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
+        return app::PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
             [&prepared](app::Worker& worker, size_t) {
                 return worker.PostCall([&worker, config = prepared]() mutable {
                     worker.AddOutbound(std::move(config));
