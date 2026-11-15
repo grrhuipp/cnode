@@ -201,6 +201,15 @@ WriteEncodedFrameBatch(transport::AsyncStream& stream,
     if (framed.empty()) {
         co_return tl::expected<void, common::ErrorCode>{};
     }
+    // Unpadded writes are the steady state: write here instead of entering the padding coroutine.
+    if (records.empty()) {
+        try {
+            co_await stream.WriteBuffers(framed);
+        } catch (const IoSystemError& e) {
+            co_return tl::unexpected(common::MapAsioError(e.code()));
+        }
+        co_return tl::expected<void, common::ErrorCode>{};
+    }
     co_return co_await WriteSlicesWithPadding(stream, records, framed);
 }
 
