@@ -95,7 +95,8 @@ struct Peer {
         }
         if (refuse || negative || nodata ||
             (malformed_type != 0 && malformed_type != (v6 ? 28 : 1))) return packet;
-        const size_t count = bulk_answers ? bulk_answers : 1;
+        const bool use_bulk = bulk_answers && (!bulk_only_first_a || (!v6 && ordinal == 1));
+        const size_t count = use_bulk ? bulk_answers : 1;
         packet[6] = static_cast<uint8_t>(count >> 8);
         packet[7] = static_cast<uint8_t>(count);
         const uint8_t size = v6 ? 16 : 4;
@@ -107,9 +108,9 @@ struct Peer {
                 static_cast<uint8_t>(ttl >> 8), static_cast<uint8_t>(ttl), 0, size});
             if (v6) {
                 auto bytes = net::ip::make_address_v6("2001:db8::1").to_bytes();
-                if (bulk_answers) bytes.back() = static_cast<uint8_t>(i + 1);
+                if (use_bulk) bytes.back() = static_cast<uint8_t>(i + 1);
                 packet.insert(packet.end(), bytes.begin(), bytes.end());
-            } else if (bulk_answers) {
+            } else if (use_bulk) {
                 packet.insert(packet.end(), {198, 51, 100, static_cast<uint8_t>(i + 1)});
             } else {
                 packet.insert(packet.end(), {192, 0, 2, static_cast<uint8_t>(ordinal)});
@@ -250,7 +251,8 @@ struct Peer {
             ++stream_closed;
             co_return;
         }
-        const auto packet = Answer(Inspect(std::move(bytes)), 4);
+        // The bulk-carrying sample is ordinal 1 when only the first A is bulk.
+        const auto packet = Answer(Inspect(std::move(bytes)), bulk_only_first_a ? 1 : 4);
         length = {static_cast<uint8_t>(packet.size() >> 8), static_cast<uint8_t>(packet.size())};
         const std::array<net::const_buffer, 2> reply{net::buffer(length), net::buffer(packet)};
         (void)co_await net::async_write(stream, reply, net::as_tuple(net::use_awaitable));
@@ -270,7 +272,7 @@ struct Peer {
     bool omit_soa = false, unrelated_soa = false, ignore_udp_limit = false;
     bool noise = false, duplicate_id = false, fault_cache_write = false, stall_stream = false;
     uint32_t soa_ttl = 900, soa_minimum = 120;
-    bool vary_a_soa_ttl = false;
+    bool vary_a_soa_ttl = false, bulk_only_first_a = false;
     mutable uint32_t min_a_soa_ttl = UINT32_MAX;
     std::function<std::vector<uint8_t>(const Query&)> answer_override;
     int malformed_type = 0;
@@ -372,7 +374,31 @@ TEST_P(DnsDatagramQueries, TruncatedAnswerIsRetriedOverTcp) {
         EXPECT_TRUE(result.Ok()) << result.error_msg;
         EXPECT_EQ(result.addresses, BulkAddresses(64));
         EXPECT_EQ(peer.packets, 4u);
-        EXPECT_EQ(peer.stream_queries, 4u) << "every truncated answer must be retried over TCP";
+        EXPECT_EQ(peer.stream_queries, 2u) << "one TCP retry per address family";
+    };
+    Run(run());
+}
+
+// Only one A sample is truncated: its TCP answer and the other samples' UDP
+// answers are merged.
+TEST_P(DnsDatagramQueries, PartiallyTruncatedSamplesMergeTcpAndUdpAnswers) {
+    peer.ServeStream();
+    peer.bulk_answers = 100;
+    peer.bulk_only_first_a = true;
+    auto run = [&]() -> net::awaitable<void> {
+        const auto result = co_await dns.Resolve("partial.example");
+        EXPECT_TRUE(result.Ok()) << result.error_msg;
+        EXPECT_EQ(peer.stream_queries, 1u);
+        const auto contains = [&](std::string_view text) {
+            return std::ranges::find(result.addresses, net::ip::make_address(text)) !=
+                   result.addresses.end();
+        };
+        EXPECT_TRUE(contains("198.51.100.1"));
+        EXPECT_TRUE(contains("198.51.100.64"));
+        EXPECT_TRUE(contains("192.0.2.2"));
+        EXPECT_TRUE(contains("192.0.2.3"));
+        EXPECT_TRUE(contains("2001:db8::1"));
+        EXPECT_EQ(result.addresses.size(), 64u + 2u + 1u);
     };
     Run(run());
 }
@@ -409,7 +435,7 @@ TEST_P(DnsDatagramQueries, OversizedDatagramIsRetriedOverTcp) {
         const auto result = co_await dns.Resolve("oversized.example");
         EXPECT_TRUE(result.Ok()) << result.error_msg;
         EXPECT_EQ(result.addresses, BulkAddresses(64));
-        EXPECT_EQ(peer.stream_queries, 4u);
+        EXPECT_EQ(peer.stream_queries, 2u);
     };
     Run(run());
 }
@@ -607,11 +633,11 @@ TEST_P(DnsStalledStreamRetry, ClosesEveryUpstreamConnection) {
     watchdog.async_wait([&](::IoErrorCode ec) {
         if (!ec) { expired = true; worker.RequestStop(); }
     });
-    while (peer.stream_queries != 4 && !expired) io.run_one();
+    while (peer.stream_queries != 2 && !expired) io.run_one();
     EXPECT_FALSE(expired) << "truncated answers must reach the upstream over TCP";
     if (end == StreamRetryEnd::ServiceStop) worker.RequestStop();
     if (end == StreamRetryEnd::WaiterCancel) signal.emit(net::cancellation_type::terminal);
-    while ((!answer || peer.stream_closed != 4) && !expired) io.run_one();
+    while ((!answer || peer.stream_closed != 2) && !expired) io.run_one();
     EXPECT_FALSE(expired) << "the resolver must close every upstream TCP connection itself";
     bool joined = false;
     net::co_spawn(io, worker.AsyncJoin(), [&](std::exception_ptr join_error) {

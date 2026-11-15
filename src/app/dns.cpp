@@ -130,11 +130,14 @@ struct DNSWorker::Impl {
 
     net::awaitable<DnsResult> ResolveUncached(std::string_view domain);
     net::awaitable<DnsResult> DoResolve(std::string_view domain);
+    // Leaves out empty when a sibling sample already owns this family's TCP
+    // retry: the stream answer is the complete RRset for every sample.
     net::awaitable<void> QueryServer(
         UpstreamExchange& server,
         std::string_view domain,
         bool query_aaaa,
-        DnsResult& out);
+        bool& stream_claimed,
+        std::optional<DnsResult>& out);
     // Leaves the ID zero; UpstreamExchange writes an unpredictable ID before send.
     static size_t BuildQueryTo(std::span<uint8_t, kQueryCapacity> query,
                                std::string_view domain,
@@ -258,14 +261,16 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
         // Preserve three A samples (round-robin answer collection), but do not
         // serialize their RTTs or hold AAAA behind them. Join all children before
         // returning or moving to another upstream, including cancellation/OOM.
-        std::array<DnsResult, kAddressQueryAttempts + 1> answers;
+        std::array<std::optional<DnsResult>, kAddressQueryAttempts + 1> answers;
+        std::array<bool, 2> stream_claimed{};  // A, AAAA
         co_await common::RunAwaitableTaskGroup(co_await net::this_coro::executor, [&](common::AwaitableTaskGroup& group) {
             for (size_t i = 0; i < answers.size(); ++i) {
-                group.Spawn(QueryServer(*server, domain, i == kAddressQueryAttempts, answers[i]));
+                const bool query_aaaa = i == kAddressQueryAttempts;
+                group.Spawn(QueryServer(*server, domain, query_aaaa, stream_claimed[query_aaaa], answers[i]));
             }
         });
-        if (stopping || std::ranges::any_of(answers, [](const DnsResult& answer) {
-                return answer.error == common::ErrorCode::CANCELLED;
+        if (stopping || std::ranges::any_of(answers, [](const std::optional<DnsResult>& answer) {
+                return answer && answer->error == common::ErrorCode::CANCELLED;
             })) {
             DnsResult cancelled;
             cancelled.error = common::ErrorCode::CANCELLED;
@@ -276,7 +281,8 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
         a_result.error_msg = "DNS A query failed";
 
         for (size_t attempt = 0; attempt < kAddressQueryAttempts; ++attempt) {
-            auto attempt_result = std::move(answers[attempt]);
+            if (!answers[attempt]) continue;  // Covered by the sibling's TCP retry.
+            auto attempt_result = std::move(*answers[attempt]);
             if (attempt_result.Ok()) {
                 if (!a_result.Ok()) {
                     a_result = std::move(attempt_result);
@@ -296,7 +302,8 @@ net::awaitable<DnsResult> DNSWorker::Impl::DoResolve(
             }
         }
 
-        auto aaaa_result = std::move(answers.back());
+        // The only AAAA query always owns its family's TCP retry.
+        auto aaaa_result = std::move(*answers.back());
 
         if (a_result.Ok() || aaaa_result.Ok()) {
             DnsResult result;
@@ -348,7 +355,8 @@ net::awaitable<void> DNSWorker::Impl::QueryServer(
     UpstreamExchange& server,
     std::string_view domain,
     bool query_aaaa,
-    DnsResult& out) {
+    bool& stream_claimed,
+    std::optional<DnsResult>& out) {
     // BuildQueryTo and ExchangeDatagram write every byte of [0, query_size).
     std::array<uint8_t, kQueryCapacity> query;
     size_t query_size = BuildQueryTo(query, domain, query_aaaa);
@@ -372,16 +380,20 @@ net::awaitable<void> DNSWorker::Impl::QueryServer(
         ((common::LoadU16BE(response.bytes.data() + 2) & FLAG_TC) != 0 ||
          response.bytes.size() > kDnsUdpPayloadSize);
     if (truncated) {
-        // RFC 7766 §5: a truncated UDP answer is retried over TCP.
+        // RFC 7766 §5: a truncated UDP answer is retried over TCP, once per
+        // family; samples run on one executor, so the first to see TC claims it.
+        if (stream_claimed) co_return;
+        stream_claimed = true;
         response = co_await server.ExchangeStream(
             std::span<const uint8_t>(query.data(), query_size), remaining());
     }
     if (response.error) {
-        out.error = response.error == io_error::timed_out ? common::ErrorCode::DNS_TIMEOUT :
+        DnsResult& failed = out.emplace();
+        failed.error = response.error == io_error::timed_out ? common::ErrorCode::DNS_TIMEOUT :
             response.error == io_error::operation_aborted ? common::ErrorCode::CANCELLED :
             response.error == io_error::no_buffer_space ? common::ErrorCode::RESOURCE_EXHAUSTED :
             common::ErrorCode::DNS_RESOLVE_FAILED;
-        out.error_msg = truncated
+        failed.error_msg = truncated
             ? std::format("TCP retry of truncated answer: {}", response.error.message())
             : response.error.message();
         co_return;
