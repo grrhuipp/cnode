@@ -116,52 +116,38 @@ CompleteHysteriaTcpHandshake(
 // proxy/hysteria server: the transport has authenticated the connection and
 // bound its identity; each logical stream is either a UDP session or a TCP
 // request whose target this handler reads before dispatch.
+struct HysteriaInboundSession {
+    explicit HysteriaInboundSession(transport::HysteriaVersion value) noexcept
+        : version(value) {}
+    HysteriaInboundSession(const HysteriaInboundSession&) = delete;
+    HysteriaInboundSession(HysteriaInboundSession&&) = delete;
+
+    net::awaitable<InboundPrepared> Prepare(
+        std::unique_ptr<transport::AsyncStream>& stream, InboundContext& context) {
+        if (context.session.content.network == common::Network::UDP)
+            co_return routing::DispatchRequest{std::move(stream)};
+        auto handshake = co_await CompleteHysteriaTcpHandshake(
+            *stream, version, context.session);
+        if (!handshake) co_return tl::unexpected(handshake.error());
+        co_return routing::DispatchRequest{std::move(stream), std::move(*handshake)};
+    }
+
+    transport::HysteriaVersion version;
+};
+
 class HysteriaInbound final : public ::proxy::Inbound {
 public:
-    HysteriaInbound(app::StatsShard& stats, transport::HysteriaVersion version) noexcept
-        : stats_(stats), version_(version) {}
+    HysteriaInbound(const app::AdmissionEnvironment& environment,
+                    transport::HysteriaVersion version) noexcept
+        : Inbound(std::in_place_type<HysteriaInbound>),
+          environment_(environment), version_(version) {}
 
-    net::awaitable<app::RelayResult> Process(
-        std::unique_ptr<transport::AsyncStream> stream,
-        routing::Dispatcher& dispatcher,
-        proxy::InboundSettings settings,
-        net::io_context& io_context,
-        common::Context& ctx,
-        const infra::TimeoutsConfig& timeouts,
-        uint32_t /*pressure_idle_timeout*/) override {
-        if (ctx.content.network == common::Network::UDP) {
-            return dispatcher.Dispatch(
-                io_context, settings.dispatch_policy,
-                routing::DispatchRequest{std::move(stream)},
-                ctx, stats_, timeouts);
-        }
-        return ProcessTcp(
-            std::move(stream), dispatcher, settings.dispatch_policy, io_context, ctx, timeouts);
-    }
+    using Session = HysteriaInboundSession;
+    const app::AdmissionEnvironment& Environment() const noexcept { return environment_; }
+    auto SessionArguments() const noexcept { return std::tuple{version_}; }
 
 private:
-    net::awaitable<app::RelayResult> ProcessTcp(
-        std::unique_ptr<transport::AsyncStream> stream,
-        routing::Dispatcher& dispatcher,
-        const routing::DispatchPolicy& dispatch_policy,
-        net::io_context& io_context,
-        common::Context& ctx,
-        const infra::TimeoutsConfig& timeouts) {
-        common::InitialPayload initial_payload;
-        {
-            auto handshake = co_await CompleteHysteriaTcpHandshake(*stream, version_, ctx);
-            if (!handshake) {
-                co_return RejectInbound(stats_, stream.get(), handshake.error());
-            }
-            initial_payload = std::move(*handshake);
-        }
-        co_return co_await dispatcher.Dispatch(
-            io_context, dispatch_policy,
-            routing::DispatchRequest{std::move(stream), std::move(initial_payload)},
-            ctx, stats_, timeouts);
-    }
-
-    app::StatsShard& stats_;
+    const app::AdmissionEnvironment& environment_;
     transport::HysteriaVersion version_;
 };
 
@@ -188,7 +174,7 @@ std::unique_ptr<::proxy::Inbound> CreateInbound(
     const app::BuildRequest& request) {
     const auto* settings = transport::GetSettings(request);
     if (!settings) return nullptr;
-    return std::make_unique<HysteriaInbound>(environment.stats, settings->version);
+    return std::make_unique<HysteriaInbound>(environment, settings->version);
 }
 
 std::optional<app::UserSet> BuildUsers(

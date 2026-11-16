@@ -8,6 +8,7 @@
 #include "app/stats.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/outbound.hpp"
+#include "transport/tcp_stream.hpp"
 #include "common/awaitable_task_group.hpp"
 
 #include <asio/co_spawn.hpp>
@@ -31,17 +32,21 @@ struct Probe {
 
 class CountingOutbound final : public ::proxy::Outbound {
 public:
-    explicit CountingOutbound(Probe& probe) : probe_(probe) { ++probe_.created; }
+    struct Session final : ::proxy::OutboundSession {
+        Probe& probe;
+        ::transport::OutboundDialer& dialer;
+        Session(::proxy::OutboundPrepareContext& context, Probe& probe) noexcept
+            : probe(probe), dialer(context.dialer) {}
+        ::proxy::OutboundRejection Prepare() const noexcept {
+            ++probe.processed;
+            probe.last_dialer = &dialer;
+            return {::common::ErrorCode::BLOCKED};
+        }
+    };
+    auto SessionArguments() noexcept { return std::tuple{std::ref(probe_)}; }
+    explicit CountingOutbound(Probe& probe)
+        : Outbound(std::in_place_type<CountingOutbound>), probe_(probe) { ++probe_.created; }
     ~CountingOutbound() noexcept override { ++probe_.destroyed; }
-
-    ::net::awaitable<::proxy::OutboundProcessResult> Process(
-        ::common::Context&, ::transport::Link, ::transport::OutboundDialer& dialer,
-        const ::infra::TimeoutsConfig&, ::app::StatsShard&, const ::app::RelayConfig&,
-        ::common::MultiBufferBatch) override {
-        ++probe_.processed;
-        probe_.last_dialer = &dialer;
-        co_return ::app::RelayResult{};
-    }
 
 private:
     Probe& probe_;
@@ -106,17 +111,40 @@ TEST_F(HandlerRegistryTest, DispatchReachesPublishedProtocol) {
     ::app::StatsShard stats;
     ::app::RelayConfig relay;
     bool completed = false;
+    ::transport::TcpStream client{::tcp::socket(io)};
     ::net::co_spawn(io,
-        first->Dispatch(ctx, ::transport::Link{}, timeouts, stats, relay, {}),
+        first->Dispatch(ctx, ::transport::Link{&client, &client, &client}, timeouts, stats, relay, {}),
         [&](std::exception_ptr error, ::proxy::OutboundProcessResult result) {
             EXPECT_FALSE(error);
-            EXPECT_TRUE(result.has_value());
+            ASSERT_FALSE(result.has_value());
+            EXPECT_EQ(result.error(), ::common::ErrorCode::BLOCKED);
             completed = true;
         });
     io.run();
     EXPECT_TRUE(completed);
     EXPECT_EQ(first_probe.processed, 1);
     EXPECT_NE(first_probe.last_dialer, nullptr);
+}
+
+TEST_F(HandlerRegistryTest, InvalidLinkNeverEntersProtocolPreparation) {
+    auto first = registry.GetHandler("direct");
+    ASSERT_TRUE(first);
+    ::common::Context ctx;
+    ::infra::TimeoutsConfig timeouts;
+    ::app::StatsShard stats;
+    ::app::RelayConfig relay;
+    bool completed = false;
+    ::net::co_spawn(io, first->Dispatch(ctx, {}, timeouts, stats, relay, {}),
+        [&](std::exception_ptr error, ::proxy::OutboundProcessResult result) {
+            EXPECT_FALSE(error);
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ::common::ErrorCode::PROTOCOL_DECODE_FAILED);
+            completed = true;
+        });
+    io.run();
+    EXPECT_TRUE(completed);
+    EXPECT_EQ(first_probe.processed, 0);
+    EXPECT_EQ(first_probe.last_dialer, nullptr);
 }
 
 TEST_F(HandlerRegistryTest, RejectedReplacementPreservesPublishedHandler) {

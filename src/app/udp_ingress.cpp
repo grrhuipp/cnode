@@ -204,7 +204,6 @@ UdpIngress::PendingUdpReply::SendBuffers() const noexcept {
 
 namespace {
 
-using proxy::AdmitNativeAssociation;
 using proxy::NativeAssociationAdmission;
 
 constexpr size_t kMaxQueuedUdpDatagrams = 256;
@@ -710,12 +709,13 @@ net::awaitable<void> UdpIngress::RunNativeDispatch(ClientSessionPtr client_sessi
         }
         auto bound = std::move(*authentication).Bind(request.profile, std::nullopt);
         request.profile = {};
-        admission = co_await AdmitNativeAssociation(*request.admission, request.context, std::move(bound));
+        admission = co_await NativeAssociationAdmission::Admit(
+            *request.admission, request.context, std::move(bound));
         if (!admission || client_session->Closed()) {
             client_session->Close();
             co_return;
         }
-        RelayResult result = co_await request.dispatcher->Dispatch(
+        RelayResult result = co_await proxy::DispatchAuthenticatedInbound(*request.dispatcher,
             *request.io_context, request.policy,
             routing::DispatchRequest{transport::Link{client_session.get(), client_session.get()}},
             request.context, request.admission->stats, request.timeouts);

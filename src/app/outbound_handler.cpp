@@ -31,7 +31,7 @@ net::awaitable<proxy::OutboundProcessResult> OutboundHandler::Dispatch(
     app::StatsShard& stats,
     const app::RelayConfig& relay_config,
     common::MultiBufferBatch&& first_payload) {
-    // Not a coroutine: the callee frame is the request's outbound frame.
+    // Not a coroutine: the final Process entry owns the common outbound frame.
     return proxy_->Process(ctx, inbound, dialer_, timeouts, stats, relay_config,
                            std::move(first_payload));
 }

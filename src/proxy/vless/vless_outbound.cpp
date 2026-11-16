@@ -61,14 +61,11 @@ public:
 
     ~VlessOutboundHandler() override;
 
-    ::net::awaitable<::proxy::OutboundProcessResult> Process(
-        ::common::Context& ctx,
-        ::transport::Link inbound,
-        ::transport::OutboundDialer& dialer,
-        const ::infra::TimeoutsConfig& timeouts,
-        ::app::StatsShard& stats,
-        const ::app::RelayConfig& relay_config,
-        ::common::MultiBufferBatch first_payload) override;
+    struct Session;
+    auto SessionArguments() noexcept {
+        return std::tuple{std::cref(*config_),
+                          encryption_tickets_ ? &*encryption_tickets_ : nullptr};
+    }
 
 private:
     std::shared_ptr<const ::proxy::VlessOutboundConfig> config_;
@@ -581,140 +578,97 @@ SendVlessHandshake(
     co_return ::proxy::VlessActiveIo{active_reader, active_writer};
 }
 
-net::awaitable<app::RelayResult>
-RelayVlessFramedOutbound(
-    common::Context& ctx,
-    transport::Link inbound,
-    transport::OutboundDialer& dialer,
-    transport::AsyncStream& stream,
-    proxy::BufferedStreamReader& active_reader,
-    transport::MultiBufferWriter& active_writer,
-    const VlessOutboundConfig& config,
-    bool is_udp,
-    bool use_vision,
-    bool use_xudp,
-    bool use_packet_addr,
-    app::StatsShard& stats,
-    const app::RelayConfig& relay_config,
-    common::MultiBufferBatch first_payload) {
-    const auto& target = ctx.outbound.target;
-    if (use_xudp && use_vision) {
-        // Xray outbound: Vision UDP becomes XUDP Mux.Cool framed inside Vision.
-        ::proxy::VisionTrafficState traffic;
-        ::proxy::VisionReader vision_reader(active_reader, config.uuid_bytes, traffic);
-        ::proxy::VisionWriter vision_writer(active_writer, config.uuid_bytes, traffic);
-        VlessMuxUdpEndpoint target_endpoint(
-            stream, active_reader, vision_reader, vision_writer, target,
-            dialer.ForwardedMetadata(ctx));
-        co_return co_await app::DoRelayLink(
-            dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-            target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-    }
-    if (use_xudp) {
-        VlessMuxUdpEndpoint target_endpoint(
-            stream, active_reader, active_reader, active_writer, target,
-            dialer.ForwardedMetadata(ctx));
-        co_return co_await app::DoRelayLink(
-            dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-            target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-    }
-    if (is_udp) {
-        VlessUdpOutboundEndpoint target_endpoint(
-            stream, active_reader, active_writer, target, use_packet_addr);
-        co_return co_await app::DoRelayLink(
-            dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-            target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-    }
-    VlessVisionOutboundEndpoint target_endpoint(
-        stream, active_reader, active_writer, config.uuid_bytes);
-    co_return co_await app::DoRelayLink(
-        dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-        target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-}
 }  // namespace
 
-VlessOutboundHandler::VlessOutboundHandler(
-    std::shared_ptr<const VlessOutboundConfig> config)
-    : config_(std::move(config))
-    , encryption_tickets_(config_->encryption
-          ? std::optional<::proxy::VlessEncryptionClientTicketCache>(std::in_place)
-          : std::nullopt) {}
-
-VlessOutboundHandler::~VlessOutboundHandler() = default;
-
-net::awaitable<OutboundProcessResult>
-VlessOutboundHandler::Process(
-    common::Context& ctx,
-    transport::Link inbound,
-    transport::OutboundDialer& dialer,
-    const infra::TimeoutsConfig& timeouts,
-    app::StatsShard& stats,
-    const app::RelayConfig& relay_config,
-    common::MultiBufferBatch first_payload) {
-    if (!inbound.Valid()) {
-        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-    if (!config_->flow.empty()) {
-        const auto network = ctx.content.network;
-        const bool rejected_udp443 = network == common::Network::UDP &&
-            ctx.outbound.target.port == 443 && !config_->vision_udp443;
-        if ((network != common::Network::TCP && network != common::Network::UDP) ||
-            rejected_udp443) {
-            co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
-        }
-    }
-    const auto& target = ctx.outbound.target;
+struct VlessOutboundHandler::Session final : OutboundSession {
+    OutboundPrepareContext& context;
+    const VlessOutboundConfig& config;
     std::unique_ptr<transport::AsyncStream> stream;
-    {
-        auto dialed = co_await dialer.Dial(ctx, config_->server);
-        if (!dialed) {
-            co_return tl::unexpected(dialed.error());
-        }
-        stream = std::move(*dialed);
-    }
+    VlessClientTicketLease tickets;
+    std::optional<proxy::BufferedStreamReader> protocol_reader;
+    std::optional<proxy::VlessEncryptedIo> encrypted_io;
+    proxy::VisionTrafficState traffic;
+    std::optional<proxy::VisionReader> vision_reader;
+    std::optional<proxy::VisionWriter> vision_writer;
+    std::variant<std::monostate, VlessTcpOutboundEndpoint, VlessUdpOutboundEndpoint,
+                 VlessVisionOutboundEndpoint, VlessMuxUdpEndpoint> endpoint;
 
-    const bool is_udp = ctx.content.network == common::Network::UDP;
-    const bool use_vision = !config_->flow.empty();
-    const bool use_xudp = is_udp && (config_->packet_xudp || use_vision);
-    const bool use_packet_addr = is_udp && config_->packet_addr && !use_vision;
-    VlessClientTicketLease tickets(encryption_tickets_ ? &*encryption_tickets_ : nullptr);
-    proxy::BufferedStreamReader protocol_reader(*stream);
-    transport::MultiBufferWriter& protocol_writer = *stream;
-    proxy::BufferedStreamReader* active_reader = &protocol_reader;
-    transport::MultiBufferWriter* active_writer = &protocol_writer;
-    std::optional<::proxy::VlessEncryptedIo> encrypted_io;
-    {
+    Session(OutboundPrepareContext& context, const VlessOutboundConfig& config,
+            proxy::VlessEncryptionClientTicketCache* cache) noexcept
+        : context(context), config(config), tickets(cache) {}
+
+    net::awaitable<OutboundPrepareResult<VlessTcpOutboundEndpoint, VlessUdpOutboundEndpoint,
+                                        VlessVisionOutboundEndpoint, VlessMuxUdpEndpoint>>
+    Prepare() {
+        auto& [ctx, dialer, timeouts] = context;
+        if (!config.flow.empty()) {
+            const auto network = ctx.content.network;
+            const bool rejected_udp443 = network == common::Network::UDP &&
+                ctx.outbound.target.port == 443 && !config.vision_udp443;
+            if ((network != common::Network::TCP && network != common::Network::UDP) ||
+                rejected_udp443) {
+                co_return tl::unexpected(common::ErrorCode::PROTOCOL_UNSUPPORTED);
+            }
+        }
+        auto dialed = co_await dialer.Dial(ctx, config.server);
+        if (!dialed) co_return tl::unexpected(dialed.error());
+        stream = std::move(*dialed);
+
+        const auto& target = ctx.outbound.target;
+        const bool is_udp = ctx.content.network == common::Network::UDP;
+        const bool use_vision = !config.flow.empty();
+        const bool use_xudp = is_udp && (config.packet_xudp || use_vision);
+        const bool use_packet_addr = is_udp && config.packet_addr && !use_vision;
+        protocol_reader.emplace(*stream);
         auto handshake = co_await SendVlessHandshake(
-            *stream, *config_, tickets, target,
+            *stream, config, tickets, target,
             is_udp, use_vision, use_xudp, use_packet_addr,
-            timeouts.HandshakeTimeout(), protocol_reader, protocol_writer,
+            timeouts.HandshakeTimeout(), *protocol_reader, *stream,
             encrypted_io, dialer, ctx);
         if (!handshake) {
             stream->CloseAbortive();
             co_return tl::unexpected(handshake.error());
         }
-        active_reader = handshake->reader;
-        active_writer = handshake->writer;
+        auto& reader = *handshake->reader;
+        auto& writer = *handshake->writer;
+        if (use_xudp) {
+            if (use_vision) {
+                // Vision UDP is XUDP Mux.Cool framed inside Vision.
+                vision_reader.emplace(reader, config.uuid_bytes, traffic);
+                vision_writer.emplace(writer, config.uuid_bytes, traffic);
+                co_return std::ref(endpoint.emplace<VlessMuxUdpEndpoint>(
+                    *stream, reader, *vision_reader, *vision_writer, target,
+                    dialer.ForwardedMetadata(ctx)));
+            }
+            co_return std::ref(endpoint.emplace<VlessMuxUdpEndpoint>(
+                *stream, reader, reader, writer, target, dialer.ForwardedMetadata(ctx)));
+        }
+        if (is_udp) {
+            co_return std::ref(endpoint.emplace<VlessUdpOutboundEndpoint>(
+                *stream, reader, writer, target, use_packet_addr));
+        }
+        if (use_vision) {
+            co_return std::ref(endpoint.emplace<VlessVisionOutboundEndpoint>(
+                *stream, reader, writer, config.uuid_bytes));
+        }
+        co_return std::ref(endpoint.emplace<VlessTcpOutboundEndpoint>(*stream, reader, writer));
     }
-    proxy::ApplyOutboundRelayTimeouts(*stream, relay_config);
 
-    app::RelayResult res;
-    if (is_udp || use_vision) {
-        res = co_await RelayVlessFramedOutbound(
-            ctx, inbound, dialer, *stream, *active_reader, *active_writer,
-            *config_, is_udp, use_vision, use_xudp, use_packet_addr,
-            stats, relay_config, std::move(first_payload));
-    } else {
-        VlessTcpOutboundEndpoint target_endpoint(*stream, *active_reader, *active_writer);
-        res = co_await app::DoRelayLink(
-            dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-            target_endpoint, ctx, stats, relay_config, std::move(first_payload));
+    void Finalize(const OutboundProcessResult& result, const std::exception_ptr& failure) noexcept {
+        if (encrypted_io && (failure || !result || !result->Ok())) {
+            encrypted_io->reader.RejectDeferredTicket();
+        }
     }
-    if (encrypted_io && !res.Ok()) {
-        encrypted_io->reader.RejectDeferredTicket();
-    }
-    co_return res;
-}
+};
+
+VlessOutboundHandler::VlessOutboundHandler(std::shared_ptr<const VlessOutboundConfig> config)
+    : Outbound(std::in_place_type<VlessOutboundHandler>)
+    , config_(std::move(config))
+    , encryption_tickets_(config_->encryption
+          ? std::optional<proxy::VlessEncryptionClientTicketCache>(std::in_place)
+          : std::nullopt) {}
+
+VlessOutboundHandler::~VlessOutboundHandler() = default;
 
 
 namespace {

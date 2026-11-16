@@ -77,6 +77,7 @@ public:
         app::DNSWorker& dns_service,
         app::RequestLoadState& request_load) noexcept;
 
+private:
     net::awaitable<RelayResult> Dispatch(
         net::io_context& io_context,
         const routing::DispatchPolicy& policy,
@@ -85,8 +86,12 @@ public:
         StatsShard& stats,
         const infra::TimeoutsConfig& timeouts) override;
 
-    // Dispatches one already authenticated link. DispatchUdpFlows re-enters
-    // here once per logical flow with split_udp_association = false.
+    friend net::awaitable<void> DispatchUdpFlows(
+        DefaultDispatcher&, net::io_context&, const routing::DispatchPolicy&,
+        routing::DispatchRequest, common::Context&, StatsShard&,
+        const infra::TimeoutsConfig&, uint32_t, RelayResult&, common::ErrorCode&);
+
+    // Internal dispatcher continuation; only the UDP-flow runtime may re-enter.
     net::awaitable<void> DispatchPreparedLink(
         net::io_context& io_context,
         const routing::DispatchPolicy& policy,

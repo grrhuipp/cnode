@@ -18,17 +18,21 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <tuple>
+#include <utility>
 #include <unordered_map>
 
 namespace app {
 
 class ConnectionLimiter;
+class UdpIngress;
 struct ConnectionFamily;
 
 }  // namespace app
 namespace transport {
 
 class AsyncStream;
+class HysteriaConnection;
 
 }  // namespace transport
 namespace infra {
@@ -215,7 +219,10 @@ public:
         net::io_context& io_context,
         common::Context& ctx,
         const infra::TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout) = 0;
+        uint32_t pressure_idle_timeout) final {
+        return process_(*this, std::move(stream), dispatcher, settings,
+                        io_context, ctx, timeouts, pressure_idle_timeout);
+    }
 
     // Native datagrams enter through the same protocol handler abstraction.
     // The owning UDP runtime performs the dispatcher handoff after protocol
@@ -229,6 +236,26 @@ public:
     CreateDatagramResponse(const InboundDatagramResult&) {
         return tl::unexpected(common::ErrorCode::NOT_SUPPORTED);
     }
+
+protected:
+    // Only a concrete protocol's typed session can bind the common executor.
+    template <typename Protocol>
+    explicit Inbound(std::in_place_type_t<Protocol>) noexcept
+        : process_(&Execute<Protocol>) {}
+
+private:
+    using ProcessFunction = net::awaitable<app::RelayResult> (*)(
+        Inbound&, std::unique_ptr<transport::AsyncStream>, routing::Dispatcher&,
+        InboundSettings, net::io_context&, common::Context&,
+        const infra::TimeoutsConfig&, uint32_t);
+
+    template <typename Protocol>
+    static net::awaitable<app::RelayResult> Execute(
+        Inbound&, std::unique_ptr<transport::AsyncStream>, routing::Dispatcher&,
+        InboundSettings, net::io_context&, common::Context&,
+        const infra::TimeoutsConfig&, uint32_t);
+
+    const ProcessFunction process_;
 };
 
 }  // namespace proxy

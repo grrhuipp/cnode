@@ -9,7 +9,6 @@
 #include "app/user_online_tracker.hpp"
 #include "common/target_address.hpp"
 #include <openssl/mem.h>
-#include "proxy/inbound.hpp"
 #include "proxy/outbound.hpp"
 #include "proxy/shadowsocks/shadowsocks_protocol.hpp"
 #include "proxy/shadowsocks/ss_stream.hpp"
@@ -46,8 +45,8 @@ struct SsOutboundConfig {
 }  // namespace proxy
 
 // ============================================================================
-// SsOutbound — 出站编排（握手、初始 payload、relay、收尾）
-// 协议加密状态由 shadowsocks_protocol.cpp 承担。
+// SsOutbound — typed endpoint preparation for the common outbound pipeline.
+// Protocol encryption state is implemented by shadowsocks_protocol.cpp.
 // ============================================================================
 namespace proxy {
 

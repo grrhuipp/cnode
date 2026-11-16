@@ -322,7 +322,7 @@ net::awaitable<void> XudpSession::Run(std::shared_ptr<XudpSession> self) {
         InboundSubstreamAdmission admission(stats_);
         auto pending = InboundSubstreamAdmission::Reserve(admission_, ctx_);
         if (!pending || admission.Hold(co_await std::move(*pending), ctx_, stats_)) {
-            (void)co_await dispatcher_.Dispatch(
+            (void)co_await DispatchAuthenticatedInbound(dispatcher_,
                 io_context_, policy_,
                 routing::DispatchRequest{transport::Link{this, this}},
                 ctx_, stats_, timeouts_);

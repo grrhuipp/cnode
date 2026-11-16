@@ -168,182 +168,12 @@ ReadVlessRequestHeader(proxy::BufferedStreamReader& active_reader,
 }
 
 
-net::awaitable<app::RelayResult> DispatchVlessUdp(
-    std::unique_ptr<transport::AsyncStream> stream,
-    transport::MultiBufferReader& active_reader,
-    transport::MultiBufferWriter& active_writer,
-    bool packet_addr_udp,
-    routing::Dispatcher& dispatcher,
-    const routing::DispatchPolicy& dispatch_policy,
-    net::io_context& io_context,
-    common::Context& ctx,
-    const app::AdmissionEnvironment& environment,
-    const infra::TimeoutsConfig& timeouts) {
-    ::proxy::VlessUdpStreamEndpoint udp_endpoint(
-        active_reader, active_writer, ctx.outbound.target, packet_addr_udp);
-    common::InitialPayload first_datagram;
-    if (packet_addr_udp) {
-        auto packet = co_await udp_endpoint.ReadMultiBuffer();
-        if (packet.empty()) co_return app::RelayResult{};
-        const auto datagram = common::InspectUdpDatagram(packet);
-        if (!datagram.Valid() || !datagram.target || !datagram.target->IsValid()) {
-            co_return proxy::RejectInbound(
-                environment.stats, stream.get(), common::ErrorCode::PROTOCOL_DECODE_FAILED);
-        }
-        // The magic address selects framing, not a routable destination.
-        proxy::BindInboundRequestTarget(
-            ctx, proxy::InboundRequestTarget{common::Network::UDP, *datagram.target});
-        first_datagram = common::InitialPayload(std::move(packet));
-    }
-    co_return co_await dispatcher.Dispatch(
-        io_context,
-        dispatch_policy,
-        routing::DispatchRequest{
-            std::move(stream), transport::Link{&udp_endpoint, &udp_endpoint},
-            std::move(first_datagram)},
-        ctx,
-        environment.stats,
-        timeouts);
-}
-
-net::awaitable<app::RelayResult> DispatchVlessVision(
-    std::unique_ptr<transport::AsyncStream> stream,
-    proxy::BufferedStreamReader& active_reader,
-    transport::MultiBufferWriter& active_writer,
-    std::array<uint8_t, 16> request_uuid,
-    routing::Dispatcher& dispatcher,
-    const routing::DispatchPolicy& dispatch_policy,
-    net::io_context& io_context,
-    common::Context& ctx,
-    const app::AdmissionEnvironment& environment,
-    const infra::TimeoutsConfig& timeouts) {
-    ::proxy::VisionTrafficState traffic;
-    ::proxy::VisionReader vision_reader(active_reader, request_uuid, traffic);
-    ::proxy::VisionWriter vision_writer(active_writer, request_uuid, traffic);
-    OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
-    co_return co_await dispatcher.Dispatch(
-        io_context,
-        dispatch_policy,
-        routing::DispatchRequest{
-            std::move(stream), transport::Link{&vision_reader, &vision_writer}},
-        ctx,
-        environment.stats,
-        timeouts);
-}
-
-net::awaitable<app::RelayResult> DispatchVlessVisionMux(
-    std::unique_ptr<transport::AsyncStream> stream,
-    proxy::BufferedStreamReader& active_reader,
-    transport::MultiBufferWriter& active_writer,
-    std::array<uint8_t, 16> request_uuid,
-    routing::Dispatcher& dispatcher,
-    const routing::DispatchPolicy& dispatch_policy,
-    net::io_context& io_context,
-    common::Context& ctx,
-    const app::AdmissionEnvironment& environment,
-    const infra::TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout) {
-    ::proxy::VisionTrafficState traffic;
-    ::proxy::VisionReader vision_reader(active_reader, request_uuid, traffic);
-    ::proxy::VisionWriter vision_writer(active_writer, request_uuid, traffic);
-    OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
-    co_return co_await proxy::ServeMuxInbound(
-        io_context,
-        transport::Link{&vision_reader, &vision_writer},
-        *stream,
-        dispatcher,
-        dispatch_policy,
-        environment,
-        ctx,
-        environment.stats,
-        timeouts,
-        pressure_idle_timeout,
-        proxy::MuxAllowedNetwork::Udp);
-}
 
 struct VlessSessionMeta {
     bool packet_addr_udp = false;
     bool use_vision = false;
 };
 
-// The caller retains the stream for plain Mux; other branches transfer it
-// into their dispatch request or wrapper coroutine.
-net::awaitable<app::RelayResult> DispatchVlessSession(
-    std::unique_ptr<transport::AsyncStream>& stream,
-    proxy::BufferedStreamReader& active_reader,
-    transport::MultiBufferWriter& response_writer,
-    VlessSessionMeta meta,
-    const std::array<uint8_t, 16>& request_uuid,
-    routing::Dispatcher& dispatcher,
-    const routing::DispatchPolicy& dispatch_policy,
-    net::io_context& io_context,
-    common::Context& ctx,
-    const app::AdmissionEnvironment& environment,
-    const infra::TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout) {
-    if (ctx.content.network == common::Network::MUX) {
-        if (meta.use_vision) {
-            return DispatchVlessVisionMux(
-                std::move(stream),
-                active_reader,
-                response_writer,
-                request_uuid,
-                dispatcher,
-                dispatch_policy,
-                io_context,
-                ctx,
-                environment,
-                timeouts,
-                pressure_idle_timeout);
-        }
-        return proxy::ServeMuxInbound(
-            io_context,
-            transport::Link{&active_reader, &response_writer},
-            *stream,
-            dispatcher,
-            dispatch_policy,
-            environment,
-            ctx,
-            environment.stats,
-            timeouts,
-            pressure_idle_timeout,
-            proxy::MuxAllowedNetwork::Any);
-    }
-    if (ctx.content.network == common::Network::UDP) {
-        return DispatchVlessUdp(
-            std::move(stream),
-            active_reader,
-            response_writer,
-            meta.packet_addr_udp,
-            dispatcher,
-            dispatch_policy,
-            io_context,
-            ctx,
-            environment,
-            timeouts);
-    }
-    if (meta.use_vision) {
-        return DispatchVlessVision(
-            std::move(stream),
-            active_reader,
-            response_writer,
-            request_uuid,
-            dispatcher,
-            dispatch_policy,
-            io_context,
-            ctx,
-            environment,
-            timeouts);
-    }
-    return dispatcher.Dispatch(
-        io_context,
-        dispatch_policy,
-        routing::DispatchRequest{
-            std::move(stream), transport::Link{&active_reader, &response_writer}},
-        ctx,
-        environment.stats,
-        timeouts);
-}
 
 template <bool Encrypted>
 struct VlessEncryptionState {};
@@ -354,10 +184,12 @@ struct VlessEncryptionState<true> {
     std::optional<::proxy::VlessEncryptionIssuedTicket> issued_ticket;
 };
 
+}  // namespace
+namespace proxy {
 // Plain sessions never reserve space for the encrypted record layer. Both
 // variants install their borrowing wrappers only in the stable common frame.
 template <bool Encrypted>
-struct VlessInboundSession {
+struct VlessInboundSession : MultiplexedInboundSession {
     explicit VlessInboundSession(
         const std::shared_ptr<const ::proxy::VlessEncryptionConfig>& config) noexcept
         : decryption(config) {}
@@ -495,72 +327,84 @@ struct VlessInboundSession {
         co_return std::move(bound);
     }
 
-    proxy::InboundContinuation Serve(
-        std::unique_ptr<transport::AsyncStream>& stream,
-        proxy::InboundContext& context) {
-        if constexpr (Encrypted) {
-            response_writer.emplace(encryption.io->writer);
-            if (encryption.issued_ticket) return ServeIssuedTicket(stream, context);
-        } else {
-            response_writer.emplace(*stream);
-        }
-        return Dispatch(stream, context);
-    }
-
-    net::awaitable<app::RelayResult> Dispatch(
+    net::awaitable<MultiplexedInboundPrepared> Prepare(
         std::unique_ptr<transport::AsyncStream>& stream,
         proxy::InboundContext& context) {
         auto* active_reader = &*protocol_reader;
-        if constexpr (Encrypted) active_reader = &encryption.io->plain_reader;
-        return DispatchVlessSession(
-            stream, *active_reader, *response_writer, meta, request_uuid,
-            context.dispatcher, context.settings.dispatch_policy, context.io_context,
-            context.session, context.admission, context.timeouts,
-            context.pressure_idle_timeout);
-    }
-
-    // Ticket binding is genuinely asynchronous and must follow successful
-    // device admission. Ordinary sessions return their dispatch without it.
-    net::awaitable<app::RelayResult> ServeIssuedTicket(
-        std::unique_ptr<transport::AsyncStream>& stream,
-        proxy::InboundContext& context) {
-        const auto& ctx = context.session;
-        const bool stored = co_await ::proxy::AuthenticateVlessTicket(
-            context.admission.coordinator, decryption, ctx.inbound.tag,
-            std::move(*encryption.issued_ticket), request_uuid);
-        encryption.issued_ticket.reset();
-        if (!meta.use_vision) OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
-        LOG_NET_DEBUG("inbound '{}' ticket issued worker={} stored={}",
-                      ctx.inbound.tag, ctx.worker_id, stored);
-        co_return co_await Dispatch(stream, context);
+        if constexpr (Encrypted) {
+            active_reader = &encryption.io->plain_reader;
+            response_writer.emplace(encryption.io->writer);
+            if (encryption.issued_ticket) {
+                const auto& ctx = context.session;
+                const bool stored = co_await ::proxy::AuthenticateVlessTicket(
+                    context.admission.coordinator, decryption, ctx.inbound.tag,
+                    std::move(*encryption.issued_ticket), request_uuid);
+                encryption.issued_ticket.reset();
+                if (!meta.use_vision)
+                    OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
+                LOG_NET_DEBUG("inbound '{}' ticket issued worker={} stored={}",
+                              ctx.inbound.tag, ctx.worker_id, stored);
+            }
+        } else {
+            response_writer.emplace(*stream);
+        }
+        transport::Link link{active_reader, &*response_writer};
+        if (meta.use_vision) {
+            vision_reader.emplace(*active_reader, request_uuid, vision_traffic);
+            vision_writer.emplace(*response_writer, request_uuid, vision_traffic);
+            OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
+            link = transport::Link{&*vision_reader, &*vision_writer};
+        }
+        if (context.session.content.network == common::Network::MUX) {
+            co_return MuxPlan(link, *stream,
+                meta.use_vision ? MuxAllowedNetwork::Udp : MuxAllowedNetwork::Any);
+        }
+        common::InitialPayload first_datagram;
+        if (context.session.content.network == common::Network::UDP) {
+            udp_endpoint.emplace(*link.reader, *link.writer,
+                context.session.outbound.target, meta.packet_addr_udp);
+            if (meta.packet_addr_udp) {
+                auto packet = co_await udp_endpoint->ReadMultiBuffer();
+                if (packet.empty()) co_return InboundPeerClosed{};
+                const auto datagram = common::InspectUdpDatagram(packet);
+                if (!datagram.Valid() || !datagram.target || !datagram.target->IsValid())
+                    co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
+                BindInboundRequestTarget(context.session,
+                    InboundRequestTarget{common::Network::UDP, *datagram.target});
+                first_datagram = common::InitialPayload(std::move(packet));
+            }
+            link = transport::Link{&*udp_endpoint, &*udp_endpoint};
+        }
+        co_return routing::DispatchRequest{
+            std::move(stream), link, std::move(first_datagram)};
     }
 
     const std::shared_ptr<const ::proxy::VlessEncryptionConfig>& decryption;
     std::optional<proxy::BufferedStreamReader> protocol_reader;
     VlessEncryptionState<Encrypted> encryption;
     std::optional<VlessResponseHeaderWriter> response_writer;
+    ::proxy::VisionTrafficState vision_traffic;
+    std::optional<::proxy::VisionReader> vision_reader;
+    std::optional<::proxy::VisionWriter> vision_writer;
+    std::optional<::proxy::VlessUdpStreamEndpoint> udp_endpoint;
     VlessSessionMeta meta;
     std::array<uint8_t, 16> request_uuid{};
 };
-}  // namespace
+}  // namespace proxy
 
 namespace proxy {
 
+template <bool Encrypted>
 class VlessInboundHandler final : public ::proxy::Inbound {
 public:
     VlessInboundHandler(const ::app::AdmissionEnvironment& environment,
             std::shared_ptr<
                 const ::proxy::VlessEncryptionConfig> decryption = {});
-    ~VlessInboundHandler() override;
+    ~VlessInboundHandler() override = default;
 
-    ::net::awaitable<::app::RelayResult> Process(
-        std::unique_ptr<::transport::AsyncStream> stream,
-        ::routing::Dispatcher& dispatcher,
-        ::proxy::InboundSettings settings,
-        ::net::io_context& io_context,
-        ::common::Context& ctx,
-        const ::infra::TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout) override;
+    using Session = VlessInboundSession<Encrypted>;
+    const app::AdmissionEnvironment& Environment() const noexcept { return environment_; }
+    auto SessionArguments() const noexcept { return std::tuple{std::cref(decryption_)}; }
 
 private:
     const ::app::AdmissionEnvironment& environment_;
@@ -569,33 +413,14 @@ private:
 
 }  // namespace proxy
 
-proxy::VlessInboundHandler::VlessInboundHandler(
+template <bool Encrypted>
+proxy::VlessInboundHandler<Encrypted>::VlessInboundHandler(
     const ::app::AdmissionEnvironment& environment,
     std::shared_ptr<const ::proxy::VlessEncryptionConfig> decryption)
-    : environment_(environment)
+    : Inbound(std::in_place_type<VlessInboundHandler>), environment_(environment)
     , decryption_(std::move(decryption)) {}
 
-proxy::VlessInboundHandler::~VlessInboundHandler() = default;
 
-net::awaitable<app::RelayResult>
-proxy::VlessInboundHandler::Process(
-    std::unique_ptr<transport::AsyncStream> stream,
-    routing::Dispatcher& dispatcher,
-    proxy::InboundSettings settings,
-    net::io_context& io_context,
-    common::Context& ctx,
-    const infra::TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout) {
-    const proxy::InboundContext context{
-        environment_, dispatcher, settings, io_context, ctx, timeouts,
-        pressure_idle_timeout};
-    if (decryption_) {
-        return proxy::ProcessInbound<VlessInboundSession<true>>(
-            std::move(stream), context, std::cref(decryption_));
-    }
-    return proxy::ProcessInbound<VlessInboundSession<false>>(
-        std::move(stream), context, std::cref(decryption_));
-}
 
 namespace {
 [[nodiscard]] const ::app::VlessInboundSettings* GetVlessSettings(
@@ -629,9 +454,12 @@ const bool kVlessInboundRegistered = [] {
             if (!settings) {
                 return nullptr;
             }
-            return std::make_unique<::proxy::VlessInboundHandler>(
-                environment,
-                settings->decryption);
+            if (settings->decryption) {
+                return std::make_unique<::proxy::VlessInboundHandler<true>>(
+                    environment, settings->decryption);
+            }
+            return std::make_unique<::proxy::VlessInboundHandler<false>>(
+                environment, settings->decryption);
         };
 
     reg.prepare_settings =

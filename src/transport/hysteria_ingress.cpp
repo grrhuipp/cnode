@@ -1063,8 +1063,14 @@ net::awaitable<HysteriaConnection::AdmitResult> HysteriaConnection::AdmitConnect
         receiver.inbound_tag, auth_hash);
     const auto profile = user ? std::optional<common::UserProfile>(user->profile) : std::nullopt;
     user.reset();
-    auto session = co_await proxy::AuthenticateAndAdmit(
-        std::move(*authentication), profile ? &*profile : nullptr, "no matching credential", std::nullopt);
+    if (!profile) {
+        const auto error = co_await authentication->RejectCredential("no matching credential");
+        if (error != common::ErrorCode::CANCELLED && error != common::ErrorCode::SOCKET_EOF)
+            listener_->environment.admission->stats.OnError();
+        co_return error == common::ErrorCode::PROTOCOL_AUTH_FAILED
+            ? AdmitResult::AuthFailed : AdmitResult::Limited;
+    }
+    auto session = co_await std::move(*authentication).Bind(*profile, std::nullopt).Admit();
     if (!session) {
         if (session.error() != common::ErrorCode::CANCELLED && session.error() != common::ErrorCode::SOCKET_EOF)
             listener_->environment.admission->stats.OnError();

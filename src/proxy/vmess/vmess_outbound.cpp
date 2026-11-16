@@ -40,14 +40,8 @@ class VmessOutboundHandler final : public ::proxy::Outbound {
 public:
     explicit VmessOutboundHandler(std::shared_ptr<const VmessPreparedSettings> prepared);
 
-    ::net::awaitable<::proxy::OutboundProcessResult> Process(
-        ::common::Context& ctx,
-        ::transport::Link inbound,
-        ::transport::OutboundDialer& dialer,
-        const ::infra::TimeoutsConfig& timeouts,
-        ::app::StatsShard& stats,
-        const ::app::RelayConfig& relay_config,
-        ::common::MultiBufferBatch first_payload) override;
+    struct Session;
+    auto SessionArguments() const noexcept { return std::tuple{std::cref(*prepared_)}; }
 
 private:
     std::shared_ptr<const VmessPreparedSettings> prepared_;
@@ -142,41 +136,35 @@ DialAndSendVMessHandshake(
 // proxy/vmess/outbound.Handler 实现
 // ============================================================================
 
-VmessOutboundHandler::VmessOutboundHandler(std::shared_ptr<const VmessPreparedSettings> prepared)
-    : prepared_(std::move(prepared)) {}
-
-net::awaitable<OutboundProcessResult>
-VmessOutboundHandler::Process(
-    common::Context& ctx,
-    transport::Link inbound,
-    transport::OutboundDialer& dialer,
-    const infra::TimeoutsConfig& timeouts,
-    app::StatsShard& stats,
-    const app::RelayConfig& relay_config,
-    common::MultiBufferBatch first_payload) {
-    if (!inbound.Valid()) {
-        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-    const bool is_udp = ctx.content.network == common::Network::UDP;
-    const auto command = is_udp ? ::proxy::VmessCommand::UDP : ::proxy::VmessCommand::TCP;
-    ::proxy::ClientSession vmess_session(prepared_->config.security, command);
+struct VmessOutboundHandler::Session final : OutboundSession {
+    OutboundPrepareContext& context;
+    const VmessPreparedSettings& prepared;
+    bool is_udp;
+    proxy::VmessCommand command;
+    proxy::ClientSession vmess_session;
     std::unique_ptr<transport::AsyncStream> stream;
-    {
-        auto dialed = co_await DialAndSendVMessHandshake(
-            ctx, dialer, *prepared_, vmess_session, command, timeouts.HandshakeTimeout());
-        if (!dialed) {
-            co_return tl::unexpected(dialed.error());
-        }
-        stream = std::move(*dialed);
-    }
-    proxy::ApplyOutboundRelayTimeouts(*stream, relay_config);
+    std::optional<VMessOutboundEndpoint> endpoint;
 
-    VMessOutboundEndpoint target_endpoint(
-        vmess_session, *stream, is_udp, ctx.outbound.target);
-    co_return co_await app::DoRelayLink(
-        dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-        target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-}
+    Session(OutboundPrepareContext& context, const VmessPreparedSettings& prepared)
+        : context(context), prepared(prepared)
+        , is_udp(context.ctx.content.network == common::Network::UDP)
+        , command(is_udp ? proxy::VmessCommand::UDP : proxy::VmessCommand::TCP)
+        , vmess_session(prepared.config.security, command) {}
+
+    net::awaitable<OutboundPrepareResult<VMessOutboundEndpoint>> Prepare() {
+        auto& [ctx, dialer, timeouts] = context;
+        auto dialed = co_await DialAndSendVMessHandshake(
+            ctx, dialer, prepared, vmess_session, command, timeouts.HandshakeTimeout());
+        if (!dialed) co_return tl::unexpected(dialed.error());
+        stream = std::move(*dialed);
+        endpoint.emplace(vmess_session, *stream, is_udp, ctx.outbound.target);
+        co_return std::ref(*endpoint);
+    }
+};
+
+VmessOutboundHandler::VmessOutboundHandler(std::shared_ptr<const VmessPreparedSettings> prepared)
+    : Outbound(std::in_place_type<VmessOutboundHandler>)
+    , prepared_(std::move(prepared)) {}
 
 // ============================================================================
 // 自注册（静态初始化，Xray init() 设计）

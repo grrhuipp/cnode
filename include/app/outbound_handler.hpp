@@ -138,6 +138,7 @@ public:
     OutboundHandler& operator=(const OutboundHandler&) = delete;
 
     // The caller keeps this handler alive until the returned awaitable completes.
+    // Process is final; the protocol can only prepare endpoints for common relay.
     [[nodiscard]] net::awaitable<proxy::OutboundProcessResult> Dispatch(
         common::Context& ctx,
         transport::Link inbound,

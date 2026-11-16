@@ -3,25 +3,24 @@
 #include "proxy/shadowsocks/ss_udp.hpp"
 #include "proxy/shadowsocks/ss_stream.hpp"
 #include "proxy/inbound.hpp"
+#include <functional>
 
 namespace app { struct AdmissionEnvironment; }
 
 namespace proxy {
+struct SsTcpSession;
 
 class SsInboundHandler final : public ::proxy::Inbound {
 public:
     SsInboundHandler(const ::app::AdmissionEnvironment& environment,
             ::proxy::SsCipherInfo cipher_info);
 
-    // 解析首包：读 salt + 首 chunk，尝试所有用户密钥，解析 SOCKS5 地址
-    ::net::awaitable<::app::RelayResult> Process(
-        std::unique_ptr<::transport::AsyncStream> stream,
-        ::routing::Dispatcher& dispatcher,
-        ::proxy::InboundSettings settings,
-        ::net::io_context& io_context,
-        ::common::Context& ctx,
-        const ::infra::TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout) override;
+    using Session = SsTcpSession;
+    using Inbound::Process;
+    const app::AdmissionEnvironment& Environment() const noexcept { return environment_; }
+    auto SessionArguments() noexcept {
+        return std::tuple{cipher_info_, std::ref(last_matched_index_)};
+    }
 
     // 对应 xray-core proxy/shadowsocks/server.go 的 handleUDPPayload 解码路径。
     [[nodiscard]] tl::expected<

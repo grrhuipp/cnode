@@ -9,7 +9,7 @@
 #include "app/worker.hpp"
 #include "worker_coordinator_fixture.hpp"
 #include "common/allocator.hpp"
-#include "proxy/inbound.hpp"
+#include "proxy/inbound_admission.hpp"
 #include "transport/async_stream.hpp"
 
 #include <asio/co_spawn.hpp>
@@ -44,24 +44,36 @@ thread_local FixtureState* fixture = nullptr;
 // travels through the real Worker handlers and physical session capabilities.
 class HoldingInbound final : public proxy::Inbound {
 public:
-    explicit HoldingInbound(FixtureState& state)
-        : state_(state) { ++state_.created; }
+    HoldingInbound(const app::AdmissionEnvironment& environment, FixtureState& state)
+        : Inbound(std::in_place_type<HoldingInbound>),
+          environment_(environment), state_(state) { ++state_.created; }
     ~HoldingInbound() override {
         state_.wrong_thread |= std::this_thread::get_id() != state_.owner;
         ++state_.destroyed;
     }
-    net::awaitable<app::RelayResult> Process(
-        std::unique_ptr<transport::AsyncStream> stream, routing::Dispatcher&,
-        proxy::InboundSettings, net::io_context&,
-        common::Context&, const infra::TimeoutsConfig&, uint32_t) override {
-        const std::array<char, 1> admitted{'A'};
-        const net::const_buffer admitted_buffer = net::buffer(admitted);
-        co_await stream->WriteBuffers({&admitted_buffer, 1});
-        std::array<char, 1> input{};
-        while (co_await stream->AsyncRead(net::buffer(input)) != 0) {}
-        co_return app::RelayResult{};
-    }
+    struct Session {
+        Session() = default;
+        Session(const Session&) = delete;
+        Session(Session&&) = delete;
+        net::awaitable<tl::expected<proxy::AuthenticatedInbound, common::ErrorCode>>
+        Authenticate(transport::AsyncStream& stream, proxy::InboundAuthentication,
+                     proxy::InboundContext&) {
+            const std::array<char, 1> admitted{'A'};
+            const net::const_buffer admitted_buffer = net::buffer(admitted);
+            co_await stream.WriteBuffers({&admitted_buffer, 1});
+            std::array<char, 1> input{};
+            while (co_await stream.AsyncRead(net::buffer(input)) != 0) {}
+            co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
+        }
+        proxy::InboundPrepared Prepare(std::unique_ptr<transport::AsyncStream>&,
+                                        proxy::InboundContext&) {
+            throw std::logic_error("closed holding fixture must not dispatch");
+        }
+    };
+    const app::AdmissionEnvironment& Environment() const noexcept { return environment_; }
+    auto SessionArguments() const noexcept { return std::tuple{}; }
 private:
+    const app::AdmissionEnvironment& environment_;
     FixtureState& state_;
 };
 
@@ -78,7 +90,7 @@ void RegisterProtocol() {
             } else {
                 EXPECT_EQ(fixture->limiter.lock().get(), limiter) << "handler replacement changed the live admission actor";
             }
-            return std::make_unique<HoldingInbound>(*fixture);
+            return std::make_unique<HoldingInbound>(environment, *fixture);
         },
     });
 }

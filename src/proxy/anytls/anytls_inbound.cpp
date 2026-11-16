@@ -43,10 +43,6 @@ constexpr size_t kMaxConcurrentSubstreams = 128;
 
 }  // namespace
 
-AnyTlsInboundHandler::AnyTlsInboundHandler(const app::AdmissionEnvironment& environment,
-                 std::shared_ptr<const AnyTlsPaddingScheme> padding_scheme)
-    : environment_(environment)
-    , padding_scheme_(std::move(padding_scheme)) {}
 
 namespace {
 
@@ -581,9 +577,20 @@ net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
         co_return common::ErrorCode::CONNECTION_CLOSED;
     }
 
-    (void)co_await DispatchPreparedUotRequest(
-        std::move(*prepared), nullptr, sub, sub,
-        dispatcher_, policy_, io_context_, sub.ctx, environment_.stats, timeouts_);
+    const bool is_connect = prepared->is_connect;
+    common::InitialPayload initial_payload(std::move(prepared->initial_decoded));
+    auto reader_destination = is_connect
+        ? prepared->destination : common::TargetAddress{};
+    BindInboundRequestTarget(sub.ctx, InboundRequestTarget{
+        common::Network::UDP, std::move(prepared->destination),
+        std::move(prepared->forwarded)});
+    UotPacketReader reader(sub, is_connect,
+        std::move(reader_destination), std::move(prepared->pending));
+    UotPacketWriter writer(sub, is_connect, sub.ctx.outbound.target);
+    (void)co_await DispatchAuthenticatedInbound(
+        dispatcher_, io_context_, policy_,
+        routing::DispatchRequest{transport::Link{&reader, &writer}, std::move(initial_payload)},
+        sub.ctx, environment_.stats, timeouts_);
     co_return common::ErrorCode::OK;
 }
 
@@ -666,7 +673,7 @@ net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessStream(
         }
         initial_payload = common::InitialPayload{std::move(prepared.pending)};
     }
-    (void)co_await dispatcher_.Dispatch(io_context_, policy_,
+    (void)co_await DispatchAuthenticatedInbound(dispatcher_, io_context_, policy_,
         routing::DispatchRequest{transport::Link{&sub, &sub}, std::move(initial_payload)},
         ctx, environment_.stats, timeouts_);
     co_return common::ErrorCode::OK;
@@ -921,6 +928,7 @@ net::awaitable<tl::expected<void, common::ErrorCode>> ReadAuth(
     co_return tl::expected<void, common::ErrorCode>{};
 }
 
+}  // namespace
 struct AnyTlsInboundSession {
     explicit AnyTlsInboundSession(const AnyTlsPaddingScheme* scheme) noexcept
         : padding_scheme(scheme) {}
@@ -961,15 +969,16 @@ struct AnyTlsInboundSession {
         co_return std::move(authentication).Bind(user->profile, std::nullopt);
     }
 
-    proxy::InboundContinuation Serve(
+    AnyTlsInboundPrepared Prepare(
         std::unique_ptr<transport::AsyncStream>& stream,
         proxy::InboundContext& context) {
         demux.emplace(
             std::move(stream), context.dispatcher, context.settings.dispatch_policy,
             context.admission, context.io_context, context.session,
             context.timeouts, control_idle_timeout, padding_scheme);
-        return demux->Run();
+        return AnyTlsSessionLoop{*this};
     }
+
 
     const AnyTlsPaddingScheme* padding_scheme;
     std::chrono::seconds control_idle_timeout{};
@@ -977,24 +986,14 @@ struct AnyTlsInboundSession {
     std::optional<AnyTLSDemuxSession> demux;
 };
 
-}  // namespace
-
-net::awaitable<app::RelayResult>
-AnyTlsInboundHandler::Process(
-    std::unique_ptr<transport::AsyncStream> stream,
-    routing::Dispatcher& dispatcher,
-    proxy::InboundSettings settings,
-    net::io_context& io_context,
-    common::Context& ctx,
-    const infra::TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout) {
-    return proxy::ProcessInbound<AnyTlsInboundSession>(
-        std::move(stream),
-        proxy::InboundContext{
-            environment_, dispatcher, settings, io_context, ctx, timeouts,
-            pressure_idle_timeout},
-        padding_scheme_.get());
+net::awaitable<app::RelayResult> AnyTlsSessionLoop::Run() {
+    return session_.demux->Run();
 }
+AnyTlsInboundHandler::AnyTlsInboundHandler(const app::AdmissionEnvironment& environment,
+                 std::shared_ptr<const AnyTlsPaddingScheme> padding_scheme)
+    : Inbound(std::in_place_type<AnyTlsInboundHandler>), environment_(environment)
+    , padding_scheme_(std::move(padding_scheme)) {}
+
 
 namespace {
 [[nodiscard]] const ::app::AnyTlsInboundSettings* GetAnyTlsSettings(

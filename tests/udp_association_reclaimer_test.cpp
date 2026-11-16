@@ -4,6 +4,7 @@
 #include "app/udp_ingress.hpp"
 #include "udp_ingress_fixture.hpp"
 #include "worker_coordinator_fixture.hpp"
+#include "datagram_only_test_inbound.hpp"
 #include "app/relay.hpp"
 
 #include "app/inbound_handler.hpp"
@@ -42,14 +43,8 @@ using Clock = std::chrono::steady_clock;
 constexpr size_t kBatchLimit = 64;
 
 
-class DummyInbound : public ::proxy::Inbound {
+class DummyInbound : public DatagramOnlyTestInbound {
 public:
-    ::net::awaitable<::app::RelayResult> Process(
-        std::unique_ptr<::transport::AsyncStream>, ::routing::Dispatcher&,
-        ::proxy::InboundSettings, ::net::io_context&,
-        ::common::Context&, const ::infra::TimeoutsConfig&, uint32_t) override {
-        co_return ::app::RelayResult{};
-    }
 
     tl::expected<::proxy::InboundDatagramResult, ::common::ErrorCode> Process(
         const ::proxy::InboundDatagramRequest&) override {

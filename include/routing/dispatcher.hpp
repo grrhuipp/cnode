@@ -87,6 +87,18 @@ struct TimeoutsConfig;
 }  // namespace infra
 
 namespace routing {
+class Dispatcher;
+struct DispatchPolicy;
+class DispatchRequest;
+}
+namespace proxy {
+net::awaitable<app::RelayResult> DispatchAuthenticatedInbound(
+    routing::Dispatcher&, net::io_context&, const routing::DispatchPolicy&,
+    routing::DispatchRequest, common::Context&, app::StatsShard&,
+    const infra::TimeoutsConfig&);
+}
+
+namespace routing {
 
 // Dispatcher-owned outbound selection policy. Both alternatives require an
 // explicit target, so a receiver cannot accidentally inherit mutable process
@@ -175,6 +187,11 @@ class Dispatcher {
 public:
     virtual ~Dispatcher() noexcept = default;
 
+private:
+    friend net::awaitable<app::RelayResult> proxy::DispatchAuthenticatedInbound(
+        Dispatcher&, net::io_context&, const DispatchPolicy&, DispatchRequest,
+        common::Context&, app::StatsShard&, const infra::TimeoutsConfig&);
+
     virtual net::awaitable<app::RelayResult> Dispatch(
         net::io_context& io_context,
         const DispatchPolicy& policy,
@@ -185,3 +202,15 @@ public:
 };
 
 }  // namespace routing
+
+namespace proxy {
+// All authenticated stream, child-stream and native datagram requests cross
+// this boundary. It returns the actual dispatcher coroutine, without a frame.
+inline net::awaitable<app::RelayResult> DispatchAuthenticatedInbound(
+    routing::Dispatcher& dispatcher, net::io_context& io,
+    const routing::DispatchPolicy& policy, routing::DispatchRequest request,
+    common::Context& ctx, app::StatsShard& stats,
+    const infra::TimeoutsConfig& timeouts) {
+    return dispatcher.Dispatch(io, policy, std::move(request), ctx, stats, timeouts);
+}
+}  // namespace proxy

@@ -97,26 +97,14 @@ struct TrojanSession {
             InboundRequestTarget{network, std::move(request.target), std::move(request.forwarded)});
     }
 
-    InboundContinuation Serve(std::unique_ptr<transport::AsyncStream>& stream,
-                              InboundContext& context) {
+    InboundPrepared Prepare(std::unique_ptr<transport::AsyncStream>& stream,
+                            InboundContext& context) {
         if (context.session.content.network == common::Network::UDP) {
             udp_endpoint.emplace(*stream);
-            return context.dispatcher.Dispatch(
-                context.io_context,
-                context.settings.dispatch_policy,
-                routing::DispatchRequest{
-                    std::move(stream), transport::Link{&*udp_endpoint, &*udp_endpoint}},
-                context.session,
-                context.admission.stats,
-                context.timeouts);
+            return routing::DispatchRequest{
+                std::move(stream), transport::Link{&*udp_endpoint, &*udp_endpoint}};
         }
-        return context.dispatcher.Dispatch(
-            context.io_context,
-            context.settings.dispatch_policy,
-            routing::DispatchRequest{std::move(stream)},
-            context.session,
-            context.admission.stats,
-            context.timeouts);
+        return routing::DispatchRequest{std::move(stream)};
     }
 };
 }  // namespace
@@ -125,14 +113,9 @@ class TrojanInboundHandler final : public ::proxy::Inbound {
 public:
     explicit TrojanInboundHandler(const ::app::AdmissionEnvironment& environment);
 
-    ::net::awaitable<::app::RelayResult> Process(
-        std::unique_ptr<::transport::AsyncStream> stream,
-        ::routing::Dispatcher& dispatcher,
-        ::proxy::InboundSettings settings,
-        ::net::io_context& io_context,
-        ::common::Context& ctx,
-        const ::infra::TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout) override;
+    using Session = TrojanSession;
+    const app::AdmissionEnvironment& Environment() const noexcept { return environment_; }
+    auto SessionArguments() const noexcept { return std::tuple{}; }
 
 private:
     const ::app::AdmissionEnvironment& environment_;
@@ -144,26 +127,9 @@ private:
 
 TrojanInboundHandler::TrojanInboundHandler(
     const ::app::AdmissionEnvironment& environment)
-    : environment_(environment)
+    : Inbound(std::in_place_type<TrojanInboundHandler>), environment_(environment)
 {}
 
-net::awaitable<app::RelayResult>
-TrojanInboundHandler::Process(
-    std::unique_ptr<transport::AsyncStream> stream,
-    routing::Dispatcher& dispatcher,
-    proxy::InboundSettings settings,
-    net::io_context& io_context,
-    common::Context& ctx,
-    const infra::TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout)
-{
-    LOG_CONN_DEBUG(ctx, "processing connection from {}:{}",
-                   ctx.inbound.source_ip, ctx.inbound.source_port);
-    return ProcessInbound<TrojanSession>(
-        std::move(stream),
-        InboundContext{environment_, dispatcher, settings, io_context,
-                       ctx, timeouts, pressure_idle_timeout});
-}
 
 
 // ============================================================================

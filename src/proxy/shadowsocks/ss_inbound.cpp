@@ -374,7 +374,6 @@ tl::expected<SsStreamWriter, common::ErrorCode> WriteTCPResponse(
     }
 }
 
-namespace {
 
 struct PreparedSsTcpSession {
     proxy::BodyReader request_reader;
@@ -392,6 +391,8 @@ struct SsTcpSession {
     size_t& last_matched_index;
     std::variant<std::monostate, ReadTCPSessionResult, PreparedSsTcpSession> state;
     std::optional<proxy::UotVersion> uot_version;
+    std::optional<proxy::UotPacketReader> uot_reader;
+    std::optional<proxy::UotPacketWriter> uot_writer;
 
     net::awaitable<tl::expected<AuthenticatedInbound, common::ErrorCode>>
     Authenticate(transport::AsyncStream& stream,
@@ -439,59 +440,21 @@ struct SsTcpSession {
         co_return std::move(bound);
     }
 
-    InboundContinuation Serve(std::unique_ptr<transport::AsyncStream>& stream,
-                              InboundContext& context);
+    net::awaitable<InboundPrepared> Prepare(
+        std::unique_ptr<transport::AsyncStream>& stream, InboundContext& context);
 };
 
-net::awaitable<app::RelayResult> DispatchSsUotSession(
-    proxy::UotVersion uot_version,
-    std::unique_ptr<transport::AsyncStream> stream,
-    transport::MultiBufferReader& request_reader,
-    transport::MultiBufferWriter& response_writer,
-    common::MultiBuffer pending,
-    routing::Dispatcher& dispatcher,
-    const routing::DispatchPolicy& dispatch_policy,
-    net::io_context& io_context,
-    common::Context& ctx,
-    app::StatsShard& stats,
-    const infra::TimeoutsConfig& timeouts) {
-    tl::expected<proxy::PreparedRequest, common::ErrorCode> prepared =
-        tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-    try {
-        prepared = co_await proxy::ReadUotRequestHeader(
-            uot_version, request_reader, std::move(pending));
-    } catch (...) {
-        auto error = proxy::ClassifyInboundHandshakeException(std::current_exception());
-        if (stream && error != common::ErrorCode::RESOURCE_EXHAUSTED)
-            error = proxy::ResolveHandshakeReadFailure(*stream, error);
-        prepared = tl::unexpected(error);
-    }
-    if (!prepared) {
-        co_return proxy::RejectInbound(stats, stream.get(), prepared.error());
-    }
-    co_return co_await proxy::DispatchPreparedUotRequest(
-        std::move(*prepared),
-        std::move(stream),
-        request_reader,
-        response_writer,
-        dispatcher,
-        dispatch_policy,
-        io_context,
-        ctx,
-        stats,
-        timeouts);
-}
 
-InboundContinuation SsTcpSession::Serve(
+net::awaitable<InboundPrepared> SsTcpSession::Prepare(
     std::unique_ptr<transport::AsyncStream>& stream,
     InboundContext& context) {
     auto& session = std::get<ReadTCPSessionResult>(state);
     auto writer = proxy::WriteTCPResponse(
         *session.user, cipher_info, session.request_salt, *stream);
     if (!session.body_reader) {
-        return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
+        co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
     }
-    if (!writer) return tl::unexpected(writer.error());
+    if (!writer) co_return tl::unexpected(writer.error());
     // Both cipher directions own their keys before UoT or relay can suspend.
     session.user.reset();
     auto& prepared = state.emplace<PreparedSsTcpSession>(PreparedSsTcpSession{
@@ -499,32 +462,39 @@ InboundContinuation SsTcpSession::Serve(
         std::move(*writer),
         std::move(session.initial_payload)});
     if (uot_version) {
-        return DispatchSsUotSession(
-            *uot_version,
-            std::move(stream),
-            prepared.request_reader,
-            prepared.response_writer,
-            std::move(prepared.initial_payload).MoveToMultiBuffer(),
-            context.dispatcher,
-            context.settings.dispatch_policy,
-            context.io_context,
-            context.session,
-            context.admission.stats,
-            context.timeouts);
+        tl::expected<proxy::PreparedRequest, common::ErrorCode> request =
+            tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
+        try {
+            request = co_await proxy::ReadUotRequestHeader(
+                *uot_version, prepared.request_reader,
+                std::move(prepared.initial_payload).MoveToMultiBuffer());
+        } catch (...) {
+            auto error = ClassifyInboundHandshakeException(std::current_exception());
+            if (stream && error != common::ErrorCode::RESOURCE_EXHAUSTED)
+                error = ResolveHandshakeReadFailure(*stream, error);
+            request = tl::unexpected(error);
+        }
+        if (!request) co_return tl::unexpected(request.error());
+        const bool is_connect = request->is_connect;
+        auto initial_payload = common::InitialPayload(std::move(request->initial_decoded));
+        auto reader_destination = is_connect
+            ? request->destination : common::TargetAddress{};
+        BindInboundRequestTarget(context.session, InboundRequestTarget{
+            common::Network::UDP, std::move(request->destination),
+            std::move(request->forwarded)});
+        uot_reader.emplace(prepared.request_reader, is_connect,
+            std::move(reader_destination), std::move(request->pending));
+        uot_writer.emplace(prepared.response_writer, is_connect, context.session.outbound.target);
+        co_return routing::DispatchRequest{
+            std::move(stream), transport::Link{&*uot_reader, &*uot_writer},
+            std::move(initial_payload)};
     }
-    return context.dispatcher.Dispatch(
-        context.io_context,
-        context.settings.dispatch_policy,
-        routing::DispatchRequest{
-            std::move(stream),
-            transport::Link{&prepared.request_reader, &prepared.response_writer},
-            std::move(prepared.initial_payload)},
-        context.session,
-        context.admission.stats,
-        context.timeouts);
+    co_return routing::DispatchRequest{
+        std::move(stream),
+        transport::Link{&prepared.request_reader, &prepared.response_writer},
+        std::move(prepared.initial_payload)};
 }
 
-}  // namespace
 
 // ============================================================================
 // proxy/shadowsocks/inbound.Handler
@@ -533,40 +503,9 @@ InboundContinuation SsTcpSession::Serve(
 proxy::SsInboundHandler::SsInboundHandler(
     const app::AdmissionEnvironment& environment,
     proxy::SsCipherInfo cipher_info)
-    : environment_(environment)
+    : Inbound(std::in_place_type<SsInboundHandler>), environment_(environment)
     , cipher_info_(cipher_info) {}
 
-// ----------------------------------------------------------------------------
-// Process
-// 流程：
-//   1. 读取 salt（salt_size 字节）
-//   2. 遍历所有用户，尝试派生子密钥并解密首 chunk 长度字段
-//   3. 找到匹配用户后解密首 chunk payload
-//   4. 解析 SOCKS5 目标地址
-//   5. 将剩余数据作为 initial_payload
-//   6. 公共骨架完成在线设备准入，再创建响应 cipher 并进入 UoT/dispatcher
-//      （UoT 请求头仅在准入后读取）
-//
-// 握手超时由底层 TcpStream 空闲超时保护（proxyman inbound 已在 Process
-// 前设置 handshake 超时），无需额外守卫。
-// ----------------------------------------------------------------------------
-net::awaitable<app::RelayResult>
-proxy::SsInboundHandler::Process(
-    std::unique_ptr<transport::AsyncStream> stream,
-    routing::Dispatcher& dispatcher,
-    proxy::InboundSettings settings,
-    net::io_context& io_context,
-    common::Context& ctx,
-    const infra::TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout) {
-    LOG_CONN_DEBUG(ctx, "processing connection from {}:{}",
-                   ctx.inbound.source_ip, ctx.inbound.source_port);
-    return ProcessInbound<SsTcpSession>(
-        std::move(stream),
-        InboundContext{environment_, dispatcher, settings, io_context,
-                       ctx, timeouts, pressure_idle_timeout},
-        cipher_info_, std::ref(last_matched_index_));
-}
 
 tl::expected<::proxy::InboundDatagramResult, ::common::ErrorCode>
 proxy::SsInboundHandler::Process(

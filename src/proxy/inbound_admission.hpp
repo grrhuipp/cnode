@@ -15,6 +15,8 @@
 #include "infra/config_types.hpp"
 #include "transport/async_stream.hpp"
 #include "transport/link.hpp"
+#include "proxy/mux/mux_server.hpp"
+#include "routing/dispatcher.hpp"
 
 #include <cstdint>
 #include <exception>
@@ -24,6 +26,8 @@
 #include <string_view>
 #include <vector>
 #include <utility>
+#include <type_traits>
+#include <variant>
 #include <tl/expected.hpp>
 
 namespace proxy {
@@ -110,8 +114,56 @@ struct InboundContext {
     uint32_t pressure_idle_timeout;
 };
 
-using InboundContinuation =
-    tl::expected<net::awaitable<app::RelayResult>, common::ErrorCode>;
+struct AnyTlsInboundSession;
+struct HysteriaInboundSession;
+struct MultiplexedInboundSession;
+
+class MuxSessionPlan {
+public:
+    transport::Link link;
+    transport::AsyncStream& control;
+    MuxAllowedNetwork allowed_network;
+private:
+    friend struct MultiplexedInboundSession;
+    MuxSessionPlan(transport::Link endpoints, transport::AsyncStream& stream,
+                   MuxAllowedNetwork allowed) noexcept
+        : link(endpoints), control(stream), allowed_network(allowed) {}
+};
+
+// Only a session explicitly supporting a physical Mux loop can prepare it.
+struct MultiplexedInboundSession {
+protected:
+    static MuxSessionPlan MuxPlan(transport::Link link,
+        transport::AsyncStream& control, MuxAllowedNetwork allowed) noexcept {
+        return MuxSessionPlan(link, control, allowed);
+    }
+};
+
+class AnyTlsSessionLoop {
+public:
+    using State = AnyTlsInboundSession;
+    net::awaitable<app::RelayResult> Run();
+private:
+    friend struct AnyTlsInboundSession;
+    explicit AnyTlsSessionLoop(AnyTlsInboundSession& session) noexcept : session_(session) {}
+    AnyTlsInboundSession& session_;
+};
+
+struct InboundPeerClosed {};
+using InboundPrepared = tl::expected<routing::DispatchRequest, common::ErrorCode>;
+using MultiplexedInboundPrepared = tl::expected<
+    std::variant<routing::DispatchRequest, MuxSessionPlan, InboundPeerClosed>, common::ErrorCode>;
+using AnyTlsInboundPrepared = tl::expected<AnyTlsSessionLoop, common::ErrorCode>;
+
+template <typename T> struct InboundPreparation {
+    using Result = T;
+    static constexpr bool asynchronous = false;
+};
+template <typename T, typename Executor>
+struct InboundPreparation<net::awaitable<T, Executor>> {
+    using Result = T;
+    static constexpr bool asynchronous = true;
+};
 
 template <typename ProtocolSession, typename... Arguments>
 net::awaitable<app::RelayResult> ProcessInbound(
@@ -203,11 +255,8 @@ private:
     template <typename ProtocolSession, typename... Arguments>
     friend net::awaitable<app::RelayResult> ProcessInbound(
         std::unique_ptr<transport::AsyncStream>, InboundContext, Arguments...);
-    friend net::awaitable<tl::expected<app::UserOnlineSessionGuard, common::ErrorCode>>
-    AuthenticateAndAdmit(InboundAuthentication, const common::UserProfile*,
-        std::string_view, std::optional<InboundRequestTarget>);
-    friend net::awaitable<std::optional<NativeAssociationAdmission>>
-    AdmitNativeAssociation(const AdmissionEnvironment&, common::Context&, AuthenticatedInbound);
+    friend class transport::HysteriaConnection;
+    friend struct NativeAssociationAdmission;
     [[nodiscard]] net::awaitable<tl::expected<app::UserOnlineSessionGuard, common::ErrorCode>> Admit() && {
         return AdmitSession(*environment_, *ctx_, user_id_, device_limit_);
     }
@@ -263,25 +312,17 @@ BeginInboundAuthentication(const AdmissionEnvironment& environment, common::Cont
     }
 }
 
-[[nodiscard]] inline net::awaitable<tl::expected<app::UserOnlineSessionGuard, common::ErrorCode>>
-AuthenticateAndAdmit(InboundAuthentication authentication, const common::UserProfile* matched,
-                     std::string_view mismatch_reason, std::optional<InboundRequestTarget> request) {
-    if (!matched) {
-        return [](InboundAuthentication auth, std::string_view reason)
-            -> net::awaitable<tl::expected<app::UserOnlineSessionGuard, common::ErrorCode>> {
-            co_return tl::unexpected(co_await auth.RejectCredential(reason));
-        }(std::move(authentication), mismatch_reason);
-    }
-    return std::move(authentication).Bind(*matched, std::move(request)).Admit();
-}
-
 struct NativeAssociationAdmission {
     app::ConnectionLimiter::Reservation connection;
     app::ConnectionLimiter::Reservation ip;
     app::UserOnlineSessionGuard user_session;
+private:
+    friend class app::UdpIngress;
+    [[nodiscard]] static net::awaitable<std::optional<NativeAssociationAdmission>>
+    Admit(const AdmissionEnvironment&, common::Context&, AuthenticatedInbound);
 };
 [[nodiscard]] inline net::awaitable<std::optional<NativeAssociationAdmission>>
-AdmitNativeAssociation(const AdmissionEnvironment& environment, common::Context& ctx,
+NativeAssociationAdmission::Admit(const AdmissionEnvironment& environment, common::Context& ctx,
                        AuthenticatedInbound bound) {
     NativeAssociationAdmission admitted;
     for (auto scope : {app::ConnectionLimiter::ReservationScope::Physical, app::ConnectionLimiter::ReservationScope::ClientIp}) {
@@ -344,9 +385,8 @@ private:
     return result;
 }
 
-// Protocol state is constructed at its final address and never moved.
-// Serving starts only after device admission; the lease covers child cleanup.
-// Process implementations return this coroutine without a forwarding frame.
+// Protocol state and all borrowing wrappers remain at their final address until
+// the dispatcher or the explicitly permitted physical-session loop has joined.
 template <typename ProtocolSession, typename... Arguments>
 net::awaitable<app::RelayResult> ProcessInbound(
     std::unique_ptr<transport::AsyncStream> stream,
@@ -358,30 +398,89 @@ net::awaitable<app::RelayResult> ProcessInbound(
     }
     try {
         ProtocolSession protocol{std::move(arguments)...};
-        auto authentication = co_await BeginInboundAuthentication(
-            context.admission, context.session);
-        if (!authentication) {
-            co_return RejectInbound(stats, stream.get(), authentication.error());
+        static_assert(!std::is_move_constructible_v<ProtocolSession> &&
+                      !std::is_copy_constructible_v<ProtocolSession>,
+                      "inbound session state must stay in the common coroutine frame");
+        app::UserOnlineSessionGuard user_session;
+        // Hysteria's physical connection already owns authentication and the
+        // device lease. Logical streams must not reserve the device again.
+        if constexpr (!std::is_same_v<ProtocolSession, HysteriaInboundSession>) {
+            auto authentication = co_await BeginInboundAuthentication(
+                context.admission, context.session);
+            if (!authentication)
+                co_return RejectInbound(stats, stream.get(), authentication.error());
+            auto authenticated = co_await protocol.Authenticate(
+                *stream, std::move(*authentication), context);
+            if (!authenticated)
+                co_return RejectInbound(stats, stream.get(), authenticated.error());
+            auto admitted = co_await std::move(*authenticated).Admit();
+            if (!admitted)
+                co_return RejectInbound(stats, stream.get(), admitted.error());
+            user_session = std::move(*admitted);
         }
-        auto authenticated = co_await protocol.Authenticate(
-            *stream, std::move(*authentication), context);
-        if (!authenticated) {
-            co_return RejectInbound(stats, stream.get(), authenticated.error());
+        using Preparation = InboundPreparation<decltype(protocol.Prepare(stream, context))>;
+        using Prepared = typename Preparation::Result;
+        static_assert(std::is_same_v<Prepared, InboundPrepared> ||
+                      std::is_same_v<Prepared, MultiplexedInboundPrepared> ||
+                      std::is_same_v<Prepared, AnyTlsInboundPrepared>,
+                      "inbound Prepare must return its typed dispatch/session plan");
+        static_assert(!std::is_same_v<Prepared, MultiplexedInboundPrepared> ||
+                      std::is_base_of_v<MultiplexedInboundSession, ProtocolSession>,
+                      "ordinary inbound sessions cannot return a physical Mux loop");
+        std::optional<Prepared> prepared;
+        if constexpr (Preparation::asynchronous) {
+            prepared.emplace(co_await protocol.Prepare(stream, context));
+        } else {
+            prepared.emplace(protocol.Prepare(stream, context));
         }
-        auto admitted = co_await std::move(*authenticated).Admit();
-        if (!admitted) {
-            co_return RejectInbound(stats, stream.get(), admitted.error());
+        if (!*prepared)
+            co_return RejectInbound(stats, stream.get(), prepared->error());
+        if constexpr (std::is_same_v<Prepared, AnyTlsInboundPrepared>) {
+            static_assert(std::is_same_v<ProtocolSession, typename Prepared::value_type::State>,
+                          "only the typed loop's own state can prepare its execution");
+            co_return co_await (**prepared).Run();
+        } else {
+            if constexpr (std::is_same_v<Prepared, MultiplexedInboundPrepared>) {
+                if (std::holds_alternative<InboundPeerClosed>(**prepared))
+                    co_return app::RelayResult{};
+                if (auto* mux = std::get_if<MuxSessionPlan>(&**prepared)) {
+                    co_return co_await ServeMuxInbound(
+                        context.io_context, mux->link, mux->control, context.dispatcher,
+                        context.settings.dispatch_policy, context.admission, context.session,
+                        stats, context.timeouts, context.pressure_idle_timeout, mux->allowed_network);
+                }
+            }
+            auto& request = [&]() -> routing::DispatchRequest& {
+                if constexpr (std::is_same_v<Prepared, MultiplexedInboundPrepared>)
+                    return std::get<routing::DispatchRequest>(**prepared);
+                else
+                    return **prepared;
+            }();
+            co_return co_await DispatchAuthenticatedInbound(context.dispatcher,
+                context.io_context, context.settings.dispatch_policy,
+                std::move(request), context.session, stats, context.timeouts);
         }
-        auto continuation = protocol.Serve(stream, context);
-        if (!continuation) {
-            co_return RejectInbound(stats, stream.get(), continuation.error());
-        }
-        co_return co_await std::move(*continuation);
     } catch (...) {
         co_return RejectInbound(
             stats, stream.get(),
             ClassifyInboundHandshakeException(std::current_exception()));
     }
+}
+
+template <typename Protocol>
+net::awaitable<app::RelayResult> Inbound::Execute(
+    Inbound& inbound, std::unique_ptr<transport::AsyncStream> stream,
+    routing::Dispatcher& dispatcher, InboundSettings settings,
+    net::io_context& io_context, common::Context& ctx,
+    const infra::TimeoutsConfig& timeouts, uint32_t pressure_idle_timeout) {
+    auto& protocol = static_cast<Protocol&>(inbound);
+    return std::apply([&](auto&&... arguments) {
+        return ProcessInbound<typename Protocol::Session>(
+            std::move(stream),
+            InboundContext{protocol.Environment(), dispatcher, settings, io_context,
+                           ctx, timeouts, pressure_idle_timeout},
+            std::forward<decltype(arguments)>(arguments)...);
+    }, protocol.SessionArguments());
 }
 
 template <typename PreparedUser, typename AssignCredential>

@@ -69,7 +69,9 @@ struct PreparedVmessInboundSession {
     ::proxy::ResponseBodyWriter response_writer;
 };
 
-struct VmessSession {
+}  // namespace
+namespace proxy {
+struct VmessSession : MultiplexedInboundSession {
     VmessSession() = default;
     VmessSession(const VmessSession&) = delete;
     VmessSession(VmessSession&&) = delete;
@@ -126,8 +128,8 @@ struct VmessSession {
         co_return std::move(bound);
     }
 
-    proxy::InboundContinuation Serve(std::unique_ptr<transport::AsyncStream>& stream,
-                                     proxy::InboundContext& context) {
+    MultiplexedInboundPrepared Prepare(std::unique_ptr<transport::AsyncStream>& stream,
+                                       InboundContext& context) {
         auto& vmess_session = std::get<::proxy::ServerSession>(state);
         auto reader = vmess_session.DecodeRequestBody(*stream);
         if (!reader) return tl::unexpected(reader.error());
@@ -137,32 +139,17 @@ struct VmessSession {
             PreparedVmessInboundSession{std::move(*reader), std::move(*writer)});
 
         if (context.session.content.network == common::Network::MUX) {
-            return proxy::ServeMuxInbound(
-                context.io_context,
+            return MuxPlan(
                 transport::Link{&prepared.request_reader, &prepared.response_writer},
-                *stream,
-                context.dispatcher,
-                context.settings.dispatch_policy,
-                context.admission,
-                context.session,
-                context.admission.stats,
-                context.timeouts,
-                context.pressure_idle_timeout,
-                proxy::MuxAllowedNetwork::Any);
+                *stream, MuxAllowedNetwork::Any);
         }
-        return context.dispatcher.Dispatch(
-            context.io_context,
-            context.settings.dispatch_policy,
-            routing::DispatchRequest{
-                std::move(stream),
-                transport::Link{&prepared.request_reader, &prepared.response_writer}},
-            context.session,
-            context.admission.stats,
-            context.timeouts);
+        return routing::DispatchRequest{
+            std::move(stream),
+            transport::Link{&prepared.request_reader, &prepared.response_writer}};
     }
 };
 
-}  // namespace
+}  // namespace proxy
 
 namespace proxy {
 
@@ -170,14 +157,9 @@ class VmessInboundHandler final : public ::proxy::Inbound {
 public:
     explicit VmessInboundHandler(const ::app::AdmissionEnvironment& environment);
 
-    ::net::awaitable<::app::RelayResult> Process(
-        std::unique_ptr<::transport::AsyncStream> stream,
-        ::routing::Dispatcher& dispatcher,
-        ::proxy::InboundSettings settings,
-        ::net::io_context& io_context,
-        ::common::Context& ctx,
-        const ::infra::TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout) override;
+    using Session = VmessSession;
+    const app::AdmissionEnvironment& Environment() const noexcept { return environment_; }
+    auto SessionArguments() const noexcept { return std::tuple{}; }
 
 private:
     const ::app::AdmissionEnvironment& environment_;
@@ -191,26 +173,9 @@ private:
 
 proxy::VmessInboundHandler::VmessInboundHandler(
     const ::app::AdmissionEnvironment& environment)
-    : environment_(environment)
+    : Inbound(std::in_place_type<VmessInboundHandler>), environment_(environment)
 {}
 
-net::awaitable<app::RelayResult>
-proxy::VmessInboundHandler::Process(
-    std::unique_ptr<transport::AsyncStream> stream,
-    routing::Dispatcher& dispatcher,
-    proxy::InboundSettings settings,
-    net::io_context& io_context,
-    common::Context& ctx,
-    const infra::TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout)
-{
-    LOG_CONN_DEBUG(ctx, "processing connection from {}:{}",
-                   ctx.inbound.source_ip, ctx.inbound.source_port);
-    return proxy::ProcessInbound<VmessSession>(
-        std::move(stream),
-        proxy::InboundContext{environment_, dispatcher, settings, io_context,
-                              ctx, timeouts, pressure_idle_timeout});
-}
 
 
 // ============================================================================

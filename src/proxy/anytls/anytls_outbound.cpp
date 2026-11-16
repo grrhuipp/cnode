@@ -1029,16 +1029,6 @@ tl::expected<void, common::ErrorCode> BuildOpenPacket(
 }  // namespace
 
 
-AnyTlsOutboundHandler::AnyTlsOutboundHandler(std::string_view tag,
-                 net::io_context& io_context,
-                 std::shared_ptr<const infra::AnyTlsSettings> settings,
-                 common::AwaitableTaskGroup& tasks)
-    : tag_(tag)
-    , settings_(std::move(settings))
-    , padding_(DefaultAnyTlsPaddingScheme())
-    , pool_(std::make_shared<SessionPool>(
-          io_context, tasks, settings_->idle_session_check_interval,
-          settings_->idle_session_timeout, settings_->min_idle_sessions, tag_)) {}
 
 AnyTlsOutboundHandler::~AnyTlsOutboundHandler() noexcept {
     if (pool_) pool_->Retire();
@@ -1079,108 +1069,7 @@ AnyTlsOutboundHandler::SessionPool::AcquireOrDial(
     co_return Adopt(session);
 }
 
-net::awaitable<OutboundProcessResult> AnyTlsOutboundHandler::Process(
-    common::Context& ctx,
-    transport::Link inbound,
-    transport::OutboundDialer& dialer,
-    const infra::TimeoutsConfig& timeouts,
-    app::StatsShard& stats,
-    const app::RelayConfig& relay_config,
-    common::MultiBufferBatch first_payload) {
-    if (!inbound.Valid()) {
-        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-    SessionPool::Lease transport_lease;
-    std::shared_ptr<ClientSession> session;
-    bool reusable = false;
-    std::exception_ptr failure;
-    OutboundProcessResult result = tl::unexpected(common::ErrorCode::INTERNAL);
-    try {
-        auto acquired = co_await pool_->AcquireOrDial(ctx, dialer, *settings_, padding_, timeouts);
-        if (!acquired) {
-            result = tl::unexpected(acquired.error());
-        } else {
-            transport_lease = std::move(*acquired);
-            session = transport_lease.Get();
-            if (session) {
-                result = co_await ProcessSession(ctx, inbound, dialer, timeouts, stats, relay_config,
-                    std::move(first_payload), session, reusable);
-            }
-        }
-    } catch (...) {
-        failure = std::current_exception();
-    }
-    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
-    session.reset();
-    if (reusable && !failure) transport_lease.Reuse();
-    if (failure) std::rethrow_exception(failure);
-    co_return result;
-}
-
-net::awaitable<OutboundProcessResult> AnyTlsOutboundHandler::ProcessSession(
-    common::Context& ctx, transport::Link inbound, transport::OutboundDialer& dialer,
-    const infra::TimeoutsConfig& timeouts, app::StatsShard& stats, const app::RelayConfig& relay_config,
-    common::MultiBufferBatch first_payload,
-    std::shared_ptr<ClientSession> session, bool& reusable) {
-    if (session->IsClosed()) co_return tl::unexpected(session->ClosedError());
-    if (session->next_sid != 1) {
-        LOG_CONN_DEBUG(ctx, "reusing idle session sid={}", session->next_sid);
-        dialer.RecordConnected(ctx, *session->stream);
-    }
-
-    if (!session || !session->stream) {
-        co_return tl::unexpected(common::ErrorCode::INTERNAL);
-    }
-    if (session->sid_exhausted) {
-        co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
-    }
-
-    auto& stream = *session->stream;
-    const uint32_t sid = session->AllocateSid();
-    auto logical = session->RegisterLogicalStream(sid);
-    LogicalStreamLease logical_lease(reusable, session, logical, sid);
-    const bool is_udp = ctx.content.network == common::Network::UDP;
-    const common::TargetAddress& original_target = ctx.outbound.target;
-    auto open_logical_stream = [&]() -> net::awaitable<tl::expected<void, common::ErrorCode>> {
-        stream.SetIdleTimeout(timeouts.HandshakeTimeout());
-        auto deadline = stream.StartPhaseDeadline(timeouts.HandshakeTimeout());
-        {
-            OpenPacketBuffer open_packet;
-            auto built = BuildOpenPacket(
-                open_packet, sid, is_udp, original_target, dialer.ForwardedMetadata(ctx),
-                session->opening_scheme_.get());
-            if (!built) {
-                stream.ClearPhaseDeadline();
-                session->CloseAll(built.error());
-                co_return tl::unexpected(built.error());
-            }
-            if (auto ok = co_await session->WriteOpenPacket(open_packet.Span()); !ok) {
-                const bool timed_out =
-                    proxy::ConsumeOutboundHandshakeTimeout(stream, deadline);
-                const common::ErrorCode error = timed_out ? common::ErrorCode::TIMEOUT : ok.error();
-                stream.Cancel();
-                logical->Close(error);
-                co_return tl::unexpected(error);
-            }
-        }
-        if (sid >= 2 && session->session_version == SessionVersion::V2) {
-            if (auto ok = co_await logical->WaitOpenResult(kSynAckTimeout, dialer.IoContext()); !ok) {
-                const bool timed_out =
-                    proxy::ConsumeOutboundHandshakeTimeout(stream, deadline);
-                const common::ErrorCode error = timed_out ? common::ErrorCode::TIMEOUT : ok.error();
-                session->CloseAll(error);
-                co_return tl::unexpected(error);
-            }
-        }
-        co_return tl::expected<void, common::ErrorCode>{};
-    };
-    if (auto ok = co_await open_logical_stream(); !ok) {
-        co_return tl::unexpected(ok.error());
-    }
-    // A pool lease exclusively owns this physical session for the request.
-    // Its background reader must observe the same deadlines as relay writes.
-    proxy::ApplyOutboundRelayTimeouts(stream, relay_config);
-
+struct AnyTlsOutboundHandler::Session final : OutboundSession {
     struct LogicalEndpoint final : transport::MultiBufferReader,
                                    transport::MultiBufferWriter {
         ClientSession& session;
@@ -1197,18 +1086,17 @@ net::awaitable<OutboundProcessResult> AnyTlsOutboundHandler::ProcessSession(
             PendingWrite& operator=(const PendingWrite&) = delete;
         };
 
-        LogicalEndpoint(ClientSession& s,
-                        ClientSession::LogicalStream& l,
-                        uint32_t stream_id) noexcept
-            : session(s)
-            , logical(l)
-            , sid(stream_id) {}
+        LogicalEndpoint(ClientSession& session, ClientSession::LogicalStream& logical,
+                        uint32_t sid) noexcept
+            : session(session), logical(logical), sid(sid) {}
 
         net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
             return logical.ReadMultiBuffer();
         }
 
-        transport::EofAction ReadEofAction() const noexcept override { return transport::EofAction::CloseLink; }
+        transport::EofAction ReadEofAction() const noexcept override {
+            return transport::EofAction::CloseLink;
+        }
         bool WriteShutdownClosesLink() const noexcept override { return true; }
 
         net::awaitable<void> WriteMultiBuffer(common::MultiBuffer mb) override {
@@ -1228,54 +1116,129 @@ net::awaitable<OutboundProcessResult> AnyTlsOutboundHandler::ProcessSession(
             }
         }
 
-        common::CancellationSource& Cancellation() noexcept override { return logical.Cancellation(); }
+        common::CancellationSource& Cancellation() noexcept override {
+            return logical.Cancellation();
+        }
 
         void Cancel() noexcept {
             cancelled = true;
             logical.Close(common::ErrorCode::CANCELLED);
-            // Relay also calls Cancel after a successful join. Preserve that
-            // idle transport, but abort a pending gate/write: a partial frame
-            // cannot safely be handed to the next request.
+            // A partial serialized frame cannot be reused by another request.
+            // Relay's post-join Cancel alone must not retire a healthy session.
             if (pending_writes != 0) session.CloseAll(common::ErrorCode::CANCELLED);
         }
 
         void Close() noexcept {}
         void CloseAbortive() noexcept {}
 
-        transport::AsyncStream& RelayControl() noexcept {
-            return *session.stream;
+        transport::AsyncStream& RelayControl() noexcept { return *session.stream; }
+    };
+
+    using UotEndpoint = proxy::UotFramedEndpoint<LogicalEndpoint>;
+    static constexpr bool reset_cancellation = true;
+    OutboundPrepareContext& context;
+    AnyTlsOutboundHandler& owner;
+    SessionPool::Lease transport_lease;
+    ClientSession* session = nullptr;
+    bool reusable = false;
+    std::optional<LogicalStreamLease> logical_lease;
+    std::optional<LogicalEndpoint> endpoint;
+    std::optional<UotEndpoint> uot;
+
+    Session(OutboundPrepareContext& context, AnyTlsOutboundHandler& owner) noexcept
+        : context(context), owner(owner) {}
+
+    net::awaitable<OutboundPrepareResult<LogicalEndpoint, UotEndpoint>> Prepare() {
+        auto& [ctx, dialer, timeouts] = context;
+        auto acquired = co_await owner.pool_->AcquireOrDial(
+            ctx, dialer, *owner.settings_, owner.padding_, timeouts);
+        if (!acquired) co_return tl::unexpected(acquired.error());
+        transport_lease = std::move(*acquired);
+        session = transport_lease.Get().get();
+        if (!session || !session->stream) {
+            co_return tl::unexpected(common::ErrorCode::INTERNAL);
         }
-    };
+        if (session->IsClosed()) co_return tl::unexpected(session->ClosedError());
+        if (session->next_sid != 1) {
+            LOG_CONN_DEBUG(ctx, "reusing idle session sid={}", session->next_sid);
+            dialer.RecordConnected(ctx, *session->stream);
+        }
+        if (session->sid_exhausted) {
+            co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
+        }
 
-    LogicalEndpoint target_endpoint(
-        *session,
-        *logical,
-        sid);
-
-    app::RelayResult result;
-    auto relay_endpoint = [&](auto& endpoint) {
-        return app::DoRelayLink(
-            dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-            endpoint, ctx, stats, relay_config, std::move(first_payload));
-    };
-
-    if (is_udp) {
-        proxy::UotFramedEndpoint uot_endpoint(
-            target_endpoint, true, original_target);
-        result = co_await relay_endpoint(uot_endpoint);
-    } else {
-        result = co_await relay_endpoint(target_endpoint);
+        auto& stream = *session->stream;
+        const uint32_t sid = session->AllocateSid();
+        logical_lease.emplace(reusable, transport_lease.Get(),
+                              session->RegisterLogicalStream(sid), sid);
+        auto& logical = *logical_lease->logical;
+        const bool is_udp = ctx.content.network == common::Network::UDP;
+        const auto& target = ctx.outbound.target;
+        stream.SetIdleTimeout(timeouts.HandshakeTimeout());
+        auto deadline = stream.StartPhaseDeadline(timeouts.HandshakeTimeout());
+        {
+            OpenPacketBuffer open_packet;
+            auto built = BuildOpenPacket(
+                open_packet, sid, is_udp, target, dialer.ForwardedMetadata(ctx),
+                session->opening_scheme_.get());
+            if (!built) {
+                stream.ClearPhaseDeadline();
+                session->CloseAll(built.error());
+                co_return tl::unexpected(built.error());
+            }
+            if (auto ok = co_await session->WriteOpenPacket(open_packet.Span()); !ok) {
+                const bool timed_out = proxy::ConsumeOutboundHandshakeTimeout(stream, deadline);
+                const auto error = timed_out ? common::ErrorCode::TIMEOUT : ok.error();
+                stream.Cancel();
+                logical.Close(error);
+                co_return tl::unexpected(error);
+            }
+        }
+        if (sid >= 2 && session->session_version == SessionVersion::V2) {
+            if (auto ok = co_await logical.WaitOpenResult(kSynAckTimeout, dialer.IoContext()); !ok) {
+                const bool timed_out = proxy::ConsumeOutboundHandshakeTimeout(stream, deadline);
+                const auto error = timed_out ? common::ErrorCode::TIMEOUT : ok.error();
+                session->CloseAll(error);
+                co_return tl::unexpected(error);
+            }
+        }
+        endpoint.emplace(*session, logical, sid);
+        if (is_udp) {
+            uot.emplace(*endpoint, true, target);
+            co_return std::ref(*uot);
+        }
+        co_return std::ref(*endpoint);
     }
 
-    if (result.error == common::ErrorCode::OK) {
-        // Request and half-close deadlines must not escape into the idle pool.
-        stream.SetIdleTimeout(std::chrono::seconds(0));
-        stream.SetWriteTimeout(std::chrono::seconds(0));
-        stream.ClearPhaseDeadline();
+    void Finalize(const OutboundProcessResult& result, const std::exception_ptr& failure) {
+        if (logical_lease && !failure && result) {
+            if (result->error == common::ErrorCode::OK) {
+                // Request and half-close deadlines must not escape into the pool.
+                session->stream->SetIdleTimeout(std::chrono::seconds(0));
+                session->stream->SetWriteTimeout(std::chrono::seconds(0));
+                session->stream->ClearPhaseDeadline();
+            }
+            logical_lease->Finish(result->error);
+        }
+        uot.reset();
+        endpoint.reset();
+        logical_lease.reset();
+        session = nullptr;
+        if (reusable && !failure) transport_lease.Reuse();
     }
-    logical_lease.Finish(result.error);
-    co_return result;
-}
+};
+
+AnyTlsOutboundHandler::AnyTlsOutboundHandler(std::string_view tag,
+                 net::io_context& io_context,
+                 std::shared_ptr<const infra::AnyTlsSettings> settings,
+                 common::AwaitableTaskGroup& tasks)
+    : Outbound(std::in_place_type<AnyTlsOutboundHandler>)
+    , tag_(tag)
+    , settings_(std::move(settings))
+    , padding_(DefaultAnyTlsPaddingScheme())
+    , pool_(std::make_shared<SessionPool>(
+          io_context, tasks, settings_->idle_session_check_interval,
+          settings_->idle_session_timeout, settings_->min_idle_sessions, tag_)) {}
 
 }  // namespace proxy
 

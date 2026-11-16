@@ -39,14 +39,8 @@ class TrojanOutboundHandler final : public ::proxy::Outbound {
 public:
     explicit TrojanOutboundHandler(std::shared_ptr<const ::proxy::TrojanOutboundConfig> config);
 
-    ::net::awaitable<::proxy::OutboundProcessResult> Process(
-        ::common::Context& ctx,
-        ::transport::Link inbound,
-        ::transport::OutboundDialer& dialer,
-        const ::infra::TimeoutsConfig& timeouts,
-        ::app::StatsShard& stats,
-        const ::app::RelayConfig& relay_config,
-        ::common::MultiBufferBatch first_payload) override;
+    struct Session;
+    auto SessionArguments() const noexcept { return std::tuple{std::cref(*config_)}; }
 
 private:
     std::shared_ptr<const ::proxy::TrojanOutboundConfig> config_;
@@ -103,44 +97,34 @@ DialAndSendTrojanHandshake(
 // proxy/trojan/outbound.Handler 实现
 // ============================================================================
 
+struct TrojanOutboundHandler::Session final : OutboundSession {
+    OutboundPrepareContext& context;
+    const TrojanOutboundConfig& config;
+    std::unique_ptr<transport::AsyncStream> stream;
+    std::optional<TrojanUdpStreamEndpoint> datagram;
+
+    Session(OutboundPrepareContext& context, const TrojanOutboundConfig& config) noexcept
+        : context(context), config(config) {}
+
+    net::awaitable<OutboundPrepareResult<transport::AsyncStream, TrojanUdpStreamEndpoint>> Prepare() {
+        auto& [ctx, dialer, timeouts] = context;
+        const bool is_udp = ctx.content.network == common::Network::UDP;
+        auto dialed = co_await DialAndSendTrojanHandshake(
+            ctx, dialer, config, is_udp, timeouts.HandshakeTimeout());
+        if (!dialed) co_return tl::unexpected(dialed.error());
+        stream = std::move(*dialed);
+        if (is_udp) {
+            datagram.emplace(*stream, ctx.outbound.target, transport::EofAction::WaitForPeer);
+            co_return std::ref(*datagram);
+        }
+        co_return std::ref(*stream);
+    }
+};
+
 TrojanOutboundHandler::TrojanOutboundHandler(
     std::shared_ptr<const TrojanOutboundConfig> config)
-    : config_(std::move(config)) {}
-
-net::awaitable<OutboundProcessResult>
-TrojanOutboundHandler::Process(
-    common::Context& ctx,
-    transport::Link inbound,
-    transport::OutboundDialer& dialer,
-    const infra::TimeoutsConfig& timeouts,
-    app::StatsShard& stats,
-    const app::RelayConfig& relay_config,
-    common::MultiBufferBatch first_payload) {
-    const bool is_udp = ctx.content.network == common::Network::UDP;
-    if (!inbound.Valid()) {
-        co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-    }
-    std::unique_ptr<transport::AsyncStream> stream;
-    {
-        auto dialed = co_await DialAndSendTrojanHandshake(
-            ctx, dialer, *config_, is_udp, timeouts.HandshakeTimeout());
-        if (!dialed) {
-            co_return tl::unexpected(dialed.error());
-        }
-        stream = std::move(*dialed);
-    }
-    proxy::ApplyOutboundRelayTimeouts(*stream, relay_config);
-    if (is_udp) {
-        TrojanUdpStreamEndpoint udp_endpoint(
-            *stream, ctx.outbound.target, transport::EofAction::WaitForPeer);
-        co_return co_await app::DoRelayLink(
-            dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-            udp_endpoint, ctx, stats, relay_config, std::move(first_payload));
-    }
-    co_return co_await app::DoRelayLink(
-        dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-        *stream, ctx, stats, relay_config, std::move(first_payload));
-}
+    : Outbound(std::in_place_type<TrojanOutboundHandler>)
+    , config_(std::move(config)) {}
 
 
 // ============================================================================

@@ -839,7 +839,7 @@ net::awaitable<void> RunSubDispatch(
             pending && !admission.Hold(co_await std::move(*pending), sub->ctx, environment.stats)) {
             sub->Reject();
         } else {
-            (void)co_await dispatcher.Dispatch(
+            (void)co_await DispatchAuthenticatedInbound(dispatcher,
                 io_context,
                 policy,
                 routing::DispatchRequest{link},

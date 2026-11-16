@@ -6,32 +6,10 @@ public:
 
     ~SsOutboundHandler() noexcept override = default;
 
-    ::net::awaitable<::proxy::OutboundProcessResult> Process(
-        ::common::Context& ctx,
-        ::transport::Link inbound,
-        ::transport::OutboundDialer& dialer,
-        const ::infra::TimeoutsConfig& timeouts,
-        ::app::StatsShard& stats,
-        const ::app::RelayConfig& relay_config,
-        ::common::MultiBufferBatch first_payload) override;
+    struct Session;
+    auto SessionArguments() const noexcept { return std::tuple{std::cref(*prepared_)}; }
 
 private:
-    ::net::awaitable<::proxy::OutboundProcessResult> ProcessDatagram(
-        ::common::Context& ctx,
-        ::transport::Link inbound,
-        ::transport::OutboundDialer& dialer,
-        ::app::StatsShard& stats,
-        const ::app::RelayConfig& relay_config,
-        ::common::MultiBufferBatch first_payload);
-    ::net::awaitable<::proxy::OutboundProcessResult> ProcessStream(
-        ::common::Context& ctx,
-        ::transport::Link inbound,
-        ::transport::OutboundDialer& dialer,
-        const ::infra::TimeoutsConfig& timeouts,
-        ::app::StatsShard& stats,
-        const ::app::RelayConfig& relay_config,
-        ::common::MultiBufferBatch first_payload,
-        bool use_uot);
 
     std::shared_ptr<const SsPreparedSettings> prepared_;
 };
@@ -586,100 +564,73 @@ DialAndHandshakeShadowsocks(
 }
 }  // namespace
 
-net::awaitable<proxy::OutboundProcessResult> proxy::SsOutboundHandler::Process(
-    common::Context& ctx,
-    transport::Link inbound,
-    transport::OutboundDialer& dialer,
-    const infra::TimeoutsConfig& timeouts,
-    app::StatsShard& stats,
-    const app::RelayConfig& relay_config,
-    common::MultiBufferBatch first_payload) {
-    if (!inbound.Valid()) {
-        return []() -> net::awaitable<proxy::OutboundProcessResult> {
-            co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-        }();
-    }
-    const bool use_uot =
-        ctx.content.network == common::Network::UDP && prepared_->config.uot_version.has_value();
-    if (ctx.content.network == common::Network::UDP && !use_uot) {
-        return ProcessDatagram(
-            ctx, inbound, dialer, stats, relay_config, std::move(first_payload));
-    }
-    return ProcessStream(
-        ctx, inbound, dialer, timeouts, stats, relay_config, std::move(first_payload), use_uot);
-}
-
-net::awaitable<proxy::OutboundProcessResult> proxy::SsOutboundHandler::ProcessDatagram(
-    common::Context& ctx,
-    transport::Link inbound,
-    transport::OutboundDialer& dialer,
-    app::StatsShard& stats,
-    const app::RelayConfig& relay_config,
-    common::MultiBufferBatch first_payload) {
-    const auto& server = prepared_->config.server;
-    auto server_target = MakeServerTarget(server);
-    if (!server_target.IsValid()) {
-        co_return tl::unexpected(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
-    }
-    std::optional<SsUdpRequest> target_endpoint;
-    if (auto opened = dialer.OpenDatagram(
-            ctx,
-            transport::OutboundDialer::DatagramRemote{
-                .address = server.literal_address,
-                .family_hint = {},
-                .family_policy = {},
-            },
-            target_endpoint,
-            std::move(server_target),
-            prepared_->credentials.Cipher(),
-            prepared_->credentials.MasterKey(),
-            prepared_->credentials.PskChain(),
-            dialer.ForwardedMetadata(ctx));
-        !opened) {
-        co_return tl::unexpected(opened.error());
-    }
-    proxy::ApplyOutboundDatagramTimeouts(*target_endpoint, relay_config);
-    co_return co_await app::DoRelayLink(
-        dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-        *target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-}
-
-net::awaitable<proxy::OutboundProcessResult> proxy::SsOutboundHandler::ProcessStream(
-    common::Context& ctx,
-    transport::Link inbound,
-    transport::OutboundDialer& dialer,
-    const infra::TimeoutsConfig& timeouts,
-    app::StatsShard& stats,
-    const app::RelayConfig& relay_config,
-    common::MultiBufferBatch first_payload,
-    bool use_uot) {
+struct proxy::SsOutboundHandler::Session final : OutboundSession {
+    using UotEndpoint = proxy::UotFramedEndpoint<ShadowsocksOutboundEndpoint>;
+    OutboundPrepareContext& context;
+    const SsPreparedSettings& prepared;
     std::unique_ptr<transport::AsyncStream> stream;
-    std::optional<ShadowsocksOutboundEndpoint> target_endpoint;
-    {
-        auto dialed = co_await DialAndHandshakeShadowsocks(
-            ctx, dialer, *prepared_, use_uot, timeouts.HandshakeTimeout(), target_endpoint);
-        if (!dialed) {
-            co_return tl::unexpected(dialed.error());
+    std::optional<SsUdpRequest> datagram;
+    std::optional<ShadowsocksOutboundEndpoint> endpoint;
+    std::optional<UotEndpoint> uot;
+
+    Session(OutboundPrepareContext& context, const SsPreparedSettings& prepared) noexcept
+        : context(context), prepared(prepared) {}
+
+    using Prepared = OutboundPrepareResult<SsUdpRequest, ShadowsocksOutboundEndpoint, UotEndpoint>;
+
+    OutboundPreparationPlan<SsUdpRequest, ShadowsocksOutboundEndpoint, UotEndpoint> Prepare() {
+        const bool use_uot = context.ctx.content.network == common::Network::UDP &&
+            prepared.config.uot_version.has_value();
+        if (context.ctx.content.network == common::Network::UDP && !use_uot) {
+            return PrepareDatagram();
         }
+        return PrepareStream(use_uot);
+    }
+
+private:
+    Prepared PrepareDatagram() {
+        auto& [ctx, dialer, timeouts] = context;
+        const auto& server = prepared.config.server;
+        auto server_target = MakeServerTarget(server);
+        if (!server_target.IsValid()) {
+            return tl::unexpected(common::ErrorCode::PROTOCOL_INVALID_ADDRESS);
+        }
+        if (auto opened = dialer.OpenDatagram(
+                ctx,
+                transport::OutboundDialer::DatagramRemote{
+                    .address = server.literal_address,
+                    .family_hint = {},
+                    .family_policy = {},
+                },
+                datagram,
+                std::move(server_target),
+                prepared.credentials.Cipher(),
+                prepared.credentials.MasterKey(),
+                prepared.credentials.PskChain(),
+                dialer.ForwardedMetadata(ctx));
+            !opened) {
+            return tl::unexpected(opened.error());
+        }
+        return std::ref(*datagram);
+    }
+
+    net::awaitable<Prepared> PrepareStream(bool use_uot) {
+        auto& [ctx, dialer, timeouts] = context;
+        auto dialed = co_await DialAndHandshakeShadowsocks(
+            ctx, dialer, prepared, use_uot, timeouts.HandshakeTimeout(), endpoint);
+        if (!dialed) co_return tl::unexpected(dialed.error());
         stream = std::move(*dialed);
+        if (use_uot) {
+            uot.emplace(*endpoint, false, ctx.outbound.target);
+            co_return std::ref(*uot);
+        }
+        co_return std::ref(*endpoint);
     }
+};
 
-    proxy::ApplyOutboundRelayTimeouts(*stream, relay_config);
-
-    if (use_uot) {
-        proxy::UotFramedEndpoint uot_endpoint(
-            *target_endpoint, false, ctx.outbound.target);
-        co_return co_await app::DoRelayLink(
-            dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-            uot_endpoint, ctx, stats, relay_config, std::move(first_payload));
-    }
-    co_return co_await app::DoRelayLink(
-        dialer.IoContext(), *inbound.reader, *inbound.writer, inbound.control,
-        *target_endpoint, ctx, stats, relay_config, std::move(first_payload));
-}
-proxy::SsOutboundHandler::SsOutboundHandler(
-    std::shared_ptr<const SsPreparedSettings> prepared)
-    : prepared_(std::move(prepared)) {}
+proxy::SsOutboundHandler::SsOutboundHandler(std::shared_ptr<const SsPreparedSettings> prepared)
+    : Outbound(std::in_place_type<SsOutboundHandler>)
+    , prepared_(std::move(prepared)) {}
 
 std::optional<SsCredentials> SsCredentials::Prepare(
     const proxy::SsCipherInfo& cipher, std::string_view password) {

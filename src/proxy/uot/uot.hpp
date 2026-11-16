@@ -67,17 +67,6 @@ ReadUotRequestHeader(
     transport::MultiBufferReader& reader,
     common::MultiBuffer pending);
 
-[[nodiscard]] net::awaitable<app::RelayResult> DispatchPreparedUotRequest(
-    PreparedRequest prepared,
-    std::unique_ptr<transport::AsyncStream> stream,
-    transport::MultiBufferReader& request_reader,
-    transport::MultiBufferWriter& response_writer,
-    routing::Dispatcher& dispatcher,
-    const routing::DispatchPolicy& dispatch_policy,
-    net::io_context& io_context,
-    common::Context& ctx,
-    app::StatsShard& stats,
-    const infra::TimeoutsConfig& timeouts);
 class UotPacketReader final : public transport::MultiBufferReader {
 public:
     common::CancellationSource& Cancellation() noexcept override { return reader_.Cancellation(); }

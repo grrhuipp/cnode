@@ -11,29 +11,19 @@
 #include <string_view>
 namespace proxy {
 
-namespace {
-constexpr std::string_view kHttp403Response =
-    "HTTP/1.1 403 Forbidden\r\n"
-    "Connection: close\r\n"
-    "Cache-Control: max-age=3600, public\r\n"
-    "Content-Length: 0\r\n"
-    "\r\n";
-
-}  // namespace
-
 
 class BlackholeOutbound final : public Outbound {
 public:
     explicit BlackholeOutbound(const infra::BlackholeSettings& settings);
 
-    net::awaitable<OutboundProcessResult> Process(
-        common::Context& ctx,
-        transport::Link inbound,
-        transport::OutboundDialer& dialer,
-        const infra::TimeoutsConfig& timeouts,
-        app::StatsShard& stats,
-        const app::RelayConfig& relay_config,
-        common::MultiBufferBatch first_payload) override;
+    struct Session final : OutboundSession {
+        bool http_response;
+        Session(OutboundPrepareContext&, bool http) noexcept : http_response(http) {}
+        OutboundRejection Prepare() const noexcept {
+            return {common::ErrorCode::BLOCKED, http_response};
+        }
+    };
+    auto SessionArguments() const noexcept { return std::tuple{http_response_}; }
 
 private:
     bool http_response_;
@@ -44,33 +34,9 @@ private:
 // ============================================================================
 
 BlackholeOutbound::BlackholeOutbound(const infra::BlackholeSettings& settings)
-    : http_response_(settings.http_response) {
-}
+    : Outbound(std::in_place_type<BlackholeOutbound>)
+    , http_response_(settings.http_response) {}
 
-net::awaitable<OutboundProcessResult> BlackholeOutbound::Process(
-    common::Context& ctx,
-    transport::Link inbound,
-    transport::OutboundDialer& /*dialer*/,
-    const infra::TimeoutsConfig& /*timeouts*/,
-    app::StatsShard& /*stats*/,
-    const app::RelayConfig& /*relay_config*/,
-    common::MultiBufferBatch first_payload) {
-    first_payload.clear();
-    const bool send_http =
-        http_response_ && ctx.content.network == common::Network::TCP && inbound.writer;
-    if (send_http) {
-        net::const_buffer response{kHttp403Response.data(), kHttp403Response.size()};
-        try {
-            co_await inbound.writer->WriteBuffers(
-                std::span<const net::const_buffer>{&response, 1});
-            co_await inbound.writer->AsyncShutdownWrite();
-        } catch (...) {
-            LOG_CONN_DEBUG(ctx, "failed to write HTTP response");
-        }
-    }
-    LOG_CONN_DEBUG(ctx, "blocked before relay response={}", send_http ? "http" : "none");
-    co_return tl::unexpected(common::ErrorCode::BLOCKED);
-}
 
 }  // namespace proxy
 

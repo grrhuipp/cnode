@@ -120,21 +120,36 @@ private:
 
 class Proxy final : public proxy::Inbound {
 public:
-    Proxy(int fault, bool codec) : fault_(fault), codec_(codec) {}
-    net::awaitable<app::RelayResult> Process(std::unique_ptr<transport::AsyncStream> stream,
-        routing::Dispatcher&, proxy::InboundSettings, net::io_context&,
-        common::Context&, const infra::TimeoutsConfig&, uint32_t) override {
-        app::RelayResult result;
-        if (codec_) {
-            auto text = co_await proxy::ReadFrameText(*stream, 19);
-            if (!text) result.error = text.error();
-        } else {
-            co_await net::post(net::use_awaitable);
-            Raise(fault_);
+    Proxy(const app::AdmissionEnvironment& environment, int fault, bool codec)
+        : Inbound(std::in_place_type<Proxy>), environment_(environment),
+          fault_(fault), codec_(codec) {}
+    struct Session {
+        Session(int value, bool read_codec) : fault(value), codec(read_codec) {}
+        Session(const Session&) = delete;
+        Session(Session&&) = delete;
+        net::awaitable<tl::expected<proxy::AuthenticatedInbound, common::ErrorCode>>
+        Authenticate(transport::AsyncStream& stream, proxy::InboundAuthentication authentication,
+                     proxy::InboundContext&) {
+            if (codec) {
+                auto text = co_await proxy::ReadFrameText(stream, 19);
+                if (!text) co_return tl::unexpected(text.error());
+            } else {
+                co_await net::post(net::use_awaitable);
+                Raise(fault);
+            }
+            co_return std::move(authentication).Bind(common::UserProfile{}, std::nullopt);
         }
-        co_return result;
-    }
+        proxy::InboundPrepared Prepare(std::unique_ptr<transport::AsyncStream>& stream,
+                                        proxy::InboundContext&) {
+            return routing::DispatchRequest{std::move(stream)};
+        }
+        int fault;
+        bool codec;
+    };
+    const app::AdmissionEnvironment& Environment() const noexcept { return environment_; }
+    auto SessionArguments() const noexcept { return std::tuple{fault_, codec_}; }
 private:
+    const app::AdmissionEnvironment& environment_;
     int fault_;
     bool codec_;
 };
@@ -142,7 +157,43 @@ private:
 class Dispatcher final : public routing::Dispatcher {
     net::awaitable<app::RelayResult> Dispatch(net::io_context&, const routing::DispatchPolicy&,
         routing::DispatchRequest, common::Context&,
-        app::StatsShard&, const infra::TimeoutsConfig&) override { throw std::logic_error("unexpected dispatch"); co_return app::RelayResult{}; }
+        app::StatsShard&, const infra::TimeoutsConfig&) override { co_return app::RelayResult{}; }
+};
+
+class AdmissionProbe final : public proxy::Inbound {
+public:
+    AdmissionProbe(const app::AdmissionEnvironment& environment,
+                   const common::UserProfile& profile, bool& prepared)
+        : Inbound(std::in_place_type<AdmissionProbe>),
+          environment_(environment), profile_(profile), prepared_(prepared) {}
+    struct Session {
+        Session(const common::UserProfile& value, bool& entered)
+            : profile(value), prepared(entered) {}
+        Session(const Session&) = delete;
+        Session(Session&&) = delete;
+        net::awaitable<tl::expected<proxy::AuthenticatedInbound, common::ErrorCode>>
+        Authenticate(transport::AsyncStream&, proxy::InboundAuthentication authentication,
+                     proxy::InboundContext&) {
+            co_return std::move(authentication).Bind(profile, std::nullopt);
+        }
+        proxy::InboundPrepared Prepare(std::unique_ptr<transport::AsyncStream>& stream,
+                                        proxy::InboundContext& context) {
+            prepared = true;
+            EXPECT_EQ(context.admission.online_users.OnlineDeviceCount(
+                context.session.inbound.tag, profile.user_id), 1);
+            return routing::DispatchRequest{std::move(stream)};
+        }
+        const common::UserProfile& profile;
+        bool& prepared;
+    };
+    const app::AdmissionEnvironment& Environment() const noexcept { return environment_; }
+    auto SessionArguments() noexcept {
+        return std::tuple{std::cref(profile_), std::ref(prepared_)};
+    }
+private:
+    const app::AdmissionEnvironment& environment_;
+    const common::UserProfile& profile_;
+    bool& prepared_;
 };
 
 using Signal = net::experimental::channel<void(IoErrorCode, int)>;
@@ -171,21 +222,32 @@ QuotaCase* quota_case = nullptr;
 
 class QuotaProxy final : public proxy::Inbound {
 public:
-    explicit QuotaProxy(QuotaCase& test) : test_(test) {}
-
-    net::awaitable<app::RelayResult> Process(
-        std::unique_ptr<transport::AsyncStream> stream, routing::Dispatcher&,
-        proxy::InboundSettings, net::io_context&,
-        common::Context&, const infra::TimeoutsConfig&, uint32_t) override {
-        const int id = static_cast<Stream&>(*stream).GetState().id;
-        ++test_.entered;
-        if (!test_.events.try_send(IoErrorCode{}, id + 1))
-            throw std::logic_error("quota fixture event queue is full");
-        (void)co_await test_.gates[id].async_receive(net::use_awaitable);
-        co_return app::RelayResult{};
-    }
-
+    QuotaProxy(const app::AdmissionEnvironment& environment, QuotaCase& test)
+        : Inbound(std::in_place_type<QuotaProxy>), environment_(environment), test_(test) {}
+    struct Session {
+        explicit Session(QuotaCase& value) : test(value) {}
+        Session(const Session&) = delete;
+        Session(Session&&) = delete;
+        net::awaitable<tl::expected<proxy::AuthenticatedInbound, common::ErrorCode>>
+        Authenticate(transport::AsyncStream&, proxy::InboundAuthentication authentication,
+                     proxy::InboundContext&) {
+            co_return std::move(authentication).Bind(common::UserProfile{}, std::nullopt);
+        }
+        net::awaitable<proxy::InboundPrepared> Prepare(
+            std::unique_ptr<transport::AsyncStream>& stream, proxy::InboundContext&) {
+            const int id = static_cast<Stream&>(*stream).GetState().id;
+            ++test.entered;
+            if (!test.events.try_send(IoErrorCode{}, id + 1))
+                throw std::logic_error("quota fixture event queue is full");
+            (void)co_await test.gates[id].async_receive(net::use_awaitable);
+            co_return routing::DispatchRequest{std::move(stream)};
+        }
+        QuotaCase& test;
+    };
+    const app::AdmissionEnvironment& Environment() const noexcept { return environment_; }
+    auto SessionArguments() noexcept { return std::tuple{std::ref(test_)}; }
 private:
+    const app::AdmissionEnvironment& environment_;
     QuotaCase& test_;
 };
 
@@ -300,7 +362,7 @@ void TestQuota(uint32_t limit, bool reject_ip, bool reverse) {
             receiver.stream_settings.network_mode = ::transport::NetworkMode::Grpc;
             receiver.stream_settings = transport::NormalizeStreamSettings(receiver.stream_settings);
             auto handler = std::make_shared<app::InboundHandler>(
-                std::move(receiver), std::make_unique<QuotaProxy>(test), environment);
+                std::move(receiver), std::make_unique<QuotaProxy>(environment, test), environment);
             Dispatcher dispatcher;
             auto& stats = environment.stats;
             app::RequestLoadState load(100, 0);
@@ -384,7 +446,7 @@ TEST(InboundAdmission, BanOnlyReservationsRequireAnAttributedNonemptyAddress) {
 
 TEST(InboundAdmission, PostBindRejectionNeitherBansNorOccupiesADevice) {
     RunFixture({.ip_ban = {.enabled = true, .failure_limit = 1, .window_seconds = 60, .ban_seconds = 60}},
-        [](net::io_context&, const app::AdmissionEnvironment& environment)
+        [](net::io_context& io, const app::AdmissionEnvironment& environment)
         -> net::awaitable<void> {
         common::Context context;
         context.inbound.tag = "post-bind";
@@ -410,13 +472,17 @@ TEST(InboundAdmission, PostBindRejectionNeitherBansNorOccupiesADevice) {
         }
         EXPECT_FALSE(co_await environment.limiter.IsBanned(context.inbound.tag, context.inbound.source_ip));
         EXPECT_EQ(environment.online_users.OnlineDeviceCount(context.inbound.tag, 7), 0);
-        auto authentication = co_await proxy::BeginInboundAuthentication(environment, context);
-        EXPECT_TRUE(authentication);
-        if (!authentication) co_return;
-        auto admitted = co_await proxy::AuthenticateAndAdmit(
-            std::move(*authentication), &profile, "no matching user", std::nullopt);
-        EXPECT_TRUE(admitted);
-        EXPECT_EQ(environment.online_users.OnlineDeviceCount(context.inbound.tag, 7), 1);
+        bool prepared = false;
+        AdmissionProbe probe(environment, profile, prepared);
+        Dispatcher dispatcher;
+        infra::TimeoutsConfig timeouts;
+        const routing::DispatchPolicy policy{{}, routing::ForceOutbound{"direct"}};
+        State state;
+        const auto result = co_await probe.Process(std::make_unique<Stream>(state),
+            dispatcher, {policy, false, false}, io, context, timeouts, 0);
+        EXPECT_EQ(result.error, common::ErrorCode::OK);
+        EXPECT_TRUE(prepared);
+        EXPECT_EQ(environment.online_users.OnlineDeviceCount(context.inbound.tag, 7), 0);
     });
 }
 }
@@ -464,7 +530,7 @@ TEST_P(InboundFailureBoundary, ReleasesStreamAndAdmissionAfterProtocolCompletion
             receiver.stream_settings.network_mode = logical ? ::transport::NetworkMode::Grpc : ::transport::NetworkMode::Tcp;
             receiver.stream_settings = transport::NormalizeStreamSettings(receiver.stream_settings);
             auto handler = std::make_shared<app::InboundHandler>(
-                std::move(receiver), std::make_unique<Proxy>(fault, codec), environment);
+                std::move(receiver), std::make_unique<Proxy>(environment, fault, codec), environment);
             Dispatcher dispatcher;
             auto& stats = environment.stats;
             app::RequestLoadState load(100, 0);
@@ -507,7 +573,7 @@ return "Limit" + std::to_string(limit) + (reject_ip ? "PerIp" : "Global") +
 
 TEST(InboundAdmission, ClosedCoordinatorCancelsEveryAuthenticationPhaseWithoutADevice) {
     RunFixture({.ip_ban = {.enabled = true, .failure_limit = 1, .window_seconds = 60, .ban_seconds = 60}},
-        [](net::io_context&, const app::AdmissionEnvironment& environment)
+        [](net::io_context& io, const app::AdmissionEnvironment& environment)
         -> net::awaitable<void> {
         common::Context context;
         context.inbound.tag = "closed";
@@ -519,12 +585,18 @@ TEST(InboundAdmission, ClosedCoordinatorCancelsEveryAuthenticationPhaseWithoutAD
         EXPECT_TRUE(credential_phase);
         if (!credential_phase) co_return;
         const common::UserProfile profile{.user_id = 9, .email = "closed", .device_limit = 1};
-        auto pending_admission = proxy::AuthenticateAndAdmit(
-            std::move(*authentication), &profile, "no matching user", std::nullopt);
+        bool prepared = false;
+        AdmissionProbe probe(environment, profile, prepared);
+        Dispatcher dispatcher;
+        infra::TimeoutsConfig timeouts;
+        const routing::DispatchPolicy policy{{}, routing::ForceOutbound{"direct"}};
+        State state;
+        auto pending_admission = probe.Process(std::make_unique<Stream>(state),
+            dispatcher, {policy, false, false}, io, context, timeouts, 0);
         environment.coordinator.CloseAdmission();
-        auto admitted = co_await std::move(pending_admission);
-        EXPECT_FALSE(admitted);
-        if (!admitted) EXPECT_EQ(admitted.error(), common::ErrorCode::CANCELLED);
+        const auto admitted = co_await std::move(pending_admission);
+        EXPECT_EQ(admitted.error, common::ErrorCode::CANCELLED);
+        EXPECT_FALSE(prepared);
         constexpr std::array<uint8_t, 1> credential{0x42};
         EXPECT_EQ(co_await credential_phase->VerifyCredential({proxy::KeyedInboundProtocol::Vless, credential}), common::ErrorCode::CANCELLED);
         context.inbound.client_ip_from_proxy_protocol = true;

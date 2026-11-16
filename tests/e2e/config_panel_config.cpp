@@ -107,6 +107,49 @@ TEST_P(StaticRouting, DefaultDirectForcedOutboundAndOptInRouting) {
 }
 INSTANTIATE_TEST_SUITE_P(LocalKeyCasing, StaticRouting, testing::Bool());
 
+class BlackholeResponse : public testing::TestWithParam<bool> {};
+TEST_P(BlackholeResponse, RejectsWithoutDialingAndClosesAfterOptionalHttpResponse) {
+    TempDir directory;
+    PortReservation reservation;
+    auto backend = Socket::Listen();
+    Json settings = Json::object();
+    if (GetParam()) settings["response"] = {{"type", "http"}};
+    Configure(directory.Path(), Inbound(reservation.port, "vless", UserA),
+        {{"protocol", "blackhole"}, {"settings", std::move(settings)}}, 2);
+    auto child = Start(directory.Path());
+    child->WaitForServerStart();
+    auto socket = Socket::Connect(reservation.port);
+    socket.Write(VlessRequest(backend.Port(),
+        "GET / HTTP/1.1\r\nHost: blocked.example\r\n\r\n", 1, "127.0.0.1", UserA));
+    if (GetParam()) {
+        EXPECT_EQ(socket.ReadExact(2), std::string("\0\0", 2));
+        std::string response;
+        const auto deadline = std::chrono::steady_clock::now() + 3s;
+        while (response.find("\r\n\r\n") == std::string::npos) {
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            Require(remaining > std::chrono::steady_clock::duration::zero(),
+                "blackhole HTTP response deadline exceeded");
+            Require(response.size() < 1024, "oversized blackhole HTTP response");
+            auto part = socket.Read(1024 - response.size(),
+                std::chrono::ceil<Milliseconds>(remaining));
+            Require(!part.empty(), "truncated blackhole HTTP response");
+            response += part;
+        }
+        std::istringstream status_line(response);
+        std::string version;
+        unsigned status = 0;
+        status_line >> version >> status;
+        EXPECT_EQ(version, "HTTP/1.1");
+        EXPECT_EQ(status, 403u);
+        EXPECT_TRUE(response.ends_with("\r\n\r\n"));
+    }
+    EXPECT_TRUE(ReadClosed(socket));
+    EXPECT_EQ(child->Stop(), 0);
+    pollfd pending{backend.Fd(), POLLIN, 0};
+    EXPECT_EQ(::poll(&pending, 1, 0), 0) << "blackhole request reached its destination";
+}
+INSTANTIATE_TEST_SUITE_P(ReplyPolicy, BlackholeResponse, testing::Bool());
+
 TEST(ConfigRouting, ValidatesKnownAndIgnoresUnknownInboundRoutingControls) {
     const std::vector<Json> invalid = {{{"outboundTag", "missing"}}, {{"outboundTag", ""}},
         {{"outboundTag", 3}}, {{"routingEnabled", "true"}}};

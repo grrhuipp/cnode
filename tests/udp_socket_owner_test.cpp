@@ -5,6 +5,7 @@
 #include "app/udp_ingress.hpp"
 #include "udp_ingress_fixture.hpp"
 #include "worker_coordinator_fixture.hpp"
+#include "datagram_only_test_inbound.hpp"
 #include "app/relay.hpp"
 #include "app/inbound_handler.hpp"
 #include "app/request_load.hpp"
@@ -56,20 +57,10 @@ struct DatagramScript {
     bool fail_next_allocation = false;
 };
 
-class DummyDatagramHandler final : public ::proxy::Inbound {
+class DummyDatagramHandler final : public DatagramOnlyTestInbound {
 public:
     explicit DummyDatagramHandler(DatagramScript* script = nullptr)
         : script_(script) {}
-    ::net::awaitable<::app::RelayResult> Process(
-        std::unique_ptr<::transport::AsyncStream>,
-        ::routing::Dispatcher&,
-        ::proxy::InboundSettings,
-        ::net::io_context&,
-        ::common::Context&,
-        const ::infra::TimeoutsConfig&,
-        uint32_t) override {
-        co_return ::app::RelayResult{};
-    }
 
     tl::expected<
         ::proxy::InboundDatagramResult,

@@ -162,42 +162,6 @@ net::awaitable<tl::expected<PreparedRequest, common::ErrorCode>> ReadUotRequestH
     }
 }
 
-net::awaitable<app::RelayResult> DispatchPreparedUotRequest(
-    PreparedRequest prepared,
-    std::unique_ptr<transport::AsyncStream> stream,
-    transport::MultiBufferReader& request_reader,
-    transport::MultiBufferWriter& response_writer,
-    routing::Dispatcher& dispatcher,
-    const routing::DispatchPolicy& dispatch_policy,
-    net::io_context& io_context,
-    common::Context& ctx,
-    app::StatsShard& stats,
-    const infra::TimeoutsConfig& timeouts) {
-    const bool is_connect = prepared.is_connect;
-    common::InitialPayload initial_payload{std::move(prepared.initial_decoded)};
-    common::TargetAddress reader_destination =
-        is_connect ? prepared.destination : common::TargetAddress{};
-    proxy::BindInboundRequestTarget(
-        ctx,
-        proxy::InboundRequestTarget{
-            common::Network::UDP,
-            std::move(prepared.destination),
-            std::move(prepared.forwarded)});
-    UotPacketReader uot_reader(
-        request_reader, is_connect, std::move(reader_destination), std::move(prepared.pending));
-    UotPacketWriter uot_writer(response_writer, is_connect, ctx.outbound.target);
-    const transport::Link link{&uot_reader, &uot_writer};
-    auto request = stream
-        ? routing::DispatchRequest{std::move(stream), link, std::move(initial_payload)}
-        : routing::DispatchRequest{link, std::move(initial_payload)};
-    co_return co_await dispatcher.Dispatch(
-        io_context,
-        dispatch_policy,
-        std::move(request),
-        ctx,
-        stats,
-        timeouts);
-}
 
 UotPacketReader::UotPacketReader(transport::MultiBufferReader& reader,
                            bool is_connect,

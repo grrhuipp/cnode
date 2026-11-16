@@ -12,6 +12,7 @@
 #include "transport/async_stream.hpp"
 #include "common/awaitable_task_group.hpp"
 #include "worker_coordinator_fixture.hpp"
+#include "datagram_only_test_inbound.hpp"
 
 #include <stdexcept>
 #include <tuple>
@@ -20,18 +21,8 @@ namespace {
 
 
 
-class DummyDatagramHandler final : public ::proxy::Inbound {
+class DummyDatagramHandler final : public DatagramOnlyTestInbound {
 public:
-    ::net::awaitable<::app::RelayResult> Process(
-        std::unique_ptr<::transport::AsyncStream>,
-        ::routing::Dispatcher&,
-        ::proxy::InboundSettings,
-        ::net::io_context&,
-        ::common::Context&,
-        const ::infra::TimeoutsConfig&,
-        uint32_t) override {
-        co_return ::app::RelayResult{};
-    }
 
     tl::expected<
         ::proxy::InboundDatagramResult,
@@ -43,16 +34,12 @@ public:
 
 class DummyOutbound final : public ::proxy::Outbound {
 public:
-    ::net::awaitable<::proxy::OutboundProcessResult> Process(
-        ::common::Context&,
-        ::transport::Link,
-        ::transport::OutboundDialer&,
-        const ::infra::TimeoutsConfig&,
-        ::app::StatsShard&,
-        const ::app::RelayConfig&,
-        ::common::MultiBufferBatch) override {
-        co_return ::app::RelayResult{};
-    }
+    struct Session : proxy::OutboundSession {
+        explicit Session(proxy::OutboundPrepareContext&) {}
+        proxy::OutboundRejection Prepare() { return {common::ErrorCode::NOT_SUPPORTED}; }
+    };
+    DummyOutbound() : Outbound(std::in_place_type<DummyOutbound>) {}
+    auto SessionArguments() const noexcept { return std::tuple{}; }
 };
 
 std::unique_ptr<::proxy::Inbound> CreateInboundHandler(

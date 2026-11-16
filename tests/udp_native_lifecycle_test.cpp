@@ -4,6 +4,7 @@
 #include "app/udp_ingress.hpp"
 #include "udp_ingress_fixture.hpp"
 #include "worker_coordinator_fixture.hpp"
+#include "datagram_only_test_inbound.hpp"
 #include "proxy/shadowsocks/ss_inbound.hpp"
 #include "proxy/shadowsocks/ss_udp.hpp"
 #include "app/relay.hpp"
@@ -53,15 +54,9 @@ public:
     }
 };
 
-class NativeInbound final : public ::proxy::Inbound {
+class NativeInbound final : public DatagramOnlyTestInbound {
 public:
 
-    ::net::awaitable<::app::RelayResult> Process(
-        std::unique_ptr<::transport::AsyncStream>, ::routing::Dispatcher&,
-        ::proxy::InboundSettings, ::net::io_context&,
-        ::common::Context&, const ::infra::TimeoutsConfig&, uint32_t) override {
-        co_return ::app::RelayResult{};
-    }
 
     tl::expected<::proxy::InboundDatagramResult, ::common::ErrorCode> Process(
         const ::proxy::InboundDatagramRequest& request) override {

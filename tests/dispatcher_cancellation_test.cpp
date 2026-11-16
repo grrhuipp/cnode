@@ -12,7 +12,7 @@
 #include "routing/router.hpp"
 #include "infra/config_types.hpp"
 #include "proxy/outbound.hpp"
-#include "transport/tcp_stream.hpp"
+#include "transport/async_stream.hpp"
 #include "common/awaitable_task_group.hpp"
 
 #include <asio/as_tuple.hpp>
@@ -49,7 +49,6 @@ struct State {
     bool closed = false;
     bool cleanup_has_owner = false;
     app::RequestLoadState* load = nullptr;
-    transport::TcpStream* phase_stream = nullptr;
 };
 
 net::awaitable<void> Wait(State& state) {
@@ -70,8 +69,9 @@ net::awaitable<void> Wait(State& state) {
 
 class Stream final : public transport::AsyncStream {
 public:
-    explicit Stream(State& state) : state_(state) {}
+    Stream(State& state, net::io_context& io) : state_(state), deadline_(io, *this) {}
     ~Stream() override {
+        deadline_.Clear();
         state_.destroyed = true;
         if (state_.notify_closed_on_destroy) NotifyClosed();
     }
@@ -89,44 +89,49 @@ public:
     }
     void ShutdownWrite() override {}
     void Cancel() noexcept override { NotifyCancellation(); }
-    void Close() override { state_.closed = true; NotifyClosed(); }
+    void Close() override {
+        deadline_.Clear();
+        state_.closed = true;
+        NotifyClosed();
+    }
     int NativeHandle() const override { return -1; }
     bool IsOpen() const override { return !state_.closed; }
 protected:
-    transport::TcpStream* BaseTcpStream() override { return state_.phase_stream; }
-    const transport::TcpStream* BaseTcpStream() const override { return state_.phase_stream; }
+    transport::StreamPhaseDeadline* LogicalPhaseDeadline() noexcept override { return &deadline_; }
 private:
     State& state_;
+    transport::StreamPhaseDeadline deadline_;
 };
 
 // Protocol instance behind one outbound tag; the probe outlives every handler.
 struct OutboundProbe {
     State state;
     State target_state;
-    bool relay = false;
 };
 
 class TestOutbound final : public proxy::Outbound {
 public:
-    explicit TestOutbound(OutboundProbe& probe) : probe_(probe) {}
-    net::awaitable<proxy::OutboundProcessResult> Process(
-        common::Context& ctx, transport::Link inbound, transport::OutboundDialer& dialer,
-        const infra::TimeoutsConfig&, app::StatsShard& stats, const app::RelayConfig& config,
-        common::MultiBufferBatch first) override {
-        auto& state = probe_.state;
-        ++state.entered;
-        if (state.block) co_await Wait(state);
-        ++state.committed;
-        if (state.return_cancelled) {
-            app::RelayResult result;
-            result.error = common::ErrorCode::CANCELLED;
-            co_return result;
+    struct Session final : proxy::OutboundSession {
+        OutboundProbe& probe;
+        Stream endpoint;
+
+        Session(proxy::OutboundPrepareContext& context, OutboundProbe& probe)
+            : probe(probe), endpoint(probe.target_state, context.dialer.IoContext()) {}
+
+        net::awaitable<proxy::OutboundPrepareResult<Stream>> Prepare() {
+            auto& state = probe.state;
+            ++state.entered;
+            if (state.block) co_await Wait(state);
+            ++state.committed;
+            if (state.return_cancelled) {
+                co_return tl::unexpected(common::ErrorCode::CANCELLED);
+            }
+            co_return std::ref(endpoint);
         }
-        if (!probe_.relay) co_return app::RelayResult{};
-        Stream target(probe_.target_state);
-        co_return co_await app::DoRelayLink(dialer.IoContext(), *inbound.reader, *inbound.writer,
-            inbound.control, target, ctx, stats, config, std::move(first));
-    }
+    };
+    auto SessionArguments() noexcept { return std::tuple{std::ref(probe_)}; }
+    explicit TestOutbound(OutboundProbe& probe)
+        : Outbound(std::in_place_type<TestOutbound>), probe_(probe) {}
 private:
     OutboundProbe& probe_;
 };
@@ -200,11 +205,6 @@ void ExerciseDispatch(Case which, bool controlled, common::ErrorCode reason = co
     net::io_context io;
     app::RequestLoadState load(100, 30);
     State source_state;
-    tcp::socket phase_socket(io);
-    IoErrorCode phase_open_error;
-    phase_socket.open(tcp::v4(), phase_open_error);
-    if (phase_open_error) throw IoSystemError(phase_open_error);
-    transport::TcpStream phase_stream(std::move(phase_socket));
     source_state.load = &load;
     source_state.block = which == Case::Sniff;
     source_state.allocation_failure = which == Case::SniffMemory;
@@ -212,7 +212,7 @@ void ExerciseDispatch(Case which, bool controlled, common::ErrorCode reason = co
     source_state.payload_size = 7;
     source_state.notify_closed_on_destroy = controlled &&
         (which == Case::RelayFailure || which == Case::RelayCancelled);
-    auto stream = std::make_unique<Stream>(source_state);
+    auto stream = std::make_unique<Stream>(source_state, io);
     auto* reader = stream.get();
     OutboundProbes outbounds;
     Router router;
@@ -221,9 +221,7 @@ void ExerciseDispatch(Case which, bool controlled, common::ErrorCode reason = co
     }
     auto& outbound = which == Case::RuleMatch ? outbounds.second : outbounds.direct;
     outbound.state.load = &load;
-    outbound.target_state.phase_stream = &phase_stream;
     outbound.state.block = which == Case::Handshake || which == Case::Parent || which == Case::Pending;
-    outbound.relay = which == Case::RelaySuccess || which == Case::RelayFailure;
     outbound.state.return_cancelled = which == Case::RelayCancelled;
     outbound.target_state.payload_size = 13;
     if (which == Case::RelayFailure) outbound.target_state.read_error = common::ErrorCode::SOCKET_READ_FAILED;
@@ -289,7 +287,7 @@ void ExerciseDispatch(Case which, bool controlled, common::ErrorCode reason = co
             else reader->Cancellation().Stop(reason);
         });
     }
-    auto request = dispatcher.Dispatch(io, policy,
+    auto request = proxy::DispatchAuthenticatedInbound(dispatcher, io, policy,
         controlled ? routing::DispatchRequest(std::move(stream))
                    : routing::DispatchRequest(transport::Link{reader, reader, nullptr}),
         ctx, stats, timeouts);
@@ -388,8 +386,8 @@ void ExerciseSiblingIsolation(bool controlled) {
     net::io_context io;
     app::RequestLoadState load(100, 30);
     State a, b;
-    auto first = std::make_unique<Stream>(a);
-    auto second = std::make_unique<Stream>(b);
+    auto first = std::make_unique<Stream>(a, io);
+    auto second = std::make_unique<Stream>(b, io);
     auto* source = first.get();
     OutboundProbes outbounds;
     for (auto* probe : {&outbounds.direct, &outbounds.second}) {
@@ -418,7 +416,7 @@ void ExerciseSiblingIsolation(bool controlled) {
     app::RelayResult result_a, result_b;
     const auto link_a = transport::Link{first.get(), first.get(), nullptr};
     const auto link_b = transport::Link{second.get(), second.get(), nullptr};
-    net::co_spawn(io, dispatcher.Dispatch(io, policy_a,
+    net::co_spawn(io, proxy::DispatchAuthenticatedInbound(dispatcher, io, policy_a,
         controlled ? routing::DispatchRequest(std::move(first)) : routing::DispatchRequest(link_a),
         ctx_a, stats, timeouts),
         net::bind_cancellation_slot(cancel_first.slot(), [&](std::exception_ptr error, app::RelayResult result) {
@@ -428,7 +426,7 @@ void ExerciseSiblingIsolation(bool controlled) {
             first_active_on_completion = outbounds.direct.state.active;
             load_on_first_completion = load.ActiveConnections();
         }));
-    net::co_spawn(io, dispatcher.Dispatch(io, policy_b,
+    net::co_spawn(io, proxy::DispatchAuthenticatedInbound(dispatcher, io, policy_b,
         controlled ? routing::DispatchRequest(std::move(second)) : routing::DispatchRequest(link_b),
         ctx_b, stats, timeouts),
         net::bind_cancellation_slot(cancel_second.slot(), [&](std::exception_ptr error, app::RelayResult result) {

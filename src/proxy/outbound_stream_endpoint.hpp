@@ -4,7 +4,6 @@
 // 端点基类见 proxy/outbound_endpoint_base.hpp。
 
 #include "app/dns.hpp"
-#include "app/relay.hpp"
 #include "proxy/outbound_endpoint_base.hpp"
 #include "common/target_address.hpp"
 #include "infra/config_types.hpp"
@@ -54,24 +53,6 @@ struct PreparedNextHop {
                    .send_through = {}},
     };
 }
-
-inline void ApplyOutboundRelayTimeouts(
-    transport::AsyncStream& stream,
-    const app::RelayConfig& relay_config) {
-    stream.SetIdleTimeout(relay_config.idle_timeout);
-    stream.SetWriteTimeout(relay_config.write_timeout);
-    stream.ClearPhaseDeadline();
-}
-
-inline void ApplyOutboundDatagramTimeouts(
-    OutboundDatagramEndpointBase& endpoint,
-    const app::RelayConfig& relay_config) {
-    auto& socket = endpoint.RelayControl();
-    socket.SetIdleTimeout(relay_config.idle_timeout);
-    socket.SetWriteTimeout(relay_config.write_timeout);
-}
-
-
 
 // Outbound-only endpoint preparation. A packet's target and payload remain
 // owned by its logical write until DNS and socket I/O have both finished.

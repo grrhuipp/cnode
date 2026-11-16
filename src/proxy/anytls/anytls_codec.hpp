@@ -171,19 +171,15 @@ ReadFramePayload(transport::AsyncStream& stream, uint16_t length);
 // AnyTLS 服务端侧协议处理器：负责 sha256(password) 认证头、
 // settings/SYN/PSH/FIN 帧解析，并将单请求 TCP framed stream 交给 dispatcher。
 // ============================================================================
+struct AnyTlsInboundSession;
 class AnyTlsInboundHandler final : public Inbound {
 public:
     AnyTlsInboundHandler(const app::AdmissionEnvironment& environment,
             std::shared_ptr<const AnyTlsPaddingScheme> padding_scheme = {});
 
-    net::awaitable<app::RelayResult> Process(
-        std::unique_ptr<transport::AsyncStream> stream,
-        routing::Dispatcher& dispatcher,
-        proxy::InboundSettings settings,
-        net::io_context& io_context,
-        common::Context& ctx,
-        const infra::TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout) override;
+    using Session = AnyTlsInboundSession;
+    const app::AdmissionEnvironment& Environment() const noexcept { return environment_; }
+    auto SessionArguments() const noexcept { return std::tuple{padding_scheme_.get()}; }
 
 private:
     const app::AdmissionEnvironment& environment_;
@@ -208,25 +204,14 @@ public:
             common::AwaitableTaskGroup& tasks);
     ~AnyTlsOutboundHandler() noexcept override;
 
-    net::awaitable<OutboundProcessResult> Process(
-        common::Context& ctx,
-        transport::Link inbound,
-        transport::OutboundDialer& dialer,
-        const infra::TimeoutsConfig& timeouts,
-        app::StatsShard& stats,
-        const app::RelayConfig& relay_config,
-        common::MultiBufferBatch first_payload) override;
+    struct Session;
+    auto SessionArguments() noexcept { return std::tuple{std::ref(*this)}; }
 
 private:
     struct ClientSession;
     class SessionPool;
     struct LogicalStreamLease;
 
-    net::awaitable<OutboundProcessResult> ProcessSession(
-        common::Context& ctx, transport::Link inbound, transport::OutboundDialer& dialer,
-        const infra::TimeoutsConfig& timeouts, app::StatsShard& stats, const app::RelayConfig& relay_config,
-        common::MultiBufferBatch first_payload,
-        std::shared_ptr<ClientSession> session, bool& reusable);
     std::string tag_;
     std::shared_ptr<const infra::AnyTlsSettings> settings_;
     std::shared_ptr<const AnyTlsPaddingScheme> padding_;

@@ -8,6 +8,7 @@
 #include "app/stats.hpp"
 #include "app/worker.hpp"
 #include "worker_coordinator_fixture.hpp"
+#include "datagram_only_test_inbound.hpp"
 #include "app/user_online_tracker.hpp"
 #include "common/allocator.hpp"
 #include "common/session.hpp"
@@ -35,6 +36,7 @@
 #include <iostream>
 #include <memory>
 #include <new>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -121,7 +123,8 @@ private:
 };
 
 
-class NativeDecoder final : public ::proxy::Inbound {
+
+class NativeDecoder final : public DatagramOnlyTestInbound {
 public:
     NativeDecoder(FixtureState& state)
         : state_(state) {
@@ -133,12 +136,6 @@ public:
         if (std::this_thread::get_id() != state_.owner)
             state_.wrong_destructor_thread = true;
         ++state_.handlers_destroyed;
-    }
-    ::net::awaitable<::app::RelayResult> Process(
-        std::unique_ptr<::transport::AsyncStream>, ::routing::Dispatcher&,
-        ::proxy::InboundSettings, ::net::io_context&,
-        ::common::Context&, const ::infra::TimeoutsConfig&, uint32_t) override {
-        co_return ::app::RelayResult{};
     }
     tl::expected<::proxy::InboundDatagramResult, ::common::ErrorCode> Process(
         const ::proxy::InboundDatagramRequest& request) override {
@@ -190,73 +187,104 @@ void RegisterProtocol() {
     (void)registered;
 }
 
-struct LinkStopObserver final : ::common::CancellationSubscription {
-    explicit LinkStopObserver(FixtureState& owner) noexcept : owner(owner) {}
-    FixtureState& owner;
-private:
-    void OnCancellation(::common::Cancellation) noexcept override {
-        owner.stop_observed = true;
-    }
-};
 
 class DelayedOutbound final : public ::proxy::Outbound {
 public:
-    DelayedOutbound(std::string tag, FixtureState& state)
-        : tag_(std::move(tag)), state_(state) {}
+    class Endpoint final : public transport::MultiBufferReader,
+                           public transport::MultiBufferWriter {
+    public:
+        Endpoint(common::Context& ctx, const std::string& tag, FixtureState& state)
+            : ctx_(ctx), tag_(tag), state_(state) {}
 
-    ::net::awaitable<::proxy::OutboundProcessResult> Process(
-        ::common::Context& ctx, ::transport::Link inbound,
-        ::transport::OutboundDialer&, const ::infra::TimeoutsConfig&, ::app::StatsShard&,
-        const ::app::RelayConfig&, ::common::MultiBufferBatch first_payload) override {
-        if (!inbound.reader || !state_.cleanup_gate)
-            throw std::logic_error("delayed outbound missing owner-local link/gate");
-        std::array<uint8_t, 2> bytes{};
-        // Without sniffing the first datagram remains on the real Link; a
-        // prefetched batch is optional, not a promise made by Dispatch.
-        auto first = first_payload.empty()
-            ? co_await inbound.reader->ReadMultiBuffer()
-            : first_payload.PopFront();
-        const bool payload_ok = first_payload.empty() &&
-            first.CopyPrefixTo(bytes) == bytes.size() &&
-            bytes[0] == 0x51 && bytes[1] == 0x52;
-        const ProcessEntered entered{
-            .first_payload_ok = payload_ok,
-            .inbound_tag = std::string(ctx.inbound.tag),
-            .outbound_tag = std::string(ctx.outbound.tag),
-            .outbound_handler_tag = tag_,
-            .user_id = ctx.inbound.user_id,
-            .user_email = std::string(ctx.inbound.user_email),
-        };
-        LinkStopObserver stop_subscription(state_);
-        stop_subscription.Resubscribe(inbound.reader->Cancellation());
-        state_.entered_metadata = entered;
-        state_.process_entered.set_value(entered);
-        state_.gate_waiting = true;
-
-        const bool previous_throw_setting =
-            co_await ::net::this_coro::throw_if_cancelled();
-        co_await ::net::this_coro::throw_if_cancelled(false);
-        std::exception_ptr wait_failure;
-        ::IoErrorCode wait_error;
-        try {
-            co_await state_.cleanup_gate->async_wait(
-                asio::bind_cancellation_slot(asio::cancellation_slot{},
-                    asio::redirect_error(asio::use_awaitable, wait_error)));
-            if (!wait_error)
-                wait_failure = std::make_exception_ptr(
-                    std::logic_error("cleanup gate expired without explicit release"));
-        } catch (...) {
-            wait_failure = std::current_exception();
+        common::CancellationSource& Cancellation() noexcept override { return cancellation_; }
+        transport::EofAction ReadEofAction() const noexcept override {
+            return transport::EofAction::CloseLink;
         }
-        co_await ::net::this_coro::throw_if_cancelled(previous_throw_setting);
-        if (wait_failure) std::rethrow_exception(wait_failure);
-        const auto cancellation = co_await ::net::this_coro::cancellation_state;
-        if (state_.stop_observed ||
-            cancellation.cancelled() != ::net::cancellation_type::none)
-            co_return tl::unexpected(::common::ErrorCode::CANCELLED);
-        co_return ::app::RelayResult{};
-    }
+        net::awaitable<common::MultiBuffer> ReadMultiBuffer() override {
+            if (stopped_) co_return common::MultiBuffer{};
+            read_gate_.emplace(co_await net::this_coro::executor);
+            read_gate_->expires_at(std::chrono::steady_clock::time_point::max());
+            IoErrorCode error;
+            co_await read_gate_->async_wait(net::redirect_error(net::use_awaitable, error));
+            co_return common::MultiBuffer{};
+        }
+        net::awaitable<void> WriteMultiBuffer(common::MultiBuffer first) override {
+            if (!state_.cleanup_gate)
+                throw std::logic_error("delayed outbound missing owner-local gate");
+            std::array<uint8_t, 2> bytes{};
+            const bool payload_ok = first.byte_size() == bytes.size() &&
+                first.CopyPrefixTo(bytes) == bytes.size() &&
+                bytes[0] == 0x51 && bytes[1] == 0x52;
+            const ProcessEntered entered{
+                .first_payload_ok = payload_ok,
+                .inbound_tag = std::string(ctx_.inbound.tag),
+                .outbound_tag = std::string(ctx_.outbound.tag),
+                .outbound_handler_tag = tag_,
+                .user_id = ctx_.inbound.user_id,
+                .user_email = std::string(ctx_.inbound.user_email),
+            };
+            state_.entered_metadata = entered;
+            state_.process_entered.set_value(entered);
+            state_.gate_waiting = true;
+            const bool previous_throw_setting = co_await net::this_coro::throw_if_cancelled();
+            co_await net::this_coro::throw_if_cancelled(false);
+            std::exception_ptr wait_failure;
+            IoErrorCode wait_error;
+            try {
+                co_await state_.cleanup_gate->async_wait(
+                    net::bind_cancellation_slot(net::cancellation_slot{},
+                        net::redirect_error(net::use_awaitable, wait_error)));
+                if (!wait_error)
+                    wait_failure = std::make_exception_ptr(
+                        std::logic_error("cleanup gate expired without explicit release"));
+            } catch (...) {
+                wait_failure = std::current_exception();
+            }
+            co_await net::this_coro::throw_if_cancelled(previous_throw_setting);
+            if (wait_failure) std::rethrow_exception(wait_failure);
+            const auto cancellation = co_await net::this_coro::cancellation_state;
+            if (state_.stop_observed ||
+                cancellation.cancelled() != net::cancellation_type::none)
+                throw transport::LinkError(common::ErrorCode::CANCELLED);
+        }
+        net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override {
+            common::MultiBuffer payload;
+            for (const auto& buffer : buffers) {
+                if (!payload.AppendSpan({static_cast<const uint8_t*>(buffer.data()), buffer.size()}))
+                    throw std::bad_alloc();
+            }
+            return WriteMultiBuffer(std::move(payload));
+        }
+        net::awaitable<void> AsyncShutdownWrite() override { Close(); co_return; }
+        bool WriteShutdownClosesLink() const noexcept override { return true; }
+        void Cancel() noexcept {
+            if (stopped_) return;
+            stopped_ = true;
+            state_.stop_observed = true;
+            cancellation_.Stop(common::ErrorCode::CANCELLED);
+            if (read_gate_) read_gate_->cancel();
+        }
+        void Close() noexcept { Cancel(); }
+    private:
+        common::Context& ctx_;
+        const std::string& tag_;
+        FixtureState& state_;
+        common::CancellationSource cancellation_;
+        std::optional<net::steady_timer> read_gate_;
+        bool stopped_ = false;
+    };
 
+    struct Session : proxy::OutboundSession {
+        Session(proxy::OutboundPrepareContext& context, const std::string& tag, FixtureState& state)
+            : endpoint(context.ctx, tag, state) {}
+        proxy::OutboundPrepareResult<Endpoint> Prepare() { return std::ref(endpoint); }
+        Endpoint endpoint;
+    };
+
+    DelayedOutbound(std::string tag, FixtureState& state)
+        : Outbound(std::in_place_type<DelayedOutbound>),
+          tag_(std::move(tag)), state_(state) {}
+    auto SessionArguments() noexcept { return std::tuple{std::cref(tag_), std::ref(state_)}; }
 private:
     std::string tag_;
     FixtureState& state_;
