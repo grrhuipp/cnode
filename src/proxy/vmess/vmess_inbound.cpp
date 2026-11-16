@@ -3,7 +3,6 @@
 #include "app/relay.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "proxy/inbound.hpp"
-#include "app/user_online_tracker.hpp"
 #include "transport/async_stream.hpp"
 #include "app/stats.hpp"
 #include "routing/dispatcher.hpp"
@@ -19,6 +18,7 @@
 #include <tl/expected.hpp>
 #include <span>
 #include <utility>
+#include <variant>
 
 
 namespace {
@@ -65,80 +65,102 @@ ReadVMessHandshakeHeader(transport::AsyncStream& stream,
 }
 
 struct PreparedVmessInboundSession {
-    app::UserOnlineSessionGuard user_session;
     ::proxy::RequestBodyReader request_reader;
     ::proxy::ResponseBodyWriter response_writer;
 };
 
-net::awaitable<tl::expected<PreparedVmessInboundSession, common::ErrorCode>>
-CompleteVmessHandshake(transport::AsyncStream& stream,
-                       std::string_view tag,
-                       const app::AdmissionEnvironment& environment,
-                       common::Context& ctx) {
-    auto auth_phase = co_await proxy::BeginInboundAuthentication(environment, ctx);
-    if (!auth_phase) {
-        co_return tl::unexpected(auth_phase.error());
-    }
-    auto authentication = std::move(*auth_phase);
-    ::proxy::ServerSession vmess_session(tag);
-    auto header = co_await ReadVMessHandshakeHeader(stream, vmess_session, ctx.conn_id);
-    if (!header) {
-        co_return tl::unexpected(header.error());
-    }
-    if (!header->request) {
-        const auto reason = vmess_session.HeaderFailureReason();
-        const auto* authenticated = vmess_session.AuthenticatedRejectedHeader();
-        if (!authenticated) {
-            co_return tl::unexpected(co_await authentication.RejectCredential(reason));
+struct VmessSession {
+    VmessSession() = default;
+    VmessSession(const VmessSession&) = delete;
+    VmessSession(VmessSession&&) = delete;
+
+    std::variant<std::monostate, ::proxy::ServerSession, PreparedVmessInboundSession> state;
+
+    net::awaitable<tl::expected<proxy::AuthenticatedInbound, common::ErrorCode>>
+    Authenticate(transport::AsyncStream& stream,
+                 proxy::InboundAuthentication authentication,
+                 proxy::InboundContext& context) {
+        auto& ctx = context.session;
+        auto& vmess_session = state.emplace<::proxy::ServerSession>(ctx.inbound.tag);
+        auto header = co_await ReadVMessHandshakeHeader(stream, vmess_session, ctx.conn_id);
+        if (!header) {
+            co_return tl::unexpected(header.error());
         }
-        auto bound = std::move(authentication).Bind(authenticated->user->profile,
-            proxy::InboundRequestTarget{RequestNetwork(authenticated->command), authenticated->target});
-        co_return tl::unexpected(std::move(bound).Reject(reason, common::ErrorCode::PROTOCOL_DECODE_FAILED));
+        if (!header->request) {
+            const auto reason = vmess_session.HeaderFailureReason();
+            const auto* authenticated = vmess_session.AuthenticatedRejectedHeader();
+            if (!authenticated) {
+                co_return tl::unexpected(co_await authentication.RejectCredential(reason));
+            }
+            auto bound = std::move(authentication).Bind(authenticated->user->profile,
+                proxy::InboundRequestTarget{RequestNetwork(authenticated->command), authenticated->target});
+            co_return tl::unexpected(std::move(bound).Reject(reason, common::ErrorCode::PROTOCOL_DECODE_FAILED));
+        }
+        auto& request = header->request;
+        if (!request->user) {
+            co_return tl::unexpected(co_await authentication.RejectCredential("no authenticated user"));
+        }
+        auto bound = std::move(authentication).Bind(request->user->profile,
+            proxy::InboundRequestTarget{
+                RequestNetwork(request->command),
+                request->target,
+                std::move(request->forwarded)});
+        if (!co_await ::proxy::RegisterSessionIfNew(
+                context.admission.coordinator, *request->user, request->body_key, request->body_iv)) {
+            // Replay is not a credential failure: it never feeds the ban table.
+            constexpr std::string_view reason = "session replay admission rejected";
+            co_return tl::unexpected(std::move(bound).Reject(reason, common::ErrorCode::PERMISSION_DENIED));
+        }
+
+        LOG_CONN_TRACE(ctx,
+                       "parsed command={} security={} options={:#04x} target={} consumed={}",
+                       static_cast<int>(request->command),
+                       static_cast<int>(request->security),
+                       static_cast<int>(request->options),
+                       request->target,
+                       header->consumed);
+
+        // Keep only body parameters across admission, never the user-table owner.
+        request->user.reset();
+        vmess_session.SetRequest(std::move(*request));
+        co_return std::move(bound);
     }
-    auto& request = header->request;
-    const size_t consumed = header->consumed;
-    if (!request->user) {
-        co_return tl::unexpected(co_await authentication.RejectCredential("no authenticated user"));
+
+    proxy::InboundContinuation Serve(std::unique_ptr<transport::AsyncStream>& stream,
+                                     proxy::InboundContext& context) {
+        auto& vmess_session = std::get<::proxy::ServerSession>(state);
+        auto reader = vmess_session.DecodeRequestBody(*stream);
+        if (!reader) return tl::unexpected(reader.error());
+        auto writer = vmess_session.EncodeResponseBodyWithHeader(*stream);
+        if (!writer) return tl::unexpected(writer.error());
+        auto& prepared = state.emplace<PreparedVmessInboundSession>(
+            PreparedVmessInboundSession{std::move(*reader), std::move(*writer)});
+
+        if (context.session.content.network == common::Network::MUX) {
+            return proxy::ServeMuxInbound(
+                context.io_context,
+                transport::Link{&prepared.request_reader, &prepared.response_writer},
+                *stream,
+                context.dispatcher,
+                context.settings.dispatch_policy,
+                context.admission,
+                context.session,
+                context.admission.stats,
+                context.timeouts,
+                context.pressure_idle_timeout,
+                proxy::MuxAllowedNetwork::Any);
+        }
+        return context.dispatcher.Dispatch(
+            context.io_context,
+            context.settings.dispatch_policy,
+            routing::DispatchRequest{
+                std::move(stream),
+                transport::Link{&prepared.request_reader, &prepared.response_writer}},
+            context.session,
+            context.admission.stats,
+            context.timeouts);
     }
-    auto bound = std::move(authentication).Bind(request->user->profile,
-        proxy::InboundRequestTarget{
-            RequestNetwork(request->command),
-            request->target,
-            std::move(request->forwarded)});
-    if (!co_await ::proxy::RegisterSessionIfNew(
-            environment.coordinator, *request->user, request->body_key, request->body_iv)) {
-        // Replay is not a credential failure: it never feeds the ban table.
-        constexpr std::string_view reason = "session replay admission rejected";
-        co_return tl::unexpected(std::move(bound).Reject(reason, common::ErrorCode::PERMISSION_DENIED));
-    }
-
-    LOG_CONN_TRACE(ctx,
-                   "parsed command={} security={} options={:#04x} target={} consumed={}",
-                   static_cast<int>(request->command),
-                   static_cast<int>(request->security),
-                   static_cast<int>(request->options),
-                   request->target,
-                   consumed);
-
-    auto user_session = co_await std::move(bound).Admit();
-    if (!user_session) co_return tl::unexpected(user_session.error());
-
-    // Header authentication and replay checks are finished. Body/response keys
-    // are already owned by request; do not move a user-table owner into Session.
-    request->user.reset();
-
-    vmess_session.SetRequest(std::move(*request));
-
-    auto reader = vmess_session.DecodeRequestBody(stream);
-    if (!reader) co_return tl::unexpected(reader.error());
-    auto writer = vmess_session.EncodeResponseBodyWithHeader(stream);
-    if (!writer) co_return tl::unexpected(writer.error());
-    co_return PreparedVmessInboundSession{
-        .user_session = std::move(*user_session),
-        .request_reader = std::move(*reader),
-        .response_writer = std::move(*writer),
-    };
-}
+};
 
 }  // namespace
 
@@ -182,49 +204,12 @@ proxy::VmessInboundHandler::Process(
     const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout)
 {
-    const std::string_view tag   = ctx.inbound.tag;
-    const std::string_view client_ip = ctx.inbound.source_ip;
-
-    LOG_CONN_DEBUG(ctx, "processing connection from {}:{}", client_ip, ctx.inbound.source_port);
-
-    std::optional<PreparedVmessInboundSession> session;
-    try {
-        auto prepared = co_await CompleteVmessHandshake(*stream, tag, environment_, ctx);
-        if (!prepared) {
-            co_return proxy::RejectInbound(environment_.stats, stream.get(), prepared.error());
-        }
-        session.emplace(std::move(*prepared));
-    } catch (...) {
-        co_return proxy::RejectInbound(
-            environment_.stats, stream.get(),
-            proxy::ClassifyInboundHandshakeException(std::current_exception()));
-    }
-    const common::Network net = ctx.content.network;
-
-    if (net == common::Network::MUX) {
-        co_return co_await proxy::ServeMuxInbound(
-            io_context,
-            transport::Link{&session->request_reader, &session->response_writer},
-            *stream,
-            dispatcher,
-            settings.dispatch_policy,
-            environment_,
-            ctx,
-            environment_.stats,
-            timeouts,
-            pressure_idle_timeout,
-            proxy::MuxAllowedNetwork::Any);
-    }
-
-    co_return co_await dispatcher.Dispatch(
-        io_context,
-        settings.dispatch_policy,
-        routing::DispatchRequest{
-            std::move(stream),
-            transport::Link{&session->request_reader, &session->response_writer}},
-        ctx,
-        environment_.stats,
-        timeouts);
+    LOG_CONN_DEBUG(ctx, "processing connection from {}:{}",
+                   ctx.inbound.source_ip, ctx.inbound.source_port);
+    return proxy::ProcessInbound<VmessSession>(
+        std::move(stream),
+        proxy::InboundContext{environment_, dispatcher, settings, io_context,
+                              ctx, timeouts, pressure_idle_timeout});
 }
 
 

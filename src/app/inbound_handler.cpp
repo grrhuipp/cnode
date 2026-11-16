@@ -16,6 +16,8 @@
 #include <map>
 #include <new>
 #include <stdexcept>
+#include <type_traits>
+#include <variant>
 #include <string>
 namespace app {
 
@@ -84,6 +86,17 @@ void CountEscapedInboundFailure(const common::Context& ctx, app::StatsShard& sta
 
 }  // namespace
 
+struct InboundHandler::AcceptedStreamRequest {
+    std::unique_ptr<transport::AsyncStream> stream;
+    common::Context& context;
+};
+
+struct InboundHandler::LogicalStreamRequest {
+    std::unique_ptr<transport::AsyncStream> stream;
+    common::Context& context;
+    transport::InboundTransportMetadata metadata;
+};
+
 class InboundHandler::LogicalTransportStreamSink final
     : public transport::InboundTransportStreamHandler {
 public:
@@ -131,41 +144,10 @@ public:
     net::awaitable<void> OnInboundTransportStream(
         std::unique_ptr<transport::AsyncStream> stream,
         transport::InboundTransportMetadata metadata) override {
-        if (!stream) {
-            co_return;
-        }
-        common::Context ctx;
-        ctx.InitSubstreamFrom(base_ctx_);
-        ApplyHttpRealIp(ctx, metadata.real_ip);
-        // 传输层已识别的原生 UDP 会话（Hysteria）在入站处理前即确定网络与首个目标。
-        if (metadata.udp_session_target) {
-            ctx.content.network = common::Network::UDP;
-            ctx.outbound.target = std::move(*metadata.udp_session_target);
-            metadata.udp_session_target.reset();
-        }
-        std::string{}.swap(metadata.real_ip);
-        InboundHandler& handler = *handler_;
-        const app::ReceiverSettings& listener = handler.receiver_;
-        proxy::InboundSubstreamAdmission admission(stats_);
-        if (auto pending = proxy::InboundSubstreamAdmission::Reserve(handler.environment_, ctx);
-            pending && !admission.Hold(co_await std::move(*pending), ctx, stats_)) {
-            co_return;
-        }
-
-        (void)stream->StartPhaseDeadline(timeouts_.HandshakeTimeout());
-
-        LOG_CONN_DEBUG(ctx, "logical transport stream ready security={} network={}",
-                       transport::SecurityModeName(listener.stream_settings.security_mode),
-                       listener.stream_settings.NetworkName());
-
-        proxy::Inbound& proxy = *handler.proxy_;
-        try {
-            (void)co_await proxy.Process(
-                std::move(stream), dispatcher_, handler.protocol_settings_, io_context_, ctx, timeouts_,
-                request_load_.PressureIdleTimeout());
-        } catch (...) {
-            CountEscapedInboundFailure(ctx, stats_);
-        }
+        return handler_->ProcessStream(
+            io_context_, dispatcher_, stats_, request_load_, timeouts_,
+            LogicalStreamRequest{std::move(stream), base_ctx_, std::move(metadata)},
+            nullptr);
     }
 
 private:
@@ -375,18 +357,65 @@ net::awaitable<void> InboundHandler::ProcessAcceptedTCP(
     std::unique_ptr<transport::AsyncStream> raw_conn,
     common::Context& ctx,
     app::DNSWorker* dns_service) {
-    app::ConnectionStatsScope connection_stats(stats);
-    auto prepared = co_await PrepareAcceptedTCP(
+    return ProcessStream(
         io_context, dispatcher, stats, request_load, timeouts,
-        std::move(raw_conn), ctx, dns_service);
-    if (!prepared) {
-        co_return;
+        AcceptedStreamRequest{std::move(raw_conn), ctx}, dns_service);
+}
+
+template <typename Request>
+net::awaitable<void> InboundHandler::ProcessStream(
+    net::io_context& io_context,
+    routing::Dispatcher& dispatcher,
+    app::StatsShard& stats,
+    app::RequestLoadState& request_load,
+    const infra::TimeoutsConfig& timeouts,
+    Request request,
+    app::DNSWorker* dns_service) {
+    static constexpr bool logical = std::is_same_v<Request, LogicalStreamRequest>;
+    if constexpr (logical) {
+        if (!request.stream) co_return;
     }
 
-    proxy::Inbound& proxy = *proxy_;
+    // Physical requests borrow their caller's context; only logical requests
+    // construct a child in this frame, with no move after it becomes visible.
+    std::conditional_t<logical, common::Context, std::monostate> child_context;
+    common::Context* context = &request.context;
+    if constexpr (logical) {
+        child_context.InitSubstreamFrom(request.context);
+        ApplyHttpRealIp(child_context, request.metadata.real_ip);
+        if (request.metadata.udp_session_target) {
+            child_context.content.network = common::Network::UDP;
+            child_context.outbound.target = std::move(*request.metadata.udp_session_target);
+        }
+        request.metadata = {};
+        context = &child_context;
+    }
+    auto& ctx = *context;
+
+    std::conditional_t<logical, proxy::InboundSubstreamAdmission,
+                       app::ConnectionStatsScope> accounting(stats);
+    std::conditional_t<logical, std::monostate,
+                       std::optional<AcceptedTcpTransport>> prepared;
+    if constexpr (logical) {
+        if (auto pending = proxy::InboundSubstreamAdmission::Reserve(environment_, ctx);
+            pending && !accounting.Hold(co_await std::move(*pending), ctx, stats)) {
+            co_return;
+        }
+        (void)request.stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
+        LOG_CONN_DEBUG(ctx, "logical transport stream ready security={} network={}",
+                       transport::SecurityModeName(receiver_.stream_settings.security_mode),
+                       receiver_.stream_settings.NetworkName());
+    } else {
+        prepared = co_await PrepareAcceptedTCP(
+            io_context, dispatcher, stats, request_load, timeouts,
+            std::move(request.stream), ctx, dns_service);
+        if (!prepared) co_return;
+        request.stream = std::move(prepared->stream);
+    }
+
     try {
-        (void)co_await proxy.Process(
-            std::move(prepared->stream), dispatcher, protocol_settings_, io_context, ctx, timeouts,
+        (void)co_await proxy_->Process(
+            std::move(request.stream), dispatcher, protocol_settings_, io_context, ctx, timeouts,
             request_load.PressureIdleTimeout());
     } catch (...) {
         CountEscapedInboundFailure(ctx, stats);

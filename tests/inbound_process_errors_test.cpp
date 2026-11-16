@@ -519,9 +519,10 @@ TEST(InboundAdmission, ClosedCoordinatorCancelsEveryAuthenticationPhaseWithoutAD
         EXPECT_TRUE(credential_phase);
         if (!credential_phase) co_return;
         const common::UserProfile profile{.user_id = 9, .email = "closed", .device_limit = 1};
-        auto bound = std::move(*authentication).Bind(profile, std::nullopt);
+        auto pending_admission = proxy::AuthenticateAndAdmit(
+            std::move(*authentication), &profile, "no matching user", std::nullopt);
         environment.coordinator.CloseAdmission();
-        auto admitted = co_await std::move(bound).Admit();
+        auto admitted = co_await std::move(pending_admission);
         EXPECT_FALSE(admitted);
         if (!admitted) EXPECT_EQ(admitted.error(), common::ErrorCode::CANCELLED);
         constexpr std::array<uint8_t, 1> credential{0x42};

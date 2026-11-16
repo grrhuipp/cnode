@@ -248,6 +248,18 @@ public:
 private:
     class LogicalTransportStreamSink;
     struct AcceptedTcpTransport;
+    struct AcceptedStreamRequest;
+    struct LogicalStreamRequest;
+
+    template <typename Request>
+    net::awaitable<void> ProcessStream(
+        net::io_context& io_context,
+        routing::Dispatcher& dispatcher,
+        app::StatsShard& stats,
+        app::RequestLoadState& request_load,
+        const infra::TimeoutsConfig& timeouts,
+        Request request,
+        app::DNSWorker* dns_service);
 
     net::awaitable<std::optional<AcceptedTcpTransport>> PrepareAcceptedTCP(
         net::io_context& io_context,

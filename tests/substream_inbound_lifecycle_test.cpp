@@ -219,10 +219,13 @@ private:
 
 class Dispatcher final : public routing::Dispatcher {
 public:
-    explicit Dispatcher(net::io_context& io) : gate(io) {
+    explicit Dispatcher(net::io_context& io) : gate(io), cleanup_gate(io) {
         gate.expires_at(net::steady_timer::time_point::max());
+        cleanup_gate.expires_at(net::steady_timer::time_point::max());
     }
     net::steady_timer gate;
+    net::steady_timer cleanup_gate;
+    bool hold_cleanup = false;
     int active = 0;
     int finished = 0;
     int attempting_writes = 0;
@@ -259,18 +262,28 @@ public:
         } scope(*this, ctx);
         EXPECT_EQ(ctx.content.network, common::Network::TCP);
         // Model DNS/dial work before relay subscribes to the logical source.
-        (void)co_await gate.async_wait(net::as_tuple(net::use_awaitable));
-        if (write_payload) {
-            ++attempting_writes;
-            constexpr std::array<uint8_t, 3> payload{1, 2, 3};
-            std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
-            try { co_await link.writer->WriteBuffers(buffers); }
-            catch (const IoSystemError&) {}
+        std::exception_ptr failure;
+        try {
+            (void)co_await gate.async_wait(net::as_tuple(net::use_awaitable));
+            if (write_payload) {
+                ++attempting_writes;
+                constexpr std::array<uint8_t, 3> payload{1, 2, 3};
+                std::array<net::const_buffer, 1> buffers{net::buffer(payload)};
+                try { co_await link.writer->WriteBuffers(buffers); }
+                catch (const IoSystemError&) {}
+            }
+        } catch (...) {
+            failure = std::current_exception();
         }
         co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
-        net::steady_timer cleanup(io);
-        cleanup.expires_after(20ms);
-        co_await cleanup.async_wait(net::use_awaitable);
+        if (hold_cleanup) {
+            (void)co_await cleanup_gate.async_wait(net::as_tuple(net::use_awaitable));
+        } else {
+            net::steady_timer cleanup(io);
+            cleanup.expires_after(20ms);
+            co_await cleanup.async_wait(net::use_awaitable);
+        }
+        if (failure) std::rethrow_exception(failure);
         co_return app::RelayResult{};
     }
 };
@@ -320,6 +333,7 @@ void RunCase(int mode, bool blocked_writes, bool mux) {
         domain.Coordinator(), domain.Limiter(), tracker, stats};
     proxy::AnyTlsInboundHandler handler(environment, {});
     Dispatcher dispatcher(io);
+    dispatcher.hold_cleanup = true;
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
     const proxy::InboundSettings settings{
@@ -344,6 +358,8 @@ void RunCase(int mode, bool blocked_writes, bool mux) {
         stream.wake.cancel();
         stream.write_wake.cancel();
         dispatcher.gate.cancel();
+        dispatcher.hold_cleanup = false;
+        dispatcher.cleanup_gate.cancel();
         io.restart();
         // A device reservation starts the coordinator's persistent return pump.
         // Join the request before shutting that pump down; io.run() alone cannot drain it.
@@ -364,6 +380,7 @@ void RunCase(int mode, bool blocked_writes, bool mux) {
         EXPECT_EQ(stream.pending_reads, 1);
     }
     if (!mux) {
+        EXPECT_EQ(tracker.OnlineDeviceCount("lifecycle", 1), 1);
         EXPECT_FALSE(old_table.expired());
         domain.InstallUsers(updates);
         EXPECT_TRUE(old_table.expired());
@@ -394,6 +411,14 @@ void RunCase(int mode, bool blocked_writes, bool mux) {
         stream.fail_syn_read = true;
         stream.wake.cancel();
     }
+    io.poll();
+    EXPECT_EQ(dispatcher.active, 2);
+    if (!mux) {
+        EXPECT_FALSE(returned);
+        EXPECT_EQ(tracker.OnlineDeviceCount("lifecycle", 1), 1);
+    }
+    dispatcher.hold_cleanup = false;
+    dispatcher.cleanup_gate.cancel();
     io.run_for(500ms);
     EXPECT_TRUE(returned);
     EXPECT_EQ(active_at_return, 0);
@@ -430,6 +455,76 @@ void RunCase(int mode, bool blocked_writes, bool mux) {
             }
         }
     }
+}
+
+TEST(AnyTlsAdmission, DeviceLimitRejectsBeforeSessionFramesOrResponses) {
+    net::io_context io;
+    DomainFixture domain(io);
+    StreamState stream(io);
+    const auto hash = proxy::HashAnyTlsPassword("device-limit");
+    stream.input.assign(hash.begin(), hash.end());
+    stream.input.insert(stream.input.end(), {0, 0});
+    const size_t authentication_bytes = stream.input.size();
+    constexpr std::array<uint8_t, 3> client_settings{'v', '=', '2'};
+    Frame(stream.input, 4, 0, client_settings);
+
+    app::PreparedAnyTlsUser user;
+    user.password_hash = hash;
+    user.profile.user_id = 7;
+    user.profile.email = "device-limit@test";
+    user.profile.device_limit = 1;
+    const app::UserSet users = app::PreparedAnyTlsUsers{user};
+    const std::array updates{app::UserStore::UserUpdate{"device-limit", users}};
+    domain.InstallUsers(updates);
+    app::UserOnlineTracker tracker(domain.Coordinator());
+    app::StatsShard stats;
+    const app::AdmissionEnvironment environment{
+        domain.Coordinator(), domain.Limiter(), tracker, stats};
+    proxy::AnyTlsInboundHandler handler(environment, {});
+    Dispatcher dispatcher(io);
+    routing::DispatchPolicy policy{{}, routing::ForceOutbound{"direct"}};
+    common::Context context;
+    context.inbound.tag = "device-limit";
+    context.inbound.source_ip = "192.0.2.2";
+    infra::TimeoutsConfig timeouts;
+    net::cancellation_signal cancellation;
+    bool returned = false;
+    std::exception_ptr failure;
+    app::RelayResult result;
+    auto run = [&]() -> net::awaitable<void> {
+        auto existing = co_await tracker.TryConnectSession(
+            "device-limit", 7, "192.0.2.1", 1);
+        EXPECT_TRUE(existing);
+        if (!existing) co_return;
+        result = co_await handler.Process(
+            std::make_unique<Stream>(stream), dispatcher,
+            proxy::InboundSettings{policy, true, false}, io, context, timeouts, 0);
+        EXPECT_EQ(tracker.OnlineDeviceCount("device-limit", 7), 1);
+        existing.reset();
+        EXPECT_EQ(tracker.OnlineDeviceCount("device-limit", 7), 0);
+    };
+    CleanupGuard cleanup([&] {
+        cancellation.emit(net::cancellation_type::all);
+        stream.closed = true;
+        stream.wake.cancel();
+        io.restart();
+        while (!returned) io.run_one();
+        domain.Shutdown();
+    });
+    net::co_spawn(domain.Executor(), run(),
+        net::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr error) {
+            failure = error;
+            returned = true;
+        }));
+    io.poll();
+    EXPECT_TRUE(returned);
+    EXPECT_FALSE(failure);
+    EXPECT_EQ(result.error, common::ErrorCode::PERMISSION_DENIED);
+    EXPECT_EQ(stream.offset, authentication_bytes);
+    EXPECT_TRUE(stream.output.empty());
+    EXPECT_TRUE(stream.closed);
+    EXPECT_TRUE(stream.destroyed);
+    EXPECT_EQ(stats.errors, 1);
 }
 bool HasAlert(const std::vector<uint8_t>& bytes) {
     for (size_t offset = 0; offset + 7 <= bytes.size();) {

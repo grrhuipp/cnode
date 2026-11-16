@@ -5,7 +5,6 @@
 #include "common/scoped_cleanse.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "proxy/inbound.hpp"
-#include "app/user_online_tracker.hpp"
 #include "proxy/vless/vless_codec.hpp"
 #include "proxy/vless/vless_encryption.hpp"
 #include "app/inbound_handler.hpp"
@@ -23,6 +22,7 @@
 #include "transport/link.hpp"
 
 #include <array>
+#include <functional>
 #include <tl/expected.hpp>
 #include <memory>
 #include <optional>
@@ -167,174 +167,6 @@ ReadVlessRequestHeader(proxy::BufferedStreamReader& active_reader,
     }
 }
 
-struct VlessHandshakeOutcome {
-    app::UserOnlineSessionGuard user_session;
-    bool packet_addr_udp = false;
-    bool use_vision = false;
-    std::array<uint8_t, 16> request_uuid{};
-    ::proxy::VlessActiveIo active;
-};
-
-net::awaitable<tl::expected<VlessHandshakeOutcome, common::ErrorCode>>
-CompleteVlessInboundHandshake(
-    transport::AsyncStream& stream,
-    const std::shared_ptr<const ::proxy::VlessEncryptionConfig>& decryption,
-    proxy::BufferedStreamReader& protocol_reader,
-    transport::MultiBufferWriter& protocol_writer,
-    std::optional<::proxy::VlessEncryptedIo>* encrypted_io,
-    const app::AdmissionEnvironment& environment,
-    proxy::InboundSettings settings,
-    common::Context& ctx) {
-    auto auth_phase = co_await proxy::BeginInboundAuthentication(environment, ctx);
-    if (!auth_phase) {
-        co_return tl::unexpected(auth_phase.error());
-    }
-    auto authentication = std::move(*auth_phase);
-    const std::string_view tag = ctx.inbound.tag;
-    const auto& client_ip = ctx.inbound.source_ip;
-    auto* active_reader = &protocol_reader;
-    auto* active_writer = &protocol_writer;
-    std::optional<::proxy::VlessEncryptionIssuedTicket> issued_ticket;
-    std::optional<std::array<uint8_t, 16>> resumed_identity;
-    if (decryption && encrypted_io) {
-        try {
-            auto runtime =
-                co_await ::proxy::RunVlessEncryptionServerHandshake(
-                    environment.coordinator,
-                    protocol_reader,
-                    protocol_writer,
-                    decryption,
-                    tag,
-                    ctx.worker_id);
-            if (!runtime) {
-                if (proxy::ConsumeStreamDeadline(stream)) {
-                    LOG_CONN_WARN(ctx, "encryption handshake timed out from {}:{}",
-                                  client_ip, ctx.inbound.source_port);
-                    co_return tl::unexpected(common::ErrorCode::TIMEOUT);
-                }
-                if (runtime.error() == ::proxy::VlessEncryptionHandshakeFailure::Closed) {
-                    co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
-                }
-                const bool truncated =
-                    runtime.error() == ::proxy::VlessEncryptionHandshakeFailure::Truncated;
-                const auto reason = truncated
-                    ? "encryption handshake truncated" : "encryption handshake rejected";
-                if (truncated) {
-                    LOG_CONN_WARN(ctx, "{} from {}:{}", reason, client_ip, ctx.inbound.source_port);
-                } else {
-                    proxy::LogInboundRequestRejected(ctx, reason);
-                }
-                co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
-            }
-            issued_ticket = std::move(runtime->issued_ticket);
-            resumed_identity = runtime->resumed_identity;
-            encrypted_io->emplace(
-                protocol_reader, protocol_writer, std::move(*runtime));
-            active_reader = &(*encrypted_io)->plain_reader;
-            active_writer = &(*encrypted_io)->writer;
-        } catch (...) {
-            auto classified = proxy::ClassifyInboundHandshakeException(std::current_exception());
-            if (proxy::ConsumeStreamDeadline(stream)) {
-                classified = common::ErrorCode::TIMEOUT;
-            }
-            if (classified == common::ErrorCode::CANCELLED) {
-                LOG_CONN_DEBUG(ctx, "encryption handshake cancelled from {}:{}",
-                               client_ip, ctx.inbound.source_port);
-            } else if (classified == common::ErrorCode::TIMEOUT ||
-                       classified == common::ErrorCode::SOCKET_READ_FAILED) {
-                LOG_CONN_WARN(ctx, "encryption handshake failed from {}:{} > {}",
-                              client_ip, ctx.inbound.source_port,
-                              classified == common::ErrorCode::TIMEOUT ? "timeout" : "transport error");
-            } else if (classified != common::ErrorCode::RESOURCE_EXHAUSTED) {
-                proxy::LogInboundRequestRejected(ctx, "encryption handshake exception");
-            }
-            co_return tl::unexpected(classified);
-        }
-    }
-
-    auto parsed_request = co_await ReadVlessRequestHeader(
-        *active_reader, stream, ctx);
-    if (!parsed_request) {
-        co_return tl::unexpected(parsed_request.error());
-    }
-    auto& request = *parsed_request;
-    common::ScopedCleanse cleanse_request_uuid{request.uuid};
-    const auto credential = co_await authentication.VerifyCredential({proxy::KeyedInboundProtocol::Vless, request.uuid});
-    if (credential != common::ErrorCode::OK) co_return tl::unexpected(credential);
-    auto user_info = app::UserStore::FindVlessUser(tag, request.uuid);
-    if (!user_info) {
-        co_return tl::unexpected(co_await authentication.RejectCredential("no matching user"));
-    }
-    common::Network net = common::Network::TCP;
-    if (request.command == ::proxy::VlessCommand::UDP) {
-        net = common::Network::UDP;
-    } else if (request.command == ::proxy::VlessCommand::MUX) {
-        net = common::Network::MUX;
-    }
-    const bool packet_addr_udp =
-        request.command == ::proxy::VlessCommand::UDP &&
-        ::proxy::IsPacketAddrMagic(request.target);
-    // Published before flow/transport validation so those rejections log the
-    // authenticated user and the requested target.
-    auto bound = std::move(authentication).Bind(user_info->profile,
-        proxy::InboundRequestTarget{
-            net,
-            std::move(request.target),
-            std::move(request.forwarded)});
-    if (resumed_identity &&
-        CRYPTO_memcmp(resumed_identity->data(), request.uuid.data(), request.uuid.size()) != 0) {
-        co_return tl::unexpected(std::move(bound).Reject("resumed identity mismatch", common::ErrorCode::PROTOCOL_AUTH_FAILED));
-    }
-    const bool use_vision = ::proxy::IsVisionFlow(request.flow);
-    if (!request.flow.empty()) {
-        if (std::string_view(request.flow) != user_info->flow) {
-            co_return tl::unexpected(std::move(bound).Reject("request flow not allowed", common::ErrorCode::PROTOCOL_UNSUPPORTED));
-        }
-        if (!use_vision) {
-            co_return tl::unexpected(std::move(bound).Reject("unknown request flow", common::ErrorCode::PROTOCOL_UNSUPPORTED));
-        }
-    }
-    if (!user_info->flow.empty() && !::proxy::IsVisionFlow(user_info->flow)) {
-        co_return tl::unexpected(std::move(bound).Reject("unsupported configured flow", common::ErrorCode::PROTOCOL_UNSUPPORTED));
-    }
-    if (request.flow.empty() && ::proxy::IsVisionFlow(user_info->flow)) {
-        co_return tl::unexpected(std::move(bound).Reject("missing required flow", common::ErrorCode::PROTOCOL_UNSUPPORTED));
-    }
-    // Xray carries Vision UDP as XUDP inside Mux.Cool; a bare UDP command is
-    // never produced by a Vision client.
-    if (use_vision && request.command == ::proxy::VlessCommand::UDP) {
-        co_return tl::unexpected(std::move(bound).Reject("flow does not support UDP", common::ErrorCode::PROTOCOL_UNSUPPORTED));
-    }
-    if (use_vision &&
-        !(settings.raw_tcp && (settings.tls_like || decryption != nullptr))) {
-        co_return tl::unexpected(std::move(bound).Reject("flow requires raw TCP TLS-like transport", common::ErrorCode::PROTOCOL_UNSUPPORTED));
-    }
-
-    auto user_session = co_await std::move(bound).Admit();
-    if (!user_session) co_return tl::unexpected(user_session.error());
-
-    // Flow validation and metadata copy are complete; no credential is needed
-    // by the request body or Vision's per-session UUID state.
-    user_info.reset();
-
-    if (issued_ticket) {
-        try {
-            const bool stored = co_await ::proxy::AuthenticateVlessTicket(
-                environment.coordinator, decryption, tag, std::move(*issued_ticket), request.uuid);
-            LOG_NET_DEBUG("inbound '{}' ticket issued worker={} stored={}", tag, ctx.worker_id, stored);
-        } catch (...) {
-            co_return tl::unexpected(proxy::ClassifyInboundHandshakeException(std::current_exception()));
-        }
-    }
-
-    co_return VlessHandshakeOutcome{
-        .user_session = std::move(*user_session),
-        .packet_addr_udp = packet_addr_udp,
-        .use_vision = use_vision,
-        .request_uuid = use_vision ? request.uuid : std::array<uint8_t, 16>{},
-        .active = {active_reader, active_writer},
-    };
-}
 
 net::awaitable<app::RelayResult> DispatchVlessUdp(
     std::unique_ptr<transport::AsyncStream> stream,
@@ -512,6 +344,204 @@ net::awaitable<app::RelayResult> DispatchVlessSession(
         environment.stats,
         timeouts);
 }
+
+template <bool Encrypted>
+struct VlessEncryptionState {};
+
+template <>
+struct VlessEncryptionState<true> {
+    std::optional<::proxy::VlessEncryptedIo> io;
+    std::optional<::proxy::VlessEncryptionIssuedTicket> issued_ticket;
+};
+
+// Plain sessions never reserve space for the encrypted record layer. Both
+// variants install their borrowing wrappers only in the stable common frame.
+template <bool Encrypted>
+struct VlessInboundSession {
+    explicit VlessInboundSession(
+        const std::shared_ptr<const ::proxy::VlessEncryptionConfig>& config) noexcept
+        : decryption(config) {}
+
+    VlessInboundSession(const VlessInboundSession&) = delete;
+    VlessInboundSession(VlessInboundSession&&) = delete;
+
+    ~VlessInboundSession() {
+        OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
+    }
+
+    net::awaitable<tl::expected<proxy::AuthenticatedInbound, common::ErrorCode>>
+    Authenticate(transport::AsyncStream& stream,
+                 proxy::InboundAuthentication authentication,
+                 proxy::InboundContext& context) {
+        auto& ctx = context.session;
+        const auto& environment = context.admission;
+        const std::string_view tag = ctx.inbound.tag;
+        const auto& client_ip = ctx.inbound.source_ip;
+        protocol_reader.emplace(stream);
+        auto* active_reader = &*protocol_reader;
+        std::optional<std::array<uint8_t, 16>> resumed_identity;
+        if constexpr (Encrypted) {
+            try {
+                auto runtime = co_await ::proxy::RunVlessEncryptionServerHandshake(
+                    environment.coordinator, *protocol_reader, stream,
+                    decryption, tag, ctx.worker_id);
+                if (!runtime) {
+                    if (proxy::ConsumeStreamDeadline(stream)) {
+                        LOG_CONN_WARN(ctx, "encryption handshake timed out from {}:{}",
+                                      client_ip, ctx.inbound.source_port);
+                        co_return tl::unexpected(common::ErrorCode::TIMEOUT);
+                    }
+                    if (runtime.error() == ::proxy::VlessEncryptionHandshakeFailure::Closed) {
+                        co_return tl::unexpected(common::ErrorCode::SOCKET_EOF);
+                    }
+                    const bool truncated =
+                        runtime.error() == ::proxy::VlessEncryptionHandshakeFailure::Truncated;
+                    const auto reason = truncated
+                        ? "encryption handshake truncated" : "encryption handshake rejected";
+                    if (truncated) {
+                        LOG_CONN_WARN(ctx, "{} from {}:{}", reason, client_ip, ctx.inbound.source_port);
+                    } else {
+                        proxy::LogInboundRequestRejected(ctx, reason);
+                    }
+                    co_return tl::unexpected(common::ErrorCode::PROTOCOL_DECODE_FAILED);
+                }
+                encryption.issued_ticket = std::move(runtime->issued_ticket);
+                resumed_identity = runtime->resumed_identity;
+                encryption.io.emplace(*protocol_reader, stream, std::move(*runtime));
+                active_reader = &encryption.io->plain_reader;
+            } catch (...) {
+                auto classified = proxy::ClassifyInboundHandshakeException(std::current_exception());
+                if (proxy::ConsumeStreamDeadline(stream)) {
+                    classified = common::ErrorCode::TIMEOUT;
+                }
+                if (classified == common::ErrorCode::CANCELLED) {
+                    LOG_CONN_DEBUG(ctx, "encryption handshake cancelled from {}:{}",
+                                   client_ip, ctx.inbound.source_port);
+                } else if (classified == common::ErrorCode::TIMEOUT ||
+                           classified == common::ErrorCode::SOCKET_READ_FAILED) {
+                    LOG_CONN_WARN(ctx, "encryption handshake failed from {}:{} > {}",
+                                  client_ip, ctx.inbound.source_port,
+                                  classified == common::ErrorCode::TIMEOUT ? "timeout" : "transport error");
+                } else if (classified != common::ErrorCode::RESOURCE_EXHAUSTED) {
+                    proxy::LogInboundRequestRejected(ctx, "encryption handshake exception");
+                }
+                co_return tl::unexpected(classified);
+            }
+        }
+
+        auto parsed_request = co_await ReadVlessRequestHeader(*active_reader, stream, ctx);
+        if (!parsed_request) co_return tl::unexpected(parsed_request.error());
+        auto& request = *parsed_request;
+        common::ScopedCleanse cleanse_request_uuid{request.uuid};
+        const auto credential = co_await authentication.VerifyCredential(
+            {proxy::KeyedInboundProtocol::Vless, request.uuid});
+        if (credential != common::ErrorCode::OK) co_return tl::unexpected(credential);
+        auto user_info = app::UserStore::FindVlessUser(tag, request.uuid);
+        if (!user_info) {
+            co_return tl::unexpected(co_await authentication.RejectCredential("no matching user"));
+        }
+        common::Network network = common::Network::TCP;
+        if (request.command == ::proxy::VlessCommand::UDP) {
+            network = common::Network::UDP;
+        } else if (request.command == ::proxy::VlessCommand::MUX) {
+            network = common::Network::MUX;
+        }
+        meta.packet_addr_udp =
+            request.command == ::proxy::VlessCommand::UDP &&
+            ::proxy::IsPacketAddrMagic(request.target);
+        // Publish identity and target before validating flow/transport so those
+        // request rejections retain the authenticated access-log metadata.
+        auto bound = std::move(authentication).Bind(user_info->profile,
+            proxy::InboundRequestTarget{
+                network, std::move(request.target), std::move(request.forwarded)});
+        if (resumed_identity &&
+            CRYPTO_memcmp(resumed_identity->data(), request.uuid.data(), request.uuid.size()) != 0) {
+            co_return tl::unexpected(std::move(bound).Reject(
+                "resumed identity mismatch", common::ErrorCode::PROTOCOL_AUTH_FAILED));
+        }
+        meta.use_vision = ::proxy::IsVisionFlow(request.flow);
+        if (!request.flow.empty()) {
+            if (std::string_view(request.flow) != user_info->flow) {
+                co_return tl::unexpected(std::move(bound).Reject(
+                    "request flow not allowed", common::ErrorCode::PROTOCOL_UNSUPPORTED));
+            }
+            if (!meta.use_vision) {
+                co_return tl::unexpected(std::move(bound).Reject(
+                    "unknown request flow", common::ErrorCode::PROTOCOL_UNSUPPORTED));
+            }
+        }
+        if (!user_info->flow.empty() && !::proxy::IsVisionFlow(user_info->flow)) {
+            co_return tl::unexpected(std::move(bound).Reject(
+                "unsupported configured flow", common::ErrorCode::PROTOCOL_UNSUPPORTED));
+        }
+        if (request.flow.empty() && ::proxy::IsVisionFlow(user_info->flow)) {
+            co_return tl::unexpected(std::move(bound).Reject(
+                "missing required flow", common::ErrorCode::PROTOCOL_UNSUPPORTED));
+        }
+        // Vision carries UDP inside Mux.Cool, never as a bare UDP command.
+        if (meta.use_vision && request.command == ::proxy::VlessCommand::UDP) {
+            co_return tl::unexpected(std::move(bound).Reject(
+                "flow does not support UDP", common::ErrorCode::PROTOCOL_UNSUPPORTED));
+        }
+        if (meta.use_vision &&
+            !(context.settings.raw_tcp && (context.settings.tls_like || Encrypted))) {
+            co_return tl::unexpected(std::move(bound).Reject(
+                "flow requires raw TCP TLS-like transport", common::ErrorCode::PROTOCOL_UNSUPPORTED));
+        }
+        if (meta.use_vision) request_uuid = request.uuid;
+        if constexpr (Encrypted) {
+            if (encryption.issued_ticket) request_uuid = request.uuid;
+        }
+        co_return std::move(bound);
+    }
+
+    proxy::InboundContinuation Serve(
+        std::unique_ptr<transport::AsyncStream>& stream,
+        proxy::InboundContext& context) {
+        if constexpr (Encrypted) {
+            response_writer.emplace(encryption.io->writer);
+            if (encryption.issued_ticket) return ServeIssuedTicket(stream, context);
+        } else {
+            response_writer.emplace(*stream);
+        }
+        return Dispatch(stream, context);
+    }
+
+    net::awaitable<app::RelayResult> Dispatch(
+        std::unique_ptr<transport::AsyncStream>& stream,
+        proxy::InboundContext& context) {
+        auto* active_reader = &*protocol_reader;
+        if constexpr (Encrypted) active_reader = &encryption.io->plain_reader;
+        return DispatchVlessSession(
+            stream, *active_reader, *response_writer, meta, request_uuid,
+            context.dispatcher, context.settings.dispatch_policy, context.io_context,
+            context.session, context.admission, context.timeouts,
+            context.pressure_idle_timeout);
+    }
+
+    // Ticket binding is genuinely asynchronous and must follow successful
+    // device admission. Ordinary sessions return their dispatch without it.
+    net::awaitable<app::RelayResult> ServeIssuedTicket(
+        std::unique_ptr<transport::AsyncStream>& stream,
+        proxy::InboundContext& context) {
+        const auto& ctx = context.session;
+        const bool stored = co_await ::proxy::AuthenticateVlessTicket(
+            context.admission.coordinator, decryption, ctx.inbound.tag,
+            std::move(*encryption.issued_ticket), request_uuid);
+        encryption.issued_ticket.reset();
+        if (!meta.use_vision) OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
+        LOG_NET_DEBUG("inbound '{}' ticket issued worker={} stored={}",
+                      ctx.inbound.tag, ctx.worker_id, stored);
+        co_return co_await Dispatch(stream, context);
+    }
+
+    const std::shared_ptr<const ::proxy::VlessEncryptionConfig>& decryption;
+    std::optional<proxy::BufferedStreamReader> protocol_reader;
+    VlessEncryptionState<Encrypted> encryption;
+    std::optional<VlessResponseHeaderWriter> response_writer;
+    VlessSessionMeta meta;
+    std::array<uint8_t, 16> request_uuid{};
+};
 }  // namespace
 
 namespace proxy {
@@ -533,23 +563,6 @@ public:
         uint32_t pressure_idle_timeout) override;
 
 private:
-    ::net::awaitable<::app::RelayResult> ProcessPlain(
-        std::unique_ptr<::transport::AsyncStream> stream,
-        ::routing::Dispatcher& dispatcher,
-        ::proxy::InboundSettings settings,
-        ::net::io_context& io_context,
-        ::common::Context& ctx,
-        const ::infra::TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout);
-    ::net::awaitable<::app::RelayResult> ProcessEncrypted(
-        std::unique_ptr<::transport::AsyncStream> stream,
-        ::routing::Dispatcher& dispatcher,
-        ::proxy::InboundSettings settings,
-        ::net::io_context& io_context,
-        ::common::Context& ctx,
-        const ::infra::TimeoutsConfig& timeouts,
-        uint32_t pressure_idle_timeout);
-
     const ::app::AdmissionEnvironment& environment_;
     std::shared_ptr<const ::proxy::VlessEncryptionConfig> decryption_;
 };
@@ -573,127 +586,16 @@ proxy::VlessInboundHandler::Process(
     common::Context& ctx,
     const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
+    const proxy::InboundContext context{
+        environment_, dispatcher, settings, io_context, ctx, timeouts,
+        pressure_idle_timeout};
     if (decryption_) {
-        return ProcessEncrypted(
-            std::move(stream), dispatcher, settings, io_context, ctx, timeouts, pressure_idle_timeout);
+        return proxy::ProcessInbound<VlessInboundSession<true>>(
+            std::move(stream), context, std::cref(decryption_));
     }
-    return ProcessPlain(
-        std::move(stream), dispatcher, settings, io_context, ctx, timeouts, pressure_idle_timeout);
+    return proxy::ProcessInbound<VlessInboundSession<false>>(
+        std::move(stream), context, std::cref(decryption_));
 }
-
-net::awaitable<app::RelayResult>
-proxy::VlessInboundHandler::ProcessPlain(
-    std::unique_ptr<transport::AsyncStream> stream,
-    routing::Dispatcher& dispatcher,
-    proxy::InboundSettings settings,
-    net::io_context& io_context,
-    common::Context& ctx,
-    const infra::TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout) {
-    proxy::BufferedStreamReader protocol_reader(*stream);
-    app::UserOnlineSessionGuard user_session;
-    VlessSessionMeta meta;
-    std::array<uint8_t, 16> request_uuid{};
-    common::ScopedCleanse cleanse_uuid{request_uuid};
-    {
-        auto handshake = co_await CompleteVlessInboundHandshake(
-            *stream,
-            decryption_,
-            protocol_reader,
-            *stream,
-            nullptr,
-            environment_,
-            settings,
-            ctx);
-        if (!handshake) {
-            co_return proxy::RejectInbound(environment_.stats, stream.get(), handshake.error());
-        }
-        user_session = std::move(handshake->user_session);
-        meta = {
-            .packet_addr_udp = handshake->packet_addr_udp,
-            .use_vision = handshake->use_vision,
-        };
-        if (meta.use_vision) {
-            request_uuid = handshake->request_uuid;
-            OPENSSL_cleanse(handshake->request_uuid.data(), handshake->request_uuid.size());
-        }
-    }
-    VlessResponseHeaderWriter response_writer(*stream);
-    co_return co_await DispatchVlessSession(
-        stream,
-        protocol_reader,
-        response_writer,
-        meta,
-        request_uuid,
-        dispatcher,
-        settings.dispatch_policy,
-        io_context,
-        ctx,
-        environment_,
-        timeouts,
-        pressure_idle_timeout);
-}
-
-net::awaitable<app::RelayResult>
-proxy::VlessInboundHandler::ProcessEncrypted(
-    std::unique_ptr<transport::AsyncStream> stream,
-    routing::Dispatcher& dispatcher,
-    proxy::InboundSettings settings,
-    net::io_context& io_context,
-    common::Context& ctx,
-    const infra::TimeoutsConfig& timeouts,
-    uint32_t pressure_idle_timeout) {
-    proxy::BufferedStreamReader protocol_reader(*stream);
-    transport::MultiBufferWriter& protocol_writer = *stream;
-    proxy::BufferedStreamReader* active_reader = &protocol_reader;
-    transport::MultiBufferWriter* active_writer = &protocol_writer;
-    std::optional<::proxy::VlessEncryptedIo> encrypted_io;
-
-    app::UserOnlineSessionGuard user_session;
-    VlessSessionMeta meta;
-    std::array<uint8_t, 16> request_uuid{};
-    common::ScopedCleanse cleanse_uuid{request_uuid};
-    {
-        auto handshake = co_await CompleteVlessInboundHandshake(
-            *stream,
-            decryption_,
-            protocol_reader,
-            protocol_writer,
-            &encrypted_io,
-            environment_,
-            settings,
-            ctx);
-        if (!handshake) {
-            co_return proxy::RejectInbound(environment_.stats, stream.get(), handshake.error());
-        }
-        active_reader = handshake->active.reader;
-        active_writer = handshake->active.writer;
-        user_session = std::move(handshake->user_session);
-        meta = {
-            .packet_addr_udp = handshake->packet_addr_udp,
-            .use_vision = handshake->use_vision,
-        };
-        if (meta.use_vision) {
-            request_uuid = handshake->request_uuid;
-            OPENSSL_cleanse(handshake->request_uuid.data(), handshake->request_uuid.size());
-        }
-    }
-    VlessResponseHeaderWriter response_writer(*active_writer);
-    co_return co_await DispatchVlessSession(
-        stream,
-        *active_reader,
-        response_writer,
-        meta,
-        request_uuid,
-        dispatcher,
-        settings.dispatch_policy,
-        io_context,
-        ctx,
-        environment_,
-        timeouts,
-        pressure_idle_timeout);
-}
-
 
 namespace {
 [[nodiscard]] const ::app::VlessInboundSettings* GetVlessSettings(

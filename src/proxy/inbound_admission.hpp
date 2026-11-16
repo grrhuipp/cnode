@@ -100,6 +100,27 @@ struct KeyedInboundCredential {
     std::span<const uint8_t> raw;
 };
 
+struct InboundContext {
+    const AdmissionEnvironment& admission;
+    routing::Dispatcher& dispatcher;
+    InboundSettings settings;
+    net::io_context& io_context;
+    common::Context& session;
+    const infra::TimeoutsConfig& timeouts;
+    uint32_t pressure_idle_timeout;
+};
+
+using InboundContinuation =
+    tl::expected<net::awaitable<app::RelayResult>, common::ErrorCode>;
+
+template <typename ProtocolSession, typename... Arguments>
+net::awaitable<app::RelayResult> ProcessInbound(
+    std::unique_ptr<transport::AsyncStream> stream,
+    InboundContext context,
+    Arguments... arguments);
+
+struct NativeAssociationAdmission;
+
 class AuthenticatedInbound;
 class InboundAuthentication {
 public:
@@ -178,10 +199,18 @@ public:
         LogInboundRequestRejected(*ctx_, reason);
         return error;
     }
+private:
+    template <typename ProtocolSession, typename... Arguments>
+    friend net::awaitable<app::RelayResult> ProcessInbound(
+        std::unique_ptr<transport::AsyncStream>, InboundContext, Arguments...);
+    friend net::awaitable<tl::expected<app::UserOnlineSessionGuard, common::ErrorCode>>
+    AuthenticateAndAdmit(InboundAuthentication, const common::UserProfile*,
+        std::string_view, std::optional<InboundRequestTarget>);
+    friend net::awaitable<std::optional<NativeAssociationAdmission>>
+    AdmitNativeAssociation(const AdmissionEnvironment&, common::Context&, AuthenticatedInbound);
     [[nodiscard]] net::awaitable<tl::expected<app::UserOnlineSessionGuard, common::ErrorCode>> Admit() && {
         return AdmitSession(*environment_, *ctx_, user_id_, device_limit_);
     }
-private:
     friend class InboundAuthentication;
     AuthenticatedInbound(const AdmissionEnvironment& environment, common::Context& ctx,
                          const common::UserProfile& profile) noexcept
@@ -313,6 +342,46 @@ private:
     app::RelayResult result;
     result.error = error;
     return result;
+}
+
+// Protocol state is constructed at its final address and never moved.
+// Serving starts only after device admission; the lease covers child cleanup.
+// Process implementations return this coroutine without a forwarding frame.
+template <typename ProtocolSession, typename... Arguments>
+net::awaitable<app::RelayResult> ProcessInbound(
+    std::unique_ptr<transport::AsyncStream> stream,
+    InboundContext context,
+    Arguments... arguments) {
+    auto& stats = context.admission.stats;
+    if (!stream) {
+        co_return RejectInbound(stats, nullptr, common::ErrorCode::PROTOCOL_DECODE_FAILED);
+    }
+    try {
+        ProtocolSession protocol{std::move(arguments)...};
+        auto authentication = co_await BeginInboundAuthentication(
+            context.admission, context.session);
+        if (!authentication) {
+            co_return RejectInbound(stats, stream.get(), authentication.error());
+        }
+        auto authenticated = co_await protocol.Authenticate(
+            *stream, std::move(*authentication), context);
+        if (!authenticated) {
+            co_return RejectInbound(stats, stream.get(), authenticated.error());
+        }
+        auto admitted = co_await std::move(*authenticated).Admit();
+        if (!admitted) {
+            co_return RejectInbound(stats, stream.get(), admitted.error());
+        }
+        auto continuation = protocol.Serve(stream, context);
+        if (!continuation) {
+            co_return RejectInbound(stats, stream.get(), continuation.error());
+        }
+        co_return co_await std::move(*continuation);
+    } catch (...) {
+        co_return RejectInbound(
+            stats, stream.get(),
+            ClassifyInboundHandshakeException(std::current_exception()));
+    }
 }
 
 template <typename PreparedUser, typename AssignCredential>

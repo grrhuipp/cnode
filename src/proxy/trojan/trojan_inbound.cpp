@@ -3,7 +3,6 @@
 #include "app/relay.hpp"
 #include "common/scoped_cleanse.hpp"
 #include "proxy/inbound.hpp"
-#include "app/user_online_tracker.hpp"
 #include "transport/async_stream.hpp"
 #include "proxy/trojan/trojan_codec.hpp"
 #include "app/stats.hpp"
@@ -65,57 +64,61 @@ ReadRawTrojanRequest(transport::AsyncStream& stream, common::Context& ctx) {
     }
 }
 
-net::awaitable<tl::expected<app::UserOnlineSessionGuard, common::ErrorCode>>
-AuthenticateTrojanRequest(transport::AsyncStream& stream,
-                          const app::AdmissionEnvironment& environment,
-                          common::Context& ctx) {
-    auto auth_phase = co_await proxy::BeginInboundAuthentication(environment, ctx);
-    if (!auth_phase) {
-        co_return tl::unexpected(auth_phase.error());
-    }
-    auto authentication = std::move(*auth_phase);
-    auto parsed_request = co_await ReadRawTrojanRequest(stream, ctx);
-    if (!parsed_request) {
-        co_return tl::unexpected(parsed_request.error());
-    }
-    auto& request = *parsed_request;
-    common::ScopedCleanse cleanse_hash{request.password_hash};
-    const auto credential = co_await authentication.VerifyCredential({
-        proxy::KeyedInboundProtocol::Trojan,
-        {reinterpret_cast<const uint8_t*>(request.password_hash.data()), request.password_hash.size()}});
-    if (credential != common::ErrorCode::OK) co_return tl::unexpected(credential);
-    auto user_info = app::UserStore::FindTrojanUser(
-        ctx.inbound.tag, request.PasswordHashView());
-    const common::Network net = (request.command == TrojanCommand::UDP_ASSOCIATE)
-        ? common::Network::UDP : common::Network::TCP;
-    const common::UserProfile* profile = user_info ? &user_info->profile : nullptr;
-    auto admit = proxy::AuthenticateAndAdmit(
-        std::move(authentication),
-        profile,
-        "no matching credential",
-        proxy::InboundRequestTarget{net, std::move(request.target), std::move(request.forwarded)});
-    user_info.reset();
-    co_return co_await std::move(admit);
-}
+struct TrojanSession {
+    TrojanSession() = default;
+    TrojanSession(const TrojanSession&) = delete;
+    TrojanSession(TrojanSession&&) = delete;
 
-net::awaitable<app::RelayResult> DispatchTrojanUdp(
-    std::unique_ptr<transport::AsyncStream> stream,
-    routing::Dispatcher& dispatcher,
-    const routing::DispatchPolicy& dispatch_policy,
-    net::io_context& io_context,
-    common::Context& ctx,
-    const app::AdmissionEnvironment& environment,
-    const infra::TimeoutsConfig& timeouts) {
-    TrojanUdpStreamEndpoint udp_endpoint(*stream);
-    co_return co_await dispatcher.Dispatch(
-        io_context,
-        dispatch_policy,
-        routing::DispatchRequest{
-            std::move(stream), transport::Link{&udp_endpoint, &udp_endpoint}},
-        ctx,
-        environment.stats,
-        timeouts);
-}
+    std::optional<TrojanUdpStreamEndpoint> udp_endpoint;
+
+    net::awaitable<tl::expected<AuthenticatedInbound, common::ErrorCode>>
+    Authenticate(transport::AsyncStream& stream,
+                 InboundAuthentication authentication,
+                 InboundContext& context) {
+        auto& ctx = context.session;
+        auto parsed_request = co_await ReadRawTrojanRequest(stream, ctx);
+        if (!parsed_request) {
+            co_return tl::unexpected(parsed_request.error());
+        }
+        auto& request = *parsed_request;
+        common::ScopedCleanse cleanse_hash{request.password_hash};
+        const auto credential = co_await authentication.VerifyCredential({
+            KeyedInboundProtocol::Trojan,
+            {reinterpret_cast<const uint8_t*>(request.password_hash.data()), request.password_hash.size()}});
+        if (credential != common::ErrorCode::OK) co_return tl::unexpected(credential);
+        auto user_info = app::UserStore::FindTrojanUser(
+            ctx.inbound.tag, request.PasswordHashView());
+        if (!user_info) {
+            co_return tl::unexpected(co_await authentication.RejectCredential("no matching credential"));
+        }
+        const common::Network network = request.command == TrojanCommand::UDP_ASSOCIATE
+            ? common::Network::UDP : common::Network::TCP;
+        co_return std::move(authentication).Bind(user_info->profile,
+            InboundRequestTarget{network, std::move(request.target), std::move(request.forwarded)});
+    }
+
+    InboundContinuation Serve(std::unique_ptr<transport::AsyncStream>& stream,
+                              InboundContext& context) {
+        if (context.session.content.network == common::Network::UDP) {
+            udp_endpoint.emplace(*stream);
+            return context.dispatcher.Dispatch(
+                context.io_context,
+                context.settings.dispatch_policy,
+                routing::DispatchRequest{
+                    std::move(stream), transport::Link{&*udp_endpoint, &*udp_endpoint}},
+                context.session,
+                context.admission.stats,
+                context.timeouts);
+        }
+        return context.dispatcher.Dispatch(
+            context.io_context,
+            context.settings.dispatch_policy,
+            routing::DispatchRequest{std::move(stream)},
+            context.session,
+            context.admission.stats,
+            context.timeouts);
+    }
+};
 }  // namespace
 
 class TrojanInboundHandler final : public ::proxy::Inbound {
@@ -152,31 +155,14 @@ TrojanInboundHandler::Process(
     net::io_context& io_context,
     common::Context& ctx,
     const infra::TimeoutsConfig& timeouts,
-    uint32_t /*pressure_idle_timeout*/)
+    uint32_t pressure_idle_timeout)
 {
     LOG_CONN_DEBUG(ctx, "processing connection from {}:{}",
                    ctx.inbound.source_ip, ctx.inbound.source_port);
-
-    app::UserOnlineSessionGuard user_session;
-    {
-        auto admitted = co_await AuthenticateTrojanRequest(*stream, environment_, ctx);
-        if (!admitted) {
-            co_return proxy::RejectInbound(environment_.stats, stream.get(), admitted.error());
-        }
-        user_session = std::move(*admitted);
-    }
-
-    if (ctx.content.network == common::Network::UDP) {
-        co_return co_await DispatchTrojanUdp(
-            std::move(stream), dispatcher, settings.dispatch_policy, io_context, ctx, environment_, timeouts);
-    }
-    co_return co_await dispatcher.Dispatch(
-        io_context,
-        settings.dispatch_policy,
-        routing::DispatchRequest{std::move(stream)},
-        ctx,
-        environment_.stats,
-        timeouts);
+    return ProcessInbound<TrojanSession>(
+        std::move(stream),
+        InboundContext{environment_, dispatcher, settings, io_context,
+                       ctx, timeouts, pressure_idle_timeout});
 }
 
 

@@ -921,35 +921,61 @@ net::awaitable<tl::expected<void, common::ErrorCode>> ReadAuth(
     co_return tl::expected<void, common::ErrorCode>{};
 }
 
-net::awaitable<tl::expected<app::UserOnlineSessionGuard, common::ErrorCode>>
-AuthenticateSession(
-    transport::AsyncStream& stream,
-    const app::AdmissionEnvironment& environment,
-    common::Context& ctx,
-    const infra::TimeoutsConfig& timeouts,
-    std::chrono::seconds control_idle_timeout) {
-    auto auth_phase = co_await proxy::BeginInboundAuthentication(environment, ctx);
-    if (!auth_phase) co_return tl::unexpected(auth_phase.error());
-    auto authentication = std::move(*auth_phase);
-    std::array<uint8_t, 32> auth_hash{};
-    common::ScopedCleanse cleanse_hash{auth_hash};
-    if (auto ok = co_await ReadAuth(stream, auth_hash); !ok) {
-        co_return tl::unexpected(ok.error());
-    }
-    const auto credential = co_await authentication.VerifyCredential({proxy::KeyedInboundProtocol::AnyTls, auth_hash});
-    if (credential != common::ErrorCode::OK) co_return tl::unexpected(credential);
-    auto user = app::UserStore::FindAnyTlsUser(ctx.inbound.tag, auth_hash);
-    OPENSSL_cleanse(auth_hash.data(), auth_hash.size());
-    if (!user) co_return tl::unexpected(co_await authentication.RejectCredential("no matching credential"));
-    stream.SetWriteTimeout(
-        std::min(timeouts.WriteTimeout(), control_idle_timeout));
+struct AnyTlsInboundSession {
+    explicit AnyTlsInboundSession(const AnyTlsPaddingScheme* scheme) noexcept
+        : padding_scheme(scheme) {}
 
-    // Session-level authentication: no target exists until streams open.
-    ctx.content.network = common::Network::MUX;
-    auto bound = std::move(authentication).Bind(user->profile, std::nullopt);
-    user.reset();
-    co_return co_await std::move(bound).Admit();
-}
+    AnyTlsInboundSession(const AnyTlsInboundSession&) = delete;
+    AnyTlsInboundSession(AnyTlsInboundSession&&) = delete;
+
+    net::awaitable<tl::expected<proxy::AuthenticatedInbound, common::ErrorCode>>
+    Authenticate(transport::AsyncStream& stream,
+                 proxy::InboundAuthentication authentication,
+                 proxy::InboundContext& context) {
+        auto& ctx = context.session;
+        control_idle_timeout = context.timeouts.IdleTimeout();
+        if (context.pressure_idle_timeout > 0) {
+            control_idle_timeout = std::min(
+                control_idle_timeout,
+                std::chrono::seconds(context.pressure_idle_timeout));
+        }
+        std::array<uint8_t, 32> auth_hash{};
+        common::ScopedCleanse cleanse_hash{auth_hash};
+        if (auto ok = co_await ReadAuth(stream, auth_hash); !ok) {
+            co_return tl::unexpected(ok.error());
+        }
+        const auto credential = co_await authentication.VerifyCredential(
+            {proxy::KeyedInboundProtocol::AnyTls, auth_hash});
+        if (credential != common::ErrorCode::OK) co_return tl::unexpected(credential);
+        auto user = app::UserStore::FindAnyTlsUser(ctx.inbound.tag, auth_hash);
+        OPENSSL_cleanse(auth_hash.data(), auth_hash.size());
+        if (!user) {
+            co_return tl::unexpected(co_await authentication.RejectCredential("no matching credential"));
+        }
+        stream.SetWriteTimeout(
+            std::min(context.timeouts.WriteTimeout(), control_idle_timeout));
+
+        // One physical authentication and device lease; children reserve only
+        // their logical-stream admission once a target becomes available.
+        ctx.content.network = common::Network::MUX;
+        co_return std::move(authentication).Bind(user->profile, std::nullopt);
+    }
+
+    proxy::InboundContinuation Serve(
+        std::unique_ptr<transport::AsyncStream>& stream,
+        proxy::InboundContext& context) {
+        demux.emplace(
+            std::move(stream), context.dispatcher, context.settings.dispatch_policy,
+            context.admission, context.io_context, context.session,
+            context.timeouts, control_idle_timeout, padding_scheme);
+        return demux->Run();
+    }
+
+    const AnyTlsPaddingScheme* padding_scheme;
+    std::chrono::seconds control_idle_timeout{};
+    // Constructed only after authentication and device admission succeed.
+    std::optional<AnyTLSDemuxSession> demux;
+};
 
 }  // namespace
 
@@ -962,45 +988,12 @@ AnyTlsInboundHandler::Process(
     common::Context& ctx,
     const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
-    if (!stream) {
-        app::RelayResult result;
-        result.error = common::ErrorCode::PROTOCOL_DECODE_FAILED;
-        co_return result;
-    }
-
-    try {
-        auto control_idle_timeout = timeouts.IdleTimeout();
-        if (pressure_idle_timeout > 0) {
-            control_idle_timeout = std::min(
-                control_idle_timeout,
-                std::chrono::seconds(pressure_idle_timeout));
-        }
-
-        app::UserOnlineSessionGuard user_session;
-        {
-            auto auth = co_await AuthenticateSession(
-                *stream, environment_, ctx, timeouts, control_idle_timeout);
-            if (!auth) {
-                co_return proxy::RejectInbound(environment_.stats, stream.get(), auth.error());
-            }
-            user_session = std::move(*auth);
-        }
-        AnyTLSDemuxSession demux(
-            std::move(stream),
-            dispatcher,
-            settings.dispatch_policy,
-            environment_,
-            io_context,
-            ctx,
-            timeouts,
-            control_idle_timeout,
-            padding_scheme_.get());
-        co_return co_await demux.Run();
-    } catch (...) {
-        co_return proxy::RejectInbound(
-            environment_.stats, stream.get(),
-            proxy::ClassifyInboundHandshakeException(std::current_exception()));
-    }
+    return proxy::ProcessInbound<AnyTlsInboundSession>(
+        std::move(stream),
+        proxy::InboundContext{
+            environment_, dispatcher, settings, io_context, ctx, timeouts,
+            pressure_idle_timeout},
+        padding_scheme_.get());
 }
 
 namespace {
