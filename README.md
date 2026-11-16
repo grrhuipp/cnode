@@ -97,7 +97,7 @@ CI 只对源码、测试、构建配置变更自动运行，纯文档和部署�
 
 ## 架构总览
 
-所有 TCP / UDP 请求经过同一条数据链路：
+所有 TCP / UDP 逻辑请求（包括 Mux、AnyTLS 和 QUIC 子流）经过同一条数据链路；物理会话的认证与解复用不替代子请求各自的分发：
 
 ```text
 Inbound Handler::Process

@@ -101,7 +101,7 @@ AuthenticateTrojanRequest(transport::AsyncStream& stream,
 net::awaitable<app::RelayResult> DispatchTrojanUdp(
     std::unique_ptr<transport::AsyncStream> stream,
     routing::Dispatcher& dispatcher,
-    const app::ReceiverSettings& receiver,
+    const routing::DispatchPolicy& dispatch_policy,
     net::io_context& io_context,
     common::Context& ctx,
     const app::AdmissionEnvironment& environment,
@@ -109,10 +109,9 @@ net::awaitable<app::RelayResult> DispatchTrojanUdp(
     TrojanUdpStreamEndpoint udp_endpoint(*stream);
     co_return co_await dispatcher.Dispatch(
         io_context,
-        receiver.dispatch_policy,
-        std::move(stream),
-        transport::Link{&udp_endpoint, &udp_endpoint},
-        common::InitialPayload{},
+        dispatch_policy,
+        routing::DispatchRequest{
+            std::move(stream), transport::Link{&udp_endpoint, &udp_endpoint}},
         ctx,
         environment.stats,
         timeouts);
@@ -126,7 +125,7 @@ public:
     ::net::awaitable<::app::RelayResult> Process(
         std::unique_ptr<::transport::AsyncStream> stream,
         ::routing::Dispatcher& dispatcher,
-        const ::app::ReceiverSettings& receiver,
+        ::proxy::InboundSettings settings,
         ::net::io_context& io_context,
         ::common::Context& ctx,
         const ::infra::TimeoutsConfig& timeouts,
@@ -149,7 +148,7 @@ net::awaitable<app::RelayResult>
 TrojanInboundHandler::Process(
     std::unique_ptr<transport::AsyncStream> stream,
     routing::Dispatcher& dispatcher,
-    const app::ReceiverSettings& receiver,
+    proxy::InboundSettings settings,
     net::io_context& io_context,
     common::Context& ctx,
     const infra::TimeoutsConfig& timeouts,
@@ -169,15 +168,12 @@ TrojanInboundHandler::Process(
 
     if (ctx.content.network == common::Network::UDP) {
         co_return co_await DispatchTrojanUdp(
-            std::move(stream), dispatcher, receiver, io_context, ctx, environment_, timeouts);
+            std::move(stream), dispatcher, settings.dispatch_policy, io_context, ctx, environment_, timeouts);
     }
-    auto* tcp_stream = stream.get();
     co_return co_await dispatcher.Dispatch(
         io_context,
-        receiver.dispatch_policy,
-        std::move(stream),
-        transport::Link{tcp_stream, tcp_stream},
-        common::InitialPayload{},
+        settings.dispatch_policy,
+        routing::DispatchRequest{std::move(stream)},
         ctx,
         environment_.stats,
         timeouts);

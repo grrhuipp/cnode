@@ -183,7 +183,7 @@ CompleteVlessInboundHandshake(
     transport::MultiBufferWriter& protocol_writer,
     std::optional<::proxy::VlessEncryptedIo>* encrypted_io,
     const app::AdmissionEnvironment& environment,
-    const app::ReceiverSettings& receiver,
+    proxy::InboundSettings settings,
     common::Context& ctx) {
     auto auth_phase = co_await proxy::BeginInboundAuthentication(environment, ctx);
     if (!auth_phase) {
@@ -306,8 +306,7 @@ CompleteVlessInboundHandshake(
         co_return tl::unexpected(std::move(bound).Reject("flow does not support UDP", common::ErrorCode::PROTOCOL_UNSUPPORTED));
     }
     if (use_vision &&
-        (!(receiver.stream_settings.IsTlsLike() || decryption != nullptr) ||
-         receiver.stream_settings.network_mode != transport::NetworkMode::Tcp)) {
+        !(settings.raw_tcp && (settings.tls_like || decryption != nullptr))) {
         co_return tl::unexpected(std::move(bound).Reject("flow requires raw TCP TLS-like transport", common::ErrorCode::PROTOCOL_UNSUPPORTED));
     }
 
@@ -343,7 +342,7 @@ net::awaitable<app::RelayResult> DispatchVlessUdp(
     transport::MultiBufferWriter& active_writer,
     bool packet_addr_udp,
     routing::Dispatcher& dispatcher,
-    const app::ReceiverSettings& receiver,
+    const routing::DispatchPolicy& dispatch_policy,
     net::io_context& io_context,
     common::Context& ctx,
     const app::AdmissionEnvironment& environment,
@@ -366,10 +365,10 @@ net::awaitable<app::RelayResult> DispatchVlessUdp(
     }
     co_return co_await dispatcher.Dispatch(
         io_context,
-        receiver.dispatch_policy,
-        std::move(stream),
-        transport::Link{&udp_endpoint, &udp_endpoint},
-        std::move(first_datagram),
+        dispatch_policy,
+        routing::DispatchRequest{
+            std::move(stream), transport::Link{&udp_endpoint, &udp_endpoint},
+            std::move(first_datagram)},
         ctx,
         environment.stats,
         timeouts);
@@ -381,7 +380,7 @@ net::awaitable<app::RelayResult> DispatchVlessVision(
     transport::MultiBufferWriter& active_writer,
     std::array<uint8_t, 16> request_uuid,
     routing::Dispatcher& dispatcher,
-    const app::ReceiverSettings& receiver,
+    const routing::DispatchPolicy& dispatch_policy,
     net::io_context& io_context,
     common::Context& ctx,
     const app::AdmissionEnvironment& environment,
@@ -392,10 +391,9 @@ net::awaitable<app::RelayResult> DispatchVlessVision(
     OPENSSL_cleanse(request_uuid.data(), request_uuid.size());
     co_return co_await dispatcher.Dispatch(
         io_context,
-        receiver.dispatch_policy,
-        std::move(stream),
-        transport::Link{&vision_reader, &vision_writer},
-        common::InitialPayload{},
+        dispatch_policy,
+        routing::DispatchRequest{
+            std::move(stream), transport::Link{&vision_reader, &vision_writer}},
         ctx,
         environment.stats,
         timeouts);
@@ -407,7 +405,7 @@ net::awaitable<app::RelayResult> DispatchVlessVisionMux(
     transport::MultiBufferWriter& active_writer,
     std::array<uint8_t, 16> request_uuid,
     routing::Dispatcher& dispatcher,
-    const app::ReceiverSettings& receiver,
+    const routing::DispatchPolicy& dispatch_policy,
     net::io_context& io_context,
     common::Context& ctx,
     const app::AdmissionEnvironment& environment,
@@ -422,7 +420,7 @@ net::awaitable<app::RelayResult> DispatchVlessVisionMux(
         transport::Link{&vision_reader, &vision_writer},
         *stream,
         dispatcher,
-        receiver.dispatch_policy,
+        dispatch_policy,
         environment,
         ctx,
         environment.stats,
@@ -436,14 +434,16 @@ struct VlessSessionMeta {
     bool use_vision = false;
 };
 
+// The caller retains the stream for plain Mux; other branches transfer it
+// into their dispatch request or wrapper coroutine.
 net::awaitable<app::RelayResult> DispatchVlessSession(
-    std::unique_ptr<transport::AsyncStream> stream,
+    std::unique_ptr<transport::AsyncStream>& stream,
     proxy::BufferedStreamReader& active_reader,
     transport::MultiBufferWriter& response_writer,
     VlessSessionMeta meta,
     const std::array<uint8_t, 16>& request_uuid,
     routing::Dispatcher& dispatcher,
-    const app::ReceiverSettings& receiver,
+    const routing::DispatchPolicy& dispatch_policy,
     net::io_context& io_context,
     common::Context& ctx,
     const app::AdmissionEnvironment& environment,
@@ -457,7 +457,7 @@ net::awaitable<app::RelayResult> DispatchVlessSession(
                 response_writer,
                 request_uuid,
                 dispatcher,
-                receiver,
+                dispatch_policy,
                 io_context,
                 ctx,
                 environment,
@@ -469,7 +469,7 @@ net::awaitable<app::RelayResult> DispatchVlessSession(
             transport::Link{&active_reader, &response_writer},
             *stream,
             dispatcher,
-            receiver.dispatch_policy,
+            dispatch_policy,
             environment,
             ctx,
             environment.stats,
@@ -484,7 +484,7 @@ net::awaitable<app::RelayResult> DispatchVlessSession(
             response_writer,
             meta.packet_addr_udp,
             dispatcher,
-            receiver,
+            dispatch_policy,
             io_context,
             ctx,
             environment,
@@ -497,7 +497,7 @@ net::awaitable<app::RelayResult> DispatchVlessSession(
             response_writer,
             request_uuid,
             dispatcher,
-            receiver,
+            dispatch_policy,
             io_context,
             ctx,
             environment,
@@ -505,10 +505,9 @@ net::awaitable<app::RelayResult> DispatchVlessSession(
     }
     return dispatcher.Dispatch(
         io_context,
-        receiver.dispatch_policy,
-        std::move(stream),
-        transport::Link{&active_reader, &response_writer},
-        common::InitialPayload{},
+        dispatch_policy,
+        routing::DispatchRequest{
+            std::move(stream), transport::Link{&active_reader, &response_writer}},
         ctx,
         environment.stats,
         timeouts);
@@ -527,7 +526,7 @@ public:
     ::net::awaitable<::app::RelayResult> Process(
         std::unique_ptr<::transport::AsyncStream> stream,
         ::routing::Dispatcher& dispatcher,
-        const ::app::ReceiverSettings& receiver,
+        ::proxy::InboundSettings settings,
         ::net::io_context& io_context,
         ::common::Context& ctx,
         const ::infra::TimeoutsConfig& timeouts,
@@ -537,7 +536,7 @@ private:
     ::net::awaitable<::app::RelayResult> ProcessPlain(
         std::unique_ptr<::transport::AsyncStream> stream,
         ::routing::Dispatcher& dispatcher,
-        const ::app::ReceiverSettings& receiver,
+        ::proxy::InboundSettings settings,
         ::net::io_context& io_context,
         ::common::Context& ctx,
         const ::infra::TimeoutsConfig& timeouts,
@@ -545,7 +544,7 @@ private:
     ::net::awaitable<::app::RelayResult> ProcessEncrypted(
         std::unique_ptr<::transport::AsyncStream> stream,
         ::routing::Dispatcher& dispatcher,
-        const ::app::ReceiverSettings& receiver,
+        ::proxy::InboundSettings settings,
         ::net::io_context& io_context,
         ::common::Context& ctx,
         const ::infra::TimeoutsConfig& timeouts,
@@ -569,24 +568,24 @@ net::awaitable<app::RelayResult>
 proxy::VlessInboundHandler::Process(
     std::unique_ptr<transport::AsyncStream> stream,
     routing::Dispatcher& dispatcher,
-    const app::ReceiverSettings& receiver,
+    proxy::InboundSettings settings,
     net::io_context& io_context,
     common::Context& ctx,
     const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
     if (decryption_) {
         return ProcessEncrypted(
-            std::move(stream), dispatcher, receiver, io_context, ctx, timeouts, pressure_idle_timeout);
+            std::move(stream), dispatcher, settings, io_context, ctx, timeouts, pressure_idle_timeout);
     }
     return ProcessPlain(
-        std::move(stream), dispatcher, receiver, io_context, ctx, timeouts, pressure_idle_timeout);
+        std::move(stream), dispatcher, settings, io_context, ctx, timeouts, pressure_idle_timeout);
 }
 
 net::awaitable<app::RelayResult>
 proxy::VlessInboundHandler::ProcessPlain(
     std::unique_ptr<transport::AsyncStream> stream,
     routing::Dispatcher& dispatcher,
-    const app::ReceiverSettings& receiver,
+    proxy::InboundSettings settings,
     net::io_context& io_context,
     common::Context& ctx,
     const infra::TimeoutsConfig& timeouts,
@@ -604,7 +603,7 @@ proxy::VlessInboundHandler::ProcessPlain(
             *stream,
             nullptr,
             environment_,
-            receiver,
+            settings,
             ctx);
         if (!handshake) {
             co_return proxy::RejectInbound(environment_.stats, stream.get(), handshake.error());
@@ -621,13 +620,13 @@ proxy::VlessInboundHandler::ProcessPlain(
     }
     VlessResponseHeaderWriter response_writer(*stream);
     co_return co_await DispatchVlessSession(
-        std::move(stream),
+        stream,
         protocol_reader,
         response_writer,
         meta,
         request_uuid,
         dispatcher,
-        receiver,
+        settings.dispatch_policy,
         io_context,
         ctx,
         environment_,
@@ -639,7 +638,7 @@ net::awaitable<app::RelayResult>
 proxy::VlessInboundHandler::ProcessEncrypted(
     std::unique_ptr<transport::AsyncStream> stream,
     routing::Dispatcher& dispatcher,
-    const app::ReceiverSettings& receiver,
+    proxy::InboundSettings settings,
     net::io_context& io_context,
     common::Context& ctx,
     const infra::TimeoutsConfig& timeouts,
@@ -662,7 +661,7 @@ proxy::VlessInboundHandler::ProcessEncrypted(
             protocol_writer,
             &encrypted_io,
             environment_,
-            receiver,
+            settings,
             ctx);
         if (!handshake) {
             co_return proxy::RejectInbound(environment_.stats, stream.get(), handshake.error());
@@ -681,13 +680,13 @@ proxy::VlessInboundHandler::ProcessEncrypted(
     }
     VlessResponseHeaderWriter response_writer(*active_writer);
     co_return co_await DispatchVlessSession(
-        std::move(stream),
+        stream,
         *active_reader,
         response_writer,
         meta,
         request_uuid,
         dispatcher,
-        receiver,
+        settings.dispatch_policy,
         io_context,
         ctx,
         environment_,

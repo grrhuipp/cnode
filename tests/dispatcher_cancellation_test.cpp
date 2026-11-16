@@ -289,9 +289,10 @@ void ExerciseDispatch(Case which, bool controlled, common::ErrorCode reason = co
             else reader->Cancellation().Stop(reason);
         });
     }
-    auto request = dispatcher.Dispatch(io, policy, controlled ? std::move(stream) : nullptr,
-        controlled ? transport::Link{} : transport::Link{reader, reader, nullptr},
-        common::InitialPayload{}, ctx, stats, timeouts);
+    auto request = dispatcher.Dispatch(io, policy,
+        controlled ? routing::DispatchRequest(std::move(stream))
+                   : routing::DispatchRequest(transport::Link{reader, reader, nullptr}),
+        ctx, stats, timeouts);
     net::co_spawn(io, std::move(request), net::bind_cancellation_slot(parent.slot(),
         [&](std::exception_ptr error, app::RelayResult value) { failure = error; result = value; done = true; }));
     io.run_for(180ms);
@@ -415,10 +416,11 @@ void ExerciseSiblingIsolation(bool controlled) {
     size_t load_on_first_completion = 0;
     net::cancellation_signal cancel_first, cancel_second;
     app::RelayResult result_a, result_b;
-    const auto link_a = controlled ? transport::Link{} : transport::Link{first.get(), first.get(), nullptr};
-    const auto link_b = controlled ? transport::Link{} : transport::Link{second.get(), second.get(), nullptr};
-    net::co_spawn(io, dispatcher.Dispatch(io, policy_a, controlled ? std::move(first) : nullptr,
-        link_a, common::InitialPayload{}, ctx_a, stats, timeouts),
+    const auto link_a = transport::Link{first.get(), first.get(), nullptr};
+    const auto link_b = transport::Link{second.get(), second.get(), nullptr};
+    net::co_spawn(io, dispatcher.Dispatch(io, policy_a,
+        controlled ? routing::DispatchRequest(std::move(first)) : routing::DispatchRequest(link_a),
+        ctx_a, stats, timeouts),
         net::bind_cancellation_slot(cancel_first.slot(), [&](std::exception_ptr error, app::RelayResult result) {
             EXPECT_FALSE(error);
             first_done = true;
@@ -426,8 +428,9 @@ void ExerciseSiblingIsolation(bool controlled) {
             first_active_on_completion = outbounds.direct.state.active;
             load_on_first_completion = load.ActiveConnections();
         }));
-    net::co_spawn(io, dispatcher.Dispatch(io, policy_b, controlled ? std::move(second) : nullptr,
-        link_b, common::InitialPayload{}, ctx_b, stats, timeouts),
+    net::co_spawn(io, dispatcher.Dispatch(io, policy_b,
+        controlled ? routing::DispatchRequest(std::move(second)) : routing::DispatchRequest(link_b),
+        ctx_b, stats, timeouts),
         net::bind_cancellation_slot(cancel_second.slot(), [&](std::exception_ptr error, app::RelayResult result) {
             EXPECT_FALSE(error);
             second_done = true;

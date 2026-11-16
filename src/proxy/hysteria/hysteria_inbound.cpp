@@ -13,7 +13,6 @@
 #include "infra/log.hpp"
 #include "proxy/inbound.hpp"
 #include "transport/async_stream.hpp"
-#include "transport/link.hpp"
 
 #include <tl/expected.hpp>
 
@@ -125,27 +124,26 @@ public:
     net::awaitable<app::RelayResult> Process(
         std::unique_ptr<transport::AsyncStream> stream,
         routing::Dispatcher& dispatcher,
-        const app::ReceiverSettings& receiver,
+        proxy::InboundSettings settings,
         net::io_context& io_context,
         common::Context& ctx,
         const infra::TimeoutsConfig& timeouts,
         uint32_t /*pressure_idle_timeout*/) override {
         if (ctx.content.network == common::Network::UDP) {
-            const transport::Link client{stream.get(), stream.get()};
             return dispatcher.Dispatch(
-                io_context, receiver.dispatch_policy, std::move(stream),
-                client, common::InitialPayload{},
+                io_context, settings.dispatch_policy,
+                routing::DispatchRequest{std::move(stream)},
                 ctx, stats_, timeouts);
         }
         return ProcessTcp(
-            std::move(stream), dispatcher, receiver, io_context, ctx, timeouts);
+            std::move(stream), dispatcher, settings.dispatch_policy, io_context, ctx, timeouts);
     }
 
 private:
     net::awaitable<app::RelayResult> ProcessTcp(
         std::unique_ptr<transport::AsyncStream> stream,
         routing::Dispatcher& dispatcher,
-        const app::ReceiverSettings& receiver,
+        const routing::DispatchPolicy& dispatch_policy,
         net::io_context& io_context,
         common::Context& ctx,
         const infra::TimeoutsConfig& timeouts) {
@@ -157,11 +155,9 @@ private:
             }
             initial_payload = std::move(*handshake);
         }
-        auto* tcp_stream = stream.get();
         co_return co_await dispatcher.Dispatch(
-            io_context, receiver.dispatch_policy, std::move(stream),
-            transport::Link{tcp_stream, tcp_stream},
-            std::move(initial_payload),
+            io_context, dispatch_policy,
+            routing::DispatchRequest{std::move(stream), std::move(initial_payload)},
             ctx, stats_, timeouts);
     }
 

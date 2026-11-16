@@ -716,9 +716,9 @@ net::awaitable<void> UdpIngress::RunNativeDispatch(ClientSessionPtr client_sessi
             co_return;
         }
         RelayResult result = co_await request.dispatcher->Dispatch(
-            *request.io_context, request.policy, nullptr,
-            transport::Link{client_session.get(), client_session.get()},
-            common::InitialPayload{}, request.context, request.admission->stats, request.timeouts);
+            *request.io_context, request.policy,
+            routing::DispatchRequest{transport::Link{client_session.get(), client_session.get()}},
+            request.context, request.admission->stats, request.timeouts);
         if (result.error != common::ErrorCode::OK) {
             LOG_CONN_DEBUG(request.context,
                 "UDP dispatcher ended > {} up={}B down={}B",

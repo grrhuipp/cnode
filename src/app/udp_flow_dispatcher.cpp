@@ -232,11 +232,9 @@ public:
         transport::Link parent,
         common::Context& parent_context,
         app::StatsShard& stats,
-        net::io_context& io_context,
-        bool terminate_on_flow_error)
+        net::io_context& io_context)
         : parent_(parent), parent_context_(parent_context), stats_(stats),
-          io_context_(io_context),
-          terminate_on_flow_error_(terminate_on_flow_error) {}
+          io_context_(io_context) {}
 
     [[nodiscard]] Resolution Resolve(
         const common::TargetAddress& target,
@@ -383,7 +381,6 @@ public:
         const std::shared_ptr<UdpRouteFlow>& flow,
         const RelayResult& child) noexcept {
         const bool terminate_stream_association =
-            terminate_on_flow_error_ &&
             flows_.size() == 1 &&
             child.error != common::ErrorCode::OK &&
             child.error != common::ErrorCode::CANCELLED &&
@@ -574,7 +571,6 @@ private:
     common::Context& parent_context_;
     app::StatsShard& stats_;
     net::io_context& io_context_;
-    bool terminate_on_flow_error_ = false;
     transport::AsyncWriteGate write_gate_;
     common::SignalChannel room_signal_{io_context_.get_executor(), 1};
     std::unordered_map<
@@ -689,32 +685,24 @@ net::awaitable<void> DispatchUdpFlows(
     DefaultDispatcher& dispatcher,
     net::io_context& io_context,
     const routing::DispatchPolicy& policy,
-    std::unique_ptr<transport::AsyncStream> inbound,
-    transport::Link inbound_link,
-    common::InitialPayload first_packet,
+    routing::DispatchRequest request,
     common::Context& parent_context,
     StatsShard& stats,
     const infra::TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout,
     RelayResult& result,
     common::ErrorCode& cancellation_reason) {
-    const bool has_protocol_link = inbound_link.Valid();
-    transport::AsyncStream* inbound_endpoint = inbound.get();
-    transport::Link parent_link{
-        has_protocol_link ? inbound_link.reader : inbound_endpoint,
-        has_protocol_link ? inbound_link.writer : inbound_endpoint,
-        inbound_link.control ? inbound_link.control : inbound_endpoint,
-    };
+    const transport::Link parent_link = request.Endpoints();
     if (!parent_link.Valid()) {
         result.error = common::ErrorCode::PROTOCOL_DECODE_FAILED;
         co_return;
     }
 
     auto state = std::make_shared<UdpAssociationState>(
-        parent_link, parent_context, stats, io_context, has_protocol_link);
+        parent_link, parent_context, stats, io_context);
     common::ResidentTaskGroup children(io_context.get_executor());
     std::exception_ptr failure;
-    common::MultiBuffer initial = std::move(first_packet).MoveToMultiBuffer();
+    common::MultiBuffer initial = std::move(request.first_payload).MoveToMultiBuffer();
 
     static constexpr auto run_flow = [](
         DefaultDispatcher* dispatcher,
@@ -727,12 +715,11 @@ net::awaitable<void> DispatchUdpFlows(
         std::shared_ptr<UdpRouteFlow> flow) -> net::awaitable<void> {
         RelayResult child_result;
         common::ErrorCode child_cancellation = common::ErrorCode::OK;
-        common::InitialPayload no_initial_payload;
         try {
             co_await dispatcher->DispatchPreparedLink(
-                *io_context, *policy, nullptr,
-                transport::Link{flow.get(), flow.get()},
-                no_initial_payload, flow->context, *stats, *timeouts,
+                *io_context, *policy,
+                routing::DispatchRequest{transport::Link{flow.get(), flow.get()}},
+                flow->context, *stats, *timeouts,
                 pressure_idle_timeout, false,
                 child_result, child_cancellation);
         } catch (...) {

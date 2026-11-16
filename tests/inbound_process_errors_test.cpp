@@ -122,7 +122,7 @@ class Proxy final : public proxy::Inbound {
 public:
     Proxy(int fault, bool codec) : fault_(fault), codec_(codec) {}
     net::awaitable<app::RelayResult> Process(std::unique_ptr<transport::AsyncStream> stream,
-        routing::Dispatcher&, const app::ReceiverSettings&, net::io_context&,
+        routing::Dispatcher&, proxy::InboundSettings, net::io_context&,
         common::Context&, const infra::TimeoutsConfig&, uint32_t) override {
         app::RelayResult result;
         if (codec_) {
@@ -141,7 +141,7 @@ private:
 
 class Dispatcher final : public routing::Dispatcher {
     net::awaitable<app::RelayResult> Dispatch(net::io_context&, const routing::DispatchPolicy&,
-        std::unique_ptr<transport::AsyncStream>, transport::Link, common::InitialPayload, common::Context&,
+        routing::DispatchRequest, common::Context&,
         app::StatsShard&, const infra::TimeoutsConfig&) override { throw std::logic_error("unexpected dispatch"); co_return app::RelayResult{}; }
 };
 
@@ -175,7 +175,7 @@ public:
 
     net::awaitable<app::RelayResult> Process(
         std::unique_ptr<transport::AsyncStream> stream, routing::Dispatcher&,
-        const app::ReceiverSettings&, net::io_context&,
+        proxy::InboundSettings, net::io_context&,
         common::Context&, const infra::TimeoutsConfig&, uint32_t) override {
         const int id = static_cast<Stream&>(*stream).GetState().id;
         ++test_.entered;

@@ -237,8 +237,9 @@ public:
     int overlapping_contexts = 0;
     int changed_contexts = 0;
     net::awaitable<app::RelayResult> Dispatch(net::io_context& io,
-        const routing::DispatchPolicy&, std::unique_ptr<transport::AsyncStream>, transport::Link link,
-        common::InitialPayload, common::Context& ctx, app::StatsShard&, const infra::TimeoutsConfig&) override {
+        const routing::DispatchPolicy&, routing::DispatchRequest request,
+        common::Context& ctx, app::StatsShard&, const infra::TimeoutsConfig&) override {
+        const auto link = request.Endpoints();
         struct Scope {
             Dispatcher& owner;
             size_t index;
@@ -275,11 +276,11 @@ public:
 };
 
 net::awaitable<app::RelayResult> RunMux(std::unique_ptr<transport::AsyncStream> stream,
-    routing::Dispatcher& dispatcher, const app::ReceiverSettings& receiver,
+    routing::Dispatcher& dispatcher, proxy::InboundSettings settings,
     net::io_context& io, const app::AdmissionEnvironment& environment,
     common::Context& context, app::StatsShard& stats, const infra::TimeoutsConfig& timeouts) {
     co_return co_await proxy::ServeMuxInbound(io, {stream.get(), stream.get(), stream.get()},
-        *stream, dispatcher, receiver.dispatch_policy, environment, context, stats, timeouts, 0,
+        *stream, dispatcher, settings.dispatch_policy, environment, context, stats, timeouts, 0,
         proxy::MuxAllowedNetwork::Any);
 }
 
@@ -290,8 +291,8 @@ void RunCase(int mode, bool blocked_writes, bool mux) {
     const auto hash = proxy::HashAnyTlsPassword("lifecycle-test");
     stream.input.assign(hash.begin(), hash.end());
     stream.input.insert(stream.input.end(), {0, 0});
-    constexpr std::array<uint8_t, 3> settings{'v', '=', '2'};
-    Frame(stream.input, 4, 0, settings);
+    constexpr std::array<uint8_t, 3> client_settings{'v', '=', '2'};
+    Frame(stream.input, 4, 0, client_settings);
     constexpr std::array<uint8_t, 7> target{1, 127, 0, 0, 1, 0, 80};
     for (uint32_t sid = 1; sid <= 2; ++sid) {
         Frame(stream.input, 1, sid);
@@ -321,6 +322,9 @@ void RunCase(int mode, bool blocked_writes, bool mux) {
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
+    const proxy::InboundSettings settings{
+        receiver.dispatch_policy, receiver.stream_settings.network_mode == transport::NetworkMode::Tcp,
+        receiver.stream_settings.IsTlsLike()};
     common::Context context;
     context.inbound.tag = "lifecycle";
     context.inbound.source_ip = "127.0.0.1";
@@ -332,8 +336,8 @@ void RunCase(int mode, bool blocked_writes, bool mux) {
     std::exception_ptr failure;
     common::ErrorCode returned_error = common::ErrorCode::INTERNAL;
     auto request = mux
-        ? RunMux(std::make_unique<Stream>(stream), dispatcher, receiver, io, environment, context, stats, timeouts)
-        : handler.Process(std::make_unique<Stream>(stream), dispatcher, receiver, io, context, timeouts, 0);
+        ? RunMux(std::make_unique<Stream>(stream), dispatcher, settings, io, environment, context, stats, timeouts)
+        : handler.Process(std::make_unique<Stream>(stream), dispatcher, settings, io, context, timeouts, 0);
     CleanupGuard cleanup([&] {
         cancellation.emit(net::cancellation_type::all);
         stream.closed = true;
@@ -456,9 +460,9 @@ void RunHandshakeCase(int mode) {
     const auto hash = proxy::HashAnyTlsPassword("handshake-test");
     stream.input.assign(hash.begin(), hash.end());
     stream.input.insert(stream.input.end(), {0, 0});
-    constexpr std::array<uint8_t, 3> settings{'v', '=', '2'};
+    constexpr std::array<uint8_t, 3> client_settings{'v', '=', '2'};
     constexpr std::array<uint8_t, 7> target{1, 127, 0, 0, 1, 0, 80};
-    Frame(stream.input, 4, 0, settings);
+    Frame(stream.input, 4, 0, client_settings);
     for (uint32_t sid = 1; sid <= (mode == 3 ? 129u : 1u); ++sid) {
         Frame(stream.input, 1, sid);
         if (mode != 3) Frame(stream.input, 2, sid, target);
@@ -477,6 +481,9 @@ void RunHandshakeCase(int mode) {
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
+    const proxy::InboundSettings settings{
+        receiver.dispatch_policy, receiver.stream_settings.network_mode == transport::NetworkMode::Tcp,
+        receiver.stream_settings.IsTlsLike()};
     common::Context context;
     context.inbound.tag = "handshake";
     infra::TimeoutsConfig timeouts;
@@ -501,7 +508,7 @@ void RunHandshakeCase(int mode) {
         domain.Shutdown();
     });
     net::co_spawn(domain.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
-        receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
+        settings, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
         [&](std::exception_ptr error, app::RelayResult result) {
             failure = error;
             returned_error = result.error;
@@ -615,8 +622,8 @@ void RunIdentityCase(int mode) {
     const auto hash = proxy::HashAnyTlsPassword("identity-test");
     stream.input.assign(hash.begin(), hash.end());
     stream.input.insert(stream.input.end(), {0, 0});
-    constexpr std::array<uint8_t, 3> settings{'v', '=', '2'};
-    Frame(stream.input, 4, 0, settings);
+    constexpr std::array<uint8_t, 3> client_settings{'v', '=', '2'};
+    Frame(stream.input, 4, 0, client_settings);
     const uint32_t first_sid = mode == 6 ? UINT32_MAX : 7;
     constexpr std::array<uint8_t, 7> target{1, 127, 0, 0, 1, 0, 80};
     constexpr std::array<uint8_t, 7> changed_target{1, 127, 0, 0, 1, 0, 81};
@@ -637,6 +644,9 @@ void RunIdentityCase(int mode) {
     Dispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
+    const proxy::InboundSettings settings{
+        receiver.dispatch_policy, receiver.stream_settings.network_mode == transport::NetworkMode::Tcp,
+        receiver.stream_settings.IsTlsLike()};
     common::Context context;
     context.inbound.tag = "identity";
     context.inbound.source_ip = "127.0.0.1";
@@ -656,7 +666,7 @@ void RunIdentityCase(int mode) {
         domain.Shutdown();
     });
     net::co_spawn(domain.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
-        receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr error, app::RelayResult result) {
+        settings, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(), [&](std::exception_ptr error, app::RelayResult result) {
             returned = true;
             failure = error;
             result_error = result.error;
@@ -729,11 +739,12 @@ public:
     std::string host;
     int calls = 0;
     net::awaitable<app::RelayResult> Dispatch(net::io_context&,
-        const routing::DispatchPolicy&, std::unique_ptr<transport::AsyncStream>, transport::Link link,
-        common::InitialPayload first, common::Context& ctx, app::StatsShard&, const infra::TimeoutsConfig&) override {
+        const routing::DispatchPolicy&, routing::DispatchRequest request,
+        common::Context& ctx, app::StatsShard&, const infra::TimeoutsConfig&) override {
+        const auto link = request.Endpoints();
         ++calls;
         host = ctx.outbound.target.host;
-        auto data = std::move(first).MoveToMultiBuffer();
+        auto data = std::move(request.first_payload).MoveToMultiBuffer();
         while (bytes.size() < 60000) {
             const auto span = data.FrontSpan();
             bytes.insert(bytes.end(), span.begin(), span.end());
@@ -752,8 +763,8 @@ void RunParsingCase(int mode) {
     const auto hash = proxy::HashAnyTlsPassword("parsing-test");
     stream.input.assign(hash.begin(), hash.end());
     stream.input.insert(stream.input.end(), {0, 0});
-    constexpr std::array<uint8_t, 3> settings{'v', '=', '2'};
-    Frame(stream.input, 4, 0, settings);
+    constexpr std::array<uint8_t, 3> client_settings{'v', '=', '2'};
+    Frame(stream.input, 4, 0, client_settings);
     Frame(stream.input, 1, 1);
     std::vector<uint8_t> target{1, 127, 0, 0, 1, 0, 80};
     const std::string domain = std::string(63, 'a') + '.' + std::string(63, 'b') + '.' +
@@ -800,6 +811,9 @@ void RunParsingCase(int mode) {
     ParsingDispatcher dispatcher;
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
+    const proxy::InboundSettings settings{
+        receiver.dispatch_policy, receiver.stream_settings.network_mode == transport::NetworkMode::Tcp,
+        receiver.stream_settings.IsTlsLike()};
     common::Context context;
     context.inbound.tag = "parsing";
     infra::TimeoutsConfig timeouts;
@@ -817,7 +831,7 @@ void RunParsingCase(int mode) {
         execution.Shutdown();
     });
     net::co_spawn(execution.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
-        receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
+        settings, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
         [&](std::exception_ptr error, app::RelayResult result) {
             returned = true;
             failure = error;
@@ -861,12 +875,13 @@ public:
     int active = 0;
     std::vector<uint8_t> received;
     net::awaitable<app::RelayResult> Dispatch(net::io_context& io,
-        const routing::DispatchPolicy&, std::unique_ptr<transport::AsyncStream>, transport::Link link,
-        common::InitialPayload first, common::Context&, app::StatsShard&, const infra::TimeoutsConfig&) override {
+        const routing::DispatchPolicy&, routing::DispatchRequest request,
+        common::Context&, app::StatsShard&, const infra::TimeoutsConfig&) override {
+        const auto link = request.Endpoints();
         ++active;
         (void)co_await gate.async_wait(net::as_tuple(net::use_awaitable));
         if (consume) {
-            auto data = std::move(first).MoveToMultiBuffer();
+            auto data = std::move(request.first_payload).MoveToMultiBuffer();
             try {
                 while (true) {
                     const auto span = data.FrontSpan();
@@ -893,9 +908,9 @@ void RunQueueCase(int mode, uint32_t seed = 0) {
     const auto hash = proxy::HashAnyTlsPassword("queue-test");
     stream.input.assign(hash.begin(), hash.end());
     stream.input.insert(stream.input.end(), {0, 0});
-    constexpr std::array<uint8_t, 3> settings{'v', '=', '2'};
+    constexpr std::array<uint8_t, 3> client_settings{'v', '=', '2'};
     constexpr std::array<uint8_t, 7> target{1, 127, 0, 0, 1, 0, 80};
-    Frame(stream.input, 4, 0, settings);
+    Frame(stream.input, 4, 0, client_settings);
     Frame(stream.input, 1, 1);
     Frame(stream.input, 2, 1, target);
     using namespace app;
@@ -912,6 +927,9 @@ void RunQueueCase(int mode, uint32_t seed = 0) {
     QueueDispatcher dispatcher(io);
     ReceiverSettings receiver{.inbound_tag = {}, .inbound_tags = {}, .protocol = {},
         .stream_settings = {}, .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
+    const proxy::InboundSettings settings{
+        receiver.dispatch_policy, receiver.stream_settings.network_mode == transport::NetworkMode::Tcp,
+        receiver.stream_settings.IsTlsLike()};
     common::Context context;
     context.inbound.tag = "queue";
     infra::TimeoutsConfig timeouts;
@@ -933,7 +951,7 @@ void RunQueueCase(int mode, uint32_t seed = 0) {
         domain.Shutdown();
     });
     net::co_spawn(domain.Executor(), handler.Process(std::make_unique<Stream>(stream), dispatcher,
-        receiver, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
+        settings, io, context, timeouts, 0), net::bind_cancellation_slot(cancellation.slot(),
         [&](std::exception_ptr, app::RelayResult) {
             returned = true; active_at_return = dispatcher.active;
         }));
@@ -1028,8 +1046,9 @@ public:
     std::vector<Packet> received;
 
     net::awaitable<app::RelayResult> Dispatch(net::io_context&,
-        const routing::DispatchPolicy&, std::unique_ptr<transport::AsyncStream>, transport::Link link,
-        common::InitialPayload, common::Context& ctx, app::StatsShard&, const infra::TimeoutsConfig&) override {
+        const routing::DispatchPolicy&, routing::DispatchRequest request,
+        common::Context& ctx, app::StatsShard&, const infra::TimeoutsConfig&) override {
+        const auto link = request.Endpoints();
         struct Scope {
             MuxUdpDispatcher& owner;
             explicit Scope(MuxUdpDispatcher& value) : owner(value) { ++owner.active; }
@@ -1074,6 +1093,9 @@ void RunMuxUdpCase(int mode) {
     app::ReceiverSettings receiver{
         .inbound_tag = {}, .inbound_tags = {}, .protocol = {}, .stream_settings = {},
         .dispatch_policy = {{}, routing::ForceOutbound{"direct"}}};
+    const proxy::InboundSettings settings{
+        receiver.dispatch_policy, receiver.stream_settings.network_mode == transport::NetworkMode::Tcp,
+        receiver.stream_settings.IsTlsLike()};
     common::Context context;
     context.inbound.tag = "mux-udp";
     infra::TimeoutsConfig timeouts;
@@ -1104,7 +1126,7 @@ void RunMuxUdpCase(int mode) {
         domain.Shutdown();
     });
     net::co_spawn(domain.Executor(),
-        RunMux(std::make_unique<Stream>(stream), dispatcher, receiver, io, environment, context, stats, timeouts),
+        RunMux(std::make_unique<Stream>(stream), dispatcher, settings, io, environment, context, stats, timeouts),
         net::bind_cancellation_slot(cancellation.slot(),
             [&](std::exception_ptr error, app::RelayResult) { failure = error; returned = true; }));
     io.poll();

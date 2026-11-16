@@ -63,7 +63,7 @@ public:
     ::net::awaitable<::app::RelayResult> Process(
         std::unique_ptr<::transport::AsyncStream>,
         ::routing::Dispatcher&,
-        const ::app::ReceiverSettings&,
+        ::proxy::InboundSettings,
         ::net::io_context&,
         ::common::Context&,
         const ::infra::TimeoutsConfig&,
@@ -140,8 +140,7 @@ class NoDispatch final : public ::routing::Dispatcher {
 public:
     ::net::awaitable<::app::RelayResult> Dispatch(
         ::net::io_context&, const ::routing::DispatchPolicy&,
-        std::unique_ptr<::transport::AsyncStream>, ::transport::Link,
-        ::common::InitialPayload, ::common::Context&, ::app::StatsShard&,
+        ::routing::DispatchRequest, ::common::Context&, ::app::StatsShard&,
         const ::infra::TimeoutsConfig&) override {
         ADD_FAILURE() << "uplink fixture started an unexpected native job";
         co_return ::app::RelayResult{};

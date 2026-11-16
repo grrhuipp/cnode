@@ -46,7 +46,7 @@ class DummyInbound : public ::proxy::Inbound {
 public:
     ::net::awaitable<::app::RelayResult> Process(
         std::unique_ptr<::transport::AsyncStream>, ::routing::Dispatcher&,
-        const ::app::ReceiverSettings&, ::net::io_context&,
+        ::proxy::InboundSettings, ::net::io_context&,
         ::common::Context&, const ::infra::TimeoutsConfig&, uint32_t) override {
         co_return ::app::RelayResult{};
     }
@@ -150,9 +150,9 @@ public:
     const ::transport::MultiBufferReader* last_reader = nullptr;
     ::net::awaitable<::app::RelayResult> Dispatch(
         ::net::io_context&, const ::routing::DispatchPolicy&,
-        std::unique_ptr<::transport::AsyncStream>, ::transport::Link link,
-        ::common::InitialPayload, ::common::Context&, ::app::StatsShard&,
+        ::routing::DispatchRequest request, ::common::Context&, ::app::StatsShard&,
         const ::infra::TimeoutsConfig&) override {
+        const auto link = request.Endpoints();
         ++dispatched;
         EXPECT_NE(link.reader, nullptr);
         if (!link.reader) co_return ::app::RelayResult{};

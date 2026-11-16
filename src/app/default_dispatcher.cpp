@@ -336,9 +336,7 @@ DefaultDispatcher::DefaultDispatcher(
 net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     net::io_context& io_context,
     const routing::DispatchPolicy& policy,
-    std::unique_ptr<transport::AsyncStream> inbound,
-    transport::Link inbound_link,
-    common::InitialPayload first_packet,
+    routing::DispatchRequest request,
     common::Context& ctx,
     StatsShard& stats,
     const infra::TimeoutsConfig& timeouts) {
@@ -374,7 +372,7 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
         if (parent_cancellation.cancelled() != net::cancellation_type::none) {
             throw IoSystemError(net::error::operation_aborted);
         }
-        auto* cancellation_reader = inbound_link.Valid() ? inbound_link.reader : inbound.get();
+        auto* cancellation_reader = request.Endpoints().reader;
         if (cancellation_reader) {
             cancellation.Resubscribe(cancellation_reader->Cancellation());
         }
@@ -386,8 +384,8 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
         co_await net::async_initiate<const net::use_awaitable_t<>&, void(std::exception_ptr)>(
             [&, exec = std::move(exec),
              task = DispatchPreparedLink(
-                 io_context, policy, std::move(inbound), inbound_link,
-                 first_packet, ctx, stats, timeouts, pressure_idle_timeout, true,
+                 io_context, policy, std::move(request),
+                 ctx, stats, timeouts, pressure_idle_timeout, true,
                  result, cancellation_reason)](auto handler) mutable {
                 cancellation.BindParent(net::get_associated_cancellation_slot(handler));
                 net::co_spawn(
@@ -421,9 +419,7 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
 net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     net::io_context& io_context,
     const routing::DispatchPolicy& policy,
-    std::unique_ptr<transport::AsyncStream> inbound,
-    transport::Link inbound_link,
-    common::InitialPayload& first_packet,
+    routing::DispatchRequest request,
     common::Context& ctx,
     StatsShard& stats,
     const infra::TimeoutsConfig& timeouts,
@@ -431,19 +427,16 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     bool split_udp_association,
     RelayResult& result,
     common::ErrorCode& cancellation_reason) {
-    const bool has_protocol_link = inbound_link.Valid();
-    if (!inbound && !has_protocol_link) {
+    const transport::Link inbound_link = request.Endpoints();
+    if (!inbound_link.Valid()) {
         stats.OnError();
         result = MakeRelayError(common::ErrorCode::PROTOCOL_DECODE_FAILED);
         co_return;
     }
-    transport::AsyncStream* inbound_endpoint = inbound.get();
-    transport::MultiBufferReader* inbound_reader =
-        has_protocol_link ? inbound_link.reader : inbound_endpoint;
-    transport::MultiBufferWriter* inbound_writer =
-        has_protocol_link ? inbound_link.writer : inbound_endpoint;
-    transport::AsyncStream* inbound_control =
-        inbound_link.control ? inbound_link.control : inbound_endpoint;
+    auto* inbound_reader = inbound_link.reader;
+    auto* inbound_writer = inbound_link.writer;
+    auto* inbound_control = inbound_link.control;
+    auto& first_packet = request.first_payload;
     if (inbound_control) {
         (void)inbound_control->ConsumePhaseDeadline();
         inbound_control->ClearPhaseDeadline();
@@ -462,8 +455,7 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     if (split_udp_association &&
         ctx.content.network == common::Network::UDP) {
         co_await DispatchUdpFlows(
-            *this, io_context, policy, std::move(inbound), inbound_link,
-            std::move(first_packet), ctx, stats, timeouts,
+            *this, io_context, policy, std::move(request), ctx, stats, timeouts,
             pressure_idle_timeout, result, cancellation_reason);
         co_return;
     }

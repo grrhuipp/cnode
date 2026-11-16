@@ -5,7 +5,7 @@
 #include "common/domain_name.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/constants.hpp"
-#include "transport/link.hpp"
+#include "transport/async_stream.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -122,11 +122,53 @@ struct DispatchPolicy {
     OutboundSelectionPolicy outbound;
 };
 
+// Owns the stream and first payload while the caller keeps any protocol
+// reader/writer wrappers alive until Dispatch completes. Logical substreams
+// borrow their session-owned endpoints instead of inventing another owner.
+class DispatchRequest {
+public:
+    explicit DispatchRequest(
+        std::unique_ptr<transport::AsyncStream> stream,
+        common::InitialPayload payload = {})
+        : stream_(std::move(stream))
+        , link_{stream_.get(), stream_.get(), stream_.get()}
+        , first_payload(std::move(payload)) {}
+
+    DispatchRequest(
+        std::unique_ptr<transport::AsyncStream> stream,
+        transport::Link link,
+        common::InitialPayload payload = {})
+        : stream_(std::move(stream))
+        , link_(link)
+        , first_payload(std::move(payload)) {
+        if (!link_.control) link_.control = stream_.get();
+    }
+
+    explicit DispatchRequest(
+        transport::Link link,
+        common::InitialPayload payload = {})
+        : link_(link), first_payload(std::move(payload)) {}
+
+    DispatchRequest(DispatchRequest&&) noexcept = default;
+    DispatchRequest& operator=(DispatchRequest&&) noexcept = default;
+    DispatchRequest(const DispatchRequest&) = delete;
+    DispatchRequest& operator=(const DispatchRequest&) = delete;
+
+    [[nodiscard]] transport::Link Endpoints() const noexcept { return link_; }
+
+private:
+    std::unique_ptr<transport::AsyncStream> stream_;
+    transport::Link link_;
+
+public:
+    common::InitialPayload first_payload;
+};
+
 // ============================================================================
 // Dispatcher - routing feature interface
 //
-// Dispatch 接收协议层准备好的不可变策略、transport::Link、初始 payload
-// 和 relay 参数；路由编排是实现细节，唯一公开热路径直接进入
+// Dispatch 接收不可变策略和拥有流/首包的 DispatchRequest；
+// 路由编排是实现细节，唯一公开热路径直接进入
 // outbound.Process 和 relay。
 // ============================================================================
 class Dispatcher {
@@ -136,9 +178,7 @@ public:
     virtual net::awaitable<app::RelayResult> Dispatch(
         net::io_context& io_context,
         const DispatchPolicy& policy,
-        std::unique_ptr<transport::AsyncStream> inbound,
-        transport::Link inbound_link,
-        common::InitialPayload first_packet,
+        DispatchRequest request,
         common::Context& ctx,
         app::StatsShard& stats,
         const infra::TimeoutsConfig& timeouts) = 0;

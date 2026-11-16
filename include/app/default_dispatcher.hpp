@@ -80,9 +80,7 @@ public:
     net::awaitable<RelayResult> Dispatch(
         net::io_context& io_context,
         const routing::DispatchPolicy& policy,
-        std::unique_ptr<transport::AsyncStream> inbound,
-        transport::Link inbound_link,
-        common::InitialPayload first_packet,
+        routing::DispatchRequest request,
         common::Context& ctx,
         StatsShard& stats,
         const infra::TimeoutsConfig& timeouts) override;
@@ -92,9 +90,7 @@ public:
     net::awaitable<void> DispatchPreparedLink(
         net::io_context& io_context,
         const routing::DispatchPolicy& policy,
-        std::unique_ptr<transport::AsyncStream> inbound,
-        transport::Link inbound_link,
-        common::InitialPayload& first_packet,
+        routing::DispatchRequest request,
         common::Context& ctx,
         StatsShard& stats,
         const infra::TimeoutsConfig& timeouts,

@@ -151,7 +151,7 @@ public:
     ::net::awaitable<::app::RelayResult> Process(
         std::unique_ptr<::transport::AsyncStream> stream,
         ::routing::Dispatcher& dispatcher,
-        const ::app::ReceiverSettings& receiver,
+        ::proxy::InboundSettings settings,
         ::net::io_context& io_context,
         ::common::Context& ctx,
         const ::infra::TimeoutsConfig& timeouts,
@@ -176,7 +176,7 @@ net::awaitable<app::RelayResult>
 proxy::VmessInboundHandler::Process(
     std::unique_ptr<transport::AsyncStream> stream,
     routing::Dispatcher& dispatcher,
-    const app::ReceiverSettings& receiver,
+    proxy::InboundSettings settings,
     net::io_context& io_context,
     common::Context& ctx,
     const infra::TimeoutsConfig& timeouts,
@@ -207,7 +207,7 @@ proxy::VmessInboundHandler::Process(
             transport::Link{&session->request_reader, &session->response_writer},
             *stream,
             dispatcher,
-            receiver.dispatch_policy,
+            settings.dispatch_policy,
             environment_,
             ctx,
             environment_.stats,
@@ -218,10 +218,10 @@ proxy::VmessInboundHandler::Process(
 
     co_return co_await dispatcher.Dispatch(
         io_context,
-        receiver.dispatch_policy,
-        std::move(stream),
-        transport::Link{&session->request_reader, &session->response_writer},
-        common::InitialPayload{},
+        settings.dispatch_policy,
+        routing::DispatchRequest{
+            std::move(stream),
+            transport::Link{&session->request_reader, &session->response_writer}},
         ctx,
         environment_.stats,
         timeouts);

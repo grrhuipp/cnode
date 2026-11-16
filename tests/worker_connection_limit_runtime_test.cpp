@@ -52,7 +52,7 @@ public:
     }
     net::awaitable<app::RelayResult> Process(
         std::unique_ptr<transport::AsyncStream> stream, routing::Dispatcher&,
-        const app::ReceiverSettings&, net::io_context&,
+        proxy::InboundSettings, net::io_context&,
         common::Context&, const infra::TimeoutsConfig&, uint32_t) override {
         const std::array<char, 1> admitted{'A'};
         const net::const_buffer admitted_buffer = net::buffer(admitted);

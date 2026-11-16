@@ -24,7 +24,6 @@ namespace app {
 
 class ConnectionLimiter;
 struct ConnectionFamily;
-struct ReceiverSettings;
 
 }  // namespace app
 namespace transport {
@@ -43,6 +42,7 @@ struct Context;
 }
 
 namespace routing {
+struct DispatchPolicy;
 class Dispatcher;
 }
 // Native datagram response view. Borrowed bytes and target are valid only
@@ -178,6 +178,14 @@ struct InboundDatagramResult {
     const common::UserProfile* user = nullptr;
 };
 
+// Prepared by the inbound Handler. Protocols see selection policy and stream
+// capabilities, never listener tags, panel settings or transport configuration.
+struct InboundSettings {
+    const routing::DispatchPolicy& dispatch_policy;
+    bool raw_tcp;
+    bool tls_like;
+};
+
 // ============================================================================
 // Inbound - 入站协议处理器接口（代理层）
 //
@@ -195,6 +203,7 @@ public:
     // 从已建立的传输流中解析协议头，并移交给 dispatcher。
     //
     // @param stream  已完成 TLS/WS 等传输层握手的字节流
+    // @param settings Handler 准备的分发策略与传输能力，不含监听配置
     // @param ctx     会话上下文（用于填充用户信息、错误记录）
     // @param pressure_idle_timeout Worker 当前压力模式的空闲超时秒数；0 表示未启用
     // @return        dispatcher/relay 结果；协议解析失败在进入 dispatcher 前返回错误
@@ -202,7 +211,7 @@ public:
     virtual net::awaitable<app::RelayResult> Process(
         std::unique_ptr<transport::AsyncStream> stream,
         routing::Dispatcher& dispatcher,
-        const app::ReceiverSettings& receiver,
+        InboundSettings settings,
         net::io_context& io_context,
         common::Context& ctx,
         const infra::TimeoutsConfig& timeouts,

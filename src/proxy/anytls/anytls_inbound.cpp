@@ -666,8 +666,8 @@ net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessStream(
         }
         initial_payload = common::InitialPayload{std::move(prepared.pending)};
     }
-    (void)co_await dispatcher_.Dispatch(io_context_, policy_, nullptr,
-        transport::Link{&sub, &sub}, std::move(initial_payload),
+    (void)co_await dispatcher_.Dispatch(io_context_, policy_,
+        routing::DispatchRequest{transport::Link{&sub, &sub}, std::move(initial_payload)},
         ctx, environment_.stats, timeouts_);
     co_return common::ErrorCode::OK;
 }
@@ -957,7 +957,7 @@ net::awaitable<app::RelayResult>
 AnyTlsInboundHandler::Process(
     std::unique_ptr<transport::AsyncStream> stream,
     routing::Dispatcher& dispatcher,
-    const app::ReceiverSettings& receiver,
+    proxy::InboundSettings settings,
     net::io_context& io_context,
     common::Context& ctx,
     const infra::TimeoutsConfig& timeouts,
@@ -988,7 +988,7 @@ AnyTlsInboundHandler::Process(
         AnyTLSDemuxSession demux(
             std::move(stream),
             dispatcher,
-            receiver.dispatch_policy,
+            settings.dispatch_policy,
             environment_,
             io_context,
             ctx,

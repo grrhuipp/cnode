@@ -186,12 +186,14 @@ net::awaitable<app::RelayResult> DispatchPreparedUotRequest(
     UotPacketReader uot_reader(
         request_reader, is_connect, std::move(reader_destination), std::move(prepared.pending));
     UotPacketWriter uot_writer(response_writer, is_connect, ctx.outbound.target);
+    const transport::Link link{&uot_reader, &uot_writer};
+    auto request = stream
+        ? routing::DispatchRequest{std::move(stream), link, std::move(initial_payload)}
+        : routing::DispatchRequest{link, std::move(initial_payload)};
     co_return co_await dispatcher.Dispatch(
         io_context,
         dispatch_policy,
-        std::move(stream),
-        transport::Link{&uot_reader, &uot_writer},
-        std::move(initial_payload),
+        std::move(request),
         ctx,
         stats,
         timeouts);

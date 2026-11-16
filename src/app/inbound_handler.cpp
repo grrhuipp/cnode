@@ -161,7 +161,7 @@ public:
         proxy::Inbound& proxy = *handler.proxy_;
         try {
             (void)co_await proxy.Process(
-                std::move(stream), dispatcher_, listener, io_context_, ctx, timeouts_,
+                std::move(stream), dispatcher_, handler.protocol_settings_, io_context_, ctx, timeouts_,
                 request_load_.PressureIdleTimeout());
         } catch (...) {
             CountEscapedInboundFailure(ctx, stats_);
@@ -181,6 +181,10 @@ private:
 InboundHandler::InboundHandler(app::ReceiverSettings receiver, std::unique_ptr<proxy::Inbound> proxy,
                                const AdmissionEnvironment& environment)
     : receiver_(std::move(receiver))
+    , protocol_settings_{
+          receiver_.dispatch_policy,
+          receiver_.stream_settings.network_mode == transport::NetworkMode::Tcp,
+          receiver_.stream_settings.IsTlsLike()}
     , security_(receiver_.stream_settings, transport::StreamEndpointRole::Inbound)
     , proxy_(std::move(proxy))
     , environment_(environment) {
@@ -382,7 +386,7 @@ net::awaitable<void> InboundHandler::ProcessAcceptedTCP(
     proxy::Inbound& proxy = *proxy_;
     try {
         (void)co_await proxy.Process(
-            std::move(prepared->stream), dispatcher, receiver_, io_context, ctx, timeouts,
+            std::move(prepared->stream), dispatcher, protocol_settings_, io_context, ctx, timeouts,
             request_load.PressureIdleTimeout());
     } catch (...) {
         CountEscapedInboundFailure(ctx, stats);

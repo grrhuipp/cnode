@@ -842,9 +842,7 @@ net::awaitable<void> RunSubDispatch(
             (void)co_await dispatcher.Dispatch(
                 io_context,
                 policy,
-                nullptr,
-                link,
-                common::InitialPayload{},
+                routing::DispatchRequest{link},
                 sub->ctx,
                 stats,
                 timeouts);

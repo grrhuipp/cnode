@@ -17,7 +17,7 @@ public:
     ::net::awaitable<::app::RelayResult> Process(
         std::unique_ptr<::transport::AsyncStream> stream,
         ::routing::Dispatcher& dispatcher,
-        const ::app::ReceiverSettings& receiver,
+        ::proxy::InboundSettings settings,
         ::net::io_context& io_context,
         ::common::Context& ctx,
         const ::infra::TimeoutsConfig& timeouts,

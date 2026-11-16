@@ -323,8 +323,9 @@ net::awaitable<void> XudpSession::Run(std::shared_ptr<XudpSession> self) {
         auto pending = InboundSubstreamAdmission::Reserve(admission_, ctx_);
         if (!pending || admission.Hold(co_await std::move(*pending), ctx_, stats_)) {
             (void)co_await dispatcher_.Dispatch(
-                io_context_, policy_, nullptr, transport::Link{this, this},
-                common::InitialPayload{}, ctx_, stats_, timeouts_);
+                io_context_, policy_,
+                routing::DispatchRequest{transport::Link{this, this}},
+                ctx_, stats_, timeouts_);
         }
     } catch (...) {
         LOG_CONN_DEBUG(ctx_, "XUDP flow dispatch failed with an exception");

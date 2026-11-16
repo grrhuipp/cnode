@@ -260,6 +260,7 @@ private:
         app::DNSWorker* dns_service);
 
     const app::ReceiverSettings receiver_;
+    const proxy::InboundSettings protocol_settings_;
     transport::TransportSecurity security_;
     std::unique_ptr<proxy::Inbound> proxy_;
     const AdmissionEnvironment& environment_;

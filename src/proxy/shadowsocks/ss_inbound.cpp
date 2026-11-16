@@ -534,7 +534,7 @@ net::awaitable<app::RelayResult>
 proxy::SsInboundHandler::Process(
     std::unique_ptr<transport::AsyncStream> stream,
     routing::Dispatcher& dispatcher,
-    const app::ReceiverSettings& receiver,
+    proxy::InboundSettings settings,
     net::io_context& io_context,
     common::Context& ctx,
     const infra::TimeoutsConfig& timeouts,
@@ -563,7 +563,7 @@ proxy::SsInboundHandler::Process(
             prepared->response_writer,
             std::move(prepared->initial_payload).MoveToMultiBuffer(),
             dispatcher,
-            receiver.dispatch_policy,
+            settings.dispatch_policy,
             io_context,
             ctx,
             environment_.stats,
@@ -572,10 +572,11 @@ proxy::SsInboundHandler::Process(
 
     co_return co_await dispatcher.Dispatch(
         io_context,
-        receiver.dispatch_policy,
-        std::move(stream),
-        transport::Link{&prepared->request_reader, &prepared->response_writer},
-        std::move(prepared->initial_payload),
+        settings.dispatch_policy,
+        routing::DispatchRequest{
+            std::move(stream),
+            transport::Link{&prepared->request_reader, &prepared->response_writer},
+            std::move(prepared->initial_payload)},
         ctx,
         environment_.stats,
         timeouts);
