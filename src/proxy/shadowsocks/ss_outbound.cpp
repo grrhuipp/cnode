@@ -1,4 +1,5 @@
 #include "proxy/shadowsocks/ss_outbound.hpp"
+#include "proxy/outbound.hpp"
 namespace proxy {
 class SsOutboundHandler final : public ::proxy::Outbound {
 public:
@@ -21,7 +22,6 @@ private:
 #include "proxy/uot/uot.hpp"
 #include "proxy/handshake_errors.hpp"
 #include "proxy/outbound_stream_endpoint.hpp"
-#include "app/relay.hpp"
 #include "app/outbound_handler.hpp"
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"
@@ -30,6 +30,8 @@ private:
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 #include <cstring>
+#include <array>
+#include <chrono>
 #include <new>
 #include <optional>
 #include <memory>
@@ -170,7 +172,7 @@ PrepareTCPRequest2022(const common::TargetAddress& target,
     prepared.write_cipher.emplace(cipher_info.type, write_subkey.data(), cipher_info.key_size);
     const size_t handshake_size =
         prepared.request_salt.size +
-        (psk_chain.size() > 0 ? (psk_chain.size() - 1) * 16 : 0) +
+        (psk_chain.size() - 1) * 16 +
         fixed_plain.size() + SsAeadCipher::kTagSize +
         variable_len + SsAeadCipher::kTagSize;
     if (handshake_size > common::Buffer::kSize) {
@@ -464,18 +466,17 @@ public:
 
 private:
     net::awaitable<common::MultiBuffer> ReadInitialMultiBuffer() {
-        if (auto* pending = std::get_if<PendingResponseState>(&response_state_)) {
-            auto reader_result = co_await proxy::ReadTCPResponse(
-                pending->cipher_info, pending->master_key, pending->request_salt, stream_);
-            if (!reader_result) {
-                OPENSSL_cleanse(pending->request_salt.bytes.data(), pending->request_salt.bytes.size());
-                pending->request_salt.size = 0;
-                throw transport::LinkError(reader_result.error());
-            }
-            response_state_.emplace<proxy::BodyReader>(std::move(reader_result->reader));
-            if (reader_result->initial_payload.byte_size() != 0)
-                co_return std::move(reader_result->initial_payload);
+        auto& pending = std::get<PendingResponseState>(response_state_);
+        auto reader_result = co_await proxy::ReadTCPResponse(
+            pending.cipher_info, pending.master_key, pending.request_salt, stream_);
+        if (!reader_result) {
+            OPENSSL_cleanse(pending.request_salt.bytes.data(), pending.request_salt.bytes.size());
+            pending.request_salt.size = 0;
+            throw transport::LinkError(reader_result.error());
         }
+        response_state_.emplace<proxy::BodyReader>(std::move(reader_result->reader));
+        if (reader_result->initial_payload.byte_size() != 0)
+            co_return std::move(reader_result->initial_payload);
         co_return co_await std::get<proxy::BodyReader>(response_state_).ReadMultiBuffer();
     }
 

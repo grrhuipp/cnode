@@ -4,14 +4,10 @@
 
 #include "proxy/anytls/anytls_codec.hpp"
 #include "proxy/anytls_padding.hpp"
-#include "common/length_prefixed_packet_buffer.hpp"
 #include "proxy/outbound_stream_endpoint.hpp"
 #include "proxy/handshake_errors.hpp"
 #include "proxy/uot/uot.hpp"
 #include "transport/async_write_gate.hpp"
-#include "app/dns.hpp"
-#include "app/relay.hpp"
-#include "app/stats.hpp"
 #include "common/ip_address.hpp"
 #include "common/session.hpp"
 #include "infra/log.hpp"
@@ -1224,7 +1220,7 @@ struct AnyTlsOutboundHandler::Session final : OutboundSession {
         endpoint.reset();
         logical_lease.reset();
         session = nullptr;
-        if (reusable && !failure) transport_lease.Reuse();
+        if (reusable) transport_lease.Reuse();
     }
 };
 
@@ -1233,12 +1229,11 @@ AnyTlsOutboundHandler::AnyTlsOutboundHandler(std::string_view tag,
                  std::shared_ptr<const infra::AnyTlsSettings> settings,
                  common::AwaitableTaskGroup& tasks)
     : Outbound(std::in_place_type<AnyTlsOutboundHandler>)
-    , tag_(tag)
     , settings_(std::move(settings))
     , padding_(DefaultAnyTlsPaddingScheme())
     , pool_(std::make_shared<SessionPool>(
           io_context, tasks, settings_->idle_session_check_interval,
-          settings_->idle_session_timeout, settings_->min_idle_sessions, tag_)) {}
+          settings_->idle_session_timeout, settings_->min_idle_sessions, tag)) {}
 
 }  // namespace proxy
 

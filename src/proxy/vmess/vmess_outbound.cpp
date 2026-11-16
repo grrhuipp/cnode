@@ -5,7 +5,6 @@
 #include "proxy/vmess/vmess_crypto.hpp"
 #include "proxy/handshake_errors.hpp"
 #include "proxy/outbound_stream_endpoint.hpp"
-#include "app/relay.hpp"
 #include "app/outbound_handler.hpp"
 #include "infra/log.hpp"
 #include "infra/config_types.hpp"
@@ -15,7 +14,6 @@
 #include "transport/link.hpp"
 #include "transport/outbound_target_builder.hpp"
 #include <chrono>
-#include <new>
 #include <openssl/aes.h>
 #include <memory>
 

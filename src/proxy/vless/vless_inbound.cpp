@@ -1,7 +1,6 @@
 #include "common/ascii.hpp"
 #include "proxy/handshake_errors.hpp"
 #include "proxy/mux/mux_server.hpp"
-#include "app/relay.hpp"
 #include "common/scoped_cleanse.hpp"
 #include "proxy/inbound_admission.hpp"
 #include "proxy/inbound.hpp"
@@ -10,7 +9,6 @@
 #include "app/inbound_handler.hpp"
 #include "app/user_store.hpp"
 #include "common/const_buffer_span.hpp"
-#include "app/stats.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/error.hpp"
 #include "common/session.hpp"
@@ -75,7 +73,7 @@ private:
         header_sent_ = true;
         std::array<net::const_buffer, 2> out;
         size_t count = 0;
-        if (const auto hdr = HeaderBuffer(); hdr.size() != 0) out[count++] = hdr;
+        out[count++] = HeaderBuffer();
         if (const auto bytes = mb.FrontSpan(); !bytes.empty()) {
             out[count++] = net::buffer(bytes.data(), bytes.size());
         }
@@ -286,10 +284,12 @@ struct VlessInboundSession : MultiplexedInboundSession {
         auto bound = std::move(authentication).Bind(user_info->profile,
             proxy::InboundRequestTarget{
                 network, std::move(request.target), std::move(request.forwarded)});
-        if (resumed_identity &&
-            CRYPTO_memcmp(resumed_identity->data(), request.uuid.data(), request.uuid.size()) != 0) {
-            co_return tl::unexpected(std::move(bound).Reject(
-                "resumed identity mismatch", common::ErrorCode::PROTOCOL_AUTH_FAILED));
+        if constexpr (Encrypted) {
+            if (resumed_identity &&
+                CRYPTO_memcmp(resumed_identity->data(), request.uuid.data(), request.uuid.size()) != 0) {
+                co_return tl::unexpected(std::move(bound).Reject(
+                    "resumed identity mismatch", common::ErrorCode::PROTOCOL_AUTH_FAILED));
+            }
         }
         meta.use_vision = ::proxy::IsVisionFlow(request.flow);
         if (!request.flow.empty()) {

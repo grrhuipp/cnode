@@ -1,5 +1,4 @@
 #include "app/outbound_handler.hpp"
-#include "app/relay.hpp"
 #include "common/session.hpp"
 #include "common/target_address.hpp"
 #include "common/constants.hpp"
@@ -7,7 +6,6 @@
 #include "proxy/freedom/freedom_udp.hpp"
 #include "infra/outbound_types.hpp"
 #include "proxy/outbound.hpp"
-#include "proxy/outbound_stream_endpoint.hpp"
 #include "transport/outbound_target_builder.hpp"
 #include <memory>
 #include <optional>

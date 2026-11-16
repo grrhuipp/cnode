@@ -1,6 +1,4 @@
 #include "proxy/uot/uot.hpp"
-#include "app/relay.hpp"
-#include "proxy/inbound_admission.hpp"
 #include "proxy/udp_datagram_frame.hpp"
 #include "proxy/buffered_stream_reader.hpp"
 #include "common/byte_reader.hpp"
@@ -10,7 +8,6 @@
 #include "common/length_prefixed_packet_buffer.hpp"
 #include <asio/this_coro.hpp>
 #include <array>
-#include <memory>
 #include <new>
 #include <utility>
 

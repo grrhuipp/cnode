@@ -18,13 +18,10 @@
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
-#include <cstdint>
 #include <exception>
-#include <optional>
-#include <string>
-#include <string_view>
 #include <tl/expected.hpp>
 #include <utility>
+#include <variant>
 
 namespace proxy {
 

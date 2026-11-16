@@ -12,7 +12,6 @@
 #include "transport/timeout_scheduler.hpp"
 
 #include <asio/as_tuple.hpp>
-#include <asio/co_spawn.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 #include <openssl/sha.h>
@@ -92,7 +91,6 @@ public:
         bytes_ -= std::min(bytes_, Charge(datagram));
         return true;
     }
-    [[nodiscard]] bool Empty() const noexcept { return queue_.empty(); }
     void Clear() noexcept {
         queue_.clear();
         bytes_ = 0;
@@ -360,7 +358,7 @@ void XudpSession::ReleaseAttachment() noexcept {
     if (remote_) {
         const auto remote = *std::exchange(remote_, std::nullopt);
         relay_->ForgetAttachment(remote.from, remote.slot, remote.generation);
-        relay_->SendDetached(remote.from, remote.slot, remote.generation, false);
+        relay_->SendDetached(remote.from, remote.slot, remote.generation);
     }
     Unattached();
 }
@@ -539,7 +537,7 @@ void XudpRelay::ForgetAttachment(uint32_t from, uint32_t slot, uint32_t generati
 
 void XudpRelay::SendAttached(uint32_t to, uint32_t slot, uint32_t generation) noexcept {
     (void)endpoint_.TryPost(to, XudpRelayMessage{
-        .kind = XudpRelayKind::Attached, .refused = false, .slot = slot,
+        .kind = XudpRelayKind::Attached, .slot = slot,
         .generation = generation, .token = 0, .payload = nullptr}, SIZE_MAX);
 }
 
@@ -547,14 +545,13 @@ void XudpRelay::SendReply(uint32_t to, uint32_t slot, uint32_t generation,
                           common::MultiBuffer datagram) noexcept {
     if (datagram.empty()) return;
     (void)endpoint_.TryPost(to, XudpRelayMessage{
-        .kind = XudpRelayKind::Reply, .refused = false, .slot = slot, .generation = generation,
+        .kind = XudpRelayKind::Reply, .slot = slot, .generation = generation,
         .token = 0, .payload = datagram.pop_front().release()}, kMaxRelayBacklog);
 }
 
-void XudpRelay::SendDetached(uint32_t to, uint32_t slot, uint32_t generation,
-                             bool refused) noexcept {
+void XudpRelay::SendDetached(uint32_t to, uint32_t slot, uint32_t generation) noexcept {
     (void)endpoint_.TryPost(to, XudpRelayMessage{
-        .kind = XudpRelayKind::Detached, .refused = refused, .slot = slot,
+        .kind = XudpRelayKind::Detached, .slot = slot,
         .generation = generation, .token = 0, .payload = nullptr}, SIZE_MAX);
 }
 
@@ -577,7 +574,7 @@ XudpRelay::Attachment XudpRelay::Open(uint32_t owner, uint64_t token, XudpClient
     slot.client = &client;
     try {
         endpoint_.Post(owner, XudpRelayMessage{
-            .kind = XudpRelayKind::Attach, .refused = false, .slot = index,
+            .kind = XudpRelayKind::Attach, .slot = index,
             .generation = generation, .token = token, .payload = nullptr});
     } catch (...) {
         slot.busy = false;
@@ -623,7 +620,7 @@ void XudpRelay::SendUplink(const Attachment& attachment, common::MultiBuffer dat
     const auto* slot = SlotFor(attachment.slot, attachment.generation);
     if (!slot || slot->detached || datagram.empty()) return;
     (void)endpoint_.TryPost(attachment.owner, XudpRelayMessage{
-        .kind = XudpRelayKind::Uplink, .refused = false, .slot = attachment.slot,
+        .kind = XudpRelayKind::Uplink, .slot = attachment.slot,
         .generation = attachment.generation, .token = 0,
         .payload = datagram.pop_front().release()}, kMaxRelayBacklog);
 }
@@ -633,7 +630,7 @@ void XudpRelay::Close(const Attachment& attachment) noexcept {
     if (!slot) return;
     if (!slot->detached) {
         (void)endpoint_.TryPost(attachment.owner, XudpRelayMessage{
-            .kind = XudpRelayKind::Detach, .refused = false, .slot = attachment.slot,
+            .kind = XudpRelayKind::Detach, .slot = attachment.slot,
             .generation = attachment.generation, .token = 0, .payload = nullptr}, SIZE_MAX);
     }
     slot->busy = false;
@@ -655,7 +652,7 @@ XudpRelay::ClientSlot* XudpRelay::SlotFor(uint32_t slot, uint32_t generation) no
 void XudpRelay::ReceiveAttach(uint32_t from, const XudpRelayMessage& message) {
     const auto found = tokens_.find(message.token);
     if (found == tokens_.end() || found->second->Closed()) {
-        SendDetached(from, message.slot, message.generation, true);
+        SendDetached(from, message.slot, message.generation);
         return;
     }
     found->second->AttachRemote(from, message.slot, message.generation);
@@ -701,7 +698,6 @@ void XudpRelay::Receive(size_t from, XudpRelayMessage& message) noexcept {
             auto* slot = SlotFor(message.slot, message.generation);
             if (!slot || slot->detached) return;
             slot->detached = true;
-            slot->refused = message.refused;
             if (slot->wake) (void)slot->wake->try_send(IoErrorCode{});
             // Taken over or ended: the sub-session ends. A refused one is
             // still waiting for its acknowledgement and claims anew.

@@ -3,15 +3,12 @@
 #include "proxy/trojan/trojan_codec.hpp"
 #include "proxy/handshake_errors.hpp"
 #include "proxy/outbound_stream_endpoint.hpp"
-#include "app/relay.hpp"
 #include "app/outbound_handler.hpp"
 #include "infra/config_types.hpp"
 #include "transport/link.hpp"
 #include "transport/outbound_target_builder.hpp"
 #include <openssl/crypto.h>
 #include <array>
-#include <cstring>
-#include <new>
 #include <utility>
 
 #include <chrono>

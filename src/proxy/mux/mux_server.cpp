@@ -7,7 +7,6 @@
 #include "common/address_codec.hpp"
 #include "common/allocator.hpp"
 #include "common/multi_buffer.hpp"
-#include "common/byte_reader.hpp"
 #include "common/session.hpp"
 #include "routing/dispatcher.hpp"
 #include "infra/config_types.hpp"
@@ -21,14 +20,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <new>
 #include <unordered_map>
 #include <utility>
-#include <vector>
 namespace proxy {
 
 // ============================================================================
@@ -386,9 +383,6 @@ public:
                     "Mux sub-session input cancelled");
             }
         }
-        if (terminal_error_ == common::ErrorCode::RESOURCE_EXHAUSTED) {
-            throw IoSystemError(io_error::no_buffer_space, "Mux sub-session input overflow");
-        }
         throw IoSystemError(io_error::operation_aborted, "Mux sub-session input cancelled");
     }
 
@@ -411,15 +405,15 @@ public:
         Cancel();
     }
 
-    void Cancel(common::ErrorCode error = common::ErrorCode::CANCELLED) noexcept {
+    void Cancel() noexcept {
         if (cancelled_) {
             return;
         }
         cancelled_ = true;
-        terminal_error_ = error;
-        cancellation_.Stop(error);
+        cancellation_.Stop();
         input_done_ = true;
-        OnCancel();
+        reply_queue_.RemoveWaitingWriter(this);
+        WakeOutputWriter();
         WakeInputReader();
         input_queue_.clear();
         reply_queue_.ReleaseSubInput(std::exchange(queued_bytes_, 0));
@@ -443,12 +437,6 @@ protected:
         , is_udp_(is_udp)
         , input_signal_(net::any_io_executor(io_context.get_executor()), 1)
         , output_signal_(net::any_io_executor(io_context.get_executor()), 1) {}
-
-    // Called once from Cancel() before queued input is discarded.
-    virtual void OnCancel() noexcept {
-        reply_queue_.RemoveWaitingWriter(this);
-        WakeOutputWriter();
-    }
 
     // Waits while `blocked()` holds for this writer's kind of reply room.
     template <class Blocked>
@@ -544,7 +532,6 @@ private:
     common::CancellationSource cancellation_;
     common::RingDeque<QueuedInput> input_queue_;
     size_t queued_bytes_ = 0;
-    common::ErrorCode terminal_error_ = common::ErrorCode::CANCELLED;
     bool end_sent_ = false;
     bool end_error_ = false;
     bool dispatch_done_ = false;

@@ -86,8 +86,6 @@ enum class XudpRelayKind : uint8_t {
 // `payload` is an owned Buffer carrying its UDP endpoint while in flight.
 struct XudpRelayMessage {
     XudpRelayKind kind = XudpRelayKind::Attach;
-    // Detached: the token named no flow, so the client may claim anew.
-    bool refused = false;
     uint32_t slot = 0;
     uint32_t generation = 0;
     uint64_t token = 0;
@@ -122,7 +120,7 @@ public:
     void SendAttached(uint32_t to, uint32_t slot, uint32_t generation) noexcept;
     void SendReply(uint32_t to, uint32_t slot, uint32_t generation,
                    common::MultiBuffer datagram) noexcept;
-    void SendDetached(uint32_t to, uint32_t slot, uint32_t generation, bool refused) noexcept;
+    void SendDetached(uint32_t to, uint32_t slot, uint32_t generation) noexcept;
 
     // ---- Client Worker side ------------------------------------------------
     struct Attachment {
@@ -148,7 +146,6 @@ private:
         bool busy = false;
         bool attached = false;
         bool detached = false;
-        bool refused = false;
         XudpClient* client = nullptr;
         // Frame-local channel of a coroutine waiting for the acknowledgement.
         common::SignalChannel* wake = nullptr;

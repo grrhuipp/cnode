@@ -212,7 +212,6 @@ private:
     class SessionPool;
     struct LogicalStreamLease;
 
-    std::string tag_;
     std::shared_ptr<const infra::AnyTlsSettings> settings_;
     std::shared_ptr<const AnyTlsPaddingScheme> padding_;
     std::shared_ptr<SessionPool> pool_;

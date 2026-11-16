@@ -6,8 +6,6 @@
 #include "transport/async_stream.hpp"
 #include "common/address_codec.hpp"
 #include "proxy/uot/uot.hpp"
-#include "app/relay.hpp"
-#include "app/stats.hpp"
 #include "routing/dispatcher.hpp"
 #include "app/inbound_handler.hpp"
 #include "infra/config_types.hpp"
@@ -19,7 +17,6 @@
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
 #include <algorithm>
-#include <functional>
 #include <optional>
 #include <span>
 #include <utility>
@@ -451,9 +448,6 @@ net::awaitable<InboundPrepared> SsTcpSession::Prepare(
     auto& session = std::get<ReadTCPSessionResult>(state);
     auto writer = proxy::WriteTCPResponse(
         *session.user, cipher_info, session.request_salt, *stream);
-    if (!session.body_reader) {
-        co_return tl::unexpected(common::ErrorCode::RESOURCE_EXHAUSTED);
-    }
     if (!writer) co_return tl::unexpected(writer.error());
     // Both cipher directions own their keys before UoT or relay can suspend.
     session.user.reset();
@@ -470,7 +464,7 @@ net::awaitable<InboundPrepared> SsTcpSession::Prepare(
                 std::move(prepared.initial_payload).MoveToMultiBuffer());
         } catch (...) {
             auto error = ClassifyInboundHandshakeException(std::current_exception());
-            if (stream && error != common::ErrorCode::RESOURCE_EXHAUSTED)
+            if (error != common::ErrorCode::RESOURCE_EXHAUSTED)
                 error = ResolveHandshakeReadFailure(*stream, error);
             request = tl::unexpected(error);
         }

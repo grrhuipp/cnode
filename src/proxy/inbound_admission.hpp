@@ -24,6 +24,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <tuple>
 #include <vector>
 #include <utility>
 #include <type_traits>

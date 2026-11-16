@@ -6,7 +6,6 @@
 #include "proxy/handshake_errors.hpp"
 #include "proxy/outbound_stream_endpoint.hpp"
 #include "app/outbound_handler.hpp"
-#include "app/relay.hpp"
 #include "common/asio_types.hpp"
 #include "common/multi_buffer.hpp"
 #include "common/length_prefixed_packet_buffer.hpp"
@@ -85,9 +84,6 @@ struct VlessResponseHeaderState {
 net::awaitable<void> ReadVlessResponseHeader(proxy::BufferedStreamReader& reader,
                                              VlessResponseHeaderState& state,
                                              const char* failure) {
-    if (state.complete) {
-        co_return;
-    }
     if (!co_await reader.ReadExact(
             state.fixed.data(), state.fixed.size(), &state.fixed_read) ||
         state.fixed[0] != proxy::kVlessVersion) {
@@ -527,7 +523,7 @@ SendVlessHandshake(
                     protocol_reader,
                     protocol_writer,
                     *config.encryption,
-                    tickets.cache ? &local_tickets : nullptr,
+                    &local_tickets,
                     tickets.rejection);
             tickets.rejection.rejected =
                 local_tickets.expires_at == std::chrono::steady_clock::time_point{};

@@ -18,15 +18,12 @@
 #include <optional>
 #include <span>
 #include <string_view>
-#include <tuple>
 #include <utility>
 #include <unordered_map>
 
 namespace app {
 
-class ConnectionLimiter;
 class UdpIngress;
-struct ConnectionFamily;
 
 }  // namespace app
 namespace transport {

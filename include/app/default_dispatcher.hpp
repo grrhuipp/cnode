@@ -104,7 +104,6 @@ private:
         RelayResult& result,
         common::ErrorCode& cancellation_reason);
 
-private:
     struct RouteResult {
         std::shared_ptr<OutboundHandler> handler;
         common::ErrorCode error;

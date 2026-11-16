@@ -1,13 +1,8 @@
 #include "app/outbound_handler.hpp"
-#include "app/relay.hpp"
-#include "common/multi_buffer.hpp"
-#include "common/session.hpp"
 #include "common/constants.hpp"
-#include "infra/log.hpp"
 #include "proxy/outbound.hpp"
 
 #include <memory>
-#include <span>
 #include <string_view>
 namespace proxy {
 
