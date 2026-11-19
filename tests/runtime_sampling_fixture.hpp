@@ -48,7 +48,9 @@ public:
         Require(prepared.has_value(), "Freedom preparation failed");
         worker.AddOutbound(std::move(*prepared));
 
-        auto request = app::PrepareBuildRequest("vless", "sampling", infra::InboundProtocolSettings{});
+        transport::StreamSettings stream_settings;
+        auto request = app::PrepareBuildRequest("vless", "sampling", infra::InboundProtocolSettings{},
+                                                stream_settings);
         Require(request.has_value(), "VLESS preparation failed");
         const std::array users{infra::InboundUserSpec{
             .user_id = 1, .email = "sampling",

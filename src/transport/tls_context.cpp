@@ -6,6 +6,7 @@
 #include "common/ip_address.hpp"
 #include "infra/log.hpp"
 #include <openssl/asn1.h>
+#include <ngtcp2/ngtcp2_crypto_boringssl.h>
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -97,111 +98,92 @@ std::string ResolveAutoSignDefaultName(const TlsConfig& config) {
     return config.server_name;
 }
 
-// 启动与续期共用的唯一自签服务端上下文构建：为配置域名签发一年期证书。
-[[nodiscard]] bssl::UniquePtr<SSL_CTX> CreateAutoSignServerContext(const TlsConfig& config) {
+[[nodiscard]] bssl::UniquePtr<SSL_CTX> CreateTlsServerContext(
+    const TlsConfig& config, TlsServerTransport transport,
+    std::span<const std::string> alpn) {
+    bssl::UniquePtr<SSL_CTX> context(SSL_CTX_new(TLS_server_method()));
+    if (!context) {
+        LOG_ERROR("failed to create TLS server context");
+        return nullptr;
+    }
+    if (!ConfigureTlsProtocolVersions(context.get(), config.min_version, config.max_version)) {
+        LOG_ERROR("invalid TLS server protocol version policy");
+        return nullptr;
+    }
+    if (transport == TlsServerTransport::Quic) {
+        if (alpn.empty()) {
+            LOG_ERROR("QUIC TLS server requires at least one ALPN protocol");
+            return nullptr;
+        }
+        // RFC 9001 §4.2: QUIC negotiates TLS 1.3 only.
+        if (config.max_version != TlsVersion::V1_3 ||
+            ngtcp2_crypto_boringssl_configure_server_context(context.get()) != 0) {
+            LOG_ERROR("cannot configure QUIC TLS 1.3 server context");
+            return nullptr;
+        }
+    }
+    if (!ConfigureTlsServerAlpn(context.get(), alpn)) {
+        LOG_ERROR("invalid TLS server ALPN policy");
+        return nullptr;
+    }
+    return context;
+}
+
+// Initial signing and renewal publish only fully configured SSL contexts.
+[[nodiscard]] bssl::UniquePtr<SSL_CTX> CreateAutoSignServerContext(
+    const TlsConfig& config, TlsServerTransport transport) {
+    auto context = CreateTlsServerContext(config, transport, config.alpn);
+    if (!context) return nullptr;
     const std::string default_name = ResolveAutoSignDefaultName(config);
     auto material = AutoSignCertificate::Create(default_name);
     if (!material) {
         LOG_ERROR("failed to generate default self-signed TLS certificate");
         return nullptr;
     }
-
-    bssl::UniquePtr<SSL_CTX> context(SSL_CTX_new(TLS_server_method()));
-    if (!context) return nullptr;
-
-    if (!ConfigureTlsProtocolVersions(
-            context.get(), config.min_version, config.max_version)) {
-        LOG_ERROR("invalid auto-sign TLS protocol version policy");
-        return nullptr;
-    }
-
     if (SSL_CTX_use_certificate(context.get(), material->Certificate()) != 1 ||
         SSL_CTX_use_PrivateKey(context.get(), material->Key()) != 1) {
         LOG_ERROR("failed to install default self-signed TLS certificate");
         return nullptr;
     }
-
     LOG_INFO("TLS auto-sign certificate created (domain={} validity=one year renewal=30 days before expiry)",
              default_name);
-    if (!ConfigureTlsServerAlpn(context.get(), config.alpn)) {
-        LOG_ERROR("invalid auto-sign TLS ALPN policy");
-        return nullptr;
-    }
     return context;
 }
 
 }  // namespace
 
 std::unique_ptr<SslContext> SslContext::CreateServer(const TlsConfig& config) {
-    bssl::UniquePtr<SSL_CTX> owner(SSL_CTX_new(TLS_server_method()));
-    SSL_CTX* ctx = owner.get();
-    if (!ctx) {
-        LOG_ERROR("failed to create TLS server context");
-        return nullptr;
-    }
-
-    if (!ConfigureTlsProtocolVersions(
-            ctx, config.min_version, config.max_version)) {
-        LOG_ERROR("invalid TLS server protocol version policy");
-        return nullptr;
-    }
-
-    if (!config.pem) {
-        LOG_ERROR("TLS certificate files were not loaded with the configuration");
-        return nullptr;
-    }
-    if (!ConfigureTlsCertificatePem(ctx, *config.pem)) {
-        LOG_ERROR("failed to load TLS certificate from {}", config.cert_file);
-        return nullptr;
-    }
-
-    if (!ConfigureTlsServerAlpn(ctx, config.alpn)) {
-        LOG_ERROR("invalid TLS server ALPN policy");
-        return nullptr;
-    }
-    return std::unique_ptr<SslContext>(new SslContext(std::move(owner)));
-}
-
-std::unique_ptr<SslContext> SslContext::CreateServerAutoSign(const TlsConfig& config) {
-    auto initial = CreateAutoSignServerContext(config);
-    if (!initial) return nullptr;
-    return std::unique_ptr<SslContext>(new SslContext(
-        AutoSignContextRenewal::Start(std::move(initial), config)));
+    return CreateServer(config, TlsServerTransport::Stream, config.alpn);
 }
 
 std::unique_ptr<SslContext> SslContext::CreateQuicServer(
     const TlsConfig& config, std::span<const std::string> alpn) {
-    if (alpn.empty()) {
-        LOG_ERROR("QUIC TLS server requires at least one ALPN protocol");
-        return nullptr;
+    return CreateServer(config, TlsServerTransport::Quic, alpn);
+}
+
+std::unique_ptr<SslContext> SslContext::CreateServer(
+    const TlsConfig& config, TlsServerTransport transport,
+    std::span<const std::string> alpn) {
+    if (config.cert_file.empty() && config.key_file.empty()) {
+        auto renewal_config = config;
+        if (transport == TlsServerTransport::Quic)
+            renewal_config.alpn.assign(alpn.begin(), alpn.end());
+        auto initial = CreateAutoSignServerContext(renewal_config, transport);
+        if (!initial) return nullptr;
+        return std::unique_ptr<SslContext>(new SslContext(
+            AutoSignContextRenewal::Start(std::move(initial), std::move(renewal_config), transport)));
     }
     if (!config.HasCertificatePair() || !config.pem) {
-        LOG_ERROR("QUIC TLS server requires a loaded certificate and private key");
+        LOG_ERROR("TLS certificate and private key files were not loaded with the configuration");
         return nullptr;
     }
-
-    bssl::UniquePtr<SSL_CTX> owner(SSL_CTX_new(TLS_server_method()));
-    SSL_CTX* ctx = owner.get();
-    if (!ctx) {
-        LOG_ERROR("failed to create QUIC TLS server context");
+    auto context = CreateTlsServerContext(config, transport, alpn);
+    if (!context) return nullptr;
+    if (!ConfigureTlsCertificatePem(context.get(), *config.pem)) {
+        LOG_ERROR("failed to load TLS certificate from {}", config.cert_file);
         return nullptr;
     }
-    // RFC 9001 §4.2: QUIC negotiates TLS 1.3 only. A configured minimum below
-    // 1.3 narrows to 1.3; a configured maximum below 1.3 leaves no version.
-    if (!ConfigureTlsProtocolVersions(ctx, config.min_version, config.max_version) ||
-        !ConfigureTlsProtocolVersions(ctx, TlsVersion::V1_3, config.max_version)) {
-        LOG_ERROR("QUIC TLS server requires tls maxVersion 1.3");
-        return nullptr;
-    }
-    if (!ConfigureTlsCertificatePem(ctx, *config.pem)) {
-        LOG_ERROR("failed to load QUIC TLS certificate from {}", config.cert_file);
-        return nullptr;
-    }
-    if (!ConfigureTlsServerAlpn(ctx, alpn)) {
-        LOG_ERROR("invalid QUIC TLS server ALPN policy");
-        return nullptr;
-    }
-    return std::unique_ptr<SslContext>(new SslContext(std::move(owner)));
+    return std::unique_ptr<SslContext>(new SslContext(std::move(context)));
 }
 
 SSL_CTX* SslContext::AcquireNative() const noexcept {
@@ -239,9 +221,7 @@ namespace {
         if (settings.IsReality()) {
             return SslContext::CreateServerReality(settings.reality, settings.tls);
         }
-        return settings.tls.HasCertificatePair()
-            ? SslContext::CreateServer(settings.tls)
-            : SslContext::CreateServerAutoSign(settings.tls);
+        return SslContext::CreateServer(settings.tls);
     }
     return settings.IsReality()
         ? SslContext::CreateClientReality(settings.reality, settings.tls)
@@ -283,6 +263,20 @@ void TransportSecurity::Prepare(StreamSettings& settings, StreamEndpointRole rol
     auto source = settings;
     source.prepared_security.reset();
     settings.prepared_security = std::make_shared<TransportSecurity>(source, role);
+}
+
+TransportSecurity::TransportSecurity(std::unique_ptr<SslContext> context)
+    : context_(std::move(context)) {}
+
+void TransportSecurity::PrepareQuicServer(
+    StreamSettings& settings, std::span<const std::string> alpn) {
+    if (!settings.IsTls())
+        throw std::invalid_argument("QUIC requires TLS");
+    auto context = SslContext::CreateQuicServer(settings.tls, alpn);
+    if (!context)
+        throw std::invalid_argument("invalid QUIC TLS settings");
+    settings.prepared_security = std::shared_ptr<const TransportSecurity>(
+        new TransportSecurity(std::move(context)));
 }
 
 namespace {
@@ -537,8 +531,9 @@ private:
     std::jthread thread_;
 };
 
-AutoSignContextRenewal::AutoSignContextRenewal(bssl::UniquePtr<SSL_CTX> initial, TlsConfig config)
-    : config_(std::move(config)) {
+AutoSignContextRenewal::AutoSignContextRenewal(
+    bssl::UniquePtr<SSL_CTX> initial, TlsConfig config, TlsServerTransport transport)
+    : config_(std::move(config)), transport_(transport) {
     if (!Publish(std::move(initial)))
         throw std::invalid_argument("auto-sign certificate has invalid validity");
 }
@@ -562,9 +557,9 @@ bool AutoSignContextRenewal::Publish(bssl::UniquePtr<SSL_CTX> context) {
 }
 
 std::shared_ptr<AutoSignContextRenewal> AutoSignContextRenewal::Start(
-    bssl::UniquePtr<SSL_CTX> initial, TlsConfig config) {
+    bssl::UniquePtr<SSL_CTX> initial, TlsConfig config, TlsServerTransport transport) {
     auto state = std::shared_ptr<AutoSignContextRenewal>(
-        new AutoSignContextRenewal(std::move(initial), std::move(config)));
+        new AutoSignContextRenewal(std::move(initial), std::move(config), transport));
     AutoSignRenewalScheduler::Instance().Add(state);
     return state;
 }
@@ -576,7 +571,7 @@ SSL_CTX* AutoSignContextRenewal::Acquire(Clock::time_point now) const noexcept {
 }
 
 bssl::UniquePtr<SSL_CTX> AutoSignContextRenewal::Rebuild() const {
-    return CreateAutoSignServerContext(config_);
+    return CreateAutoSignServerContext(config_, transport_);
 }
 
 // ============================================================================

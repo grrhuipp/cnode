@@ -463,7 +463,8 @@ const bool kVlessInboundRegistered = [] {
         };
 
     reg.prepare_settings =
-        [](std::string_view tag, const ::infra::InboundProtocolSettings& config)
+        [](std::string_view tag, const ::infra::InboundProtocolSettings& config,
+           transport::StreamSettings&)
             -> std::optional<std::shared_ptr<
                 const ::app::PreparedInboundSettings>> {
             ::app::VlessInboundSettings settings;

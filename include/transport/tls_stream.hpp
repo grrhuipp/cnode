@@ -17,20 +17,17 @@ struct RealityServerConnState;
 struct RealityConfig;
 struct TlsConfig;
 class AutoSignContextRenewal;
+enum class TlsServerTransport;
 // ============================================================================
 // OpenSSL 上下文管理（RAII）
 // ============================================================================
 class SslContext {
 public:
-    // 创建服务端上下文（从文件加载证书）
+    // Load the configured PEM pair, or generate and renew a self-signed
+    // certificate when neither path is configured.
     static std::unique_ptr<SslContext> CreateServer(const TlsConfig& config);
 
-    // 创建服务端上下文（启动时为配置域名生成固定自签证书）
-    static std::unique_ptr<SslContext> CreateServerAutoSign(const TlsConfig& config);
-
-    // 创建 QUIC 服务端上下文：证书来自 config.pem；版本按 config 的 min/max 收敛到
-    // QUIC 强制的 TLS 1.3（max 低于 1.3 时失败）；ALPN 只在 |alpn|（非空）中按服务端
-    // 偏好选择，无交集时以致命告警拒绝。QUIC 库回调由调用方在返回的 Native() 上安装。
+    // QUIC uses the same certificate policy, with TLS 1.3 and mandatory ALPN.
     static std::unique_ptr<SslContext> CreateQuicServer(
         const TlsConfig& config, std::span<const std::string> alpn);
 
@@ -58,6 +55,9 @@ public:
     SslContext& operator=(const SslContext&) = delete;
 
 private:
+    static std::unique_ptr<SslContext> CreateServer(
+        const TlsConfig& config, TlsServerTransport transport,
+        std::span<const std::string> alpn);
     explicit SslContext(bssl::UniquePtr<SSL_CTX> context) : native_owner_(std::move(context)) {}
     // Auto-sign: Native() stays null; handshakes pin the renewal's current snapshot.
     explicit SslContext(std::shared_ptr<AutoSignContextRenewal> renewal) noexcept

@@ -17,6 +17,8 @@
 
 namespace transport {
 
+enum class TlsServerTransport { Stream, Quic };
+
 // Built from trusted configuration before accepting connections. No SNI-driven
 // generation, mutable certificate cache, or request-path key rotation.
 class AutoSignCertificate {
@@ -40,7 +42,8 @@ class AutoSignContextRenewal {
 public:
     using Clock = std::chrono::system_clock;
     static std::shared_ptr<AutoSignContextRenewal> Start(
-        bssl::UniquePtr<SSL_CTX> initial, TlsConfig config);
+        bssl::UniquePtr<SSL_CTX> initial, TlsConfig config,
+        TlsServerTransport transport = TlsServerTransport::Stream);
     [[nodiscard]] SSL_CTX* Acquire(Clock::time_point now = Clock::now()) const noexcept;
 private:
     friend class AutoSignRenewalScheduler;
@@ -49,7 +52,8 @@ private:
         Clock::time_point expires;
     };
     static_assert(std::atomic<const Snapshot*>::is_always_lock_free);
-    AutoSignContextRenewal(bssl::UniquePtr<SSL_CTX> initial, TlsConfig config);
+    AutoSignContextRenewal(bssl::UniquePtr<SSL_CTX> initial, TlsConfig config,
+                           TlsServerTransport transport);
     // Construction (before scheduler registration) or the scheduler thread only.
     bool Publish(bssl::UniquePtr<SSL_CTX> context);
     // Runs on the scheduler thread only; null when signing or setup fails.
@@ -62,6 +66,7 @@ private:
     std::vector<std::unique_ptr<const Snapshot>> history_;
     std::atomic<const Snapshot*> current_{nullptr};
     const TlsConfig config_;
+    const TlsServerTransport transport_;
     // Scheduler-thread state, like history_; handed over by registration.
     Clock::time_point next_attempt_ = Clock::time_point::min();
 };

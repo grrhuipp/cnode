@@ -88,7 +88,7 @@ mise run test:configure -- \
   -DCNODE_REFERENCE_HYSTERIA2=/path/to/hysteria
 mise exec -- cmake --build build/musl --target cnode_e2e_reference_hysteria
 mise exec -- ctest --test-dir build/musl --no-tests=error \
-  -R '^e2e\.reference_hysteria\..*/V2_' -V
+  -R '^e2e\.reference_hysteria\.(HysteriaReference\.PanelV2_|.*/V2_)' -V
 ```
 
 本地与 CI 使用同一份 mise 固定工具链和配置入口，均为 `Release`；vcpkg 跟随上游最新提交，CI 每次运行先解析一次最新提交，再供引导与缓存键共用。本地默认关闭 LTO（`CNODE_ENABLE_LTO=OFF`），仅 CI 开启 LTO（`-DCNODE_ENABLE_LTO=ON`）；测试配置统一运行 `mise run test:configure`。宿主发行版无需相同，不要求容器。CTest 使用不指定数量的 `--parallel`，按可用 CPU 自动调度。
@@ -237,7 +237,7 @@ geosite.dat
 
 - `nodeType` 只接受 `vmess`、`vless`、`trojan`、`shadowsocks`、`anytls`、`hysteria`、`hysteria2`。
 - `sendIP: "auto"` 表示 direct 出站优先绑定入站连接命中的本地 IP（源进源出）；`enableDNS` 默认 `true`；`dnsType` 映射为 freedom 出站的 `domainStrategy`；`proxyProtocol` 见下文。
-- `tlsEnable: true` 且 `tlsCert`/`tlsKey` 为空时自动生成自签名证书（仅测试用）；TLS 由外部 nginx/caddy 终结时保持 `false`。
+- `tlsEnable: true` 允许 cnode 终结节点 TLS，证书规则见下节；Hysteria v1/v2 必须由 cnode 终结 QUIC/TLS。其他协议由外部 nginx/caddy 终结 TLS 时保持 `false`。
 - `requestTimeout` 以秒为单位，默认 30，范围 1–3600，覆盖单次面板请求的 DNS、连接、TLS、发送和响应读取。
 - 面板 HTTPS 使用系统 CA 校验证书与主机名，最低 TLS 1.2。连接或握手失败可换下一个地址；请求开始发送后失败不跨地址重发。
 - 面板节点资源标签为 `panel/{Name}/{NodeID}/{protocol}/{port}`，可在路由 `inboundTag` 与日志筛选中使用；静态入站与出站标签不得使用 `panel/` 前缀。
@@ -259,7 +259,7 @@ geosite.dat
 - 传输名称保留 [Xray 的公开拼写](https://github.com/XTLS/Xray-core/blob/main/infra/conf/transport_internet.go)：`raw`/`tcp`、`ws`/`websocket`、`xhttp`/`splithttp` 分别表示同一种传输；本实现另支持用 `h2` 强制 HTTP/2。
 - WebSocket 入站默认取 `X-Forwarded-For` 首个 IP 作为客户端地址；`wsSettings.realIpHeader` 可改用其他头，设为 `""` 关闭。该头可被伪造，仅应经可信代理访问，源端口记为 `:0`。
 - WebSocket 与 HTTPUpgrade 入站按 URL 路径精确匹配配置（包括 `/`），查询字符串不参与路径匹配；Host 比较前去除首尾空白。
-- TLS 证书可写 `tlsSettings.certificates[].certificateFile`/`keyFile`，或 `tlsSettings.certFile`/`keyFile`；这些文件、`tlsSettings.caFile` 与面板 `tlsCert`/`tlsKey` 在加载配置时读入，文件缺失、为空或超过 1 MiB 时拒绝加载；证书更新需重新加载配置。autosign 只为配置的名称签发证书并在到期前自动更新。
+- TLS 入站（含 Hysteria v1/v2）未配置证书和私钥时，自动为配置的服务端名称签发自签证书（未指定名称时用 `localhost`），并在到期前自动更新。客户端需信任自签证书。静态入站用 `tlsSettings.certificates[].certificateFile`/`keyFile` 或 `tlsSettings.certFile`/`keyFile` 配置显式证书，面板用 `tlsCert`/`tlsKey`。两者必须成对配置；文件在加载时读入，缺失、为空或超过 1 MiB 时拒绝加载，不回退自签。显式证书文件更新后需重新加载配置。`tlsSettings.caFile` 同样在加载时读取，供 TLS 客户端验证对端。
 - XHTTP `mode` 只接受 `auto`（或省略）、`packet-up`、`stream-up`、`stream-one`。
 - REALITY 服务端支持 `dest`、`xver`（0/1/2）、`serverNames`、`shortIds`、`privateKey`、`minClientVer`、`maxClientVer`、`maxTimeDiff`、`mldsa65Seed`；客户端支持 `serverName`、`publicKey`、`shortId`、`fingerprint`（`chrome`/`firefox`/`safari`/`ios`/`android`/`edge`/`360`/`qq`/`random`）、`spiderX`、`mldsa65Verify`，ClientHello 与浏览器及 Xray 的 uTLS 预设一致，提供 ALPN `h2`、`http/1.1`。`show`、`type`、`masterKeyLog` 等其他字段不生效，按未知字段忽略。未认证连接透明回落到 `dest`，使用 `timeouts.dial`、`connIdle`、`write`、`uplinkOnly`、`downlinkOnly`。V2Board `tls=2` 节点自动同步为 REALITY。
 - 出站 `settings` 各层对象中的未知键按配置总则忽略。Trojan/Shadowsocks 可用扁平服务器字段或单元素 `servers` 数组；VLESS/VMess 可用扁平字段或单元素 `vnext` 数组及其中的单元素 `users` 数组；使用嵌套结构时只读取嵌套对象，同层扁平字段不作回退。

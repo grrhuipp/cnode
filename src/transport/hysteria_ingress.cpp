@@ -1,6 +1,7 @@
 #include "transport/hysteria_ingress.hpp"
 #include "transport/hysteria_connection.hpp"
 #include "transport/tls_stream.hpp"
+#include "transport/transport_security.hpp"
 #include "transport/link.hpp"
 #include <linux/filter.h>
 #include <sys/socket.h>
@@ -28,7 +29,6 @@
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
-#include <ngtcp2/ngtcp2_crypto_boringssl.h>
 
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -373,7 +373,9 @@ bool HysteriaConnection::Initialize(const ngtcp2_pkt_hd& header) {
         return false;
 
     core_->conn_ref = {&GetConn, this};
-    core_->ssl = SSL_new(listener_->ssl_context->Native());
+    auto* tls = listener_->ssl_context->AcquireNative();
+    if (!tls) return false;
+    core_->ssl = SSL_new(tls);
     if (!core_->ssl) return false;
     SSL_set_app_data(core_->ssl, &core_->conn_ref);
     SSL_set_accept_state(core_->ssl);
@@ -1644,6 +1646,15 @@ void HysteriaConnection::CloseUdpSession(uint32_t session_id) noexcept {
     }
 }
 
+void PrepareHysteriaServerSecurity(HysteriaVersion version, StreamSettings& stream_settings) {
+    if (version == HysteriaVersion::V1 && !stream_settings.tls.alpn.empty()) {
+        TransportSecurity::PrepareQuicServer(stream_settings, stream_settings.tls.alpn);
+    } else {
+        const std::array alpn{std::string(version == HysteriaVersion::V2 ? "h3" : "hysteria")};
+        TransportSecurity::PrepareQuicServer(stream_settings, alpn);
+    }
+}
+
 HysteriaIngress::HysteriaIngress(
     uint32_t worker_id_value, uint32_t worker_count_value, net::io_context& io_value,
     app::DatagramSessionEnvironment environment_value)
@@ -1657,17 +1668,9 @@ HysteriaIngress::HysteriaIngress(
     const auto* configured = GetSettings(*environment.prepared);
     if (!configured) throw std::invalid_argument("missing Hysteria settings");
     settings = *configured;
-    const auto& stream_settings = Receiver().stream_settings;
-    const std::vector<std::string> default_alpn{
-        settings.version == HysteriaVersion::V2 ? "h3" : "hysteria"};
-    const auto& alpn = settings.version == HysteriaVersion::V2 || stream_settings.tls.alpn.empty()
-        ? default_alpn : stream_settings.tls.alpn;
-    if (!stream_settings.IsTls())
-        throw std::invalid_argument("Hysteria requires TLS");
-    ssl_context = SslContext::CreateQuicServer(stream_settings.tls, alpn);
-    if (!ssl_context ||
-        ngtcp2_crypto_boringssl_configure_server_context(ssl_context->Native()) != 0)
-        throw std::invalid_argument("invalid Hysteria TLS settings");
+    const auto& security = Receiver().stream_settings.prepared_security;
+    ssl_context = security ? security->Context() : nullptr;
+    if (!ssl_context) throw std::invalid_argument("missing prepared Hysteria TLS context");
 }
 
 HysteriaIngress::~HysteriaIngress() noexcept { RequestStop(); }

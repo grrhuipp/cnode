@@ -158,7 +158,9 @@ constexpr uint64_t kBytesPerSecondPerMbps = 125000;
 }
 
 std::optional<std::shared_ptr<const app::PreparedInboundSettings>>
-PrepareSettings(transport::HysteriaVersion version, const infra::InboundProtocolSettings& config) {
+PrepareSettings(transport::HysteriaVersion version, const infra::InboundProtocolSettings& config,
+                transport::StreamSettings& stream_settings) {
+    transport::PrepareHysteriaServerSecurity(version, stream_settings);
     return std::make_shared<const app::PreparedInboundSettings>(
         transport::HysteriaSettings{
             .version = version,
@@ -203,16 +205,16 @@ app::ProxyRegistration Registration() {
 
 const bool kHysteriaRegistered = [] {
     auto v1 = Registration();
-    v1.prepare_settings = [](std::string_view, const infra::InboundProtocolSettings& config)
-        -> std::optional<std::shared_ptr<const app::PreparedInboundSettings>> {
-        return PrepareSettings(transport::HysteriaVersion::V1, config);
+    v1.prepare_settings = [](std::string_view, const infra::InboundProtocolSettings& config,
+                             transport::StreamSettings& stream_settings) {
+        return PrepareSettings(transport::HysteriaVersion::V1, config, stream_settings);
     };
     app::RegisterProxy(common::kHysteria, std::move(v1));
 
     auto v2 = Registration();
-    v2.prepare_settings = [](std::string_view, const infra::InboundProtocolSettings& config)
-        -> std::optional<std::shared_ptr<const app::PreparedInboundSettings>> {
-        return PrepareSettings(transport::HysteriaVersion::V2, config);
+    v2.prepare_settings = [](std::string_view, const infra::InboundProtocolSettings& config,
+                             transport::StreamSettings& stream_settings) {
+        return PrepareSettings(transport::HysteriaVersion::V2, config, stream_settings);
     };
     app::RegisterProxy(common::kHysteria2, std::move(v2));
     return true;

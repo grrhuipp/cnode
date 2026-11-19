@@ -154,12 +154,13 @@ struct ProxyRegistration {
         uint32_t worker_id, uint32_t worker_count, net::io_context& io,
         app::DatagramSessionEnvironment environment) = nullptr;
 
-    // Parse protocol-specific source fields on the cold path into the closed
-    // immutable settings variant.
+    // Prepare protocol-specific immutable settings and, for a QUIC
+    // transport, its server security before publishing the receiver.
     std::optional<std::shared_ptr<const PreparedInboundSettings>>
     (*prepare_settings)(
         std::string_view tag,
-        const ::infra::InboundProtocolSettings& settings) = nullptr;
+        const ::infra::InboundProtocolSettings& settings,
+        transport::StreamSettings& stream_settings) = nullptr;
 
     // 用户构建属于冷路径，结果发布到进程级只读 UserStore 快照。所有来源共用；
     // 来源间的凭据差异只存在于 InboundProtocolSettings / InboundUserSpec 数据中。
@@ -188,7 +189,8 @@ void RegisterProxy(std::string_view protocol, ProxyRegistration registration);
 [[nodiscard]] std::optional<BuildRequest> PrepareBuildRequest(
     std::string_view protocol,
     std::string_view tag,
-    const ::infra::InboundProtocolSettings& settings);
+    const ::infra::InboundProtocolSettings& settings,
+    transport::StreamSettings& stream_settings);
 
 [[nodiscard]] std::optional<UserSet> BuildUsers(
     const BuildRequest& req,

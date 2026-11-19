@@ -274,6 +274,8 @@ TEST_P(QuicAlpnHandshake, NegotiatesOnlyACommonConfiguredProtocol) {
     bssl::UniquePtr<SSL> server(SSL_new(context->Native()));
     ASSERT_NE(client, nullptr);
     ASSERT_NE(server, nullptr);
+    // Exercise the QUIC context's ALPN policy over a TLS record BIO pair.
+    ASSERT_EQ(SSL_set_quic_method(server.get(), nullptr), 1);
     BIO* client_bio = nullptr;
     BIO* server_bio = nullptr;
     ASSERT_EQ(BIO_new_bio_pair(&client_bio, 0, &server_bio, 0), 1);

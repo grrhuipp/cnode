@@ -2,6 +2,7 @@
 
 #include "transport/stream_settings.hpp"
 #include <memory>
+#include <span>
 
 namespace transport {
 
@@ -22,6 +23,7 @@ public:
     TransportSecurity(const StreamSettings& settings, StreamEndpointRole role);
     ~TransportSecurity();
     static void Prepare(StreamSettings& settings, StreamEndpointRole role);
+    static void PrepareQuicServer(StreamSettings& settings, std::span<const std::string> alpn);
 
     // Pinned: in-flight handshakes borrow the contexts by address.
     TransportSecurity(const TransportSecurity&) = delete;
@@ -36,6 +38,7 @@ public:
     }
 
 private:
+    explicit TransportSecurity(std::unique_ptr<SslContext> context);
     StreamEndpointRole role_ = StreamEndpointRole::Inbound;
     std::shared_ptr<SslContext> context_;
     std::shared_ptr<TransportSecurity> xhttp_download_;

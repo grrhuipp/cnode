@@ -1,4 +1,5 @@
 #include "reference_support.hpp"
+#include "config_panel_common.hpp"
 #include <openssl/rand.h>
 #include <csignal>
 #include <iostream>
@@ -186,6 +187,58 @@ std::string ReferenceBinary(int version) {
 #endif
     throw std::runtime_error("unconfigured Hysteria version registered");
 }
+
+#ifdef CNODE_REFERENCE_HYSTERIA2
+TEST(HysteriaReference, PanelV2_AutoSignsWithoutCertificateFiles) {
+    const auto binary = ReferenceBinary(2);
+    VerifyHysteria(binary, 2);
+    TempDir root;
+    auto server_reservation = Socket::ReserveUdp();
+    auto socks_reservation = Socket::ReserveTcp();
+    const auto server_port = server_reservation.Port();
+    const auto socks_port = socks_reservation.Port();
+    config_panel::LoopServer panel([server_port](Socket socket) {
+        const auto request = config_panel::ReadHttp(socket);
+        if (request.path.starts_with("/api/v1/server/UniProxy/config?")) {
+            config_panel::Reply(socket, 200, Json{{"version", 2}, {"server_port", server_port},
+                {"server_name", "localhost"}, {"up_mbps", 100}, {"down_mbps", 100}}.dump());
+        } else if (request.path.starts_with("/api/v1/server/UniProxy/user?")) {
+            config_panel::Reply(socket, 200, Json{{"users", Json::array({
+                {{"id", 1}, {"uuid", UserId}, {"speed_limit", 0}, {"device_limit", 0}}})}}.dump());
+        } else {
+            config_panel::Reply(socket, 200, "{}");
+        }
+    });
+    WriteJson(root.Path(), "config.json", {
+        {"workers", 2}, {"log", {{"logDir", (root.Path() / "logs").string()}}},
+        {"panels", Json::array({{{"name", "hy2"}, {"type", "V2Board"},
+            {"apiHost", "http://127.0.0.1:" + std::to_string(panel.Port())}, {"key", "local-test-key"},
+            {"nodeIDs", {1}}, {"nodeType", "hysteria2"}, {"listenIP", "127.0.0.1"}, {"tlsEnable", true}}})}});
+    constexpr std::string_view payload = "hy2-panel-autosign";
+    TcpServer target([payload](Socket socket, size_t) {
+        const auto received = socket.ReadExact(payload.size());
+        EXPECT_EQ(received, payload);
+        socket.Write(received);
+    });
+    Child server({Binary().string(), "--config-dir", root.Path().string()}, root.Path() / "cnode.log");
+    server.WaitForLog("Panel configuration ready: tag=panel/hy2/1/hysteria2/");
+    const auto config = root.Path() / "client.yaml";
+    WriteFile(config, "server: " + Address(server_port) + "\nauth: " + std::string(UserId) +
+        "\ntls:\n  sni: localhost\n  insecure: true\nsocks5:\n  listen: " + Address(socks_port) + "\n");
+    Child client({binary, "client", "-c", config.string()}, root.Path() / "client.log");
+    {
+        auto socket = Connect(socks_port);
+        Socks(socket, target.Port());
+        socket.Write(payload);
+        EXPECT_EQ(socket.ReadExact(payload.size()), payload);
+    }
+    client.Stop();
+    server.Signal(SIGTERM);
+    EXPECT_EQ(server.Wait(10s), 0);
+    target.Join();
+    panel.Join();
+}
+#endif
 
 class HysteriaReference : public testing::TestWithParam<std::tuple<int, std::string>> {};
 TEST_P(HysteriaReference, AuthenticatedCrossWorkerReturnAndFailClosedShutdown) {

@@ -37,16 +37,18 @@ PreparedInbound PrepareInbound(const infra::InboundSpec& spec) {
             "inbound '" + spec.tag + "' has unsupported protocol '" +
             spec.protocol + "'");
     }
+    transport::StreamSettings stream_settings = spec.stream_settings;
     auto build_request = PrepareBuildRequest(
-        spec.protocol, spec.tag, spec.settings);
+        spec.protocol, spec.tag, spec.settings, stream_settings);
     if (!build_request) {
         throw std::invalid_argument(
             "inbound '" + spec.tag + "' has invalid protocol settings");
     }
     auto users = PrepareInboundUsers(*build_request, spec.users);
 
-    transport::StreamSettings stream_settings = spec.stream_settings;
-    transport::TransportSecurity::Prepare(stream_settings, transport::StreamEndpointRole::Inbound);
+    if (RegisteredDatagramTransport(spec.protocol) != DatagramTransport::Quic) {
+        transport::TransportSecurity::Prepare(stream_settings, transport::StreamEndpointRole::Inbound);
+    }
     // XHTTP 会话命名空间按入站 tag 隔离，配置准备期一次推导，Worker 只读。
     if (stream_settings.IsXHttp()) {
         auto& ns = stream_settings.xhttp.session_namespace;

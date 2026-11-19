@@ -3,6 +3,7 @@
 #include "transport/tls_context.hpp"
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <ngtcp2/ngtcp2_crypto_boringssl.h>
 #include <chrono>
 #include <memory>
 #include <stdexcept>
@@ -39,20 +40,30 @@ template<class Predicate> bool Await(Predicate predicate) {
 }
 }
 
-TEST(AutosignContext, RenewalPublishesNewSnapshotWithoutMutatingEstablishedConnection) {
+class RenewedTlsServer : public testing::TestWithParam<bool> {};
+TEST_P(RenewedTlsServer, PublishesNewSnapshotWithoutMutatingEstablishedConnection) {
     constexpr long kTenDays = 10L * 24 * 60 * 60;
     auto initial = Context(kTenDays);
+    if (GetParam())
+        ASSERT_EQ(ngtcp2_crypto_boringssl_configure_server_context(initial.get()), 0);
     SSL_CTX* initial_ptr = initial.get();
     std::unique_ptr<SSL, decltype(&SSL_free)> established(SSL_new(initial_ptr), SSL_free);
     ASSERT_NE(established, nullptr);
-    auto renewal = Renewal::Start(std::move(initial), RenewalConfig("renewal.example"));
+    auto config = RenewalConfig("renewal.example");
+    if (GetParam()) config.alpn = {"h3"};
+    auto renewal = Renewal::Start(std::move(initial), std::move(config),
+        GetParam() ? ::transport::TlsServerTransport::Quic : ::transport::TlsServerTransport::Stream);
     ASSERT_TRUE(Await([&] { return renewal->Acquire() != initial_ptr; }));
     SSL_CTX* replacement = renewal->Acquire();
     ASSERT_NE(replacement, nullptr);
     EXPECT_EQ(SSL_get_SSL_CTX(established.get()), initial_ptr);
     EXPECT_NE(SSL_CTX_get0_certificate(replacement), SSL_get_certificate(established.get()));
+    bssl::UniquePtr<SSL> next(SSL_new(replacement));
+    ASSERT_NE(next, nullptr);
+    EXPECT_EQ(SSL_is_quic(next.get()) != 0, GetParam());
     EXPECT_EQ(renewal->Acquire(Renewal::Clock::now() + std::chrono::hours(24 * 11)), replacement);
 }
+INSTANTIATE_TEST_SUITE_P(Transports, RenewedTlsServer, testing::Bool());
 
 TEST(AutosignContext, FailedRenewalRetainsValidSnapshotButRejectsExpiredSnapshot) {
     constexpr long kTenDays = 10L * 24 * 60 * 60;

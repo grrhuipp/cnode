@@ -41,6 +41,7 @@ namespace transport {
 class InboundTransportStreamHandler;
 class SslContext;
 
+void PrepareHysteriaServerSecurity(HysteriaVersion version, StreamSettings& stream_settings);
 
 [[nodiscard]] inline const HysteriaSettings* GetSettings(
     const app::BuildRequest& request) noexcept {
@@ -280,7 +281,7 @@ private:
     uint32_t worker_count;
     net::io_context& io;
     HysteriaSettings settings;
-    std::unique_ptr<SslContext> ssl_context;
+    const SslContext* ssl_context = nullptr;  // Borrowed from environment.handler's receiver.
     std::unordered_map<std::string,
         std::shared_ptr<HysteriaSocketState>, common::TransparentStringHash, common::TransparentStringEq> sockets;
     std::unordered_map<

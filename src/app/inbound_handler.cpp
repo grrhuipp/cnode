@@ -505,7 +505,8 @@ std::unique_ptr<transport::QuicListener> NewQuicListener(
 std::optional<BuildRequest> PrepareBuildRequest(
     std::string_view protocol,
     std::string_view tag,
-    const ::infra::InboundProtocolSettings& settings) {
+    const ::infra::InboundProtocolSettings& settings,
+    transport::StreamSettings& stream_settings) {
     const auto* registration = FindRegistration(protocol);
     if (!registration) {
         return std::nullopt;
@@ -517,7 +518,7 @@ std::optional<BuildRequest> PrepareBuildRequest(
         .settings = {},
     };
     if (registration->prepare_settings) {
-        auto prepared = registration->prepare_settings(tag, settings);
+        auto prepared = registration->prepare_settings(tag, settings, stream_settings);
         if (!prepared) {
             return std::nullopt;
         }

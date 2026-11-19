@@ -1020,7 +1020,8 @@ const bool kInboundRegistered = [] {
         };
 
     reg.prepare_settings =
-        [](std::string_view tag, const ::infra::InboundProtocolSettings& config)
+        [](std::string_view tag, const ::infra::InboundProtocolSettings& config,
+           transport::StreamSettings&)
             -> std::optional<std::shared_ptr<
                 const ::app::PreparedInboundSettings>> {
             // Text was validated (size and grammar) by infra::ParseAnyTlsPaddingScheme;
