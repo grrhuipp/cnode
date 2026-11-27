@@ -108,8 +108,11 @@ std::string_view ResolveOutboundTlsServerName(
 net::awaitable<tl::expected<OutboundTransportTarget, common::ErrorCode>>
 BuildOutboundTransportTarget(OutboundTargetOptions options);
 
-// 统一出站传输连接：
-// 消费冷路径预构建候选，建立 TCP 连接，并按 StreamSettings 完成 TLS/WS。
+// 统一出站传输连接：消费冷路径预构建候选建立 TCP 连接。多候选按 RFC 8305
+// Happy Eyeballs 从首个候选的地址族起交替两族，每 250 ms 或前一尝试失败时
+// 发起下一尝试，整场竞速受同一个 target.timeout 约束；首个建连成功者胜出，
+// 其余尝试取消并收束后才返回。StreamSettings 的 TLS/WS 等只在胜出连接上构建，
+// 构建失败即本次拨号结果。
 [[nodiscard]]
 net::awaitable<DialResult> DialOutboundTransport(
     net::io_context& io_context,

@@ -1,8 +1,10 @@
 #include "transport/outbound_target_builder.hpp"
 
 #include "app/dns.hpp"
+#include "common/awaitable_task_group.hpp"
 #include "common/ip_address.hpp"
 #include "infra/log.hpp"
+#include "transport/async_delay.hpp"
 #include "transport/tcp_stream.hpp"
 #include "transport/transport_stack.hpp"
 #include "transport/xhttp_client.hpp"
@@ -28,13 +30,155 @@ namespace {
     return mode == XHttpMode::PacketUp || mode == XHttpMode::StreamUp;
 }
 
-net::awaitable<DialResult> DialAndBuildSingleCandidate(
+// RFC 8305 §8 推荐的 Connection Attempt Delay。
+constexpr std::chrono::milliseconds kConnectionAttemptDelay{250};
+
+// RFC 8305 Happy Eyeballs v2 的 TCP 连接竞速，只存活在拨号协程帧上。
+// 所有尝试、尝试间隔与整体截止期都是同一任务组的子任务：任务组 join 后
+// 本对象才析构，借用的候选、ctx 与组指针均不越过 join。
+struct CandidateRace {
+    CandidateRace(net::io_context& io_context,
+                  common::Context& ctx,
+                  std::span<const OutboundDialCandidate> candidates,
+                  std::chrono::seconds timeout)
+        : io_context(io_context),
+          ctx(ctx),
+          candidates(candidates),
+          timeout(timeout),
+          preferred_v6(candidates.front().endpoint.address().is_v6()),
+          attempt_delay(io_context),
+          deadline(io_context) {}
+    CandidateRace(const CandidateRace&) = delete;
+    CandidateRace& operator=(const CandidateRace&) = delete;
+
+    // RFC 8305 §4：从首选地址族开始交替两个地址族，族内保持候选顺序；
+    // 一族耗尽后按序取另一族。两个游标只前进，整体 O(N) 且不分配。
+    [[nodiscard]] const OutboundDialCandidate* NextCandidate() noexcept {
+        const bool preferred_turn = launched % 2 == 0;
+        const bool first_v6 = preferred_turn == preferred_v6;
+        if (const auto* candidate = TakeNext(first_v6)) return candidate;
+        return TakeNext(!first_v6);
+    }
+
+    // 胜者、全部失败或截止期任一到达即裁决；停止任务组以取消其余尝试、
+    // 尝试间隔与截止期，任务组仍等待它们实际完成。
+    void Conclude(DialResult outcome) {
+        concluded = true;
+        result = std::move(outcome);
+        group->Cancel();
+    }
+
+    net::io_context& io_context;
+    common::Context& ctx;
+    std::span<const OutboundDialCandidate> candidates;
+    std::chrono::seconds timeout;
+    bool preferred_v6;
+    common::AwaitableTaskGroup* group = nullptr;
+    AsyncDelay attempt_delay;
+    AsyncDelay deadline;
+    DialResult result =
+        DialResult::Fail(common::ErrorCode::DIAL_CONNECT_FAILED, "all dial candidates failed");
+    size_t launched = 0;
+    size_t in_flight = 0;
+    // 尝试失败时置位：发起方不再等待剩余的 Connection Attempt Delay。
+    bool attempt_failed = false;
+    bool concluded = false;
+
+private:
+    [[nodiscard]] const OutboundDialCandidate* TakeNext(bool v6) noexcept {
+        size_t& cursor = v6 ? next_v6_ : next_v4_;
+        while (cursor < candidates.size() &&
+               candidates[cursor].endpoint.address().is_v6() != v6) {
+            ++cursor;
+        }
+        return cursor < candidates.size() ? &candidates[cursor++] : nullptr;
+    }
+
+    size_t next_v4_ = 0;
+    size_t next_v6_ = 0;
+};
+
+net::awaitable<void> AttemptRaceCandidate(CandidateRace& race,
+                                          const OutboundDialCandidate& candidate) {
+    auto attempt = co_await ConnectOutboundCandidate(race.io_context, candidate, race.timeout);
+    --race.in_flight;
+    // 已裁决后完成的连接（含同一轮事件中晚到的成功）随 attempt 析构关闭。
+    if (race.concluded) co_return;
+    if (attempt.Ok()) {
+        race.Conclude(std::move(attempt));
+        co_return;
+    }
+    LOG_CONN_DEBUG(race.ctx,
+                   "dial candidate failed endpoint={}:{} > {}",
+                   common::AddressText(candidate.endpoint.address()).View(),
+                   candidate.endpoint.port(),
+                   attempt.error_msg);
+    if (race.in_flight == 0 && race.launched == race.candidates.size()) {
+        race.Conclude(std::move(attempt));
+        co_return;
+    }
+    race.result = std::move(attempt);
+    // RFC 8305 §5：前一次尝试失败时立即开始下一次，不等满尝试间隔。
+    race.attempt_failed = true;
+    race.attempt_delay.Cancel();
+}
+
+// 本协程被取消（裁决或父取消）后不得再 co_await 子协程：Asio 会在 await 处
+// 抛出 operation_aborted，使任务组把已裁决的结果覆盖为取消异常。
+net::awaitable<void> LaunchRaceAttempts(CandidateRace& race) {
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    while (const auto* candidate = race.NextCandidate()) {
+        ++race.launched;
+        ++race.in_flight;
+        race.group->Spawn(AttemptRaceCandidate(race, *candidate));
+        if (race.concluded || race.launched == race.candidates.size()) co_return;
+        if (!race.attempt_failed) {
+            co_await race.attempt_delay.WaitFor(kConnectionAttemptDelay);
+            if (race.concluded || cancellation.cancelled() != net::cancellation_type::none) {
+                co_return;
+            }
+        }
+        race.attempt_failed = false;
+    }
+}
+
+net::awaitable<void> EnforceRaceDeadline(CandidateRace& race) {
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    co_await race.deadline.WaitFor(race.timeout);
+    if (race.concluded || cancellation.cancelled() != net::cancellation_type::none) co_return;
+    race.Conclude(DialResult::Fail(common::ErrorCode::DIAL_TIMEOUT, "connection timed out"));
+}
+
+// 多候选只竞速 TCP 建连：整场竞速受同一个拨号截止期约束，首个成功的连接
+// 胜出，其余尝试被取消并 join 后才返回。传输层构建只在胜者上执行一次，
+// 与 Xray 先竞速 TCP、再在所得连接上叠加安全层/传输层一致。
+net::awaitable<DialResult> RaceOutboundCandidates(
+    net::io_context& io_context,
+    common::Context& ctx,
+    std::span<const OutboundDialCandidate> candidates,
+    std::chrono::seconds timeout) {
+    CandidateRace race(io_context, ctx, candidates, timeout);
+    co_await common::RunAwaitableTaskGroup(
+        net::any_io_executor(io_context.get_executor()),
+        [&race](common::AwaitableTaskGroup& group) {
+            race.group = &group;
+            group.Spawn(EnforceRaceDeadline(race));
+            // 子任务就地启动：非正截止期会在此前裁决并停止任务组。
+            if (!race.concluded) group.Spawn(LaunchRaceAttempts(race));
+        });
+    race.group = nullptr;
+    co_return std::move(race.result);
+}
+
+net::awaitable<DialResult> DialAndBuildTransport(
     net::io_context& io_context,
     common::Context& ctx,
     const OutboundTransportTarget& target,
-    const OutboundDialCandidate& candidate) {
+    std::span<const OutboundDialCandidate> candidates) {
 
-    auto tcp_result = co_await ConnectOutboundCandidate(io_context, candidate, target.timeout);
+    auto tcp_result = candidates.size() == 1
+        ? co_await ConnectOutboundCandidate(io_context, candidates.front(), target.timeout)
+        : co_await RaceOutboundCandidates(io_context, ctx, candidates, target.timeout);
     if (!tcp_result.Ok()) {
         co_return tcp_result;
     }
@@ -65,33 +209,6 @@ net::awaitable<DialResult> DialAndBuildSingleCandidate(
     stream->SetIdleTimeout(std::chrono::seconds(0));
 
     co_return DialResult::Success(std::move(stream));
-}
-
-net::awaitable<DialResult> DialAndBuildCandidatesSequential(
-    net::io_context& io_context,
-    common::Context& ctx,
-    const OutboundTransportTarget& target,
-    std::span<const OutboundDialCandidate> candidates) {
-
-    DialResult last_result =
-        DialResult::Fail(common::ErrorCode::DIAL_CONNECT_FAILED, "all dial candidates failed");
-
-    for (const auto& candidate : candidates) {
-        auto attempt = co_await DialAndBuildSingleCandidate(
-            io_context, ctx, target, candidate);
-        if (attempt.Ok()) {
-            co_return attempt;
-        }
-
-        LOG_CONN_DEBUG(ctx,
-                       "dial candidate failed endpoint={}:{} > {}",
-                       common::AddressText(candidate.endpoint.address()).View(),
-                       candidate.endpoint.port(),
-                       attempt.error_msg);
-        last_result = std::move(attempt);
-    }
-
-    co_return last_result;
 }
 
 [[nodiscard]] std::optional<OutboundDialer::OrderedBind> SelectOrderedBind(
@@ -356,12 +473,7 @@ __attribute__((weak)) net::awaitable<DialResult> DialOutboundTransport(
     if (IsXHttpSplitOutbound(target)) {
         return DialXHttpSplitOutboundTransport(io_context, ctx, target);
     }
-    if (candidates.size() == 1) {
-        return DialAndBuildSingleCandidate(
-            io_context, ctx, target, candidates.front());
-    }
-    return DialAndBuildCandidatesSequential(
-        io_context, ctx, target, candidates);
+    return DialAndBuildTransport(io_context, ctx, target, candidates);
 }
 
 std::string_view ResolveOutboundTlsServerName(
