@@ -467,6 +467,69 @@ TEST(NodeTransaction, CleansUncommittedOrphanCandidate) {
     ExpectEmpty(runtime, next->tag);
 }
 
+// 回滚也失败后，本地恢复只依赖保留快照：清理新旧残留后立即重建最后提交状态，
+// 不等待面板应答，校验器保持为最后提交值。
+TEST(NodeTransaction, LocalRecoveryRestoresCommittedRuntimeWithoutPanel) {
+    Runtime runtime;
+    NodeState state;
+    const auto old = Snapshot(1000);
+    const auto next = Snapshot(2000, 2);
+    Seed(runtime, state, old);
+    runtime.faults = {{"add-in:" + next->tag, 1, true}, {"remove-in:" + next->tag, 1, false}};
+    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, next)));
+    ASSERT_TRUE(state.HasPendingCleanup());
+    EXPECT_EQ(state.phase, NodeRuntimePhase::RecoveryRequired);
+    runtime.faults.clear();
+    ASSERT_FALSE(RunNodeRuntimeOperation(RecoverNodeRuntime(runtime, state)));
+    EXPECT_FALSE(state.HasPendingCleanup());
+    EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
+    EXPECT_EQ(state.committed, old);
+    ExpectMatches(runtime, *old);
+    ExpectEmpty(runtime, next->tag);
+    EXPECT_EQ(state.committed->users_etag, "users-1");
+    EXPECT_EQ(state.committed->config_etag, "config-1");
+    EXPECT_TRUE(state.ReservesPort(1000));
+    EXPECT_FALSE(state.ReservesPort(2000));
+}
+
+// 重建失败但补偿完整时不留残留：节点停止、保留提交快照，控制面可继续拉取面板。
+TEST(NodeTransaction, FailedLocalRestoreKeepsSnapshotWithoutPendingCleanup) {
+    Runtime runtime;
+    NodeState state;
+    const auto old = Snapshot(1000);
+    Seed(runtime, state, old);
+    state.pending_cleanup = {old, {}};
+    state.phase = NodeRuntimePhase::RecoveryRequired;
+    runtime.faults = {{"add-in:" + old->tag, 1, false, true}};
+    EXPECT_TRUE(RunNodeRuntimeOperation(RecoverNodeRuntime(runtime, state)));
+    EXPECT_FALSE(state.HasPendingCleanup());
+    EXPECT_EQ(state.phase, NodeRuntimePhase::Stopped);
+    EXPECT_EQ(state.committed, old);
+    ExpectEmpty(runtime, old->tag);
+    EXPECT_FALSE(state.ReservesPort(1000));
+    runtime.faults.clear();
+    ASSERT_FALSE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, old)));
+    EXPECT_EQ(state.phase, NodeRuntimePhase::Ready);
+    ExpectMatches(runtime, *old);
+}
+
+TEST(NodeTransaction, LocalRecoveryWithoutCommittedSnapshotOnlyCleans) {
+    Runtime runtime;
+    NodeState state;
+    const auto next = Snapshot(2000);
+    runtime.faults = {{"add-in:" + next->tag, 1, true}, {"remove-in:" + next->tag, 1, false}};
+    EXPECT_TRUE(RunNodeRuntimeOperation(ApplyNodeChange(runtime, state, next)));
+    ASSERT_TRUE(state.HasPendingCleanup());
+    runtime.faults.clear();
+    const auto installs = runtime.counts["add-in:" + next->tag];
+    ASSERT_FALSE(RunNodeRuntimeOperation(RecoverNodeRuntime(runtime, state)));
+    EXPECT_FALSE(state.HasPendingCleanup());
+    EXPECT_FALSE(state.committed);
+    EXPECT_EQ(state.phase, NodeRuntimePhase::Stopped);
+    EXPECT_EQ(runtime.counts["add-in:" + next->tag], installs);
+    ExpectEmpty(runtime, next->tag);
+}
+
 TEST(NodeTransaction, ReservesEndpointsBeforeFirstSuspend) {
     Runtime runtime;
     NodeState state;

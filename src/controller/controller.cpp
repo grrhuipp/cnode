@@ -656,12 +656,23 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
     NodeRuntime runtime(io_context_, workers_, panel, stopping_);
 
     // One pull attempt is made for each scheduler invocation.
-    // Cleanup depends only on retained local snapshots, so a failing or
-    // unavailable panel cannot indefinitely retain orphan resources.
+    // Recovery depends only on retained local snapshots, so a failing or
+    // unavailable panel can neither retain orphan resources nor keep the last
+    // committed node down.
     if (panel.node.HasPendingCleanup()) {
         auto lease = co_await node_mutations_.Acquire(panel.mutation);
         app::ThrowIfStopping(stopping_);
-        co_await controller::CleanPendingNodeRuntime(runtime, panel.node);
+        try {
+            co_await controller::RecoverNodeRuntime(runtime, panel.node);
+            if (panel.node.phase == controller::NodeRuntimePhase::Ready) {
+                LOG_PANEL_INFO(log_context, "Committed runtime restored: tag={}",
+                               panel.node.committed->tag);
+            }
+        } catch (const std::exception& error) {
+            // 补偿完整的重建失败只让节点保持停止；面板仍可能下发修正后的配置。
+            if (stopping_ || panel.node.HasPendingCleanup()) throw;
+            LOG_PANEL_WARN(log_context, "Committed runtime restore failed: {}", error.what());
+        }
     }
     app::ThrowIfStopping(stopping_);
     const auto old_state = panel.node.committed;

@@ -524,4 +524,16 @@ net::awaitable<void> ApplyNodeChange(
     std::rethrow_exception(failure);
 }
 
+// 本地恢复只依赖保留的快照，不等待面板：先清理失败转换遗留的新旧资源，再以最后
+// 提交快照重建节点；无提交快照时只清理。重建按 ApplyNodeChange 的准备—提交—回滚
+// 执行：失败且补偿完整时节点停止、保留快照；补偿未完成则继续保留待清理目标。
+template <typename Runtime>
+net::awaitable<void> RecoverNodeRuntime(Runtime& runtime, NodeState& state) {
+    if (!state.committed) {
+        co_await CleanPendingNodeRuntime(runtime, state);
+        co_return;
+    }
+    co_await ApplyNodeChange(runtime, state, state.committed);
+}
+
 }  // namespace controller
