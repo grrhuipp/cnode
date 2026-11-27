@@ -34,9 +34,11 @@ public:
             const_cast<common::SignalChannel&>(input_signal_).get_executor(),
             net::execution::context));
     }
-    void SetUploadBudget(const std::shared_ptr<XHttpPacketUpSession>& budget) noexcept {
-        upload_budget_ = budget;
-    }
+    // Charges the DATA already queued to `budget` and every later frame until
+    // the queue drains. False, leaving the stream uncharged, when the budget
+    // cannot take what is queued. Called at most once per stream.
+    [[nodiscard]] bool AttachUploadBudget(
+        const std::shared_ptr<XHttpPacketUpSession>& budget) noexcept;
 
     // Queues a received DATA payload. False asks the session to reset the
     // stream: the per-stream or XHTTP session budget is exhausted. `session`
@@ -107,6 +109,9 @@ private:
     // `session` is the caller's lock of session_ for the current synchronous
     // step; null when the session is gone.
     void PopFrontDataFrame(Http2ServerSession* session) noexcept;
+    // Gives back the receive memory and upload budget that a dequeued frame
+    // of `storage` capacity held.
+    void ReleaseFrontStorage(Http2ServerSession* session, size_t storage) noexcept;
     void DropQueuedData() noexcept;
     void ConsumeData(Http2ServerSession* session, size_t size) noexcept;
     void ReleaseDecoderStorage(Http2ServerSession* session) noexcept;
@@ -127,7 +132,9 @@ private:
     std::weak_ptr<Http2ServerSession> session_;
     common::CancellationSource cancellation_;
     std::weak_ptr<XHttpPacketUpSession> upload_budget_;
-    size_t upload_reserved_ = 0;
+    // While set, every queued frame's storage is reserved in upload_budget_
+    // (unless that session is gone): releases mirror reservations exactly.
+    bool upload_budget_attached_ = false;
     uint32_t stream_id_ = 0;
     H2PayloadCodec payload_codec_ = H2PayloadCodec::GrpcHunk;
     H2InboundPayload inbound_;
@@ -249,6 +256,8 @@ public:
 
     // `http_config` (required for RawData) and `xhttp_config` are borrowed
     // from the handshake caller, which awaits Run() to completion.
+    // `request_handshake_timeout` bounds each XHTTP upload until its session
+    // takes it; zero leaves it unbounded.
     Http2ServerSession(app::GroupCoordinator& coordinator, net::io_context& io_context,
                        std::unique_ptr<AsyncStream> stream,
                        std::shared_ptr<InboundTransportStreamHandler> stream_handler,
@@ -257,7 +266,8 @@ public:
                        const HttpConfig* http_config,
                        const XHttpConfig* xhttp_config,
                        const GrpcConfig* grpc_config,
-                       uint32_t initial_receive_window);
+                       uint32_t initial_receive_window,
+                       std::chrono::seconds request_handshake_timeout);
 
     ~Http2ServerSession() noexcept;
 
@@ -405,6 +415,7 @@ private:
     std::vector<uint8_t> response_header_block_;
     HpackDecoder hpack_decoder_;
     uint64_t conn_id_ = 0;
+    std::chrono::seconds request_handshake_timeout_{0};
     uint32_t last_remote_stream_id_ = 0;
     common::AwaitableTaskGroup* tasks_ = nullptr;
     size_t active_requests_ = 0;

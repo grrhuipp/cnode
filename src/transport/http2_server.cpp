@@ -59,6 +59,16 @@ net::awaitable<void> Http2ServerSubStreamState::WaitSendCredit() {
     }
 }
 
+bool Http2ServerSubStreamState::AttachUploadBudget(
+    const std::shared_ptr<XHttpPacketUpSession>& budget) noexcept {
+    // DATA may queue while the upload's session is looked up; it is charged
+    // now, so that every dequeued frame gives back exactly what it took.
+    if (queued_storage_ != 0 && !budget->Reserve(queued_storage_)) return false;
+    upload_budget_ = budget;
+    upload_budget_attached_ = true;
+    return true;
+}
+
 bool Http2ServerSubStreamState::EnqueueData(
     Http2ServerSession& session,
     H2Frame& frame,
@@ -94,7 +104,7 @@ bool Http2ServerSubStreamState::EnqueueData(
     }
     if (storage > kHttp2MaxQueuedStreamStorage - queued_storage_ ||
         !session.ReserveReceiveMemory(storage)) return false;
-    const auto upload_budget = upload_budget_.lock();
+    const auto upload_budget = upload_budget_attached_ ? upload_budget_.lock() : nullptr;
     if (upload_budget && !upload_budget->Reserve(storage)) {
         session.ReleaseReceiveMemory(storage);
         return false;
@@ -130,7 +140,6 @@ bool Http2ServerSubStreamState::EnqueueData(
         added.start = 0;
         added.end = remaining;
     }
-    if (upload_budget) upload_reserved_ += storage;
     queued_storage_ += storage;
     queued_bytes_ += size;
     WakeInputReader();
@@ -301,27 +310,24 @@ net::awaitable<void> Http2ServerSubStreamState::AsyncShutdownWrite() {
     }
 }
 
-void Http2ServerSubStreamState::PopFrontDataFrame(Http2ServerSession* session) noexcept {
-    const auto& front = data_frames_.front();
-    const size_t storage = front.payload->capacity;
+void Http2ServerSubStreamState::ReleaseFrontStorage(
+    Http2ServerSession* session, size_t storage) noexcept {
     queued_storage_ -= storage;
     if (session) session->ReleaseReceiveMemory(storage);
-    if (upload_reserved_ != 0) {
-        if (auto budget = upload_budget_.lock()) {
-            budget->Release(storage);
-        }
-        upload_reserved_ -= std::min(upload_reserved_, storage);
+    if (upload_budget_attached_) {
+        if (auto budget = upload_budget_.lock()) budget->Release(storage);
     }
+}
+
+void Http2ServerSubStreamState::PopFrontDataFrame(Http2ServerSession* session) noexcept {
+    ReleaseFrontStorage(session, data_frames_.front().payload->capacity);
     data_frames_.pop_front();
 }
 
 void Http2ServerSubStreamState::DropQueuedData() noexcept {
     const size_t discarded = std::exchange(queued_bytes_, 0);
-    const size_t upload_reserved = std::exchange(upload_reserved_, 0);
-    if (upload_reserved != 0) {
-        if (auto budget = upload_budget_.lock()) {
-            budget->Release(upload_reserved);
-        }
+    if (std::exchange(upload_budget_attached_, false) && queued_storage_ != 0) {
+        if (auto budget = upload_budget_.lock()) budget->Release(queued_storage_);
     }
     upload_budget_.reset();
     data_frames_.clear();
@@ -426,16 +432,8 @@ common::MultiBuffer Http2ServerSubStreamState::ConsumeRawMultiBuffer() noexcept 
     const auto session = LockSession();
     auto& front = data_frames_.front();
     const size_t size = front.payload->Len();
-    const size_t storage = front.payload->capacity;
     common::BufferGuard buffer = std::move(front.payload);
-    queued_storage_ -= storage;
-    if (session) session->ReleaseReceiveMemory(storage);
-    if (upload_reserved_ != 0) {
-        if (auto budget = upload_budget_.lock()) {
-            budget->Release(storage);
-        }
-        upload_reserved_ -= std::min(upload_reserved_, storage);
-    }
+    ReleaseFrontStorage(session.get(), buffer->capacity);
     data_frames_.pop_front();
     ConsumeData(session.get(), size);
     return common::MultiBuffer{std::move(buffer)};
@@ -487,7 +485,8 @@ Http2ServerSession::Http2ServerSession(
     const HttpConfig* http_config,
     const XHttpConfig* xhttp_config,
     const GrpcConfig* grpc_config,
-    uint32_t initial_receive_window)
+    uint32_t initial_receive_window,
+    std::chrono::seconds request_handshake_timeout)
     : coordinator_(coordinator)
     , io_context_(io_context)
     , stream_(std::move(stream))
@@ -496,7 +495,8 @@ Http2ServerSession::Http2ServerSession(
     , http_config_(http_config)
     , xhttp_config_(xhttp_config)
     , grpc_config_(grpc_config)
-    , conn_id_(conn_id) {
+    , conn_id_(conn_id)
+    , request_handshake_timeout_(request_handshake_timeout) {
     initial_receive_window_ = initial_receive_window;
     if (!stream_ || !stream_->DeferWriteCancellation()) {
         throw std::invalid_argument("HTTP/2 requires a physical transport with deferred write cancellation");
@@ -787,6 +787,47 @@ net::awaitable<void> Http2ServerSession::FlushReceiveCredit() {
     credit_flush_running_ = false;
 }
 
+namespace {
+// An XHTTP upload finds its session, delivers its body and, when it came
+// first, meets the downlink within the request handshake deadline, as on
+// HTTP/1.1. Expiry resets the stream: its terminal cancellation then reaches
+// every wait synchronously, including one not yet suspended when the
+// deadline fired, and unwinding returns the queued DATA, the session budget,
+// the upload slot and any directory wait.
+class UploadHandshakeDeadline final : private common::CancellationSubscription {
+public:
+    // `upload` outlives this guard, or Finish() runs before it goes.
+    UploadHandshakeDeadline(AsyncStream& upload, std::chrono::seconds timeout)
+        : upload_(upload), deadline_(upload.StartPhaseDeadline(timeout)) {
+        if (deadline_) Resubscribe(upload_.Cancellation());
+    }
+
+    // The upload reached its session: its own lifetime takes over.
+    void Finish() noexcept {
+        Unsubscribe();
+        if (deadline_) {
+            deadline_ = {};
+            upload_.ClearPhaseDeadline();
+        }
+    }
+
+private:
+    // The phase deadline only cancels pending operations; reset the stream
+    // when that cancellation is its expiry.
+    void OnCancellation(common::Cancellation cancellation) noexcept override {
+        if (cancellation.terminal) return;
+        if (deadline_.Expired()) {
+            upload_.CloseAbortive();
+            return;
+        }
+        Resubscribe(upload_.Cancellation());
+    }
+
+    AsyncStream& upload_;
+    PhaseDeadlineToken deadline_;
+};
+}  // namespace
+
 net::awaitable<void> Http2ServerSession::RunUpload(
     uint32_t stream_id,
     bool end_stream,
@@ -795,6 +836,8 @@ net::awaitable<void> Http2ServerSession::RunUpload(
     std::string session_id,
     uint64_t seq) {
     RequestScope active(active_requests_);
+    std::unique_ptr<AsyncStream> upload = std::make_unique<Http2ServerSubStream>(sub);
+    UploadHandshakeDeadline deadline(*upload, request_handshake_timeout_);
     XHttpUploadTarget target;
     try {
         const auto access = kind == XHttpRequestMeta::Kind::PacketUp
@@ -824,7 +867,13 @@ net::awaitable<void> Http2ServerSession::RunUpload(
         RemoveStream(stream_id);
         co_return;
     }
-    if (!co_await AcceptStream(stream_id, end_stream, *sub)) {
+    // DATA queued during the lookup counts against the session from here on;
+    // a session that cannot take it refuses the stream like excess DATA.
+    const bool charged = !target.session || sub->AttachUploadBudget(target.session);
+    if (!charged && StreamWritable(stream_id)) {
+        (void)co_await ResetStream(stream_id, H2Error::ExcessiveLoad);
+    }
+    if (!charged || !co_await AcceptStream(stream_id, end_stream, *sub)) {
         // The stream-up this session waited for will not come.
         if (kind == XHttpRequestMeta::Kind::StreamUp && target.session &&
             target.session->CanAttachStream()) {
@@ -832,8 +881,6 @@ net::awaitable<void> Http2ServerSession::RunUpload(
         }
         co_return;
     }
-    if (target.session) sub->SetUploadBudget(target.session);
-    std::unique_ptr<AsyncStream> upload = std::make_unique<Http2ServerSubStream>(sub);
     try {
         if (kind == XHttpRequestMeta::Kind::PacketUp) {
             {
@@ -853,11 +900,13 @@ net::awaitable<void> Http2ServerSession::RunUpload(
                     throw IoSystemError(io_error::timed_out);
                 }
             }
+            deadline.Finish();
             target = XHttpUploadTarget{};
             co_await upload->AsyncShutdownWrite();
             upload->Close();
             co_return;
         }
+        deadline.Finish();
         LOG_CONN_DEBUG(conn_id_, "XHTTP server H2 stream-up upload ready session={} stream_id={} remote={}",
                       PublicHttpTargetForLog(session_id), stream_id, target.session == nullptr);
         if (!target.session) {
@@ -1352,7 +1401,8 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     const HttpConfig* http_config,
     const XHttpConfig* xhttp_config,
     const GrpcConfig* grpc_config,
-    bool read_client_preface) {
+    bool read_client_preface,
+    std::chrono::seconds request_handshake_timeout) {
     if (read_client_preface) {
         std::array<uint8_t, kHttp2ClientPreface.size()> preface{};
         size_t done = 0;
@@ -1377,7 +1427,8 @@ net::awaitable<TransportBuildResult> StartHttp2ServerSession(
     co_await WriteHttp2ServerPreface(*stream, initial_window);
     auto session = std::make_shared<Http2ServerSession>(
         coordinator, io_context, std::move(stream), std::move(stream_handler), payload_codec,
-        conn_id, http_config, xhttp_config, grpc_config, initial_window);
+        conn_id, http_config, xhttp_config, grpc_config, initial_window,
+        request_handshake_timeout);
     co_await session->Run();
     co_return std::unique_ptr<AsyncStream>{};
 }
@@ -1401,7 +1452,8 @@ net::awaitable<TransportBuildResult> DoGrpcServerHandshake(
         nullptr,
         nullptr,
         &cfg,
-        true);
+        true,
+        std::chrono::seconds{0});
 }
 
 net::awaitable<TransportBuildResult> RunHttp2ServerSession(
@@ -1411,7 +1463,8 @@ net::awaitable<TransportBuildResult> RunHttp2ServerSession(
     const XHttpConfig* xhttp_cfg,
     net::io_context& io_context,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
-    uint64_t conn_id) {
+    uint64_t conn_id,
+    std::chrono::seconds request_handshake_timeout) {
     const uint32_t initial_window = (cfg && cfg->initial_window_size)
         ? *cfg->initial_window_size : kDefaultInitialWindow;
     return StartHttp2ServerSession(coordinator,
@@ -1424,7 +1477,8 @@ net::awaitable<TransportBuildResult> RunHttp2ServerSession(
         cfg,
         xhttp_cfg,
         nullptr,
-        false);
+        false,
+        request_handshake_timeout);
 }
 
 }  // namespace transport

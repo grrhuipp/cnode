@@ -304,6 +304,8 @@ net::awaitable<TransportBuildResult> ConnectOutboundSecurity(
 
 // HTTP/2 prior knowledge is recognized by the full client preface; anything
 // else is served as HTTP/1 with the sniffed bytes as the start of the request.
+// `request_handshake_timeout` bounds each HTTP/2 XHTTP upload (zero: unbounded);
+// HTTP/1 requests use the connection's own handshake deadline.
 net::awaitable<TransportBuildResult> DoHttpServerHandshake(
     app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
@@ -312,7 +314,8 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
     uint64_t conn_id,
     InboundTransportMetadata* transport_metadata,
-    const XHttpConfig* xhttp_config) {
+    const XHttpConfig* xhttp_config,
+    std::chrono::seconds request_handshake_timeout) {
 
     std::array<uint8_t, kHttp2ClientPreface.size()> first{};
     size_t total = 0;
@@ -337,7 +340,8 @@ net::awaitable<TransportBuildResult> DoHttpServerHandshake(
             xhttp_config,
             io_context,
             std::move(stream_handler),
-            conn_id);
+            conn_id,
+            request_handshake_timeout);
     }
 
     const std::span<const uint8_t> initial(first.data(), total);
@@ -469,7 +473,8 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
             std::move(stream_handler),
             conn_id,
             metadata,
-            nullptr);
+            nullptr,
+            std::chrono::seconds{0});
         if (!http_result) {
             LogLayerFailure(conn_id, "HTTP server handshake", http_result.error());
             co_return tl::unexpected(http_result.error());
@@ -479,9 +484,13 @@ net::awaitable<TransportBuildResult> BuildInboundTransport(
 
     // 4. XHTTP 层（服务端：H2 stream-one 或 H1 packet-up）
     if (s.IsXHttp()) {
+        // HTTP/2 上传沿用入站连接的握手期限（README：先于下行到达的上传在请求握手期限内等待下行）。
+        const auto request_handshake_timeout = fallback
+            ? fallback->timeouts.HandshakeTimeout() : std::chrono::seconds{0};
         auto xhttp_result = co_await DoHttpServerHandshake(
             coordinator, std::move(stream), nullptr, io_context,
-            std::move(stream_handler), conn_id, metadata, &s.xhttp);
+            std::move(stream_handler), conn_id, metadata, &s.xhttp,
+            request_handshake_timeout);
         if (!xhttp_result) {
             LogLayerFailure(conn_id, "XHTTP server handshake", xhttp_result.error());
             co_return tl::unexpected(xhttp_result.error());

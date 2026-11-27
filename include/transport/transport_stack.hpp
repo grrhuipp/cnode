@@ -81,7 +81,9 @@ net::awaitable<ProxyProtocolReadResult> ReadInboundProxyProtocol(
 // the owning handler's TransportSecurity::Context(): borrowed for the call,
 // required exactly when the settings use TLS or REALITY. |fallback| is
 // required for REALITY with dest; an unauthenticated ClientHello is then
-// relayed to dest and the call yields a null stream.
+// relayed to dest and the call yields a null stream. Its timeouts also bound
+// each HTTP/2 XHTTP upload by the handshake timeout; without |fallback| those
+// uploads wait unbounded.
 net::awaitable<TransportBuildResult> BuildInboundTransport(
     app::GroupCoordinator& coordinator,
     net::io_context& io_context,

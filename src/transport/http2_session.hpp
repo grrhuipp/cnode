@@ -58,6 +58,8 @@ inline constexpr std::string_view kHttp2ClientPreface =
 
 // h2 / XHTTP server after the caller consumed the client preface. `cfg` and
 // `xhttp_cfg` are borrowed for the whole call; the session never outlives it.
+// Each XHTTP upload must reach its session within `request_handshake_timeout`
+// (zero: unbounded).
 [[nodiscard]] net::awaitable<TransportBuildResult> RunHttp2ServerSession(
     app::GroupCoordinator& coordinator,
     std::unique_ptr<AsyncStream> stream,
@@ -65,7 +67,8 @@ inline constexpr std::string_view kHttp2ClientPreface =
     const XHttpConfig* xhttp_cfg,
     net::io_context& io_context,
     std::shared_ptr<InboundTransportStreamHandler> stream_handler,
-    uint64_t conn_id);
+    uint64_t conn_id,
+    std::chrono::seconds request_handshake_timeout);
 
 [[nodiscard]] net::awaitable<TransportBuildResult> DoGrpcClientHandshake(
     std::unique_ptr<AsyncStream> stream,
