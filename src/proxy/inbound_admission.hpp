@@ -215,8 +215,7 @@ private:
                 reason == app::ConnectionLimiter::RejectReason::NONE) co_return common::ErrorCode::OK;
             co_return co_await RecordFailure(environment, ctx,
                 app::ConnectionLimiter::RejectReasonToString(reason), std::nullopt,
-                reason == app::ConnectionLimiter::RejectReason::TRACKING_CAPACITY
-                    ? common::ErrorCode::RESOURCE_EXHAUSTED : common::ErrorCode::BLOCKED);
+                common::ErrorCode::BLOCKED);
         } catch (...) {
             co_return ClassifyInboundHandshakeException(std::current_exception());
         }

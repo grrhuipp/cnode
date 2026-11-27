@@ -56,7 +56,7 @@ TEST(BanTrackingContract, FixedWindowResetsAtBoundaryForBothRules) {
     limiter.OnAuthFailTracked(ip_key, key, 219);
     EXPECT_TRUE(IsIPBanned(limiter, ip_key, 219));
     EXPECT_EQ(limiter.CheckCredential(key, 219), Reason::CREDENTIAL_BANNED);
-    EXPECT_EQ(limiter.TryAcceptIP(Core::IpHash(kIP), ip_key, 219), Reason::IP_BANNED);
+    EXPECT_EQ(limiter.TryAcceptIP(Core::IpHash(kIP), ip_key, 219).reason, Reason::IP_BANNED);
     EXPECT_TRUE(IsIPBanned(limiter, ip_key, 398));
     EXPECT_EQ(limiter.CheckCredential(key, 398), Reason::CREDENTIAL_BANNED);
     EXPECT_FALSE(IsIPBanned(limiter, ip_key, 399));
@@ -207,12 +207,12 @@ TEST(BanTrackingContract, DisabledIPBanDoesNotAffectConnectionQuotas) {
     EXPECT_FALSE(IsIPBanned(limiter, ip_key, 100));
     EXPECT_EQ(limiter.CheckCredential(Key(6), 100), Reason::CREDENTIAL_BANNED);
     EXPECT_EQ(limiter.TryAcceptGlobal(), Reason::NONE);
-    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100), Reason::NONE);
-    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100), Reason::MAX_CONNECTIONS_PER_IP);
+    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100).reason, Reason::NONE);
+    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100).reason, Reason::MAX_CONNECTIONS_PER_IP);
     EXPECT_EQ(limiter.TryAcceptGlobal(), Reason::MAX_CONNECTIONS);
     limiter.ReleaseHash(ip_hash);
     EXPECT_EQ(limiter.TryAcceptGlobal(), Reason::MAX_CONNECTIONS);
-    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100), Reason::NONE);
+    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100).reason, Reason::NONE);
     limiter.ReleaseHash(ip_hash);
     limiter.ReleaseGlobal();
     EXPECT_EQ(limiter.TryAcceptGlobal(), Reason::NONE);
@@ -229,9 +229,9 @@ TEST(BanTrackingContract, ExplicitIPBanBypassStillEnforcesConnectionQuota) {
     ASSERT_TRUE(ip_key);
     const auto ip_hash = Core::IpHash(kIP);
     limiter.OnAuthFailTracked(ip_key, std::nullopt, 100);
-    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100), Reason::IP_BANNED);
-    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, std::nullopt, 100), Reason::NONE);
-    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, std::nullopt, 100), Reason::MAX_CONNECTIONS_PER_IP);
+    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100).reason, Reason::IP_BANNED);
+    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, std::nullopt, 100).reason, Reason::NONE);
+    EXPECT_EQ(limiter.TryAcceptIP(ip_hash, std::nullopt, 100).reason, Reason::MAX_CONNECTIONS_PER_IP);
     limiter.ReleaseHash(ip_hash);
 }
 
@@ -255,34 +255,38 @@ TEST(BanTrackingContract, DisabledIPOnlyOperationsSkipClosedMailbox) {
     EXPECT_TRUE(completed);
 }
 
-TEST(BanTrackingContract, ConnectionCapacityRejectsAndReclaimsReleasedSlots) {
+// kProbe 个起始槽相同的哈希占满探测窗口；下一个同起始槽哈希无槽可用。
+constexpr uint64_t CollidingHash(uint64_t ordinal) noexcept {
+    return 7 + ordinal * Core::kSlotCount;
+}
+
+TEST(BanTrackingContract, ConnectionCapacityAdmitsUntrackedAddressesAndReclaimsReleasedSlots) {
     app::RateLimitConfig config;
     config.max_conn_per_ip = 1;
     config.ip_ban.enabled = false;
     Core limiter(config);
-    std::vector<std::string> admitted;
-    std::string rejected;
-    for (unsigned value = 0; value <= Core::kSlotCount; ++value) {
-        auto address = "198.18." + std::to_string(value >> 8) + "." +
-                       std::to_string(value & 255);
-        const auto reason = limiter.TryAcceptIP(Core::IpHash(address), std::nullopt, 100);
-        if (reason != Reason::NONE) {
-            ASSERT_EQ(reason, Reason::TRACKING_CAPACITY);
-            rejected = std::move(address);
-            break;
-        }
-        admitted.push_back(std::move(address));
+    for (uint64_t ordinal = 1; ordinal <= Core::kProbe; ++ordinal) {
+        const auto admitted = limiter.TryAcceptIP(CollidingHash(ordinal), std::nullopt, 100);
+        ASSERT_EQ(admitted.reason, Reason::NONE);
+        ASSERT_EQ(admitted.charged_hash, CollidingHash(ordinal));
     }
-    ASSERT_FALSE(rejected.empty());
-    for (const auto& address : admitted) limiter.ReleaseHash(Core::IpHash(address));
-    const auto rejected_hash = Core::IpHash(rejected);
-    EXPECT_EQ(limiter.TryAcceptIP(rejected_hash, std::nullopt, 100), Reason::NONE);
-    EXPECT_EQ(limiter.TryAcceptIP(rejected_hash, std::nullopt, 100),
-              Reason::MAX_CONNECTIONS_PER_IP);
-    limiter.ReleaseHash(rejected_hash);
+    // 窗口满：新地址照常放行但不计入，因此也不受按 IP 上限约束。
+    const auto overflow = CollidingHash(Core::kProbe + 1);
+    for (unsigned i = 0; i < 2; ++i) {
+        const auto untracked = limiter.TryAcceptIP(overflow, std::nullopt, 100);
+        EXPECT_EQ(untracked.reason, Reason::NONE);
+        EXPECT_EQ(untracked.charged_hash, 0u);
+    }
+    limiter.ReleaseHash(CollidingHash(1));
+    const auto tracked = limiter.TryAcceptIP(overflow, std::nullopt, 100);
+    EXPECT_EQ(tracked.reason, Reason::NONE);
+    EXPECT_EQ(tracked.charged_hash, overflow);
+    EXPECT_EQ(limiter.TryAcceptIP(overflow, std::nullopt, 100).reason, Reason::MAX_CONNECTIONS_PER_IP);
+    limiter.ReleaseHash(overflow);
+    EXPECT_EQ(limiter.TryAcceptIP(overflow, std::nullopt, 100).charged_hash, overflow);
 }
 
-TEST(BanTrackingContract, CredentialQueriesDoNotInsertAndSaturationFailsClosedUntilExpiry) {
+TEST(BanTrackingContract, CredentialQueriesDoNotInsertAndSaturationAdmitsUntrackedKeys) {
     app::RateLimitConfig config;
     config.ip_ban.enabled = false;
     config.max_conn_per_ip = 1;
@@ -291,27 +295,23 @@ TEST(BanTrackingContract, CredentialQueriesDoNotInsertAndSaturationFailsClosedUn
     for (uint64_t value = 0; value < Core::kSlotCount * 2; ++value)
         ASSERT_EQ(limiter.CheckCredential(Key(value), 100), Reason::NONE);
 
-    uint64_t rejected = Core::kSlotCount + 1;
-    for (uint64_t value = 0; value <= Core::kSlotCount; ++value) {
-        const auto reason = limiter.CheckCredential(Key(value), 100);
-        if (reason == Reason::TRACKING_CAPACITY) {
-            rejected = value;
-            break;
-        }
-        ASSERT_EQ(reason, Reason::NONE); // distinct keys must not share counters/bans
-        limiter.OnAuthFailTracked(std::nullopt, Key(value), 100);
-        ASSERT_EQ(limiter.CheckCredential(Key(value), 100), Reason::NONE);
+    for (uint64_t ordinal = 1; ordinal <= Core::kProbe; ++ordinal) {
+        limiter.OnAuthFailTracked(std::nullopt, Key(CollidingHash(ordinal)), 100);
+        ASSERT_EQ(limiter.CheckCredential(Key(CollidingHash(ordinal)), 100), Reason::NONE);
     }
-    ASSERT_LE(rejected, Core::kSlotCount);
-    EXPECT_EQ(limiter.CheckCredential(Key(rejected), 159), Reason::TRACKING_CAPACITY);
-    EXPECT_EQ(limiter.TryAcceptIP(Core::IpHash(kIP), std::nullopt, 159), Reason::NONE);
-    limiter.ReleaseHash(Core::IpHash(kIP)); // failure-table saturation consumes no quota
-    EXPECT_EQ(limiter.CheckCredential(Key(rejected), 160), Reason::NONE);
+    // 探测窗口满：攻击者可任选的新凭据不被跟踪，既不拒绝也不封禁。
+    const auto overflow = Key(CollidingHash(Core::kProbe + 1));
     for (unsigned i = 0; i < 10; ++i)
-        limiter.OnAuthFailTracked(std::nullopt, Key(rejected), 160);
-    EXPECT_EQ(limiter.CheckCredential(Key(rejected), 160), Reason::CREDENTIAL_BANNED);
-    EXPECT_EQ(limiter.CheckCredential(Key(rejected), 339), Reason::CREDENTIAL_BANNED);
-    EXPECT_EQ(limiter.CheckCredential(Key(rejected), 340), Reason::NONE);
+        limiter.OnAuthFailTracked(std::nullopt, overflow, 100);
+    EXPECT_EQ(limiter.CheckCredential(overflow, 159), Reason::NONE);
+    EXPECT_EQ(limiter.TryAcceptIP(Core::IpHash(kIP), std::nullopt, 159).reason, Reason::NONE);
+    limiter.ReleaseHash(Core::IpHash(kIP)); // failure-table saturation consumes no quota
+    // 窗口内计数过期后槽位可复用，新键恢复计数与封禁。
+    for (unsigned i = 0; i < 10; ++i)
+        limiter.OnAuthFailTracked(std::nullopt, overflow, 160);
+    EXPECT_EQ(limiter.CheckCredential(overflow, 160), Reason::CREDENTIAL_BANNED);
+    EXPECT_EQ(limiter.CheckCredential(overflow, 339), Reason::CREDENTIAL_BANNED);
+    EXPECT_EQ(limiter.CheckCredential(overflow, 340), Reason::NONE);
 }
 
 TEST(BanTrackingContract, IPFailureCapacityIsIndependentAndExpiredSlotsAreReusable) {
@@ -320,34 +320,33 @@ TEST(BanTrackingContract, IPFailureCapacityIsIndependentAndExpiredSlotsAreReusab
     config.ip_ban = {.enabled = true, .failure_limit = 1,
                      .window_seconds = 60, .ban_seconds = 180};
     Core limiter(config);
-    std::string rejected;
+    std::string untracked;
     for (unsigned value = 0; value <= Core::kSlotCount; ++value) {
         auto address = "198.19." + std::to_string(value >> 8) + "." +
                        std::to_string(value & 255);
         const auto address_key = limiter.ComputeIpBanKey(kTag, address);
         ASSERT_TRUE(address_key);
-        const auto reason = limiter.CheckIPBan(*address_key, 100);
-        if (reason == Reason::TRACKING_CAPACITY) {
-            rejected = std::move(address);
+        ASSERT_EQ(limiter.CheckIPBan(*address_key, 100), Reason::NONE);
+        limiter.OnAuthFailTracked(address_key, std::nullopt, 100);
+        if (!IsIPBanned(limiter, address_key, 100)) {
+            untracked = std::move(address);
             break;
         }
-        ASSERT_EQ(reason, Reason::NONE);
-        limiter.OnAuthFailTracked(address_key, std::nullopt, 100);
-        ASSERT_TRUE(IsIPBanned(limiter, address_key, 100));
     }
-    ASSERT_FALSE(rejected.empty());
-    const auto rejected_key = limiter.ComputeIpBanKey(kTag, rejected);
-    const auto rejected_hash = Core::IpHash(rejected);
-    EXPECT_EQ(limiter.TryAcceptIP(rejected_hash, rejected_key, 279), Reason::TRACKING_CAPACITY);
+    ASSERT_FALSE(untracked.empty());
+    const auto untracked_key = limiter.ComputeIpBanKey(kTag, untracked);
+    const auto untracked_hash = Core::IpHash(untracked);
+    // 封禁表满不影响连接配额：未跟踪的地址照常按 IP 计数。
+    EXPECT_EQ(limiter.TryAcceptIP(untracked_hash, untracked_key, 279).charged_hash, untracked_hash);
+    EXPECT_EQ(limiter.TryAcceptIP(untracked_hash, untracked_key, 279).reason, Reason::MAX_CONNECTIONS_PER_IP);
     EXPECT_EQ(limiter.CheckCredential(Key(7), 279), Reason::NONE);
     for (unsigned i = 0; i < 10; ++i)
         limiter.OnAuthFailTracked(std::nullopt, Key(7), 279);
     EXPECT_EQ(limiter.CheckCredential(Key(7), 279), Reason::CREDENTIAL_BANNED);
-    EXPECT_EQ(limiter.TryAcceptIP(rejected_hash, std::nullopt, 279), Reason::NONE);
-    limiter.ReleaseHash(rejected_hash);
-    EXPECT_EQ(limiter.CheckIPBan(*rejected_key, 280), Reason::NONE);
-    limiter.OnAuthFailTracked(rejected_key, std::nullopt, 280);
-    EXPECT_EQ(limiter.TryAcceptIP(rejected_hash, rejected_key, 280), Reason::IP_BANNED);
+    limiter.ReleaseHash(untracked_hash);
+    EXPECT_EQ(limiter.CheckIPBan(*untracked_key, 280), Reason::NONE);
+    limiter.OnAuthFailTracked(untracked_key, std::nullopt, 280);
+    EXPECT_EQ(limiter.TryAcceptIP(untracked_hash, untracked_key, 280).reason, Reason::IP_BANNED);
 }
 
 TEST(BanTrackingContract, ReconstructedLimiterStartsWithoutQuotasOrBans) {
@@ -366,8 +365,8 @@ TEST(BanTrackingContract, ReconstructedLimiterStartsWithoutQuotasOrBans) {
         EXPECT_EQ(limiter.CheckCredential(credential, 100), Reason::NONE);
         EXPECT_EQ(limiter.TryAcceptGlobal(), Reason::NONE);
         EXPECT_EQ(limiter.TryAcceptGlobal(), Reason::MAX_CONNECTIONS);
-        EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100), Reason::NONE);
-        EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100), Reason::MAX_CONNECTIONS_PER_IP);
+        EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100).reason, Reason::NONE);
+        EXPECT_EQ(limiter.TryAcceptIP(ip_hash, ip_key, 100).reason, Reason::MAX_CONNECTIONS_PER_IP);
         for (unsigned failure = 0; failure < 10; ++failure)
             limiter.OnAuthFailTracked(ip_key, credential, 100);
         EXPECT_EQ(limiter.CheckIPBan(*ip_key, 100), Reason::IP_BANNED);

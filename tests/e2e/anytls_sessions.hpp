@@ -540,7 +540,8 @@ inline void ServerFinRejected(std::string reference = {}) {
     });
     const auto refused = Socket::ReserveTcp();
     Node node;
-    StartServer(node, reference, {{"maxConnectionsPerIP", 2}});
+    // 按 IP 额度 1：会话与流 1 共用物理连接底座，流 3 是额外的第二份。
+    StartServer(node, reference, {{"maxConnectionsPerIP", 1}});
     TlsContext context(false);
     TlsSocket client(ConnectChild(*node.child, node.port), context, false);
     Frames frames(client);

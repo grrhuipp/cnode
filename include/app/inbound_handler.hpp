@@ -278,6 +278,8 @@ private:
     transport::TransportSecurity security_;
     std::unique_ptr<proxy::Inbound> proxy_;
     const AdmissionEnvironment& environment_;
+    // 传输握手可能以真实 IP 头替换客户端地址；否则握手前的地址即最终客户端地址。
+    const bool transport_forwards_client_ip_;
 };
 
 // ============================================================================

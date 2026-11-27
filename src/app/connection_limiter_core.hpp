@@ -135,23 +135,31 @@ public:
     [[nodiscard]] RejectReason CheckIPBan(
         const AuthCredentialKey& ban_key, uint64_t now = NowSeconds()) const noexcept {
         if (!TracksAuthBan()) return RejectReason::NONE;
-        return ip_failures_->Check(ban_key, cfg_.ip_ban, now, RejectReason::IP_BANNED);
+        return ip_failures_->Check(ban_key, now, RejectReason::IP_BANNED);
     }
 
-    [[nodiscard]] RejectReason TryAcceptIP(
+    // charged_hash 为实际计入的槽位；0 表示放行但未计入（未启用按 IP 限制，或
+    // 探测窗口内全是活动地址）。未计入的连接归还时不得扣减任何槽位。
+    struct IpAdmission {
+        RejectReason reason = RejectReason::NONE;
+        uint64_t charged_hash = 0;
+    };
+    [[nodiscard]] IpAdmission TryAcceptIP(
         uint64_t ip_hash, const std::optional<AuthCredentialKey>& ban_key,
         uint64_t now = NowSeconds()) noexcept {
         if (ban_key) {
             const auto reason = CheckIPBan(*ban_key, now);
-            if (reason != RejectReason::NONE) return reason;
+            if (reason != RejectReason::NONE) return {reason};
         }
-        if (!TracksIpConnections()) return RejectReason::NONE;
+        if (!TracksIpConnections()) return {};
+        // 按 IP 限制只约束同一地址的并发；不同地址的洪泛本就不受其约束，
+        // 跟踪表满时拒绝只会把洪泛转嫁给合法用户，故未跟踪的地址照常放行。
         auto* slot = FindOrCreateConnection(ip_hash);
-        if (!slot) return RejectReason::TRACKING_CAPACITY;
+        if (!slot) return {};
         if (slot->conns >= cfg_.max_conn_per_ip)
-            return RejectReason::MAX_CONNECTIONS_PER_IP;
+            return {RejectReason::MAX_CONNECTIONS_PER_IP};
         ++slot->conns;
-        return RejectReason::NONE;
+        return {RejectReason::NONE, ip_hash};
     }
 
     void ReleaseGlobal() noexcept {
@@ -186,8 +194,7 @@ public:
     [[nodiscard]] RejectReason CheckCredential(
         const AuthCredentialKey& credential, uint64_t now = NowSeconds()) const noexcept {
         if (!credential_failures_) return RejectReason::NONE;
-        return credential_failures_->Check(
-            credential, kCredentialBan, now, RejectReason::CREDENTIAL_BANNED);
+        return credential_failures_->Check(credential, now, RejectReason::CREDENTIAL_BANNED);
     }
 
 private:
@@ -228,7 +235,8 @@ private:
 
     // 两个真实消费者共用固定窗口算法。每表上限 16384 个键，每次最多探测 32 槽；
     // 只在失败时插入，查询不插入。过期槽惰性复用，无扫描、锁或额外容器。
-    // 探测范围没有可用槽时，未知键查询返回 TRACKING_CAPACITY（fail closed）。
+    // 探测范围没有可用槽时新键不被跟踪：不计数、不封禁，查询照常放行（键可由
+    // 攻击者任意选择，满表拒绝只会把洪泛转嫁给合法用户）。
     class FailureTable {
         struct Slot {
             AuthCredentialKey key;
@@ -242,18 +250,15 @@ private:
         }
     public:
         [[nodiscard]] RejectReason Check(
-            const AuthCredentialKey& key, const infra::AuthFailureLimitConfig& config,
-            uint64_t now, RejectReason banned) const noexcept {
+            const AuthCredentialKey& key, uint64_t now, RejectReason banned) const noexcept {
             const size_t index = Index(key);
-            bool available = false;
             for (size_t i = 0; i < kProbe; ++i) {
                 const auto& slot = slots_[(index + i) & kMask];
                 if (!slot.occupied) return RejectReason::NONE;
                 if (slot.key == key)
                     return slot.counter.Banned(now) ? banned : RejectReason::NONE;
-                available |= slot.counter.Expired(config, now);
             }
-            return available ? RejectReason::NONE : RejectReason::TRACKING_CAPACITY;
+            return RejectReason::NONE;
         }
         void Record(const AuthCredentialKey& key, const infra::AuthFailureLimitConfig& config,
                     uint64_t now) noexcept {
@@ -271,7 +276,7 @@ private:
                 }
                 if (!reusable && slot.counter.Expired(config, now)) reusable = &slot;
             }
-            if (!reusable) return; // 后续准入查询将报告容量不足，而不是无保护放行。
+            if (!reusable) return; // 探测窗口已满：该键不被跟踪。
             reusable->key = key;
             reusable->counter = {};
             reusable->occupied = true;

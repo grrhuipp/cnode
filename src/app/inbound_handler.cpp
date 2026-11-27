@@ -83,6 +83,13 @@ void CountEscapedInboundFailure(const common::Context& ctx, app::StatsShard& sta
     stats.OnError();
 }
 
+// 只有配置了真实 IP 头的 WS/HTTPUpgrade/HTTP 传输会在握手后替换客户端地址
+// （ApplyHttpRealIp）；gRPC、XHTTP 与 raw 的握手前地址即最终客户端地址。
+[[nodiscard]] bool TransportForwardsClientIp(const transport::StreamSettings& settings) noexcept {
+    return (settings.IsWs() && !settings.ws.real_ip_header.empty()) ||
+           (settings.IsHttpUpgrade() && !settings.http_upgrade.real_ip_header.empty()) ||
+           (settings.IsHttp() && !settings.http.real_ip_header.empty());
+}
 
 }  // namespace
 
@@ -169,7 +176,8 @@ InboundHandler::InboundHandler(app::ReceiverSettings receiver, std::unique_ptr<p
           receiver_.stream_settings.IsTlsLike()}
     , security_(receiver_.stream_settings, transport::StreamEndpointRole::Inbound)
     , proxy_(std::move(proxy))
-    , environment_(environment) {
+    , environment_(environment)
+    , transport_forwards_client_ip_(TransportForwardsClientIp(receiver_.stream_settings)) {
     if (!proxy_) throw std::logic_error("inbound handler has no protocol");
 }
 std::shared_ptr<transport::InboundTransportStreamHandler> InboundHandler::NewAuthenticatedStreamSink(
@@ -261,8 +269,15 @@ InboundHandler::PrepareAcceptedTCP(
         ApplyProxyProtocolResult(ctx, proxy_read.result);
     }
 
+    // 客户端地址在握手前已确定时，TLS/REALITY 等传输握手期间即按该地址占用
+    // 按 IP 额度，与全局额度同属一个物理连接族底座，同地址子流沿用而不重复计数。
+    // 可被真实 IP 头替换地址的传输把 socket 端视为可信前置代理，握手后再按
+    // 转发地址占用。
+    const auto physical_scope = transport_forwards_client_ip_
+        ? app::ConnectionLimiter::ReservationScope::Physical
+        : app::ConnectionLimiter::ReservationScope::PhysicalClientIp;
     app::ConnectionLimiter::Admission physical_admission;
-    if (auto pending = proxy::ReserveInboundConnection(environment_, app::ConnectionLimiter::ReservationScope::Physical, ctx)) {
+    if (auto pending = proxy::ReserveInboundConnection(environment_, physical_scope, ctx)) {
         physical_admission = co_await std::move(*pending);
     }
     auto reject = physical_admission.reason;
@@ -325,18 +340,21 @@ InboundHandler::PrepareAcceptedTCP(
         co_return std::nullopt;
     }
 
-    ApplyHttpRealIp(ctx, local_metadata.real_ip);
+    app::ConnectionLimiter::Reservation ip_limit;
+    if (transport_forwards_client_ip_) {
+        ApplyHttpRealIp(ctx, local_metadata.real_ip);
+        app::ConnectionLimiter::Admission ip_admission;
+        if (auto pending = proxy::ReserveInboundConnection(environment_, app::ConnectionLimiter::ReservationScope::ClientIp, ctx)) {
+            ip_admission = co_await std::move(*pending);
+        }
+        reject = ip_admission.reason;
+        if (reject != app::ConnectionLimiter::RejectReason::NONE) {
+            proxy::RejectInboundAdmission(ctx, stats, reject);
+            co_return std::nullopt;
+        }
+        ip_limit = std::move(ip_admission.reservation);
+    }
     local_metadata = {};
-    app::ConnectionLimiter::Admission ip_admission;
-    if (auto pending = proxy::ReserveInboundConnection(environment_, app::ConnectionLimiter::ReservationScope::ClientIp, ctx)) {
-        ip_admission = co_await std::move(*pending);
-    }
-    reject = ip_admission.reason;
-    if (reject != app::ConnectionLimiter::RejectReason::NONE) {
-        proxy::RejectInboundAdmission(ctx, stats, reject);
-        co_return std::nullopt;
-    }
-    auto ip_limit = std::move(ip_admission.reservation);
 
     LOG_CONN_DEBUG(ctx, "transport ready security={} network={}",
                    transport::SecurityModeName(listener.stream_settings.security_mode),
@@ -396,24 +414,24 @@ net::awaitable<void> InboundHandler::ProcessStream(
                        app::ConnectionStatsScope> accounting(stats);
     std::conditional_t<logical, std::monostate,
                        std::optional<AcceptedTcpTransport>> prepared;
-    if constexpr (logical) {
-        if (auto pending = proxy::InboundSubstreamAdmission::Reserve(environment_, ctx);
-            pending && !accounting.Hold(co_await std::move(*pending), ctx, stats)) {
-            co_return;
-        }
-        (void)request.stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
-        LOG_CONN_DEBUG(ctx, "logical transport stream ready security={} network={}",
-                       transport::SecurityModeName(receiver_.stream_settings.security_mode),
-                       receiver_.stream_settings.NetworkName());
-    } else {
-        prepared = co_await PrepareAcceptedTCP(
-            io_context, dispatcher, stats, request_load, timeouts,
-            std::move(request.stream), ctx, dns_service);
-        if (!prepared) co_return;
-        request.stream = std::move(prepared->stream);
-    }
-
+    // 准入、传输构建与协议处理共用一个异常边界：逃逸的异常只计一次错误。
     try {
+        if constexpr (logical) {
+            if (auto pending = proxy::InboundSubstreamAdmission::Reserve(environment_, ctx);
+                pending && !accounting.Hold(co_await std::move(*pending), ctx, stats)) {
+                co_return;
+            }
+            (void)request.stream->StartPhaseDeadline(timeouts.HandshakeTimeout());
+            LOG_CONN_DEBUG(ctx, "logical transport stream ready security={} network={}",
+                           transport::SecurityModeName(receiver_.stream_settings.security_mode),
+                           receiver_.stream_settings.NetworkName());
+        } else {
+            prepared = co_await PrepareAcceptedTCP(
+                io_context, dispatcher, stats, request_load, timeouts,
+                std::move(request.stream), ctx, dns_service);
+            if (!prepared) co_return;
+            request.stream = std::move(prepared->stream);
+        }
         (void)co_await proxy_->Process(
             std::move(request.stream), dispatcher, protocol_settings_, io_context, ctx, timeouts,
             request_load.PressureIdleTimeout());

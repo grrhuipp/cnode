@@ -412,7 +412,11 @@ TEST(InboundAdmission, UntrackedAndPerIpReservationsSkipOnlyIrrelevantScopes) {
     RunFixture({.max_conn_per_ip = 1},
         [](net::io_context&, const app::AdmissionEnvironment& environment)
         -> net::awaitable<void> {
-        EXPECT_FALSE(environment.limiter.TryReserve({.scope = Scope::Physical}));
+        // 只跟踪按 IP 额度时，物理连接仍持有族节点，供子流和转发地址共用底座。
+        auto physical = environment.limiter.TryReserve({.scope = Scope::Physical});
+        EXPECT_TRUE(physical);
+        if (!physical) co_return;
+        EXPECT_EQ((co_await std::move(*physical)).reason, app::ConnectionLimiter::RejectReason::NONE);
         for (auto scope : {Scope::ClientIp, Scope::Logical}) {
             auto pending = environment.limiter.TryReserve({.scope = scope, .tag = "test", .ip = "192.0.2.1"});
             EXPECT_TRUE(pending);

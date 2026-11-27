@@ -30,8 +30,13 @@ struct RateLimitConfig {
 
 // Lease shared by one physical connection and its logical children; carried in
 // common::Inbound so protocol substreams reserve against the same family.
+// 物理连接与并发子流共用一个"底座"额度：全局额度总是如此；物理连接占用按 IP
+// 额度时（握手前或握手后确定地址，ip_hash 非 0），与其同地址子流也共用该底座。
+// 以下字段只在协调器执行器上访问。
 struct ConnectionFamily {
-    size_t children = 0; // control-executor only
+    size_t children = 0;
+    size_t ip_children = 0; // 共用 ip_hash 底座的子流数
+    uint64_t ip_hash = 0;   // 物理连接已计入的按 IP 槽位；0 = 未计入
     bool physical = true;
 };
 
@@ -48,7 +53,6 @@ public:
         MAX_CONNECTIONS_PER_IP,
         IP_BANNED,
         CREDENTIAL_BANNED,
-        TRACKING_CAPACITY,
     };
     [[nodiscard]] static const char* RejectReasonToString(RejectReason reason) noexcept;
     using Family = ConnectionFamily;
@@ -57,9 +61,10 @@ private:
     struct Return final : GroupCoordinator::ReservedOperation {
         std::shared_ptr<ConnectionLimiter> owner;
         std::shared_ptr<Family> family;
-        uint64_t ip_hash = 0;
+        uint64_t ip_hash = 0; // 独立计入的按 IP 槽位；0 = 未计入
         bool physical = false;
         bool child = false;
+        bool shares_family_ip = false;
         bool admitted = false;
         void Invoke() noexcept;
     };
@@ -102,7 +107,12 @@ public:
     ConnectionLimiter(const ConnectionLimiter&) = delete;
     ConnectionLimiter& operator=(const ConnectionLimiter&) = delete;
 
-    enum class ReservationScope : uint8_t { Physical, ClientIp, Logical };
+    // Physical：客户端地址可能在传输握手后改变的物理连接，只占全局额度并检查封禁。
+    // PhysicalClientIp：客户端地址在握手前已确定（socket 或 PROXY protocol）的
+    // 物理连接，另占该地址的按 IP 额度。ClientIp：按 IP 额度；携带物理连接族时
+    // 补占该连接握手后确定的地址。Logical：物理连接族内的逻辑子流。
+    // 物理连接占用的按 IP 额度是族底座：物理连接与并发子流合计 max(1, 子流数)。
+    enum class ReservationScope : uint8_t { Physical, PhysicalClientIp, ClientIp, Logical };
     struct ReservationRequest {
         ReservationScope scope;
         std::shared_ptr<Family> family{};
@@ -125,9 +135,9 @@ private:
     class Service;
     ConnectionLimiter(const RateLimitConfig& config, std::shared_ptr<GroupCoordinator> coordinator);
     net::awaitable<Admission> ReservePhysical(
-        std::string_view tag, std::string_view ip, bool check_ban);
+        std::string_view tag, std::string_view ip, bool check_ban, bool client_ip);
     net::awaitable<Admission> Reserve(std::shared_ptr<Family> family,
-        std::string_view tag, std::string_view ip, bool check_ban);
+        std::string_view tag, std::string_view ip, bool check_ban, bool logical);
 
     const RateLimitConfig config_;
     // 可变表只在协调器执行器上访问；指纹上下文构造后只读。
