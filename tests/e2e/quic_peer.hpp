@@ -128,6 +128,26 @@ public:
         return id;
     }
 
+    // Opens a bidirectional stream carrying |bytes| verbatim, without the HY2
+    // TCP request prefix (e.g. HTTP/3 frames on an unauthenticated connection).
+    int64_t OpenRaw(std::string_view bytes) {
+        RequireOpen();
+        if (streams_.size() >= MaxStreams) throw std::runtime_error("QUIC peer stream limit");
+        CheckQueue(bytes.size());
+        int64_t id = -1;
+        CheckQuic(ngtcp2_conn_open_bidi_stream(quic_.get(), &id, nullptr), "open raw stream");
+        try {
+            auto [it, inserted] = streams_.try_emplace(id);
+            if (!inserted) Fail("QUIC duplicate stream ID");
+            Queue(it->second, std::string(bytes), false);
+        } catch (...) {
+            ngtcp2_conn_shutdown_stream(quic_.get(), 0, id, 0);
+            throw;
+        }
+        Flush();
+        return id;
+    }
+
     void Send(int64_t id, std::string_view bytes, bool fin = false) {
         RequireOpen();
         auto& stream = Find(id);

@@ -1135,8 +1135,11 @@ void HysteriaConnection::OnStreamData(
             Close();
             return;
         }
-        ngtcp2_conn_extend_max_stream_offset(core_->quic, stream_id, data.size());
-        ngtcp2_conn_extend_max_offset(core_->quic, data.size());
+        // nghttp3 counts only consumed bytes: QPACK-blocked input stays
+        // uncredited until deferred_consume, and DATA payload is credited by
+        // recv_data. Crediting data.size() would let a peer grow nghttp3's
+        // buffer of a blocked stream without bound.
+        ConsumeStream(stream_id, static_cast<size_t>(consumed));
         return;
     }
     if (it == core_->streams.end()) return;
@@ -1262,6 +1265,17 @@ bool HysteriaConnection::SetupHttp3() {
         void* user_data, void*) {
         static_cast<HysteriaConnection*>(user_data)->OnHttpHeader(
             stream_id, token, name, value);
+        return 0;
+    };
+    // The server reads no request body: DATA payload is consumed on arrival.
+    callbacks.recv_data = [](nghttp3_conn*, int64_t stream_id, const uint8_t*,
+        size_t length, void* user_data, void*) {
+        static_cast<HysteriaConnection*>(user_data)->ConsumeStream(stream_id, length);
+        return 0;
+    };
+    callbacks.deferred_consume = [](nghttp3_conn*, int64_t stream_id,
+        size_t consumed, void* user_data, void*) {
+        static_cast<HysteriaConnection*>(user_data)->ConsumeStream(stream_id, consumed);
         return 0;
     };
     callbacks.end_headers = [](nghttp3_conn*, int64_t stream_id, int,
