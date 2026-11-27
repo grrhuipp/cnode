@@ -217,7 +217,29 @@ InboundHandler::PrepareAcceptedTCP(
         stats.OnError();
         co_return std::nullopt;
     }
-    if (listener.proxy_protocol != transport::ProxyProtocolMode::Off) {
+    // 物理连接先占全局额度（读 PROXY 头期间的静默连接同样计入 maxConnections）。
+    // 按 IP 额度只按客户端地址计：未启用 PROXY protocol 且传输不会替换地址时，
+    // socket 地址即最终地址，随全局额度一并占用；启用时 socket 对端是可信负载
+    // 均衡器，读头后按 PROXY 提供的地址补占；可被真实 IP 头替换地址的传输在握手
+    // 后按转发地址补占。三者都是同一物理连接族的底座，同地址子流沿用而不重复计数。
+    const bool reads_proxy_protocol = listener.proxy_protocol != transport::ProxyProtocolMode::Off;
+    const auto physical_scope = reads_proxy_protocol || transport_forwards_client_ip_
+        ? app::ConnectionLimiter::ReservationScope::Physical
+        : app::ConnectionLimiter::ReservationScope::PhysicalClientIp;
+    app::ConnectionLimiter::Admission physical_admission;
+    if (auto pending = proxy::ReserveInboundConnection(environment_, physical_scope, ctx)) {
+        physical_admission = co_await std::move(*pending);
+    }
+    auto reject = physical_admission.reason;
+    if (reject != app::ConnectionLimiter::RejectReason::NONE) {
+        proxy::RejectInboundAdmission(ctx, stats, reject);
+        co_return std::nullopt;
+    }
+    auto connection_limit = std::move(physical_admission.reservation);
+    ctx.inbound.connection_family = connection_limit.FamilyLease();
+
+    app::ConnectionLimiter::Reservation ip_limit;
+    if (reads_proxy_protocol) {
         auto proxy_read = co_await transport::ReadInboundProxyProtocol(
             *raw_conn,
             timeouts.HandshakeTimeout());
@@ -267,26 +289,26 @@ InboundHandler::PrepareAcceptedTCP(
         }
 
         ApplyProxyProtocolResult(ctx, proxy_read.result);
-    }
 
-    // 客户端地址在握手前已确定时，TLS/REALITY 等传输握手期间即按该地址占用
-    // 按 IP 额度，与全局额度同属一个物理连接族底座，同地址子流沿用而不重复计数。
-    // 可被真实 IP 头替换地址的传输把 socket 端视为可信前置代理，握手后再按
-    // 转发地址占用。
-    const auto physical_scope = transport_forwards_client_ip_
-        ? app::ConnectionLimiter::ReservationScope::Physical
-        : app::ConnectionLimiter::ReservationScope::PhysicalClientIp;
-    app::ConnectionLimiter::Admission physical_admission;
-    if (auto pending = proxy::ReserveInboundConnection(environment_, physical_scope, ctx)) {
-        physical_admission = co_await std::move(*pending);
+        // TLS/REALITY 握手前按 PROXY 提供的地址（无地址时为 socket 地址）补占
+        // 按 IP 额度并检查封禁；转发型传输只检查封禁，额度留到握手后。
+        if (!transport_forwards_client_ip_) {
+            app::ConnectionLimiter::Admission ip_admission;
+            if (auto pending = proxy::ReserveInboundConnection(
+                    environment_, app::ConnectionLimiter::ReservationScope::ClientIp, ctx)) {
+                ip_admission = co_await std::move(*pending);
+            }
+            reject = ip_admission.reason;
+            ip_limit = std::move(ip_admission.reservation);
+        } else if (environment_.limiter.TracksAuthBan() && ctx.inbound.HasProxyProtocolClientIP() &&
+                   co_await environment_.limiter.IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
+            reject = app::ConnectionLimiter::RejectReason::IP_BANNED;
+        }
+        if (reject != app::ConnectionLimiter::RejectReason::NONE) {
+            proxy::RejectInboundAdmission(ctx, stats, reject);
+            co_return std::nullopt;
+        }
     }
-    auto reject = physical_admission.reason;
-    if (reject != app::ConnectionLimiter::RejectReason::NONE) {
-        proxy::RejectInboundAdmission(ctx, stats, reject);
-        co_return std::nullopt;
-    }
-    auto connection_limit = std::move(physical_admission.reservation);
-    ctx.inbound.connection_family = connection_limit.FamilyLease();
 
     raw_conn->SetIdleTimeout(timeouts.HandshakeTimeout());
     (void)raw_conn->StartPhaseDeadline(timeouts.HandshakeTimeout());
@@ -340,7 +362,6 @@ InboundHandler::PrepareAcceptedTCP(
         co_return std::nullopt;
     }
 
-    app::ConnectionLimiter::Reservation ip_limit;
     if (transport_forwards_client_ip_) {
         ApplyHttpRealIp(ctx, local_metadata.real_ip);
         app::ConnectionLimiter::Admission ip_admission;

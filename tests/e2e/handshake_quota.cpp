@@ -38,10 +38,16 @@ std::string ClientHello() {
     return hello;
 }
 
-bool TlsRoundTrip(uint16_t port, uint16_t target) {
+std::string ProxyHeader(std::string_view client) {
+    return "PROXY TCP4 " + std::string(client) + " 198.51.100.1 32100 443\r\n";
+}
+
+bool TlsRoundTrip(uint16_t port, uint16_t target, std::string_view prefix = {}) {
     try {
         TlsContext context(false);
-        WireTls stream(Socket::Connect(port), context);
+        auto socket = Socket::Connect(port);
+        if (!prefix.empty()) socket.Write(prefix);
+        WireTls stream(std::move(socket), context);
         stream.Write(VlessRequest(target, kRequest));
         return stream.ReadExact(2 + kResponse.size()) == std::string(2, '\0') + std::string(kResponse);
     } catch (const std::exception&) {
@@ -73,6 +79,74 @@ TEST(HandshakeQuota, PendingTlsHandshakeHoldsTheSourceAddressSlot) {
 
     pending.Close();
     Until([&] { return TlsRoundTrip(port, target.Port()); }, 5s);
+    EXPECT_TRUE(child->Running());
+}
+
+Json ProxyQuotaConfig(Json limits) {
+    auto config = QuotaConfig();
+    config["limits"] = std::move(limits);
+    return config;
+}
+
+Json ProxyInbound(uint16_t port) {
+    auto inbound = Inbound(port, TlsSettings(true));
+    inbound["proxyProtocol"] = "on";
+    return inbound;
+}
+
+// PROXY protocol 入站：socket 对端是可信负载均衡器。读头期间连接已占全局额度，
+// 一条尚未发出 PROXY 头的静默连接即可占满 maxConnections。
+TEST(HandshakeQuota, SilentProxyProtocolReadCountsAgainstTheGlobalLimit) {
+    TempDir root;
+    Targets target([](Socket& socket) {
+        EXPECT_EQ(socket.ReadExact(kRequest.size()), kRequest);
+        socket.Write(kResponse);
+    });
+    auto reservation = Socket::ReserveTcp();
+    const auto port = reservation.Port();
+    Config(root.Path(), Json::array({ProxyInbound(port)}), Json::array({Direct()}),
+           ProxyQuotaConfig({{"maxConnections", 1}}));
+    auto child = Start(root.Path());
+
+    auto silent = Socket::Connect(port);
+    // 接受顺序之外再留出余量，使静默连接的准入先于下一条连接到达协调器。
+    std::this_thread::sleep_for(200ms);
+    auto second = Socket::Connect(port);
+    second.Write(ProxyHeader("192.0.2.20") + ClientHello());
+    ExpectClosed(second);
+
+    silent.Close();
+    Until([&] { return TlsRoundTrip(port, target.Port(), ProxyHeader("192.0.2.20")); }, 5s);
+    EXPECT_TRUE(child->Running());
+}
+
+// 按 IP 额度在 PROXY 头之后、TLS 握手之前按 PROXY 提供的地址计入；负载均衡器
+// 自身的 socket 地址不计入。
+TEST(HandshakeQuota, ProxySuppliedAddressHoldsThePerIpSlotBeforeTls) {
+    TempDir root;
+    Targets target([](Socket& socket) {
+        EXPECT_EQ(socket.ReadExact(kRequest.size()), kRequest);
+        socket.Write(kResponse);
+    });
+    auto reservation = Socket::ReserveTcp();
+    const auto port = reservation.Port();
+    Config(root.Path(), Json::array({ProxyInbound(port)}), Json::array({Direct()}),
+           ProxyQuotaConfig({{"maxConnectionsPerIP", 1}}));
+    auto child = Start(root.Path());
+    const auto hello = ClientHello();
+
+    auto pending = Socket::Connect(port);
+    pending.Write(ProxyHeader("192.0.2.10") + hello);
+    EXPECT_FALSE(pending.Read(65536, 5s).empty()) << "first handshake was not admitted";
+
+    EXPECT_TRUE(TlsRoundTrip(port, target.Port(), ProxyHeader("192.0.2.11")));
+
+    auto duplicate = Socket::Connect(port);
+    duplicate.Write(ProxyHeader("192.0.2.10") + hello);
+    ExpectClosed(duplicate);
+
+    pending.Close();
+    Until([&] { return TlsRoundTrip(port, target.Port(), ProxyHeader("192.0.2.10")); }, 5s);
     EXPECT_TRUE(child->Running());
 }
 
