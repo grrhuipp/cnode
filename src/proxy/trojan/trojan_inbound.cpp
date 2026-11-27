@@ -99,8 +99,11 @@ struct TrojanSession {
                             InboundContext& context) {
         if (context.session.content.network == common::Network::UDP) {
             udp_endpoint.emplace(*stream);
-            return routing::DispatchRequest{
+            // Every Trojan UDP packet names its destination.
+            routing::DispatchRequest request{
                 std::move(stream), transport::Link{&*udp_endpoint, &*udp_endpoint}};
+            request.udp_addressing = routing::UdpAddressing::PerPacket;
+            return request;
         }
         return routing::DispatchRequest{std::move(stream)};
     }

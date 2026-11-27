@@ -587,10 +587,10 @@ net::awaitable<common::ErrorCode> AnyTLSDemuxSession::ProcessUdpSubstream(
     UotPacketReader reader(sub, is_connect,
         std::move(reader_destination), std::move(prepared->pending));
     UotPacketWriter writer(sub, is_connect, sub.ctx.outbound.target);
+    routing::DispatchRequest request{transport::Link{&reader, &writer}, std::move(initial_payload)};
+    request.udp_addressing = is_connect ? routing::UdpAddressing::SingleLink : routing::UdpAddressing::PerPacket;
     (void)co_await DispatchAuthenticatedInbound(
-        dispatcher_, io_context_, policy_,
-        routing::DispatchRequest{transport::Link{&reader, &writer}, std::move(initial_payload)},
-        sub.ctx, environment_.stats, timeouts_);
+        dispatcher_, io_context_, policy_, std::move(request), sub.ctx, environment_.stats, timeouts_);
     co_return common::ErrorCode::OK;
 }
 

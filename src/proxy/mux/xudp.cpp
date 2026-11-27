@@ -320,10 +320,11 @@ net::awaitable<void> XudpSession::Run(std::shared_ptr<XudpSession> self) {
         InboundSubstreamAdmission admission(stats_);
         auto pending = InboundSubstreamAdmission::Reserve(admission_, ctx_);
         if (!pending || admission.Hold(co_await std::move(*pending), ctx_, stats_)) {
+            // An XUDP sub-session is one Xray link, whatever its packets address.
+            routing::DispatchRequest request{transport::Link{this, this}};
+            request.udp_addressing = routing::UdpAddressing::SingleLink;
             (void)co_await DispatchAuthenticatedInbound(dispatcher_,
-                io_context_, policy_,
-                routing::DispatchRequest{transport::Link{this, this}},
-                ctx_, stats_, timeouts_);
+                io_context_, policy_, std::move(request), ctx_, stats_, timeouts_);
         }
     } catch (...) {
         LOG_CONN_DEBUG(ctx_, "XUDP flow dispatch failed with an exception");

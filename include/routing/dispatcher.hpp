@@ -134,6 +134,14 @@ struct DispatchPolicy {
     OutboundSelectionPolicy outbound;
 };
 
+// How a UDP request's carrier addresses its datagrams, set by the inbound
+// that knows it. PerPacket carriers (Trojan, Shadowsocks, native UDP,
+// Hysteria, UoT non-connect) are Xray's udp.Dispatcher sessions: a target
+// that fails ends only its flow. SingleLink carriers (VLESS/VMess UDP, Mux
+// and XUDP sub-sessions, UoT connect) are one Xray link: its failure ends the
+// request.
+enum class UdpAddressing : uint8_t { PerPacket, SingleLink };
+
 // Owns the stream and first payload while the caller keeps any protocol
 // reader/writer wrappers alive until Dispatch completes. Logical substreams
 // borrow their session-owned endpoints instead of inventing another owner.
@@ -174,6 +182,7 @@ private:
 
 public:
     common::InitialPayload first_payload;
+    UdpAddressing udp_addressing = UdpAddressing::PerPacket;
 };
 
 // ============================================================================

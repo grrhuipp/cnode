@@ -719,9 +719,11 @@ net::awaitable<void> UdpIngress::RunNativeDispatch(ClientSessionPtr client_sessi
             client_session->Close();
             co_return;
         }
+        // Every native datagram names its destination.
+        routing::DispatchRequest dispatch{transport::Link{client_session.get(), client_session.get()}};
+        dispatch.udp_addressing = routing::UdpAddressing::PerPacket;
         RelayResult result = co_await proxy::DispatchAuthenticatedInbound(*request.dispatcher,
-            *request.io_context, request.policy,
-            routing::DispatchRequest{transport::Link{client_session.get(), client_session.get()}},
+            *request.io_context, request.policy, std::move(dispatch),
             request.context, request.admission->stats, request.timeouts);
         if (result.error != common::ErrorCode::OK) {
             LOG_CONN_DEBUG(request.context,

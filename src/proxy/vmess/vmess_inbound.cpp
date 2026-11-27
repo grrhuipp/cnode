@@ -141,9 +141,12 @@ struct VmessSession : MultiplexedInboundSession {
                 transport::Link{&prepared.request_reader, &prepared.response_writer},
                 *stream, MuxAllowedNetwork::Any);
         }
-        return routing::DispatchRequest{
+        routing::DispatchRequest request{
             std::move(stream),
             transport::Link{&prepared.request_reader, &prepared.response_writer}};
+        // VMess UDP is one Xray link to its request target.
+        request.udp_addressing = routing::UdpAddressing::SingleLink;
+        return request;
     }
 };
 

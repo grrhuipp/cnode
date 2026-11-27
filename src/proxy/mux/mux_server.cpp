@@ -826,10 +826,13 @@ net::awaitable<void> RunSubDispatch(
             pending && !admission.Hold(co_await std::move(*pending), sub->ctx, environment.stats)) {
             sub->Reject();
         } else {
+            // A Mux.Cool sub-session is one Xray link.
+            routing::DispatchRequest request{link};
+            request.udp_addressing = routing::UdpAddressing::SingleLink;
             (void)co_await DispatchAuthenticatedInbound(dispatcher,
                 io_context,
                 policy,
-                routing::DispatchRequest{link},
+                std::move(request),
                 sub->ctx,
                 stats,
                 timeouts);

@@ -209,13 +209,18 @@ private:
     bool closed_ = false;
 };
 
+// Lives while a flow or a QUIC alias names it: a target whose flows ended
+// frees its slot, so the target cap bounds live targets, not lifetime ones.
 struct UdpTargetState {
     const common::TargetAddress* target = nullptr;
+    size_t references = 0;
     bool saw_quic = false;
 };
 
 struct QuicAliasEntry {
     std::weak_ptr<UdpRouteFlow> owner;
+    // Live flows listing this CID; the entry goes with the last of them.
+    size_t claims = 0;
     bool ambiguous = false;
 };
 
@@ -232,9 +237,10 @@ public:
         transport::Link parent,
         common::Context& parent_context,
         app::StatsShard& stats,
-        net::io_context& io_context)
+        net::io_context& io_context,
+        routing::UdpAddressing addressing)
         : parent_(parent), parent_context_(parent_context), stats_(stats),
-          io_context_(io_context) {}
+          io_context_(io_context), addressing_(addressing) {}
 
     [[nodiscard]] Resolution Resolve(
         const common::TargetAddress& target,
@@ -246,16 +252,33 @@ public:
                 .error = common::ErrorCode::RESOURCE_EXHAUSTED,
             };
         }
+        // Pinned: a flow that fails to register may drop the last reference.
+        ++target_state->references;
+        Resolution resolved;
+        try {
+            resolved = ResolveOn(*target_state, payload);
+        } catch (...) {
+            --target_state->references;
+            ReleaseTargetIfUnused(*target_state);
+            throw;
+        }
+        --target_state->references;
+        ReleaseTargetIfUnused(*target_state);
+        return resolved;
+    }
 
+    [[nodiscard]] Resolution ResolveOn(
+        UdpTargetState& target_state,
+        std::span<const uint8_t> payload) {
         const auto long_header = sniff::InspectQuicLongHeader(payload);
         if (long_header) {
-            if (auto alias = FindAlias(*target_state, long_header->destination);
+            if (auto alias = FindAlias(target_state, long_header->destination);
                 alias.error != common::ErrorCode::OK || alias.flow) {
                 return alias;
             }
             if (long_header->type == sniff::QuicLongPacketType::Initial) {
                 UdpFlowKey key{
-                    .target = target_state,
+                    .target = &target_state,
                     .quic_version = long_header->version,
                     .initial_dcid = long_header->destination,
                     .quic = true,
@@ -276,12 +299,12 @@ public:
                 .error = common::ErrorCode::PROTOCOL_DECODE_FAILED,
             };
         } else if (LooksLikeQuicShortHeader(payload) &&
-                   target_state->saw_quic) {
-            return ResolveShortHeader(*target_state, payload);
+                   target_state.saw_quic) {
+            return ResolveShortHeader(target_state, payload);
         }
 
         UdpFlowKey key{
-            .target = target_state,
+            .target = &target_state,
             .initial_dcid = {},
         };
         return FindOrCreateFlow(key);
@@ -323,19 +346,23 @@ public:
         }
     }
 
+    // The target state may go with the flow's last reference; the flow keeps
+    // its own copy of the target in its context.
     void FinishFlow(const std::shared_ptr<UdpRouteFlow>& flow) noexcept {
+        auto& target = *const_cast<UdpTargetState*>(flow->key.target);
         for (const auto& cid : flow->aliases) {
-            const QuicAliasKey key{flow->key.target, cid};
-            auto found = aliases_.find(key);
-            if (found == aliases_.end() || found->second.ambiguous) continue;
-            if (found->second.owner.lock().get() == flow.get()) {
-                aliases_.erase(found);
-            }
+            auto found = aliases_.find(QuicAliasKey{&target, cid});
+            if (found == aliases_.end() || --found->second.claims != 0) continue;
+            aliases_.erase(found);
+            --target.references;
         }
+        flow->aliases.clear();
         if (auto found = flows_.find(flow->key);
             found != flows_.end() && found->second.get() == flow.get()) {
             flows_.erase(found);
+            --target.references;
         }
+        ReleaseTargetIfUnused(target);
     }
 
     void FinishInputs() noexcept {
@@ -377,30 +404,29 @@ public:
             : aggregate_.bytes_down + child.bytes_down;
     }
 
-    // An association that addressed one target is Xray's single-link UDP
-    // request (VLESS/VMess UDP, an XUDP sub-session): the failure of that
-    // target ends the request. One that addressed several is per-packet
-    // addressed like Xray's udp.Dispatcher (Trojan, Shadowsocks, SOCKS): a
-    // failed target ends only its flow, and its next datagram starts another.
+    // A per-packet addressed carrier is Xray's udp.Dispatcher session
+    // (Trojan, Shadowsocks, native UDP): a failed target ends only its flow,
+    // and its next datagram starts another. A single-link carrier (VLESS/VMess
+    // UDP, a Mux or XUDP sub-session) is one Xray link: once its last flow
+    // fails, the request ends.
     void CompleteFlow(
         const std::shared_ptr<UdpRouteFlow>& flow,
         const RelayResult& child) noexcept {
-        const bool terminate_single_target_association =
-            targets_.size() == 1 &&
+        const bool end_link =
+            addressing_ == routing::UdpAddressing::SingleLink &&
             flows_.size() == 1 &&
             child.error != common::ErrorCode::OK &&
             child.error != common::ErrorCode::CANCELLED &&
             child.error != common::ErrorCode::SOCKET_EOF;
         RecordResult(child);
         FinishFlow(flow);
-        if (terminate_single_target_association) {
+        if (end_link) {
             const auto self = shared_from_this();
             try {
-                // Datagrams read meanwhile may have started a flow or named
-                // another target; either keeps the association.
+                // A datagram read meanwhile may have started another flow,
+                // which keeps the link.
                 net::post(io_context_, [self, error = child.error]() {
-                    if (self->active_ && self->flows_.empty() && self->targets_.size() == 1)
-                        self->Fail(error);
+                    if (self->active_ && self->flows_.empty()) self->Fail(error);
                 });
             } catch (...) {
                 failed_ = common::ErrorCode::RESOURCE_EXHAUSTED;
@@ -491,7 +517,9 @@ private:
             *this, key, parent_context_, io_context_);
         auto [inserted, accepted] = flows_.emplace(key, flow);
         if (!accepted) return {.flow = inserted->second};
-        if (key.quic) const_cast<UdpTargetState*>(key.target)->saw_quic = true;
+        auto& target = *const_cast<UdpTargetState*>(key.target);
+        ++target.references;
+        if (key.quic) target.saw_quic = true;
         return {.flow = std::move(flow), .created = true};
     }
 
@@ -508,10 +536,7 @@ private:
             };
         }
         auto flow = found->second.owner.lock();
-        if (!flow) {
-            aliases_.erase(found);
-            return {};
-        }
+        if (!flow) return {};
         return {.flow = std::move(flow)};
     }
 
@@ -547,39 +572,49 @@ private:
         return {.flow = std::move(selected)};
     }
 
+    // Each flow claims a CID once; a CID two live flows claim is ambiguous
+    // until both end.
     [[nodiscard]] bool AddAlias(
         const std::shared_ptr<UdpRouteFlow>& flow,
         const sniff::QuicConnectionId& cid) {
         if (cid.size == 0) return true;
-        if (std::find(flow->aliases.begin(), flow->aliases.end(), cid) ==
+        if (std::find(flow->aliases.begin(), flow->aliases.end(), cid) !=
             flow->aliases.end()) {
-            if (flow->aliases.size() >= kMaxQuicAliasesPerFlow) return false;
-            flow->aliases.push_back(cid);
-        }
-        cid_lengths_ |= uint32_t{1} << cid.size;
-        const QuicAliasKey key{flow->key.target, cid};
-        if (auto found = aliases_.find(key); found != aliases_.end()) {
-            if (found->second.ambiguous) return true;
-            auto current = found->second.owner.lock();
-            if (!current) {
-                found->second.owner = flow;
-                return true;
-            }
-            if (current.get() != flow.get()) {
-                found->second.owner.reset();
-                found->second.ambiguous = true;
-            }
             return true;
         }
-        if (aliases_.size() >= kMaxQuicAliases) return false;
-        aliases_.emplace(key, QuicAliasEntry{flow, false});
+        if (flow->aliases.size() >= kMaxQuicAliasesPerFlow) return false;
+        flow->aliases.reserve(flow->aliases.size() + 1);
+        auto& target = *const_cast<UdpTargetState*>(flow->key.target);
+        const QuicAliasKey key{&target, cid};
+        if (auto found = aliases_.find(key); found != aliases_.end()) {
+            auto& entry = found->second;
+            if (!entry.ambiguous && entry.owner.lock().get() != flow.get()) {
+                entry.owner.reset();
+                entry.ambiguous = true;
+            }
+            ++entry.claims;
+        } else {
+            if (aliases_.size() >= kMaxQuicAliases) return false;
+            aliases_.emplace(key, QuicAliasEntry{flow, 1, false});
+            ++target.references;
+        }
+        flow->aliases.push_back(cid);
+        cid_lengths_ |= uint32_t{1} << cid.size;
         return true;
+    }
+
+    void ReleaseTargetIfUnused(UdpTargetState& target) noexcept {
+        if (target.references != 0) return;
+        const auto found = targets_.find(TargetLookup{target.target});
+        if (found != targets_.end() && found->second.get() == &target) targets_.erase(found);
+        common::MaybeShrinkHashContainer(targets_);
     }
 
     transport::Link parent_;
     common::Context& parent_context_;
     app::StatsShard& stats_;
     net::io_context& io_context_;
+    routing::UdpAddressing addressing_;
     transport::AsyncWriteGate write_gate_;
     common::SignalChannel room_signal_{io_context_.get_executor(), 1};
     std::unordered_map<
@@ -708,7 +743,7 @@ net::awaitable<void> DispatchUdpFlows(
     }
 
     auto state = std::make_shared<UdpAssociationState>(
-        parent_link, parent_context, stats, io_context);
+        parent_link, parent_context, stats, io_context, request.udp_addressing);
     common::ResidentTaskGroup children(io_context.get_executor());
     std::exception_ptr failure;
     common::MultiBuffer initial = std::move(request.first_payload).MoveToMultiBuffer();

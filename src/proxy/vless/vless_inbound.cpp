@@ -375,8 +375,10 @@ struct VlessInboundSession : MultiplexedInboundSession {
             }
             link = transport::Link{&*udp_endpoint, &*udp_endpoint};
         }
-        co_return routing::DispatchRequest{
-            std::move(stream), link, std::move(first_datagram)};
+        routing::DispatchRequest request{std::move(stream), link, std::move(first_datagram)};
+        // VLESS UDP is one Xray link to its request target.
+        request.udp_addressing = routing::UdpAddressing::SingleLink;
+        co_return std::move(request);
     }
 
     const std::shared_ptr<const ::proxy::VlessEncryptionConfig>& decryption;

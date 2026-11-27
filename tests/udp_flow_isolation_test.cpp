@@ -18,12 +18,15 @@
 #include <asio/as_tuple.hpp>
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>
-#include <asio/ip/udp.hpp>
+#include <asio/detached.hpp>
 #include <asio/steady_timer.hpp>
 
 #include <array>
 #include <chrono>
 #include <memory>
+#include <regex>
+#include <string>
+#include <vector>
 
 namespace {
 using namespace std::chrono_literals;
@@ -106,10 +109,18 @@ struct AssociationOutcome {
     int prepared = 0;
 };
 
-// One native UDP association: `blocked` datagrams name targets a detect rule
-// rejects, all read before their flows run; a datagram for an admitted target
-// follows once every blocked flow has failed.
-AssociationOutcome RunAssociation(std::initializer_list<common::TargetAddress> blocked) {
+struct AssociationScenario {
+    // Read in one batch, before any of their flows runs.
+    std::vector<common::TargetAddress> batched;
+    // Each sent once the previous one's flow has failed.
+    std::vector<common::TargetAddress> sequential;
+    routing::UdpAddressing addressing = routing::UdpAddressing::PerPacket;
+};
+
+// One native UDP association: blocked datagrams name targets a detect rule
+// rejects; a datagram for an admitted target follows once every blocked flow
+// has failed.
+AssociationOutcome RunAssociation(const AssociationScenario& scenario) {
     net::io_context io;
     app::RequestLoadState load(100, 30);
     TargetProbe probe;
@@ -145,7 +156,7 @@ AssociationOutcome RunAssociation(std::initializer_list<common::TargetAddress> b
     app::UdpIngress::ClientSession association(io, {}, udp::endpoint{}, owner, budget,
                                                budget.AcquireAssociation());
     uint8_t marker = 0;
-    for (const auto& target : blocked) EXPECT_TRUE(association.Push(target, Datagram(++marker)));
+    for (const auto& target : scenario.batched) EXPECT_TRUE(association.Push(target, Datagram(++marker)));
 
     routing::DispatchPolicy policy{routing::SniffConfig{}, routing::ForceOutbound{"direct"}};
     common::Context ctx;
@@ -153,7 +164,8 @@ AssociationOutcome RunAssociation(std::initializer_list<common::TargetAddress> b
     ctx.inbound.tag = "udp-flow-test";
     ctx.inbound.user_id = 42;
     ctx.content.network = common::Network::UDP;
-    ctx.outbound.target = *blocked.begin();
+    ctx.outbound.target = scenario.batched.empty() ? scenario.sequential.front()
+                                                   : scenario.batched.front();
     ctx.outbound.original_target = ctx.outbound.target;
     app::StatsShard stats;
     infra::TimeoutsConfig timeouts;
@@ -161,9 +173,10 @@ AssociationOutcome RunAssociation(std::initializer_list<common::TargetAddress> b
     AssociationOutcome outcome;
     bool done = false;
     net::cancellation_signal parent;
+    routing::DispatchRequest request(transport::Link{&association, &association, nullptr});
+    request.udp_addressing = scenario.addressing;
     net::co_spawn(io,
-        proxy::DispatchAuthenticatedInbound(dispatcher, io, policy,
-            routing::DispatchRequest(transport::Link{&association, &association, nullptr}),
+        proxy::DispatchAuthenticatedInbound(dispatcher, io, policy, std::move(request),
             ctx, stats, timeouts),
         net::bind_cancellation_slot(parent.slot(),
             [&](std::exception_ptr error, app::RelayResult result) {
@@ -171,12 +184,29 @@ AssociationOutcome RunAssociation(std::initializer_list<common::TargetAddress> b
                 outcome.error = result.error;
                 done = true;
             }));
-    net::steady_timer admitted(io, 50ms);
-    admitted.async_wait([&](IoErrorCode error) {
-        if (!error && !done)
-            (void)association.Push(common::TargetAddress("198.51.100.7", 53), Datagram(0xa0));
-    });
-    io.run_for(150ms);
+    bool admitted = false;
+    // Named: the coroutine borrows the closure's captures until it ends.
+    auto send_datagrams = [&]() -> net::awaitable<void> {
+        net::steady_timer pause(io);
+        for (const auto& target : scenario.sequential) {
+            if (done) co_return;
+            (void)association.Push(target, Datagram(++marker));
+            pause.expires_after(2ms);
+            co_await pause.async_wait(net::use_awaitable);
+        }
+        pause.expires_after(50ms);
+        co_await pause.async_wait(net::use_awaitable);
+        if (done) co_return;
+        (void)association.Push(common::TargetAddress("198.51.100.7", 53), Datagram(0xa0));
+        pause.expires_after(100ms);
+        co_await pause.async_wait(net::use_awaitable);
+        admitted = true;
+    };
+    net::co_spawn(io, send_datagrams(), net::detached);
+    while (!admitted && !done) {
+        if (io.stopped()) io.restart();
+        io.run_one_for(10ms);
+    }
     outcome.ended_before_close = done;
     outcome.prepared = probe.prepared;
 
@@ -204,21 +234,46 @@ AssociationOutcome RunAssociation(std::initializer_list<common::TargetAddress> b
 // Xray's udp.Dispatcher keeps a per-packet addressed session when one
 // destination fails; the next datagram dispatches again.
 TEST(UdpFlowIsolation, FailedTargetsDoNotEndMultiTargetAssociation) {
-    const auto outcome = RunAssociation({common::TargetAddress("192.0.2.1", 53),
-                                         common::TargetAddress("192.0.2.2", 53)});
+    const auto outcome = RunAssociation({.batched = {common::TargetAddress("192.0.2.1", 53),
+                                                     common::TargetAddress("192.0.2.2", 53)},
+                                         .sequential = {}});
     EXPECT_FALSE(outcome.ended_before_close)
         << "blocked targets ended the association with "
         << common::ErrorCodeToString(outcome.error);
     EXPECT_EQ(outcome.prepared, 1) << "a later admitted target never reached its outbound";
 }
 
-// A single-target association is Xray's single-link UDP request: the failure
-// of its only target ends it.
-TEST(UdpFlowIsolation, FailedOnlyTargetEndsSingleTargetAssociation) {
-    const auto outcome = RunAssociation({common::TargetAddress("192.0.2.1", 53)});
+// Xray's udp.Dispatcher re-dispatches the next packet even after the only
+// destination failed: a per-packet addressed carrier is never ended by it.
+TEST(UdpFlowIsolation, PerPacketCarrierSurvivesItsOnlyTargetFailing) {
+    const auto outcome = RunAssociation({.batched = {common::TargetAddress("192.0.2.1", 53)},
+                                         .sequential = {}});
+    EXPECT_FALSE(outcome.ended_before_close) << common::ErrorCodeToString(outcome.error);
+    EXPECT_EQ(outcome.prepared, 1);
+}
+
+// A single-link carrier (VLESS/VMess UDP, Mux/XUDP sub-session) is one Xray
+// link: its failure ends the request.
+TEST(UdpFlowIsolation, SingleLinkCarrierEndsWhenItsLinkFails) {
+    const auto outcome = RunAssociation({.batched = {common::TargetAddress("192.0.2.1", 53)},
+                                         .sequential = {},
+                                         .addressing = routing::UdpAddressing::SingleLink});
     EXPECT_TRUE(outcome.ended_before_close);
     EXPECT_EQ(outcome.error, common::ErrorCode::BLOCKED);
     EXPECT_EQ(outcome.prepared, 0);
+}
+
+// Targets whose flows ended release their slot: an association that has
+// addressed more targets over its lifetime than may be live at once still
+// reaches a new one.
+TEST(UdpFlowIsolation, EndedTargetsReleaseTheirSlots) {
+    AssociationScenario scenario;
+    scenario.batched = {common::TargetAddress("192.0.2.1", 53), common::TargetAddress("192.0.2.2", 53)};
+    for (int host = 3; host < 3 + 80; ++host)
+        scenario.sequential.emplace_back("192.0.2." + std::to_string(host), 53);
+    const auto outcome = RunAssociation(scenario);
+    EXPECT_FALSE(outcome.ended_before_close) << common::ErrorCodeToString(outcome.error);
+    EXPECT_EQ(outcome.prepared, 1) << "a new target was refused after earlier targets ended";
 }
 
 }  // namespace

@@ -479,9 +479,14 @@ net::awaitable<InboundPrepared> SsTcpSession::Prepare(
         uot_reader.emplace(prepared.request_reader, is_connect,
             std::move(reader_destination), std::move(request->pending));
         uot_writer.emplace(prepared.response_writer, is_connect, context.session.outbound.target);
-        co_return routing::DispatchRequest{
+        routing::DispatchRequest uot_request{
             std::move(stream), transport::Link{&*uot_reader, &*uot_writer},
             std::move(initial_payload)};
+        // UoT connect mode carries one destination; otherwise each packet
+        // names its own.
+        uot_request.udp_addressing = is_connect
+            ? routing::UdpAddressing::SingleLink : routing::UdpAddressing::PerPacket;
+        co_return std::move(uot_request);
     }
     co_return routing::DispatchRequest{
         std::move(stream),
