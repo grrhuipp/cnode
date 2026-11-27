@@ -263,9 +263,18 @@ private:
 
     [[nodiscard]] const app::ReceiverSettings& Receiver() const noexcept;
     void Spawn(net::awaitable<void> task);
-    [[nodiscard]] bool Queue(HysteriaSocketState& socket, std::span<const uint8_t> data,
-                             const udp::endpoint& remote,
-                             HysteriaConnection& connection, bool terminal = false);
+    enum class SocketOutput : uint8_t {
+        Accepted,  // Sent, queued, or dropped by a nonfatal socket error.
+        Full,      // Dropped: the shared queue is full; see AwaitSocketRoom.
+        Closed,    // The socket is gone or the listener is stopping.
+    };
+    [[nodiscard]] SocketOutput Queue(HysteriaSocketState& socket, std::span<const uint8_t> data,
+                                     const udp::endpoint& remote,
+                                     HysteriaConnection& connection, bool terminal = false);
+    // True when |socket|'s queue is full; |connection| then stops writing and
+    // is resumed once the queue drains.
+    [[nodiscard]] bool AwaitSocketRoom(HysteriaSocketState& socket, HysteriaConnection& connection);
+    void ResumeBlockedConnections(HysteriaSocketState& socket) noexcept;
     void Associate(const ngtcp2_cid& cid, std::shared_ptr<HysteriaConnection> connection);
     void Dissociate(const ngtcp2_cid& cid) noexcept;
     void DissociateAll(HysteriaConnection& connection) noexcept;

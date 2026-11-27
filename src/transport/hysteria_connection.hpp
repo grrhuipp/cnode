@@ -119,6 +119,8 @@ private:
     HysteriaSocketState* OutputSocket(const ngtcp2_path& path) const noexcept;
     void PublishExpiry() noexcept;
     void OnTimeout() override;
+    // The socket queue drained: run timers that came due meanwhile and write.
+    void ResumeOutput();
     void InitializeBaseContext(const udp::endpoint& remote);
     void Flush();
     bool TrySendImmediateDatagram(
@@ -197,6 +199,9 @@ private:
     bool stats_open_ = false;
     bool in_ngtcp2_callback_ = false;
     bool closed_ = false;
+    // Socket whose full queue this connection waits on; compared only, never
+    // dereferenced. While set, due timers wait for the socket's resume.
+    const HysteriaSocketState* output_wait_ = nullptr;
     // UDP sessions whose replies wait for room in the datagram queue.
     std::vector<UdpSessionStream*> datagram_waiters_;
 };

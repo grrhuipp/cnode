@@ -99,7 +99,10 @@ bool AttachQuicReuseportBpf(int fd, uint32_t worker_count) noexcept {
 
 namespace {
 
+// 同一 Worker 监听 socket 上所有连接共享的发送队列上限。队列满是瞬时拥塞而非
+// 连接错误：写出方暂停，排空到一半后按登记顺序恢复（同 quic-go sendQueue）。
 constexpr size_t kMaxQueuedSocketPackets = 1024;
+constexpr size_t kResumeQueuedSocketPackets = kMaxQueuedSocketPackets / 2;
 constexpr size_t kMaxConnections = 65536;
 constexpr size_t kMaxStreamHeaderBytes = 8192;
 constexpr size_t kMaxUdpSessions = 256;
@@ -172,6 +175,10 @@ struct HysteriaSocketState final {
         bool terminal = false;
     };
     common::RingDeque<Output> output;
+    // Connections paused by a full |output|; each resumes once it drains.
+    // Registration requires a full queue, so SendLoop always reaches the
+    // resume threshold afterwards and empties this list.
+    std::vector<std::weak_ptr<HysteriaConnection>> blocked;
     common::SignalChannel changed;
 };
 
@@ -437,6 +444,12 @@ void HysteriaConnection::PublishExpiry() noexcept {
         return;
     }
     const auto now = Timestamp();
+    // A due timer only asks to write; while the socket queue is full that
+    // would spin. The socket's resume runs the expired timers instead.
+    if (output_wait_ && deadline <= now) {
+        TimeoutEvent::Cancel();
+        return;
+    }
     const auto remaining = std::min<ngtcp2_tstamp>(
         deadline > now ? deadline - now : 0,
         std::chrono::nanoseconds::max().count());
@@ -552,6 +565,15 @@ void HysteriaConnection::OnExpiry() {
     in_ngtcp2_callback_ = false;
     if (result != 0) {
         Close();
+        return;
+    }
+    Flush();
+}
+
+void HysteriaConnection::ResumeOutput() {
+    if (!core_ || closed_) return;
+    if (ngtcp2_conn_get_expiry(core_->quic) <= Timestamp()) {
+        OnExpiry();
         return;
     }
     Flush();
@@ -786,9 +808,13 @@ void HysteriaConnection::Flush() {
         core_->h3_requests.size() + 3;
     const auto local = MakeAddress(core_->local);
     const auto remote = MakeAddress(core_->remote);
+    // Room is checked before ngtcp2 builds each packet: a packet it built is
+    // already counted in flight, so pausing beats dropping it.
+    auto* default_socket = listener_->Resolve(core_->local);
     size_t packets = 0;
     for (size_t attempt = 0;
          attempt < attempt_limit && packets < packet_limit; ++attempt) {
+        if (default_socket && listener_->AwaitSocketRoom(*default_socket, *this)) return;
         int64_t stream_id = -1;
         int fin = 0;
         std::array<ngtcp2_vec, 16> vectors{};
@@ -863,13 +889,17 @@ void HysteriaConnection::Flush() {
             if (written == 0) return;
             auto* output_socket = OutputSocket(write_path.path);
             auto output_remote = EndpointFromAddress(write_path.path.remote);
-            if (!output_socket || !output_remote ||
-                !listener_->Queue(*output_socket,
+            const auto queued = output_socket && output_remote
+                ? listener_->Queue(*output_socket,
                     std::span<const uint8_t>(packet.data(), static_cast<size_t>(written)),
-                    *output_remote, *this)) {
+                    *output_remote, *this)
+                : HysteriaIngress::SocketOutput::Closed;
+            if (queued == HysteriaIngress::SocketOutput::Closed) {
                 Close();
                 return;
             }
+            // Full: another path's socket is congested; loss recovery resends.
+            if (queued == HysteriaIngress::SocketOutput::Full) return;
             ++packets;
             continue;
         }
@@ -935,13 +965,16 @@ void HysteriaConnection::Flush() {
         }
         auto* output_socket = OutputSocket(write_path.path);
         auto output_remote = EndpointFromAddress(write_path.path.remote);
-        if (!output_socket || !output_remote ||
-            !listener_->Queue(*output_socket,
+        const auto queued = output_socket && output_remote
+            ? listener_->Queue(*output_socket,
                 std::span<const uint8_t>(packet.data(), static_cast<size_t>(written)),
-                *output_remote, *this)) {
+                *output_remote, *this)
+            : HysteriaIngress::SocketOutput::Closed;
+        if (queued == HysteriaIngress::SocketOutput::Closed) {
             Close();
             return;
         }
+        if (queued == HysteriaIngress::SocketOutput::Full) return;
         ++packets;
     }
 }
@@ -1489,6 +1522,9 @@ void HysteriaConnection::DeliverUdpPacket(
 bool HysteriaConnection::TrySendImmediateDatagram(
     std::span<const uint8_t> header, std::span<const uint8_t> payload) {
     if (!core_ || closed_ || in_ngtcp2_callback_) return false;
+    // A full socket queue defers the datagram to the connection's own queue.
+    if (auto* socket = listener_->Resolve(core_->local);
+        socket && listener_->AwaitSocketRoom(*socket, *this)) return false;
     in_ngtcp2_callback_ = true;
     struct RefreshExpiry {
         HysteriaConnection& connection;
@@ -1526,9 +1562,9 @@ bool HysteriaConnection::TrySendImmediateDatagram(
         auto* output_socket = OutputSocket(write_path.path);
         auto output_remote = EndpointFromAddress(write_path.path.remote);
         if (!output_socket || !output_remote ||
-            !listener_->Queue(*output_socket,
+            listener_->Queue(*output_socket,
                 std::span<const uint8_t>(packet.data(), static_cast<size_t>(written)),
-                *output_remote, *this)) {
+                *output_remote, *this) == HysteriaIngress::SocketOutput::Closed) {
             Close();
             return true;
         }
@@ -1695,25 +1731,54 @@ void HysteriaIngress::Spawn(net::awaitable<void> task) {
     }
 }
 
-bool HysteriaIngress::Queue(HysteriaSocketState& socket, std::span<const uint8_t> data,
-                            const udp::endpoint& remote, HysteriaConnection& connection,
-                            bool terminal) {
-    if (stopping || !socket.socket || !socket.socket->is_open()) return false;
+HysteriaIngress::SocketOutput HysteriaIngress::Queue(
+    HysteriaSocketState& socket, std::span<const uint8_t> data,
+    const udp::endpoint& remote, HysteriaConnection& connection, bool terminal) {
+    if (stopping || !socket.socket || !socket.socket->is_open()) return SocketOutput::Closed;
     if (socket.output.empty()) {
         IoErrorCode error;
         (void)socket.socket->send_to(net::buffer(data.data(), data.size()), remote, 0, error);
-        if (!error) return true;
-        if (error == net::error::operation_aborted) return false;
+        if (!error) return SocketOutput::Accepted;
+        if (error == net::error::operation_aborted) return SocketOutput::Closed;
         if (error != net::error::would_block && error != net::error::try_again) {
-            return true;
+            return SocketOutput::Accepted;
         }
     }
-    if (socket.output.size() >= kMaxQueuedSocketPackets) return false;
+    // A terminal CONNECTION_CLOSE is advisory and never waits for room.
+    if (terminal ? socket.output.size() >= kMaxQueuedSocketPackets
+                 : AwaitSocketRoom(socket, connection))
+        return SocketOutput::Full;
     socket.output.push_back({
         std::vector<uint8_t>(data.begin(), data.end()),
         remote, connection.shared_from_this(), terminal});
     (void)socket.changed.try_send(IoErrorCode{});
+    return SocketOutput::Accepted;
+}
+
+bool HysteriaIngress::AwaitSocketRoom(
+    HysteriaSocketState& socket, HysteriaConnection& connection) {
+    if (socket.output.size() < kMaxQueuedSocketPackets) return false;
+    if (connection.output_wait_ != &socket) {
+        socket.blocked.push_back(connection.weak_from_this());
+        connection.output_wait_ = &socket;
+    }
     return true;
+}
+
+void HysteriaIngress::ResumeBlockedConnections(HysteriaSocketState& socket) noexcept {
+    auto blocked = std::exchange(socket.blocked, {});
+    for (auto& entry : blocked) {
+        auto connection = entry.lock();
+        // A connection that moved to another socket waits there instead.
+        if (!connection || connection->output_wait_ != &socket) continue;
+        connection->output_wait_ = nullptr;
+        try {
+            connection->ResumeOutput();
+        } catch (...) {
+            connection->Close();
+            environment.admission->stats.OnError();
+        }
+    }
 }
 
 void HysteriaIngress::Associate(
@@ -1799,6 +1864,8 @@ net::awaitable<void> HysteriaIngress::SendLoop(std::shared_ptr<HysteriaSocketSta
         }
         auto packet = std::move(socket->output.front());
         socket->output.pop_front();
+        if (!socket->blocked.empty() && socket->output.size() <= kResumeQueuedSocketPackets)
+            ResumeBlockedConnections(*socket);
         if (stopping || (packet.connection && packet.connection->Closed() && !packet.terminal)) {
             continue;
         }
