@@ -1436,7 +1436,13 @@ void HysteriaConnection::ProcessUdpMessage(const HysteriaUdpMessage& message) {
     if (it == fragments_.end()) {
         if (message.fragment_id == 0 && !message.target.IsValid()) return;
         if (fragments_.size() >= kMaxPendingFragments) {
-            fragments_.erase(fragments_.begin());
+            // Evict the packet started first (earliest overall deadline): a
+            // newer packet is likelier to complete, as Hysteria's defragger
+            // keeps the latest packet. Hash order would pick arbitrarily.
+            fragments_.erase(std::min_element(fragments_.begin(), fragments_.end(),
+                [](const auto& left, const auto& right) {
+                    return left.second.deadline < right.second.deadline;
+                }));
         }
         it = fragments_.try_emplace(key).first;
         it->second.count = message.fragment_count;
