@@ -108,9 +108,9 @@ Inbound Handler::Process
 
 每个数据 Worker 独立绑定同一组 `SO_REUSEPORT` 端口；连接与有状态会话一生固定在创建它的 Worker 上。Hysteria2 QUIC 连接通过内核态 CID 分流固定到原 Worker，客户端路径迁移后仍由原 Worker 服务；Hysteria2 只提供配置的服务端 UDP 端口，不实现端口跳跃。XHTTP 会话归下行（GET）所在的 Worker，下行数据不跨 Worker；同一会话的上传无论落在哪个 Worker 的哪条连接上，都在该 Worker 完成解析，再经 Worker 间无锁 SPSC 队列交给会话，连接本身不迁移。SS2022 UDP 会话与 XUDP 流（Global ID 非零的 Mux UDP 子会话）归创建它的 Worker：客户端 NAT 重绑定后，或换一条连接续用同一 Global ID 时，数据报无论落到哪个 Worker 都在当地解密，再经 SPSC 队列交给原 Worker，出站 socket 与回包来源端口保持不变。主线程运行唯一主控事件循环，承载面板同步、监控、DNS 与全局准入。
 
-一个已认证 UDP association 只保留协议认证、重放保护和回包路径；Dispatcher 按原始目标拆分独立路由子流。普通 UDP 以完整目标为键，QUIC 以目标、版本和 Initial DCID 为键并跟踪后续 CID；每个子流独立嗅探、选路、出站、统计和访问日志。回包始终恢复该子流的原始目标，因此不同 FakeIP 即使解析到同一真实 IP，也不会共用路由或回包地址。
+一个已认证 UDP association 只保留协议认证、重放保护和回包路径；Dispatcher 按原始目标拆分独立路由子流。普通 UDP 以完整目标为键，QUIC 以目标、版本和 Initial DCID 为键并跟踪后续 CID；每个子流独立嗅探、选路、出站、统计和访问日志。回包始终恢复该子流的原始目标，因此不同 FakeIP 即使解析到同一真实 IP，也不会共用路由或回包地址。UDP 载体按寻址方式区分：Trojan、Shadowsocks、原生 UDP、Hysteria 与 UoT 非 connect 模式逐包寻址，某个目标的路由、解析或拨号失败只结束该目标的子流，后续数据报重新建流（同 Xray udp.Dispatcher）；VLESS/VMess UDP、Mux 与 XUDP 子会话及 UoT connect 模式为单链路，最后一个子流失败即结束该请求。
 
-控制面从面板拉取节点、用户和规则，归一化为不可变运行时快照后原子发布到各 Worker。用户或规则的局部更新保留未变更的监听和资源，成功应用后才确认同步验证器；失败保留最后提交的配置。分层职责与边界规则见 [`AGENTS.md`](AGENTS.md)。
+控制面从面板拉取节点、用户和规则，归一化为不可变运行时快照后原子发布到各 Worker。用户或规则的局部更新保留未变更的监听和资源，成功应用后才确认同步验证器；失败保留最后提交的配置。用户列表解码、凭据派生、入站与 TLS 准备及用户快照构建在控制面常驻的单线程上执行，主控事件循环只负责网络 I/O 与发布。回滚失败遗留的资源清理完成后，节点立即按最后提交的快照在本地重建，不等待面板应答。分层职责与边界规则见 [`AGENTS.md`](AGENTS.md)。
 
 ## 部署
 
@@ -208,9 +208,9 @@ geosite.dat
 | `limits.maxConnections`、`limits.maxConnectionsPerIP` | 全进程共享的连接配额，`0` 表示不限 |
 | `limits.ipBan` | 见[认证失败限制](#认证失败限制) |
 | `timeouts.handshake` | 握手阶段期限，秒，默认 60 |
-| `timeouts.dial` | 出站拨号，秒，默认 10 |
+| `timeouts.dial` | 出站拨号，秒，默认 10；目标解析出多个地址时按 RFC 8305 交替地址族、每 250 ms 发起下一次尝试，所有尝试共用这一个截止期（含 XHTTP 下行与独立上行目标的首个上行请求） |
 | `timeouts.write` | 写期限，秒，默认 30 |
-| `timeouts.connIdle` | 连接与 UDP 会话空闲超时，秒，默认 300 |
+| `timeouts.connIdle` | 连接与 UDP 会话空闲超时，秒，默认 300；UDP association 的上行数据报与回包均刷新空闲计时（同 Xray） |
 | `timeouts.uplinkOnly`、`timeouts.downlinkOnly` | 单方向结束后另一方向的剩余时间，秒，默认 5 / 5 |
 | `panels` | 面板对象数组，见下文 |
 
@@ -291,26 +291,27 @@ geosite.dat
 
 - IPBan 按入站标签和 PROXY protocol 提供的非空客户端 IP 计数；直连 socket IP、HTTP 转发头不参与。启用后在传输握手前拒绝已封禁 IP，不踢掉已有连接。三个数值字段均为正整数，即使关闭也拒绝非法值。
 - **失败凭据限制固定开启，不可配置**：同一入站、同一认证信息跨 IP 累计，60 秒内 10 次失败后拒绝 180 秒。支持 VLESS、Trojan、AnyTLS 和 Hysteria v1/v2；VMess、Shadowsocks 只使用可选 IPBan。`limits.credentialBan` 不是配置项，按未知字段忽略。
-- 计数在所有 Worker 间共享，仅保存在内存，重启清空；认证成功不清零，封禁期间不续期。每种规则最多跟踪 16,384 个键，满时拒绝未知键。凭据原文不写入日志。
+- 计数在所有 Worker 间共享，仅保存在内存，重启清空；认证成功不清零，封禁期间不续期。每种规则最多跟踪 16,384 个键；表满时新键不计数、不封禁，照常放行。凭据原文不写入日志。
 
 ## 资源上限与运行语义
 
 以下为对使用者可见的固定预算；它们是本地资源限制，不是协议限制。
 
-- 连接配额：`maxConnections`/`maxConnectionsPerIP` 是全进程值，物理连接占一个额度，额外并发逻辑请求增加额度。
+- 连接配额：`maxConnections`/`maxConnectionsPerIP` 是全进程值。一条 TCP 物理连接与其并发逻辑请求（Mux、AnyTLS、gRPC/XHTTP 子流）合计占 max(1, 并发逻辑请求数) 个额度。TCP 连接在读取 PROXY 头期间即占全局额度（负载均衡器的 socket 地址不计入按 IP 额度）；按 IP 额度在 TLS/REALITY 等传输握手开始前按客户端地址占用：启用 PROXY protocol 时为其提供的地址，否则为 socket 地址；配置了真实 IP 头的 WebSocket、HTTPUpgrade、HTTP 传输把对端视为可信前置代理，握手完成后才按转发地址（请求未带该头时按 socket 地址）占用。Hysteria 的 QUIC 连接只占全局额度，按 IP 额度按并发逻辑流计。按 IP 跟踪表满时，新地址不受按 IP 上限约束。
 - 在线设备额度在认证与前置请求校验通过后申请，会话内在途任务收束后才释放；Mux、AnyTLS、QUIC 子流继承物理会话身份，不重复占用设备额度。
 - 限速：每个转发方向按 bytes/s 独立限速，初始额度一秒流量，空闲最多积累两秒。
 - TCP keepalive：空闲 60 秒后开始探测，间隔 10 秒，共 6 次。
+- 文件描述符：启动时把 `RLIMIT_NOFILE` 软上限提升到硬上限（同 Go 运行时）；硬上限本身由 systemd `LimitNOFILE` 或 `ulimit -Hn` 提供，提升失败只记录日志、不阻断启动。
 - 嗅探：TCP 复制至多 4 KiB 前缀；UDP QUIC 嗅探总窗口 200 ms、最多 64 个数据报、累计 64 KiB。
 - DNS：每条上游应答最多取 64 个地址，其余记录仍参与校验与 TTL 计算。
 - HTTP/2（gRPC、h2、XHTTP 服务端）：每连接最多 250 个并发流（与 Go net/http 即 Xray 服务端相同），超额 REFUSED_STREAM；已关闭流仍在收尾的请求另计，每连接最多 1000 个；流窗口 4 MiB、连接窗口 8 MiB。gRPC 单条消息正文最多 4 MiB。
 - 面板 HTTP：每行最多 64 KiB，响应头（含临时响应及 trailer）累计最多 256 KiB，解码后响应体最多 64 MiB；这些预算不扩大普通代理传输的限制。
-- XHTTP：每个 session 排队数据与并发上传共用 4 MiB 预算，最多 1024 个排队包、64 个在途上传。跨 Worker 上传：每对 Worker 之间已读取但会话尚未接收的 packet-up 数据最多 16 MiB，每个 stream-up 上传最多 1 MiB 在途；先于下行到达的上传在请求握手期限内等待下行。
+- XHTTP：每个 session 排队数据与并发上传共用 4 MiB 预算，最多 1024 个排队包、64 个在途上传。跨 Worker 上传：每对 Worker 之间已读取但会话尚未接收的 packet-up 数据最多 16 MiB，每个 stream-up 上传最多 1 MiB 缓冲占用在途；先于下行到达的上传（HTTP/1.1 与 HTTP/2）在请求握手期限内等待下行，超时重置该请求并释放会话预算与上传槽位。
 - Mux：每连接最多 1,024 个子会话；未转发客户端数据共享 4 MiB 预算，降至 2 MiB 后恢复读取（与 Xray 相同的队头阻塞语义）。
 - AnyTLS 入站：每个 Session 最多 128 条未结束子流，子流从 SYN 起受 `timeouts.handshake` 绝对期限约束；每条子流接收队列最多 65,535 字节有效数据。
-- 原生 UDP：每 Worker 最多 4096 个出站 UDP socket、4096 个存活入站 association、8192 份排队数据报、64 MiB 排队缓冲；满额拒绝新请求，不驱逐已有请求。每个逻辑 UDP 请求独占一个出站 socket，源端口在请求期间不变。上行半关闭后在 `downlinkOnly` 窗口内继续收包。每个 association 最多排队 256 个上行数据报（512 KiB），超出的数据报丢弃、association 保留（同 Xray UDP 入站的溢出丢弃）；回包写入监听 socket 的队列满时等待，不丢弃。监听与出站 UDP socket 分别请求 4 MiB 与 1 MiB 内核接收缓冲（受 `net.core.rmem_max` 限制）。
-- UDP 路由子流：每个 association 最多保留 64 个目标、64 个路由子流和 512 个 QUIC CID alias；每个子流最多排队 512 个数据报或 512 KiB（同 Xray 默认的每链路 pipe），association 子流队列合计最多 4 MiB。队列满时暂停读取上游而不丢包、不结束子流。Mux 与 XUDP 的 UDP 回包在连接 UDP 预算（4 MiB）用尽时等待，Hysteria 回包在 QUIC 数据报队列满时等待（同 quic-go）；跨 Worker 转交的 XUDP 回包不等待，超出补发上限即丢弃。
-- Hysteria UDP 分片重组：5 秒无新片或 15 秒整体期限即丢弃该轮分片，不关闭会话。Hysteria v1 服务端使用 BBR v2 拥塞控制，与官方 v1 客户端线协议互通，但带宽控制行为不是 Brutal。
+- 原生 UDP：每 Worker 最多 4096 个出站 UDP socket、4096 个存活入站 association、8192 份排队数据报、64 MiB 排队缓冲；满额拒绝新请求，不驱逐已有请求。每个逻辑 UDP 请求独占一个出站 socket，源端口在请求期间不变。上行半关闭后在 `downlinkOnly` 窗口内继续收包。每个 association 最多排队 256 个上行数据报（512 KiB），超出的数据报丢弃、association 保留（同 Xray UDP 入站的溢出丢弃）；回包写入监听 socket 的队列满时等待，不丢弃。单个回包因目的地错误（如 EMSGSIZE、ENETUNREACH、EPERM）发送失败时只丢弃该数据报，同一监听 socket 上其他会话的回包继续发送。监听与出站 UDP socket 分别请求 4 MiB 与 1 MiB 内核接收缓冲（受 `net.core.rmem_max` 限制）。
+- UDP 路由子流：每个 association 同时最多 64 个目标、64 个路由子流和 512 个 QUIC CID alias，子流结束后释放其目标与 alias；每个子流最多排队 512 个数据报或 512 KiB（同 Xray 默认的每链路 pipe），association 子流队列合计最多 4 MiB。队列满时暂停读取上游而不丢包、不结束子流。Mux 与 XUDP 的 UDP 回包在连接 UDP 预算（4 MiB）用尽时等待，Hysteria 回包在 QUIC 数据报队列满时等待（同 quic-go）；跨 Worker 转交的 XUDP 回包不等待，超出补发上限即丢弃。
+- Hysteria：每个监听 socket 的共享发送队列最多 1024 个包，满时暂停相关连接写出、排空到一半后恢复，不关闭连接。UDP 分片重组：5 秒无新片或 15 秒整体期限即丢弃该轮分片，不关闭会话；同时最多 64 组未完成分片，超出时淘汰最早开始的一组。HTTP/3 请求流只按实际消费的字节归还流控额度。Hysteria v1 服务端使用 BBR v2 拥塞控制，与官方 v1 客户端线协议互通，但带宽控制行为不是 Brutal。
 - VMess 重放窗口 180 秒，最多 65,536 项，满时拒绝新记录。
 - SS2022 TCP 按 [SIP022 §3.1.5](https://shadowsocks.org/doc/sip022.html#_3-1-5-replay-protection) 记录已认证请求的 salt：进程级去重，保留 65 秒，最多 262,144 项；满时拒绝新记录，不提前淘汰未过期项。重放或跟踪容量拒绝不计入认证失败封禁。
 - XUDP：Global ID 按入站及其报告的用户身份（ID、email）区分；没有子会话承载的流保留 1 分钟后结束，期间回包最多暂存 256 个（512 KiB）。每个 Worker 最多 16,384 个流，超出时子会话按普通 Mux UDP 处理。跨 Worker 转交的数据报在对端暂不可收时最多排队 1,024 个，超出丢弃。
