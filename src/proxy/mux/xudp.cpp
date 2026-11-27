@@ -536,6 +536,9 @@ void XudpRelay::ForgetAttachment(uint32_t from, uint32_t slot, uint32_t generati
     common::MaybeShrinkHashContainer(attachments_);
 }
 
+// Owner -> client control messages are bounded by construction: one Attached
+// and one Detached per attachment, and a client reuses an attachment slot only
+// after the Detached that ends it arrives.
 void XudpRelay::SendAttached(uint32_t to, uint32_t slot, uint32_t generation) noexcept {
     (void)endpoint_.TryPost(to, XudpRelayMessage{
         .kind = XudpRelayKind::Attached, .slot = slot,
@@ -626,19 +629,32 @@ void XudpRelay::SendUplink(const Attachment& attachment, common::MultiBuffer dat
         .payload = datagram.pop_front().release()}, kMaxRelayBacklog);
 }
 
+// The slot stays reserved until the flow Worker's Detached ends the
+// attachment, so open/close churn toward a Worker that does not drain is
+// bounded by the slots rather than by its rate.
 void XudpRelay::Close(const Attachment& attachment) noexcept {
     auto* slot = SlotFor(attachment.slot, attachment.generation);
     if (!slot) return;
-    if (!slot->detached) {
-        (void)endpoint_.TryPost(attachment.owner, XudpRelayMessage{
-            .kind = XudpRelayKind::Detach, .slot = attachment.slot,
-            .generation = attachment.generation, .token = 0, .payload = nullptr}, SIZE_MAX);
-    }
-    slot->busy = false;
     slot->client = nullptr;
     slot->wake = nullptr;
+    if (slot->detached) {
+        FreeSlot(attachment.slot);
+        return;
+    }
+    slot->closed = true;
+    (void)endpoint_.TryPost(attachment.owner, XudpRelayMessage{
+        .kind = XudpRelayKind::Detach, .slot = attachment.slot,
+        .generation = attachment.generation, .token = 0, .payload = nullptr}, SIZE_MAX);
+}
+
+void XudpRelay::FreeSlot(uint32_t index) noexcept {
+    auto& slot = slots_[index];
+    slot.busy = false;
+    slot.closed = false;
+    slot.client = nullptr;
+    slot.wake = nullptr;
     try {
-        free_slots_.push_back(attachment.slot);
+        free_slots_.push_back(index);
     } catch (...) {
         // The slot stays unused; its generation still guards stale messages.
     }
@@ -650,13 +666,20 @@ XudpRelay::ClientSlot* XudpRelay::SlotFor(uint32_t slot, uint32_t generation) no
     return entry.busy && entry.generation == generation ? &entry : nullptr;
 }
 
-void XudpRelay::ReceiveAttach(uint32_t from, const XudpRelayMessage& message) {
+// Every attachment draws exactly one Detached from here: on refusal, when the
+// flow lets it go, or acknowledging the client's Detach.
+void XudpRelay::ReceiveAttach(uint32_t from, const XudpRelayMessage& message) noexcept {
     const auto found = tokens_.find(message.token);
     if (found == tokens_.end() || found->second->Closed()) {
         SendDetached(from, message.slot, message.generation);
         return;
     }
-    found->second->AttachRemote(from, message.slot, message.generation);
+    try {
+        found->second->AttachRemote(from, message.slot, message.generation);
+    } catch (...) {
+        found->second->DetachRemote(from, message.slot, message.generation);
+        SendDetached(from, message.slot, message.generation);
+    }
 }
 
 void XudpRelay::Receive(size_t from, XudpRelayMessage& message) noexcept {
@@ -677,8 +700,10 @@ void XudpRelay::Receive(size_t from, XudpRelayMessage& message) noexcept {
         case XudpRelayKind::Detach: {
             const auto found = attachments_.find(
                 AttachmentKey{source, message.slot, message.generation});
+            // Unbound: its Detached was already sent when the flow let it go.
             if (found == attachments_.end()) return;
             found->second->DetachRemote(source, message.slot, message.generation);
+            SendDetached(source, message.slot, message.generation);
             return;
         }
         case XudpRelayKind::Attached: {
@@ -697,7 +722,12 @@ void XudpRelay::Receive(size_t from, XudpRelayMessage& message) noexcept {
         }
         case XudpRelayKind::Detached: {
             auto* slot = SlotFor(message.slot, message.generation);
-            if (!slot || slot->detached) return;
+            if (!slot) return;
+            if (slot->closed) {
+                FreeSlot(message.slot);
+                return;
+            }
+            if (slot->detached) return;
             slot->detached = true;
             if (slot->wake) (void)slot->wake->try_send(IoErrorCode{});
             // Taken over or ended: the sub-session ends. A refused one is

@@ -136,6 +136,7 @@ public:
         const Attachment& attachment, common::CancellationSource& cancellation);
     void SendUplink(const Attachment& attachment, common::MultiBuffer datagram) noexcept;
     // The sub-session ends: tells the flow Worker unless it detached first.
+    // The slot returns once the flow Worker acknowledges.
     void Close(const Attachment& attachment) noexcept;
 
     void Receive(size_t from, XudpRelayMessage& message) noexcept;
@@ -146,6 +147,9 @@ private:
         bool busy = false;
         bool attached = false;
         bool detached = false;
+        // The sub-session ended; the slot waits for the flow Worker's
+        // Detached before it is reused.
+        bool closed = false;
         XudpClient* client = nullptr;
         // Frame-local channel of a coroutine waiting for the acknowledgement.
         common::SignalChannel* wake = nullptr;
@@ -160,7 +164,8 @@ private:
         [[nodiscard]] size_t operator()(const AttachmentKey& key) const noexcept;
     };
 
-    void ReceiveAttach(uint32_t from, const XudpRelayMessage& message);
+    void ReceiveAttach(uint32_t from, const XudpRelayMessage& message) noexcept;
+    void FreeSlot(uint32_t index) noexcept;
     [[nodiscard]] ClientSlot* SlotFor(uint32_t slot, uint32_t generation) noexcept;
 
     std::unordered_map<uint64_t, XudpSession*> tokens_;

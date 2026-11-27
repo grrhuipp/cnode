@@ -62,13 +62,13 @@ void UdpSessionRelay::ReleaseToken(uint64_t token) noexcept {
 }
 
 void UdpSessionRelay::SendGone(uint32_t to, uint64_t token) noexcept {
-    try {
-        endpoint_.Post(to, UdpRelayMessage{.kind = UdpRelayKind::Gone, .token = token,
-                                           .packet_id = 0, .client = {}, .payload = nullptr});
-    } catch (...) {
-        // Allocation failure: the forwarder keeps its route until its next
-        // datagram draws another Gone.
-    }
+    // Gone is idempotent and answers every datagram of an unknown session: a
+    // dropped one is drawn again by the forwarder's next datagram, so beyond
+    // the backlog it drops like a datagram instead of growing per datagram.
+    constexpr size_t kMaxBacklog = 1024;
+    (void)endpoint_.TryPost(to, UdpRelayMessage{.kind = UdpRelayKind::Gone, .token = token,
+                                                .packet_id = 0, .client = {}, .payload = nullptr},
+                            kMaxBacklog);
 }
 
 void UdpSessionRelay::AddRoute(uint32_t owner, uint64_t token, UdpIngress& ingress) {
