@@ -10,6 +10,7 @@
 #include "api/request_task.hpp"
 #include "transport/http1_handshake.hpp"
 
+#include <asio/co_spawn.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/ssl.hpp>
 #include <asio/redirect_error.hpp>
@@ -300,7 +301,7 @@ public:
     GetNodeInfo(std::string committed_etag) override;
 
     net::awaitable<UserListFetchResult>
-    GetUserList(std::string committed_etag) override;
+    GetUserList(std::string committed_etag, net::any_io_executor decode_executor) override;
 
     net::awaitable<bool>
     ReportNodeOnlineUsers(const std::vector<OnlineUser>& online_users) override;
@@ -341,6 +342,9 @@ private:
                              std::string_view missing_etag_error,
                              std::string_view pull_failure_label,
                              bool log_not_modified = false);
+
+    // Synchronous and CPU-bound for large lists; runs on the decode executor.
+    [[nodiscard]] UserListFetchResult DecodeUserList(std::string body, std::string etag) const;
 
     net::io_context& io_context_;
     Config config_;
@@ -613,7 +617,7 @@ APIClient::GetNodeInfo(std::string committed_etag) {
 }
 
 net::awaitable<UserListFetchResult>
-APIClient::GetUserList(std::string committed_etag) {
+APIClient::GetUserList(std::string committed_etag, net::any_io_executor decode_executor) {
     // Only the owner of a committed user snapshot may supply its validator.
     // A successful fetch alone must not acknowledge a failed runtime update.
     auto fetched = co_await FetchConditionalResource<UserListFetchResult>(
@@ -625,13 +629,21 @@ APIClient::GetUserList(std::string committed_etag) {
     if (!fetched) {
         co_return std::move(fetched.error());
     }
-    auto& resp = *fetched;
+    co_return co_await net::co_spawn(std::move(decode_executor),
+        [this, body = std::move(fetched->body), etag = std::move(fetched->etag)]() mutable
+            -> net::awaitable<UserListFetchResult> {
+            co_return DecodeUserList(std::move(body), std::move(etag));
+        },
+        net::use_awaitable);
+}
+
+UserListFetchResult APIClient::DecodeUserList(std::string body, std::string etag) const {
     try {
-        auto jv = infra::parse(resp.body);
-        std::string{}.swap(resp.body);
+        auto jv = infra::parse(body);
+        std::string{}.swap(body);
         if (!jv.is_object()) {
             LOG_PANEL_ERROR(log_context_, "User list parsing failed: root JSON value must be an object");
-            co_return UserListFetchResult::Fail(
+            return UserListFetchResult::Fail(
                 common::ErrorCode::PANEL_INVALID_RESPONSE,
                 "root JSON value must be an object");
         }
@@ -640,17 +652,16 @@ APIClient::GetUserList(std::string committed_etag) {
         jv = infra::value{};
         if (!users) {
             LOG_PANEL_ERROR(log_context_, "User list parsing failed: {}", users.error());
-            co_return UserListFetchResult::Fail(
+            return UserListFetchResult::Fail(
                 common::ErrorCode::PANEL_INVALID_RESPONSE,
                 std::move(users.error()));
         }
 
         LOG_PANEL_DEBUG(log_context_, "User list received: users={}", users->size());
-        co_return UserListFetchResult::Success(std::move(*users), std::move(resp.etag));
-
+        return UserListFetchResult::Success(std::move(*users), std::move(etag));
     } catch (const std::exception& e) {
         LOG_PANEL_ERROR(log_context_, "User list parsing failed: {}", e.what());
-        co_return UserListFetchResult::Fail(common::ErrorCode::PANEL_INVALID_RESPONSE, e.what());
+        return UserListFetchResult::Fail(common::ErrorCode::PANEL_INVALID_RESPONSE, e.what());
     }
 }
 

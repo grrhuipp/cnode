@@ -146,8 +146,10 @@ public:
     GetNodeInfo(std::string committed_etag) = 0;
 
     // The validator belongs to the last successfully published user snapshot.
+    // A complete response body is decoded on `decode_executor`, off the
+    // caller's event loop; the result resumes on the caller's executor.
     virtual net::awaitable<UserListFetchResult>
-    GetUserList(std::string committed_etag) = 0;
+    GetUserList(std::string committed_etag, net::any_io_executor decode_executor) = 0;
 
     virtual net::awaitable<bool>
     ReportNodeOnlineUsers(const std::vector<api::OnlineUser>& online_users) = 0;

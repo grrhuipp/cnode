@@ -9,6 +9,7 @@
 #include <asio/steady_timer.hpp>
 #include <asio/read_until.hpp>
 #include <asio/streambuf.hpp>
+#include <asio/thread_pool.hpp>
 #include <asio/write.hpp>
 #include <algorithm>
 
@@ -173,6 +174,8 @@ class PanelHttpConsumer : public testing::TestWithParam<std::string_view> {};
 TEST_P(PanelHttpConsumer, PreservesResponseBoundariesAndValidatorIdentity) {
     const auto mode = GetParam();
     net::io_context io;
+    // Decoding runs on a separate resident thread and resumes on `io`.
+    net::thread_pool decoder(1);
     ::app::DnsConfig dns_config;
     dns_config.servers = {{net::ip::address_v4::loopback(), 53}};
     ::app::DNSWorker resolver(io, dns_config, 16);
@@ -271,7 +274,7 @@ TEST_P(PanelHttpConsumer, PreservesResponseBoundariesAndValidatorIdentity) {
             EXPECT_FALSE(write_error);
     };
     net::co_spawn(io, serve(), [&](std::exception_ptr failure) { server_failure = failure; });
-    net::co_spawn(io, client->GetUserList("committed-users"),
+    net::co_spawn(io, client->GetUserList("committed-users", decoder.get_executor()),
         [&](std::exception_ptr failure, api::UserListFetchResult value) {
             client_failure = failure;
             result = std::move(value);

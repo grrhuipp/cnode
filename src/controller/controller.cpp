@@ -16,6 +16,7 @@
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/this_coro.hpp>
+#include <asio/thread_pool.hpp>
 #include <asio/use_awaitable.hpp>
 
 #include <algorithm>
@@ -31,6 +32,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -175,6 +177,7 @@ struct controller::Controller::Impl : std::enable_shared_from_this<controller::C
     net::awaitable<std::vector<api::UserTraffic>> CollectTraffic(PanelRuntime& panel);
     net::awaitable<controller::OnlineSnapshot>
     GetOnlineSnapshot(const std::string& tag);
+    [[nodiscard]] net::any_io_executor PreparationExecutor();
 
     net::io_context&                       io_context_;
     const std::vector<std::unique_ptr<app::Worker>>&  workers_;
@@ -211,11 +214,29 @@ struct controller::Controller::Impl : std::enable_shared_from_this<controller::C
         std::weak_ptr<common::MonitorLoop> status_loop;
     };
     std::vector<std::unique_ptr<PanelRuntime>> panels_;
+    // CPU-bound sync preparation (user list decoding, credential derivation,
+    // inbound/TLS preparation, user snapshot construction) runs on this
+    // resident thread and resumes on the controller executor. Each panel sync
+    // loop awaits its own job, and panels are fixed before Start, so queued
+    // jobs never exceed the panel count. Declared last: joined first.
+    std::optional<net::thread_pool> preparation_pool_;
 };
 namespace controller {
 
 namespace {
 
+// Runs a synchronous preparation on `executor` and resumes the awaiting
+// coroutine on its own executor with the value or exception.
+template <typename Function>
+net::awaitable<std::invoke_result_t<Function&>> RunPreparation(
+    net::any_io_executor executor, Function function) {
+    using Result = std::invoke_result_t<Function&>;
+    co_return co_await net::co_spawn(std::move(executor),
+        [function = std::move(function)]() mutable -> net::awaitable<Result> {
+            co_return function();
+        },
+        net::use_awaitable);
+}
 
 [[nodiscard]] app::PreparedOutboundConfig BuildPanelAutoOutbound(
     const std::string& tag,
@@ -237,6 +258,55 @@ namespace {
         throw std::logic_error("failed to prepare panel auto freedom outbound");
     }
     return std::move(*prepared);
+}
+
+// Builds the candidate snapshot from one pull. Credential derivation, inbound
+// and TLS preparation are CPU-bound (and may read certificate files), so this
+// runs on the preparation thread; every input is owned or immutable.
+[[nodiscard]] std::shared_ptr<const controller::NodeSnapshot> PrepareNodeCandidate(
+    const infra::PanelConfig& panel_config,
+    std::string tag,
+    const std::shared_ptr<const controller::NodeSnapshot>& old_state,
+    api::NodeInfoFetchResult config_result,
+    api::UserListFetchResult users_result,
+    bool users_changed) {
+    auto candidate = std::make_shared<controller::NodeSnapshot>();
+    candidate->config = config_result.not_modified
+        ? old_state->config : std::move(*config_result.node_info);
+    candidate->config_etag = config_result.not_modified
+        ? old_state->config_etag : std::move(config_result.etag);
+    candidate->users = users_changed
+        ? std::make_shared<const std::vector<api::UserInfo>>(std::move(users_result.users))
+        : old_state->users;
+    candidate->users_etag = users_changed
+        ? std::move(users_result.etag) : old_state->users_etag;
+    candidate->rules = config_result.not_modified
+        ? old_state->rules
+        : std::make_shared<const std::vector<common::DetectRule>>(
+              std::move(config_result.rules));
+    const bool rebuild_settings = !old_state ||
+        controller::NodeConfigChanged(old_state->config, candidate->config);
+    if (rebuild_settings) {
+        candidate->inbound = std::make_shared<const app::PreparedInbound>(app::PrepareInbound(
+            controller::MapPanelInbound(panel_config, candidate->config, *candidate->users)));
+        candidate->outbound =
+            std::make_shared<const app::PreparedOutboundConfig>(
+                BuildPanelAutoOutbound(tag, panel_config));
+    } else if (users_changed) {
+        // Only the users changed: keep every prepared setting and rebuild the
+        // authentication payload through the same per-protocol builder.
+        auto inbound = std::make_shared<app::PreparedInbound>(*old_state->inbound);
+        inbound->users = app::PrepareInboundUsers(
+            inbound->build_request,
+            controller::MapPanelUsers(candidate->config, *candidate->users));
+        candidate->inbound = std::move(inbound);
+        candidate->outbound = old_state->outbound;
+    } else {
+        candidate->inbound = old_state->inbound;
+        candidate->outbound = old_state->outbound;
+    }
+    candidate->tag = std::move(tag);
+    return candidate;
 }
 
 std::unique_ptr<api::API> ValidatePanelRuntimeArgs(
@@ -283,9 +353,10 @@ public:
     NodeRuntime(net::io_context& io_context,
                 const std::vector<std::unique_ptr<app::Worker>>& workers,
                 PanelRuntime& panel,
-                const bool& stopping)
+                const bool& stopping,
+                net::any_io_executor preparation_executor)
         : io_context_(io_context), workers_(workers), panel_(panel),
-          stopping_(stopping) {}
+          stopping_(stopping), preparation_executor_(std::move(preparation_executor)) {}
 
     net::awaitable<void> RemoveInbound(const std::string& tag) {
         return app::PostToEachWorker(io_context_.get_executor(), workers_, stopping_,
@@ -386,9 +457,12 @@ public:
     net::awaitable<void> ApplyUsers(
         const std::string& tag, const app::UserSet& users) {
         co_await RecoverUsers();
+        // The mutation lease serializes this preparation with every commit.
+        auto candidate = co_await RunPreparation(preparation_executor_, [&tag, &users] {
+            return app::UserStore::PrepareUsers(tag, users);
+        });
         co_await ::app::PublishUsers(io_context_.get_executor(), workers_,
-            app::UserStore::PrepareUsers(tag, users),
-            panel_.node.user_recovery, stopping_);
+            std::move(candidate), panel_.node.user_recovery, stopping_);
     }
 
     [[nodiscard]] bool IsStopping() const noexcept { return stopping_; }
@@ -398,6 +472,7 @@ private:
     const std::vector<std::unique_ptr<app::Worker>>& workers_;
     PanelRuntime& panel_;
     const bool& stopping_;
+    net::any_io_executor preparation_executor_;
 };
 namespace controller {
 
@@ -456,9 +531,15 @@ void Controller::Impl::AddPanel(std::unique_ptr<api::API> panel,
     panels_.push_back(std::move(runtime));
 }
 
+net::any_io_executor Controller::Impl::PreparationExecutor() {
+    if (!preparation_pool_) throw std::logic_error("panel preparation requires a started controller");
+    return preparation_pool_->get_executor();
+}
+
 void Controller::Impl::Start() {
     if (stopping_) return;
     node_mutations_.Seal();
+    if (!preparation_pool_ && !panels_.empty()) preparation_pool_.emplace(1);
     enum class LoopKind { Sync, Status };
     for (auto& entry : panels_) {
         auto* panel = entry.get();
@@ -653,7 +734,7 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
     const auto& panel_name = panel.config.Name;
     const auto& log_context = panel.log_context;
 
-    NodeRuntime runtime(io_context_, workers_, panel, stopping_);
+    NodeRuntime runtime(io_context_, workers_, panel, stopping_, PreparationExecutor());
 
     // One pull attempt is made for each scheduler invocation.
     // Recovery depends only on retained local snapshots, so a failing or
@@ -708,7 +789,7 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
     }
 
     auto users_result = co_await panel.client->GetUserList(
-        old_state ? old_state->users_etag : std::string{});
+        old_state ? old_state->users_etag : std::string{}, PreparationExecutor());
     app::ThrowIfStopping(stopping_);
     if (!users_result.Ok()) {
         if (transitioning) {
@@ -726,50 +807,22 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
         }
     }
 
-    const bool users_changed = users_result.Ok() && !users_result.not_modified;
+    const bool users_ok = users_result.Ok();
+    const bool users_changed = users_ok && !users_result.not_modified;
     if (!transitioning && config_result.not_modified && !users_changed) {
-        panel.state = users_result.Ok() ? PanelState::Ready : PanelState::Degraded;
+        panel.state = users_ok ? PanelState::Ready : PanelState::Degraded;
         co_return;
     }
-    auto candidate = std::make_shared<controller::NodeSnapshot>();
-    candidate->config = config_result.not_modified
-        ? old_state->config : std::move(*config_result.node_info);
-    candidate->config_etag = config_result.not_modified
-        ? old_state->config_etag : std::move(config_result.etag);
-    candidate->tag = tag;
-    candidate->users = users_changed
-        ? std::make_shared<const std::vector<api::UserInfo>>(std::move(users_result.users))
-        : old_state->users;
-    candidate->users_etag = users_changed
-        ? std::move(users_result.etag) : old_state->users_etag;
-    candidate->rules = config_result.not_modified
-        ? old_state->rules
-        : std::make_shared<const std::vector<common::DetectRule>>(
-              std::move(config_result.rules));
-    const bool rebuild_settings = !old_state ||
-        controller::NodeConfigChanged(old_state->config, candidate->config);
-    if (rebuild_settings) {
-        candidate->inbound = std::make_shared<const app::PreparedInbound>(app::PrepareInbound(
-            controller::MapPanelInbound(panel.config, candidate->config, *candidate->users)));
-        candidate->outbound =
-            std::make_shared<const app::PreparedOutboundConfig>(
-                BuildPanelAutoOutbound(tag, panel.config));
-    } else if (users_changed) {
-        // Only the users changed: keep every prepared setting and rebuild the
-        // authentication payload through the same per-protocol builder.
-        auto inbound = std::make_shared<app::PreparedInbound>(*old_state->inbound);
-        inbound->users = app::PrepareInboundUsers(
-            inbound->build_request,
-            controller::MapPanelUsers(candidate->config, *candidate->users));
-        candidate->inbound = std::move(inbound);
-        candidate->outbound = old_state->outbound;
-    } else {
-        candidate->inbound = old_state->inbound;
-        candidate->outbound = old_state->outbound;
-    }
-    std::shared_ptr<const controller::NodeSnapshot> next = std::move(candidate);
     // Candidate data and authentication payloads are complete before
     // entering the transaction's first runtime mutation.
+    std::shared_ptr<const controller::NodeSnapshot> next = co_await RunPreparation(
+        PreparationExecutor(),
+        [&panel_config = panel.config, tag, old_state, users_changed,
+         config = std::move(config_result), users = std::move(users_result)]() mutable {
+            return PrepareNodeCandidate(panel_config, tag, old_state,
+                std::move(config), std::move(users), users_changed);
+        });
+    app::ThrowIfStopping(stopping_);
     // Hold fair admission before checking endpoints: another panel may
     // commit or retain recovery reservations while this one waits.
     auto lease = co_await node_mutations_.Acquire(panel.mutation);
@@ -791,7 +844,7 @@ net::awaitable<void> Controller::Impl::NodeInfoMonitor(PanelRuntime& panel) {
         LOG_PANEL_INFO(log_context, "Panel configuration ready: tag={} replaced={}",
             tag, old_state ? "yes" : "no");
     }
-    panel.state = users_result.Ok() ? PanelState::Ready : PanelState::Degraded;
+    panel.state = users_ok ? PanelState::Ready : PanelState::Degraded;
 }
 
 void Controller::Impl::LogPanelStatus(const PanelRuntime& panel) const {
