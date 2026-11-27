@@ -41,6 +41,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <format>
@@ -91,6 +92,25 @@ ProcessDescriptors ReadProcessDescriptors() noexcept {
         ::closedir(directory);
         if (complete && count > 0) result.open = count - 1;
     }
+    return result;
+}
+
+DescriptorLimitRaise RaiseDescriptorSoftLimit() noexcept {
+    DescriptorLimitRaise result;
+    rlimit limits{};
+    if (::getrlimit(RLIMIT_NOFILE, &limits) != 0) {
+        result.error = errno;
+        return result;
+    }
+    result.previous_soft = result.current_soft = limits.rlim_cur;
+    result.hard = limits.rlim_max;
+    if (limits.rlim_cur == limits.rlim_max) return result;
+    limits.rlim_cur = limits.rlim_max;
+    if (::setrlimit(RLIMIT_NOFILE, &limits) != 0) {
+        result.error = errno;
+        return result;
+    }
+    result.current_soft = limits.rlim_cur;
     return result;
 }
 
@@ -1022,6 +1042,13 @@ int RunFromCommandLine(int argc, char* argv[]) {
     LOG_CONSOLE("Starting cnode v1.0.0: channel={} build={}", BUILD_CHANNEL, BUILD_ID);
     LOG_CONSOLE("Runtime configured: workers={} io=epoll accept=SO_REUSEPORT allocator=mimalloc-thread-heap",
                 config.workers);
+    if (const auto raised = RaiseDescriptorSoftLimit(); raised.error != 0) {
+        LOG_CONSOLE("Process descriptor limit unchanged: soft_limit={} hard_limit={} error={}",
+                    raised.previous_soft, raised.hard, std::strerror(raised.error));
+    } else if (raised.current_soft != raised.previous_soft) {
+        LOG_CONSOLE("Process descriptor limit raised: soft_limit={} -> {}",
+                    raised.previous_soft, raised.current_soft);
+    }
     if (!infra::ValidateConfig(config)) {
         infra::Log::WriteConsole(infra::LogLevel::ERROR, "Invalid configuration");
         infra::Log::Shutdown();

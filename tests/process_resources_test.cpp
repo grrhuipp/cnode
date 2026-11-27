@@ -34,3 +34,26 @@ TEST(ProcessResources, ReportsOperatingSystemSoftLimit) {
         EXPECT_EQ(*sample.soft_limit, static_cast<size_t>(limits.rlim_cur));
     }
 }
+
+TEST(ProcessResources, RaisesSoftLimitToHardLimit) {
+    rlimit original{};
+    ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &original), 0);
+    if (original.rlim_max == RLIM_INFINITY || original.rlim_max <= 64)
+        GTEST_SKIP() << "hard limit leaves no room for a lower soft limit";
+    rlimit lowered = original;
+    lowered.rlim_cur = 64;
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &lowered), 0);
+
+    const auto raised = ::app::RaiseDescriptorSoftLimit();
+    rlimit after{};
+    ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &after), 0);
+    const auto sample = ::app::ReadProcessDescriptors();
+    (void)::setrlimit(RLIMIT_NOFILE, &original);
+
+    EXPECT_EQ(raised.error, 0);
+    EXPECT_EQ(raised.previous_soft, 64u);
+    EXPECT_EQ(raised.current_soft, original.rlim_max);
+    EXPECT_EQ(raised.hard, original.rlim_max);
+    EXPECT_EQ(after.rlim_cur, original.rlim_max);
+    EXPECT_EQ(sample.soft_limit, static_cast<size_t>(original.rlim_max));
+}
