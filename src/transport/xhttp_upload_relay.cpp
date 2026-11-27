@@ -22,9 +22,11 @@ using RelayMessage = XHttpRelayMessage;
 // Packet bytes one Worker may have read toward one other Worker that its
 // session has not yet taken; bounded like a session's own payload budget.
 constexpr size_t kPacketBudget = 4 * XHttpPacketQueue::kMaxQueuedBytes;
-// Stream-up bytes in flight or unread per remote upload: the receiver window.
+// Buffer storage of one remote upload in flight or unread: the receiver
+// window. Counting storage, not payload bytes, keeps a body read in tiny
+// pieces from pinning a full Buffer per byte.
 constexpr int64_t kStreamWindow = 1024 * 1024;
-// Stream bytes consumed before the session Worker returns them as credit.
+// Storage consumed before the session Worker returns it as credit.
 constexpr size_t kCreditBatch = 64 * 1024;
 // Concurrent uploads from one Worker toward one other Worker.
 constexpr size_t kMaxUploadSlots = 64 * 1024;
@@ -167,8 +169,8 @@ struct XHttpUploadRelay::State {
 };
 
 // Session-side end of one stream-up upload received on another Worker. The
-// session reads it like a local upload; bytes it consumes return to the
-// upload Worker as credit.
+// session reads it like a local upload; the storage of each Buffer it
+// consumes returns to the upload Worker as credit.
 class XHttpRemoteUploadStream final : public AsyncStream {
 public:
     XHttpRemoteUploadStream(XHttpUploadRelay::State& relay, size_t from,
@@ -182,8 +184,8 @@ public:
 
     void Deliver(common::MultiBuffer payload) {
         if (finished_) return;
-        inbox_bytes_ += payload.byte_size();
-        if (inbox_bytes_ > static_cast<size_t>(kStreamWindow) + common::Buffer::kSize * 64) {
+        inbox_storage_ += payload.FrontBuffer()->capacity;
+        if (inbox_storage_ > static_cast<size_t>(kStreamWindow) + common::Buffer::kSize * 64) {
             // The upload Worker ignored its window.
             aborted_ = true;
             inbox_.clear();
@@ -202,10 +204,13 @@ public:
         for (;;) {
             if (!inbox_.empty()) {
                 auto& front = inbox_.front();
+                const size_t storage = front.FrontBuffer()->capacity;
                 const size_t n = front.ConsumePrefixTo(
                     std::span<uint8_t>(static_cast<uint8_t*>(buffer.data()), buffer.size()));
-                if (front.empty()) inbox_.pop_front();
-                Consumed(n);
+                if (front.empty()) {
+                    inbox_.pop_front();
+                    Consumed(storage);
+                }
                 co_return n;
             }
             if (co_await WaitInput()) co_return 0;
@@ -217,7 +222,7 @@ public:
             if (!inbox_.empty()) {
                 auto payload = std::move(inbox_.front());
                 inbox_.pop_front();
-                Consumed(payload.byte_size());
+                Consumed(payload.FrontBuffer()->capacity);
                 co_return payload;
             }
             if (co_await WaitInput()) co_return common::MultiBuffer{};
@@ -260,9 +265,9 @@ private:
 
     void Wake() noexcept { (void)signal_.try_send(IoErrorCode{}); }
 
-    void Consumed(size_t bytes) {
-        inbox_bytes_ -= std::min(inbox_bytes_, bytes);
-        pending_credit_ += bytes;
+    void Consumed(size_t storage) {
+        inbox_storage_ -= std::min(inbox_storage_, storage);
+        pending_credit_ += storage;
         if (!relay_ || finished_ || ended_) return;
         if (pending_credit_ < kCreditBatch && !inbox_.empty()) return;
         relay_->Post(from_, RelayMessage{
@@ -291,7 +296,8 @@ private:
     uint32_t generation_;
     common::SignalChannel signal_;
     common::RingDeque<common::MultiBuffer> inbox_;
-    size_t inbox_bytes_ = 0;
+    // Buffer storage delivered and not yet consumed.
+    size_t inbox_storage_ = 0;
     size_t pending_credit_ = 0;
     uint64_t read_abort_epoch_ = 0;
     bool ended_ = false;
@@ -630,7 +636,7 @@ net::awaitable<void> XHttpUploadRelay::PumpStream(
                 send(RelayKind::StreamEnd);
                 co_return;
             }
-            slot.credit -= static_cast<int64_t>(payload.byte_size());
+            slot.credit -= static_cast<int64_t>(payload.FrontBuffer()->capacity);
             send(RelayKind::StreamData, payload.pop_front().release());
         }
     } catch (...) {
