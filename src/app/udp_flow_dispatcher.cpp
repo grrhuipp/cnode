@@ -377,21 +377,30 @@ public:
             : aggregate_.bytes_down + child.bytes_down;
     }
 
+    // An association that addressed one target is Xray's single-link UDP
+    // request (VLESS/VMess UDP, an XUDP sub-session): the failure of that
+    // target ends the request. One that addressed several is per-packet
+    // addressed like Xray's udp.Dispatcher (Trojan, Shadowsocks, SOCKS): a
+    // failed target ends only its flow, and its next datagram starts another.
     void CompleteFlow(
         const std::shared_ptr<UdpRouteFlow>& flow,
         const RelayResult& child) noexcept {
-        const bool terminate_stream_association =
+        const bool terminate_single_target_association =
+            targets_.size() == 1 &&
             flows_.size() == 1 &&
             child.error != common::ErrorCode::OK &&
             child.error != common::ErrorCode::CANCELLED &&
             child.error != common::ErrorCode::SOCKET_EOF;
         RecordResult(child);
         FinishFlow(flow);
-        if (terminate_stream_association) {
+        if (terminate_single_target_association) {
             const auto self = shared_from_this();
             try {
+                // Datagrams read meanwhile may have started a flow or named
+                // another target; either keeps the association.
                 net::post(io_context_, [self, error = child.error]() {
-                    if (self->active_) self->Fail(error);
+                    if (self->active_ && self->flows_.empty() && self->targets_.size() == 1)
+                        self->Fail(error);
                 });
             } catch (...) {
                 failed_ = common::ErrorCode::RESOURCE_EXHAUSTED;
