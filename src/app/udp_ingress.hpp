@@ -222,11 +222,12 @@ struct UdpAssociationHook final {
     UdpSocketState* socket = nullptr;
     const ClientSessionKey* client_key = nullptr;
     std::chrono::seconds idle_timeout{};
-    // Valid uplink activity only; the reclaimer re-checks it lazily when the
-    // row's deadline passes, so packets never re-key the maintenance heap.
+    // Valid activity in either direction, as Xray's UDP inactivity timer; the
+    // reclaimer re-checks it lazily when the row's deadline passes, so packets
+    // never re-key the maintenance heap.
     TimePoint last_active{};
-    // Earliest instant the row may need reclaiming. Uplink activity does not
-    // move it; a due open row is re-checked against its last activity and
+    // Earliest instant the row may need reclaiming. Activity does not move
+    // it; a due open row is re-checked against its last activity and
     // re-armed. min() marks a closed row, max() an open row that never expires.
     TimePoint deadline{};
     std::size_t heap_index = 0;

@@ -467,8 +467,12 @@ UdpIngress::ClientSession::WriteMultiBuffer(common::MultiBuffer mb) {
             throw IoSystemError(io_error::operation_aborted, "UDP client reply path closed");
         }
     }
-    // An encoding or queueing failure loses this datagram only.
-    (void)reply_.Send(proxy::UDPPacketView{*datagram.target, mb.FrontSpan()}, reply_endpoint_);
+    // An encoding or queueing failure loses this datagram only. A queued
+    // reply is association activity, as in Xray, whose UDP inactivity timer
+    // both directions refresh.
+    if (reply_.Send(proxy::UDPPacketView{*datagram.target, mb.FrontSpan()}, reply_endpoint_)) {
+        if (auto* hook = association_hook_) hook->last_active = std::chrono::steady_clock::now();
+    }
     mb.clear();
     co_return;
 }
@@ -1393,11 +1397,17 @@ net::awaitable<void> UdpIngress::SendUdpReplies(
     while (packet && ingress.OwnsSocket(*socket)) {
         auto [ec, bytes] = co_await socket->socket->async_send_to(
             packet->SendBuffers(), packet->endpoint, net::as_tuple(net::use_awaitable));
-        if (ec || bytes != packet->payload.byte_size()) {
+        // Only a cancelled or closed socket ends the sender. Errors of one
+        // destination (EMSGSIZE, ENETUNREACH, EHOSTUNREACH, a netfilter
+        // EPERM/EACCES, ENOBUFS, an ICMP-reported ECONNREFUSED) lose that
+        // datagram alone: the queue holds every session of this listener.
+        if (ec == net::error::operation_aborted || ec == net::error::bad_descriptor) {
             ingress.ClearReplyQueue(*socket);
-            if (ec && ec != net::error::operation_aborted)
-                LOG_NET_DEBUG("UDP reply failed worker={} > {}", worker_id, ec.message());
             co_return;
+        }
+        if (ec || bytes != packet->payload.byte_size()) {
+            LOG_NET_DEBUG("UDP reply dropped worker={} > {}", worker_id,
+                          ec ? ec.message() : std::string("short datagram write"));
         }
         packet = ingress.CompleteReplySend(*socket, packet->id);
     }

@@ -423,9 +423,9 @@ TEST_F(UdpAssociationReclaimerTest, IdleExpiryAllowsSynchronousSocketRetirement)
     EXPECT_FALSE(sockets.Find(idle_ingress, "idle")) << "natural expiry reentry did not safely retire the association and socket";
 }
 
-TEST_F(UdpAssociationReclaimerTest, DownlinkDoesNotRefreshIdleDeadline) {
-    // Downlink traffic does not refresh idle time: the row still expires at
-    // its original deadline, well before a refreshed deadline could pass.
+TEST_F(UdpAssociationReclaimerTest, DownlinkRefreshesIdleDeadline) {
+    // As Xray's UDP inactivity timer, a queued reply is activity: the row
+    // outlives its original deadline and expires one idle period after it.
     ::common::TargetAddress target;
     target.type = ::common::AddressType::IPv4;
     target.resolved_addr = ::net::ip::address_v4::loopback();
@@ -436,7 +436,7 @@ TEST_F(UdpAssociationReclaimerTest, DownlinkDoesNotRefreshIdleDeadline) {
     auto accepted_reply = std::make_shared<AcceptedReplyResponse>();
     ::udp::socket peer(io, {::net::ip::address_v4::loopback(), 0});
     peer.non_blocking(true);
-    constexpr auto downlink_idle = 2s;
+    constexpr auto downlink_idle = 1s;
     auto downlink = downlink_ingress.CreateClientSession(sockets.Get(downlink_ingress, "activity"), Key(1), io,
     {.socket = downlink_socket, .response = accepted_reply, .owner = &downlink_ingress},
     peer.local_endpoint(), Key(1).owner,
@@ -449,6 +449,7 @@ TEST_F(UdpAssociationReclaimerTest, DownlinkDoesNotRefreshIdleDeadline) {
     reply->SetUDP(target);
     bool reply_completed = false;
     DrainIngress drain{io, downlink_ingress};
+    const auto reply_started = Clock::now();
     ::net::co_spawn(io,
         downlink->WriteMultiBuffer(::common::MultiBuffer{std::move(reply)}),
         [&](std::exception_ptr error) {
@@ -456,7 +457,6 @@ TEST_F(UdpAssociationReclaimerTest, DownlinkDoesNotRefreshIdleDeadline) {
             reply_completed = true;
         });
     EXPECT_TRUE(RunUntil(io, [&] { return reply_completed; })) << "UDP downlink write did not complete";
-    const auto downlink_written = Clock::now();
     std::array<uint8_t, 1> received{};
     ::udp::endpoint sender;
     size_t received_size = 0;
@@ -467,14 +467,17 @@ TEST_F(UdpAssociationReclaimerTest, DownlinkDoesNotRefreshIdleDeadline) {
     }));
     EXPECT_EQ(received_size, 1u);
     EXPECT_EQ(received[0], 2);
-    EXPECT_TRUE(RunUntil(io, [&] { return downlink->Closed(); })) << "UDP downlink traffic incorrectly refreshed association idle time";
-    EXPECT_LT(Clock::now() - downlink_written, downlink_idle) << "UDP downlink traffic incorrectly refreshed association idle time";
-    EXPECT_EQ(downlink_ingress.GetResourceStats().associations, 0) << "UDP downlink traffic incorrectly refreshed association idle time";
+    RunFor(io, 500ms);
+    EXPECT_FALSE(downlink->Closed()) << "UDP downlink traffic did not refresh association idle time";
+    EXPECT_EQ(downlink_ingress.GetResourceStats().associations, 1) << "UDP downlink traffic did not refresh association idle time";
+    EXPECT_TRUE(RunUntil(io, [&] { return downlink->Closed(); })) << "refreshed UDP association never expired";
+    EXPECT_GE(Clock::now() - reply_started, downlink_idle) << "UDP association expired before one idle period after its reply";
+    EXPECT_EQ(downlink_ingress.GetResourceStats().associations, 0) << "expired UDP association kept its row";
     downlink.reset();
 }
 
 TEST_F(UdpAssociationReclaimerTest, UplinkRefreshesAndRearmsIdleDeadline) {
-    // Valid uplink only moves last activity. When the original deadline passes
+    // Valid uplink moves last activity. When the original deadline passes
     // the row is re-checked and re-armed; it expires one idle period after the
     // uplink, not before.
     Ingress activity_ingress("activity", std::make_unique<DatagramInbound>(), reclaimer, budget, io);
