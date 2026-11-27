@@ -78,6 +78,7 @@ struct CandidateRace {
     AsyncDelay deadline;
     DialResult result =
         DialResult::Fail(common::ErrorCode::DIAL_CONNECT_FAILED, "all dial candidates failed");
+    const OutboundDialCandidate* winner = nullptr;
     size_t launched = 0;
     size_t in_flight = 0;
     // 尝试失败时置位：发起方不再等待剩余的 Connection Attempt Delay。
@@ -105,6 +106,7 @@ net::awaitable<void> AttemptRaceCandidate(CandidateRace& race,
     // 已裁决后完成的连接（含同一轮事件中晚到的成功）随 attempt 析构关闭。
     if (race.concluded) co_return;
     if (attempt.Ok()) {
+        race.winner = &candidate;
         race.Conclude(std::move(attempt));
         co_return;
     }
@@ -149,36 +151,15 @@ net::awaitable<void> EnforceRaceDeadline(CandidateRace& race) {
     race.Conclude(DialResult::Fail(common::ErrorCode::DIAL_TIMEOUT, "connection timed out"));
 }
 
-// 多候选只竞速 TCP 建连：整场竞速受同一个拨号截止期约束，首个成功的连接
-// 胜出，其余尝试被取消并 join 后才返回。传输层构建只在胜者上执行一次，
-// 与 Xray 先竞速 TCP、再在所得连接上叠加安全层/传输层一致。
-net::awaitable<DialResult> RaceOutboundCandidates(
-    net::io_context& io_context,
-    common::Context& ctx,
-    std::span<const OutboundDialCandidate> candidates,
-    std::chrono::seconds timeout) {
-    CandidateRace race(io_context, ctx, candidates, timeout);
-    co_await common::RunAwaitableTaskGroup(
-        net::any_io_executor(io_context.get_executor()),
-        [&race](common::AwaitableTaskGroup& group) {
-            race.group = &group;
-            group.Spawn(EnforceRaceDeadline(race));
-            // 子任务就地启动：非正截止期会在此前裁决并停止任务组。
-            if (!race.concluded) group.Spawn(LaunchRaceAttempts(race));
-        });
-    race.group = nullptr;
-    co_return std::move(race.result);
-}
-
 net::awaitable<DialResult> DialAndBuildTransport(
     net::io_context& io_context,
     common::Context& ctx,
     const OutboundTransportTarget& target,
     std::span<const OutboundDialCandidate> candidates) {
 
-    auto tcp_result = candidates.size() == 1
+    DialResult tcp_result = candidates.size() == 1
         ? co_await ConnectOutboundCandidate(io_context, candidates.front(), target.timeout)
-        : co_await RaceOutboundCandidates(io_context, ctx, candidates, target.timeout);
+        : (co_await RaceOutboundCandidates(io_context, ctx, candidates, target.timeout)).tcp;
     if (!tcp_result.Ok()) {
         co_return tcp_result;
     }
@@ -457,6 +438,27 @@ net::awaitable<DialResult> ConnectOutboundCandidate(
         candidate.endpoint,
         candidate.bind_local ? &*candidate.bind_local : nullptr,
         timeout);
+}
+
+// 多候选只竞速 TCP 建连：整场竞速受同一个拨号截止期约束，首个成功的连接
+// 胜出，其余尝试被取消并 join 后才返回。传输层构建只在胜者上执行一次，
+// 与 Xray 先竞速 TCP、再在所得连接上叠加安全层/传输层一致。
+net::awaitable<OutboundCandidateConnection> RaceOutboundCandidates(
+    net::io_context& io_context,
+    common::Context& ctx,
+    std::span<const OutboundDialCandidate> candidates,
+    std::chrono::seconds timeout) {
+    CandidateRace race(io_context, ctx, candidates, timeout);
+    co_await common::RunAwaitableTaskGroup(
+        net::any_io_executor(io_context.get_executor()),
+        [&race](common::AwaitableTaskGroup& group) {
+            race.group = &group;
+            group.Spawn(EnforceRaceDeadline(race));
+            // 子任务就地启动：非正截止期会在此前裁决并停止任务组。
+            if (!race.concluded) group.Spawn(LaunchRaceAttempts(race));
+        });
+    race.group = nullptr;
+    co_return OutboundCandidateConnection{.tcp = std::move(race.result), .candidate = race.winner};
 }
 
 __attribute__((weak)) net::awaitable<DialResult> DialOutboundTransport(

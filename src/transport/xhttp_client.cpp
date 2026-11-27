@@ -693,49 +693,54 @@ private:
     uint64_t next_seq_ = 0;
 };
 
-net::awaitable<DialResult> DialAndBuildXHttpRequestCandidate(
+// 下行 GET 只在建连胜出的候选上发起；构建失败即本次拨号结果，不换候选重建。
+net::awaitable<OutboundCandidateConnection> DialAndBuildXHttpDownlink(
     net::io_context& io_context,
     common::Context& ctx,
     const OutboundTransportTarget& target,
-    const OutboundDialCandidate& candidate,
-    std::string_view path,
-    XHttpClientRequestKind kind,
-    std::span<const net::const_buffer> packet_payload = {}) {
+    std::string_view path) {
 
-    auto tcp_result = co_await ConnectOutboundCandidate(io_context, candidate, target.timeout);
-    if (!tcp_result.Ok()) {
-        co_return tcp_result;
+    const auto candidates = target.Candidates();
+    auto connection = candidates.size() == 1
+        ? OutboundCandidateConnection{
+              .tcp = co_await ConnectOutboundCandidate(io_context, candidates.front(), target.timeout),
+              .candidate = &candidates.front()}
+        : co_await RaceOutboundCandidates(io_context, ctx, candidates, target.timeout);
+    if (!connection.tcp.Ok()) {
+        co_return OutboundCandidateConnection{.tcp = std::move(connection.tcp), .candidate = nullptr};
     }
 
-    tcp_result.stream->SetIdleTimeout(target.timeout);
-    (void)tcp_result.stream->StartPhaseDeadline(target.timeout);
+    auto& tcp = connection.tcp.stream;
+    tcp->SetIdleTimeout(target.timeout);
+    (void)tcp->StartPhaseDeadline(target.timeout);
 
     auto build_result = co_await BuildOutboundXHttpClientRequest(
-        std::move(tcp_result.stream),
+        std::move(tcp),
         *target.stream_settings,
         target.security_context,
         target.tls_server_name,
         target.HttpHost(),
         path,
-        kind,
-        packet_payload,
+        XHttpClientRequestKind::Downlink,
+        {},
         ctx.conn_id);
     if (!build_result) {
-        co_return DialResult::Fail(build_result.error());
+        co_return OutboundCandidateConnection{
+            .tcp = DialResult::Fail(build_result.error()), .candidate = nullptr};
     }
 
     auto stream = std::move(*build_result);
-    if (kind != XHttpClientRequestKind::PacketUp && !stream) {
-        co_return DialResult::Fail(
-            common::ErrorCode::SOCKET_EOF,
-            "xhttp client request returned no stream");
+    if (!stream) {
+        co_return OutboundCandidateConnection{
+            .tcp = DialResult::Fail(
+                common::ErrorCode::SOCKET_EOF,
+                "xhttp client request returned no stream"),
+            .candidate = nullptr};
     }
-    if (stream) {
-        stream->ClearPhaseDeadline();
-        stream->SetIdleTimeout(std::chrono::seconds(0));
-    }
-
-    co_return DialResult::Success(std::move(stream));
+    stream->ClearPhaseDeadline();
+    stream->SetIdleTimeout(std::chrono::seconds(0));
+    connection.tcp = DialResult::Success(std::move(stream));
+    co_return connection;
 }
 
 }  // namespace
@@ -780,38 +785,16 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
     std::string upload_path = BuildXHttpSplitPath(
         target.stream_settings->xhttp, session_id_text);
 
-    DialResult last_result =
-        DialResult::Fail(common::ErrorCode::DIAL_CONNECT_FAILED, "all xhttp candidates failed");
-    std::optional<OutboundDialCandidate> selected;
-    std::unique_ptr<AsyncStream> downlink;
-
-    for (const auto& candidate : downlink_target.Candidates()) {
-        auto attempt = co_await DialAndBuildXHttpRequestCandidate(
-            io_context,
-            ctx,
-            downlink_target,
-            candidate,
-            downlink_path,
-            XHttpClientRequestKind::Downlink);
-        if (attempt.Ok()) {
-            selected = candidate;
-            downlink = std::move(attempt.stream);
-            break;
-        }
-        LOG_CONN_DEBUG(ctx,
-                       "XHTTP downlink candidate failed endpoint={}:{} > {}",
-                       common::AddressText(candidate.endpoint.address()).View(),
-                       candidate.endpoint.port(),
-                       attempt.error_msg);
-        last_result = std::move(attempt);
+    auto downlink = co_await DialAndBuildXHttpDownlink(
+        io_context, ctx, downlink_target, downlink_path);
+    if (!downlink.tcp.Ok()) {
+        co_return std::move(downlink.tcp);
     }
 
-    if (!downlink || !selected) {
-        co_return last_result;
-    }
-
-    std::optional<OutboundDialCandidate> upload_candidate =
-        target.xhttp_download_target ? FirstDialCandidate(target) : selected;
+    // 上行与下行同一目标时沿用下行胜出的候选，避免每次上行重新撞上黑洞地址。
+    std::optional<OutboundDialCandidate> upload_candidate = target.xhttp_download_target
+        ? FirstDialCandidate(target)
+        : std::optional<OutboundDialCandidate>(*downlink.candidate);
     if (!upload_candidate) {
         co_return DialResult::Fail(
             common::ErrorCode::INVALID_ARGUMENT,
@@ -822,7 +805,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
         co_return DialResult::Success(
             std::make_unique<XHttpPacketUpClientStream>(
                 io_context,
-                std::move(downlink),
+                std::move(downlink.tcp.stream),
                 target,
                 *upload_candidate,
                 std::move(upload_path),
@@ -832,7 +815,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
     co_return DialResult::Success(
         std::make_unique<XHttpSplitClientStream>(
             io_context,
-            std::move(downlink),
+            std::move(downlink.tcp.stream),
             target,
             *upload_candidate,
             std::move(upload_path),
