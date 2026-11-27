@@ -32,6 +32,7 @@
 #include <format>
 #include <limits>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <span>
 #include <stdexcept>
@@ -481,6 +482,7 @@ private:
         }
     }
     void Run(std::stop_token stop) {
+        auto wait_retry = kMinimumWaitRetry;
         using Clock = AutoSignContextRenewal::Clock;
         while (!stop.stop_requested()) {
             std::unique_lock lock(mutex_);
@@ -500,7 +502,18 @@ private:
             }
             lock.unlock();
             if (!due) {
-                Wait(next);
+                // 等待描述符故障可能是暂时的（ENOMEM 等）：退避重试而不是永久停止续签，
+                // 否则证书过期后所有新握手失败。停机请求可立即打断退避。
+                try {
+                    Wait(next);
+                    wait_retry = kMinimumWaitRetry;
+                } catch (const std::exception& error) {
+                    LOG_ERROR("TLS auto-sign renewal wait failed; retrying in {}s > {}",
+                              wait_retry.count(), error.what());
+                    std::unique_lock retry_lock(mutex_);
+                    (void)retry_wake_.wait_for(retry_lock, stop, wait_retry, [] { return false; });
+                    wait_retry = std::min(wait_retry * 2, kMaximumWaitRetry);
+                }
                 continue;
             }
             bool renewed = false;
@@ -523,7 +536,10 @@ private:
         }
     }
     static constexpr size_t kCapacity = 4096;
+    static constexpr std::chrono::seconds kMinimumWaitRetry{1};
+    static constexpr std::chrono::seconds kMaximumWaitRetry{60};
     std::mutex mutex_;
+    std::condition_variable_any retry_wake_;
     int wake_ = -1;
     int timer_ = -1;
     bool failed_ = false;
