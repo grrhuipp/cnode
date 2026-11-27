@@ -27,15 +27,6 @@ namespace transport {
 
 namespace {
 
-[[nodiscard]] std::optional<OutboundDialCandidate> FirstDialCandidate(
-    const OutboundTransportTarget& target) {
-    const auto candidates = target.Candidates();
-    if (!candidates.empty()) {
-        return candidates.front();
-    }
-    return std::nullopt;
-}
-
 [[nodiscard]] std::string BuildXHttpSplitPath(
     const XHttpConfig& cfg,
     std::string_view session_id) {
@@ -116,7 +107,7 @@ protected:
     XHttpSplitOutboundStreamBase(net::io_context& io_context,
                                  std::unique_ptr<AsyncStream> downlink,
                                  const OutboundTransportTarget& target,
-                                 const OutboundDialCandidate& candidate,
+                                 std::span<const OutboundDialCandidate> upload_candidates,
                                  std::string upload_path,
                                  uint64_t conn_id,
                                  const char* missing_settings_error)
@@ -126,7 +117,7 @@ protected:
         , security_context_(target.security_context)
         , tls_server_name_(target.tls_server_name)
         , ws_host_(target.HttpHost())
-        , candidate_(candidate)
+        , candidate_(upload_candidates.front())
         , upload_path_(std::move(upload_path))
         , base_upload_path_size_(upload_path_.size())
         , timeout_(target.timeout)
@@ -135,6 +126,9 @@ protected:
             throw IoSystemError(io_error::broken_pipe, missing_settings_error);
         }
         upload_path_.reserve(base_upload_path_size_ + 21);
+        if (upload_candidates.size() > 1) {
+            upload_race_candidates_.assign(upload_candidates.begin(), upload_candidates.end());
+        }
     }
 
 public:
@@ -277,7 +271,9 @@ protected:
         XHttpClientRequestKind kind,
         std::span<const net::const_buffer> payloads) {
         const bool stream_up = kind == XHttpClientRequestKind::StreamUp;
-        auto tcp_result = co_await ConnectOutboundCandidate(io_context_, candidate_, timeout_);
+        auto tcp_result = upload_race_candidates_.empty()
+            ? co_await ConnectOutboundCandidate(io_context_, candidate_, timeout_)
+            : co_await RaceUploadCandidates();
         if (!tcp_result.Ok()) {
             if (tcp_result.error == common::ErrorCode::DIAL_TIMEOUT) {
                 upload_write_expired_ = true;
@@ -332,6 +328,19 @@ protected:
         co_return std::move(*build_result);
     }
 
+    // 独立上行目标的首个上行请求按 RFC 8305 竞速全部候选，胜者此后固定复用并
+    // 释放候选副本；失败时保留副本，下一请求重新竞速。上行请求由 upload_gate_
+    // 串行，竞速期间副本不变。
+    net::awaitable<DialResult> RaceUploadCandidates() {
+        auto raced = co_await RaceOutboundCandidates(
+            io_context_, conn_id_, upload_race_candidates_, timeout_);
+        if (raced.candidate) {
+            candidate_ = *raced.candidate;
+            std::vector<OutboundDialCandidate>{}.swap(upload_race_candidates_);
+        }
+        co_return std::move(raced.tcp);
+    }
+
     net::io_context& io_context_;
     std::unique_ptr<AsyncStream> downlink_;
     TcpStream* in_flight_upload_tcp_ = nullptr;
@@ -340,6 +349,8 @@ protected:
     std::string tls_server_name_;
     std::string ws_host_;
     OutboundDialCandidate candidate_;
+    // 尚未选定的上行候选（会话级，元素数即已解析地址数）；空表示 candidate_ 已定。
+    std::vector<OutboundDialCandidate> upload_race_candidates_;
     std::string upload_path_;
     size_t base_upload_path_size_ = 0;
     AsyncWriteGate upload_gate_;
@@ -367,14 +378,14 @@ public:
     XHttpSplitClientStream(net::io_context& io_context,
                            std::unique_ptr<AsyncStream> downlink,
                            const OutboundTransportTarget& target,
-                           const OutboundDialCandidate& candidate,
+                           std::span<const OutboundDialCandidate> upload_candidates,
                            std::string upload_path,
                            uint64_t conn_id)
         : XHttpSplitOutboundStreamBase(
               io_context,
               std::move(downlink),
               target,
-              candidate,
+              upload_candidates,
               std::move(upload_path),
               conn_id,
               "xhttp stream-up missing stream settings") {
@@ -596,14 +607,14 @@ public:
     XHttpPacketUpClientStream(net::io_context& io_context,
                               std::unique_ptr<AsyncStream> downlink,
                               const OutboundTransportTarget& target,
-                              const OutboundDialCandidate& candidate,
+                              std::span<const OutboundDialCandidate> upload_candidates,
                               std::string upload_path,
                               uint64_t conn_id)
         : XHttpSplitOutboundStreamBase(
               io_context,
               std::move(downlink),
               target,
-              candidate,
+              upload_candidates,
               std::move(upload_path),
               conn_id,
               "xhttp packet-up missing stream settings") {
@@ -705,7 +716,7 @@ net::awaitable<OutboundCandidateConnection> DialAndBuildXHttpDownlink(
         ? OutboundCandidateConnection{
               .tcp = co_await ConnectOutboundCandidate(io_context, candidates.front(), target.timeout),
               .candidate = &candidates.front()}
-        : co_await RaceOutboundCandidates(io_context, ctx, candidates, target.timeout);
+        : co_await RaceOutboundCandidates(io_context, ctx.conn_id, candidates, target.timeout);
     if (!connection.tcp.Ok()) {
         co_return OutboundCandidateConnection{.tcp = std::move(connection.tcp), .candidate = nullptr};
     }
@@ -791,11 +802,12 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
         co_return std::move(downlink.tcp);
     }
 
-    // 上行与下行同一目标时沿用下行胜出的候选，避免每次上行重新撞上黑洞地址。
-    std::optional<OutboundDialCandidate> upload_candidate = target.xhttp_download_target
-        ? FirstDialCandidate(target)
-        : std::optional<OutboundDialCandidate>(*downlink.candidate);
-    if (!upload_candidate) {
+    // 上行与下行同一目标时沿用下行胜出的候选；独立上行目标交给会话在首个
+    // 上行请求时竞速。
+    const auto upload_candidates = target.xhttp_download_target
+        ? target.Candidates()
+        : std::span<const OutboundDialCandidate>(downlink.candidate, 1);
+    if (upload_candidates.empty()) {
         co_return DialResult::Fail(
             common::ErrorCode::INVALID_ARGUMENT,
             "missing xhttp upload candidate");
@@ -807,7 +819,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
                 io_context,
                 std::move(downlink.tcp.stream),
                 target,
-                *upload_candidate,
+                upload_candidates,
                 std::move(upload_path),
                 ctx.conn_id));
     }
@@ -817,7 +829,7 @@ net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
             io_context,
             std::move(downlink.tcp.stream),
             target,
-            *upload_candidate,
+            upload_candidates,
             std::move(upload_path),
             ctx.conn_id));
 }

@@ -35,14 +35,14 @@ constexpr std::chrono::milliseconds kConnectionAttemptDelay{250};
 
 // RFC 8305 Happy Eyeballs v2 的 TCP 连接竞速，只存活在拨号协程帧上。
 // 所有尝试、尝试间隔与整体截止期都是同一任务组的子任务：任务组 join 后
-// 本对象才析构，借用的候选、ctx 与组指针均不越过 join。
+// 本对象才析构，借用的候选与组指针均不越过 join。
 struct CandidateRace {
     CandidateRace(net::io_context& io_context,
-                  common::Context& ctx,
+                  uint64_t conn_id,
                   std::span<const OutboundDialCandidate> candidates,
                   std::chrono::seconds timeout)
         : io_context(io_context),
-          ctx(ctx),
+          conn_id(conn_id),
           candidates(candidates),
           timeout(timeout),
           preferred_v6(candidates.front().endpoint.address().is_v6()),
@@ -69,7 +69,7 @@ struct CandidateRace {
     }
 
     net::io_context& io_context;
-    common::Context& ctx;
+    uint64_t conn_id;
     std::span<const OutboundDialCandidate> candidates;
     std::chrono::seconds timeout;
     bool preferred_v6;
@@ -110,7 +110,7 @@ net::awaitable<void> AttemptRaceCandidate(CandidateRace& race,
         race.Conclude(std::move(attempt));
         co_return;
     }
-    LOG_CONN_DEBUG(race.ctx,
+    LOG_CONN_DEBUG(race.conn_id,
                    "dial candidate failed endpoint={}:{} > {}",
                    common::AddressText(candidate.endpoint.address()).View(),
                    candidate.endpoint.port(),
@@ -159,7 +159,7 @@ net::awaitable<DialResult> DialAndBuildTransport(
 
     DialResult tcp_result = candidates.size() == 1
         ? co_await ConnectOutboundCandidate(io_context, candidates.front(), target.timeout)
-        : (co_await RaceOutboundCandidates(io_context, ctx, candidates, target.timeout)).tcp;
+        : (co_await RaceOutboundCandidates(io_context, ctx.conn_id, candidates, target.timeout)).tcp;
     if (!tcp_result.Ok()) {
         co_return tcp_result;
     }
@@ -445,10 +445,10 @@ net::awaitable<DialResult> ConnectOutboundCandidate(
 // 与 Xray 先竞速 TCP、再在所得连接上叠加安全层/传输层一致。
 net::awaitable<OutboundCandidateConnection> RaceOutboundCandidates(
     net::io_context& io_context,
-    common::Context& ctx,
+    uint64_t conn_id,
     std::span<const OutboundDialCandidate> candidates,
     std::chrono::seconds timeout) {
-    CandidateRace race(io_context, ctx, candidates, timeout);
+    CandidateRace race(io_context, conn_id, candidates, timeout);
     co_await common::RunAwaitableTaskGroup(
         net::any_io_executor(io_context.get_executor()),
         [&race](common::AwaitableTaskGroup& group) {

@@ -34,16 +34,18 @@ struct OutboundCandidateConnection {
 // 对至少两个已解析候选按 RFC 8305 Happy Eyeballs 竞速建立裸 TCP 连接
 // （transport_dialer.cpp 实现）：从首个候选的地址族起交替两族，每 250 ms 或
 // 前一尝试失败时发起下一尝试，整场竞速受同一个 timeout 约束；首个建连成功者
-// 胜出，其余尝试取消并收束后才返回。普通拨号与 XHTTP 下行共用这一步。
+// 胜出，其余尝试取消并收束后才返回。普通拨号、XHTTP 下行与独立上行目标共用
+// 这一步；conn_id 只用于逐候选失败的诊断日志。
 [[nodiscard]] net::awaitable<OutboundCandidateConnection> RaceOutboundCandidates(
     net::io_context& io_context,
-    common::Context& ctx,
+    uint64_t conn_id,
     std::span<const OutboundDialCandidate> candidates,
     std::chrono::seconds timeout);
 
-// 下行按候选竞速建连后返回组合流，上行请求在写入时才拨号，且与下行共用
-// 同一目标时沿用下行胜出的候选；|target| 的 XHTTP 模式必须解析为 PacketUp
-// 或 StreamUp，否则返回失败。
+// 下行按候选竞速建连后返回组合流，上行请求在写入时才拨号：与下行同一目标时
+// 沿用下行胜出的候选；downloadSettings 指定独立下行时，首个上行请求竞速上行
+// 目标的候选，胜者此后在本会话内复用。|target| 的 XHTTP 模式必须解析为
+// PacketUp 或 StreamUp，否则返回失败。
 [[nodiscard]] net::awaitable<DialResult> DialXHttpSplitOutboundTransport(
     net::io_context& io_context,
     common::Context& ctx,

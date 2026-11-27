@@ -227,11 +227,19 @@ TEST(DialHappyEyeballs, AllBlackholedFamiliesFailWithinOneDialTimeout) {
             {"xhttpSettings", {{"path", "/race"}, {"mode", mode}}}};
 }
 
+struct XHttpCase {
+    std::string name;
+    std::string mode;
+    // Downlink on its own downloadSettings server (literal 127.0.0.1), so
+    // only the upload requests resolve race.test.
+    bool separate_download = false;
+};
+
 // One node is both ends: `entry` forwards through a VLESS XHTTP outbound to
 // race.test, whose first A record is black-holed and whose second is the
 // node's own XHTTP inbound, which leaves through freedom.
 [[nodiscard]] std::unique_ptr<Child> StartXHttpNode(const TempDir& root, uint16_t entry, uint16_t xhttp,
-                                                    uint16_t dns_port, std::string_view mode) {
+                                                    uint16_t dns_port, const XHttpCase& item) {
     Json config = {{"workers", 1}, {"log", {{"logDir", (root.Path() / "logs").string()}}},
         {"dns", {{"servers", Json::array({"127.0.0.1:" + std::to_string(dns_port)})}, {"timeout", 5}}},
         {"timeouts", {{"dial", 10}}}};
@@ -241,12 +249,19 @@ TEST(DialHappyEyeballs, AllBlackholedFamiliesFailWithinOneDialTimeout) {
         {{"tag", "entry"}, {"protocol", "vless"}, {"listen", "127.0.0.1"}, {"port", entry},
          {"outboundTag", "via-xhttp"}, {"settings", {{"clients", clients}}}},
         {{"tag", "xhttp-in"}, {"protocol", "vless"}, {"listen", "127.0.0.1"}, {"port", xhttp},
-         {"outboundTag", "direct"}, {"settings", {{"clients", clients}}}, {"streamSettings", XHttpStream(mode)}}}));
+         {"outboundTag", "direct"}, {"settings", {{"clients", clients}}}, {"streamSettings", XHttpStream(item.mode)}}}));
+    Json stream = XHttpStream(item.mode);
+    if (item.separate_download) {
+        Json download = XHttpStream(item.mode);
+        download["address"] = "127.0.0.1";
+        download["port"] = xhttp;
+        stream["xhttpSettings"]["downloadSettings"] = download;
+    }
     WriteJson(root.Path(), "outbounds.json", Json::array({
         {{"tag", "via-xhttp"}, {"protocol", "vless"},
          {"settings", {{"vnext", Json::array({{{"address", "race.test"}, {"port", xhttp},
              {"users", Json::array({{{"id", UserId}, {"encryption", "none"}}})}}})}}},
-         {"streamSettings", XHttpStream(mode)}},
+         {"streamSettings", stream}},
         {{"tag", "direct"}, {"protocol", "freedom"}, {"settings", Json::object()}}}));
     auto child = std::make_unique<Child>(
         std::vector<std::string>{Binary().string(), "--config-dir", root.Path().string()},
@@ -255,9 +270,10 @@ TEST(DialHappyEyeballs, AllBlackholedFamiliesFailWithinOneDialTimeout) {
     return child;
 }
 
-class XHttpSplitDial : public testing::TestWithParam<std::string> {};
+class XHttpSplitDial : public testing::TestWithParam<XHttpCase> {};
 
-TEST_P(XHttpSplitDial, DownlinkRacesPastBlackholedAddressAndUploadsFollowWinner) {
+TEST_P(XHttpSplitDial, RacesPastBlackholedAddressAndReusesWinner) {
+    constexpr int Rounds = 6;
     TempDir root;
     PortReservation entry, xhttp;
     auto blackhole = MakeBlackhole("127.0.0.2", xhttp.port);
@@ -266,35 +282,40 @@ TEST_P(XHttpSplitDial, DownlinkRacesPastBlackholedAddressAndUploadsFollowWinner)
     auto target = Socket::Listen();
     auto child = StartXHttpNode(root, entry.port, xhttp.port, dns.Port(), GetParam());
 
-    const std::string second(Payload.rbegin(), Payload.rend());
     PeerThread echo([&] {
         auto connection = target.Accept(12s);
-        for (const auto& expected : {std::string(Payload), second}) {
-            auto data = connection.ReadExact(expected.size(), 12s);
-            Require(data == expected, "outbound TCP bytes changed");
+        for (int round = 0; round <= Rounds; ++round) {
+            auto data = connection.ReadExact(Payload.size(), 12s);
+            Require(data == Payload, "outbound TCP bytes changed");
             connection.Write(data);
         }
     });
     auto client = Socket::Connect(entry.port);
-    const auto start = Clock::now();
+    auto start = Clock::now();
     client.Write(VlessRequest(target.Port(), Payload));
     EXPECT_EQ(client.ReadExact(2 + Payload.size(), 12s), std::string(2, '\0') + std::string(Payload));
-    // The downlink starts on 127.0.0.1 250 ms after the stalled attempt
-    // instead of after the whole 10 s dial timeout; every upload request
-    // reuses that winner rather than the black-holed first record.
+    // The first connect to race.test moves on to 127.0.0.1 250 ms after the
+    // stalled attempt instead of after the whole 10 s dial timeout.
     EXPECT_LT(Clock::now() - start, 3s);
-    client.Write(second);
-    EXPECT_EQ(client.ReadExact(second.size(), 12s), second);
-    EXPECT_LT(Clock::now() - start, 4s);
+    // Later upload requests reuse that winner: re-racing would cost the
+    // 250 ms attempt delay per packet-up request, the black hole 10 s.
+    start = Clock::now();
+    for (int round = 0; round < Rounds; ++round) {
+        client.Write(Payload);
+        EXPECT_EQ(client.ReadExact(Payload.size(), 12s), Payload);
+    }
+    EXPECT_LT(Clock::now() - start, 1200ms);
     echo.Join();
     EXPECT_TRUE(child->Running());
     child->Stop();
 }
 
-INSTANTIATE_TEST_SUITE_P(Modes, XHttpSplitDial, testing::Values("packet-up", "stream-up"),
-    [](const testing::TestParamInfo<std::string>& info) {
-        return info.param == "packet-up" ? std::string("PacketUp") : std::string("StreamUp");
-    });
+INSTANTIATE_TEST_SUITE_P(Modes, XHttpSplitDial, testing::Values(
+    XHttpCase{"PacketUp", "packet-up"},
+    XHttpCase{"StreamUp", "stream-up"},
+    XHttpCase{"PacketUpSeparateDownload", "packet-up", true},
+    XHttpCase{"StreamUpSeparateDownload", "stream-up", true}),
+    [](const testing::TestParamInfo<XHttpCase>& info) { return info.param.name; });
 
 }  // namespace
 }  // namespace cnode::e2e::udp
