@@ -130,10 +130,9 @@ public:
 
     // ── 数据收集（在所属 Worker 线程执行，无竞争）──
 
-    // Snapshot on this Worker; acknowledge only after off-thread durable storage.
-    [[nodiscard]] app::UserTrafficCounters SnapshotTraffic(std::string_view tag);
-    void CommitTraffic(std::string_view tag, const app::UserTrafficCounters& snapshot);
-    void RollbackTraffic(std::string_view tag, const app::UserTrafficCounters& snapshot);
+    // Moves the pending deltas out of this Worker; the caller owns them whether
+    // or not the panel accepts the report.
+    [[nodiscard]] app::UserTrafficCounters TakeTraffic(std::string_view tag);
 
     // 协议类型由 inbound handler 的 ReceiverSettings 自动判断，无需外部传入。
     [[nodiscard]] std::vector<OnlineDevice> GetOnlineDevices(std::string_view tag) const;

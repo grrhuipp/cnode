@@ -689,7 +689,7 @@ APIClient::ReportUserTraffic(const std::vector<UserTraffic>& data) {
     auto resp = co_await HttpRequest(
         HttpMethod::Post, std::move(path), std::move(body_json), {});
     if (resp.status != 200) {
-        LOG_PANEL_WARN(log_context_, "Traffic API acceptance unknown: {}", FormatReportFailure(resp, config_.Key));
+        LOG_PANEL_WARN(log_context_, "Traffic report failed: {}", FormatReportFailure(resp, config_.Key));
         co_return false;
     }
 

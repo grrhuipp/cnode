@@ -75,8 +75,6 @@ struct PanelConfig {
     std::chrono::seconds RequestTimeout{common::kPanelRequestTimeout};
     PanelNodeIds NodeIDs;
     std::string NodeType = std::string(common::kDefaultNodeProtocol);
-    // Local durable accounting state; resolved relative to the loaded config directory.
-    std::filesystem::path TrafficJournalDir = "traffic-journal";
     transport::InboundListen ListenIP;
     transport::OutboundBind SendIP = transport::OutboundBind::Auto();
     bool EnableDNS = true;

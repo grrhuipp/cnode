@@ -1696,17 +1696,6 @@ std::optional<Config> LoadConfig(const std::filesystem::path& path) {
 
     Config& cfg = *cfg_opt;
     cfg.config_dir = config_dir;
-    if (!cfg.panels.empty()) {
-        const auto journal_dir = std::filesystem::absolute(config_dir / "traffic-journal", ec);
-        if (ec) {
-            Log::WriteConsole(LogLevel::ERROR, std::format(
-                "Traffic journal path resolution failed: reason={}", ec.message()));
-            return std::nullopt;
-        }
-        for (auto& panel : cfg.panels) {
-            panel.TrafficJournalDir = journal_dir;
-        }
-    }
 
     if (cfg.dns.servers.empty()) {
         auto system_servers = LoadSystemDnsServers();

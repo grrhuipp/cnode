@@ -310,9 +310,8 @@ struct PanelNode {
         child = std::make_unique<Child>(
             std::vector<std::string>{Binary().string(), "--config-dir", directory.Path().string()},
             directory.Path() / "child.log");
-        // Bootstrap makes the traffic journal directory durable before the runtime starts; those fsyncs are
-        // served by the host filesystem and can take many seconds under concurrent writeback. The ready
-        // marker ends that phase, so only the panel exchange after it keeps a tight bound.
+        // Boot can take seconds on a loaded host. The ready marker ends that
+        // phase, so only the panel exchange after it keeps a tight bound.
         child->WaitForLog("server started", 60s);
         Until(
             [&] {

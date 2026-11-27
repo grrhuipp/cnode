@@ -51,8 +51,9 @@ public:
     // Main-executor only. Stop is terminal; join waits every started loop.
     void RequestStop() noexcept;
     net::awaitable<void> AsyncJoin();
-    // After AsyncJoin and session drain, while Worker control queues remain open.
-    // Persists final deltas for next startup; throws on any durability failure.
+    // After AsyncJoin and session drain, while Worker control queues and DNS
+    // remain open. Reports final deltas once; a failed report drops them.
+    // Throws only when a Worker collection fails.
     net::awaitable<void> FlushTraffic();
 
     struct NodeStatsInfo {

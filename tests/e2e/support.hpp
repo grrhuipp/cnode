@@ -28,11 +28,10 @@ namespace cnode::e2e {
 using Json = nlohmann::json;
 using namespace std::chrono_literals;
 using Milliseconds = std::chrono::milliseconds;
-// A panel-configured cnode syncs its traffic journal directories while it
-// boots and its final record while it stops. On a busy disk one fsync can
-// take many seconds, and a process inside it reacts to no signal, SIGKILL
-// included. Bounds that span such a phase use this value; a child that exits
-// in the meantime is still reported at once.
+// A panel-configured cnode makes its final traffic report while it stops,
+// bounded by the panel request timeout (30 s by default), and a loaded host
+// can stall boot for seconds. Bounds that span such a phase use this value; a
+// child that exits in the meantime is still reported at once.
 inline constexpr Milliseconds StorageStallBound = 60s;
 
 std::filesystem::path Binary();

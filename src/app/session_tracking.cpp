@@ -3,7 +3,7 @@
 #include "common/allocator.hpp"
 #include "common/session.hpp"
 
-#include <stdexcept>
+#include <iterator>
 
 namespace app {
 
@@ -67,12 +67,14 @@ void SessionTrackingState::UnregisterActiveSession(ActiveSession& node) noexcept
     node = {};
 }
 
-UserTrafficCounters SessionTrackingState::SnapshotTraffic(std::string_view accounting_key) {
+UserTrafficCounters SessionTrackingState::TakeTraffic(std::string_view accounting_key) {
     UserTrafficCounters result;
     const auto entry = accounts_.find(accounting_key);
     if (entry == accounts_.end()) return result;
 
     AccountBucket& bucket = entry->second;
+    // Folding only moves live bytes into the ledger, so a failed copy below
+    // leaves every byte still pending.
     for (auto* node = bucket.active_head; node; node = node->next) {
         const auto up = node->traffic->bytes_up - node->last_reported_up;
         const auto down = node->traffic->bytes_down - node->last_reported_down;
@@ -83,49 +85,14 @@ UserTrafficCounters SessionTrackingState::SnapshotTraffic(std::string_view accou
     }
 
     result.users.reserve(bucket.traffic.size());
-    for (auto& [user_id, account] : bucket.traffic) {
+    for (const auto& [user_id, account] : bucket.traffic) {
         if (account.completed.upload || account.completed.download) {
             result.users.emplace(user_id, account.completed);
-            account.snapshotted = account.completed;
         }
     }
-    return result;
-}
-
-void SessionTrackingState::CommitTraffic(
-    std::string_view accounting_key, const UserTrafficCounters& snapshot) {
-    if (snapshot.empty()) return;
-    const auto entry = accounts_.find(accounting_key);
-    if (entry == accounts_.end()) {
-        throw std::logic_error("traffic snapshot account disappeared before commit");
-    }
-    auto& bucket = entry->second;
-    struct MatchedCommit {
-        decltype(bucket.traffic.begin()) it;
-        std::decay_t<decltype(snapshot.users.begin()->second)> value;
-    };
-    std::vector<MatchedCommit> matched;
-    matched.reserve(snapshot.users.size());
-    for (const auto& [uid, value] : snapshot) {
-        const auto it = bucket.traffic.find(uid);
-        if (it == bucket.traffic.end() ||
-            it->second.completed.upload < value.upload ||
-            it->second.completed.download < value.download ||
-            it->second.snapshotted.upload < value.upload ||
-            it->second.snapshotted.download < value.download) {
-            throw std::logic_error("traffic snapshot exceeds in-flight counters");
-        }
-        matched.push_back(MatchedCommit{it, value});
-    }
-    for (const auto& [it, value] : matched) {
-        it->second.completed.upload -= value.upload;
-        it->second.completed.download -= value.download;
-        it->second.snapshotted.upload -= value.upload;
-        it->second.snapshotted.download -= value.download;
-        if (it->second.active == 0 && it->second.completed.upload == 0 &&
-            it->second.completed.download == 0) {
-            bucket.traffic.erase(it);
-        }
+    for (auto it = bucket.traffic.begin(); it != bucket.traffic.end();) {
+        it->second.completed = {};
+        it = it->second.active == 0 ? bucket.traffic.erase(it) : std::next(it);
     }
     if (bucket.traffic.empty()) {
         accounts_.erase(entry);
@@ -133,35 +100,7 @@ void SessionTrackingState::CommitTraffic(
     } else {
         common::MaybeShrinkHashContainer(bucket.traffic);
     }
-}
-
-void SessionTrackingState::RollbackTraffic(
-    std::string_view accounting_key, const UserTrafficCounters& snapshot) {
-    if (snapshot.empty()) return;
-    const auto entry = accounts_.find(accounting_key);
-    if (entry == accounts_.end()) {
-        throw std::logic_error("traffic snapshot account disappeared before rollback");
-    }
-    auto& bucket = entry->second;
-    struct MatchedRollback {
-        Account* account;
-        std::decay_t<decltype(snapshot.users.begin()->second)> value;
-    };
-    std::vector<MatchedRollback> matched;
-    matched.reserve(snapshot.users.size());
-    for (const auto& [uid, value] : snapshot) {
-        const auto it = bucket.traffic.find(uid);
-        if (it == bucket.traffic.end() ||
-            it->second.snapshotted.upload < value.upload ||
-            it->second.snapshotted.download < value.download) {
-            throw std::logic_error("traffic rollback exceeds in-flight counters");
-        }
-        matched.push_back(MatchedRollback{&it->second, value});
-    }
-    for (const auto& [account, value] : matched) {
-        account->snapshotted.upload -= value.upload;
-        account->snapshotted.download -= value.download;
-    }
+    return result;
 }
 
 }  // namespace app

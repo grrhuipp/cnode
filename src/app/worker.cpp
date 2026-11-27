@@ -1049,21 +1049,9 @@ void Worker::UpdateRule(
 // 数据收集（在 Worker 线程执行）
 // ============================================================================
 
-app::UserTrafficCounters Worker::SnapshotTraffic(std::string_view tag) {
+app::UserTrafficCounters Worker::TakeTraffic(std::string_view tag) {
     if (!runtime_ || !runtime_->session_tracking) return app::UserTrafficCounters{};
-    return runtime_->session_tracking->SnapshotTraffic(tag);
-}
-
-void Worker::CommitTraffic(
-    std::string_view tag, const app::UserTrafficCounters& snapshot) {
-    if (!runtime_ || !runtime_->session_tracking) return;
-    runtime_->session_tracking->CommitTraffic(tag, snapshot);
-}
-
-void Worker::RollbackTraffic(
-    std::string_view tag, const app::UserTrafficCounters& snapshot) {
-    if (!runtime_ || !runtime_->session_tracking) return;
-    runtime_->session_tracking->RollbackTraffic(tag, snapshot);
+    return runtime_->session_tracking->TakeTraffic(tag);
 }
 
 std::vector<OnlineDevice> Worker::GetOnlineDevices(std::string_view tag) const {

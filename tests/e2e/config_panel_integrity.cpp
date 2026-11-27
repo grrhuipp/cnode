@@ -51,16 +51,7 @@ private:
         if (data.empty() || mode == "ok") Reply(socket, 200, R"({"data":true})");
         else if (mode == "non2xx") Reply(socket, 503, R"({"message":"partial application is possible"})");
         else if (mode == "truncated") socket.Write("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{");
-        else if (mode == "kill") HoldUntilPeerCloses(socket);
         // lost: accept the full request and close without any response.
-    }
-    // kill：不回应，把请求挂到 cnode 被 SIGKILL、内核关闭连接为止。
-    static void HoldUntilPeerCloses(Socket& socket) {
-        try {
-            Require(socket.Read(1, 20s).empty(), "panel push sent bytes after its request");
-        } catch (const std::system_error& error) {
-            if (error.code() != std::errc::connection_reset) throw;
-        }
     }
     uint16_t node_;
     std::mutex mutex_;
@@ -70,20 +61,6 @@ private:
     std::vector<std::pair<std::string, std::string>> gets_;
     LoopServer server_;
 };
-std::vector<std::filesystem::path> Records(const std::filesystem::path& root, std::string_view state) {
-    std::vector<std::filesystem::path> result;
-    const auto journal = root / "traffic-journal";
-    if (!std::filesystem::exists(journal)) return result;
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(journal))
-        if (entry.is_regular_file() && entry.path().extension() == "." + std::string(state)) result.push_back(entry.path());
-    std::sort(result.begin(), result.end());
-    return result;
-}
-auto SnapshotUnknown(const std::filesystem::path& root) {
-    std::vector<std::pair<std::string, std::string>> result;
-    for (const auto& path : Records(root, "unknown")) result.emplace_back(path.filename().string(), ReadFile(path));
-    return result;
-}
 void WaitEcho(Child& child, uint16_t node, uint16_t echo, std::string_view host = "127.0.0.1",
               std::string_view inbound_address = "127.0.0.1") {
     Until([&] {
@@ -96,7 +73,7 @@ void WaitEcho(Child& child, uint16_t node, uint16_t echo, std::string_view host 
     }, 12s);
 }
 class AccountingFault : public testing::TestWithParam<std::string> {};
-TEST_P(AccountingFault, QuarantinesAmbiguousRequestsAcrossRestartUntilExplicitReconciliation) {
+TEST_P(AccountingFault, DropsFailedPushWithoutRetryOrLocalState) {
     const auto mode = GetParam();
     TempDir directory;
     auto reservation = ReserveRuntimePort();
@@ -114,63 +91,21 @@ TEST_P(AccountingFault, QuarantinesAmbiguousRequestsAcrossRestartUntilExplicitRe
     child->WaitForServerStart();
     WaitEcho(*child, node, echo.Port(), "127.0.0.1", reservation.address);
     Until([&] { return panel.Posts(true) != 0; }, 12s);
-    Until([&] { return !Records(directory.Path(), "unknown").empty(); }, 12s);
-    if (mode == "kill") { child->Signal(SIGKILL); EXPECT_NE(child->Wait(), 0); }
-    else {
-        const auto count = panel.Posts(true);
-        panel.EmptyCycles(*child);
-        EXPECT_EQ(panel.Posts(true), count) << "ambiguous additive request was retried";
-        EXPECT_EQ(child->Stop(), 0);
-    }
-    const auto unknown = SnapshotUnknown(directory.Path());
-    ASSERT_FALSE(unknown.empty());
-    for (const auto& path : Records(directory.Path(), "unknown")) {
-        EXPECT_EQ(std::filesystem::status(path).permissions() & std::filesystem::perms::mask,
-                  std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
-        EXPECT_EQ(std::filesystem::status(path.parent_path()).permissions() & std::filesystem::perms::mask,
-                  std::filesystem::perms::owner_all);
-        EXPECT_EQ(ReadFile(path).find("fixture-secret"), std::string::npos);
-    }
+    child->WaitForLog("Traffic dropped");
+    // The panel recovers: the failed additive push must still never be resent.
     panel.Mode("ok");
-    auto count = panel.Posts(true);
-    child = Start(directory.Path());
-    child->WaitForServerStart();
+    const auto count = panel.Posts(true);
     panel.EmptyCycles(*child);
-    EXPECT_EQ(panel.Posts(true), count) << "restart retransmitted unknown traffic";
-    EXPECT_EQ(SnapshotUnknown(directory.Path()), unknown);
+    EXPECT_EQ(panel.Posts(true), count) << "failed additive push was retried";
     EXPECT_EQ(child->Stop(), 0);
-    const auto path = Records(directory.Path(), "unknown").front();
-    {
-        Child list({CNODE_TEST_JOURNAL_BINARY, path.parent_path().string(), "list"}, directory.Path() / "journal-list.log");
-        EXPECT_EQ(list.Wait(), 0);
-    }
-    const auto decision = mode == "non2xx" ? "confirmed-not-applied" : "confirmed-applied";
-    {
-        Child resolve({CNODE_TEST_JOURNAL_BINARY, path.parent_path().string(), "resolve", path.filename().string(),
-            "--decision", decision, "--evidence", "fixture operator ledger check"}, directory.Path() / "journal-resolve.log");
-        EXPECT_EQ(resolve.Wait(), 0) << ReadFile(resolve.LogPath());
-    }
-    EXPECT_FALSE(std::filesystem::exists(path));
-    if (mode == "non2xx") {
-        auto ready = path;
-        ready.replace_extension(".ready");
-        EXPECT_TRUE(std::filesystem::exists(ready));
-        count = panel.Posts(true);
-        child = Start(directory.Path());
-        child->WaitForServerStart();
-        Until([&] { return panel.Posts(true) >= count + 1; }, 12s);
-        panel.EmptyCycles(*child);
-        EXPECT_EQ(panel.Posts(true), count + 1) << "explicit replay was repeated";
-        EXPECT_FALSE(std::filesystem::exists(ready));
-        EXPECT_FALSE(std::filesystem::exists(path));
-        EXPECT_EQ(child->Stop(), 0);
-    }
+    EXPECT_EQ(panel.Posts(true), count) << "shutdown resent dropped traffic";
+    EXPECT_FALSE(std::filesystem::exists(directory.Path() / "traffic-journal"));
     panel.Join();
     echo.Join();
 }
-INSTANTIATE_TEST_SUITE_P(HttpAmbiguity, AccountingFault, testing::Values("non2xx", "truncated", "lost", "kill"));
+INSTANTIATE_TEST_SUITE_P(HttpFailure, AccountingFault, testing::Values("non2xx", "truncated", "lost"));
 
-TEST(PanelIntegrity, GracefulShutdownPersistsUnsampledCountersAndReplaysExactlyOnce) {
+TEST(PanelIntegrity, GracefulShutdownReportsUnsampledCountersOnce) {
     TempDir directory;
     auto reservation = ReserveRuntimePort();
     const auto node = reservation.tcp.Port();
@@ -186,17 +121,15 @@ TEST(PanelIntegrity, GracefulShutdownPersistsUnsampledCountersAndReplaysExactlyO
     auto child = Start(directory.Path());
     child->WaitForServerStart();
     WaitEcho(*child, node, echo.Port(), "127.0.0.1", reservation.address);
-    EXPECT_EQ(child->Stop(), 0);
-    EXPECT_FALSE(Records(directory.Path(), "ready").empty());
     EXPECT_EQ(panel.Posts(true), 0u);
+    EXPECT_EQ(child->Stop(), 0);
+    EXPECT_EQ(panel.Posts(true), 1u) << "graceful shutdown must report the final deltas";
+    EXPECT_FALSE(std::filesystem::exists(directory.Path() / "traffic-journal"));
     panel.PushInterval(1);
     child = Start(directory.Path());
     child->WaitForServerStart();
-    Until([&] { return panel.Posts(true) != 0; }, 12s);
-    Until([&] { return Records(directory.Path(), "ready").empty() && Records(directory.Path(), "unknown").empty(); }, 12s);
-    const auto count = panel.Posts(true);
     panel.EmptyCycles(*child);
-    EXPECT_EQ(panel.Posts(true), count);
+    EXPECT_EQ(panel.Posts(true), 1u) << "restart resent reported traffic";
     EXPECT_EQ(child->Stop(), 0);
     panel.Join();
     echo.Join();

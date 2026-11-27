@@ -360,8 +360,7 @@ void ExerciseDispatch(Case which, bool controlled, common::ErrorCode reason = co
         EXPECT_EQ(outbound.target_state.written, 7u);
         if (controlled) EXPECT_TRUE(source_state.closed);
     }
-    const auto traffic = session_tracking.SnapshotTraffic(ctx.inbound.accounting_key);
-    session_tracking.CommitTraffic(ctx.inbound.accounting_key, traffic);
+    const auto traffic = session_tracking.TakeTraffic(ctx.inbound.accounting_key);
     if (which == Case::RelaySuccess) {
         const auto user = traffic.users.find(42);
         EXPECT_NE(user, traffic.users.end());
@@ -373,7 +372,7 @@ void ExerciseDispatch(Case which, bool controlled, common::ErrorCode reason = co
     // Completed requests must no longer contribute live traffic to reporting.
     ++ctx.traffic.bytes_up;
     ++ctx.traffic.bytes_down;
-    EXPECT_TRUE(session_tracking.SnapshotTraffic(ctx.inbound.accounting_key).empty());
+    EXPECT_TRUE(session_tracking.TakeTraffic(ctx.inbound.accounting_key).empty());
     if (!controlled && done) {
         // Borrowed logical inputs may outlive Dispatcher and notify again.
         // No callback may retain its completed task group or stack context.
@@ -472,7 +471,7 @@ void ExpectTraffic(const app::UserTrafficCounters& traffic, int64_t user_id,
     EXPECT_EQ(user->second.download, download);
 }
 
-TEST(DispatcherAccounting, CompletionPreservesUncommittedTrafficWithoutAllocating) {
+TEST(DispatcherAccounting, TakeLeavesLaterTrafficAndCompletionDoesNotAllocate) {
     struct Restore {
         bool previous = common::reject_next_process_allocation;
         size_t rejections = common::rejected_process_allocations;
@@ -493,11 +492,7 @@ TEST(DispatcherAccounting, CompletionPreservesUncommittedTrafficWithoutAllocatin
     new_traffic.bytes_up = 13;
     new_traffic.bytes_down = 17;
     static_traffic.bytes_up = 1000;
-    auto first = tracking.SnapshotTraffic(key);
-    ExpectTraffic(first, 42, 20, 28);
-    // Failed persistence leaves the same delta visible; sampling is not reset.
-    const auto uncommitted = tracking.SnapshotTraffic(key);
-    ExpectTraffic(uncommitted, 42, 20, 28);
+    ExpectTraffic(tracking.TakeTraffic(key), 42, 20, 28);
     old_traffic.bytes_up += 19;
     new_traffic.bytes_down += 23;
     const auto rejections = common::rejected_process_allocations;
@@ -510,14 +505,10 @@ TEST(DispatcherAccounting, CompletionPreservesUncommittedTrafficWithoutAllocatin
     common::reject_next_process_allocation = false;
     EXPECT_TRUE(allocation_still_pending);
     EXPECT_EQ(rejections_after_teardown, rejections);
-    // Completion during off-thread persistence must survive committing the
-    // older snapshot. This also exercises account address stability on close.
-    tracking.CommitTraffic(key, first);
-    const auto remaining = tracking.SnapshotTraffic(key);
-    tracking.CommitTraffic(key, remaining);
-    ExpectTraffic(remaining, 42, 19, 23);
-    EXPECT_TRUE(tracking.SnapshotTraffic(key).empty());
-    EXPECT_TRUE(tracking.SnapshotTraffic({}).empty());
+    // Sessions closing after a take hand only their later bytes to the next one.
+    ExpectTraffic(tracking.TakeTraffic(key), 42, 19, 23);
+    EXPECT_TRUE(tracking.TakeTraffic(key).empty());
+    EXPECT_TRUE(tracking.TakeTraffic({}).empty());
 }
 
 TEST(DispatcherAccounting, ReusedSessionStartsWithFreshTraffic) {
@@ -529,37 +520,13 @@ TEST(DispatcherAccounting, ReusedSessionStartsWithFreshTraffic) {
     traffic.bytes_up = 7;
     traffic.bytes_down = 11;
     tracking.UnregisterActiveSession(active);
-    const auto first = tracking.SnapshotTraffic(key);
-    tracking.CommitTraffic(key, first);
+    ExpectTraffic(tracking.TakeTraffic(key), 42, 7, 11);
     tracking.RegisterActiveSession(active, key, 42, traffic);
     traffic.bytes_up = 3;
     traffic.bytes_down = 5;
     tracking.UnregisterActiveSession(active);
-    const auto reused = tracking.SnapshotTraffic(key);
-    tracking.CommitTraffic(key, reused);
-    ExpectTraffic(reused, 42, 3, 5);
-    EXPECT_TRUE(tracking.SnapshotTraffic(key).empty());
-}
-
-TEST(DispatcherAccounting, RollbackRestoresTrafficFromRetiredSession) {
-    constexpr std::string_view key = "panel/same-node/9/";
-    // A closed session folds its remaining delta into the Worker ledger while
-    // an earlier snapshot is in flight; rollback restores the full total.
-    app::SessionTrackingState aggregate;
-    app::SessionTrackingState::ActiveSession retired_session;
-    common::Traffic retired_traffic;
-    aggregate.RegisterActiveSession(retired_session, key, 77, retired_traffic);
-    retired_traffic.bytes_up = 29;
-    retired_traffic.bytes_down = 31;
-    const auto in_flight = aggregate.SnapshotTraffic(key);
-    retired_traffic.bytes_up += 37;
-    retired_traffic.bytes_down += 41;
-    aggregate.UnregisterActiveSession(retired_session);
-    aggregate.RollbackTraffic(key, in_flight);
-    const auto consolidated = aggregate.SnapshotTraffic(key);
-    ExpectTraffic(consolidated, 77, 66, 72);
-    aggregate.CommitTraffic(key, consolidated);
-    EXPECT_TRUE(aggregate.SnapshotTraffic(key).empty());
+    ExpectTraffic(tracking.TakeTraffic(key), 42, 3, 5);
+    EXPECT_TRUE(tracking.TakeTraffic(key).empty());
 }
 
 class DispatcherStopReason

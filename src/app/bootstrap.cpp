@@ -602,7 +602,6 @@ public:
         env.controller->RequestStop();
         for (const auto& loop : monitor_loops) loop->RequestStop();
         for (size_t i = 0; i < started_threads; ++i) env.worker_pool.workers[i]->RequestDrain();
-        env.dns_worker->RequestStop();
         stop_event.cancel();
         IoErrorCode ignored;
         if (signals) signals->cancel(ignored);
@@ -839,8 +838,8 @@ public:
             IoErrorCode ec;
             co_await stop_event.async_wait(net::redirect_error(net::use_awaitable, ec));
         }
-        // Drain data tasks first, retaining bounded control admission for the
-        // final durable accounting snapshot. Every owner still joins on failure.
+        // Drain data tasks first, retaining bounded control admission and DNS
+        // for the final traffic report. Every owner still joins on failure.
         try { co_await env.controller->AsyncJoin(); }
         catch (...) { RecordFailure(std::current_exception()); }
         try { co_await JoinMonitor(); }

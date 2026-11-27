@@ -265,7 +265,6 @@ struct UserTrafficCounters {
 class SessionTrackingState {
     struct Account {
         UserTraffic completed;
-        UserTraffic snapshotted;
         size_t active = 0;
     };
     struct AccountBucket;
@@ -299,11 +298,9 @@ public:
 
     void UnregisterActiveSession(ActiveSession& node) noexcept;
 
-    [[nodiscard]] UserTrafficCounters SnapshotTraffic(std::string_view tag);
-    // Deduct only an already-durable snapshot. Later traffic remains pending.
-    void CommitTraffic(std::string_view tag, const UserTrafficCounters& snapshot);
-    // Re-expose a failed durable snapshot without touching later traffic.
-    void RollbackTraffic(std::string_view tag, const UserTrafficCounters& snapshot);
+    // Moves every pending delta of `tag` out of the ledger. Live sessions keep
+    // counting from here; only idle accounts are released.
+    [[nodiscard]] UserTrafficCounters TakeTraffic(std::string_view tag);
 
 private:
     struct AccountBucket {

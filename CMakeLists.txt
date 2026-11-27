@@ -122,7 +122,6 @@ set(CNODE_CORE_SOURCES
     src/app/bootstrap.cpp
     src/app/router.cpp
     src/controller/controller.cpp
-    src/controller/traffic_journal.cpp
     src/api/v2board.cpp
 
     # Proxy
@@ -173,9 +172,6 @@ set_property(SOURCE src/app/bootstrap.cpp
 
 add_executable(cnode src/main.cpp)
 target_link_libraries(cnode PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core>")
-
-add_executable(cnode_traffic_journal EXCLUDE_FROM_ALL tools/traffic_journal.cpp)
-target_link_libraries(cnode_traffic_journal PRIVATE cnode_core)
 
 if(NOT BUILD_TESTING)
     return()
@@ -361,10 +357,6 @@ foreach(source IN LISTS e2e_sources)
     cnode_e2e("${name}" "${source}")
     if(name MATCHES "^udp_" OR name STREQUAL "quic_udp")
         target_link_libraries(cnode_e2e_${name} PRIVATE unofficial-sodium::sodium)
-    elseif(name STREQUAL "config_panel_integrity")
-        target_compile_definitions(cnode_e2e_${name} PRIVATE
-            CNODE_TEST_JOURNAL_BINARY="$<TARGET_FILE:cnode_traffic_journal>")
-        add_dependencies(cnode_e2e_${name} cnode_traffic_journal)
     elseif(name STREQUAL "config_panel_failure")
         target_link_libraries(cnode_e2e_${name} PRIVATE cnode_allocation_hook)
     endif()

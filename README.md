@@ -319,24 +319,13 @@ geosite.dat
 ### 流量上报
 
 - V2Board 上报包含用户流量与在线设备。`online` 沿用 v2node 口径：本 push 周期内产生过流量的不同 UID；人数为 0 时也发送空 `/push`。首次上报在启动后一个完整 `push_interval` 之后。
-- 流量增量先持久化到 `<配置目录>/traffic-journal/<身份哈希>/`，每个身份最多 1,024 条、64 MiB，达到上限时明确报错并保留未提交计数。
-- 上报接口无幂等键，不承诺 exactly-once：发送前记录转为 `unknown`，仅完整 HTTP 200 后清除；`unknown` 批次不自动重发。正常停止会持久化最终采样，SIGKILL 前未采样的计数会丢失。
+- 流量增量只保存在内存，不落盘。每个 push 周期从各 Worker 取出增量后上报；上报接口无幂等键，HTTP 非 200、连接或响应中断时该批增量直接丢弃，不重发，warning 日志记录 `Traffic dropped` 及用户数和字节数。
+- 正常停止在收束会话后做最后一次上报，失败即丢弃；进程崩溃或 SIGKILL 时未上报的增量丢失。
 - 流量和在线设备上报收到 HTTP 非 200 响应时，warning 日志记录状态码与正文摘要：内容最多 256 字节，截断时追加 `...`，换行合并、控制字符清理；普通错误字段不做过滤，但已知 API Key 的直接回显会遮蔽。HTTP 200 的成功判定不变，不解析正文中的业务错误码。
-
-停机后根据面板侧账务证据逐批对账；确认已入账则删除，确认未入账才重新置为可发送：
-
-```sh
-mise exec -- cmake --build build/musl --target cnode_traffic_journal
-build/musl/cnode_traffic_journal '/path/to/traffic-journal/<身份哈希>' list
-build/musl/cnode_traffic_journal '/path/to/traffic-journal/<身份哈希>' resolve batch-XXXXXX.unknown \
-  --decision confirmed-applied --evidence '面板侧对账记录编号'
-```
-
-确认未入账时将 `--decision` 改为 `confirmed-not-applied`，下次启动允许该批次重新发送。
 
 ### 停机
 
-收到停机信号后先关闭新连接准入、取消面板与监控，再收束请求并持久化最终流量，最后停止各 Worker；数据面的在途操作结束后才收束主控协调器，不等待代理流量自然排空。转发载荷只按成功写出的字节计入流量。
+收到停机信号后先关闭新连接准入、取消面板与监控，再收束请求并上报最终流量，最后停止各 Worker；数据面的在途操作结束后才收束主控协调器，不等待代理流量自然排空。转发载荷只按成功写出的字节计入流量。
 
 ## 日志格式
 
@@ -375,13 +364,12 @@ include/              公共 API 和窄接口
 src/app/              Worker、DNS、dispatcher、router、proxyman、准入与监控、bootstrap
 src/proxy/            协议实现
 src/transport/        传输层实现
-src/controller/       控制面节点同步与流量账本
+src/controller/       控制面节点同步与流量上报
 src/api/              面板 API client
 src/infra/            配置、JSON、日志、校验
 src/common/           通用类型、缓冲、队列、在线配额、会话、mux
 src/geo/              geoip / geosite 数据读取
 src/sniff/            HTTP / TLS / QUIC sniffing
-tools/                流量账本离线对账工具
 config/               示例配置
 scripts/              部署与更新脚本
 ```

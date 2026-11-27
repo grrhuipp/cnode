@@ -2,7 +2,6 @@
 #include "app/worker_batch.hpp"
 #include "common/monitor_loop.hpp"
 #include "controller/node_transaction.hpp"
-#include "controller/traffic_journal.hpp"
 #include "api/api.hpp"
 #include "app/prepared_inbound.hpp"
 #include "app/user_store.hpp"
@@ -17,6 +16,7 @@
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/this_coro.hpp>
+#include <asio/use_awaitable.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -24,12 +24,14 @@
 #include <exception>
 #include <format>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -170,8 +172,7 @@ struct controller::Controller::Impl : std::enable_shared_from_this<controller::C
     net::awaitable<void> UserInfoMonitor(PanelRuntime& panel,
                                          std::string tag);
 
-    net::awaitable<void> CollectTraffic(PanelRuntime& panel,
-                                        bool* appended_out = nullptr);
+    net::awaitable<std::vector<api::UserTraffic>> CollectTraffic(PanelRuntime& panel);
     net::awaitable<controller::OnlineSnapshot>
     GetOnlineSnapshot(const std::string& tag);
 
@@ -179,7 +180,6 @@ struct controller::Controller::Impl : std::enable_shared_from_this<controller::C
     const std::vector<std::unique_ptr<app::Worker>>&  workers_;
     bool stopping_ = false;
     controller::NodeMutationGate node_mutations_;
-    std::unique_ptr<controller::JournalExecutor> journal_executor_;
 
     enum class PanelState {
         Connecting,
@@ -206,7 +206,6 @@ struct controller::Controller::Impl : std::enable_shared_from_this<controller::C
         controller::NodeState node;
         controller::NodeMutationGate::Participant mutation;
         NodeStats stats;
-        std::unique_ptr<controller::TrafficJournal> traffic_journal;
         // Active loops retain Impl, which owns these address-stable entities.
         std::weak_ptr<common::MonitorLoop> sync_loop;
         std::weak_ptr<common::MonitorLoop> status_loop;
@@ -256,6 +255,21 @@ std::unique_ptr<api::API> ValidatePanelRuntimeArgs(
     return state.config.TransportProtocol.empty()
         ? common::kTcp
         : std::string_view(state.config.TransportProtocol);
+}
+
+// UniProxy push is additive and carries no idempotency key: a delta whose
+// report fails or is interrupted is never resent.
+void LogDroppedTraffic(const infra::PanelLogContext& log_context,
+                       const std::vector<api::UserTraffic>& traffic) {
+    if (traffic.empty()) return;
+    uint64_t upload = 0;
+    uint64_t download = 0;
+    for (const auto& user : traffic) {
+        upload += static_cast<uint64_t>(user.Upload);
+        download += static_cast<uint64_t>(user.Download);
+    }
+    LOG_PANEL_WARN(log_context, "Traffic dropped: users={} upload={}B download={}B",
+                   traffic.size(), upload, download);
 }
 
 }  // namespace
@@ -431,14 +445,7 @@ Controller::Impl::PanelRuntime::PanelRuntime(
     , node_id(config.NodeIDs.Front())
     , log_context{config.Name, config.APIHost, node_id, config.NodeType}
     , accounting_key(common::BuildPanelNodeAccountingKey(config.Name, node_id))
-    , mutation(gate, std::move(executor), node) {
-    traffic_journal = std::make_unique<controller::TrafficJournal>(config);
-    const auto unknown = traffic_journal->UnknownCount();
-    if (unknown != 0) {
-        LOG_PANEL_ERROR(log_context, "Traffic accounting requires reconciliation: unknown_records={} directory={}",
-                        unknown, traffic_journal->Directory().string());
-    }
-}
+    , mutation(gate, std::move(executor), node) {}
 
 void Controller::Impl::AddPanel(std::unique_ptr<api::API> panel,
                                 const infra::PanelConfig& panel_config) {
@@ -446,9 +453,6 @@ void Controller::Impl::AddPanel(std::unique_ptr<api::API> panel,
     // Construct the complete entity before publishing it to the owner.
     auto runtime = std::make_unique<PanelRuntime>(
         std::move(panel), panel_config, node_mutations_, io_context_.get_executor());
-    if (!journal_executor_) {
-        journal_executor_ = std::make_unique<controller::JournalExecutor>();
-    }
     panels_.push_back(std::move(runtime));
 }
 
@@ -827,84 +831,59 @@ void Controller::Impl::LogPanelStatus(const PanelRuntime& panel) const {
         push_interval.count());
 }
 
-net::awaitable<void>
-Controller::Impl::CollectTraffic(PanelRuntime& panel, bool* appended_out) {
-    // Do not abandon a durable append before its matching Worker commit.
-    // Shutdown joins this critical section before taking its final snapshot.
-    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
-    struct WorkerTrafficSlice {
-        app::Worker* worker = nullptr;
-        app::UserTrafficCounters snapshot;
+net::awaitable<std::vector<api::UserTraffic>>
+Controller::Impl::CollectTraffic(PanelRuntime& panel) {
+    // UniProxy counters are signed 64-bit; clamp instead of wrapping.
+    const auto add = [](int64_t& total, uint64_t delta) noexcept {
+        constexpr auto kMax = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+        const auto current = static_cast<uint64_t>(total);
+        total = static_cast<int64_t>(delta > kMax - current ? kMax : current + delta);
     };
-    std::vector<WorkerTrafficSlice> active_slices;
-    active_slices.reserve(workers_.size());
-    app::UserTrafficCounters combined;
+    std::unordered_map<int64_t, api::UserTraffic> combined;
     for (const auto& worker : workers_) {
         auto* w = worker.get();
-        auto snapshot = co_await w->PostCall([w, &panel] {
-            return w->SnapshotTraffic(panel.accounting_key);
+        const auto taken = co_await w->PostCall([w, &panel] {
+            return w->TakeTraffic(panel.accounting_key);
         });
-        if (snapshot.empty()) continue;
-        for (const auto& [uid, delta] : snapshot.users) {
-            auto& total = combined.users[uid];
-            total.upload += delta.upload;
-            total.download += delta.download;
-        }
-        active_slices.push_back({w, std::move(snapshot)});
-    }
-    if (active_slices.empty()) co_return;
-    std::exception_ptr append_failure;
-    try {
-        co_await journal_executor_->Run([&panel, &combined] {
-            panel.traffic_journal->Append(combined);
-            return true;
-        });
-    } catch (...) {
-        append_failure = std::current_exception();
-    }
-    if (append_failure) {
-        for (const auto& slice : active_slices) {
-            try {
-                auto* w = slice.worker;
-                const auto& snapshot = slice.snapshot;
-                co_await w->PostCall([w, &panel, &snapshot] {
-                    w->RollbackTraffic(panel.accounting_key, snapshot);
-                });
-            } catch (...) {
-                panel.traffic_journal->Suspend();
-                throw;
-            }
-        }
-        std::rethrow_exception(append_failure);
-    }
-    if (appended_out) *appended_out = true;
-    for (const auto& slice : active_slices) {
-        try {
-            auto* w = slice.worker;
-            const auto& snapshot = slice.snapshot;
-            co_await w->PostCall([w, &panel, &snapshot] {
-                w->CommitTraffic(panel.accounting_key, snapshot);
-            });
-        } catch (...) {
-            panel.traffic_journal->Suspend();
-            throw;
+        for (const auto& [uid, delta] : taken) {
+            auto& total = combined[uid];
+            total.UID = uid;
+            add(total.Upload, delta.upload);
+            add(total.Download, delta.download);
         }
     }
+    std::vector<api::UserTraffic> traffic;
+    traffic.reserve(combined.size());
+    for (const auto& [uid, value] : combined) traffic.push_back(value);
+    // The push body lists users in ascending uid, independent of hash order.
+    std::ranges::sort(traffic, {}, &api::UserTraffic::UID);
+    co_return traffic;
 }
 
 net::awaitable<void> Controller::Impl::FlushTraffic() {
     co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
     std::exception_ptr failure;
     for (const auto& panel : panels_) {
+        std::vector<api::UserTraffic> traffic;
         try {
-            co_await CollectTraffic(*panel);
+            traffic = co_await CollectTraffic(*panel);
         } catch (const std::exception& error) {
             if (!failure) failure = std::current_exception();
-            LOG_PANEL_ERROR(panel->log_context, "Final traffic persistence failed: {}", error.what());
+            LOG_PANEL_ERROR(panel->log_context, "Final traffic collection failed: {}", error.what());
+            continue;
         } catch (...) {
             if (!failure) failure = std::current_exception();
-            LOG_PANEL_ERROR(panel->log_context, "Final traffic persistence failed: unknown error");
+            LOG_PANEL_ERROR(panel->log_context, "Final traffic collection failed: unknown error");
+            continue;
         }
+        if (traffic.empty()) continue;
+        bool accepted = false;
+        try {
+            accepted = co_await panel->client->ReportUserTraffic(traffic);
+        } catch (const std::exception& error) {
+            LOG_PANEL_WARN(panel->log_context, "Final traffic report failed: {}", error.what());
+        }
+        if (!accepted) LogDroppedTraffic(panel->log_context, traffic);
     }
     if (failure) std::rethrow_exception(failure);
 }
@@ -939,95 +918,45 @@ net::awaitable<void> Controller::Impl::UserInfoMonitor(PanelRuntime& panel,
     const auto& log_context = panel.log_context;
 
     app::ThrowIfStopping(stopping_);
-    // Drain never-attempted crash/backpressure records before collecting more;
-    // otherwise a full journal of ready records could never free its capacity.
     auto& ns = panel.stats;
-    controller::TrafficJournal::Batch batch;
-    bool traffic_ok = false;
-    bool journal_ok = true;
+    std::vector<api::UserTraffic> traffic;
+    bool collected = false;
     try {
-        batch = co_await journal_executor_->Run([&panel] {
-            return panel.traffic_journal->Prepare();
-        });
-        if (batch.records.empty()) {
-            // reset_cancellation_state in CollectTraffic applies to its entire
-            // coroutine thread, not just that function. Join a shielded child so a
-            // durable append always reaches CommitTraffic without disabling stop
-            // cancellation for this loop's subsequent panel requests.
-            bool appended = false;
-            try {
-                co_await net::co_spawn(io_context_,
-                    CollectTraffic(panel, &appended),
-                    net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
-            } catch (const std::exception& e) {
-                if (stopping_) throw;
-                journal_ok = false;
-                LOG_PANEL_WARN(log_context, "Traffic collection failed: operation=push reason={}", e.what());
-            }
-            app::ThrowIfStopping(stopping_);
-            if (appended) {
-                batch = co_await journal_executor_->Run([&panel] {
-                    return panel.traffic_journal->Prepare();
-                });
-            }
-        }
-        app::ThrowIfStopping(stopping_);
-        if (!batch.records.empty()) {
-            co_await journal_executor_->Run([&panel, &batch] {
-                panel.traffic_journal->Begin(batch);
-                return true;
-            });
-        }
-        const auto& traffic_data = batch.traffic;
-        uint64_t batch_up = 0;
-        uint64_t batch_down = 0;
-        for (const auto& td : traffic_data) {
-            batch_up += td.Upload;
-            batch_down += td.Download;
-        }
-        if (!batch.records.empty() || journal_ok) {
-            try {
-                // Marked unknown durably BEFORE any network transmission. Even non-2xx
-                // may follow partial server-side accounting; never retry these deltas.
-                // An empty push still clears the panel's previous online-user count.
-                traffic_ok = co_await panel.client->ReportUserTraffic(traffic_data);
-            } catch (const std::exception& e) {
-                if (stopping_) {
-                    if (!traffic_ok && !batch.records.empty()) {
-                        LOG_PANEL_ERROR(log_context, "Traffic accounting API acceptance unknown: records={} retained without retry; directory={}",
-                                        batch.records.size(), panel.traffic_journal->Directory().string());
-                    }
-                    throw;
-                }
-                LOG_PANEL_WARN(log_context, "Traffic report failed: operation=push reason={}", e.what());
-            }
-        }
-        if (!traffic_ok && !batch.records.empty()) {
-            LOG_PANEL_ERROR(log_context, "Traffic accounting API acceptance unknown: records={} retained without retry; directory={}",
-                            batch.records.size(), panel.traffic_journal->Directory().string());
-        }
-        if (traffic_ok) {
-            ns.bytes_up += batch_up;
-            ns.bytes_down += batch_down;
-            if (!batch.records.empty()) {
-                co_await journal_executor_->Run([&panel, &batch] {
-                    panel.traffic_journal->Acknowledge(batch);
-                    return true;
-                });
-            }
-        }
-        app::ThrowIfStopping(stopping_);
-        if (traffic_ok) {
-            LOG_PANEL_DEBUG(log_context, "Traffic report accepted: users={}", traffic_data.size());
-        }
+        // Stop does not interrupt the per-Worker takes; it still cancels the
+        // panel requests below. A failed take drops what was already taken.
+        traffic = co_await net::co_spawn(io_context_, CollectTraffic(panel),
+            net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
+        collected = true;
     } catch (const std::exception& e) {
         if (stopping_) throw;
-        journal_ok = false;
-        LOG_PANEL_ERROR(log_context, "Traffic journal failed: operation=push reason={}", e.what());
+        LOG_PANEL_WARN(log_context, "Traffic collection failed: operation=push reason={}", e.what());
     }
+    bool traffic_ok = false;
+    if (collected) {
+        try {
+            // An empty push still clears the panel's previous online-user count.
+            traffic_ok = co_await panel.client->ReportUserTraffic(traffic);
+        } catch (const std::exception& e) {
+            if (stopping_) {
+                LogDroppedTraffic(log_context, traffic);
+                throw;
+            }
+            LOG_PANEL_WARN(log_context, "Traffic report failed: operation=push reason={}", e.what());
+        }
+        if (traffic_ok) {
+            for (const auto& user : traffic) {
+                ns.bytes_up += static_cast<uint64_t>(user.Upload);
+                ns.bytes_down += static_cast<uint64_t>(user.Download);
+            }
+            LOG_PANEL_DEBUG(log_context, "Traffic report accepted: users={}", traffic.size());
+        } else {
+            LogDroppedTraffic(log_context, traffic);
+        }
+    }
+    app::ThrowIfStopping(stopping_);
 
-    const size_t traffic_users = batch.traffic.size();
-    batch = {};
+    const size_t traffic_users = traffic.size();
+    std::vector<api::UserTraffic>{}.swap(traffic);
     auto online = co_await GetOnlineSnapshot(tag);
     ns.online_count = online.user_count;
 
@@ -1041,11 +970,11 @@ net::awaitable<void> Controller::Impl::UserInfoMonitor(PanelRuntime& panel,
         LOG_PANEL_WARN(log_context, "Online report failed: operation=push reason={}", e.what());
     }
 
-    const bool report_ok = traffic_ok && journal_ok && online_ok;
+    const bool report_ok = traffic_ok && online_ok;
     LOG_PANEL_INFO(log_context,
         "Panel report: state={} operation=push traffic={} traffic_users={} online={} online_users={} devices={}",
         report_ok ? "ok" : "degraded",
-        (traffic_ok && journal_ok) ? "ok" : "failed",
+        traffic_ok ? "ok" : "failed",
         traffic_users,
         online_ok ? "ok" : "failed",
         online.user_count,
